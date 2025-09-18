@@ -1,0 +1,821 @@
+#include "Parser/Parser.hpp"
+#include <iostream>
+
+namespace Cryo
+{
+    Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context)
+        : _lexer(std::move(lexer)), _context(context), _builder(context)
+    {
+        // Initialize by getting the first token
+        advance();
+    }
+
+    std::unique_ptr<ProgramNode> Parser::parse_program()
+    {
+        auto program = _builder.create_program_node(SourceLocation{});
+
+        // Parse optional namespace declaration
+        if (_current_token.is(TokenKind::TK_KW_NAMESPACE))
+        {
+            std::string namespace_name = parse_namespace();
+            // TODO: Store namespace information in program node or context
+        }
+
+        // Parse statements until EOF
+        while (!is_at_end())
+        {
+            try
+            {
+                auto stmt = parse_statement();
+                if (stmt)
+                {
+                    program->add_statement(std::move(stmt));
+                }
+            }
+            catch (const ParseError &e)
+            {
+                _errors.push_back(e);
+                synchronize(); // Recover from error
+            }
+        }
+
+        return program;
+    }
+
+    // Token management
+    void Parser::advance()
+    {
+        if (_lexer && _lexer->has_more_tokens())
+        {
+            _current_token = _lexer->next_token();
+        }
+    }
+
+    bool Parser::match(TokenKind kind)
+    {
+        if (_current_token.is(kind))
+        {
+            advance();
+            return true;
+        }
+        return false;
+    }
+
+    bool Parser::match(std::initializer_list<TokenKind> kinds)
+    {
+        for (auto kind : kinds)
+        {
+            if (_current_token.is(kind))
+            {
+                advance();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Token Parser::consume(TokenKind expected, const std::string &error_message)
+    {
+        if (_current_token.is(expected))
+        {
+            Token token = _current_token;
+            advance();
+            return token;
+        }
+
+        error(error_message);
+        return Token{}; // Return empty token on error
+    }
+
+    bool Parser::is_at_end() const
+    {
+        return _current_token.is_eof();
+    }
+
+    // Error handling
+    void Parser::error(const std::string &message)
+    {
+        throw ParseError(message, _current_token.location());
+    }
+
+    void Parser::synchronize()
+    {
+        // Skip tokens until we find a statement boundary
+        while (!is_at_end())
+        {
+            if (_current_token.is(TokenKind::TK_SEMICOLON))
+            {
+                advance();
+                return;
+            }
+
+            // Check for statement start tokens
+            if (match({TokenKind::TK_KW_FUNCTION, TokenKind::TK_KW_CONST, TokenKind::TK_KW_MUT,
+                       TokenKind::TK_KW_IF, TokenKind::TK_KW_WHILE, TokenKind::TK_KW_FOR,
+                       TokenKind::TK_KW_RETURN, TokenKind::TK_KW_BREAK, TokenKind::TK_KW_CONTINUE}))
+            {
+                return;
+            }
+
+            advance();
+        }
+    }
+
+    // Type parsing
+    std::string Parser::parse_type()
+    {
+        if (!is_type_token())
+        {
+            error("Expected type");
+            return "";
+        }
+
+        Token type_token = _current_token;
+        advance();
+
+        std::string base_type = std::string(type_token.text());
+
+        // Handle array types (e.g., i32[], str[][])
+        while (_current_token.is(TokenKind::TK_L_SQUARE))
+        {
+            consume(TokenKind::TK_L_SQUARE, "Expected '['");
+            consume(TokenKind::TK_R_SQUARE, "Expected ']'");
+            base_type += "[]";
+        }
+
+        return base_type;
+    }
+
+    // Namespace parsing
+    std::string Parser::parse_namespace()
+    {
+        consume(TokenKind::TK_KW_NAMESPACE, "Expected 'namespace'");
+
+        std::string namespace_name;
+
+        // Parse namespace identifier (can be dotted like Examples.BinOp)
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            namespace_name = std::string(_current_token.text());
+            advance();
+
+            while (_current_token.is(TokenKind::TK_PERIOD))
+            {
+                advance(); // consume '.'
+                if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                {
+                    namespace_name += "." + std::string(_current_token.text());
+                    advance();
+                }
+                else
+                {
+                    error("Expected identifier after '.'");
+                    break;
+                }
+            }
+        }
+        else
+        {
+            error("Expected namespace identifier");
+        }
+
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after namespace declaration");
+        return namespace_name;
+    }
+
+    // Statement parsing
+    std::unique_ptr<ASTNode> Parser::parse_statement()
+    {
+        // Variable declarations
+        if (_current_token.is(TokenKind::TK_KW_CONST) || _current_token.is(TokenKind::TK_KW_MUT))
+        {
+            return parse_variable_declaration();
+        }
+
+        // Function declarations
+        if (_current_token.is(TokenKind::TK_KW_FUNCTION) || is_visibility_modifier())
+        {
+            return parse_function_declaration();
+        }
+
+        // Control flow statements
+        if (_current_token.is(TokenKind::TK_KW_IF))
+        {
+            return parse_if_statement();
+        }
+
+        if (_current_token.is(TokenKind::TK_KW_WHILE))
+        {
+            return parse_while_statement();
+        }
+
+        if (_current_token.is(TokenKind::TK_KW_FOR))
+        {
+            return parse_for_statement();
+        }
+
+        if (_current_token.is(TokenKind::TK_KW_RETURN))
+        {
+            return parse_return_statement();
+        }
+
+        if (_current_token.is(TokenKind::TK_KW_BREAK))
+        {
+            return parse_break_statement();
+        }
+
+        if (_current_token.is(TokenKind::TK_KW_CONTINUE))
+        {
+            return parse_continue_statement();
+        }
+
+        if (_current_token.is(TokenKind::TK_L_BRACE))
+        {
+            return parse_block_statement();
+        }
+
+        // Expression statements
+        return parse_expression_statement();
+    }
+
+    std::unique_ptr<VariableDeclarationNode> Parser::parse_variable_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        // Parse variable modifier (const or mut)
+        bool is_mutable = false;
+        if (_current_token.is(TokenKind::TK_KW_CONST))
+        {
+            advance();
+            is_mutable = false;
+        }
+        else if (_current_token.is(TokenKind::TK_KW_MUT))
+        {
+            advance();
+            is_mutable = true;
+        }
+        else
+        {
+            error("Expected 'const' or 'mut'");
+        }
+
+        // Parse variable name
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected variable name");
+        std::string var_name = std::string(name_token.text());
+
+        // Parse type annotation
+        consume(TokenKind::TK_COLON, "Expected ':' after variable name");
+        std::string var_type = parse_type();
+
+        // Parse optional initializer
+        std::unique_ptr<ExpressionNode> initializer = nullptr;
+        if (_current_token.is(TokenKind::TK_EQUAL))
+        {
+            advance(); // consume '='
+            initializer = parse_expression();
+        }
+
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after variable declaration");
+
+        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, std::move(initializer));
+        // TODO: Store type information and mutability in the variable declaration
+
+        return var_decl;
+    }
+
+    std::unique_ptr<FunctionDeclarationNode> Parser::parse_function_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        // Parse optional visibility modifier
+        bool is_public = false;
+        if (_current_token.is(TokenKind::TK_KW_PUBLIC))
+        {
+            is_public = true;
+            advance();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_PRIVATE))
+        {
+            is_public = false;
+            advance();
+        }
+
+        consume(TokenKind::TK_KW_FUNCTION, "Expected 'function'");
+
+        // Parse function name
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
+        std::string func_name = std::string(name_token.text());
+
+        auto func_decl = _builder.create_function_declaration(start_loc, func_name);
+
+        // Parse parameter list
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
+
+        if (!_current_token.is(TokenKind::TK_R_PAREN))
+        {
+            auto params = parse_parameter_list();
+            for (auto &param : params)
+            {
+                func_decl->add_parameter(std::move(param));
+            }
+        }
+
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
+
+        // Parse return type
+        std::string return_type = "void";
+        if (_current_token.is(TokenKind::TK_ARROW))
+        {
+            advance(); // consume '->'
+            return_type = parse_type();
+        }
+
+        // Parse function body
+        auto body = parse_block_statement();
+        func_decl->set_body(std::unique_ptr<BlockStatementNode>(
+            dynamic_cast<BlockStatementNode *>(body.release())));
+
+        return func_decl;
+    }
+
+    std::unique_ptr<ReturnStatementNode> Parser::parse_return_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_RETURN, "Expected 'return'");
+
+        std::unique_ptr<ExpressionNode> expr = nullptr;
+        if (!_current_token.is(TokenKind::TK_SEMICOLON))
+        {
+            expr = parse_expression();
+        }
+
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after return statement");
+
+        return _builder.create_return_statement(start_loc, std::move(expr));
+    }
+
+    std::unique_ptr<BlockStatementNode> Parser::parse_block_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_L_BRACE, "Expected '{'");
+
+        auto block = _builder.create_block_statement(start_loc);
+
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            auto stmt = parse_statement();
+            if (stmt)
+            {
+                // Convert to StatementNode if needed
+                if (auto statement_node = dynamic_cast<StatementNode *>(stmt.get()))
+                {
+                    stmt.release(); // Release ownership
+                    block->add_statement(std::unique_ptr<StatementNode>(statement_node));
+                }
+                else if (auto decl_node = dynamic_cast<DeclarationNode *>(stmt.get()))
+                {
+                    // Declarations can also go in blocks - create a wrapper or handle differently
+                    // For now, we'll skip non-statement nodes
+                    // TODO: Properly handle declarations in blocks
+                }
+            }
+        }
+
+        consume(TokenKind::TK_R_BRACE, "Expected '}'");
+        return block;
+    }
+
+    // Expression parsing implementation
+    std::unique_ptr<ExpressionNode> Parser::parse_expression()
+    {
+        return parse_assignment();
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_assignment()
+    {
+        auto expr = parse_conditional();
+
+        if (is_assignment_operator(_current_token.kind()))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_assignment();
+
+            // For now, treat assignment as binary expression
+            // TODO: Create proper assignment node
+            return _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_conditional()
+    {
+        // TODO: Implement ternary operator (condition ? true_expr : false_expr)
+        return parse_logical_or();
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_logical_or()
+    {
+        auto expr = parse_logical_and();
+
+        while (_current_token.is(TokenKind::TK_PIPEPIPE))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_logical_and();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_logical_and()
+    {
+        auto expr = parse_equality();
+
+        while (_current_token.is(TokenKind::TK_AMPAMP))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_equality();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_equality()
+    {
+        auto expr = parse_relational();
+
+        while (_current_token.is(TokenKind::TK_EQUALEQUAL) || _current_token.is(TokenKind::TK_EXCLAIMEQUAL))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_relational();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_relational()
+    {
+        auto expr = parse_additive();
+
+        while (_current_token.is(TokenKind::TK_L_ANGLE) || _current_token.is(TokenKind::TK_R_ANGLE) ||
+               _current_token.is(TokenKind::TK_LESSEQUAL) || _current_token.is(TokenKind::TK_GREATEREQUAL))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_additive();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_additive()
+    {
+        auto expr = parse_multiplicative();
+
+        while (_current_token.is(TokenKind::TK_PLUS) || _current_token.is(TokenKind::TK_MINUS))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_multiplicative();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_multiplicative()
+    {
+        auto expr = parse_unary();
+
+        while (_current_token.is(TokenKind::TK_STAR) || _current_token.is(TokenKind::TK_SLASH) || _current_token.is(TokenKind::TK_PERCENT))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_unary();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_unary()
+    {
+        if (_current_token.is(TokenKind::TK_MINUS) || _current_token.is(TokenKind::TK_EXCLAIM))
+        {
+            Token op = _current_token;
+            advance();
+            auto expr = parse_unary();
+
+            // Create unary expression (treat as binary with null left operand for now)
+            // TODO: Create proper unary expression node
+            return _builder.create_binary_expression(op, nullptr, std::move(expr));
+        }
+
+        return parse_primary();
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_primary()
+    {
+        // Literals
+        if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+        {
+            return parse_number_literal();
+        }
+
+        if (_current_token.is(TokenKind::TK_STRING_LITERAL))
+        {
+            return parse_string_literal();
+        }
+
+        if (_current_token.is(TokenKind::TK_KW_TRUE) || _current_token.is(TokenKind::TK_KW_FALSE))
+        {
+            return parse_boolean_literal();
+        }
+
+        // Identifiers (can be function calls or variable references)
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            auto identifier = parse_identifier();
+
+            // Check for function call
+            if (_current_token.is(TokenKind::TK_L_PAREN))
+            {
+                return parse_call_expression(std::move(identifier));
+            }
+
+            // Check for array access
+            if (_current_token.is(TokenKind::TK_L_SQUARE))
+            {
+                return parse_array_access(std::move(identifier));
+            }
+
+            return identifier;
+        }
+
+        // Parenthesized expressions
+        if (_current_token.is(TokenKind::TK_L_PAREN))
+        {
+            advance(); // consume '('
+            auto expr = parse_expression();
+            consume(TokenKind::TK_R_PAREN, "Expected ')' after expression");
+            return expr;
+        }
+
+        // Array literals
+        if (_current_token.is(TokenKind::TK_L_SQUARE))
+        {
+            return parse_array_literal();
+        }
+
+        error("Expected expression");
+        return nullptr;
+    }
+
+    // Literal parsing
+    std::unique_ptr<LiteralNode> Parser::parse_number_literal()
+    {
+        Token token = consume(TokenKind::TK_NUMERIC_CONSTANT, "Expected number");
+        return _builder.create_literal_node(token);
+    }
+
+    std::unique_ptr<LiteralNode> Parser::parse_string_literal()
+    {
+        Token token = consume(TokenKind::TK_STRING_LITERAL, "Expected string");
+        return _builder.create_literal_node(token);
+    }
+
+    std::unique_ptr<LiteralNode> Parser::parse_boolean_literal()
+    {
+        Token token = _current_token;
+        if (_current_token.is(TokenKind::TK_KW_TRUE) || _current_token.is(TokenKind::TK_KW_FALSE))
+        {
+            advance();
+            return _builder.create_literal_node(token);
+        }
+
+        error("Expected boolean literal");
+        return nullptr;
+    }
+
+    std::unique_ptr<IdentifierNode> Parser::parse_identifier()
+    {
+        Token token = consume(TokenKind::TK_IDENTIFIER, "Expected identifier");
+        return _builder.create_identifier_node(token);
+    }
+
+    // Utility methods
+    bool Parser::is_type_token() const
+    {
+        return _current_token.is(TokenKind::TK_KW_I8) ||
+               _current_token.is(TokenKind::TK_KW_I16) ||
+               _current_token.is(TokenKind::TK_KW_I32) ||
+               _current_token.is(TokenKind::TK_KW_I64) ||
+               _current_token.is(TokenKind::TK_KW_UINT) ||
+               _current_token.is(TokenKind::TK_KW_FLOAT) ||
+               _current_token.is(TokenKind::TK_KW_DOUBLE) ||
+               _current_token.is(TokenKind::TK_KW_BOOLEAN) ||
+               _current_token.is(TokenKind::TK_KW_STRING) ||
+               _current_token.is(TokenKind::TK_KW_VOID) ||
+               _current_token.is(TokenKind::TK_IDENTIFIER); // For user-defined types
+    }
+
+    bool Parser::is_visibility_modifier() const
+    {
+        return _current_token.is(TokenKind::TK_KW_PUBLIC) ||
+               _current_token.is(TokenKind::TK_KW_PRIVATE);
+    }
+
+    bool Parser::is_variable_modifier() const
+    {
+        return _current_token.is(TokenKind::TK_KW_CONST) ||
+               _current_token.is(TokenKind::TK_KW_MUT);
+    }
+
+    bool Parser::is_assignment_operator(TokenKind kind) const
+    {
+        return kind == TokenKind::TK_EQUAL ||
+               kind == TokenKind::TK_PLUSEQUAL ||
+               kind == TokenKind::TK_MINUSEQUAL ||
+               kind == TokenKind::TK_STAREQUAL ||
+               kind == TokenKind::TK_SLASHEQUAL;
+    }
+
+    // Stub implementations for remaining methods
+    std::unique_ptr<ASTNode> Parser::parse_if_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_IF, "Expected 'if'");
+
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after 'if'");
+        auto condition = parse_expression();
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after if condition");
+
+        auto then_stmt = parse_statement();
+
+        std::unique_ptr<StatementNode> else_stmt = nullptr;
+        if (_current_token.is(TokenKind::TK_KW_ELSE))
+        {
+            advance(); // consume 'else'
+            auto else_node = parse_statement();
+            if (auto stmt = dynamic_cast<StatementNode *>(else_node.get()))
+            {
+                else_node.release();
+                else_stmt = std::unique_ptr<StatementNode>(stmt);
+            }
+        }
+
+        // Convert then_stmt to StatementNode
+        if (auto stmt = dynamic_cast<StatementNode *>(then_stmt.get()))
+        {
+            then_stmt.release();
+            auto then_statement = std::unique_ptr<StatementNode>(stmt);
+            return _builder.create_if_statement(start_loc, std::move(condition), std::move(then_statement), std::move(else_stmt));
+        }
+
+        error("Invalid then statement in if");
+        return nullptr;
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_while_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_WHILE, "Expected 'while'");
+
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after 'while'");
+        auto condition = parse_expression();
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after while condition");
+
+        auto body = parse_statement();
+        if (auto stmt = dynamic_cast<StatementNode *>(body.get()))
+        {
+            body.release();
+            auto body_stmt = std::unique_ptr<StatementNode>(stmt);
+            return _builder.create_while_statement(start_loc, std::move(condition), std::move(body_stmt));
+        }
+
+        error("Invalid body statement in while");
+        return nullptr;
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_for_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_FOR, "Expected 'for'");
+
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after 'for'");
+
+        // Parse initialization (variable declaration)
+        auto init = parse_variable_declaration();
+
+        // Parse condition
+        auto condition = parse_expression();
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after for condition");
+
+        // Parse update expression
+        auto update = parse_expression();
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after for clauses");
+
+        // Parse body
+        auto body = parse_statement();
+        if (auto stmt = dynamic_cast<StatementNode *>(body.get()))
+        {
+            body.release();
+            auto body_stmt = std::unique_ptr<StatementNode>(stmt);
+            return _builder.create_for_statement(start_loc, std::move(init), std::move(condition), std::move(update), std::move(body_stmt));
+        }
+
+        error("Invalid body statement in for");
+        return nullptr;
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_break_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_BREAK, "Expected 'break'");
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after 'break'");
+
+        return _builder.create_break_statement(start_loc);
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_continue_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_CONTINUE, "Expected 'continue'");
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after 'continue'");
+
+        return _builder.create_continue_statement(start_loc);
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_expression_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        auto expr = parse_expression();
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after expression");
+
+        return _builder.create_expression_statement(start_loc, std::move(expr));
+    }
+
+    std::vector<std::unique_ptr<VariableDeclarationNode>> Parser::parse_parameter_list()
+    {
+        std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+
+        params.push_back(parse_parameter());
+
+        while (_current_token.is(TokenKind::TK_COMMA))
+        {
+            advance(); // consume ','
+            params.push_back(parse_parameter());
+        }
+
+        return params;
+    }
+
+    std::unique_ptr<VariableDeclarationNode> Parser::parse_parameter()
+    {
+        // Parse parameter name
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected parameter name");
+        std::string param_name = std::string(name_token.text());
+
+        // Parse type annotation
+        consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
+        std::string param_type = parse_type();
+
+        // Create parameter as variable declaration (without initializer)
+        return _builder.create_variable_declaration(name_token.location(), param_name, nullptr);
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_call_expression(std::unique_ptr<ExpressionNode> expr)
+    {
+        // TODO: Implement function call parsing
+        error("Function calls not yet implemented");
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_array_access(std::unique_ptr<ExpressionNode> expr)
+    {
+        // TODO: Implement array access parsing
+        error("Array access not yet implemented");
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_array_literal()
+    {
+        // TODO: Implement array literal parsing
+        error("Array literals not yet implemented");
+        return nullptr;
+    }
+
+    Token Parser::peek_next()
+    {
+        // TODO: Implement lookahead
+        return Token{};
+    }
+}
