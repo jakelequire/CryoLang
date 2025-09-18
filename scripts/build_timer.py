@@ -148,7 +148,7 @@ def get_compiler_info():
     info = {}
     try:
         # Try to get C compiler version
-        c_compiler_cmd = "gcc --version" if os.name == "nt" else "clang-18 --version"
+        c_compiler_cmd = "gcc --version" if os.name == "nt" else "clang-20 --version"
         result = subprocess.run(c_compiler_cmd, shell=True, capture_output=True, text=True)
         if result.returncode == 0:
             info["c_compiler"] = result.stdout.splitlines()[0]
@@ -157,7 +157,7 @@ def get_compiler_info():
     
     try:
         # Try to get C++ compiler version
-        cpp_compiler_cmd = "g++ --version" if os.name == "nt" else "clang++-18 --version"
+        cpp_compiler_cmd = "g++ --version" if os.name == "nt" else "clang++-20 --version"
         result = subprocess.run(cpp_compiler_cmd, shell=True, capture_output=True, text=True)
         if result.returncode == 0:
             info["cpp_compiler"] = result.stdout.splitlines()[0]
@@ -213,13 +213,6 @@ def main():
     print_timing("Compiler build completed in", build_time)
     all_success = all_success and build_success
     
-    test_time = 0
-    # Build tests unless skipped
-    if not args.no_tests and build_success:
-        test_time, test_success = run_command("make -j tests", "Building test suite")
-        print_timing("Test suite build completed in", test_time)
-        all_success = all_success and test_success
-    
     # Calculate total time
     total_time = time.time() - total_start_time
     
@@ -229,8 +222,6 @@ def main():
     if args.clean:
         print_timing("Clean time", clean_time, indent=2)
     print_timing("Compiler build time", build_time, indent=2)
-    if not args.no_tests:
-        print_timing("Test suite build time", test_time, indent=2)
     
     print_colored("\n" + "━" * 80, "1;36")
     print_timing("TOTAL BUILD TIME", total_time)

@@ -51,8 +51,8 @@ ifeq ($(OS), Windows_NT)
 	CXX_COMPILER = C:/msys64/mingw64/bin/g++
 else
 # Linux settings
-	C_COMPILER = clang-23
-	CXX_COMPILER = clang++-23
+	C_COMPILER = clang-20
+	CXX_COMPILER = clang++-20
 endif
 
 # >>=======--------------------------------------------------=======<< #
@@ -121,7 +121,7 @@ MAIN_FILE = $(SRC_DIR)main.cpp
 
 # ---------------------------------------------
 # Main binary
-MAIN_BIN = $(BIN_DIR)compiler$(BIN_SUFFIX)
+MAIN_BIN = $(BIN_DIR)cryo$(BIN_SUFFIX)
 
 # ---------------------------------------------
 # Ensure OBJ_DIR exists
@@ -186,6 +186,9 @@ rebuild:
 .PHONY: all
 all: 
 	@$(MAKE) timed-build
+
+run: $(MAIN_BIN)
+	@$(MAIN_BIN)
 	
 .PHONY: build
 build: $(MAIN_BIN)
