@@ -1,0 +1,117 @@
+#pragma once
+
+#include "Lexer/lexer.hpp"
+#include "AST/ASTNode.hpp"
+#include "AST/ASTBuilder.hpp"
+#include "AST/ASTContext.hpp"
+#include <memory>
+#include <vector>
+#include <stdexcept>
+
+namespace Cryo
+{
+    class ParseError : public std::runtime_error
+    {
+    public:
+        ParseError(const std::string &message, SourceLocation location)
+            : std::runtime_error(message), _location(location) {}
+
+        const SourceLocation &location() const { return _location; }
+
+    private:
+        SourceLocation _location;
+    };
+
+    class Parser
+    {
+    private:
+        std::unique_ptr<Lexer> _lexer;
+        ASTContext &_context;
+        ASTBuilder _builder;
+        Token _current_token;
+        std::vector<ParseError> _errors;
+
+    public:
+        Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
+
+        // Main parsing entry point
+        std::unique_ptr<ProgramNode> parse_program();
+
+        // Error handling
+        const std::vector<ParseError> &errors() const { return _errors; }
+        bool has_errors() const { return !_errors.empty(); }
+
+    private:
+        // Token management
+        void advance();
+        bool match(TokenKind kind);
+        bool match(std::initializer_list<TokenKind> kinds);
+        Token consume(TokenKind expected, const std::string &error_message);
+        bool is_at_end() const;
+
+        // Error handling
+        void error(const std::string &message);
+        void synchronize();
+
+        // Type parsing
+        std::string parse_type();
+        std::vector<std::string> parse_type_list(); // For arrays like i32[][]
+
+        // Namespace parsing
+        std::string parse_namespace();
+
+        // Statement parsing
+        std::unique_ptr<ASTNode> parse_statement();
+        std::unique_ptr<VariableDeclarationNode> parse_variable_declaration();
+        std::unique_ptr<FunctionDeclarationNode> parse_function_declaration();
+        std::unique_ptr<ReturnStatementNode> parse_return_statement();
+        std::unique_ptr<BlockStatementNode> parse_block_statement();
+        std::unique_ptr<ASTNode> parse_if_statement();
+        std::unique_ptr<ASTNode> parse_while_statement();
+        std::unique_ptr<ASTNode> parse_for_statement();
+        std::unique_ptr<ASTNode> parse_break_statement();
+        std::unique_ptr<ASTNode> parse_continue_statement();
+        std::unique_ptr<ASTNode> parse_expression_statement();
+
+        // Parameter parsing for functions
+        std::vector<std::unique_ptr<VariableDeclarationNode>> parse_parameter_list();
+        std::unique_ptr<VariableDeclarationNode> parse_parameter();
+
+        // Expression parsing (precedence climbing)
+        std::unique_ptr<ExpressionNode> parse_expression();
+        std::unique_ptr<ExpressionNode> parse_assignment();
+        std::unique_ptr<ExpressionNode> parse_conditional();
+        std::unique_ptr<ExpressionNode> parse_logical_or();
+        std::unique_ptr<ExpressionNode> parse_logical_and();
+        std::unique_ptr<ExpressionNode> parse_equality();
+        std::unique_ptr<ExpressionNode> parse_relational();
+        std::unique_ptr<ExpressionNode> parse_additive();
+        std::unique_ptr<ExpressionNode> parse_multiplicative();
+        std::unique_ptr<ExpressionNode> parse_unary();
+        std::unique_ptr<ExpressionNode> parse_primary();
+        std::unique_ptr<ExpressionNode> parse_call_expression(std::unique_ptr<ExpressionNode> expr);
+        std::unique_ptr<ExpressionNode> parse_array_access(std::unique_ptr<ExpressionNode> expr);
+
+        // Literal parsing
+        std::unique_ptr<LiteralNode> parse_number_literal();
+        std::unique_ptr<LiteralNode> parse_string_literal();
+        std::unique_ptr<LiteralNode> parse_boolean_literal();
+        std::unique_ptr<IdentifierNode> parse_identifier();
+
+        // Array literal parsing
+        std::unique_ptr<ExpressionNode> parse_array_literal();
+
+        // Utility methods
+        bool is_type_token() const;
+        bool is_visibility_modifier() const;
+        bool is_variable_modifier() const; // const, mut
+        int get_operator_precedence(TokenKind kind) const;
+        bool is_binary_operator(TokenKind kind) const;
+        bool is_unary_operator(TokenKind kind) const;
+        bool is_assignment_operator(TokenKind kind) const;
+
+        // Look ahead utilities
+        Token peek() const { return _current_token; }
+        Token peek_next();
+    };
+}
