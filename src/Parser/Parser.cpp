@@ -4,10 +4,43 @@
 namespace Cryo
 {
     Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context)
-        : _lexer(std::move(lexer)), _context(context), _builder(context)
+        : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(nullptr)
     {
         // Initialize by getting the first token
         advance();
+    }
+
+    Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file)
+        : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
+    {
+        // Initialize by getting the first token
+        advance();
+    }
+
+    void Parser::report_error(DiagnosticID id, const std::string &message, SourceRange range)
+    {
+        if (_diagnostic_manager)
+        {
+            _diagnostic_manager->report_error(id, DiagnosticCategory::Parser, message, range, _source_file);
+        }
+        else
+        {
+            // Fallback to old error system
+            std::cerr << "Parse Error: " << message << std::endl;
+        }
+    }
+
+    void Parser::report_warning(DiagnosticID id, const std::string &message, SourceRange range)
+    {
+        if (_diagnostic_manager)
+        {
+            _diagnostic_manager->report_warning(id, DiagnosticCategory::Parser, message, range, _source_file);
+        }
+        else
+        {
+            // Fallback to old warning system
+            std::cerr << "Parse Warning: " << message << std::endl;
+        }
     }
 
     std::unique_ptr<ProgramNode> Parser::parse_program()
@@ -45,15 +78,19 @@ namespace Cryo
     // Token management
     void Parser::advance()
     {
-        if (_lexer && _lexer->has_more_tokens())
+        do
         {
-            _current_token = _lexer->next_token();
-        }
-        else
-        {
-            // When no more tokens available, set current token to EOF
-            _current_token = Token(TokenKind::TK_EOF, "", SourceLocation{});
-        }
+            if (_lexer && _lexer->has_more_tokens())
+            {
+                _current_token = _lexer->next_token();
+            }
+            else
+            {
+                // When no more tokens available, set current token to EOF
+                _current_token = Token(TokenKind::TK_EOF, "", SourceLocation{});
+                break;
+            }
+        } while (_current_token.is(TokenKind::TK_COMMENT)); // Skip comment tokens
     }
 
     bool Parser::match(TokenKind kind)
@@ -100,9 +137,17 @@ namespace Cryo
     // Error handling
     void Parser::error(const std::string &message)
     {
+        // Create a source range from the current token location
+        SourceRange range;
+        range.start = _current_token.location();
+        range.end = _current_token.location();
+
+        // Report to GDM if available
+        report_error(DiagnosticID::Unknown, message, range);
+
+        // Still throw for old error handling compatibility
         throw ParseError(message, _current_token.location());
     }
-
     void Parser::synchronize()
     {
         // Skip tokens until we find a statement boundary

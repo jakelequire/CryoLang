@@ -4,6 +4,7 @@
 #include "AST/ASTNode.hpp"
 #include "AST/ASTBuilder.hpp"
 #include "AST/ASTContext.hpp"
+#include "GDM/GDM.hpp"
 #include <memory>
 #include <vector>
 #include <stdexcept>
@@ -30,9 +31,12 @@ namespace Cryo
         ASTBuilder _builder;
         Token _current_token;
         std::vector<ParseError> _errors;
+        DiagnosticManager *_diagnostic_manager;
+        std::string _source_file;
 
     public:
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
+        Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file);
 
         // Main parsing entry point
         std::unique_ptr<ProgramNode> parse_program();
@@ -42,6 +46,10 @@ namespace Cryo
         bool has_errors() const { return !_errors.empty(); }
 
     private:
+        // Diagnostic reporting
+        void report_error(DiagnosticID id, const std::string &message, SourceRange range = SourceRange{});
+        void report_warning(DiagnosticID id, const std::string &message, SourceRange range = SourceRange{});
+
         // Token management
         void advance();
         bool match(TokenKind kind);
