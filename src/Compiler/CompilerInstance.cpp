@@ -168,13 +168,26 @@ namespace Cryo
         return true;
     }
 
-    void CompilerInstance::print_ast(std::ostream &os) const
+    void CompilerInstance::print_ast(std::ostream &os, bool use_colors) const
     {
         if (_ast_root)
         {
             os << "=== AST Structure ===" << std::endl;
             _ast_root->print(os);
             os << "===================" << std::endl;
+        }
+        else
+        {
+            os << "No AST available" << std::endl;
+        }
+    }
+
+    void CompilerInstance::dump_ast(std::ostream &os, bool use_colors) const
+    {
+        if (_ast_root)
+        {
+            ASTDumper dumper(os, use_colors);
+            dumper.dump(_ast_root.get());
         }
         else
         {
