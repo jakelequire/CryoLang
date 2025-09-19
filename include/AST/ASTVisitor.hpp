@@ -21,6 +21,7 @@ namespace Cryo
     class BreakStatementNode;
     class ContinueStatementNode;
     class ExpressionStatementNode;
+    class DeclarationStatementNode;
 
     class ASTVisitor
     {
@@ -46,6 +47,7 @@ namespace Cryo
         virtual void visit(BreakStatementNode &node) = 0;
         virtual void visit(ContinueStatementNode &node) = 0;
         virtual void visit(ExpressionStatementNode &node) = 0;
+        virtual void visit(DeclarationStatementNode &node) = 0;
     };
 
     // Base visitor with default implementations
@@ -70,5 +72,6 @@ namespace Cryo
         void visit(BreakStatementNode &node) override {}
         void visit(ContinueStatementNode &node) override {}
         void visit(ExpressionStatementNode &node) override {}
+        void visit(DeclarationStatementNode &node) override {}
     };
 }

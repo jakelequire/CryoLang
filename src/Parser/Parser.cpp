@@ -416,21 +416,31 @@ namespace Cryo
 
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
-            auto stmt = parse_statement();
-            if (stmt)
+            try
             {
-                // Convert to StatementNode if needed
-                if (auto statement_node = dynamic_cast<StatementNode *>(stmt.get()))
+                auto stmt = parse_statement();
+                if (stmt)
                 {
-                    stmt.release(); // Release ownership
-                    block->add_statement(std::unique_ptr<StatementNode>(statement_node));
+                    // Convert to StatementNode if needed
+                    if (auto statement_node = dynamic_cast<StatementNode *>(stmt.get()))
+                    {
+                        stmt.release(); // Release ownership
+                        block->add_statement(std::unique_ptr<StatementNode>(statement_node));
+                    }
+                    else if (auto decl_node = dynamic_cast<DeclarationNode *>(stmt.get()))
+                    {
+                        // Wrap the declaration in a DeclarationStatementNode
+                        stmt.release(); // Release ownership
+                        auto decl_stmt = _builder.create_declaration_statement(decl_node->location(),
+                                                                               std::unique_ptr<DeclarationNode>(decl_node));
+                        block->add_statement(std::move(decl_stmt));
+                    }
                 }
-                else if (auto decl_node = dynamic_cast<DeclarationNode *>(stmt.get()))
-                {
-                    // Declarations can also go in blocks - create a wrapper or handle differently
-                    // For now, we'll skip non-statement nodes
-                    // TODO: Properly handle declarations in blocks
-                }
+            }
+            catch (const ParseError &e)
+            {
+                _errors.push_back(e);
+                synchronize(); // Recover from error and continue parsing block
             }
         }
 
@@ -598,19 +608,30 @@ namespace Cryo
         {
             auto identifier = parse_identifier();
 
-            // Check for function call
-            if (_current_token.is(TokenKind::TK_L_PAREN))
+            // Handle postfix expressions (function calls, array access, etc.)
+            std::unique_ptr<ExpressionNode> expr = std::move(identifier);
+
+            // Chain multiple postfix operations (e.g., func()[0].method())
+            while (true)
             {
-                return parse_call_expression(std::move(identifier));
+                if (_current_token.is(TokenKind::TK_L_PAREN))
+                {
+                    // Function call
+                    expr = parse_call_expression(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_L_SQUARE))
+                {
+                    // Array access
+                    expr = parse_array_access(std::move(expr));
+                }
+                else
+                {
+                    // No more postfix operations
+                    break;
+                }
             }
 
-            // Check for array access
-            if (_current_token.is(TokenKind::TK_L_SQUARE))
-            {
-                return parse_array_access(std::move(identifier));
-            }
-
-            return identifier;
+            return expr;
         }
 
         // Parenthesized expressions
@@ -849,21 +870,54 @@ namespace Cryo
         std::string param_type = parse_type();
 
         // Create parameter as variable declaration (without initializer)
-        return _builder.create_variable_declaration(name_token.location(), param_name, nullptr);
+        return _builder.create_variable_declaration(name_token.location(), param_name, param_type);
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_call_expression(std::unique_ptr<ExpressionNode> expr)
     {
-        // TODO: Implement function call parsing
-        error("Function calls not yet implemented");
-        return expr;
+        SourceLocation call_location = _current_token.location();
+        consume(TokenKind::TK_L_PAREN, "Expected '(' to start function call");
+
+        // Create call expression with the callee (function name/expression)
+        auto call_expr = _builder.create_call_expression(call_location, std::move(expr));
+
+        // Parse arguments if any
+        if (!_current_token.is(TokenKind::TK_R_PAREN))
+        {
+            do
+            {
+                auto arg = parse_expression();
+                if (arg)
+                {
+                    call_expr->add_argument(std::move(arg));
+                }
+            } while (match(TokenKind::TK_COMMA));
+        }
+
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after function arguments");
+
+        return call_expr;
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_array_access(std::unique_ptr<ExpressionNode> expr)
     {
-        // TODO: Implement array access parsing
-        error("Array access not yet implemented");
-        return expr;
+        SourceLocation access_location = _current_token.location();
+        consume(TokenKind::TK_L_SQUARE, "Expected '[' for array access");
+
+        auto index = parse_expression();
+        if (!index)
+        {
+            error("Expected expression for array index");
+            return expr;
+        }
+
+        consume(TokenKind::TK_R_SQUARE, "Expected ']' after array index");
+
+        // For now, treat array access as a binary expression with a special operator
+        // In the future, you might want to create a dedicated ArrayAccessNode
+        Token array_access_token(TokenKind::TK_L_SQUARE, "[", access_location);
+
+        return _builder.create_binary_expression(array_access_token, std::move(expr), std::move(index));
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_array_literal()

@@ -114,6 +114,11 @@ namespace Cryo
         return std::make_unique<ExpressionStatementNode>(loc, std::move(expr));
     }
 
+    std::unique_ptr<DeclarationStatementNode> ASTBuilder::create_declaration_statement(SourceLocation loc, std::unique_ptr<DeclarationNode> decl)
+    {
+        return std::make_unique<DeclarationStatementNode>(loc, std::move(decl));
+    }
+
     // Helper methods
     bool ASTBuilder::is_literal_token(TokenKind kind) const
     {

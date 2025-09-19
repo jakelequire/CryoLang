@@ -71,6 +71,7 @@ namespace Cryo
         // Utility
         void print_ast(std::ostream &os = std::cout, bool use_colors = true) const;
         void dump_ast(std::ostream &os = std::cout, bool use_colors = true) const;
+        void dump_symbol_table(std::ostream &os = std::cout) const;
         void print_diagnostics(std::ostream &os = std::cerr) const;
         void clear();
 
@@ -78,6 +79,8 @@ namespace Cryo
         void initialize_components();
         void reset_state();
         bool parse_source_from_file(std::unique_ptr<File> file);
+        void populate_symbol_table(ASTNode *node);
+        void populate_symbol_table_with_scope(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name);
     };
 
     /**

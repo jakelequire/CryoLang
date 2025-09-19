@@ -33,6 +33,7 @@ namespace Cryo
         BreakStatement,
         ContinueStatement,
         ExpressionStatement,
+        DeclarationStatement,
 
         // Concrete declaration types
         VariableDeclaration,
@@ -607,6 +608,27 @@ namespace Cryo
             os << std::string(indent, ' ') << "ExpressionStatement:" << std::endl;
             if (_expression)
                 _expression->print(os, indent + 2);
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Declaration statement - wraps a declaration to be used in statement contexts
+    class DeclarationStatementNode : public StatementNode
+    {
+    private:
+        std::unique_ptr<DeclarationNode> _declaration;
+
+    public:
+        DeclarationStatementNode(SourceLocation loc, std::unique_ptr<DeclarationNode> decl)
+            : StatementNode(NodeKind::DeclarationStatement, loc), _declaration(std::move(decl)) {}
+
+        DeclarationNode *declaration() const { return _declaration.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            if (_declaration)
+                _declaration->print(os, indent);
         }
 
         void accept(ASTVisitor &visitor) override;

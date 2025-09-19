@@ -465,6 +465,16 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(DeclarationStatementNode &node)
+    {
+        // For DeclarationStatementNode, we just delegate to the wrapped declaration
+        // This makes the AST output cleaner by not showing the wrapper
+        if (node.declaration())
+        {
+            node.declaration()->accept(*this);
+        }
+    }
+
     void ASTDumper::dump_child(const ASTNode *child, bool is_last)
     {
         if (!child)

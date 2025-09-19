@@ -2,7 +2,7 @@
 
 namespace Cryo
 {
-    bool SymbolTable::declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc)
+    bool SymbolTable::declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, const std::string &data_type, const std::string &scope)
     {
         // Check if symbol already exists in current scope
         if (symbols_.find(name) != symbols_.end())
@@ -11,7 +11,7 @@ namespace Cryo
         }
 
         // Add the symbol to current scope
-        symbols_[name] = Symbol{name, kind, loc};
+        symbols_[name] = Symbol{name, kind, loc, data_type, scope};
         return true;
     }
 
@@ -44,4 +44,128 @@ namespace Cryo
         // Return parent scope
         return std::move(parent_scope_);
     }
+
+    std::string SymbolTable::get_symbol_kind_string(SymbolKind kind) const
+    {
+        switch (kind)
+        {
+        case SymbolKind::Variable:
+            return "Variable";
+        case SymbolKind::Function:
+            return "Function";
+        case SymbolKind::Type:
+            return "Type";
+        default:
+            return "Unknown";
+        }
+    }
+
+    void SymbolTable::dump(std::ostream &os, int indent_level) const
+    {
+        std::string indent(indent_level * 2, ' ');
+
+        if (symbols_.empty())
+        {
+            os << indent << "(empty scope)" << std::endl;
+        }
+        else
+        {
+            for (const auto &[name, symbol] : symbols_)
+            {
+                os << indent << "|-- " << symbol.name
+                   << " [" << get_symbol_kind_string(symbol.kind) << "]"
+                   << " (" << symbol.data_type << ")"
+                   << " at line " << symbol.declaration_location.line()
+                   << ", col " << symbol.declaration_location.column()
+                   << std::endl;
+            }
+        }
+
+        // If there's a parent scope, show it with increased indentation
+        if (parent_scope_)
+        {
+            os << indent << "`-- Parent Scope:" << std::endl;
+            parent_scope_->dump(os, indent_level + 1);
+        }
+    }
+
+    void SymbolTable::print_pretty(std::ostream &os) const
+    {
+        os << "+===============================================================+" << std::endl;
+        os << "|                        Symbol Table                           |" << std::endl;
+        os << "+===============================================================+" << std::endl;
+
+        if (symbols_.empty() && !parent_scope_)
+        {
+            os << "|  No symbols found                                             |" << std::endl;
+            os << "+===============================================================+" << std::endl;
+            return;
+        }
+
+        // Count total symbols across all scopes
+        int total_symbols = 0;
+        const SymbolTable *current = this;
+        while (current)
+        {
+            total_symbols += current->symbols_.size();
+            current = current->parent_scope_.get();
+        }
+
+        os << "|  Total symbols: " << total_symbols;
+        // Pad to align right side of box
+        for (int i = std::to_string(total_symbols).length(); i < 48; i++)
+        {
+            os << " ";
+        }
+        os << "|" << std::endl;
+        os << "+---------------------------------------------------------------+" << std::endl;
+
+        // Header for symbol details - properly aligned
+        os << "| Type     | Name           | Data Type | Location | Scope       |" << std::endl;
+        os << "+----------+----------------+-----------+----------+-------------+" << std::endl;
+
+        // Display symbols from current and parent scopes
+        print_symbols_table(os, 0);
+
+        os << "+===============================================================+" << std::endl;
+    }
+
+    void SymbolTable::print_symbols_table(std::ostream &os, int scope_level) const
+    {
+        // Print symbols in current scope
+        for (const auto &[name, symbol] : symbols_)
+        {
+            std::string kind_str = get_symbol_kind_string(symbol.kind);
+            std::string location = std::to_string(symbol.declaration_location.line()) +
+                                   ":" + std::to_string(symbol.declaration_location.column());
+
+            os << "| " << format_field(kind_str, 8)
+               << " | " << format_field(symbol.name, 14)
+               << " | " << format_field(symbol.data_type, 9)
+               << " | " << format_field(location, 8)
+               << " | " << format_field(symbol.scope, 11)
+               << " |" << std::endl;
+        }
+
+        // Print symbols from parent scopes
+        if (parent_scope_)
+        {
+            parent_scope_->print_symbols_table(os, scope_level + 1);
+        }
+    }
+
+    std::string SymbolTable::format_field(const std::string &text, int width) const
+    {
+        if (text.length() >= width)
+        {
+            return text.substr(0, width);
+        }
+        else
+        {
+            std::string result = text;
+            result.resize(width, ' ');
+            return result;
+        }
+    }
+
 }
