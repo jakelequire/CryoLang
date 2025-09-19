@@ -41,6 +41,7 @@ namespace Cryo
         std::unique_ptr<BreakStatementNode> create_break_statement(SourceLocation loc);
         std::unique_ptr<ContinueStatementNode> create_continue_statement(SourceLocation loc);
         std::unique_ptr<ExpressionStatementNode> create_expression_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> expr);
+        std::unique_ptr<DeclarationStatementNode> create_declaration_statement(SourceLocation loc, std::unique_ptr<DeclarationNode> decl);
 
         // Helper methods
     private:

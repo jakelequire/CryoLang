@@ -102,4 +102,9 @@ namespace Cryo
     {
         visitor.visit(*this);
     }
+
+    void DeclarationStatementNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
 }

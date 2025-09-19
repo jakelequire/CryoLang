@@ -75,6 +75,7 @@ namespace Cryo
         void visit(BreakStatementNode &node) override;
         void visit(ContinueStatementNode &node) override;
         void visit(ExpressionStatementNode &node) override;
+        void visit(DeclarationStatementNode &node) override;
 
     private:
         // Helper methods for traversing children

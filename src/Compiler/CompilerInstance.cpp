@@ -110,6 +110,14 @@ namespace Cryo
                 return false;
             }
 
+            // Phase 5: Semantic analysis (including symbol table population)
+            if (!analyze())
+            {
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
+                                                  "Analysis failed", SourceRange{}, file_path);
+                return false;
+            }
+
             if (_debug_mode)
             {
                 std::cout << "=== Compilation Completed ===" << std::endl;
@@ -193,6 +201,9 @@ namespace Cryo
             return false;
         }
 
+        // Basic symbol table population
+        populate_symbol_table(_ast_root.get());
+
         // Placeholder for future semantic analysis
         // - Type checking
         // - Symbol resolution
@@ -234,6 +245,18 @@ namespace Cryo
         }
     }
 
+    void CompilerInstance::dump_symbol_table(std::ostream &os) const
+    {
+        if (_symbol_table)
+        {
+            _symbol_table->print_pretty(os);
+        }
+        else
+        {
+            os << "No symbol table available" << std::endl;
+        }
+    }
+
     void CompilerInstance::print_diagnostics(std::ostream &os) const
     {
         if (_diagnostic_manager)
@@ -266,6 +289,63 @@ namespace Cryo
         }
         _lexer.reset();
         _parser.reset();
+    }
+
+    void CompilerInstance::populate_symbol_table(ASTNode *node)
+    {
+        populate_symbol_table_with_scope(node, _symbol_table.get(), "Global");
+    }
+
+    void CompilerInstance::populate_symbol_table_with_scope(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name)
+    {
+        if (!node || !current_scope)
+            return;
+
+        // Handle function declarations
+        if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(node))
+        {
+            // Add function to current (global) scope
+            current_scope->declare_symbol(func_decl->name(), SymbolKind::Function,
+                                          func_decl->location(), func_decl->return_type_annotation(), scope_name);
+
+            // Recurse into function body with function name as new scope
+            if (func_decl->body())
+            {
+                populate_symbol_table_with_scope(func_decl->body(), current_scope, func_decl->name());
+            }
+        }
+        // Handle variable declarations
+        else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
+        {
+            current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
+                                          var_decl->location(), var_decl->type_annotation(), scope_name);
+        }
+        // Handle declaration statements (our wrapper)
+        else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
+        {
+            if (decl_stmt->declaration())
+            {
+                populate_symbol_table_with_scope(decl_stmt->declaration(), current_scope, scope_name);
+            }
+        }
+        // Handle program nodes
+        else if (auto program = dynamic_cast<ProgramNode *>(node))
+        {
+            const auto &statements = program->statements();
+            for (const auto &stmt : statements)
+            {
+                populate_symbol_table_with_scope(stmt.get(), current_scope, scope_name);
+            }
+        }
+        // Handle block statements
+        else if (auto block = dynamic_cast<BlockStatementNode *>(node))
+        {
+            const auto &statements = block->statements();
+            for (const auto &stmt : statements)
+            {
+                populate_symbol_table_with_scope(stmt.get(), current_scope, scope_name);
+            }
+        }
     }
 
     std::unique_ptr<CompilerInstance> create_compiler_instance()
