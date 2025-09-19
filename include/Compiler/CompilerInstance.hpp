@@ -5,6 +5,7 @@
 #include "AST/ASTContext.hpp"
 #include "AST/SymbolTable.hpp"
 #include "AST/ASTNode.hpp"
+#include "AST/ASTDumper.hpp"
 #include "Utils/file.hpp"
 #include <memory>
 #include <string>
@@ -67,7 +68,8 @@ namespace Cryo
         bool has_errors() const { return !_diagnostics.empty(); }
 
         // Utility
-        void print_ast(std::ostream &os = std::cout) const;
+        void print_ast(std::ostream &os = std::cout, bool use_colors = true) const;
+        void dump_ast(std::ostream &os = std::cout, bool use_colors = true) const;
         void print_diagnostics(std::ostream &os = std::cerr) const;
         void clear();
 

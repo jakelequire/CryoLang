@@ -62,14 +62,21 @@ namespace Cryo
         return std::make_unique<ReturnStatementNode>(loc, std::move(expr));
     }
 
-    std::unique_ptr<VariableDeclarationNode> ASTBuilder::create_variable_declaration(SourceLocation loc, std::string name, std::unique_ptr<ExpressionNode> init)
+    std::unique_ptr<VariableDeclarationNode> ASTBuilder::create_variable_declaration(SourceLocation loc,
+                                                                                     std::string name,
+                                                                                     std::string type_annotation,
+                                                                                     std::unique_ptr<ExpressionNode> init,
+                                                                                     bool is_mutable)
     {
-        return std::make_unique<VariableDeclarationNode>(loc, std::move(name), std::move(init));
+        return std::make_unique<VariableDeclarationNode>(loc, std::move(name), std::move(type_annotation), std::move(init), is_mutable);
     }
 
-    std::unique_ptr<FunctionDeclarationNode> ASTBuilder::create_function_declaration(SourceLocation loc, std::string name)
+    std::unique_ptr<FunctionDeclarationNode> ASTBuilder::create_function_declaration(SourceLocation loc,
+                                                                                     std::string name,
+                                                                                     std::string return_type,
+                                                                                     bool is_public)
     {
-        return std::make_unique<FunctionDeclarationNode>(loc, std::move(name));
+        return std::make_unique<FunctionDeclarationNode>(loc, std::move(name), std::move(return_type), is_public);
     }
 
     std::unique_ptr<CallExpressionNode> ASTBuilder::create_call_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> callee)
@@ -113,7 +120,9 @@ namespace Cryo
         return kind == TokenKind::TK_STRING_LITERAL ||
                kind == TokenKind::TK_NUMERIC_CONSTANT ||
                kind == TokenKind::TK_CHAR_CONSTANT ||
-               kind == TokenKind::TK_BOOLEAN_LITERAL;
+               kind == TokenKind::TK_BOOLEAN_LITERAL ||
+               kind == TokenKind::TK_KW_TRUE ||
+               kind == TokenKind::TK_KW_FALSE;
     }
 
     void ASTBuilder::validate_identifier_token(const Token &token) const

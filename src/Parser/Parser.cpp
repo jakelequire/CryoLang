@@ -49,6 +49,11 @@ namespace Cryo
         {
             _current_token = _lexer->next_token();
         }
+        else
+        {
+            // When no more tokens available, set current token to EOF
+            _current_token = Token(TokenKind::TK_EOF, "", SourceLocation{});
+        }
     }
 
     bool Parser::match(TokenKind kind)
@@ -259,11 +264,11 @@ namespace Cryo
             error("Expected 'const' or 'mut'");
         }
 
-        // Parse variable name
+        // Parse variable name first (correct syntax: const identifier: type)
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected variable name");
         std::string var_name = std::string(name_token.text());
 
-        // Parse type annotation
+        // Parse required colon and type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after variable name");
         std::string var_type = parse_type();
 
@@ -277,8 +282,7 @@ namespace Cryo
 
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after variable declaration");
 
-        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, std::move(initializer));
-        // TODO: Store type information and mutability in the variable declaration
+        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, var_type, std::move(initializer), is_mutable);
 
         return var_decl;
     }
@@ -306,18 +310,13 @@ namespace Cryo
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
         std::string func_name = std::string(name_token.text());
 
-        auto func_decl = _builder.create_function_declaration(start_loc, func_name);
-
-        // Parse parameter list
+        // Parse parameter list first to get parameters
         consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
 
+        std::vector<std::unique_ptr<VariableDeclarationNode>> params;
         if (!_current_token.is(TokenKind::TK_R_PAREN))
         {
-            auto params = parse_parameter_list();
-            for (auto &param : params)
-            {
-                func_decl->add_parameter(std::move(param));
-            }
+            params = parse_parameter_list();
         }
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
@@ -328,6 +327,15 @@ namespace Cryo
         {
             advance(); // consume '->'
             return_type = parse_type();
+        }
+
+        // Create function declaration with type information
+        auto func_decl = _builder.create_function_declaration(start_loc, func_name, return_type, is_public);
+
+        // Add parameters to function
+        for (auto &param : params)
+        {
+            func_decl->add_parameter(std::move(param));
         }
 
         // Parse function body
@@ -618,8 +626,15 @@ namespace Cryo
                _current_token.is(TokenKind::TK_KW_I16) ||
                _current_token.is(TokenKind::TK_KW_I32) ||
                _current_token.is(TokenKind::TK_KW_I64) ||
+               _current_token.is(TokenKind::TK_KW_INT) ||
                _current_token.is(TokenKind::TK_KW_UINT) ||
+               _current_token.is(TokenKind::TK_KW_UINT8) ||
+               _current_token.is(TokenKind::TK_KW_UINT16) ||
+               _current_token.is(TokenKind::TK_KW_UINT32) ||
+               _current_token.is(TokenKind::TK_KW_UINT64) ||
                _current_token.is(TokenKind::TK_KW_FLOAT) ||
+               _current_token.is(TokenKind::TK_KW_F32) ||
+               _current_token.is(TokenKind::TK_KW_F64) ||
                _current_token.is(TokenKind::TK_KW_DOUBLE) ||
                _current_token.is(TokenKind::TK_KW_BOOLEAN) ||
                _current_token.is(TokenKind::TK_KW_STRING) ||

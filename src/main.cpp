@@ -20,9 +20,9 @@ int main(int argc, char *argv[])
         {
             std::cout << "\n✓ Compilation successful!" << std::endl;
 
-            // Show the resulting AST
+            // Show the resulting AST with pretty printing
             std::cout << "\nGenerated AST:" << std::endl;
-            compiler->print_ast();
+            compiler->dump_ast();
         }
         else
         {
@@ -40,7 +40,7 @@ int main(int argc, char *argv[])
         if (compiler->compile_file(test_file))
         {
             std::cout << "\n✓ Test compilation successful!" << std::endl;
-            compiler->print_ast();
+            compiler->dump_ast();
         }
         else
         {

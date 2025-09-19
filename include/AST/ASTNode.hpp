@@ -263,20 +263,44 @@ namespace Cryo
     {
     private:
         std::string _name;
+        std::string _type_annotation; // Type annotation from source code
         std::unique_ptr<ExpressionNode> _initializer;
+        bool _is_mutable = false; // const vs mut
+        bool _is_auto = false;    // auto type inference
 
     public:
         VariableDeclarationNode(SourceLocation loc, std::string name,
-                                std::unique_ptr<ExpressionNode> init = nullptr)
+                                std::string type_annotation = "",
+                                std::unique_ptr<ExpressionNode> init = nullptr,
+                                bool is_mutable = false)
             : DeclarationNode(NodeKind::VariableDeclaration, loc),
-              _name(std::move(name)), _initializer(std::move(init)) {}
+              _name(std::move(name)), _type_annotation(std::move(type_annotation)),
+              _initializer(std::move(init)), _is_mutable(is_mutable)
+        {
+            _is_auto = (_type_annotation == "auto" || _type_annotation.empty());
+        }
 
         const std::string &name() const { return _name; }
+        const std::string &type_annotation() const { return _type_annotation; }
         ExpressionNode *initializer() const { return _initializer.get(); }
+        bool is_mutable() const { return _is_mutable; }
+        bool is_auto() const { return _is_auto; }
+        bool has_initializer() const { return _initializer != nullptr; }
+
+        // Type annotation setters
+        void set_type_annotation(const std::string &type)
+        {
+            _type_annotation = type;
+            _is_auto = (type == "auto");
+        }
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "VariableDecl: " << _name << std::endl;
+            os << std::string(indent, ' ') << "VariableDecl: "
+               << (_is_mutable ? "mut " : "const ") << _name;
+            if (!_type_annotation.empty())
+                os << ": " << _type_annotation;
+            os << std::endl;
             if (_initializer)
                 _initializer->print(os, indent + 2);
         }
@@ -289,16 +313,32 @@ namespace Cryo
     {
     private:
         std::string _name;
+        std::string _return_type_annotation = "void"; // Return type annotation
         std::vector<std::unique_ptr<VariableDeclarationNode>> _parameters;
         std::unique_ptr<BlockStatementNode> _body;
+        bool _is_public = false; // Visibility
+        bool _is_static = false;
+        bool _is_inline = false;
+        bool _is_variadic = false; // Variadic function (...args)
 
     public:
-        FunctionDeclarationNode(SourceLocation loc, std::string name)
-            : DeclarationNode(NodeKind::FunctionDeclaration, loc), _name(std::move(name)) {}
+        FunctionDeclarationNode(SourceLocation loc, std::string name,
+                                std::string return_type = "void",
+                                bool is_public = false)
+            : DeclarationNode(NodeKind::FunctionDeclaration, loc),
+              _name(std::move(name)), _return_type_annotation(std::move(return_type)),
+              _is_public(is_public) {}
 
         const std::string &name() const { return _name; }
+        const std::string &return_type_annotation() const { return _return_type_annotation; }
         const std::vector<std::unique_ptr<VariableDeclarationNode>> &parameters() const { return _parameters; }
         BlockStatementNode *body() const { return _body.get(); }
+
+        bool is_public() const { return _is_public; }
+        bool is_static() const { return _is_static; }
+        bool is_inline() const { return _is_inline; }
+        bool is_variadic() const { return _is_variadic; }
+        size_t parameter_count() const { return _parameters.size(); }
 
         void add_parameter(std::unique_ptr<VariableDeclarationNode> param)
         {
@@ -310,15 +350,41 @@ namespace Cryo
             _body = std::move(body);
         }
 
+        void set_return_type(const std::string &return_type)
+        {
+            _return_type_annotation = return_type;
+        }
+
+        void set_visibility(bool is_public) { _is_public = is_public; }
+        void set_static(bool is_static) { _is_static = is_static; }
+        void set_inline(bool is_inline) { _is_inline = is_inline; }
+        void set_variadic(bool is_variadic) { _is_variadic = is_variadic; }
+
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "FunctionDecl: " << _name << std::endl;
-            os << std::string(indent + 2, ' ') << "Parameters:" << std::endl;
-            for (const auto &param : _parameters)
+            os << std::string(indent, ' ') << "FunctionDecl: "
+               << (_is_public ? "public " : "private ") << _name << "(";
+            for (size_t i = 0; i < _parameters.size(); ++i)
             {
-                if (param)
-                    param->print(os, indent + 4);
+                if (i > 0)
+                    os << ", ";
+                if (_parameters[i])
+                    os << _parameters[i]->type_annotation() << " " << _parameters[i]->name();
             }
+            if (_is_variadic)
+                os << "...";
+            os << ") -> " << _return_type_annotation << std::endl;
+
+            if (!_parameters.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Parameters:" << std::endl;
+                for (const auto &param : _parameters)
+                {
+                    if (param)
+                        param->print(os, indent + 4);
+                }
+            }
+
             if (_body)
             {
                 os << std::string(indent + 2, ' ') << "Body:" << std::endl;

@@ -25,8 +25,15 @@ namespace Cryo
         std::unique_ptr<ProgramNode> create_program_node(SourceLocation loc);
         std::unique_ptr<BlockStatementNode> create_block_statement(SourceLocation loc);
         std::unique_ptr<ReturnStatementNode> create_return_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> expr = nullptr);
-        std::unique_ptr<VariableDeclarationNode> create_variable_declaration(SourceLocation loc, std::string name, std::unique_ptr<ExpressionNode> init = nullptr);
-        std::unique_ptr<FunctionDeclarationNode> create_function_declaration(SourceLocation loc, std::string name);
+        std::unique_ptr<VariableDeclarationNode> create_variable_declaration(SourceLocation loc,
+                                                                             std::string name,
+                                                                             std::string type_annotation,
+                                                                             std::unique_ptr<ExpressionNode> init = nullptr,
+                                                                             bool is_mutable = false);
+        std::unique_ptr<FunctionDeclarationNode> create_function_declaration(SourceLocation loc,
+                                                                             std::string name,
+                                                                             std::string return_type,
+                                                                             bool is_public = false);
         std::unique_ptr<CallExpressionNode> create_call_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> callee);
         std::unique_ptr<IfStatementNode> create_if_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> then_stmt, std::unique_ptr<StatementNode> else_stmt = nullptr);
         std::unique_ptr<WhileStatementNode> create_while_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> body);

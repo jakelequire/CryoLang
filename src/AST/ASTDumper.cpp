@@ -1,0 +1,492 @@
+#include "AST/ASTDumper.hpp"
+#include <sstream>
+
+namespace Cryo
+{
+    ASTDumper::ASTDumper(std::ostream &output, bool use_colors)
+        : _output(output), _use_colors(use_colors), _current_level(0)
+    {
+    }
+
+    void ASTDumper::dump(const ASTNode *node)
+    {
+        if (!node)
+        {
+            _output << Colors::TREE << "nullptr" << Colors::RESET << std::endl;
+            return;
+        }
+
+        _is_last_stack.clear();
+        _current_level = 0;
+
+        // Start the dump - cast away const for visitor pattern
+        const_cast<ASTNode *>(node)->accept(*this);
+    }
+
+    void ASTDumper::print_prefix()
+    {
+        if (_use_colors)
+            _output << Colors::TREE;
+
+        for (size_t i = 0; i < _is_last_stack.size(); ++i)
+        {
+            if (i == _is_last_stack.size() - 1)
+            {
+                // This is the current level
+                _output << (_is_last_stack[i] ? TreeChars::LAST_BRANCH : TreeChars::BRANCH);
+            }
+            else
+            {
+                // This is a parent level
+                _output << (_is_last_stack[i] ? TreeChars::SPACE : TreeChars::VERTICAL);
+            }
+        }
+
+        if (_use_colors)
+            _output << Colors::RESET;
+    }
+
+    void ASTDumper::print_location(const SourceLocation &loc)
+    {
+        if (_use_colors)
+            _output << Colors::LOCATION;
+
+        _output << " <line:" << loc.line() << ":" << loc.column() << ">";
+
+        if (_use_colors)
+            _output << Colors::RESET;
+    }
+
+    std::string ASTDumper::get_node_color(NodeKind kind) const
+    {
+        if (!_use_colors)
+            return "";
+
+        switch (kind)
+        {
+        case NodeKind::Program:
+        case NodeKind::VariableDeclaration:
+        case NodeKind::FunctionDeclaration:
+            return Colors::DECLARATION;
+
+        case NodeKind::BlockStatement:
+        case NodeKind::ReturnStatement:
+        case NodeKind::IfStatement:
+        case NodeKind::WhileStatement:
+        case NodeKind::ForStatement:
+        case NodeKind::BreakStatement:
+        case NodeKind::ContinueStatement:
+        case NodeKind::ExpressionStatement:
+            return Colors::STATEMENT;
+
+        case NodeKind::BinaryExpression:
+        case NodeKind::CallExpression:
+            return Colors::EXPRESSION;
+
+        case NodeKind::Literal:
+            return Colors::LITERAL;
+
+        case NodeKind::Identifier:
+            return Colors::IDENTIFIER;
+
+        default:
+            return Colors::EXPRESSION;
+        }
+    }
+
+    std::string ASTDumper::get_literal_type_string(TokenKind kind) const
+    {
+        switch (kind)
+        {
+        case TokenKind::TK_NUMERIC_CONSTANT:
+            return "int";
+        case TokenKind::TK_STRING_LITERAL:
+            return "string";
+        case TokenKind::TK_CHAR_CONSTANT:
+            return "char";
+        case TokenKind::TK_BOOLEAN_LITERAL:
+            return "bool";
+        default:
+            return "unknown";
+        }
+    }
+
+    void ASTDumper::visit(ExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "Expression";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(StatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "Statement";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(DeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "Declaration";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(LiteralNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "IntegerLiteral";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << node.value();
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << " ";
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "'" << get_literal_type_string(node.literal_kind()) << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(IdentifierNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "DeclRefExpr";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        // Add type information if available
+        if (node.type().has_value())
+        {
+            _output << " ";
+            if (_use_colors)
+                _output << Colors::TYPE;
+            _output << "'" << node.type().value() << "'";
+            if (_use_colors)
+                _output << Colors::RESET;
+        }
+
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(BinaryExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "BinaryOperator";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.operator_token().to_string() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        // Dump left and right operands
+        dump_child(node.left(), false);
+        dump_child(node.right(), true);
+    }
+
+    void ASTDumper::visit(ProgramNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "TranslationUnitDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        const auto &statements = node.statements();
+        for (size_t i = 0; i < statements.size(); ++i)
+        {
+            bool is_last = (i == statements.size() - 1);
+            dump_child(statements[i].get(), is_last);
+        }
+    }
+
+    void ASTDumper::visit(BlockStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "CompoundStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        const auto &statements = node.statements();
+        for (size_t i = 0; i < statements.size(); ++i)
+        {
+            bool is_last = (i == statements.size() - 1);
+            dump_child(statements[i].get(), is_last);
+        }
+    }
+
+    void ASTDumper::visit(ReturnStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ReturnStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        if (node.expression())
+        {
+            dump_child(node.expression(), true);
+        }
+    }
+
+    void ASTDumper::visit(VariableDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "VarDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        if (node.initializer())
+        {
+            dump_child(node.initializer(), true);
+        }
+    }
+
+    void ASTDumper::visit(FunctionDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "FunctionDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        // Dump parameters
+        const auto &params = node.parameters();
+        bool has_body = node.body() != nullptr;
+
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            bool is_last = (i == params.size() - 1) && !has_body;
+            dump_child(params[i].get(), is_last);
+        }
+
+        // Dump body
+        if (node.body())
+        {
+            dump_child(node.body(), true);
+        }
+    }
+
+    void ASTDumper::visit(CallExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "CallExpr";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        // Dump callee
+        const auto &args = node.arguments();
+        bool has_args = !args.empty();
+        dump_child(node.callee(), !has_args);
+
+        // Dump arguments
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            bool is_last = (i == args.size() - 1);
+            dump_child(args[i].get(), is_last);
+        }
+    }
+
+    void ASTDumper::visit(IfStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "IfStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        bool has_then = node.then_statement() != nullptr;
+        bool has_else = node.else_statement() != nullptr;
+
+        // Dump condition
+        dump_child(node.condition(), !has_then && !has_else);
+
+        // Dump then statement
+        if (has_then)
+        {
+            dump_child(node.then_statement(), !has_else);
+        }
+
+        // Dump else statement
+        if (has_else)
+        {
+            dump_child(node.else_statement(), true);
+        }
+    }
+
+    void ASTDumper::visit(WhileStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "WhileStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        bool has_body = node.body() != nullptr;
+
+        // Dump condition
+        dump_child(node.condition(), !has_body);
+
+        // Dump body
+        if (has_body)
+        {
+            dump_child(node.body(), true);
+        }
+    }
+
+    void ASTDumper::visit(ForStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ForStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        bool has_init = node.init() != nullptr;
+        bool has_condition = node.condition() != nullptr;
+        bool has_update = node.update() != nullptr;
+        bool has_body = node.body() != nullptr;
+
+        // Count remaining children
+        int remaining = (has_init ? 1 : 0) + (has_condition ? 1 : 0) +
+                        (has_update ? 1 : 0) + (has_body ? 1 : 0);
+
+        if (has_init)
+        {
+            dump_child(node.init(), --remaining == 0);
+        }
+        if (has_condition)
+        {
+            dump_child(node.condition(), --remaining == 0);
+        }
+        if (has_update)
+        {
+            dump_child(node.update(), --remaining == 0);
+        }
+        if (has_body)
+        {
+            dump_child(node.body(), --remaining == 0);
+        }
+    }
+
+    void ASTDumper::visit(BreakStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "BreakStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(ContinueStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ContinueStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(ExpressionStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ExprStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        if (node.expression())
+        {
+            dump_child(node.expression(), true);
+        }
+    }
+
+    void ASTDumper::dump_child(const ASTNode *child, bool is_last)
+    {
+        if (!child)
+            return;
+
+        push_level(is_last);
+        const_cast<ASTNode *>(child)->accept(*this);
+        pop_level();
+    }
+
+    void ASTDumper::push_level(bool is_last)
+    {
+        _is_last_stack.push_back(is_last);
+        _current_level++;
+    }
+
+    void ASTDumper::pop_level()
+    {
+        if (!_is_last_stack.empty())
+        {
+            _is_last_stack.pop_back();
+            _current_level--;
+        }
+    }
+}
