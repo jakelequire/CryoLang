@@ -6,6 +6,7 @@
 #include "AST/SymbolTable.hpp"
 #include "AST/ASTNode.hpp"
 #include "AST/ASTDumper.hpp"
+#include "GDM/GDM.hpp"
 #include "Utils/file.hpp"
 #include <memory>
 #include <string>
@@ -28,6 +29,7 @@ namespace Cryo
         std::unique_ptr<Parser> _parser;
         std::unique_ptr<ASTContext> _ast_context;
         std::unique_ptr<SymbolTable> _symbol_table;
+        std::unique_ptr<DiagnosticManager> _diagnostic_manager;
 
         // Compilation state
         std::string _source_file;
@@ -36,7 +38,6 @@ namespace Cryo
 
         // Results
         std::unique_ptr<ProgramNode> _ast_root;
-        std::vector<std::string> _diagnostics;
 
     public:
         CompilerInstance();
@@ -61,11 +62,11 @@ namespace Cryo
         Parser *parser() const { return _parser.get(); }
         ASTContext *ast_context() const { return _ast_context.get(); }
         SymbolTable *symbol_table() const { return _symbol_table.get(); }
+        DiagnosticManager *diagnostic_manager() const { return _diagnostic_manager.get(); }
 
         // Results access
         ProgramNode *ast_root() const { return _ast_root.get(); }
-        const std::vector<std::string> &diagnostics() const { return _diagnostics; }
-        bool has_errors() const { return !_diagnostics.empty(); }
+        bool has_errors() const;
 
         // Utility
         void print_ast(std::ostream &os = std::cout, bool use_colors = true) const;
@@ -76,8 +77,6 @@ namespace Cryo
     private:
         void initialize_components();
         void reset_state();
-        void report_error(const std::string &message);
-        void report_warning(const std::string &message);
         bool parse_source_from_file(std::unique_ptr<File> file);
     };
 

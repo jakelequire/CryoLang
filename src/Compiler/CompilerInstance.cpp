@@ -15,6 +15,11 @@ namespace Cryo
     {
         _ast_context = std::make_unique<ASTContext>();
         _symbol_table = std::make_unique<SymbolTable>();
+        _diagnostic_manager = std::make_unique<DiagnosticManager>();
+
+        // Configure diagnostic manager
+        _diagnostic_manager->set_formatter_options(true, true, 2);
+
         // Lexer and Parser will be created when we have a file to work with
     }
 
@@ -36,13 +41,17 @@ namespace Cryo
         auto file = make_file_from_path(source_file);
         if (!file)
         {
-            report_error("Failed to create file object for: " + source_file);
+            _diagnostic_manager->report_error(DiagnosticID::FileNotFound, DiagnosticCategory::System,
+                                              "Failed to create file object for: " + source_file,
+                                              SourceRange{}, source_file);
             return false;
         }
 
         if (!file->load())
         {
-            report_error("Failed to load source file: " + source_file);
+            _diagnostic_manager->report_error(DiagnosticID::FileReadError, DiagnosticCategory::System,
+                                              "Failed to load source file: " + source_file,
+                                              SourceRange{}, source_file);
             return false;
         }
 
@@ -55,7 +64,9 @@ namespace Cryo
         auto file = make_file_from_string("source", source_code);
         if (!file)
         {
-            report_error("Failed to create in-memory file");
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
+                                              "Failed to create in-memory file",
+                                              SourceRange{}, "source");
             return false;
         }
 
@@ -68,37 +79,52 @@ namespace Cryo
 
         try
         {
-            // Phase 1: Create lexer with the file
+            // Store file information for diagnostics
+            std::string file_path = file->path().empty() ? file->name() : file->path();
+            std::string file_content = std::string(file->content());
+
+            // Create a shared file copy for the diagnostic manager
+            auto diagnostic_file = make_file_from_string(file->name(), file_content);
+            std::shared_ptr<File> shared_diagnostic_file(diagnostic_file.release());
+            _diagnostic_manager->add_source_file(file_path, shared_diagnostic_file);
+
+            // Phase 1: Create lexer with the original file
             _lexer = std::make_unique<Lexer>(std::move(file));
 
             // Phase 2: Create parser with lexer and AST context
-            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context);
+            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostic_manager.get(), file_path);
 
             // Phase 3: Parse the program
             if (!parse())
             {
-                report_error("Parsing failed");
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Parser,
+                                                  "Parsing failed", SourceRange{}, file_path);
                 return false;
             }
 
             // Phase 4: Basic validation
             if (!_ast_root)
             {
-                report_error("No AST generated");
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Parser,
+                                                  "No AST generated", SourceRange{}, file_path);
                 return false;
             }
 
             if (_debug_mode)
             {
-                std::cout << "=== Compilation successful ===" << std::endl;
-                print_ast();
+                std::cout << "=== Compilation Completed ===" << std::endl;
             }
+
+            // Print any diagnostics that were collected
+            print_diagnostics();
 
             return true;
         }
         catch (const std::exception &e)
         {
-            report_error(std::string("Compilation exception: ") + e.what());
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
+                                              std::string("Compilation exception: ") + e.what(),
+                                              SourceRange{}, _source_file);
             return false;
         }
     }
@@ -107,14 +133,16 @@ namespace Cryo
     {
         if (_source_file.empty())
         {
-            report_error("No source file specified");
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
+                                              "No source file specified", SourceRange{}, "");
             return false;
         }
 
         auto file = make_file_from_path(_source_file);
         if (!file || !file->load())
         {
-            report_error("Failed to load source file");
+            _diagnostic_manager->report_error(DiagnosticID::FileReadError, DiagnosticCategory::System,
+                                              "Failed to load source file", SourceRange{}, _source_file);
             return false;
         }
 
@@ -125,7 +153,9 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            report_error(std::string("Lexer error: ") + e.what());
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Lexer,
+                                              std::string("Lexer error: ") + e.what(),
+                                              SourceRange{}, _source_file);
             return false;
         }
     }
@@ -134,7 +164,8 @@ namespace Cryo
     {
         if (!_parser)
         {
-            report_error("Parser not initialized");
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Parser,
+                                              "Parser not initialized", SourceRange{}, _source_file);
             return false;
         }
 
@@ -145,7 +176,9 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            report_error(std::string("Parser error: ") + e.what());
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Parser,
+                                              std::string("Parser error: ") + e.what(),
+                                              SourceRange{}, _source_file);
             return false;
         }
     }
@@ -155,7 +188,8 @@ namespace Cryo
         // Future: Implement semantic analysis
         if (!_ast_root)
         {
-            report_error("No AST available for analysis");
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
+                                              "No AST available for analysis", SourceRange{}, _source_file);
             return false;
         }
 
@@ -166,6 +200,11 @@ namespace Cryo
         // - etc.
 
         return true;
+    }
+
+    bool CompilerInstance::has_errors() const
+    {
+        return _diagnostic_manager && _diagnostic_manager->has_errors();
     }
 
     void CompilerInstance::print_ast(std::ostream &os, bool use_colors) const
@@ -197,14 +236,13 @@ namespace Cryo
 
     void CompilerInstance::print_diagnostics(std::ostream &os) const
     {
-        if (!_diagnostics.empty())
+        if (_diagnostic_manager)
         {
-            os << "=== Diagnostics ===" << std::endl;
-            for (const auto &diagnostic : _diagnostics)
+            if (_diagnostic_manager->total_count() > 0)
             {
-                os << diagnostic << std::endl;
+                _diagnostic_manager->print_all(os);
+                _diagnostic_manager->print_summary(os);
             }
-            os << "==================" << std::endl;
         }
     }
 
@@ -213,32 +251,21 @@ namespace Cryo
         reset_state();
         _source_file.clear();
         _include_paths.clear();
+        if (_diagnostic_manager)
+        {
+            _diagnostic_manager->clear();
+        }
     }
 
     void CompilerInstance::reset_state()
     {
         _ast_root.reset();
-        _diagnostics.clear();
+        if (_diagnostic_manager)
+        {
+            _diagnostic_manager->clear();
+        }
         _lexer.reset();
         _parser.reset();
-    }
-
-    void CompilerInstance::report_error(const std::string &message)
-    {
-        _diagnostics.push_back("Error: " + message);
-        if (_debug_mode)
-        {
-            std::cerr << "Error: " << message << std::endl;
-        }
-    }
-
-    void CompilerInstance::report_warning(const std::string &message)
-    {
-        _diagnostics.push_back("Warning: " + message);
-        if (_debug_mode)
-        {
-            std::cerr << "Warning: " << message << std::endl;
-        }
     }
 
     std::unique_ptr<CompilerInstance> create_compiler_instance()
