@@ -212,33 +212,33 @@ namespace Cryo
             if (_type_checker->has_errors())
             {
                 // Convert type errors to diagnostic manager errors
-                for (const auto& type_error : _type_checker->errors())
+                for (const auto &type_error : _type_checker->errors())
                 {
                     DiagnosticID diag_id = DiagnosticID::Unknown;
                     switch (type_error.kind)
                     {
-                        case TypeError::ErrorKind::TypeMismatch:
-                            diag_id = DiagnosticID::TypeMismatch;
-                            break;
-                        case TypeError::ErrorKind::UndefinedVariable:
-                            diag_id = DiagnosticID::UndefinedVariable;
-                            break;
-                        case TypeError::ErrorKind::UndefinedFunction:
-                            diag_id = DiagnosticID::UndefinedFunction;
-                            break;
-                        case TypeError::ErrorKind::RedefinedSymbol:
-                            diag_id = DiagnosticID::RedefinedSymbol;
-                            break;
-                        default:
-                            diag_id = DiagnosticID::Unknown;
-                            break;
+                    case TypeError::ErrorKind::TypeMismatch:
+                        diag_id = DiagnosticID::TypeMismatch;
+                        break;
+                    case TypeError::ErrorKind::UndefinedVariable:
+                        diag_id = DiagnosticID::UndefinedVariable;
+                        break;
+                    case TypeError::ErrorKind::UndefinedFunction:
+                        diag_id = DiagnosticID::UndefinedFunction;
+                        break;
+                    case TypeError::ErrorKind::RedefinedSymbol:
+                        diag_id = DiagnosticID::RedefinedSymbol;
+                        break;
+                    default:
+                        diag_id = DiagnosticID::Unknown;
+                        break;
                     }
 
                     SourceRange range(type_error.location);
                     _diagnostic_manager->report_error(diag_id, DiagnosticCategory::Semantic,
                                                       type_error.message, range, _source_file);
                 }
-                
+
                 if (_debug_mode)
                 {
                     std::cout << "Type checking failed with " << _type_checker->error_count() << " errors." << std::endl;
@@ -319,7 +319,7 @@ namespace Cryo
         if (_type_checker && _type_checker->has_errors())
         {
             os << "=== Type Errors ===" << std::endl;
-            for (const auto& error : _type_checker->errors())
+            for (const auto &error : _type_checker->errors())
             {
                 os << error.to_string() << std::endl;
             }

@@ -34,7 +34,7 @@ namespace Cryo
             // Allow promotion from smaller to larger types
             if (is_floating_point() && other.is_integral())
                 return true; // int -> float
-            
+
             if (is_integral() && other.is_integral())
             {
                 // Allow promotion between integral types of same signedness
@@ -496,20 +496,34 @@ namespace Cryo
         // Map your TokenKind enum values to types
         switch (static_cast<TokenKind>(token_kind))
         {
-            case TokenKind::TK_KW_VOID: return get_void_type();
-            case TokenKind::TK_KW_BOOLEAN: return get_boolean_type();
-            case TokenKind::TK_KW_CHAR: return get_char_type();
-            case TokenKind::TK_KW_STRING: return get_string_type();
-            case TokenKind::TK_KW_I8: return get_i8_type();
-            case TokenKind::TK_KW_I16: return get_i16_type();
-            case TokenKind::TK_KW_I32: return get_i32_type();
-            case TokenKind::TK_KW_I64: return get_i64_type();
-            case TokenKind::TK_KW_INT: return get_int_type();
-            case TokenKind::TK_KW_F32: return get_f32_type();
-            case TokenKind::TK_KW_F64: return get_f64_type();
-            case TokenKind::TK_KW_FLOAT: return get_default_float_type();
-            case TokenKind::TK_KW_AUTO: return get_auto_type();
-            default: return get_unknown_type();
+        case TokenKind::TK_KW_VOID:
+            return get_void_type();
+        case TokenKind::TK_KW_BOOLEAN:
+            return get_boolean_type();
+        case TokenKind::TK_KW_CHAR:
+            return get_char_type();
+        case TokenKind::TK_KW_STRING:
+            return get_string_type();
+        case TokenKind::TK_KW_I8:
+            return get_i8_type();
+        case TokenKind::TK_KW_I16:
+            return get_i16_type();
+        case TokenKind::TK_KW_I32:
+            return get_i32_type();
+        case TokenKind::TK_KW_I64:
+            return get_i64_type();
+        case TokenKind::TK_KW_INT:
+            return get_int_type();
+        case TokenKind::TK_KW_F32:
+            return get_f32_type();
+        case TokenKind::TK_KW_F64:
+            return get_f64_type();
+        case TokenKind::TK_KW_FLOAT:
+            return get_default_float_type();
+        case TokenKind::TK_KW_AUTO:
+            return get_auto_type();
+        default:
+            return get_unknown_type();
         }
     }
 

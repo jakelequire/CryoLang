@@ -97,7 +97,7 @@ namespace Cryo
         _in_loop = false;
 
         // Visit all top-level declarations and statements
-        for (const auto& stmt : program.statements())
+        for (const auto &stmt : program.statements())
         {
             if (stmt)
             {
@@ -113,7 +113,7 @@ namespace Cryo
     void TypeChecker::visit(ProgramNode &node)
     {
         // Visit all top-level declarations and statements
-        for (const auto& stmt : node.statements())
+        for (const auto &stmt : node.statements())
         {
             if (stmt)
             {
@@ -191,7 +191,7 @@ namespace Cryo
 
         // Parse return type from node annotation
         Type *return_type = _type_context.parse_type_from_string(node.return_type_annotation());
-        
+
         // Collect parameter types
         std::vector<Type *> param_types;
         for (const auto &param : node.parameters())
@@ -473,21 +473,21 @@ namespace Cryo
         // Type check the binary operation
         if (node.left() && node.right())
         {
-            Type* left_type = node.left()->get_type();
-            Type* right_type = node.right()->get_type();
-            
+            Type *left_type = node.left()->get_type();
+            Type *right_type = node.right()->get_type();
+
             if (left_type && right_type)
             {
                 // Check for assignment operations
-                if (node.op() == "=" || node.op() == "+=" || node.op() == "-=" || 
+                if (node.op() == "=" || node.op() == "+=" || node.op() == "-=" ||
                     node.op() == "*=" || node.op() == "/=")
                 {
                     // For assignment, check if right is assignable to left
                     if (!left_type->is_assignable_from(right_type))
                     {
                         diagnostics_.report_error(node.location(),
-                            "Type mismatch in assignment: cannot assign " + 
-                            right_type->get_name() + " to " + left_type->get_name());
+                                                  "Type mismatch in assignment: cannot assign " +
+                                                      right_type->get_name() + " to " + left_type->get_name());
                     }
                     // Assignment result has the type of the left operand
                     node.set_type(left_type);
@@ -495,12 +495,12 @@ namespace Cryo
                 else
                 {
                     // For other operations, types should be compatible
-                    Type* result_type = nullptr;
-                    
+                    Type *result_type = nullptr;
+
                     // Arithmetic operations
                     if (node.op() == "+" || node.op() == "-" || node.op() == "*" || node.op() == "/")
                     {
-                        if (left_type == right_type && 
+                        if (left_type == right_type &&
                             (left_type->get_name() == "int" || left_type->get_name() == "double"))
                         {
                             result_type = left_type;
@@ -508,13 +508,13 @@ namespace Cryo
                         else
                         {
                             diagnostics_.report_error(node.location(),
-                                "Type mismatch in arithmetic operation: " + 
-                                left_type->get_name() + " " + node.op() + " " + right_type->get_name());
+                                                      "Type mismatch in arithmetic operation: " +
+                                                          left_type->get_name() + " " + node.op() + " " + right_type->get_name());
                         }
                     }
                     // Comparison operations
-                    else if (node.op() == "==" || node.op() == "!=" || 
-                             node.op() == "<" || node.op() == ">" || 
+                    else if (node.op() == "==" || node.op() == "!=" ||
+                             node.op() == "<" || node.op() == ">" ||
                              node.op() == "<=" || node.op() == ">=")
                     {
                         if (left_type->is_assignable_from(right_type) || right_type->is_assignable_from(left_type))
@@ -524,11 +524,11 @@ namespace Cryo
                         else
                         {
                             diagnostics_.report_error(node.location(),
-                                "Cannot compare incompatible types: " + 
-                                left_type->get_name() + " and " + right_type->get_name());
+                                                      "Cannot compare incompatible types: " +
+                                                          left_type->get_name() + " and " + right_type->get_name());
                         }
                     }
-                    
+
                     if (result_type)
                     {
                         node.set_type(result_type);
