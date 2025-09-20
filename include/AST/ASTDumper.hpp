@@ -48,6 +48,7 @@ namespace Cryo
         void print_prefix();
         void print_location(const SourceLocation &loc);
         std::string get_node_color(NodeKind kind) const;
+        std::string get_literal_node_name(TokenKind kind) const;
         std::string get_literal_type_string(TokenKind kind) const;
 
     public:

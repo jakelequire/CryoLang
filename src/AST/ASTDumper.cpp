@@ -94,6 +94,25 @@ namespace Cryo
         }
     }
 
+    std::string ASTDumper::get_literal_node_name(TokenKind kind) const
+    {
+        switch (kind)
+        {
+        case TokenKind::TK_NUMERIC_CONSTANT:
+            return "IntegerLiteral";
+        case TokenKind::TK_STRING_LITERAL:
+            return "StringLiteral";
+        case TokenKind::TK_CHAR_CONSTANT:
+            return "CharLiteral";
+        case TokenKind::TK_BOOLEAN_LITERAL:
+        case TokenKind::TK_KW_TRUE:
+        case TokenKind::TK_KW_FALSE:
+            return "BooleanLiteral";
+        default:
+            return "Literal";
+        }
+    }
+
     std::string ASTDumper::get_literal_type_string(TokenKind kind) const
     {
         switch (kind)
@@ -105,7 +124,9 @@ namespace Cryo
         case TokenKind::TK_CHAR_CONSTANT:
             return "char";
         case TokenKind::TK_BOOLEAN_LITERAL:
-            return "bool";
+        case TokenKind::TK_KW_TRUE:
+        case TokenKind::TK_KW_FALSE:
+            return "boolean";
         default:
             return "unknown";
         }
@@ -144,7 +165,7 @@ namespace Cryo
     void ASTDumper::visit(LiteralNode &node)
     {
         print_prefix();
-        _output << get_node_color(node.kind()) << "IntegerLiteral";
+        _output << get_node_color(node.kind()) << get_literal_node_name(node.literal_kind());
         if (_use_colors)
             _output << Colors::RESET;
         print_location(node.location());
@@ -304,10 +325,28 @@ namespace Cryo
         if (_use_colors)
             _output << Colors::RESET;
 
+        // Build and display function signature
+        _output << " ";
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "'(";
+
+        // Add parameter types
+        const auto &params = node.parameters();
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            if (i > 0)
+                _output << ", ";
+            _output << params[i]->type_annotation();
+        }
+
+        _output << ") -> " << node.return_type_annotation() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
         _output << std::endl;
 
         // Dump parameters
-        const auto &params = node.parameters();
         bool has_body = node.body() != nullptr;
 
         for (size_t i = 0; i < params.size(); ++i)
