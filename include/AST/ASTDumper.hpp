@@ -30,9 +30,9 @@ namespace Cryo
     // Tree drawing characters
     namespace TreeChars
     {
-        const std::string BRANCH = "├─";      // ├─
-        const std::string LAST_BRANCH = "└─"; // └─
-        const std::string VERTICAL = "│ ";    // │
+        const std::string BRANCH = "|-";      // |-
+        const std::string LAST_BRANCH = "`-"; // `-
+        const std::string VERTICAL = "| ";    // |
         const std::string SPACE = "  ";       // Two spaces
     }
 
