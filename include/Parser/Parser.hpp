@@ -64,7 +64,7 @@ namespace Cryo
 
         // Type parsing
         std::string parse_type();
-        Type* parse_type_annotation(); // New method that returns Type*
+        Type *parse_type_annotation();              // New method that returns Type*
         std::vector<std::string> parse_type_list(); // For arrays like i32[][]
 
         // Namespace parsing

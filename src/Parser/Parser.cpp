@@ -196,7 +196,7 @@ namespace Cryo
         return base_type;
     }
 
-    Type* Parser::parse_type_annotation()
+    Type *Parser::parse_type_annotation()
     {
         if (!is_type_token())
         {
@@ -208,7 +208,7 @@ namespace Cryo
         advance();
 
         // Get base type from token kind
-        Type* base_type = _context.types().resolve_type_from_token_kind(static_cast<int>(type_token.kind()));
+        Type *base_type = _context.types().resolve_type_from_token_kind(static_cast<int>(type_token.kind()));
 
         // Handle array types (e.g., i32[], str[][])
         while (_current_token.is(TokenKind::TK_L_SQUARE))
@@ -340,7 +340,7 @@ namespace Cryo
 
         // Parse required colon and type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after variable name");
-        Type* var_type = parse_type_annotation();
+        Type *var_type = parse_type_annotation();
 
         // Parse optional initializer
         std::unique_ptr<ExpressionNode> initializer = nullptr;
@@ -392,7 +392,7 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type
-        Type* return_type = _context.types().get_void_type();
+        Type *return_type = _context.types().get_void_type();
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -892,7 +892,7 @@ namespace Cryo
 
         // Parse type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
-        Type* param_type = parse_type_annotation();
+        Type *param_type = parse_type_annotation();
 
         // Create parameter as variable declaration (without initializer)
         return _builder.create_variable_declaration(name_token.location(), param_name, param_type->to_string());
