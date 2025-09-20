@@ -17,6 +17,9 @@ namespace Cryo
         _symbol_table = std::make_unique<SymbolTable>();
         _diagnostic_manager = std::make_unique<DiagnosticManager>();
 
+        // Create type checker with the AST context's type context
+        _type_checker = std::make_unique<TypeChecker>(_ast_context->types());
+
         // Configure diagnostic manager
         _diagnostic_manager->set_formatter_options(true, true, 2);
 
@@ -193,7 +196,6 @@ namespace Cryo
 
     bool CompilerInstance::analyze()
     {
-        // Future: Implement semantic analysis
         if (!_ast_root)
         {
             _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
@@ -201,16 +203,71 @@ namespace Cryo
             return false;
         }
 
-        // Basic symbol table population
-        populate_symbol_table(_ast_root.get());
+        try
+        {
+            // Phase 1: Type checking
+            _type_checker->check_program(*_ast_root);
 
-        // Placeholder for future semantic analysis
-        // - Type checking
-        // - Symbol resolution
-        // - Control flow analysis
-        // - etc.
+            // Check if type checking found errors
+            if (_type_checker->has_errors())
+            {
+                // Convert type errors to diagnostic manager errors
+                for (const auto& type_error : _type_checker->errors())
+                {
+                    DiagnosticID diag_id = DiagnosticID::Unknown;
+                    switch (type_error.kind)
+                    {
+                        case TypeError::ErrorKind::TypeMismatch:
+                            diag_id = DiagnosticID::TypeMismatch;
+                            break;
+                        case TypeError::ErrorKind::UndefinedVariable:
+                            diag_id = DiagnosticID::UndefinedVariable;
+                            break;
+                        case TypeError::ErrorKind::UndefinedFunction:
+                            diag_id = DiagnosticID::UndefinedFunction;
+                            break;
+                        case TypeError::ErrorKind::RedefinedSymbol:
+                            diag_id = DiagnosticID::RedefinedSymbol;
+                            break;
+                        default:
+                            diag_id = DiagnosticID::Unknown;
+                            break;
+                    }
 
-        return true;
+                    SourceRange range(type_error.location);
+                    _diagnostic_manager->report_error(diag_id, DiagnosticCategory::Semantic,
+                                                      type_error.message, range, _source_file);
+                }
+                
+                if (_debug_mode)
+                {
+                    std::cout << "Type checking failed with " << _type_checker->error_count() << " errors." << std::endl;
+                }
+                return false;
+            }
+
+            // Phase 2: Basic symbol table population (for legacy compatibility)
+            populate_symbol_table(_ast_root.get());
+
+            // Phase 3: Future semantic analysis phases would go here
+            // - Control flow analysis
+            // - Dead code elimination
+            // - etc.
+
+            if (_debug_mode)
+            {
+                std::cout << "Type checking completed successfully." << std::endl;
+            }
+
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
+                                              std::string("Analysis error: ") + e.what(),
+                                              SourceRange{}, _source_file);
+            return false;
+        }
     }
 
     bool CompilerInstance::has_errors() const
@@ -254,6 +311,23 @@ namespace Cryo
         else
         {
             os << "No symbol table available" << std::endl;
+        }
+    }
+
+    void CompilerInstance::dump_type_errors(std::ostream &os) const
+    {
+        if (_type_checker && _type_checker->has_errors())
+        {
+            os << "=== Type Errors ===" << std::endl;
+            for (const auto& error : _type_checker->errors())
+            {
+                os << error.to_string() << std::endl;
+            }
+            os << "=== End Type Errors ===" << std::endl;
+        }
+        else
+        {
+            os << "No type errors found." << std::endl;
         }
     }
 

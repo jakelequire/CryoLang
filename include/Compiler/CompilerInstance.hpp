@@ -6,6 +6,7 @@
 #include "AST/SymbolTable.hpp"
 #include "AST/ASTNode.hpp"
 #include "AST/ASTDumper.hpp"
+#include "AST/TypeChecker.hpp"
 #include "GDM/GDM.hpp"
 #include "Utils/file.hpp"
 #include <memory>
@@ -30,6 +31,7 @@ namespace Cryo
         std::unique_ptr<ASTContext> _ast_context;
         std::unique_ptr<SymbolTable> _symbol_table;
         std::unique_ptr<DiagnosticManager> _diagnostic_manager;
+        std::unique_ptr<TypeChecker> _type_checker;
 
         // Compilation state
         std::string _source_file;
@@ -63,6 +65,7 @@ namespace Cryo
         ASTContext *ast_context() const { return _ast_context.get(); }
         SymbolTable *symbol_table() const { return _symbol_table.get(); }
         DiagnosticManager *diagnostic_manager() const { return _diagnostic_manager.get(); }
+        TypeChecker *type_checker() const { return _type_checker.get(); }
 
         // Results access
         ProgramNode *ast_root() const { return _ast_root.get(); }
@@ -72,6 +75,7 @@ namespace Cryo
         void print_ast(std::ostream &os = std::cout, bool use_colors = true) const;
         void dump_ast(std::ostream &os = std::cout, bool use_colors = true) const;
         void dump_symbol_table(std::ostream &os = std::cout) const;
+        void dump_type_errors(std::ostream &os = std::cout) const;
         void print_diagnostics(std::ostream &os = std::cerr) const;
         void clear();
 
