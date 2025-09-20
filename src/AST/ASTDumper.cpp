@@ -99,7 +99,7 @@ namespace Cryo
         switch (kind)
         {
         case TokenKind::TK_NUMERIC_CONSTANT:
-            return "IntegerLiteral";
+            return "IntegerLiteral"; // Note: This will be overridden in visit(LiteralNode&) for floats
         case TokenKind::TK_STRING_LITERAL:
             return "StringLiteral";
         case TokenKind::TK_CHAR_CONSTANT:
@@ -118,7 +118,7 @@ namespace Cryo
         switch (kind)
         {
         case TokenKind::TK_NUMERIC_CONSTANT:
-            return "int";
+            return "int"; // Note: This will be overridden in visit(LiteralNode&) for floats
         case TokenKind::TK_STRING_LITERAL:
             return "string";
         case TokenKind::TK_CHAR_CONSTANT:
@@ -130,6 +130,14 @@ namespace Cryo
         default:
             return "unknown";
         }
+    }
+
+    // Helper function to determine if a numeric literal contains a decimal point
+    bool ASTDumper::is_float_literal(const std::string &value) const
+    {
+        return value.find('.') != std::string::npos ||
+               value.find('e') != std::string::npos ||
+               value.find('E') != std::string::npos;
     }
 
     void ASTDumper::visit(ExpressionNode &node)
@@ -165,7 +173,31 @@ namespace Cryo
     void ASTDumper::visit(LiteralNode &node)
     {
         print_prefix();
-        _output << get_node_color(node.kind()) << get_literal_node_name(node.literal_kind());
+
+        // For numeric constants, determine if it's actually a float literal
+        std::string node_name;
+        std::string type_name;
+
+        if (node.literal_kind() == TokenKind::TK_NUMERIC_CONSTANT)
+        {
+            if (is_float_literal(node.value()))
+            {
+                node_name = "FloatLiteral";
+                type_name = "float";
+            }
+            else
+            {
+                node_name = "IntegerLiteral";
+                type_name = "int";
+            }
+        }
+        else
+        {
+            node_name = get_literal_node_name(node.literal_kind());
+            type_name = get_literal_type_string(node.literal_kind());
+        }
+
+        _output << get_node_color(node.kind()) << node_name;
         if (_use_colors)
             _output << Colors::RESET;
         print_location(node.location());
@@ -180,7 +212,7 @@ namespace Cryo
         _output << " ";
         if (_use_colors)
             _output << Colors::TYPE;
-        _output << "'" << get_literal_type_string(node.literal_kind()) << "'";
+        _output << "'" << type_name << "'";
         if (_use_colors)
             _output << Colors::RESET;
 
@@ -236,6 +268,22 @@ namespace Cryo
         // Dump left and right operands
         dump_child(node.left(), false);
         dump_child(node.right(), true);
+    }
+
+    void ASTDumper::visit(TernaryExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "TernaryOperator";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " '?:'";
+        _output << std::endl;
+
+        // Dump condition, true expression, and false expression
+        dump_child(node.condition(), false);
+        dump_child(node.true_expression(), false);
+        dump_child(node.false_expression(), true);
     }
 
     void ASTDumper::visit(ProgramNode &node)

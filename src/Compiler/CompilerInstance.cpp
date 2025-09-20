@@ -378,9 +378,12 @@ namespace Cryo
         // Handle function declarations
         if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(node))
         {
-            // Add function to current (global) scope
+            // Build full function signature
+            std::string function_signature = build_function_signature(func_decl);
+
+            // Add function to current (global) scope with full signature
             current_scope->declare_symbol(func_decl->name(), SymbolKind::Function,
-                                          func_decl->location(), func_decl->return_type_annotation(), scope_name);
+                                          func_decl->location(), function_signature, scope_name);
 
             // Recurse into function body with function name as new scope
             if (func_decl->body())
@@ -420,6 +423,26 @@ namespace Cryo
                 populate_symbol_table_with_scope(stmt.get(), current_scope, scope_name);
             }
         }
+    }
+
+    std::string CompilerInstance::build_function_signature(FunctionDeclarationNode *func_decl)
+    {
+        if (!func_decl)
+            return "unknown";
+
+        std::string signature = "(";
+
+        // Add parameter types
+        const auto &params = func_decl->parameters();
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            if (i > 0)
+                signature += ", ";
+            signature += params[i]->type_annotation();
+        }
+
+        signature += ") -> " + func_decl->return_type_annotation();
+        return signature;
     }
 
     std::unique_ptr<CompilerInstance> create_compiler_instance()

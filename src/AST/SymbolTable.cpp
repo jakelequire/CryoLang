@@ -91,14 +91,14 @@ namespace Cryo
 
     void SymbolTable::print_pretty(std::ostream &os) const
     {
-        os << "+===============================================================+" << std::endl;
-        os << "|                        Symbol Table                           |" << std::endl;
-        os << "+===============================================================+" << std::endl;
+        os << "+=========================================================================================+" << std::endl;
+        os << "|                                      Symbol Table                                       |" << std::endl;
+        os << "+=========================================================================================+" << std::endl;
 
         if (symbols_.empty() && !parent_scope_)
         {
-            os << "|  No symbols found                                             |" << std::endl;
-            os << "+===============================================================+" << std::endl;
+            os << "|  No symbols found                                                                       |" << std::endl;
+            os << "+=========================================================================================+" << std::endl;
             return;
         }
 
@@ -113,21 +113,21 @@ namespace Cryo
 
         os << "|  Total symbols: " << total_symbols;
         // Pad to align right side of box
-        for (int i = std::to_string(total_symbols).length(); i < 48; i++)
+        for (int i = std::to_string(total_symbols).length(); i < 72; i++)
         {
             os << " ";
         }
         os << "|" << std::endl;
-        os << "+---------------------------------------------------------------+" << std::endl;
+        os << "+-----------------------------------------------------------------------------------------+" << std::endl;
 
-        // Header for symbol details - properly aligned
-        os << "| Type     | Name           | Data Type | Location | Scope       |" << std::endl;
-        os << "+----------+----------------+-----------+----------+-------------+" << std::endl;
+        // Header for symbol details - properly aligned with wider columns (Scope and Location swapped)
+        os << "| Type     | Name           | Data Type                      | Scope           | Location |" << std::endl;
+        os << "+----------+----------------+--------------------------------+-----------------+----------+" << std::endl;
 
         // Display symbols from current and parent scopes
         print_symbols_table(os, 0);
 
-        os << "+===============================================================+" << std::endl;
+        os << "+=========================================================================================+" << std::endl;
     }
 
     void SymbolTable::print_symbols_table(std::ostream &os, int scope_level) const
@@ -141,9 +141,9 @@ namespace Cryo
 
             os << "| " << format_field(kind_str, 8)
                << " | " << format_field(symbol.name, 14)
-               << " | " << format_field(symbol.data_type, 9)
+               << " | " << format_field(symbol.data_type, 30)
+               << " | " << format_field(symbol.scope, 15)
                << " | " << format_field(location, 8)
-               << " | " << format_field(symbol.scope, 11)
                << " |" << std::endl;
         }
 

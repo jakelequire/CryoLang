@@ -6,7 +6,7 @@
 
 <function-declaration>  ::=  <visibility> "function" <identifier> "(" [<param-list>] ")" ["->" <type>] <block>
 <param-list>            ::=  <param> { "," <param> }
-<param>                 ::=  <type> <identifier>
+<param>                 ::=  <identifier> ":" <type>
 <block>                 ::=  "{" { <statement> } "}"
 <visibility>            ::=  "public" | "private"
 
@@ -34,7 +34,7 @@
 <return-statement>    ::=  "return" [<expression>] ";"
 
 
-<type>           ::=  "int"| "i8" | "i16" | "i32" | "i64" | "i128" | "float" | "boolean" | "str" | "void" | <identifier> | <type> "[]"
+<type>           ::=  "int"| "i8" | "i16" | "i32" | "i64" | "i128" | "float" | "boolean" | "string" | "char" | "void" | <identifier> | <type> "[]"
 <identifier>     ::=  <letter> { <letter> | <digit> }
 <number>         ::=  { <digit> } ["." { <digit> }]
 <string>         ::=  '"' { <any-character-except-quote> } '"'
