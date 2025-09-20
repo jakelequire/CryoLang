@@ -47,12 +47,14 @@ NUM_JOBS = $(shell expr $(NUM_CORES) + 1)
 # OS-specific settings for compilers
 ifeq ($(OS), Windows_NT)
 # Windows settings
-	C_COMPILER = C:/msys64/mingw64/bin/gcc
-	CXX_COMPILER = C:/msys64/mingw64/bin/g++
+	C_COMPILER = clang
+	CXX_COMPILER = clang++
+	PYTHON = python
 else
 # Linux settings
 	C_COMPILER = clang-20
 	CXX_COMPILER = clang++-20
+	PYTHON = python3
 endif
 
 # >>=======--------------------------------------------------=======<< #
@@ -75,9 +77,12 @@ ifeq ($(OS), Windows_NT)
     CXX =           $(CXX_COMPILER) $(CXX_STANDARD) $(DEBUG_FLAGS) $(OPTIMIZATION)
     CFLAGS =        $(WIN_INCLUDES) $(LLVM_CFLAGS) -fexceptions
     CXXFLAGS =      $(WIN_INCLUDES) $(LLVM_CXXFLAGS) -fexceptions
-    LDFLAGS =       -L"C:/msys64/mingw64/lib" $(LLVM_LIBS) $(STDLIBS) -v
-    LLVM_LIBS :=    -lLLVM 
-    STDLIBS :=      -lmingw32 -lmingwex -lmsvcrt -lucrt -lpthread -lws2_32 -ladvapi32 -lshell32 -luser32 -lkernel32 -Wl,-subsystem,console
+    LDFLAGS =       $(LLVM_LDFLAGS) $(STDLIBS) -v
+    LLVM_CONFIG =   llvm-config-20
+    LLVM_CFLAGS =   $(shell $(LLVM_CONFIG) --cflags)
+    LLVM_CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
+    LLVM_LDFLAGS =  $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs) $(shell $(LLVM_CONFIG) --system-libs)
+    STDLIBS :=      
     MKDIR =         if not exist
     RMDIR =         rmdir /S /Q
     DEL =           del /Q
@@ -90,10 +95,10 @@ else
     CXXFLAGS =      $(LINUX_INCLUDES) $(LLVM_CXXFLAGS) -fexceptions
     LLVM_CONFIG =   llvm-config-20
     LLVM_CFLAGS =   $(shell $(LLVM_CONFIG) --cflags)
-	LLVM_CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
+    LLVM_CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
     LLVM_LDFLAGS =  $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs) $(shell $(LLVM_CONFIG) --system-libs)
     LDFLAGS =       $(LLVM_LDFLAGS) -lpthread -v
-	STD_LIBS =      -lstdc++ -lm -lc -lgcc -lgcc_eh -lstdc++fs
+    STD_LIBS =      -lstdc++ -lm -lc -lgcc -lgcc_eh -lstdc++fs
     MKDIR =         mkdir -p
     RMDIR =         rm -rf
     DEL =           rm -f
@@ -125,17 +130,35 @@ MAIN_BIN = $(BIN_DIR)cryo$(BIN_SUFFIX)
 
 # ---------------------------------------------
 # Ensure OBJ_DIR exists
-$(shell mkdir -p $(OBJ_DIR))
+# Create directories at makefile parse time
+ifeq ($(OS), Windows_NT)
+    $(shell if not exist "bin" mkdir "bin")
+    $(shell if not exist "bin\.o" mkdir "bin\.o")
+else
+    $(shell $(MKDIR) $(OBJ_DIR))
+endif
 
 # ---------------------------------------------
 # Define all source files
-C_SRCS := $(shell find $(SRC_DIR) -name '*.c')
-CPP_SRCS := $(shell find $(SRC_DIR) -name '*.cpp')
+ifeq ($(OS), Windows_NT)
+    # Windows - using MSYS2 find with full path
+    C_SRCS := $(shell C:/msys64/usr/bin/find $(SRC_DIR) -name "*.c" -type f)
+    CPP_SRCS := $(shell C:/msys64/usr/bin/find $(SRC_DIR) -name "*.cpp" -type f)
+else
+    # Linux - native find
+    C_SRCS := $(shell find $(SRC_DIR) -name "*.c" -type f)
+    CPP_SRCS := $(shell find $(SRC_DIR) -name "*.cpp" -type f)
+endif
 
 # ---------------------------------------------
 # Define all object files
-C_OBJS := $(patsubst $(SRC_DIR)%.c,$(OBJ_DIR)%.o,$(C_SRCS))
-CPP_OBJS := $(patsubst $(SRC_DIR)%.cpp,$(OBJ_DIR)%.o,$(CPP_SRCS))
+ifeq ($(OS), Windows_NT)
+    C_OBJS := $(patsubst $(SRC_DIR)%, $(OBJ_DIR)%, $(C_SRCS:.c=.o))
+    CPP_OBJS := $(patsubst $(SRC_DIR)%, $(OBJ_DIR)%, $(CPP_SRCS:.cpp=.o))
+else
+    C_OBJS := $(patsubst $(SRC_DIR)%.c,$(OBJ_DIR)%.o,$(C_SRCS))
+    CPP_OBJS := $(patsubst $(SRC_DIR)%.cpp,$(OBJ_DIR)%.o,$(CPP_SRCS))
+endif
 
 # ---------------------------------------------
 # Combine all object files
@@ -143,18 +166,30 @@ ALL_OBJS := $(C_OBJS) $(CPP_OBJS)
 
 # Add these directory rules
 $(BIN_DIR) $(OBJ_DIR):
-	@mkdir -p $@
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$@)" mkdir "$(subst /,\,$@)"
+else
+	@$(MKDIR) $@
+endif
 
 # ---------------------------------------------
 # Compile C source files
 $(OBJ_DIR)%.o: $(SRC_DIR)%.c | $(OBJ_DIR)
-	@mkdir -p $(dir $@)
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
+else
+	@$(MKDIR) $(dir $@)
+endif
 	$(CXX) $(CFLAGS) -c $< -o $@
 
 # ---------------------------------------------
 # Compile C++ source files
 $(OBJ_DIR)%.o: $(SRC_DIR)%.cpp | $(OBJ_DIR)
-	@mkdir -p $(dir $@)
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
+else
+	@$(MKDIR) $(dir $@)
+endif
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # >>=======--------------------------------------------------=======<< #
@@ -163,7 +198,11 @@ $(OBJ_DIR)%.o: $(SRC_DIR)%.cpp | $(OBJ_DIR)
 
 # Main target
 $(MAIN_BIN): $(ALL_OBJS)
-	@mkdir -p $(dir $@)
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
+else
+	@$(MKDIR) $(dir $@)
+endif
 	$(CXX) $(CXXFLAGS) $(ALL_OBJS) -o $@ $(LDFLAGS)
 
 # >>=======--------------------------------------------------=======<< #
@@ -176,12 +215,12 @@ BUILD_TIMER = ./scripts/build_timer.py
 # Timed build target
 .PHONY: timed-build
 timed-build:
-	@python3 $(BUILD_TIMER)
+	@$(PYTHON) $(BUILD_TIMER)
 
 # Clean and timed build
 .PHONY: rebuild
 rebuild:
-	@python3 $(BUILD_TIMER) --clean
+	@$(PYTHON) $(BUILD_TIMER) --clean
 
 .PHONY: all
 all: 
@@ -195,7 +234,7 @@ build: $(MAIN_BIN)
 
 # Clean all components
 clean:
-	python3 ./scripts/clean.py
+	@$(PYTHON) ./scripts/clean.py
 
 .PHONY: debug clean all 
 .NOTPARALLEL: clean clean-% libs
