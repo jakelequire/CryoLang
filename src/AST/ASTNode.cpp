@@ -8,6 +8,16 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void ArrayLiteralNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    void ArrayAccessNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     // Control flow statement visitor implementations
     void IfStatementNode::accept(ASTVisitor &visitor)
     {

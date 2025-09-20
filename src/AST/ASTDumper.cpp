@@ -81,6 +81,8 @@ namespace Cryo
 
         case NodeKind::BinaryExpression:
         case NodeKind::CallExpression:
+        case NodeKind::ArrayLiteral:
+        case NodeKind::ArrayAccess:
             return Colors::EXPRESSION;
 
         case NodeKind::Literal:
@@ -430,6 +432,50 @@ namespace Cryo
             bool is_last = (i == args.size() - 1);
             dump_child(args[i].get(), is_last);
         }
+    }
+
+    void ASTDumper::visit(ArrayLiteralNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ArrayLiteral";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " [" << node.size() << "]";
+
+        if (!node.element_type().empty())
+        {
+            _output << " ";
+            if (_use_colors)
+                _output << Colors::TYPE;
+            _output << "'" << node.element_type() << "[]'";
+            if (_use_colors)
+                _output << Colors::RESET;
+        }
+
+        _output << std::endl;
+
+        // Dump array elements
+        const auto &elements = node.elements();
+        for (size_t i = 0; i < elements.size(); ++i)
+        {
+            bool is_last = (i == elements.size() - 1);
+            dump_child(elements[i].get(), is_last);
+        }
+    }
+
+    void ASTDumper::visit(ArrayAccessNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ArrayAccess";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        // Dump array and index
+        dump_child(node.array(), false);
+        dump_child(node.index(), true);
     }
 
     void ASTDumper::visit(IfStatementNode &node)

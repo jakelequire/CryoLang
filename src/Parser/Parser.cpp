@@ -966,18 +966,44 @@ namespace Cryo
 
         consume(TokenKind::TK_R_SQUARE, "Expected ']' after array index");
 
-        // For now, treat array access as a binary expression with a special operator
-        // In the future, you might want to create a dedicated ArrayAccessNode
-        Token array_access_token(TokenKind::TK_L_SQUARE, "[", access_location);
-
-        return _builder.create_binary_expression(array_access_token, std::move(expr), std::move(index));
+        return _builder.create_array_access(access_location, std::move(expr), std::move(index));
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_array_literal()
     {
-        // TODO: Implement array literal parsing
-        error("Array literals not yet implemented");
-        return nullptr;
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_L_SQUARE, "Expected '[' for array literal");
+
+        auto array_literal = _builder.create_array_literal(start_loc);
+
+        // Handle empty arrays
+        if (_current_token.is(TokenKind::TK_R_SQUARE))
+        {
+            advance(); // consume ']'
+            return array_literal;
+        }
+
+        // Parse array elements
+        do
+        {
+            auto element = parse_expression();
+            if (element)
+            {
+                array_literal->add_element(std::move(element));
+            }
+
+            if (_current_token.is(TokenKind::TK_COMMA))
+            {
+                advance(); // consume ','
+            }
+            else
+            {
+                break;
+            }
+        } while (!_current_token.is(TokenKind::TK_R_SQUARE) && !is_at_end());
+
+        consume(TokenKind::TK_R_SQUARE, "Expected ']' after array elements");
+        return array_literal;
     }
 
     Token Parser::peek_next()

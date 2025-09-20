@@ -2,7 +2,7 @@
 
 namespace Cryo
 {
-    bool SymbolTable::declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, const std::string &data_type, const std::string &scope)
+    bool SymbolTable::declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type, const std::string &scope)
     {
         // Check if symbol already exists in current scope
         if (symbols_.find(name) != symbols_.end())
@@ -72,9 +72,10 @@ namespace Cryo
         {
             for (const auto &[name, symbol] : symbols_)
             {
+                std::string type_str = symbol.data_type ? symbol.data_type->to_string() : "unknown";
                 os << indent << "|-- " << symbol.name
                    << " [" << get_symbol_kind_string(symbol.kind) << "]"
-                   << " (" << symbol.data_type << ")"
+                   << " (" << type_str << ")"
                    << " at line " << symbol.declaration_location.line()
                    << ", col " << symbol.declaration_location.column()
                    << std::endl;
@@ -136,12 +137,13 @@ namespace Cryo
         for (const auto &[name, symbol] : symbols_)
         {
             std::string kind_str = get_symbol_kind_string(symbol.kind);
+            std::string type_str = symbol.data_type ? symbol.data_type->to_string() : "unknown";
             std::string location = std::to_string(symbol.declaration_location.line()) +
                                    ":" + std::to_string(symbol.declaration_location.column());
 
             os << "| " << format_field(kind_str, 8)
                << " | " << format_field(symbol.name, 14)
-               << " | " << format_field(symbol.data_type, 30)
+               << " | " << format_field(type_str, 30)
                << " | " << format_field(symbol.scope, 15)
                << " | " << format_field(location, 8)
                << " |" << std::endl;
