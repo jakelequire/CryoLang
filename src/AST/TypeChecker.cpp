@@ -547,8 +547,14 @@ namespace Cryo
                     // Arithmetic operations
                     if (op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS || op == TokenKind::TK_STAR || op == TokenKind::TK_SLASH)
                     {
-                        if (left_type == right_type &&
-                            (left_type->name() == "int" || left_type->name() == "double"))
+                        // Handle string concatenation for + operator
+                        if (op == TokenKind::TK_PLUS && left_type->name() == "string" && right_type->name() == "string")
+                        {
+                            result_type = left_type; // string + string = string
+                        }
+                        // Handle numeric arithmetic
+                        else if (left_type == right_type &&
+                                 (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float"))
                         {
                             result_type = left_type;
                         }

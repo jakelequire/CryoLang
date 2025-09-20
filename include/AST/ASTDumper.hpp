@@ -72,6 +72,8 @@ namespace Cryo
         void visit(VariableDeclarationNode &node) override;
         void visit(FunctionDeclarationNode &node) override;
         void visit(CallExpressionNode &node) override;
+        void visit(ArrayLiteralNode &node) override;
+        void visit(ArrayAccessNode &node) override;
         void visit(IfStatementNode &node) override;
         void visit(WhileStatementNode &node) override;
         void visit(ForStatementNode &node) override;

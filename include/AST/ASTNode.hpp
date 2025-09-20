@@ -24,6 +24,8 @@ namespace Cryo
         BinaryExpression,
         TernaryExpression,
         CallExpression,
+        ArrayLiteral,
+        ArrayAccess,
 
         // Concrete statement types
         BlockStatement,
@@ -471,6 +473,81 @@ namespace Cryo
             {
                 if (arg)
                     arg->print(os, indent + 4);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Array literal
+    class ArrayLiteralNode : public ExpressionNode
+    {
+    private:
+        std::vector<std::unique_ptr<ExpressionNode>> _elements;
+        std::string _element_type; // Type of array elements
+
+    public:
+        ArrayLiteralNode(SourceLocation loc)
+            : ExpressionNode(NodeKind::ArrayLiteral, loc) {}
+
+        const std::vector<std::unique_ptr<ExpressionNode>> &elements() const { return _elements; }
+        const std::string &element_type() const { return _element_type; }
+        size_t size() const { return _elements.size(); }
+
+        void add_element(std::unique_ptr<ExpressionNode> element)
+        {
+            _elements.push_back(std::move(element));
+        }
+
+        void set_element_type(const std::string &type)
+        {
+            _element_type = type;
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "ArrayLiteral[" << _elements.size() << "]";
+            if (!_element_type.empty())
+                os << " (" << _element_type << ")";
+            os << ":" << std::endl;
+            for (const auto &element : _elements)
+            {
+                if (element)
+                    element->print(os, indent + 2);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Array access
+    class ArrayAccessNode : public ExpressionNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _array;
+        std::unique_ptr<ExpressionNode> _index;
+
+    public:
+        ArrayAccessNode(SourceLocation loc, std::unique_ptr<ExpressionNode> array,
+                        std::unique_ptr<ExpressionNode> index)
+            : ExpressionNode(NodeKind::ArrayAccess, loc), _array(std::move(array)),
+              _index(std::move(index)) {}
+
+        ExpressionNode *array() const { return _array.get(); }
+        ExpressionNode *index() const { return _index.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "ArrayAccess:" << std::endl;
+            if (_array)
+            {
+                os << std::string(indent + 2, ' ') << "Array:" << std::endl;
+                _array->print(os, indent + 4);
+            }
+            if (_index)
+            {
+                os << std::string(indent + 2, ' ') << "Index:" << std::endl;
+                _index->print(os, indent + 4);
             }
         }
 

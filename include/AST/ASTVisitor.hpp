@@ -16,6 +16,8 @@ namespace Cryo
     class VariableDeclarationNode;
     class FunctionDeclarationNode;
     class CallExpressionNode;
+    class ArrayLiteralNode;
+    class ArrayAccessNode;
     class IfStatementNode;
     class WhileStatementNode;
     class ForStatementNode;
@@ -43,6 +45,8 @@ namespace Cryo
         virtual void visit(VariableDeclarationNode &node) = 0;
         virtual void visit(FunctionDeclarationNode &node) = 0;
         virtual void visit(CallExpressionNode &node) = 0;
+        virtual void visit(ArrayLiteralNode &node) = 0;
+        virtual void visit(ArrayAccessNode &node) = 0;
         virtual void visit(IfStatementNode &node) = 0;
         virtual void visit(WhileStatementNode &node) = 0;
         virtual void visit(ForStatementNode &node) = 0;
@@ -69,6 +73,8 @@ namespace Cryo
         void visit(VariableDeclarationNode &node) override {}
         void visit(FunctionDeclarationNode &node) override {}
         void visit(CallExpressionNode &node) override {}
+        void visit(ArrayLiteralNode &node) override {}
+        void visit(ArrayAccessNode &node) override {}
         void visit(IfStatementNode &node) override {}
         void visit(WhileStatementNode &node) override {}
         void visit(ForStatementNode &node) override {}

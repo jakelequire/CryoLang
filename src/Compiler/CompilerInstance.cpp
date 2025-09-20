@@ -378,12 +378,24 @@ namespace Cryo
         // Handle function declarations
         if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(node))
         {
-            // Build full function signature
-            std::string function_signature = build_function_signature(func_decl);
+            // Create function type from return type and parameters
+            std::vector<Type *> param_types;
+            for (const auto &param : func_decl->parameters())
+            {
+                // Parse parameter type from string annotation
+                Type *param_type = _ast_context->types().parse_type_from_string(param->type_annotation());
+                param_types.push_back(param_type);
+            }
 
-            // Add function to current (global) scope with full signature
+            // Parse return type
+            Type *return_type = _ast_context->types().parse_type_from_string(func_decl->return_type_annotation());
+
+            // Create function type
+            Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
+
+            // Add function to current (global) scope with proper Type
             current_scope->declare_symbol(func_decl->name(), SymbolKind::Function,
-                                          func_decl->location(), function_signature, scope_name);
+                                          func_decl->location(), function_type, scope_name);
 
             // Recurse into function body with function name as new scope
             if (func_decl->body())
@@ -394,8 +406,11 @@ namespace Cryo
         // Handle variable declarations
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
+            // Parse variable type from string annotation
+            Type *var_type = _ast_context->types().parse_type_from_string(var_decl->type_annotation());
+
             current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
-                                          var_decl->location(), var_decl->type_annotation(), scope_name);
+                                          var_decl->location(), var_type, scope_name);
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))

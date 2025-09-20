@@ -5,6 +5,7 @@
 #include <iostream>
 
 #include "Lexer/lexer.hpp"
+#include "AST/Type.hpp" // Add Type include
 
 namespace Cryo
 {
@@ -20,14 +21,14 @@ namespace Cryo
         std::string name;
         SymbolKind kind;
         SourceLocation declaration_location;
-        std::string data_type; // Data type information (e.g., "int", "string", "void", etc.)
-        std::string scope;     // Scope information (e.g., "Global", "main", "test_fn")
+        Type *data_type;   // Changed from string to Type*
+        std::string scope; // Scope information (e.g., "Global", "main", "test_fn")
 
         // Default constructor
-        Symbol() : name(""), kind(SymbolKind::Variable), declaration_location(SourceLocation()), data_type("unknown"), scope("Global") {}
+        Symbol() : name(""), kind(SymbolKind::Variable), declaration_location(SourceLocation()), data_type(nullptr), scope("Global") {}
 
         // Parameterized constructor
-        Symbol(const std::string &n, SymbolKind k, SourceLocation loc, const std::string &type = "unknown", const std::string &sc = "Global")
+        Symbol(const std::string &n, SymbolKind k, SourceLocation loc, Type *type = nullptr, const std::string &sc = "Global")
             : name(n), kind(k), declaration_location(loc), data_type(type), scope(sc) {}
     };
 
@@ -42,7 +43,7 @@ namespace Cryo
             : parent_scope_(std::move(parent)) {}
 
         // Symbol management
-        bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, const std::string &data_type = "unknown", const std::string &scope = "Global");
+        bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type = nullptr, const std::string &scope = "Global");
         Symbol *lookup_symbol(const std::string &name);
 
         // Scope management
