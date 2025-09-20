@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 
 
 # Define the Cryo logo with proper line breaks
-cryo_logo = """
+cryo_logo = r"""
                   #              
                 = #^.            
       =        ^# # #.           

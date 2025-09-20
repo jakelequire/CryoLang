@@ -31,7 +31,7 @@
 # --------------------------------------------- #
 OPTIMIZATION =  -Og
 NO_WARNINGS =   -w
-DEBUG_FLAGS =   -D_CRT_SECURE_NO_WARNINGS  $(NO_WARNINGS)
+DEBUG_FLAGS =   -D_CRT_SECURE_NO_WARNINGS  $(NO_WARNINGS) -g
 C_STANDARD =    -std=c23
 CXX_STANDARD =  -std=c++23
 
