@@ -117,6 +117,9 @@ namespace Cryo
         bool has_errors() const { return !_errors.empty(); }
         size_t error_count() const { return _errors.size(); }
 
+        // Visitor methods - Program
+        void visit(ProgramNode &node) override;
+
         // Visitor methods - Declarations
         void visit(VariableDeclarationNode &node) override;
         void visit(FunctionDeclarationNode &node) override;

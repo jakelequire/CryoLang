@@ -7,12 +7,14 @@ namespace Cryo
 {
     class ASTNode;
     class SymbolTable;
+    class TypeContext;
 
     class ASTContext
     {
     private:
         std::vector<std::unique_ptr<ASTNode>> _nodes;
         std::unique_ptr<SymbolTable> _symbol_table;
+        std::unique_ptr<TypeContext> _type_context;
 
     public:
         ASTContext();
@@ -31,6 +33,7 @@ namespace Cryo
 
         // Global state
         SymbolTable &symbols() { return *_symbol_table; }
+        TypeContext &types() { return *_type_context; }
 
         // Memory statistics
         size_t node_count() const { return _nodes.size(); }

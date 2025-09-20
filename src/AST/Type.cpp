@@ -16,8 +16,35 @@ namespace Cryo
 
     bool Type::is_assignable_from(const Type &other) const
     {
-        // Default implementation - strict equality
-        return equals(other);
+        // Same type is always assignable
+        if (equals(other))
+            return true;
+
+        // Unknown type is assignable from anything (for error recovery)
+        if (_kind == TypeKind::Unknown || other._kind == TypeKind::Unknown)
+            return true;
+
+        // Auto type needs special handling
+        if (_kind == TypeKind::Auto)
+            return true;
+
+        // Numeric promotions
+        if (is_numeric() && other.is_numeric())
+        {
+            // Allow promotion from smaller to larger types
+            if (is_floating_point() && other.is_integral())
+                return true; // int -> float
+            
+            if (is_integral() && other.is_integral())
+            {
+                // Allow promotion between integral types of same signedness
+                if (is_signed() == other.is_signed())
+                    return size_bytes() >= other.size_bytes();
+            }
+        }
+
+        // No implicit conversion allowed
+        return false;
     }
 
     bool Type::is_convertible_to(const Type &other) const
@@ -466,11 +493,7 @@ namespace Cryo
 
     Type *TypeContext::resolve_type_from_token_kind(int token_kind)
     {
-        // This would map your TokenKind enum values to types
-        // You'll need to include the actual token definitions and map them
-
-        // Example mappings (you'll need to adjust based on your actual TokenKind enum)
-        /*
+        // Map your TokenKind enum values to types
         switch (static_cast<TokenKind>(token_kind))
         {
             case TokenKind::TK_KW_VOID: return get_void_type();
@@ -485,11 +508,9 @@ namespace Cryo
             case TokenKind::TK_KW_F32: return get_f32_type();
             case TokenKind::TK_KW_F64: return get_f64_type();
             case TokenKind::TK_KW_FLOAT: return get_default_float_type();
+            case TokenKind::TK_KW_AUTO: return get_auto_type();
             default: return get_unknown_type();
         }
-        */
-
-        return get_unknown_type();
     }
 
     bool TypeContext::are_types_compatible(Type *lhs, Type *rhs)

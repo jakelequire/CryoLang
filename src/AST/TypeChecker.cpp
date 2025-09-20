@@ -97,7 +97,29 @@ namespace Cryo
         _in_loop = false;
 
         // Visit all top-level declarations and statements
-        program.accept(*this);
+        for (const auto& stmt : program.statements())
+        {
+            if (stmt)
+            {
+                stmt->accept(*this);
+            }
+        }
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Program Visitors
+    //===----------------------------------------------------------------------===//
+
+    void TypeChecker::visit(ProgramNode &node)
+    {
+        // Visit all top-level declarations and statements
+        for (const auto& stmt : node.statements())
+        {
+            if (stmt)
+            {
+                stmt->accept(*this);
+            }
+        }
     }
 
     //===----------------------------------------------------------------------===//
@@ -110,8 +132,11 @@ namespace Cryo
         Type *declared_type = nullptr;
         Type *inferred_type = nullptr;
 
-        // TODO: Parse type annotation from node
-        // For now, we'll use type inference from initializer
+        // Parse type annotation from node
+        if (!node.type_annotation().empty() && node.type_annotation() != "auto")
+        {
+            declared_type = _type_context.parse_type_from_string(node.type_annotation());
+        }
 
         if (node.initializer())
         {
@@ -154,7 +179,7 @@ namespace Cryo
         }
 
         // Declare the variable in symbol table
-        if (!declare_variable(var_name, final_type, node.location(), true)) // TODO: Check mutability
+        if (!declare_variable(var_name, final_type, node.location(), node.is_mutable()))
         {
             report_redefined_symbol(node.location(), var_name);
         }
@@ -164,9 +189,19 @@ namespace Cryo
     {
         const std::string &func_name = node.name();
 
-        // TODO: Parse return type and parameter types from node
-        Type *return_type = _type_context.get_void_type(); // Default for now
+        // Parse return type from node annotation
+        Type *return_type = _type_context.parse_type_from_string(node.return_type_annotation());
+        
+        // Collect parameter types
         std::vector<Type *> param_types;
+        for (const auto &param : node.parameters())
+        {
+            if (param)
+            {
+                Type *param_type = _type_context.parse_type_from_string(param->type_annotation());
+                param_types.push_back(param_type);
+            }
+        }
 
         // Create function type
         FunctionType *func_type = static_cast<FunctionType *>(
@@ -382,6 +417,19 @@ namespace Cryo
     }
 
     //===----------------------------------------------------------------------===//
+    // Statement Visitors
+    //===----------------------------------------------------------------------===//
+
+    void TypeChecker::visit(ExpressionStatementNode &node)
+    {
+        // Visit the expression
+        if (node.expression())
+        {
+            node.expression()->accept(*this);
+        }
+    }
+
+    //===----------------------------------------------------------------------===//
     // Expression Visitors
     //===----------------------------------------------------------------------===//
 
@@ -412,45 +460,81 @@ namespace Cryo
 
     void TypeChecker::visit(BinaryExpressionNode &node)
     {
-        // Visit operands
+        // Visit the left and right operands
         if (node.left())
+        {
             node.left()->accept(*this);
+        }
         if (node.right())
+        {
             node.right()->accept(*this);
-
-        // Get operand types
-        Type *lhs_type = nullptr;
-        Type *rhs_type = nullptr;
-
-        if (node.left() && node.left()->type().has_value())
-        {
-            lhs_type = _type_context.parse_type_from_string(node.left()->type().value());
         }
 
-        if (node.right() && node.right()->type().has_value())
+        // Type check the binary operation
+        if (node.left() && node.right())
         {
-            rhs_type = _type_context.parse_type_from_string(node.right()->type().value());
-        }
-
-        if (!lhs_type || !rhs_type)
-        {
-            node.set_type(_type_context.get_unknown_type()->to_string());
-            return;
-        }
-
-        // Check operation compatibility and determine result type
-        TokenKind op = node.operator_token().kind();
-
-        if (!check_binary_operation_compatibility(op, lhs_type, rhs_type, node.location()))
-        {
-            node.set_type(_type_context.get_unknown_type()->to_string());
-            return;
-        }
-
-        Type *result_type = infer_binary_expression_type(node);
-        if (result_type)
-        {
-            node.set_type(result_type->to_string());
+            Type* left_type = node.left()->get_type();
+            Type* right_type = node.right()->get_type();
+            
+            if (left_type && right_type)
+            {
+                // Check for assignment operations
+                if (node.op() == "=" || node.op() == "+=" || node.op() == "-=" || 
+                    node.op() == "*=" || node.op() == "/=")
+                {
+                    // For assignment, check if right is assignable to left
+                    if (!left_type->is_assignable_from(right_type))
+                    {
+                        diagnostics_.report_error(node.location(),
+                            "Type mismatch in assignment: cannot assign " + 
+                            right_type->get_name() + " to " + left_type->get_name());
+                    }
+                    // Assignment result has the type of the left operand
+                    node.set_type(left_type);
+                }
+                else
+                {
+                    // For other operations, types should be compatible
+                    Type* result_type = nullptr;
+                    
+                    // Arithmetic operations
+                    if (node.op() == "+" || node.op() == "-" || node.op() == "*" || node.op() == "/")
+                    {
+                        if (left_type == right_type && 
+                            (left_type->get_name() == "int" || left_type->get_name() == "double"))
+                        {
+                            result_type = left_type;
+                        }
+                        else
+                        {
+                            diagnostics_.report_error(node.location(),
+                                "Type mismatch in arithmetic operation: " + 
+                                left_type->get_name() + " " + node.op() + " " + right_type->get_name());
+                        }
+                    }
+                    // Comparison operations
+                    else if (node.op() == "==" || node.op() == "!=" || 
+                             node.op() == "<" || node.op() == ">" || 
+                             node.op() == "<=" || node.op() == ">=")
+                    {
+                        if (left_type->is_assignable_from(right_type) || right_type->is_assignable_from(left_type))
+                        {
+                            result_type = context_.type_context().get_bool_type();
+                        }
+                        else
+                        {
+                            diagnostics_.report_error(node.location(),
+                                "Cannot compare incompatible types: " + 
+                                left_type->get_name() + " and " + right_type->get_name());
+                        }
+                    }
+                    
+                    if (result_type)
+                    {
+                        node.set_type(result_type);
+                    }
+                }
+            }
         }
     }
 
@@ -520,7 +604,8 @@ namespace Cryo
     {
         switch (node.literal_kind())
         {
-        case TokenKind::TK_BOOLEAN_LITERAL:
+        case TokenKind::TK_KW_TRUE:
+        case TokenKind::TK_KW_FALSE:
             return _type_context.get_boolean_type();
 
         case TokenKind::TK_NUMERIC_CONSTANT:
