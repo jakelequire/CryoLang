@@ -499,8 +499,24 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_conditional()
     {
-        // TODO: Implement ternary operator (condition ? true_expr : false_expr)
-        return parse_logical_or();
+        auto expr = parse_logical_or();
+
+        // Check for ternary operator: condition ? true_expr : false_expr
+        if (_current_token.is(TokenKind::TK_QUESTION))
+        {
+            SourceLocation ternary_loc = _current_token.location();
+            advance(); // consume '?'
+
+            auto true_expr = parse_expression();
+
+            consume(TokenKind::TK_COLON, "Expected ':' after true expression in ternary operator");
+
+            auto false_expr = parse_conditional(); // Right associative
+
+            return _builder.create_ternary_expression(ternary_loc, std::move(expr), std::move(true_expr), std::move(false_expr));
+        }
+
+        return expr;
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_logical_or()
@@ -623,6 +639,11 @@ namespace Cryo
             return parse_string_literal();
         }
 
+        if (_current_token.is(TokenKind::TK_CHAR_CONSTANT))
+        {
+            return parse_character_literal();
+        }
+
         if (_current_token.is(TokenKind::TK_KW_TRUE) || _current_token.is(TokenKind::TK_KW_FALSE))
         {
             return parse_boolean_literal();
@@ -704,6 +725,12 @@ namespace Cryo
         return nullptr;
     }
 
+    std::unique_ptr<LiteralNode> Parser::parse_character_literal()
+    {
+        Token token = consume(TokenKind::TK_CHAR_CONSTANT, "Expected character");
+        return _builder.create_literal_node(token);
+    }
+
     std::unique_ptr<IdentifierNode> Parser::parse_identifier()
     {
         Token token = consume(TokenKind::TK_IDENTIFIER, "Expected identifier");
@@ -728,6 +755,7 @@ namespace Cryo
                _current_token.is(TokenKind::TK_KW_F64) ||
                _current_token.is(TokenKind::TK_KW_DOUBLE) ||
                _current_token.is(TokenKind::TK_KW_BOOLEAN) ||
+               _current_token.is(TokenKind::TK_KW_CHAR) ||
                _current_token.is(TokenKind::TK_KW_STRING) ||
                _current_token.is(TokenKind::TK_KW_VOID) ||
                _current_token.is(TokenKind::TK_IDENTIFIER); // For user-defined types

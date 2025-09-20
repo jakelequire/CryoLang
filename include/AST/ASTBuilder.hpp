@@ -16,6 +16,7 @@ namespace Cryo
 
         // Factory methods for creating various AST nodes
         std::unique_ptr<BinaryExpressionNode> create_binary_expression(Token op, std::unique_ptr<ExpressionNode> lhs, std::unique_ptr<ExpressionNode> rhs);
+        std::unique_ptr<TernaryExpressionNode> create_ternary_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> true_expr, std::unique_ptr<ExpressionNode> false_expr);
         std::unique_ptr<StatementNode> create_statement_node(NodeKind kind); // Simplified signature
         std::unique_ptr<DeclarationNode> create_declaration_node(Token identifier, std::unique_ptr<ExpressionNode> init = nullptr);
         std::unique_ptr<LiteralNode> create_literal_node(Token literal);

@@ -14,6 +14,17 @@ namespace Cryo
         return node;
     }
 
+    std::unique_ptr<TernaryExpressionNode> ASTBuilder::create_ternary_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> true_expr, std::unique_ptr<ExpressionNode> false_expr)
+    {
+        auto node = std::make_unique<TernaryExpressionNode>(
+            NodeKind::TernaryExpression,
+            loc,
+            std::move(condition),
+            std::move(true_expr),
+            std::move(false_expr));
+        return node;
+    }
+
     std::unique_ptr<StatementNode> ASTBuilder::create_statement_node(NodeKind kind)
     {
         SourceLocation default_loc; // You'll need to handle this properly

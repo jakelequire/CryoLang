@@ -73,6 +73,12 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    // TernaryExpressionNode visitor implementation
+    void TernaryExpressionNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     // ProgramNode visitor implementation
     void ProgramNode::accept(ASTVisitor &visitor)
     {

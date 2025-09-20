@@ -50,6 +50,7 @@ namespace Cryo
         std::string get_node_color(NodeKind kind) const;
         std::string get_literal_node_name(TokenKind kind) const;
         std::string get_literal_type_string(TokenKind kind) const;
+        bool is_float_literal(const std::string &value) const;
 
     public:
         ASTDumper(std::ostream &output, bool use_colors = true);
@@ -64,6 +65,7 @@ namespace Cryo
         void visit(LiteralNode &node) override;
         void visit(IdentifierNode &node) override;
         void visit(BinaryExpressionNode &node) override;
+        void visit(TernaryExpressionNode &node) override;
         void visit(ProgramNode &node) override;
         void visit(BlockStatementNode &node) override;
         void visit(ReturnStatementNode &node) override;

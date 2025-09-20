@@ -9,6 +9,7 @@ namespace Cryo
     class StatementNode;
     class DeclarationNode;
     class BinaryExpressionNode;
+    class TernaryExpressionNode;
     class ProgramNode;
     class BlockStatementNode;
     class ReturnStatementNode;
@@ -35,6 +36,7 @@ namespace Cryo
         virtual void visit(StatementNode &node) = 0;
         virtual void visit(DeclarationNode &node) = 0;
         virtual void visit(BinaryExpressionNode &node) = 0;
+        virtual void visit(TernaryExpressionNode &node) = 0;
         virtual void visit(ProgramNode &node) = 0;
         virtual void visit(BlockStatementNode &node) = 0;
         virtual void visit(ReturnStatementNode &node) = 0;
@@ -60,6 +62,7 @@ namespace Cryo
         void visit(StatementNode &node) override {}
         void visit(DeclarationNode &node) override {}
         void visit(BinaryExpressionNode &node) override {}
+        void visit(TernaryExpressionNode &node) override {}
         void visit(ProgramNode &node) override {}
         void visit(BlockStatementNode &node) override {}
         void visit(ReturnStatementNode &node) override {}

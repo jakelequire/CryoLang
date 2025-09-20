@@ -22,6 +22,7 @@ namespace Cryo
         Literal,
         Identifier,
         BinaryExpression,
+        TernaryExpression,
         CallExpression,
 
         // Concrete statement types
@@ -174,6 +175,48 @@ namespace Cryo
                 _left->print(os, indent + 2);
             if (_right)
                 _right->print(os, indent + 2);
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    class TernaryExpressionNode : public ExpressionNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _condition;
+        std::unique_ptr<ExpressionNode> _true_expr;
+        std::unique_ptr<ExpressionNode> _false_expr;
+
+    public:
+        TernaryExpressionNode(NodeKind kind, SourceLocation loc,
+                              std::unique_ptr<ExpressionNode> condition,
+                              std::unique_ptr<ExpressionNode> true_expr,
+                              std::unique_ptr<ExpressionNode> false_expr)
+            : ExpressionNode(kind, loc), _condition(std::move(condition)),
+              _true_expr(std::move(true_expr)), _false_expr(std::move(false_expr)) {}
+
+        ExpressionNode *condition() const { return _condition.get(); }
+        ExpressionNode *true_expression() const { return _true_expr.get(); }
+        ExpressionNode *false_expression() const { return _false_expr.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "TernaryExpression:" << std::endl;
+            if (_condition)
+            {
+                os << std::string(indent + 2, ' ') << "Condition:" << std::endl;
+                _condition->print(os, indent + 4);
+            }
+            if (_true_expr)
+            {
+                os << std::string(indent + 2, ' ') << "TrueExpr:" << std::endl;
+                _true_expr->print(os, indent + 4);
+            }
+            if (_false_expr)
+            {
+                os << std::string(indent + 2, ' ') << "FalseExpr:" << std::endl;
+                _false_expr->print(os, indent + 4);
+            }
         }
 
         void accept(ASTVisitor &visitor) override;
