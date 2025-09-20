@@ -70,12 +70,25 @@ namespace Cryo
 
     std::unique_ptr<TypedSymbolTable> TypedSymbolTable::enter_scope()
     {
-        return std::make_unique<TypedSymbolTable>(std::move(_parent_scope));
+        // Create a new symbol table with the current table as parent
+        auto current_table = std::make_unique<TypedSymbolTable>();
+        current_table->_symbols = std::move(this->_symbols);
+        current_table->_parent_scope = std::move(this->_parent_scope);
+
+        return std::make_unique<TypedSymbolTable>(std::move(current_table));
     }
 
     std::unique_ptr<TypedSymbolTable> TypedSymbolTable::exit_scope()
     {
-        return std::move(_parent_scope);
+        if (_parent_scope)
+        {
+            return std::move(_parent_scope);
+        }
+        else
+        {
+            // If no parent scope, return a new empty table to avoid null pointer
+            return std::make_unique<TypedSymbolTable>();
+        }
     }
 
     //===----------------------------------------------------------------------===//
@@ -190,7 +203,15 @@ namespace Cryo
         const std::string &func_name = node.name();
 
         // Parse return type from node annotation
-        Type *return_type = _type_context.parse_type_from_string(node.return_type_annotation());
+        const std::string &return_type_str = node.return_type_annotation();
+        Type *return_type = _type_context.parse_type_from_string(return_type_str);
+
+        if (!return_type)
+        {
+            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                         "Unable to parse return type: " + return_type_str);
+            return_type = _type_context.get_unknown_type();
+        }
 
         // Collect parameter types
         std::vector<Type *> param_types;
@@ -198,7 +219,14 @@ namespace Cryo
         {
             if (param)
             {
-                Type *param_type = _type_context.parse_type_from_string(param->type_annotation());
+                const std::string &param_type_str = param->type_annotation();
+                Type *param_type = _type_context.parse_type_from_string(param_type_str);
+                if (!param_type)
+                {
+                    report_error(TypeError::ErrorKind::InvalidOperation, param->location(),
+                                 "Unable to parse parameter type: " + param_type_str);
+                    param_type = _type_context.get_unknown_type();
+                }
                 param_types.push_back(param_type);
             }
         }
@@ -410,18 +438,6 @@ namespace Cryo
 
     void TypeChecker::visit(ExpressionStatementNode &node)
     {
-        if (node.expression())
-        {
-            node.expression()->accept(*this);
-        }
-    }
-
-    //===----------------------------------------------------------------------===//
-    // Statement Visitors
-    //===----------------------------------------------------------------------===//
-
-    void TypeChecker::visit(ExpressionStatementNode &node)
-    {
         // Visit the expression
         if (node.expression())
         {
@@ -473,24 +489,36 @@ namespace Cryo
         // Type check the binary operation
         if (node.left() && node.right())
         {
-            Type *left_type = node.left()->get_type();
-            Type *right_type = node.right()->get_type();
+            Type *left_type = nullptr;
+            Type *right_type = nullptr;
+
+            if (node.left()->type().has_value())
+            {
+                left_type = _type_context.parse_type_from_string(node.left()->type().value());
+            }
+
+            if (node.right()->type().has_value())
+            {
+                right_type = _type_context.parse_type_from_string(node.right()->type().value());
+            }
 
             if (left_type && right_type)
             {
+                TokenKind op = node.operator_token().kind();
+
                 // Check for assignment operations
-                if (node.op() == "=" || node.op() == "+=" || node.op() == "-=" ||
-                    node.op() == "*=" || node.op() == "/=")
+                if (op == TokenKind::TK_EQUAL || op == TokenKind::TK_PLUSEQUAL || op == TokenKind::TK_MINUSEQUAL ||
+                    op == TokenKind::TK_STAREQUAL || op == TokenKind::TK_SLASHEQUAL)
                 {
                     // For assignment, check if right is assignable to left
-                    if (!left_type->is_assignable_from(right_type))
+                    if (!left_type->is_assignable_from(*right_type))
                     {
-                        diagnostics_.report_error(node.location(),
-                                                  "Type mismatch in assignment: cannot assign " +
-                                                      right_type->get_name() + " to " + left_type->get_name());
+                        report_error(TypeError::ErrorKind::InvalidAssignment, node.location(),
+                                     "Type mismatch in assignment: cannot assign " +
+                                         right_type->name() + " to " + left_type->name());
                     }
                     // Assignment result has the type of the left operand
-                    node.set_type(left_type);
+                    node.set_type(left_type->name());
                 }
                 else
                 {
@@ -498,40 +526,40 @@ namespace Cryo
                     Type *result_type = nullptr;
 
                     // Arithmetic operations
-                    if (node.op() == "+" || node.op() == "-" || node.op() == "*" || node.op() == "/")
+                    if (op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS || op == TokenKind::TK_STAR || op == TokenKind::TK_SLASH)
                     {
                         if (left_type == right_type &&
-                            (left_type->get_name() == "int" || left_type->get_name() == "double"))
+                            (left_type->name() == "int" || left_type->name() == "double"))
                         {
                             result_type = left_type;
                         }
                         else
                         {
-                            diagnostics_.report_error(node.location(),
-                                                      "Type mismatch in arithmetic operation: " +
-                                                          left_type->get_name() + " " + node.op() + " " + right_type->get_name());
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Type mismatch in arithmetic operation: " +
+                                             left_type->name() + " and " + right_type->name());
                         }
                     }
                     // Comparison operations
-                    else if (node.op() == "==" || node.op() == "!=" ||
-                             node.op() == "<" || node.op() == ">" ||
-                             node.op() == "<=" || node.op() == ">=")
+                    else if (op == TokenKind::TK_EQUALEQUAL || op == TokenKind::TK_EXCLAIMEQUAL ||
+                             op == TokenKind::TK_L_ANGLE || op == TokenKind::TK_R_ANGLE ||
+                             op == TokenKind::TK_LESSEQUAL || op == TokenKind::TK_GREATEREQUAL)
                     {
-                        if (left_type->is_assignable_from(right_type) || right_type->is_assignable_from(left_type))
+                        if (left_type->is_assignable_from(*right_type) || right_type->is_assignable_from(*left_type))
                         {
-                            result_type = context_.type_context().get_bool_type();
+                            result_type = _type_context.get_boolean_type();
                         }
                         else
                         {
-                            diagnostics_.report_error(node.location(),
-                                                      "Cannot compare incompatible types: " +
-                                                          left_type->get_name() + " and " + right_type->get_name());
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Cannot compare incompatible types: " +
+                                             left_type->name() + " and " + right_type->name());
                         }
                     }
 
                     if (result_type)
                     {
-                        node.set_type(result_type);
+                        node.set_type(result_type->name());
                     }
                 }
             }
