@@ -31,6 +31,18 @@ int main(int argc, char *argv[])
         else
         {
             std::cerr << "\n❌ Compilation failed!" << std::endl;
+
+            // Still show AST if it was generated (helps with debugging)
+            try
+            {
+                std::cout << "\nGenerated AST:" << std::endl;
+                compiler->dump_ast();
+            }
+            catch (...)
+            {
+                // AST might not be available
+            }
+
             compiler->print_diagnostics();
             return 1;
         }
@@ -53,6 +65,18 @@ int main(int argc, char *argv[])
         else
         {
             std::cerr << "\n❌ Test compilation failed!" << std::endl;
+
+            // Still show AST if it was generated (helps with debugging)
+            try
+            {
+                std::cout << "\nGenerated AST:" << std::endl;
+                compiler->dump_ast();
+            }
+            catch (...)
+            {
+                // AST might not be available
+            }
+
             compiler->print_diagnostics();
 
             // Fallback: show how to use the compiler

@@ -131,6 +131,7 @@ namespace Cryo
         void visit(WhileStatementNode &node) override;
         void visit(ForStatementNode &node) override;
         void visit(ExpressionStatementNode &node) override;
+        void visit(DeclarationStatementNode &node) override;
 
         // Visitor methods - Expressions
         void visit(LiteralNode &node) override;

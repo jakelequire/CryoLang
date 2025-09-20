@@ -273,7 +273,14 @@ namespace Cryo
 
     void TypeChecker::visit(BlockStatementNode &node)
     {
-        enter_scope();
+        // Only enter a new scope if we're not already in a function scope
+        // Function parameters and body variables should share the same scope
+        bool should_create_scope = !_in_function;
+
+        if (should_create_scope)
+        {
+            enter_scope();
+        }
 
         for (const auto &stmt : node.statements())
         {
@@ -283,7 +290,10 @@ namespace Cryo
             }
         }
 
-        exit_scope();
+        if (should_create_scope)
+        {
+            exit_scope();
+        }
     }
 
     void TypeChecker::visit(ReturnStatementNode &node)
@@ -445,6 +455,15 @@ namespace Cryo
         }
     }
 
+    void TypeChecker::visit(DeclarationStatementNode &node)
+    {
+        // Forward to the wrapped declaration
+        if (node.declaration())
+        {
+            node.declaration()->accept(*this);
+        }
+    }
+
     //===----------------------------------------------------------------------===//
     // Expression Visitors
     //===----------------------------------------------------------------------===//
@@ -596,8 +615,33 @@ namespace Cryo
         // Check if callee is callable
         if (node.callee() && node.callee()->type().has_value())
         {
-            Type *callee_type = _type_context.parse_type_from_string(
-                node.callee()->type().value());
+            std::string callee_type_str = node.callee()->type().value();
+
+            // Skip reparsing for function types - the type was already correctly computed
+            // during symbol declaration. Just verify it looks like a function signature.
+            if (callee_type_str.find("->") != std::string::npos || callee_type_str.find("(") == 0)
+            {
+                // This is a function type string - trust it and proceed
+                // For now, we'll assume all well-formed function signatures are callable
+                // TODO: Implement proper return type extraction from signature
+
+                // Extract return type from function signature like "(int, int) -> int"
+                size_t arrow_pos = callee_type_str.find(" -> ");
+                if (arrow_pos != std::string::npos)
+                {
+                    std::string return_type_str = callee_type_str.substr(arrow_pos + 4);
+                    node.set_type(return_type_str);
+                }
+                else
+                {
+                    // Fallback for malformed signatures
+                    node.set_type("unknown");
+                }
+                return;
+            }
+
+            // For non-function types, use the original parsing logic
+            Type *callee_type = _type_context.parse_type_from_string(callee_type_str);
 
             if (callee_type->kind() != TypeKind::Function)
             {
