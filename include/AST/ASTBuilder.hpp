@@ -36,6 +36,7 @@ namespace Cryo
                                                                              std::string return_type,
                                                                              bool is_public = false);
         std::unique_ptr<CallExpressionNode> create_call_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> callee);
+        std::unique_ptr<NewExpressionNode> create_new_expression(SourceLocation loc, std::string type_name);
         std::unique_ptr<ArrayLiteralNode> create_array_literal(SourceLocation loc);
         std::unique_ptr<ArrayAccessNode> create_array_access(SourceLocation loc, std::unique_ptr<ExpressionNode> array, std::unique_ptr<ExpressionNode> index);
         std::unique_ptr<MemberAccessNode> create_member_access(SourceLocation loc, std::unique_ptr<ExpressionNode> object, std::string member);

@@ -898,6 +898,12 @@ namespace Cryo
             return parse_array_literal();
         }
 
+        // New expressions (constructor calls)
+        if (_current_token.is(TokenKind::TK_KW_NEW))
+        {
+            return parse_new_expression();
+        }
+
         error("Expected expression");
         return nullptr;
     }
@@ -1173,12 +1179,71 @@ namespace Cryo
         return _builder.create_array_access(access_location, std::move(expr), std::move(index));
     }
 
+    std::unique_ptr<ExpressionNode> Parser::parse_new_expression()
+    {
+        SourceLocation new_location = _current_token.location();
+        consume(TokenKind::TK_KW_NEW, "Expected 'new' keyword");
+
+        // Parse type name
+        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            error("Expected type name after 'new'");
+            return nullptr;
+        }
+
+        std::string type_name = std::string(_current_token.text());
+        advance(); // consume type name
+
+        auto new_expr = _builder.create_new_expression(new_location, type_name);
+
+        // Handle generic types like GenericStruct<string>
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            advance(); // consume '<'
+            
+            do {
+                // Accept both identifiers and type keywords (like string, int, float, etc.)
+                if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
+                {
+                    error("Expected type name in generic arguments");
+                    return nullptr;
+                }
+                
+                new_expr->add_generic_arg(std::string(_current_token.text()));
+                advance(); // consume type argument
+                
+            } while (match(TokenKind::TK_COMMA));
+
+            consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic arguments");
+        }
+
+        // Parse constructor arguments
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after type name");
+
+        if (!_current_token.is(TokenKind::TK_R_PAREN))
+        {
+            do
+            {
+                // Parse positional arguments (no named parameter support)
+                auto arg = parse_expression();
+                if (arg)
+                {
+                    new_expr->add_argument(std::move(arg));
+                }
+            } while (match(TokenKind::TK_COMMA));
+        }
+
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
+
+        return new_expr;
+    }
+
     std::unique_ptr<ExpressionNode> Parser::parse_member_access(std::unique_ptr<ExpressionNode> expr)
     {
         SourceLocation access_location = _current_token.location();
         consume(TokenKind::TK_PERIOD, "Expected '.' for member access");
 
-        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+        if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
         {
             error("Expected member name after '.'");
             return expr;
@@ -1187,7 +1252,20 @@ namespace Cryo
         std::string member_name = std::string(_current_token.text());
         advance(); // consume member name
 
-        return _builder.create_member_access(access_location, std::move(expr), member_name);
+        // Check if this is a method call (member access followed by function call)
+        if (_current_token.is(TokenKind::TK_L_PAREN))
+        {
+            // Create member access node first
+            auto member_access = _builder.create_member_access(access_location, std::move(expr), member_name);
+            
+            // Then parse the function call with the member access as the callee
+            return parse_call_expression(std::move(member_access));
+        }
+        else
+        {
+            // Simple member access (field access)
+            return _builder.create_member_access(access_location, std::move(expr), member_name);
+        }
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_array_literal()
@@ -1637,7 +1715,7 @@ namespace Cryo
         return field;
     }
 
-    std::unique_ptr<StructMethodNode> Parser::parse_struct_method()
+    std::unique_ptr<StructMethodNode> Parser::parse_struct_method(const std::string &struct_name)
     {
         SourceLocation start_loc = _current_token.location();
         

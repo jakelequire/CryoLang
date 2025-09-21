@@ -443,44 +443,62 @@ namespace Cryo
         return result;
     }
 
+    std::string TypeContext::normalize_generic_type_string(const std::string &type_str)
+    {
+        std::string result = type_str;
+        
+        // Remove spaces after commas in generic type arguments
+        size_t pos = 0;
+        while ((pos = result.find(", ", pos)) != std::string::npos)
+        {
+            result.erase(pos + 1, 1); // Remove the space after comma
+            pos += 1; // Move past the comma
+        }
+        
+        return result;
+    }
+
     Type *TypeContext::parse_type_from_string(const std::string &type_str)
     {
+        // Normalize the type string first to handle spacing inconsistencies
+        std::string normalized_type_str = normalize_generic_type_string(type_str);
+        
         // Basic type string parsing
-        if (type_str == "void")
+        if (normalized_type_str == "void")
             return get_void_type();
-        if (type_str == "boolean")
+        if (normalized_type_str == "boolean")
             return get_boolean_type();
-        if (type_str == "char")
+        if (normalized_type_str == "char")
             return get_char_type();
-        if (type_str == "string")
+        if (normalized_type_str == "string")
             return get_string_type();
-        if (type_str == "auto")
+        if (normalized_type_str == "auto")
             return get_auto_type();
 
         // Integer types
-        if (type_str == "i8")
+        if (normalized_type_str == "i8")
             return get_i8_type();
-        if (type_str == "i16")
+        if (normalized_type_str == "i16")
             return get_i16_type();
-        if (type_str == "i32")
+        if (normalized_type_str == "i32")
             return get_i32_type();
-        if (type_str == "i64")
+        if (normalized_type_str == "i64")
             return get_i64_type();
-        if (type_str == "int")
+        if (normalized_type_str == "int")
             return get_int_type();
 
         // Float types
-        if (type_str == "f32")
+        if (normalized_type_str == "f32")
             return get_f32_type();
-        if (type_str == "f64")
+        if (normalized_type_str == "f64")
             return get_f64_type();
-        if (type_str == "float")
+        if (normalized_type_str == "float")
             return get_default_float_type();
 
         // Array types (basic parsing for "type[]")
-        if (type_str.length() > 2 && type_str.substr(type_str.length() - 2) == "[]")
+        if (normalized_type_str.length() > 2 && normalized_type_str.substr(normalized_type_str.length() - 2) == "[]")
         {
-            std::string element_type_str = type_str.substr(0, type_str.length() - 2);
+            std::string element_type_str = normalized_type_str.substr(0, normalized_type_str.length() - 2);
             Type *element_type = parse_type_from_string(element_type_str);
             if (element_type)
             {
@@ -489,29 +507,29 @@ namespace Cryo
         }
 
         // Check for user-defined struct types (including generic instantiation)
-        auto struct_it = _struct_types.find(type_str);
+        auto struct_it = _struct_types.find(normalized_type_str);
         if (struct_it != _struct_types.end())
         {
             return struct_it->second.get();
         }
         
         // Check for generic instantiation syntax (e.g., "SimpleGeneric<int>")
-        size_t angle_pos = type_str.find('<');
-        if (angle_pos != std::string::npos && type_str.back() == '>')
+        size_t angle_pos = normalized_type_str.find('<');
+        if (angle_pos != std::string::npos && normalized_type_str.back() == '>')
         {
             // This looks like a generic instantiation - create struct type for it
-            return get_struct_type(type_str);
+            return get_struct_type(normalized_type_str);
         }
 
         // Check for user-defined class types
-        auto class_it = _class_types.find(type_str);
+        auto class_it = _class_types.find(normalized_type_str);
         if (class_it != _class_types.end())
         {
             return class_it->second.get();
         }
 
         // Check for generic type parameters
-        auto generic_it = _generic_types.find(type_str);
+        auto generic_it = _generic_types.find(normalized_type_str);
         if (generic_it != _generic_types.end())
         {
             return generic_it->second.get();

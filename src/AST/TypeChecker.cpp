@@ -638,6 +638,15 @@ namespace Cryo
         // Check if callee is callable
         if (node.callee() && node.callee()->type().has_value())
         {
+            // Special handling for method calls (MemberAccess as callee)
+            if (node.callee()->kind() == NodeKind::MemberAccess)
+            {
+                // For method calls, the MemberAccess already contains the return type
+                std::string return_type = node.callee()->type().value();
+                node.set_type(return_type);
+                return;
+            }
+
             std::string callee_type_str = node.callee()->type().value();
 
             // Skip reparsing for function types - the type was already correctly computed
@@ -691,6 +700,98 @@ namespace Cryo
         }
     }
 
+    void TypeChecker::visit(NewExpressionNode &node)
+    {
+        // Visit arguments first to ensure they are type-checked
+        for (const auto &arg : node.arguments())
+        {
+            if (arg)
+            {
+                arg->accept(*this);
+            }
+        }
+
+        // Build the full type name including generic arguments
+        std::string type_name = node.type_name();
+        
+        // Handle generic types
+        if (!node.generic_args().empty()) {
+            type_name += "<";
+            for (size_t i = 0; i < node.generic_args().size(); ++i) {
+                if (i > 0) type_name += ", ";
+                type_name += node.generic_args()[i];
+            }
+            type_name += ">";
+        }
+        
+        // Look for the type definition in the symbol table
+        TypedSymbol *type_symbol = _symbol_table->lookup_symbol(node.type_name());
+        
+        if (type_symbol)
+        {
+            // The type exists, so the new expression is valid
+            node.set_type(type_name);
+        }
+        else
+        {
+            // Type not found - report error and set to unknown
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                         "Undefined type '" + node.type_name() + "' in constructor call");
+            node.set_type("unknown");
+        }
+        
+        // TODO: Add constructor argument validation
+        // For now, we assume any struct/class can be constructed with any arguments
+        // Later we can add proper constructor signature checking
+    }
+
+    // Helper function to substitute generic type parameters in a type string
+    std::string substitute_generic_type(const std::string& type_str, 
+                                       const std::string& object_type,
+                                       const std::string& base_type)
+    {
+        // Extract generic arguments from object_type (e.g., "GenericStruct<string>" -> ["string"])
+        std::vector<std::string> generic_args;
+        size_t start_pos = object_type.find('<');
+        if (start_pos != std::string::npos)
+        {
+            size_t end_pos = object_type.rfind('>');
+            if (end_pos != std::string::npos && end_pos > start_pos)
+            {
+                std::string args_str = object_type.substr(start_pos + 1, end_pos - start_pos - 1);
+                
+                // Simple parsing of comma-separated generic arguments
+                std::stringstream ss(args_str);
+                std::string arg;
+                while (std::getline(ss, arg, ','))
+                {
+                    // Trim whitespace
+                    size_t first = arg.find_first_not_of(' ');
+                    if (first != std::string::npos)
+                    {
+                        size_t last = arg.find_last_not_of(' ');
+                        generic_args.push_back(arg.substr(first, (last - first + 1)));
+                    }
+                }
+            }
+        }
+
+        // For now, handle simple case of single generic parameter T -> first argument
+        if (type_str == "T" && !generic_args.empty())
+        {
+            return generic_args[0];
+        }
+        
+        // Handle U as second parameter for multi-parameter generics
+        if (type_str == "U" && generic_args.size() >= 2)
+        {
+            return generic_args[1];
+        }
+        
+        // Return original type if no substitution needed
+        return type_str;
+    }
+
     void TypeChecker::visit(MemberAccessNode &node)
     {
         // Visit the object expression first
@@ -713,30 +814,57 @@ namespace Cryo
         // Get the member name
         std::string member_name = node.member();
         
-        // Look up the type by name to get struct information
-        Type *struct_type = lookup_variable_type(object_type);
-        if (!struct_type || (struct_type->kind() != TypeKind::Struct && struct_type->kind() != TypeKind::Generic))
+        // For generic types, extract the base type name for field/method lookup
+        std::string lookup_type = object_type;
+        size_t generic_pos = object_type.find('<');
+        if (generic_pos != std::string::npos) 
+        {
+            lookup_type = object_type.substr(0, generic_pos);
+        }
+
+        // Look up the type by name to get struct/class information
+        Type *struct_type = lookup_variable_type(lookup_type);
+        if (!struct_type || (struct_type->kind() != TypeKind::Struct && 
+                            struct_type->kind() != TypeKind::Class && 
+                            struct_type->kind() != TypeKind::Generic))
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                       "Cannot access member of non-struct type: " + object_type);
+                       "Cannot access member of non-struct/class type: " + object_type);
             node.set_type("unknown");
             return;
         }
 
         // Look up field in struct field map
-        auto struct_it = _struct_fields.find(object_type);
+        auto struct_it = _struct_fields.find(lookup_type);
         if (struct_it != _struct_fields.end())
         {
             auto field_it = struct_it->second.find(member_name);
             if (field_it != struct_it->second.end())
             {
-                // Found the field - set the type
-                node.set_type(field_it->second->to_string());
+                // Found the field - substitute generic type parameters if needed
+                std::string field_type = field_it->second->to_string();
+                std::string resolved_type = substitute_generic_type(field_type, object_type, lookup_type);
+                node.set_type(resolved_type);
                 return;
             }
         }
 
-        // Field not found in struct
+        // Look up method in struct method map
+        auto method_struct_it = _struct_methods.find(lookup_type);
+        if (method_struct_it != _struct_methods.end())
+        {
+            auto method_it = method_struct_it->second.find(member_name);
+            if (method_it != method_struct_it->second.end())
+            {
+                // Found the method - substitute generic type parameters if needed
+                std::string method_return_type = method_it->second->to_string();
+                std::string resolved_type = substitute_generic_type(method_return_type, object_type, lookup_type);
+                node.set_type(resolved_type);
+                return;
+            }
+        }
+
+        // Field or method not found in struct
         report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
                    "Unknown member '" + member_name + "' in type '" + object_type + "'");
         node.set_type("unknown");
@@ -855,6 +983,14 @@ namespace Cryo
         Type *class_type = _type_context.get_class_type(class_name);
         _symbol_table->declare_symbol(class_name, class_type, node.location(), false);
 
+        // Save previous class type and set current for 'this' keyword in methods
+        Type *previous_struct_type = _current_struct_type;
+        _current_struct_type = class_type;
+        
+        // Save previous class name and set current for field/method tracking
+        std::string previous_struct_name = _current_struct_name;
+        _current_struct_name = class_name;
+
         // Enter class scope
         enter_scope();
 
@@ -907,6 +1043,10 @@ namespace Cryo
 
         // Exit class scope
         exit_scope();
+        
+        // Restore previous struct type and struct name
+        _current_struct_type = previous_struct_type;
+        _current_struct_name = previous_struct_name;
         
         node.set_type(class_name);
     }
@@ -1051,9 +1191,11 @@ namespace Cryo
             }
         }
 
-        // Save previous struct type and set current for 'this' keyword
+        // Save previous struct type and struct name
         Type *previous_struct_type = _current_struct_type;
+        std::string previous_struct_name = _current_struct_name;
         _current_struct_type = target_type;
+        _current_struct_name = target_type_name;
 
         // Enter implementation scope
         enter_scope();
@@ -1070,8 +1212,9 @@ namespace Cryo
         // Exit implementation scope
         exit_scope();
         
-        // Restore previous struct type
+        // Restore previous struct type and name
         _current_struct_type = previous_struct_type;
+        _current_struct_name = previous_struct_name;
     }
 
     void TypeChecker::visit(GenericParameterNode &node)
@@ -1142,6 +1285,19 @@ namespace Cryo
 
         // Delegate to FunctionDeclarationNode visitor for most processing
         visit(static_cast<FunctionDeclarationNode&>(node));
+        
+        // Store method information for member access resolution
+        if (!_current_struct_name.empty())
+        {
+            // Get the return type from the node
+            std::string return_type_str = node.return_type_annotation();
+            Type *return_type = _type_context.parse_type_from_string(return_type_str);
+            
+            if (return_type)
+            {
+                _struct_methods[_current_struct_name][method_name] = return_type;
+            }
+        }
     }
 
     //===----------------------------------------------------------------------===//
@@ -1405,3 +1561,5 @@ namespace Cryo
         return oss.str();
     }
 }
+
+

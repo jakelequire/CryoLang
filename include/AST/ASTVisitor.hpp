@@ -52,6 +52,7 @@ namespace Cryo
         virtual void visit(VariableDeclarationNode &node) = 0;
         virtual void visit(FunctionDeclarationNode &node) = 0;
         virtual void visit(CallExpressionNode &node) = 0;
+        virtual void visit(NewExpressionNode &node) = 0;
         virtual void visit(ArrayLiteralNode &node) = 0;
         virtual void visit(ArrayAccessNode &node) = 0;
         virtual void visit(MemberAccessNode &node) = 0;
@@ -91,6 +92,7 @@ namespace Cryo
         void visit(VariableDeclarationNode &node) override {}
         void visit(FunctionDeclarationNode &node) override {}
         void visit(CallExpressionNode &node) override {}
+        void visit(NewExpressionNode &node) override {}
         void visit(ArrayLiteralNode &node) override {}
         void visit(ArrayAccessNode &node) override {}
         void visit(MemberAccessNode &node) override {}

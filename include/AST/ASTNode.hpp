@@ -25,6 +25,7 @@ namespace Cryo
         BinaryExpression,
         TernaryExpression,
         CallExpression,
+        NewExpression,
         ArrayLiteral,
         ArrayAccess,
         MemberAccess,
@@ -944,6 +945,53 @@ namespace Cryo
             {
                 if (arg)
                     arg->print(os, indent + 4);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // New expression (constructor call)
+    class NewExpressionNode : public ExpressionNode
+    {
+    private:
+        std::string _type_name;
+        std::vector<std::string> _generic_args; // For generic types like GenericStruct<string>
+        std::vector<std::unique_ptr<ExpressionNode>> _arguments;
+
+    public:
+        NewExpressionNode(SourceLocation loc, std::string type_name)
+            : ExpressionNode(NodeKind::NewExpression, loc), _type_name(std::move(type_name)) {}
+
+        const std::string &type_name() const { return _type_name; }
+        const std::vector<std::string> &generic_args() const { return _generic_args; }
+        const std::vector<std::unique_ptr<ExpressionNode>> &arguments() const { return _arguments; }
+
+        void add_generic_arg(const std::string &type) { _generic_args.push_back(type); }
+        
+        void add_argument(std::unique_ptr<ExpressionNode> arg)
+        {
+            _arguments.push_back(std::move(arg));
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "NewExpression: " << _type_name;
+            if (!_generic_args.empty()) {
+                os << "<";
+                for (size_t i = 0; i < _generic_args.size(); ++i) {
+                    if (i > 0) os << ", ";
+                    os << _generic_args[i];
+                }
+                os << ">";
+            }
+            os << std::endl;
+            
+            if (!_arguments.empty()) {
+                os << std::string(indent + 2, ' ') << "Arguments:" << std::endl;
+                for (const auto &arg : _arguments) {
+                    if (arg) arg->print(os, indent + 4);
+                }
             }
         }
 

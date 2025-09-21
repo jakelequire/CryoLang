@@ -438,6 +438,36 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(NewExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "NewExpr";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " '" << node.type_name();
+        
+        // Print generic arguments if any
+        if (!node.generic_args().empty()) {
+            _output << "<";
+            for (size_t i = 0; i < node.generic_args().size(); ++i) {
+                if (i > 0) _output << ", ";
+                _output << node.generic_args()[i];
+            }
+            _output << ">";
+        }
+        
+        _output << "'" << std::endl;
+
+        // Dump arguments
+        const auto &args = node.arguments();
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            bool is_last = (i == args.size() - 1);
+            dump_child(args[i].get(), is_last);
+        }
+    }
+
     void ASTDumper::visit(ArrayLiteralNode &node)
     {
         print_prefix();
