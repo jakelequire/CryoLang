@@ -849,6 +849,91 @@ namespace Cryo
         _output << std::endl;
     }
 
+    void ASTDumper::visit(EnumDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "EnumDeclaration";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        // Dump variants
+        const auto &variants = node.variants();
+        for (size_t i = 0; i < variants.size(); ++i)
+        {
+            dump_child(variants[i].get(), i == variants.size() - 1);
+        }
+    }
+
+    void ASTDumper::visit(EnumVariantNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(NodeKind::Declaration) << "EnumVariant";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        if (!node.is_simple_variant())
+        {
+            _output << " (";
+            const auto &types = node.associated_types();
+            for (size_t i = 0; i < types.size(); ++i)
+            {
+                if (i > 0) _output << ", ";
+                if (_use_colors)
+                    _output << Colors::TYPE;
+                _output << types[i];
+                if (_use_colors)
+                    _output << Colors::RESET;
+            }
+            _output << ")";
+        }
+
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(ScopeResolutionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ScopeResolution";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << node.scope_name();
+        if (_use_colors)
+            _output << Colors::RESET;
+        
+        _output << "::";
+        
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << node.member_name();
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+    }
+
     void ASTDumper::visit(ImplementationBlockNode &node)
     {
         print_prefix();

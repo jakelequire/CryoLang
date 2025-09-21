@@ -742,6 +742,35 @@ namespace Cryo
         node.set_type("unknown");
     }
 
+    void TypeChecker::visit(ScopeResolutionNode &node)
+    {
+        const std::string &scope_name = node.scope_name();
+        const std::string &member_name = node.member_name();
+        
+        // Look up the scope type (should be an enum)
+        Type *scope_type = lookup_variable_type(scope_name);
+        if (!scope_type)
+        {
+            report_undefined_symbol(node.location(), scope_name);
+            node.set_type(_type_context.get_unknown_type()->to_string());
+            return;
+        }
+        
+        // Verify it's an enum type
+        if (scope_type->kind() != TypeKind::Enum)
+        {
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                       "Scope resolution '::' can only be used with enum types, got: " + scope_name);
+            node.set_type(_type_context.get_unknown_type()->to_string());
+            return;
+        }
+        
+        // For enum scope resolution like Color::RED, the type should be Color
+        // TODO: In a more complete implementation, we would validate that RED is a valid variant of Color
+        // For now, we'll just set the type to the enum type
+        node.set_type(scope_type->to_string());
+    }
+
     //===----------------------------------------------------------------------===//
     // Struct/Class Declaration Visitors
     //===----------------------------------------------------------------------===//
@@ -906,6 +935,94 @@ namespace Cryo
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
                        "Invalid target type for type alias: " + target_type_str);
+        }
+    }
+
+    void TypeChecker::visit(EnumDeclarationNode &node)
+    {
+        std::string enum_name = node.name();
+        
+        // Check for redefinition
+        if (_symbol_table->lookup_symbol(enum_name))
+        {
+            report_redefined_symbol(node.location(), enum_name);
+            return;
+        }
+
+        // Collect variant information
+        std::vector<std::string> variant_names;
+        bool is_simple_enum = node.is_simple_enum();
+        
+        for (const auto &variant : node.variants())
+        {
+            if (variant)
+            {
+                variant_names.push_back(variant->name());
+                variant->accept(*this);
+            }
+        }
+
+        // Create enum type and register it
+        Type *enum_type = _type_context.get_enum_type(enum_name, variant_names, is_simple_enum);
+        _symbol_table->declare_symbol(enum_name, enum_type, node.location(), false);
+        
+        // For simple enums (C-style), register each variant as a constant
+        if (is_simple_enum)
+        {
+            int variant_value = 0;
+            for (const auto &variant : node.variants())
+            {
+                if (variant)
+                {
+                    // Simple variants are essentially integer constants
+                    Type *int_type = _type_context.get_int_type();
+                    _symbol_table->declare_symbol(variant->name(), int_type, variant->location(), false);
+                    variant_value++;
+                }
+            }
+        }
+        else
+        {
+            // For complex enums (Rust-style), variants are constructor functions
+            for (const auto &variant : node.variants())
+            {
+                if (variant && !variant->is_simple_variant())
+                {
+                    // Create a function type for the variant constructor
+                    std::vector<Type*> param_types;
+                    for (const auto &type_str : variant->associated_types())
+                    {
+                        Type *param_type = _type_context.parse_type_from_string(type_str);
+                        if (param_type)
+                        {
+                            param_types.push_back(param_type);
+                        }
+                    }
+                    
+                    Type *variant_constructor = _type_context.create_function_type(enum_type, param_types);
+                    _symbol_table->declare_symbol(variant->name(), variant_constructor, variant->location(), false);
+                }
+            }
+        }
+        
+        // EnumDeclarationNode is a DeclarationNode, not ExpressionNode, so no set_type call needed
+    }
+
+    void TypeChecker::visit(EnumVariantNode &node)
+    {
+        // Individual variant processing - validation is mostly done in EnumDeclarationNode
+        if (!node.is_simple_variant())
+        {
+            // Validate associated types for complex variants
+            for (const auto &type_str : node.associated_types())
+            {
+                Type *type = _type_context.parse_type_from_string(type_str);
+                if (!type || type->kind() == TypeKind::Unknown)
+                {
+                    report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                               "Invalid type in enum variant: " + type_str);
+                }
+            }
         }
     }
 

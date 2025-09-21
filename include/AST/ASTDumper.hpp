@@ -84,7 +84,10 @@ namespace Cryo
         void visit(DeclarationStatementNode &node) override;
         void visit(StructDeclarationNode &node) override;
         void visit(ClassDeclarationNode &node) override;
+        void visit(EnumDeclarationNode &node) override;
+        void visit(EnumVariantNode &node) override;
         void visit(TypeAliasDeclarationNode &node) override;
+        void visit(ScopeResolutionNode &node) override;
         void visit(ImplementationBlockNode &node) override;
         void visit(GenericParameterNode &node) override;
         void visit(StructFieldNode &node) override;

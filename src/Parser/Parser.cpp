@@ -359,7 +359,7 @@ namespace Cryo
             return parse_variable_declaration();
         }
 
-        // Type declarations - struct, class, type alias
+        // Type declarations - struct, class, type alias, enum
         if (_current_token.is(TokenKind::TK_KW_TYPE))
         {
             // Look ahead to see if it's "type struct", "type class", or "type alias"
@@ -372,10 +372,20 @@ namespace Cryo
             {
                 return parse_class_declaration();
             }
+            else if (next.is(TokenKind::TK_KW_ENUM))
+            {
+                return parse_enum_declaration();
+            }
             else
             {
                 return parse_type_alias_declaration();
             }
+        }
+
+        // Standalone enum declaration
+        if (_current_token.is(TokenKind::TK_KW_ENUM))
+        {
+            return parse_enum_declaration();
         }
 
         // Class declaration
@@ -816,10 +826,31 @@ namespace Cryo
             return std::move(expr);
         }
 
-        // Identifiers (can be function calls or variable references)
+        // Identifiers (can be function calls, variable references, or scope resolution)
         if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
             auto identifier = parse_identifier();
+            
+            // Check for scope resolution (Type::Member)
+            if (_current_token.is(TokenKind::TK_COLONCOLON))
+            {
+                advance(); // consume '::'
+                
+                if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                {
+                    error("Expected identifier after '::'");
+                    return nullptr;
+                }
+                
+                std::string scope_name = identifier->name();
+                std::string member_name = std::string(_current_token.text());
+                SourceLocation loc = identifier->location();
+                
+                advance(); // consume member identifier
+                
+                // Create scope resolution node
+                return _builder.create_scope_resolution(loc, scope_name, member_name);
+            }
 
             // Handle postfix expressions (function calls, array access, etc.)
             std::unique_ptr<ExpressionNode> expr = std::move(identifier);
@@ -1349,6 +1380,101 @@ namespace Cryo
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after type alias");
         
         return _builder.create_type_alias_declaration(start_loc, alias_name, target_type);
+    }
+
+    std::unique_ptr<EnumDeclarationNode> Parser::parse_enum_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+        
+        // Handle both "enum" and "type enum" syntax
+        if (_current_token.is(TokenKind::TK_KW_TYPE))
+        {
+            consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
+        }
+        
+        consume(TokenKind::TK_KW_ENUM, "Expected 'enum'");
+        
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected enum name");
+        std::string enum_name = std::string(name_token.text());
+        
+        auto enum_decl = _builder.create_enum_declaration(start_loc, enum_name);
+        
+        // Parse generic parameters if present
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            auto generic_params = parse_generic_parameters();
+            for (auto &param : generic_params)
+            {
+                enum_decl->add_generic_parameter(std::move(param));
+            }
+        }
+        
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after enum name");
+        
+        // Parse enum variants
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            auto variant = parse_enum_variant();
+            if (variant)
+            {
+                enum_decl->add_variant(std::move(variant));
+            }
+            
+            // Optional comma between variants
+            if (_current_token.is(TokenKind::TK_COMMA))
+            {
+                advance();
+            }
+        }
+        
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after enum body");
+        
+        return enum_decl;
+    }
+
+    std::unique_ptr<EnumVariantNode> Parser::parse_enum_variant()
+    {
+        SourceLocation start_loc = _current_token.location();
+        
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected enum variant name");
+        std::string variant_name = std::string(name_token.text());
+        
+        // Check if this is a simple variant (C-style) or complex variant (Rust-style)
+        if (_current_token.is(TokenKind::TK_L_PAREN))
+        {
+            // Complex variant with associated data: Bar(Baz)
+            consume(TokenKind::TK_L_PAREN, "Expected '('");
+            
+            std::vector<std::string> associated_types;
+            
+            // Parse associated types
+            if (!_current_token.is(TokenKind::TK_R_PAREN))
+            {
+                do
+                {
+                    std::string type = parse_type();
+                    associated_types.push_back(type);
+                    
+                    if (_current_token.is(TokenKind::TK_COMMA))
+                    {
+                        advance();
+                    }
+                    else
+                    {
+                        break;
+                    }
+                } while (!is_at_end());
+            }
+            
+            consume(TokenKind::TK_R_PAREN, "Expected ')' after variant types");
+            
+            return _builder.create_enum_variant(start_loc, variant_name, associated_types);
+        }
+        else
+        {
+            // Simple variant: NAME_1, NAME_2
+            return _builder.create_enum_variant(start_loc, variant_name);
+        }
     }
 
     std::unique_ptr<ImplementationBlockNode> Parser::parse_implementation_block()

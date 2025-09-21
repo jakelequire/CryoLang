@@ -424,6 +424,35 @@ namespace Cryo
         std::string to_string() const override { return _name; }
     };
 
+    // Enum type (user-defined)
+    class EnumType : public Type
+    {
+    private:
+        std::vector<std::string> _variants;
+        bool _is_simple_enum; // true for C-style, false for Rust-style
+
+    public:
+        EnumType(const std::string &name, std::vector<std::string> variants, bool is_simple = true)
+            : Type(TypeKind::Enum, name), _variants(std::move(variants)), _is_simple_enum(is_simple) {}
+
+        bool is_primitive() const override { return _is_simple_enum; }
+        bool is_value_type() const override { return true; }
+        size_t size_bytes() const override 
+        { 
+            return _is_simple_enum ? sizeof(int) : sizeof(void*); // Simple enums are ints, complex ones are tagged unions
+        }
+        size_t alignment() const override { return _is_simple_enum ? sizeof(int) : sizeof(void*); }
+        std::string to_string() const override { return _name; }
+
+        const std::vector<std::string> &variants() const { return _variants; }
+        bool is_simple_enum() const { return _is_simple_enum; }
+        
+        bool has_variant(const std::string &variant_name) const 
+        {
+            return std::find(_variants.begin(), _variants.end(), variant_name) != _variants.end();
+        }
+    };
+
     // Type factory and context for managing types
     class TypeContext
     {
@@ -443,6 +472,7 @@ namespace Cryo
         // User-defined type cache
         std::unordered_map<std::string, std::unique_ptr<StructType>> _struct_types;
         std::unordered_map<std::string, std::unique_ptr<ClassType>> _class_types;
+        std::unordered_map<std::string, std::unique_ptr<EnumType>> _enum_types;
         std::unordered_map<std::string, std::unique_ptr<Type>> _generic_types;
 
         // Complex type cache
@@ -483,6 +513,7 @@ namespace Cryo
         // Create user-defined types
         Type *get_struct_type(const std::string &name);
         Type *get_class_type(const std::string &name);
+        Type *get_enum_type(const std::string &name, std::vector<std::string> variants = {}, bool is_simple = true);
         Type *get_generic_type(const std::string &name);
 
         // Type parsing utilities

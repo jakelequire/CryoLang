@@ -624,6 +624,22 @@ namespace Cryo
         return result;
     }
 
+    Type *TypeContext::get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple)
+    {
+        auto it = _enum_types.find(name);
+        if (it != _enum_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Create new enum type
+        auto enum_type = std::make_unique<EnumType>(name, std::move(variants), is_simple);
+        Type *result = enum_type.get();
+        _enum_types[name] = std::move(enum_type);
+
+        return result;
+    }
+
     Type *TypeContext::get_generic_type(const std::string &name)
     {
         // Check if we already have this generic type

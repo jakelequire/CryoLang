@@ -134,6 +134,8 @@ namespace Cryo
         void visit(FunctionDeclarationNode &node) override;
         void visit(StructDeclarationNode &node) override;
         void visit(ClassDeclarationNode &node) override;
+        void visit(EnumDeclarationNode &node) override;
+        void visit(EnumVariantNode &node) override;
         void visit(TypeAliasDeclarationNode &node) override;
         void visit(ImplementationBlockNode &node) override;
         void visit(GenericParameterNode &node) override;
@@ -155,6 +157,7 @@ namespace Cryo
         void visit(BinaryExpressionNode &node) override;
         void visit(CallExpressionNode &node) override;
         void visit(MemberAccessNode &node) override;
+        void visit(ScopeResolutionNode &node) override;
 
     private:
         // Type inference and deduction
