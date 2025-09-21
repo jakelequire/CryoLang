@@ -608,6 +608,81 @@ namespace Cryo
         }
     }
 
+    void TypeChecker::visit(UnaryExpressionNode &node)
+    {
+        // Visit the operand first
+        if (node.operand())
+        {
+            node.operand()->accept(*this);
+
+            Type *operand_type = node.operand()->type().has_value()
+                                     ? _type_context.parse_type_from_string(node.operand()->type().value())
+                                     : nullptr;
+
+            if (operand_type)
+            {
+                TokenKind op = node.operator_token().kind();
+
+                if (op == TokenKind::TK_AMP) // Address-of operator (&)
+                {
+                    // Create a pointer type to the operand type
+                    Type *pointer_type = _type_context.create_pointer_type(operand_type);
+                    node.set_type(pointer_type->to_string());
+                }
+                else if (op == TokenKind::TK_STAR) // Dereference operator (*)
+                {
+                    // Operand should be a pointer or reference type
+                    if (operand_type->kind() == TypeKind::Pointer)
+                    {
+                        // Get the pointee type
+                        auto *ptr_type = static_cast<PointerType *>(operand_type);
+                        node.set_type(ptr_type->pointee_type()->to_string());
+                    }
+                    else if (operand_type->kind() == TypeKind::Reference)
+                    {
+                        // Get the referent type
+                        auto *ref_type = static_cast<ReferenceType *>(operand_type);
+                        node.set_type(ref_type->referent_type()->to_string());
+                    }
+                    else
+                    {
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Cannot dereference non-pointer/reference type: " + operand_type->to_string());
+                    }
+                }
+                else if (op == TokenKind::TK_MINUS) // Unary minus
+                {
+                    if (is_numeric_type(operand_type))
+                    {
+                        node.set_type(operand_type->to_string());
+                    }
+                    else
+                    {
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Unary minus cannot be applied to non-numeric type: " + operand_type->to_string());
+                    }
+                }
+                else if (op == TokenKind::TK_EXCLAIM) // Logical NOT
+                {
+                    if (is_boolean_context_valid(operand_type))
+                    {
+                        node.set_type(_type_context.get_boolean_type()->to_string());
+                    }
+                    else
+                    {
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Logical NOT cannot be applied to non-boolean type: " + operand_type->to_string());
+                    }
+                }
+                else
+                {
+                    report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                 "Unknown unary operator: " + node.operator_token().to_string());
+                }
+            }
+        }
+    }
+
     void TypeChecker::visit(CallExpressionNode &node)
     {
         // Visit callee

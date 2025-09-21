@@ -175,6 +175,14 @@ namespace Cryo
     // Type parsing
     std::string Parser::parse_type()
     {
+        // Handle reference types (&type)
+        if (_current_token.is(TokenKind::TK_AMP))
+        {
+            advance(); // consume '&'
+            std::string base_type = parse_type(); // recursive call
+            return "&" + base_type;
+        }
+
         if (!is_type_token())
         {
             error("Expected type");
@@ -221,11 +229,26 @@ namespace Cryo
             base_type += "[]";
         }
 
+        // Handle pointer types (type *)
+        while (_current_token.is(TokenKind::TK_STAR))
+        {
+            advance(); // consume '*'
+            base_type += "*";
+        }
+
         return base_type;
     }
 
     Type *Parser::parse_type_annotation()
     {
+        // Handle reference types (&type)
+        if (_current_token.is(TokenKind::TK_AMP))
+        {
+            advance(); // consume '&'
+            Type *base_type = parse_type_annotation(); // recursive call
+            return _context.types().create_reference_type(base_type);
+        }
+
         if (!is_type_token())
         {
             error("Expected type");
@@ -308,6 +331,13 @@ namespace Cryo
             consume(TokenKind::TK_L_SQUARE, "Expected '['");
             consume(TokenKind::TK_R_SQUARE, "Expected ']'");
             base_type = _context.types().create_array_type(base_type);
+        }
+
+        // Handle pointer types (type *)
+        while (_current_token.is(TokenKind::TK_STAR))
+        {
+            advance(); // consume '*'
+            base_type = _context.types().create_pointer_type(base_type);
         }
 
         return base_type;
@@ -745,15 +775,15 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_unary()
     {
-        if (_current_token.is(TokenKind::TK_MINUS) || _current_token.is(TokenKind::TK_EXCLAIM))
+        if (_current_token.is(TokenKind::TK_MINUS) || _current_token.is(TokenKind::TK_EXCLAIM) ||
+            _current_token.is(TokenKind::TK_AMP) || _current_token.is(TokenKind::TK_STAR))
         {
             Token op = _current_token;
             advance();
             auto expr = parse_unary();
 
-            // Create unary expression (treat as binary with null left operand for now)
-            // TODO: Create proper unary expression node
-            return _builder.create_binary_expression(op, nullptr, std::move(expr));
+            // Create proper unary expression node
+            return _builder.create_unary_expression(op, std::move(expr));
         }
 
         return parse_primary();

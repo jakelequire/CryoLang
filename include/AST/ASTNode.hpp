@@ -23,6 +23,7 @@ namespace Cryo
         Literal,
         Identifier,
         BinaryExpression,
+        UnaryExpression,
         TernaryExpression,
         CallExpression,
         NewExpression,
@@ -186,6 +187,30 @@ namespace Cryo
                 _left->print(os, indent + 2);
             if (_right)
                 _right->print(os, indent + 2);
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    class UnaryExpressionNode : public ExpressionNode
+    {
+    private:
+        Token _operator;
+        std::unique_ptr<ExpressionNode> _operand;
+
+    public:
+        UnaryExpressionNode(NodeKind kind, SourceLocation loc, Token op,
+                           std::unique_ptr<ExpressionNode> operand)
+            : ExpressionNode(kind, loc), _operator(op), _operand(std::move(operand)) {}
+
+        const Token &operator_token() const { return _operator; }
+        ExpressionNode *operand() const { return _operand.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "UnaryExpression: " << _operator.to_string() << std::endl;
+            if (_operand)
+                _operand->print(os, indent + 2);
         }
 
         void accept(ASTVisitor &visitor) override;

@@ -276,6 +276,38 @@ namespace Cryo
         dump_child(node.right(), true);
     }
 
+    void ASTDumper::visit(UnaryExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "UnaryOperator";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.operator_token().to_string() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        // Display type if available
+        if (node.type().has_value())
+        {
+            _output << " ";
+            if (_use_colors)
+                _output << Colors::TYPE;
+            _output << "'" << node.type().value() << "'";
+            if (_use_colors)
+                _output << Colors::RESET;
+        }
+
+        _output << std::endl;
+
+        // Dump operand
+        dump_child(node.operand(), true);
+    }
+
     void ASTDumper::visit(TernaryExpressionNode &node)
     {
         print_prefix();
