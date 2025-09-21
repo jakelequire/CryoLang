@@ -715,7 +715,7 @@ namespace Cryo
         
         // Look up the type by name to get struct information
         Type *struct_type = lookup_variable_type(object_type);
-        if (!struct_type || struct_type->kind() != TypeKind::Struct)
+        if (!struct_type || (struct_type->kind() != TypeKind::Struct && struct_type->kind() != TypeKind::Generic))
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
                        "Cannot access member of non-struct type: " + object_type);
@@ -723,20 +723,23 @@ namespace Cryo
             return;
         }
 
-        // For struct types, look up the field type
-        // TODO: This is simplified - we need proper field type lookup from struct definition
-        // For now, assume basic field types based on common names
-        if (member_name == "x" || member_name == "y" || member_name == "z")
+        // Look up field in struct field map
+        auto struct_it = _struct_fields.find(object_type);
+        if (struct_it != _struct_fields.end())
         {
-            node.set_type("int");
+            auto field_it = struct_it->second.find(member_name);
+            if (field_it != struct_it->second.end())
+            {
+                // Found the field - set the type
+                node.set_type(field_it->second->to_string());
+                return;
+            }
         }
-        else
-        {
-            // Unknown member - this would normally be caught by checking struct definition
-            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                       "Unknown member '" + member_name + "' in type '" + object_type + "'");
-            node.set_type("unknown");
-        }
+
+        // Field not found in struct
+        report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                   "Unknown member '" + member_name + "' in type '" + object_type + "'");
+        node.set_type("unknown");
     }
 
     //===----------------------------------------------------------------------===//
@@ -758,6 +761,14 @@ namespace Cryo
         // This allows fields to reference this struct type or other struct types
         Type *struct_type = _type_context.get_struct_type(struct_name);
         _symbol_table->declare_symbol(struct_name, struct_type, node.location(), false);
+
+        // Save previous struct type and set current for 'this' keyword in methods
+        Type *previous_struct_type = _current_struct_type;
+        _current_struct_type = struct_type;
+        
+        // Save previous struct name and set current for field tracking
+        std::string previous_struct_name = _current_struct_name;
+        _current_struct_name = struct_name;
 
         // Enter struct scope
         enter_scope();
@@ -791,6 +802,10 @@ namespace Cryo
 
         // Exit struct scope
         exit_scope();
+        
+        // Restore previous struct type and struct name
+        _current_struct_type = previous_struct_type;
+        _current_struct_name = previous_struct_name;
         
         node.set_type(struct_name);
     }
@@ -980,6 +995,13 @@ namespace Cryo
         {
             // Register field in current scope (struct/class scope)
             _symbol_table->declare_symbol(field_name, field_type, node.location(), node.is_mutable());
+            
+            // Store field information for later member access resolution
+            if (!_current_struct_name.empty())
+            {
+                _struct_fields[_current_struct_name][field_name] = field_type;
+            }
+            
             node.set_type(field_type_str);
         }
         else

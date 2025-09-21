@@ -488,11 +488,19 @@ namespace Cryo
             }
         }
 
-        // Check for user-defined struct types
+        // Check for user-defined struct types (including generic instantiation)
         auto struct_it = _struct_types.find(type_str);
         if (struct_it != _struct_types.end())
         {
             return struct_it->second.get();
+        }
+        
+        // Check for generic instantiation syntax (e.g., "SimpleGeneric<int>")
+        size_t angle_pos = type_str.find('<');
+        if (angle_pos != std::string::npos && type_str.back() == '>')
+        {
+            // This looks like a generic instantiation - create struct type for it
+            return get_struct_type(type_str);
         }
 
         // Check for user-defined class types
@@ -500,6 +508,13 @@ namespace Cryo
         if (class_it != _class_types.end())
         {
             return class_it->second.get();
+        }
+
+        // Check for generic type parameters
+        auto generic_it = _generic_types.find(type_str);
+        if (generic_it != _generic_types.end())
+        {
+            return generic_it->second.get();
         }
 
         return get_unknown_type();
@@ -611,7 +626,16 @@ namespace Cryo
 
     Type *TypeContext::get_generic_type(const std::string &name)
     {
-        // For now, return unknown type - generics need special handling
-        return get_unknown_type();
+        // Check if we already have this generic type
+        auto it = _generic_types.find(name);
+        if (it != _generic_types.end()) {
+            return it->second.get();
+        }
+        
+        // Create new generic type
+        auto generic_type = std::make_unique<GenericType>(name);
+        Type *type_ptr = generic_type.get();
+        _generic_types[name] = std::move(generic_type);
+        return type_ptr;
     }
 }
