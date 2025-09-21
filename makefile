@@ -19,21 +19,8 @@
 # Cryo Compiler Makefile                                                       *
 #*******************************************************************************
 
-# --------------------------------------------- #
-# `-O0`    - No optimization					#
-# `-O1`    - Basic optimization					#
-# `-O2`    - Further optimization				#
-# `-O3`    - Maximum optimization				#
-# `-Og`    - Optimize debugging experience		#
-# `-Os`    - Optimize for size					#
-# `-Ofast` - Optimize for speed					#
-# `-Oz`    - Optimize for size					#
-# --------------------------------------------- #
-OPTIMIZATION =  -Og
-NO_WARNINGS =   -w
-DEBUG_FLAGS =   -D_CRT_SECURE_NO_WARNINGS  $(NO_WARNINGS) -g
-C_STANDARD =    -std=c23
-CXX_STANDARD =  -std=c++23
+# Include shared configuration
+include makefile.config
 
 # Determine number of CPU cores
 ifeq ($(OS), Windows_NT)
@@ -44,66 +31,9 @@ endif
 
 NUM_JOBS = $(shell expr $(NUM_CORES) + 1)
 
-# OS-specific settings for compilers
-ifeq ($(OS), Windows_NT)
-# Windows settings
-	C_COMPILER = clang
-	CXX_COMPILER = clang++
-	PYTHON = python
-else
-# Linux settings
-	C_COMPILER = clang-20
-	CXX_COMPILER = clang++-20
-	PYTHON = python3
-endif
-
 # >>=======--------------------------------------------------=======<< #
 # >>=======                 Include Paths                    =======<< #
 # >>=======--------------------------------------------------=======<< #
-
-# Include paths
-LINUX_INCLUDES =    -I./include
-
-WIN_INCLUDES =      -I"C:/msys64/mingw64/include" -I./include
-
-# >>=======--------------------------------------------------=======<< #
-# >>=======       OS-specific settings for compilers         =======<< #
-# >>=======--------------------------------------------------=======<< #
-
-# OS-specific settings
-ifeq ($(OS), Windows_NT)
-    # Windows settings
-    CC =            $(C_COMPILER) $(C_STANDARD) $(DEBUG_FLAGS) $(OPTIMIZATION)
-    CXX =           $(CXX_COMPILER) $(CXX_STANDARD) $(DEBUG_FLAGS) $(OPTIMIZATION)
-    CFLAGS =        $(WIN_INCLUDES) $(LLVM_CFLAGS) -fexceptions
-    CXXFLAGS =      $(WIN_INCLUDES) $(LLVM_CXXFLAGS) -fexceptions
-    LDFLAGS =       $(LLVM_LDFLAGS) $(STDLIBS) -v
-    LLVM_CONFIG =   llvm-config
-    LLVM_CFLAGS =   $(shell $(LLVM_CONFIG) --cflags)
-    LLVM_CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
-    LLVM_LDFLAGS =  $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs) $(shell $(LLVM_CONFIG) --system-libs)
-    STDLIBS :=      
-    MKDIR =         if not exist
-    RMDIR =         rmdir /S /Q
-    DEL =           del /Q
-    BIN_SUFFIX =    .exe
-else
-    # Linux settings
-    CC =            $(C_COMPILER) $(C_STANDARD) $(DEBUG_FLAGS) $(OPTIMIZATION)
-    CXX =           $(CXX_COMPILER) $(CXX_STANDARD) $(DEBUG_FLAGS) $(OPTIMIZATION)
-    CFLAGS =        $(LINUX_INCLUDES) $(LLVM_CFLAGS) -fexceptions
-    CXXFLAGS =      $(LINUX_INCLUDES) $(LLVM_CXXFLAGS) -fexceptions
-    LLVM_CONFIG =   llvm-config-20
-    LLVM_CFLAGS =   $(shell $(LLVM_CONFIG) --cflags)
-    LLVM_CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
-    LLVM_LDFLAGS =  $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs) $(shell $(LLVM_CONFIG) --system-libs)
-    LDFLAGS =       $(LLVM_LDFLAGS) -lpthread -v
-    STD_LIBS =      -lstdc++ -lm -lc -lgcc -lgcc_eh -lstdc++fs
-    MKDIR =         mkdir -p
-    RMDIR =         rm -rf
-    DEL =           rm -f
-    BIN_SUFFIX =
-endif
 
 # >>=======--------------------------------------------------=======<< #
 # >>=======                  Define Paths                    =======<< #
@@ -212,6 +142,18 @@ endif
 # Build timer script
 BUILD_TIMER = ./scripts/build_timer.py
 
+# >>=======--------------------------------------------------=======<< #
+# >>=======                    TOOLS                         =======<< #
+# >>=======--------------------------------------------------=======<< #
+
+# Tools targets - delegate to individual tool makefiles
+.PHONY: tools lsp
+tools: lsp
+
+lsp: $(MAIN_BIN)
+	@echo "Building CryoLSP..."
+	@$(MAKE) -C tools/CryoLSP
+
 # Timed build target
 .PHONY: timed-build
 timed-build:
@@ -235,6 +177,7 @@ build: $(MAIN_BIN)
 # Clean all components
 clean:
 	@$(PYTHON) ./scripts/clean.py
+	@$(MAKE) -C tools/CryoLSP clean 2>/dev/null || true
 
-.PHONY: debug clean all 
+.PHONY: debug clean all lsp tools
 .NOTPARALLEL: clean clean-% libs
