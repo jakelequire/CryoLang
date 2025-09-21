@@ -78,7 +78,7 @@ ifeq ($(OS), Windows_NT)
     CFLAGS =        $(WIN_INCLUDES) $(LLVM_CFLAGS) -fexceptions
     CXXFLAGS =      $(WIN_INCLUDES) $(LLVM_CXXFLAGS) -fexceptions
     LDFLAGS =       $(LLVM_LDFLAGS) $(STDLIBS) -v
-    LLVM_CONFIG =   llvm-config-20
+    LLVM_CONFIG =   llvm-config
     LLVM_CFLAGS =   $(shell $(LLVM_CONFIG) --cflags)
     LLVM_CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
     LLVM_LDFLAGS =  $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs) $(shell $(LLVM_CONFIG) --system-libs)

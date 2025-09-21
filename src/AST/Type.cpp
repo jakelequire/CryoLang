@@ -270,6 +270,44 @@ namespace Cryo
     }
 
     //===----------------------------------------------------------------------===//
+    // Reference Type Implementation
+    //===----------------------------------------------------------------------===//
+
+    std::string ReferenceType::to_string() const
+    {
+        return "&" + _referent_type->to_string();
+    }
+
+    bool ReferenceType::equals(const Type &other) const
+    {
+        if (other.kind() != TypeKind::Reference)
+            return false;
+
+        const auto &other_ref = static_cast<const ReferenceType &>(other);
+        return _referent_type->equals(*other_ref._referent_type);
+    }
+
+    bool ReferenceType::is_assignable_from(const Type &other) const
+    {
+        // Reference can be assigned from a pointer to the same type
+        if (other.kind() == TypeKind::Pointer)
+        {
+            const auto &other_ptr = static_cast<const PointerType &>(other);
+            return _referent_type->equals(*other_ptr.pointee_type());
+        }
+
+        // Reference can be assigned from another reference to the same type
+        if (other.kind() == TypeKind::Reference)
+        {
+            const auto &other_ref = static_cast<const ReferenceType &>(other);
+            return _referent_type->equals(*other_ref._referent_type);
+        }
+
+        // Default behavior
+        return Type::is_assignable_from(other);
+    }
+
+    //===----------------------------------------------------------------------===//
     // Function Type Implementation
     //===----------------------------------------------------------------------===//
 
@@ -413,6 +451,17 @@ namespace Cryo
         return result;
     }
 
+    Type *TypeContext::create_reference_type(Type *referent_type)
+    {
+        auto reference_type = std::make_unique<ReferenceType>(
+            std::shared_ptr<Type>(referent_type, [](Type *) {}));
+
+        Type *result = reference_type.get();
+        _complex_types.push_back(std::move(reference_type));
+
+        return result;
+    }
+
     Type *TypeContext::create_optional_type(Type *wrapped_type)
     {
         auto optional_type = std::make_unique<OptionalType>(
@@ -503,6 +552,28 @@ namespace Cryo
             if (element_type)
             {
                 return create_array_type(element_type);
+            }
+        }
+
+        // Pointer types (basic parsing for "type*")
+        if (normalized_type_str.length() > 1 && normalized_type_str.back() == '*')
+        {
+            std::string pointee_type_str = normalized_type_str.substr(0, normalized_type_str.length() - 1);
+            Type *pointee_type = parse_type_from_string(pointee_type_str);
+            if (pointee_type)
+            {
+                return create_pointer_type(pointee_type);
+            }
+        }
+
+        // Reference types (basic parsing for "&type")
+        if (normalized_type_str.length() > 1 && normalized_type_str.front() == '&')
+        {
+            std::string referent_type_str = normalized_type_str.substr(1);
+            Type *referent_type = parse_type_from_string(referent_type_str);
+            if (referent_type)
+            {
+                return create_reference_type(referent_type);
             }
         }
 

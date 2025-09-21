@@ -272,6 +272,33 @@ namespace Cryo
         bool equals(const Type &other) const override;
     };
 
+    // Reference type
+    class ReferenceType : public Type
+    {
+    private:
+        std::shared_ptr<Type> _referent_type;
+
+    public:
+        ReferenceType(std::shared_ptr<Type> referent_type)
+            : Type(TypeKind::Reference), _referent_type(referent_type)
+        {
+            _name = "&" + referent_type->name();
+        }
+
+        std::shared_ptr<Type> referent_type() const { return _referent_type; }
+
+        bool is_reference_type() const override { return true; }
+        bool is_value_type() const override { return false; }
+        bool is_nullable() const override { return false; } // References cannot be null
+
+        size_t size_bytes() const override { return sizeof(void *); }
+        size_t alignment() const override { return sizeof(void *); }
+        std::string to_string() const override;
+
+        bool equals(const Type &other) const override;
+        bool is_assignable_from(const Type &other) const override;
+    };
+
     // Pointer type
     class PointerType : public Type
     {
@@ -507,6 +534,7 @@ namespace Cryo
         // Create complex types
         Type *create_array_type(Type *element_type, std::optional<size_t> size = std::nullopt);
         Type *create_pointer_type(Type *pointee_type);
+        Type *create_reference_type(Type *referent_type);
         Type *create_optional_type(Type *wrapped_type);
         Type *create_function_type(Type *return_type, std::vector<Type *> param_types, bool is_variadic = false);
 

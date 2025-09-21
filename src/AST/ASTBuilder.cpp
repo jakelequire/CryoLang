@@ -14,6 +14,16 @@ namespace Cryo
         return node;
     }
 
+    std::unique_ptr<UnaryExpressionNode> ASTBuilder::create_unary_expression(Token op, std::unique_ptr<ExpressionNode> operand)
+    {
+        auto node = std::make_unique<UnaryExpressionNode>(
+            NodeKind::UnaryExpression,
+            op.location(),
+            op,
+            std::move(operand));
+        return node;
+    }
+
     std::unique_ptr<TernaryExpressionNode> ASTBuilder::create_ternary_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> true_expr, std::unique_ptr<ExpressionNode> false_expr)
     {
         auto node = std::make_unique<TernaryExpressionNode>(
