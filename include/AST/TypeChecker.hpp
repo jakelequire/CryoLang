@@ -103,10 +103,16 @@ namespace Cryo
         
         // Current struct type (for 'this' keyword resolution)
         Type *_current_struct_type = nullptr;
+        
+        // Current struct name (for field tracking)
+        std::string _current_struct_name;
 
         // Type checking state
         bool _in_function = false;
         bool _in_loop = false;
+
+        // Struct field tracking - maps struct name -> field name -> field type
+        std::unordered_map<std::string, std::unordered_map<std::string, Type*>> _struct_fields;
 
     public:
         TypeChecker(TypeContext &type_ctx);

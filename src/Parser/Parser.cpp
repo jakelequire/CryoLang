@@ -186,6 +186,33 @@ namespace Cryo
 
         std::string base_type = std::string(type_token.text());
 
+        // Handle generic instantiation (e.g., SimpleGeneric<int>)
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            base_type += "<";
+            advance(); // consume '<'
+            
+            // Parse type arguments
+            do
+            {
+                std::string arg_type = parse_type();
+                base_type += arg_type;
+                
+                if (_current_token.is(TokenKind::TK_COMMA))
+                {
+                    base_type += ",";
+                    advance(); // consume ','
+                }
+                else
+                {
+                    break;
+                }
+            } while (true);
+            
+            consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic type arguments");
+            base_type += ">";
+        }
+
         // Handle array types (e.g., i32[], str[][])
         while (_current_token.is(TokenKind::TK_L_SQUARE))
         {
@@ -208,8 +235,72 @@ namespace Cryo
         Token type_token = _current_token;
         advance();
 
-        // Get base type from token kind
-        Type *base_type = _context.types().resolve_type_from_token_kind(static_cast<int>(type_token.kind()));
+        Type *base_type;
+        
+        // Handle identifiers (could be generic parameters or user-defined types)
+        if (type_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            std::string type_name = std::string(type_token.text());
+            
+            // Check if this is a generic instantiation (e.g., SimpleGeneric<int>)
+            if (_current_token.is(TokenKind::TK_L_ANGLE))
+            {
+                // Parse generic type instantiation
+                advance(); // consume '<'
+                
+                std::vector<Type*> type_args;
+                
+                // Parse type arguments
+                do
+                {
+                    Type *arg_type = parse_type_annotation();
+                    type_args.push_back(arg_type);
+                    
+                    if (_current_token.is(TokenKind::TK_COMMA))
+                    {
+                        advance(); // consume ','
+                    }
+                    else
+                    {
+                        break;
+                    }
+                } while (true);
+                
+                consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic type arguments");
+                
+                // For now, create an instantiated generic type name
+                // TODO: In a more complete implementation, we would create proper instantiated types
+                std::string instantiated_name = type_name + "<";
+                for (size_t i = 0; i < type_args.size(); ++i)
+                {
+                    if (i > 0) instantiated_name += ",";
+                    instantiated_name += type_args[i]->to_string();
+                }
+                instantiated_name += ">";
+                
+                // Create or get the instantiated type
+                base_type = _context.types().get_struct_type(instantiated_name);
+            }
+            else
+            {
+                // Try to resolve as a struct/class type first
+                Type *struct_type = _context.types().get_struct_type(type_name);
+                if (struct_type && struct_type->kind() != TypeKind::Unknown)
+                {
+                    base_type = struct_type;
+                }
+                else
+                {
+                    // Could be a generic parameter - create/get generic type
+                    base_type = _context.types().get_generic_type(type_name);
+                }
+            }
+        }
+        else
+        {
+            // Get base type from token kind for built-in types
+            base_type = _context.types().resolve_type_from_token_kind(static_cast<int>(type_token.kind()));
+        }
 
         // Handle array types (e.g., i32[], str[][])
         while (_current_token.is(TokenKind::TK_L_SQUARE))

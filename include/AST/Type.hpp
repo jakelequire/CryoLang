@@ -383,6 +383,21 @@ namespace Cryo
         std::string to_string() const override { return "unknown"; }
     };
 
+    // Generic type parameter
+    class GenericType : public Type
+    {
+    public:
+        GenericType(const std::string &name) : Type(TypeKind::Generic, name) {}
+
+        // Generic types are placeholders, so they act like unknown types for compatibility
+        bool is_assignable_from(const Type &other) const override { return true; }
+        bool is_convertible_to(const Type &other) const override { return true; }
+
+        size_t size_bytes() const override { return 0; }  // Size unknown until instantiation
+        size_t alignment() const override { return 1; }   // Alignment unknown until instantiation
+        std::string to_string() const override { return name(); }
+    };
+
     // Struct type (user-defined)
     class StructType : public Type
     {
@@ -428,6 +443,7 @@ namespace Cryo
         // User-defined type cache
         std::unordered_map<std::string, std::unique_ptr<StructType>> _struct_types;
         std::unordered_map<std::string, std::unique_ptr<ClassType>> _class_types;
+        std::unordered_map<std::string, std::unique_ptr<Type>> _generic_types;
 
         // Complex type cache
         std::vector<std::unique_ptr<Type>> _complex_types;
