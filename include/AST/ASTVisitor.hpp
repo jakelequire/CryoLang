@@ -55,6 +55,7 @@ namespace Cryo
         virtual void visit(ArrayLiteralNode &node) = 0;
         virtual void visit(ArrayAccessNode &node) = 0;
         virtual void visit(MemberAccessNode &node) = 0;
+        virtual void visit(ScopeResolutionNode &node) = 0;
         virtual void visit(IfStatementNode &node) = 0;
         virtual void visit(WhileStatementNode &node) = 0;
         virtual void visit(ForStatementNode &node) = 0;
@@ -64,6 +65,8 @@ namespace Cryo
         virtual void visit(DeclarationStatementNode &node) = 0;
         virtual void visit(StructDeclarationNode &node) = 0;
         virtual void visit(ClassDeclarationNode &node) = 0;
+        virtual void visit(EnumDeclarationNode &node) = 0;
+        virtual void visit(EnumVariantNode &node) = 0;
         virtual void visit(TypeAliasDeclarationNode &node) = 0;
         virtual void visit(ImplementationBlockNode &node) = 0;
         virtual void visit(GenericParameterNode &node) = 0;
@@ -91,6 +94,7 @@ namespace Cryo
         void visit(ArrayLiteralNode &node) override {}
         void visit(ArrayAccessNode &node) override {}
         void visit(MemberAccessNode &node) override {}
+        void visit(ScopeResolutionNode &node) override {}
         void visit(IfStatementNode &node) override {}
         void visit(WhileStatementNode &node) override {}
         void visit(ForStatementNode &node) override {}
@@ -100,6 +104,8 @@ namespace Cryo
         void visit(DeclarationStatementNode &node) override {}
         void visit(StructDeclarationNode &node) override {}
         void visit(ClassDeclarationNode &node) override {}
+        void visit(EnumDeclarationNode &node) override {}
+        void visit(EnumVariantNode &node) override {}
         void visit(TypeAliasDeclarationNode &node) override {}
         void visit(ImplementationBlockNode &node) override {}
         void visit(GenericParameterNode &node) override {}

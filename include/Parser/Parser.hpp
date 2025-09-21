@@ -79,6 +79,7 @@ namespace Cryo
         std::unique_ptr<FunctionDeclarationNode> parse_function_declaration();
         std::unique_ptr<StructDeclarationNode> parse_struct_declaration();
         std::unique_ptr<ClassDeclarationNode> parse_class_declaration();
+        std::unique_ptr<EnumDeclarationNode> parse_enum_declaration();
         std::unique_ptr<TypeAliasDeclarationNode> parse_type_alias_declaration();
         std::unique_ptr<ImplementationBlockNode> parse_implementation_block();
         std::unique_ptr<ReturnStatementNode> parse_return_statement();
@@ -126,6 +127,9 @@ namespace Cryo
         std::unique_ptr<StructFieldNode> parse_struct_field();
         std::unique_ptr<StructMethodNode> parse_struct_method();
         Visibility parse_visibility_modifier();
+
+        // Enum parsing helpers
+        std::unique_ptr<EnumVariantNode> parse_enum_variant();
 
         // Utility methods
         bool is_type_token() const;

@@ -110,6 +110,11 @@ namespace Cryo
         return std::make_unique<MemberAccessNode>(loc, std::move(object), std::move(member));
     }
 
+    std::unique_ptr<ScopeResolutionNode> ASTBuilder::create_scope_resolution(SourceLocation loc, std::string scope_name, std::string member_name)
+    {
+        return std::make_unique<ScopeResolutionNode>(loc, std::move(scope_name), std::move(member_name));
+    }
+
     std::unique_ptr<IfStatementNode> ASTBuilder::create_if_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> then_stmt, std::unique_ptr<StatementNode> else_stmt)
     {
         return std::make_unique<IfStatementNode>(loc, std::move(condition), std::move(then_stmt), std::move(else_stmt));
@@ -174,6 +179,21 @@ namespace Cryo
     std::unique_ptr<TypeAliasDeclarationNode> ASTBuilder::create_type_alias_declaration(SourceLocation loc, std::string alias_name, std::string target_type)
     {
         return std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), std::move(target_type));
+    }
+
+    std::unique_ptr<EnumDeclarationNode> ASTBuilder::create_enum_declaration(SourceLocation loc, std::string name)
+    {
+        return std::make_unique<EnumDeclarationNode>(loc, std::move(name));
+    }
+
+    std::unique_ptr<EnumVariantNode> ASTBuilder::create_enum_variant(SourceLocation loc, std::string name)
+    {
+        return std::make_unique<EnumVariantNode>(loc, std::move(name));
+    }
+
+    std::unique_ptr<EnumVariantNode> ASTBuilder::create_enum_variant(SourceLocation loc, std::string name, std::vector<std::string> associated_types)
+    {
+        return std::make_unique<EnumVariantNode>(loc, std::move(name), std::move(associated_types));
     }
 
     std::unique_ptr<ImplementationBlockNode> ASTBuilder::create_implementation_block(SourceLocation loc, std::string target_type)

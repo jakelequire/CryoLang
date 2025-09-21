@@ -1,6 +1,6 @@
 
 <program>        ::= { <statement> }
-<statement>      ::= <var-declaration> | <function-declaration> | <struct-declaration> | <class-declaration> | <type-alias-declaration> | <implementation-block> | <expression-statement> | <if-statement> | <while-statement> | <for-statement> | <break-statement> | <continue-statement> | <return-statement>
+<statement>      ::= <var-declaration> | <function-declaration> | <struct-declaration> | <class-declaration> | <enum-declaration> | <type-alias-declaration> | <implementation-block> | <expression-statement> | <if-statement> | <while-statement> | <for-statement> | <break-statement> | <continue-statement> | <return-statement>
 
 <var-declaration> ::= ("const" | "mut") <identifier> ":" <type> ["=" <expression>] ";"
 
@@ -12,6 +12,7 @@
 
 <struct-declaration>    ::=  "type" "struct" <identifier> [<generic-params>] "{" { <struct-member> } "}"
 <class-declaration>     ::=  "class" <identifier> [<generic-params>] [":" <identifier>] "{" { <class-member> } "}"
+<enum-declaration>      ::=  ["type"] "enum" <identifier> [<generic-params>] "{" { <enum-variant> } "}"
 <type-alias-declaration>::=  "type" <identifier> "=" <type> ";"
 <implementation-block>  ::=  "implement" "struct" <identifier> "{" { <implementation-member> } "}"
 
@@ -28,6 +29,9 @@
 
 <field-implementation>  ::=  <identifier> "=" <expression> ";"
 <method-implementation> ::=  <identifier> "(" [<param-list>] ")" ["->" <type>] <block>
+
+<enum-variant>          ::=  <identifier> ["(" <type-list> ")"] [","]
+<type-list>             ::=  <type> { "," <type> }
 
 
 <expression-statement>    ::=  <expression> ";"

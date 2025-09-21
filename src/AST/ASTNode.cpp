@@ -23,6 +23,11 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void ScopeResolutionNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     // Control flow statement visitor implementations
     void IfStatementNode::accept(ASTVisitor &visitor)
     {
@@ -161,6 +166,18 @@ namespace Cryo
 
     // TypeAliasDeclarationNode visitor implementation
     void TypeAliasDeclarationNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // EnumDeclarationNode visitor implementation
+    void EnumDeclarationNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // EnumVariantNode visitor implementation
+    void EnumVariantNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);
     }

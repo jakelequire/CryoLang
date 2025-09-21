@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <algorithm>
 
 namespace Cryo
 {
@@ -27,6 +28,7 @@ namespace Cryo
         ArrayLiteral,
         ArrayAccess,
         MemberAccess,
+        ScopeResolution,
 
         // Concrete statement types
         BlockStatement,
@@ -44,6 +46,7 @@ namespace Cryo
         FunctionDeclaration,
         StructDeclaration,
         ClassDeclaration,
+        EnumDeclaration,
         TypeAliasDeclaration,
         ImplementationBlock,
 
@@ -761,6 +764,100 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
+    // Enum variant (for both simple and complex variants)
+    class EnumVariantNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        std::vector<std::string> _associated_types; // Empty for simple variants like NAME_1
+        
+    public:
+        EnumVariantNode(SourceLocation loc, std::string name)
+            : DeclarationNode(NodeKind::Declaration, loc), _name(std::move(name)) {}
+            
+        EnumVariantNode(SourceLocation loc, std::string name, std::vector<std::string> associated_types)
+            : DeclarationNode(NodeKind::Declaration, loc), _name(std::move(name)), 
+              _associated_types(std::move(associated_types)) {}
+              
+        const std::string &name() const { return _name; }
+        const std::vector<std::string> &associated_types() const { return _associated_types; }
+        bool is_simple_variant() const { return _associated_types.empty(); }
+        
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "EnumVariant: " << _name;
+            if (!_associated_types.empty()) {
+                os << "(";
+                for (size_t i = 0; i < _associated_types.size(); ++i) {
+                    if (i > 0) os << ", ";
+                    os << _associated_types[i];
+                }
+                os << ")";
+            }
+            os << std::endl;
+        }
+        
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Enum declaration (supports both C-style and Rust-style)
+    class EnumDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        std::vector<std::unique_ptr<EnumVariantNode>> _variants;
+        std::vector<std::unique_ptr<GenericParameterNode>> _generic_parameters;
+        
+    public:
+        EnumDeclarationNode(SourceLocation loc, std::string name)
+            : DeclarationNode(NodeKind::EnumDeclaration, loc), _name(std::move(name)) {}
+            
+        const std::string &name() const { return _name; }
+        const std::vector<std::unique_ptr<EnumVariantNode>> &variants() const { return _variants; }
+        const std::vector<std::unique_ptr<GenericParameterNode>> &generic_parameters() const { return _generic_parameters; }
+        
+        void add_variant(std::unique_ptr<EnumVariantNode> variant)
+        {
+            _variants.push_back(std::move(variant));
+        }
+        
+        void add_generic_parameter(std::unique_ptr<GenericParameterNode> param)
+        {
+            _generic_parameters.push_back(std::move(param));
+        }
+        
+        // Check if this is a simple C-style enum (all variants are simple)
+        bool is_simple_enum() const
+        {
+            return std::all_of(_variants.begin(), _variants.end(),
+                             [](const auto &variant) { return variant->is_simple_variant(); });
+        }
+        
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "EnumDeclaration: " << _name;
+            
+            if (!_generic_parameters.empty()) {
+                os << "<";
+                for (size_t i = 0; i < _generic_parameters.size(); ++i) {
+                    if (i > 0) os << ", ";
+                    os << "T" << i; // Simplified for now
+                }
+                os << ">";
+            }
+            
+            os << " {" << std::endl;
+            
+            for (const auto &variant : _variants) {
+                variant->print(os, indent + 4);
+            }
+            
+            os << std::string(indent, ' ') << "}" << std::endl;
+        }
+        
+        void accept(ASTVisitor &visitor) override;
+    };
+
     // Implementation block (impl StructName { ... })
     class ImplementationBlockNode : public DeclarationNode
     {
@@ -953,6 +1050,30 @@ namespace Cryo
                 _object->print(os, indent + 4);
             }
             os << std::string(indent + 2, ' ') << "Member: " << _member << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Scope resolution (for enum access like Color::RED)
+    class ScopeResolutionNode : public ExpressionNode
+    {
+    private:
+        std::string _scope_name;  // e.g., "Color"
+        std::string _member_name; // e.g., "RED"
+
+    public:
+        ScopeResolutionNode(SourceLocation loc, std::string scope_name, std::string member_name)
+            : ExpressionNode(NodeKind::ScopeResolution, loc), 
+              _scope_name(std::move(scope_name)), _member_name(std::move(member_name)) {}
+
+        const std::string &scope_name() const { return _scope_name; }
+        const std::string &member_name() const { return _member_name; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "ScopeResolution: " << _scope_name 
+               << "::" << _member_name << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;
