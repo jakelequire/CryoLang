@@ -18,6 +18,7 @@ namespace Cryo
     class CallExpressionNode;
     class ArrayLiteralNode;
     class ArrayAccessNode;
+    class MemberAccessNode;
     class IfStatementNode;
     class WhileStatementNode;
     class ForStatementNode;
@@ -25,6 +26,12 @@ namespace Cryo
     class ContinueStatementNode;
     class ExpressionStatementNode;
     class DeclarationStatementNode;
+    class StructDeclarationNode;
+    class ClassDeclarationNode;
+    class TypeAliasDeclarationNode;
+    class ImplementationBlockNode;
+    class StructFieldNode;
+    class StructMethodNode;
 
     class ASTVisitor
     {
@@ -47,6 +54,7 @@ namespace Cryo
         virtual void visit(CallExpressionNode &node) = 0;
         virtual void visit(ArrayLiteralNode &node) = 0;
         virtual void visit(ArrayAccessNode &node) = 0;
+        virtual void visit(MemberAccessNode &node) = 0;
         virtual void visit(IfStatementNode &node) = 0;
         virtual void visit(WhileStatementNode &node) = 0;
         virtual void visit(ForStatementNode &node) = 0;
@@ -54,6 +62,13 @@ namespace Cryo
         virtual void visit(ContinueStatementNode &node) = 0;
         virtual void visit(ExpressionStatementNode &node) = 0;
         virtual void visit(DeclarationStatementNode &node) = 0;
+        virtual void visit(StructDeclarationNode &node) = 0;
+        virtual void visit(ClassDeclarationNode &node) = 0;
+        virtual void visit(TypeAliasDeclarationNode &node) = 0;
+        virtual void visit(ImplementationBlockNode &node) = 0;
+        virtual void visit(GenericParameterNode &node) = 0;
+        virtual void visit(StructFieldNode &node) = 0;
+        virtual void visit(StructMethodNode &node) = 0;
     };
 
     // Base visitor with default implementations
@@ -75,6 +90,7 @@ namespace Cryo
         void visit(CallExpressionNode &node) override {}
         void visit(ArrayLiteralNode &node) override {}
         void visit(ArrayAccessNode &node) override {}
+        void visit(MemberAccessNode &node) override {}
         void visit(IfStatementNode &node) override {}
         void visit(WhileStatementNode &node) override {}
         void visit(ForStatementNode &node) override {}
@@ -82,5 +98,12 @@ namespace Cryo
         void visit(ContinueStatementNode &node) override {}
         void visit(ExpressionStatementNode &node) override {}
         void visit(DeclarationStatementNode &node) override {}
+        void visit(StructDeclarationNode &node) override {}
+        void visit(ClassDeclarationNode &node) override {}
+        void visit(TypeAliasDeclarationNode &node) override {}
+        void visit(ImplementationBlockNode &node) override {}
+        void visit(GenericParameterNode &node) override {}
+        void visit(StructFieldNode &node) override {}
+        void visit(StructMethodNode &node) override {}
     };
 }

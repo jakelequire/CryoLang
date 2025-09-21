@@ -38,6 +38,7 @@ namespace Cryo
         std::unique_ptr<CallExpressionNode> create_call_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> callee);
         std::unique_ptr<ArrayLiteralNode> create_array_literal(SourceLocation loc);
         std::unique_ptr<ArrayAccessNode> create_array_access(SourceLocation loc, std::unique_ptr<ExpressionNode> array, std::unique_ptr<ExpressionNode> index);
+        std::unique_ptr<MemberAccessNode> create_member_access(SourceLocation loc, std::unique_ptr<ExpressionNode> object, std::string member);
         std::unique_ptr<IfStatementNode> create_if_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> then_stmt, std::unique_ptr<StatementNode> else_stmt = nullptr);
         std::unique_ptr<WhileStatementNode> create_while_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> body);
         std::unique_ptr<ForStatementNode> create_for_statement(SourceLocation loc, std::unique_ptr<VariableDeclarationNode> init, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> update, std::unique_ptr<StatementNode> body);
@@ -45,6 +46,15 @@ namespace Cryo
         std::unique_ptr<ContinueStatementNode> create_continue_statement(SourceLocation loc);
         std::unique_ptr<ExpressionStatementNode> create_expression_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> expr);
         std::unique_ptr<DeclarationStatementNode> create_declaration_statement(SourceLocation loc, std::unique_ptr<DeclarationNode> decl);
+
+        // Struct and Class creation methods
+        std::unique_ptr<GenericParameterNode> create_generic_parameter(SourceLocation loc, std::string name);
+        std::unique_ptr<StructFieldNode> create_struct_field(SourceLocation loc, std::string name, std::string type_annotation, Visibility visibility = Visibility::Public);
+        std::unique_ptr<StructMethodNode> create_struct_method(SourceLocation loc, std::string name, std::string return_type, Visibility visibility = Visibility::Public, bool is_constructor = false);
+        std::unique_ptr<StructDeclarationNode> create_struct_declaration(SourceLocation loc, std::string name);
+        std::unique_ptr<ClassDeclarationNode> create_class_declaration(SourceLocation loc, std::string name);
+        std::unique_ptr<TypeAliasDeclarationNode> create_type_alias_declaration(SourceLocation loc, std::string alias_name, std::string target_type);
+        std::unique_ptr<ImplementationBlockNode> create_implementation_block(SourceLocation loc, std::string target_type);
 
         // Helper methods
     private:

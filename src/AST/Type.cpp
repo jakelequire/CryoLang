@@ -488,6 +488,20 @@ namespace Cryo
             }
         }
 
+        // Check for user-defined struct types
+        auto struct_it = _struct_types.find(type_str);
+        if (struct_it != _struct_types.end())
+        {
+            return struct_it->second.get();
+        }
+
+        // Check for user-defined class types
+        auto class_it = _class_types.find(type_str);
+        if (class_it != _class_types.end())
+        {
+            return class_it->second.get();
+        }
+
         return get_unknown_type();
     }
 
@@ -561,5 +575,43 @@ namespace Cryo
         }
 
         return nullptr;
+    }
+
+    Type *TypeContext::get_struct_type(const std::string &name)
+    {
+        auto it = _struct_types.find(name);
+        if (it != _struct_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Create new struct type
+        auto struct_type = std::make_unique<StructType>(name);
+        Type *result = struct_type.get();
+        _struct_types[name] = std::move(struct_type);
+
+        return result;
+    }
+
+    Type *TypeContext::get_class_type(const std::string &name)
+    {
+        auto it = _class_types.find(name);
+        if (it != _class_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Create new class type
+        auto class_type = std::make_unique<ClassType>(name);
+        Type *result = class_type.get();
+        _class_types[name] = std::move(class_type);
+
+        return result;
+    }
+
+    Type *TypeContext::get_generic_type(const std::string &name)
+    {
+        // For now, return unknown type - generics need special handling
+        return get_unknown_type();
     }
 }

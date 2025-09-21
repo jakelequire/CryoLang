@@ -86,6 +86,7 @@ namespace Cryo
         {"export", TokenKind::TK_KW_EXPORT},
         {"from", TokenKind::TK_KW_FROM},
         {"as", TokenKind::TK_KW_AS},
+        {"implement", TokenKind::TK_KW_IMPLEMENT},
 
         // Type System
         {"void", TokenKind::TK_KW_VOID},
@@ -280,6 +281,12 @@ namespace Cryo
             _previous_token = _current_token;
             _current_token = token;
             _token_count++;
+            
+            // IMPORTANT: When returning a peeked token, we need to advance
+            // the buffer position to match the token that was peeked
+            // We do this by re-lexing to the same position
+            lex_token(); // This will properly advance _current to the right position
+            
             return _current_token;
         }
 

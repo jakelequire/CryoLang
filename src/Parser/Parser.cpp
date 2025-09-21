@@ -161,6 +161,7 @@ namespace Cryo
 
             // Check for statement start tokens
             if (match({TokenKind::TK_KW_FUNCTION, TokenKind::TK_KW_CONST, TokenKind::TK_KW_MUT,
+                       TokenKind::TK_KW_TYPE, TokenKind::TK_KW_CLASS, TokenKind::TK_KW_IMPLEMENT,
                        TokenKind::TK_KW_IF, TokenKind::TK_KW_WHILE, TokenKind::TK_KW_FOR,
                        TokenKind::TK_KW_RETURN, TokenKind::TK_KW_BREAK, TokenKind::TK_KW_CONTINUE}))
             {
@@ -265,6 +266,37 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_KW_CONST) || _current_token.is(TokenKind::TK_KW_MUT))
         {
             return parse_variable_declaration();
+        }
+
+        // Type declarations - struct, class, type alias
+        if (_current_token.is(TokenKind::TK_KW_TYPE))
+        {
+            // Look ahead to see if it's "type struct", "type class", or "type alias"
+            Token next = peek_next();
+            if (next.is(TokenKind::TK_KW_STRUCT))
+            {
+                return parse_struct_declaration();
+            }
+            else if (next.is(TokenKind::TK_KW_CLASS))
+            {
+                return parse_class_declaration();
+            }
+            else
+            {
+                return parse_type_alias_declaration();
+            }
+        }
+
+        // Class declaration
+        if (_current_token.is(TokenKind::TK_KW_CLASS))
+        {
+            return parse_class_declaration();
+        }
+
+        // Implementation block
+        if (_current_token.is(TokenKind::TK_KW_IMPLEMENT))
+        {
+            return parse_implementation_block();
         }
 
         // Function declarations
@@ -649,6 +681,50 @@ namespace Cryo
             return parse_boolean_literal();
         }
 
+        // 'this' keyword - temporarily disabled while fixing implementation
+        if (_current_token.is(TokenKind::TK_KW_THIS))
+        {
+            Token this_token = _current_token;
+            advance(); // consume 'this'
+            
+            // Create a new token with TK_IDENTIFIER kind but same text/location
+            Token this_identifier_token(TokenKind::TK_IDENTIFIER, 
+                                      this_token.text(), 
+                                      this_token.location());
+            
+            auto this_expr = _builder.create_identifier_node(this_identifier_token);
+            
+            // Handle postfix expressions on 'this' (like this.member)
+            std::unique_ptr<ExpressionNode> expr = std::move(this_expr);
+            
+            // Chain multiple postfix operations
+            while (true)
+            {
+                if (_current_token.is(TokenKind::TK_L_PAREN))
+                {
+                    // Function call
+                    expr = parse_call_expression(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_L_SQUARE))
+                {
+                    // Array access
+                    expr = parse_array_access(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_PERIOD))
+                {
+                    // Member access
+                    expr = parse_member_access(std::move(expr));
+                }
+                else
+                {
+                    // No more postfix operations
+                    break;
+                }
+            }
+            
+            return std::move(expr);
+        }
+
         // Identifiers (can be function calls or variable references)
         if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
@@ -669,6 +745,11 @@ namespace Cryo
                 {
                     // Array access
                     expr = parse_array_access(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_PERIOD))
+                {
+                    // Member access
+                    expr = parse_member_access(std::move(expr));
                 }
                 else
                 {
@@ -764,7 +845,8 @@ namespace Cryo
     bool Parser::is_visibility_modifier() const
     {
         return _current_token.is(TokenKind::TK_KW_PUBLIC) ||
-               _current_token.is(TokenKind::TK_KW_PRIVATE);
+               _current_token.is(TokenKind::TK_KW_PRIVATE) ||
+               _current_token.is(TokenKind::TK_KW_PROTECTED);
     }
 
     bool Parser::is_variable_modifier() const
@@ -969,6 +1051,23 @@ namespace Cryo
         return _builder.create_array_access(access_location, std::move(expr), std::move(index));
     }
 
+    std::unique_ptr<ExpressionNode> Parser::parse_member_access(std::unique_ptr<ExpressionNode> expr)
+    {
+        SourceLocation access_location = _current_token.location();
+        consume(TokenKind::TK_PERIOD, "Expected '.' for member access");
+
+        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            error("Expected member name after '.'");
+            return expr;
+        }
+
+        std::string member_name = std::string(_current_token.text());
+        advance(); // consume member name
+
+        return _builder.create_member_access(access_location, std::move(expr), member_name);
+    }
+
     std::unique_ptr<ExpressionNode> Parser::parse_array_literal()
     {
         SourceLocation start_loc = _current_token.location();
@@ -1006,9 +1105,428 @@ namespace Cryo
         return array_literal;
     }
 
+    // Struct and Class parsing methods
+    std::unique_ptr<StructDeclarationNode> Parser::parse_struct_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+        
+        consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
+        consume(TokenKind::TK_KW_STRUCT, "Expected 'struct'");
+        
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected struct name");
+        std::string struct_name = std::string(name_token.text());
+        
+        auto struct_decl = _builder.create_struct_declaration(start_loc, struct_name);
+        
+        // Parse optional generic parameters
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            auto generics = parse_generic_parameters();
+            for (auto& generic : generics)
+            {
+                struct_decl->add_generic_parameter(std::move(generic));
+            }
+        }
+        
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after struct name");
+        
+        // Parse struct members (fields and methods)
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            try
+            {
+                // Check if it's a method (has parentheses) or field (has colon)
+                Token next = peek_next();
+                if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) && 
+                    next.is(TokenKind::TK_L_PAREN))
+                {
+                    // It's a method
+                    auto method = parse_struct_method();
+                    struct_decl->add_method(std::move(method));
+                }
+                else
+                {
+                    // It's a field
+                    auto field = parse_struct_field();
+                    struct_decl->add_field(std::move(field));
+                }
+            }
+            catch (const ParseError& e)
+            {
+                _errors.push_back(e);
+                synchronize();
+            }
+        }
+        
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after struct body");
+        return struct_decl;
+    }
+
+    std::unique_ptr<ClassDeclarationNode> Parser::parse_class_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+        
+        // Check if it's "type class" or just "class"
+        if (_current_token.is(TokenKind::TK_KW_TYPE))
+        {
+            consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
+        }
+        
+        consume(TokenKind::TK_KW_CLASS, "Expected 'class'");
+        
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected class name");
+        std::string class_name = std::string(name_token.text());
+        
+        auto class_decl = _builder.create_class_declaration(start_loc, class_name);
+        
+        // Parse optional generic parameters
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            auto generics = parse_generic_parameters();
+            for (auto& generic : generics)
+            {
+                class_decl->add_generic_parameter(std::move(generic));
+            }
+        }
+        
+        // Parse optional base class
+        if (_current_token.is(TokenKind::TK_COLON))
+        {
+            advance(); // consume ':'
+            Token base_token = consume(TokenKind::TK_IDENTIFIER, "Expected base class name");
+            class_decl->set_base_class(std::string(base_token.text()));
+        }
+        
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after class declaration");
+        
+        // Parse class members
+        Visibility current_visibility = Visibility::Private; // Default for classes
+        
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            try
+            {
+                // Check for visibility modifiers
+                if (is_visibility_modifier())
+                {
+                    current_visibility = parse_visibility_modifier();
+                    consume(TokenKind::TK_COLON, "Expected ':' after visibility modifier");
+                    continue;
+                }
+                
+                // Check if it's a method or field
+                Token next = peek_next();
+                if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
+                {
+                    // It's a method
+                    auto method = parse_struct_method();
+                    // Note: We reuse StructMethodNode for class methods
+                    class_decl->add_method(std::move(method));
+                }
+                else
+                {
+                    // It's a field
+                    auto field = parse_struct_field();
+                    class_decl->add_field(std::move(field));
+                }
+            }
+            catch (const ParseError& e)
+            {
+                _errors.push_back(e);
+                synchronize();
+            }
+        }
+        
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after class body");
+        return class_decl;
+    }
+
+    std::unique_ptr<TypeAliasDeclarationNode> Parser::parse_type_alias_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+        
+        consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
+        
+        Token alias_token = consume(TokenKind::TK_IDENTIFIER, "Expected type alias name");
+        std::string alias_name = std::string(alias_token.text());
+        
+        consume(TokenKind::TK_EQUAL, "Expected '=' in type alias");
+        
+        // Parse target type
+        std::string target_type = parse_type();
+        
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after type alias");
+        
+        return _builder.create_type_alias_declaration(start_loc, alias_name, target_type);
+    }
+
+    std::unique_ptr<ImplementationBlockNode> Parser::parse_implementation_block()
+    {
+        SourceLocation start_loc = _current_token.location();
+        
+        consume(TokenKind::TK_KW_IMPLEMENT, "Expected 'implement'");
+        
+        // Optional 'struct' keyword for backward compatibility
+        if (_current_token.is(TokenKind::TK_KW_STRUCT))
+        {
+            advance(); // consume 'struct'
+        }
+        
+        Token target_token = consume(TokenKind::TK_IDENTIFIER, "Expected target type name");
+        std::string target_type = std::string(target_token.text());
+        
+        auto impl_block = _builder.create_implementation_block(start_loc, target_type);
+        
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after implement declaration");
+        
+        // TODO: Add implementation block context tracking
+        
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            try
+            {
+                // Check if it's a field implementation or method implementation
+                Token next = peek_next();
+                if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_EQUAL))
+                {
+                    // Field implementation: field_name = value;
+                    Token field_token = consume(TokenKind::TK_IDENTIFIER, "Expected field name");
+                    consume(TokenKind::TK_EQUAL, "Expected '=' in field implementation");
+                    
+                    auto value = parse_expression();
+                    consume(TokenKind::TK_SEMICOLON, "Expected ';' after field implementation");
+                    
+                    // Create a field node with the default value
+                    auto field = _builder.create_struct_field(field_token.location(), 
+                                                             std::string(field_token.text()), 
+                                                             "auto", // Type will be inferred
+                                                             Visibility::Public);
+                    field->set_default_value(std::move(value));
+                    impl_block->add_field_implementation(std::move(field));
+                }
+                else if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) && 
+                         (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
+                {
+                    // Method implementation
+                    auto method = parse_struct_method();
+                    impl_block->add_method_implementation(std::move(method));
+                }
+                else
+                {
+                    error("Expected field implementation or method implementation");
+                    synchronize();
+                }
+            }
+            catch (const ParseError& e)
+            {
+                _errors.push_back(e);
+                synchronize();
+            }
+        }
+        
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after implementation block");
+        
+        return impl_block;
+    }
+
+    // Struct/Class helper parsing methods
+    std::vector<std::unique_ptr<GenericParameterNode>> Parser::parse_generic_parameters()
+    {
+        std::vector<std::unique_ptr<GenericParameterNode>> generics;
+        
+        consume(TokenKind::TK_L_ANGLE, "Expected '<' for generics");
+        
+        if (!_current_token.is(TokenKind::TK_R_ANGLE))
+        {
+            do
+            {
+                auto generic = parse_generic_parameter();
+                generics.push_back(std::move(generic));
+                
+                if (_current_token.is(TokenKind::TK_COMMA))
+                {
+                    advance(); // consume ','
+                }
+                else
+                {
+                    break;
+                }
+            } while (!_current_token.is(TokenKind::TK_R_ANGLE) && !is_at_end());
+        }
+        
+        consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic parameters");
+        return generics;
+    }
+
+    std::unique_ptr<GenericParameterNode> Parser::parse_generic_parameter()
+    {
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected generic parameter name");
+        auto generic = _builder.create_generic_parameter(name_token.location(), 
+                                                        std::string(name_token.text()));
+        
+        // Parse optional constraints (T: Trait1 + Trait2)
+        if (_current_token.is(TokenKind::TK_COLON))
+        {
+            advance(); // consume ':'
+            
+            do
+            {
+                Token constraint_token = consume(TokenKind::TK_IDENTIFIER, "Expected constraint type");
+                generic->add_constraint(std::string(constraint_token.text()));
+                
+                if (_current_token.is(TokenKind::TK_PLUS))
+                {
+                    advance(); // consume '+'
+                }
+                else
+                {
+                    break;
+                }
+            } while (!is_at_end());
+        }
+        
+        return generic;
+    }
+
+    std::unique_ptr<StructFieldNode> Parser::parse_struct_field()
+    {
+        SourceLocation start_loc = _current_token.location();
+        
+        // Parse optional visibility (default is public for structs)
+        Visibility visibility = Visibility::Public;
+        if (is_visibility_modifier())
+        {
+            visibility = parse_visibility_modifier();
+        }
+        
+        Token field_token = consume(TokenKind::TK_IDENTIFIER, "Expected field name");
+        std::string field_name = std::string(field_token.text());
+        
+        consume(TokenKind::TK_COLON, "Expected ':' after field name");
+        
+        std::string field_type = parse_type();
+        
+        auto field = _builder.create_struct_field(start_loc, field_name, field_type, visibility);
+        
+        // Parse optional default value
+        if (_current_token.is(TokenKind::TK_EQUAL))
+        {
+            advance(); // consume '='
+            auto default_value = parse_expression();
+            field->set_default_value(std::move(default_value));
+        }
+        
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after field declaration");
+        return field;
+    }
+
+    std::unique_ptr<StructMethodNode> Parser::parse_struct_method()
+    {
+        SourceLocation start_loc = _current_token.location();
+        
+        // Parse optional visibility (default is public for structs)
+        Visibility visibility = Visibility::Public;
+        if (is_visibility_modifier())
+        {
+            visibility = parse_visibility_modifier();
+        }
+        
+        // Check for constructor
+        bool is_constructor = false;
+        if (_current_token.is(TokenKind::TK_KW_CONSTRUCTOR))
+        {
+            is_constructor = true;
+            advance();
+        }
+        
+        Token method_token;
+        std::string method_name;
+        
+        // Accept both identifiers and keywords as method names
+        if (_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword())
+        {
+            method_token = _current_token;
+            method_name = std::string(method_token.text());
+            advance();
+        }
+        else
+        {
+            error("Expected method name");
+            return nullptr;
+        }
+        
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after method name");
+        
+        // Parse parameters
+        std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+        if (!_current_token.is(TokenKind::TK_R_PAREN))
+        {
+            params = parse_parameter_list();
+        }
+        
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
+        
+        // Parse return type (optional for constructors)
+        std::string return_type = "void";
+        if (_current_token.is(TokenKind::TK_ARROW))
+        {
+            advance(); // consume '->'
+            return_type = parse_type();
+        }
+        else if (is_constructor)
+        {
+            return_type = "void"; // Constructors don't have explicit return types
+        }
+        
+        auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor);
+        
+        // Add parameters
+        for (auto& param : params)
+        {
+            method->add_parameter(std::move(param));
+        }
+        
+        // Parse optional body (for method implementations)
+        if (_current_token.is(TokenKind::TK_L_BRACE))
+        {
+            auto body = parse_block_statement();
+            method->set_body(std::unique_ptr<BlockStatementNode>(
+                dynamic_cast<BlockStatementNode*>(body.release())));
+        }
+        else
+        {
+            // Method signature only
+            consume(TokenKind::TK_SEMICOLON, "Expected ';' after method signature");
+        }
+        
+        return method;
+    }
+
+    Visibility Parser::parse_visibility_modifier()
+    {
+        if (_current_token.is(TokenKind::TK_KW_PUBLIC))
+        {
+            advance();
+            return Visibility::Public;
+        }
+        else if (_current_token.is(TokenKind::TK_KW_PRIVATE))
+        {
+            advance();
+            return Visibility::Private;
+        }
+        else if (_current_token.is(TokenKind::TK_KW_PROTECTED))
+        {
+            advance();
+            return Visibility::Protected;
+        }
+        
+        error("Expected visibility modifier");
+        return Visibility::Public; // Default fallback
+    }
+
     Token Parser::peek_next()
     {
-        // TODO: Implement lookahead
-        return Token{};
+        // Use the lexer's built-in peek functionality
+        return _lexer->peek_token();
     }
 }

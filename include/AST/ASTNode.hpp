@@ -26,6 +26,7 @@ namespace Cryo
         CallExpression,
         ArrayLiteral,
         ArrayAccess,
+        MemberAccess,
 
         // Concrete statement types
         BlockStatement,
@@ -41,6 +42,10 @@ namespace Cryo
         // Concrete declaration types
         VariableDeclaration,
         FunctionDeclaration,
+        StructDeclaration,
+        ClassDeclaration,
+        TypeAliasDeclaration,
+        ImplementationBlock,
 
         // Top-level
         Program,
@@ -441,6 +446,375 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
+    // Visibility enum for struct/class members
+    enum class Visibility
+    {
+        Public,
+        Private,
+        Protected
+    };
+
+    // Forward declarations for struct/class components
+    class StructFieldNode;
+    class StructMethodNode;
+    class GenericParameterNode;
+
+    // Generic parameter for types
+    class GenericParameterNode : public ASTNode
+    {
+    private:
+        std::string _name;
+        std::vector<std::string> _constraints; // Type constraints
+
+    public:
+        GenericParameterNode(SourceLocation loc, std::string name)
+            : ASTNode(NodeKind::Declaration, loc), _name(std::move(name)) {}
+
+        const std::string &name() const { return _name; }
+        const std::vector<std::string> &constraints() const { return _constraints; }
+
+        void add_constraint(const std::string &constraint)
+        {
+            _constraints.push_back(constraint);
+        }
+
+        void set_type(const std::string &type) { /* Generic parameters have implicit types */ }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "GenericParam: " << _name;
+            if (!_constraints.empty())
+            {
+                os << " : ";
+                for (size_t i = 0; i < _constraints.size(); ++i)
+                {
+                    if (i > 0) os << " + ";
+                    os << _constraints[i];
+                }
+            }
+            os << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Struct field declaration
+    class StructFieldNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        std::string _type_annotation;
+        Visibility _visibility;
+        std::unique_ptr<ExpressionNode> _default_value;
+
+    public:
+        StructFieldNode(SourceLocation loc, std::string name, std::string type_annotation, 
+                       Visibility visibility = Visibility::Public)
+            : DeclarationNode(NodeKind::VariableDeclaration, loc), 
+              _name(std::move(name)), _type_annotation(std::move(type_annotation)), 
+              _visibility(visibility) {}
+
+        const std::string &name() const { return _name; }
+        const std::string &type_annotation() const { return _type_annotation; }
+        Visibility visibility() const { return _visibility; }
+        ExpressionNode *default_value() const { return _default_value.get(); }
+
+        // Compatibility methods for TypeChecker
+        const std::string &field_type() const { return _type_annotation; }
+        bool is_mutable() const { return _visibility != Visibility::Private; }
+        void set_type(const std::string &type) { _type_annotation = type; }
+
+        void set_default_value(std::unique_ptr<ExpressionNode> value)
+        {
+            _default_value = std::move(value);
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "Field: ";
+            if (_visibility == Visibility::Private) os << "private ";
+            else if (_visibility == Visibility::Protected) os << "protected ";
+            os << _name << ": " << _type_annotation;
+            if (_default_value)
+            {
+                os << " = ";
+                _default_value->print(os, 0);
+            }
+            os << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Struct method declaration (can be signature only or with body)
+    class StructMethodNode : public FunctionDeclarationNode
+    {
+    private:
+        Visibility _visibility;
+        bool _is_constructor;
+
+    public:
+        StructMethodNode(SourceLocation loc, std::string name, std::string return_type,
+                        Visibility visibility = Visibility::Public, bool is_constructor = false)
+            : FunctionDeclarationNode(loc, std::move(name), std::move(return_type)),
+              _visibility(visibility), _is_constructor(is_constructor) {}
+
+        Visibility visibility() const { return _visibility; }
+        bool is_constructor() const { return _is_constructor; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "Method: ";
+            if (_visibility == Visibility::Private) os << "private ";
+            else if (_visibility == Visibility::Protected) os << "protected ";
+            if (_is_constructor) os << "constructor ";
+            
+            // Call parent print method
+            FunctionDeclarationNode::print(os, 0);
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Struct declaration
+    class StructDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        std::vector<std::unique_ptr<GenericParameterNode>> _generic_parameters;
+        std::vector<std::unique_ptr<StructFieldNode>> _fields;
+        std::vector<std::unique_ptr<StructMethodNode>> _methods;
+
+    public:
+        StructDeclarationNode(SourceLocation loc, std::string name)
+            : DeclarationNode(NodeKind::StructDeclaration, loc), _name(std::move(name)) {}
+
+        const std::string &name() const { return _name; }
+        const std::vector<std::unique_ptr<GenericParameterNode>> &generic_parameters() const { return _generic_parameters; }
+        const std::vector<std::unique_ptr<StructFieldNode>> &fields() const { return _fields; }
+        const std::vector<std::unique_ptr<StructMethodNode>> &methods() const { return _methods; }
+
+        void set_type(const std::string &type_name) { /* For type checker compatibility */ }
+
+        void add_generic_parameter(std::unique_ptr<GenericParameterNode> param)
+        {
+            _generic_parameters.push_back(std::move(param));
+        }
+
+        void add_field(std::unique_ptr<StructFieldNode> field)
+        {
+            _fields.push_back(std::move(field));
+        }
+
+        void add_method(std::unique_ptr<StructMethodNode> method)
+        {
+            _methods.push_back(std::move(method));
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "StructDecl: " << _name;
+            if (!_generic_parameters.empty())
+            {
+                os << "<";
+                for (size_t i = 0; i < _generic_parameters.size(); ++i)
+                {
+                    if (i > 0) os << ", ";
+                    os << _generic_parameters[i]->name();
+                }
+                os << ">";
+            }
+            os << std::endl;
+
+            if (!_fields.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Fields:" << std::endl;
+                for (const auto &field : _fields)
+                {
+                    if (field)
+                        field->print(os, indent + 4);
+                }
+            }
+
+            if (!_methods.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Methods:" << std::endl;
+                for (const auto &method : _methods)
+                {
+                    if (method)
+                        method->print(os, indent + 4);
+                }
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Class declaration (similar to struct but defaults to private)
+    class ClassDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        std::vector<std::unique_ptr<GenericParameterNode>> _generic_parameters;
+        std::vector<std::unique_ptr<StructFieldNode>> _fields;
+        std::vector<std::unique_ptr<StructMethodNode>> _methods;
+        std::string _base_class; // Optional base class
+
+    public:
+        ClassDeclarationNode(SourceLocation loc, std::string name)
+            : DeclarationNode(NodeKind::ClassDeclaration, loc), _name(std::move(name)) {}
+
+        const std::string &name() const { return _name; }
+        const std::vector<std::unique_ptr<GenericParameterNode>> &generic_parameters() const { return _generic_parameters; }
+        const std::vector<std::unique_ptr<StructFieldNode>> &fields() const { return _fields; }
+        const std::vector<std::unique_ptr<StructMethodNode>> &methods() const { return _methods; }
+        const std::string &base_class() const { return _base_class; }
+
+        void set_type(const std::string &type_name) { /* For type checker compatibility */ }
+
+        void add_generic_parameter(std::unique_ptr<GenericParameterNode> param)
+        {
+            _generic_parameters.push_back(std::move(param));
+        }
+
+        void add_field(std::unique_ptr<StructFieldNode> field)
+        {
+            _fields.push_back(std::move(field));
+        }
+
+        void add_method(std::unique_ptr<StructMethodNode> method)
+        {
+            _methods.push_back(std::move(method));
+        }
+
+        void set_base_class(const std::string &base)
+        {
+            _base_class = base;
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "ClassDecl: " << _name;
+            if (!_generic_parameters.empty())
+            {
+                os << "<";
+                for (size_t i = 0; i < _generic_parameters.size(); ++i)
+                {
+                    if (i > 0) os << ", ";
+                    os << _generic_parameters[i]->name();
+                }
+                os << ">";
+            }
+            if (!_base_class.empty())
+            {
+                os << " : " << _base_class;
+            }
+            os << std::endl;
+
+            if (!_fields.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Fields:" << std::endl;
+                for (const auto &field : _fields)
+                {
+                    if (field)
+                        field->print(os, indent + 4);
+                }
+            }
+
+            if (!_methods.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Methods:" << std::endl;
+                for (const auto &method : _methods)
+                {
+                    if (method)
+                        method->print(os, indent + 4);
+                }
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Type alias declaration (type Foo = Bar)
+    class TypeAliasDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _alias_name;
+        std::string _target_type;
+
+    public:
+        TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name, std::string target_type)
+            : DeclarationNode(NodeKind::TypeAliasDeclaration, loc),
+              _alias_name(std::move(alias_name)), _target_type(std::move(target_type)) {}
+
+        const std::string &alias_name() const { return _alias_name; }
+        const std::string &target_type() const { return _target_type; }
+
+        void set_type(const std::string &type) { _target_type = type; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "TypeAlias: " << _alias_name 
+               << " = " << _target_type << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Implementation block (impl StructName { ... })
+    class ImplementationBlockNode : public DeclarationNode
+    {
+    private:
+        std::string _target_type;
+        std::vector<std::unique_ptr<StructFieldNode>> _field_implementations;
+        std::vector<std::unique_ptr<StructMethodNode>> _method_implementations;
+
+    public:
+        ImplementationBlockNode(SourceLocation loc, std::string target_type)
+            : DeclarationNode(NodeKind::ImplementationBlock, loc), _target_type(std::move(target_type)) {}
+
+        const std::string &target_type() const { return _target_type; }
+        const std::vector<std::unique_ptr<StructFieldNode>> &field_implementations() const { return _field_implementations; }
+        const std::vector<std::unique_ptr<StructMethodNode>> &method_implementations() const { return _method_implementations; }
+
+        void add_field_implementation(std::unique_ptr<StructFieldNode> field)
+        {
+            _field_implementations.push_back(std::move(field));
+        }
+
+        void add_method_implementation(std::unique_ptr<StructMethodNode> method)
+        {
+            _method_implementations.push_back(std::move(method));
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "ImplementationBlock for " << _target_type << std::endl;
+
+            if (!_field_implementations.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Field Implementations:" << std::endl;
+                for (const auto &field : _field_implementations)
+                {
+                    if (field)
+                        field->print(os, indent + 4);
+                }
+            }
+
+            if (!_method_implementations.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Method Implementations:" << std::endl;
+                for (const auto &method : _method_implementations)
+                {
+                    if (method)
+                        method->print(os, indent + 4);
+                }
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
     // Call expression
     class CallExpressionNode : public ExpressionNode
     {
@@ -549,6 +923,36 @@ namespace Cryo
                 os << std::string(indent + 2, ' ') << "Index:" << std::endl;
                 _index->print(os, indent + 4);
             }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Member access (dot notation like obj.member)
+    class MemberAccessNode : public ExpressionNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _object;
+        std::string _member;
+
+    public:
+        MemberAccessNode(SourceLocation loc, std::unique_ptr<ExpressionNode> object,
+                         std::string member)
+            : ExpressionNode(NodeKind::MemberAccess, loc), _object(std::move(object)),
+              _member(std::move(member)) {}
+
+        ExpressionNode *object() const { return _object.get(); }
+        const std::string &member() const { return _member; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "MemberAccess:" << std::endl;
+            if (_object)
+            {
+                os << std::string(indent + 2, ' ') << "Object:" << std::endl;
+                _object->print(os, indent + 4);
+            }
+            os << std::string(indent + 2, ' ') << "Member: " << _member << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;

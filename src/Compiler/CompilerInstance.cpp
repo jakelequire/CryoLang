@@ -403,6 +403,16 @@ namespace Cryo
                 populate_symbol_table_with_scope(func_decl->body(), current_scope, func_decl->name());
             }
         }
+        // Handle struct declarations
+        else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
+        {
+            // Get or create struct type
+            Type *struct_type = _ast_context->types().get_struct_type(struct_decl->name());
+
+            // Add struct to symbol table as a Type symbol
+            current_scope->declare_symbol(struct_decl->name(), SymbolKind::Type,
+                                          struct_decl->location(), struct_type, scope_name);
+        }
         // Handle variable declarations
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
