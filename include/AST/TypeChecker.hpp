@@ -113,6 +113,9 @@ namespace Cryo
 
         // Struct field tracking - maps struct name -> field name -> field type
         std::unordered_map<std::string, std::unordered_map<std::string, Type*>> _struct_fields;
+        
+        // Struct method tracking - maps struct name -> method name -> return type
+        std::unordered_map<std::string, std::unordered_map<std::string, Type*>> _struct_methods;
 
     public:
         TypeChecker(TypeContext &type_ctx);
@@ -156,6 +159,7 @@ namespace Cryo
         void visit(IdentifierNode &node) override;
         void visit(BinaryExpressionNode &node) override;
         void visit(CallExpressionNode &node) override;
+        void visit(NewExpressionNode &node) override;
         void visit(MemberAccessNode &node) override;
         void visit(ScopeResolutionNode &node) override;
 

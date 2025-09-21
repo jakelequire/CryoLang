@@ -517,6 +517,7 @@ namespace Cryo
         Type *get_generic_type(const std::string &name);
 
         // Type parsing utilities
+        std::string normalize_generic_type_string(const std::string &type_str);
         Type *parse_type_from_string(const std::string &type_str);
         Type *resolve_type_from_token_kind(int token_kind); // From your TokenKind enum
 

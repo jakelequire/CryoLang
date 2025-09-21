@@ -95,6 +95,11 @@ namespace Cryo
         return std::make_unique<CallExpressionNode>(loc, std::move(callee));
     }
 
+    std::unique_ptr<NewExpressionNode> ASTBuilder::create_new_expression(SourceLocation loc, std::string type_name)
+    {
+        return std::make_unique<NewExpressionNode>(loc, std::move(type_name));
+    }
+
     std::unique_ptr<ArrayLiteralNode> ASTBuilder::create_array_literal(SourceLocation loc)
     {
         return std::make_unique<ArrayLiteralNode>(loc);

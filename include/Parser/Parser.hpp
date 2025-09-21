@@ -108,6 +108,7 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> parse_unary();
         std::unique_ptr<ExpressionNode> parse_primary();
         std::unique_ptr<ExpressionNode> parse_call_expression(std::unique_ptr<ExpressionNode> expr);
+        std::unique_ptr<ExpressionNode> parse_new_expression();
         std::unique_ptr<ExpressionNode> parse_array_access(std::unique_ptr<ExpressionNode> expr);
         std::unique_ptr<ExpressionNode> parse_member_access(std::unique_ptr<ExpressionNode> expr);
 
@@ -125,7 +126,7 @@ namespace Cryo
         std::vector<std::unique_ptr<GenericParameterNode>> parse_generic_parameters();
         std::unique_ptr<GenericParameterNode> parse_generic_parameter();
         std::unique_ptr<StructFieldNode> parse_struct_field();
-        std::unique_ptr<StructMethodNode> parse_struct_method();
+        std::unique_ptr<StructMethodNode> parse_struct_method(const std::string &struct_name = "");
         Visibility parse_visibility_modifier();
 
         // Enum parsing helpers
