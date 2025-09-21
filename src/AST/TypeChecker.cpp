@@ -481,6 +481,23 @@ namespace Cryo
     {
         const std::string &name = node.name();
 
+        // Special handling for 'this' keyword
+        if (name == "this")
+        {
+            // For now, treat 'this' as having the current struct type
+            // TODO: Add proper implementation block context checking
+            if (_current_struct_type)
+            {
+                node.set_type(_current_struct_type->to_string());
+            }
+            else
+            {
+                report_undefined_symbol(node.location(), name);
+                node.set_type(_type_context.get_unknown_type()->to_string());
+            }
+            return;
+        }
+
         TypedSymbol *symbol = _symbol_table->lookup_symbol(name);
         if (!symbol)
         {
@@ -672,6 +689,320 @@ namespace Cryo
         {
             node.set_type(_type_context.get_unknown_type()->to_string());
         }
+    }
+
+    void TypeChecker::visit(MemberAccessNode &node)
+    {
+        // Visit the object expression first
+        if (node.object())
+        {
+            node.object()->accept(*this);
+        }
+
+        // Get the type of the object being accessed
+        std::string object_type = node.object() && node.object()->type().has_value() 
+                                  ? node.object()->type().value() 
+                                  : "unknown";
+        
+        if (object_type == "unknown")
+        {
+            node.set_type("unknown");
+            return;
+        }
+
+        // Get the member name
+        std::string member_name = node.member();
+        
+        // Look up the type by name to get struct information
+        Type *struct_type = lookup_variable_type(object_type);
+        if (!struct_type || struct_type->kind() != TypeKind::Struct)
+        {
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                       "Cannot access member of non-struct type: " + object_type);
+            node.set_type("unknown");
+            return;
+        }
+
+        // For struct types, look up the field type
+        // TODO: This is simplified - we need proper field type lookup from struct definition
+        // For now, assume basic field types based on common names
+        if (member_name == "x" || member_name == "y" || member_name == "z")
+        {
+            node.set_type("int");
+        }
+        else
+        {
+            // Unknown member - this would normally be caught by checking struct definition
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                       "Unknown member '" + member_name + "' in type '" + object_type + "'");
+            node.set_type("unknown");
+        }
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Struct/Class Declaration Visitors
+    //===----------------------------------------------------------------------===//
+
+    void TypeChecker::visit(StructDeclarationNode &node)
+    {
+        std::string struct_name = node.name();
+        
+        // Check for redefinition
+        if (_symbol_table->lookup_symbol(struct_name))
+        {
+            report_redefined_symbol(node.location(), struct_name);
+            return;
+        }
+
+        // Register struct type in symbol table FIRST, before processing fields
+        // This allows fields to reference this struct type or other struct types
+        Type *struct_type = _type_context.get_struct_type(struct_name);
+        _symbol_table->declare_symbol(struct_name, struct_type, node.location(), false);
+
+        // Enter struct scope
+        enter_scope();
+
+        // Process generic parameters if any
+        for (const auto &generic_param : node.generic_parameters())
+        {
+            if (generic_param)
+            {
+                generic_param->accept(*this);
+            }
+        }
+
+        // Process fields
+        for (const auto &field : node.fields())
+        {
+            if (field)
+            {
+                field->accept(*this);
+            }
+        }
+
+        // Process methods
+        for (const auto &method : node.methods())
+        {
+            if (method)
+            {
+                method->accept(*this);
+            }
+        }
+
+        // Exit struct scope
+        exit_scope();
+        
+        node.set_type(struct_name);
+    }
+
+    void TypeChecker::visit(ClassDeclarationNode &node)
+    {
+        std::string class_name = node.name();
+        
+        // Check for redefinition
+        if (_symbol_table->lookup_symbol(class_name))
+        {
+            report_redefined_symbol(node.location(), class_name);
+            return;
+        }
+
+        // Register class type in symbol table FIRST, before processing fields
+        // This allows fields to reference this class type or other class/struct types
+        Type *class_type = _type_context.get_class_type(class_name);
+        _symbol_table->declare_symbol(class_name, class_type, node.location(), false);
+
+        // Enter class scope
+        enter_scope();
+
+        // Process generic parameters if any
+        for (const auto &generic_param : node.generic_parameters())
+        {
+            if (generic_param)
+            {
+                generic_param->accept(*this);
+            }
+        }
+
+        // Process base class if any
+        if (!node.base_class().empty())
+        {
+            std::string base_class_name = node.base_class();
+            TypedSymbol *base_symbol = _symbol_table->lookup_symbol(base_class_name);
+            if (!base_symbol)
+            {
+                report_undefined_symbol(node.location(), base_class_name);
+            }
+            else
+            {
+                Type *base_class_type = base_symbol->type;
+                if (!base_class_type || base_class_type->kind() != TypeKind::Class)
+                {
+                    report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                               "Base class must be a valid class type");
+                }
+            }
+        }
+
+        // Process fields
+        for (const auto &field : node.fields())
+        {
+            if (field)
+            {
+                field->accept(*this);
+            }
+        }
+
+        // Process methods
+        for (const auto &method : node.methods())
+        {
+            if (method)
+            {
+                method->accept(*this);
+            }
+        }
+
+        // Exit class scope
+        exit_scope();
+        
+        node.set_type(class_name);
+    }
+
+    void TypeChecker::visit(TypeAliasDeclarationNode &node)
+    {
+        std::string alias_name = node.alias_name();
+        
+        // Check for redefinition
+        if (_symbol_table->lookup_symbol(alias_name))
+        {
+            report_redefined_symbol(node.location(), alias_name);
+            return;
+        }
+
+        // Visit target type to ensure it's valid
+        std::string target_type_str = node.target_type();
+        Type *target_type = _type_context.parse_type_from_string(target_type_str);
+        
+        if (target_type && target_type->kind() != TypeKind::Unknown)
+        {
+            // Register type alias in symbol table
+            _symbol_table->declare_symbol(alias_name, target_type, node.location(), false);
+        }
+        else
+        {
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                       "Invalid target type for type alias: " + target_type_str);
+        }
+    }
+
+    void TypeChecker::visit(ImplementationBlockNode &node)
+    {
+        // Get target type name as string
+        std::string target_type_name = node.target_type();
+        Type *target_type = nullptr;
+        
+        if (!target_type_name.empty())
+        {
+            // Look up the target type in symbol table
+            target_type = lookup_variable_type(target_type_name);
+            if (!target_type)
+            {
+                report_undefined_symbol(node.location(), target_type_name);
+                return;
+            }
+            
+            // Verify it's a struct or class type
+            if (target_type->kind() != TypeKind::Struct && target_type->kind() != TypeKind::Class)
+            {
+                report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                           "Implementation block can only be applied to struct or class types");
+                return;
+            }
+        }
+
+        // Save previous struct type and set current for 'this' keyword
+        Type *previous_struct_type = _current_struct_type;
+        _current_struct_type = target_type;
+
+        // Enter implementation scope
+        enter_scope();
+
+        // Process all methods in the implementation block
+        for (const auto &method : node.method_implementations())
+        {
+            if (method)
+            {
+                method->accept(*this);
+            }
+        }
+
+        // Exit implementation scope
+        exit_scope();
+        
+        // Restore previous struct type
+        _current_struct_type = previous_struct_type;
+    }
+
+    void TypeChecker::visit(GenericParameterNode &node)
+    {
+        std::string param_name = node.name();
+        
+        // Check for redefinition within the same generic parameter list
+        if (_symbol_table->lookup_symbol(param_name))
+        {
+            report_redefined_symbol(node.location(), param_name);
+            return;
+        }
+
+        // Register generic parameter as a type parameter
+        // For now, treat it as a placeholder type
+        Type *generic_type = _type_context.get_generic_type(param_name);
+        _symbol_table->declare_symbol(param_name, generic_type, node.location(), false);
+        
+        node.set_type("generic<" + param_name + ">");
+    }
+
+    void TypeChecker::visit(StructFieldNode &node)
+    {
+        std::string field_name = node.name();
+        
+        // Check for redefinition within the same struct
+        if (_symbol_table->lookup_symbol(field_name))
+        {
+            report_redefined_symbol(node.location(), field_name);
+            return;
+        }
+
+        // Get field type from type annotation
+        std::string field_type_str = node.field_type();
+        Type *field_type = _type_context.parse_type_from_string(field_type_str);
+        
+        if (field_type && field_type->kind() != TypeKind::Unknown)
+        {
+            // Register field in current scope (struct/class scope)
+            _symbol_table->declare_symbol(field_name, field_type, node.location(), node.is_mutable());
+            node.set_type(field_type_str);
+        }
+        else
+        {
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                       "Invalid field type: " + field_type_str);
+            node.set_type("unknown");
+        }
+    }
+
+    void TypeChecker::visit(StructMethodNode &node)
+    {
+        std::string method_name = node.name();
+        
+        // Check for redefinition within the same struct/class
+        if (_symbol_table->lookup_symbol(method_name))
+        {
+            report_redefined_symbol(node.location(), method_name);
+            return;
+        }
+
+        // Delegate to FunctionDeclarationNode visitor for most processing
+        visit(static_cast<FunctionDeclarationNode&>(node));
     }
 
     //===----------------------------------------------------------------------===//

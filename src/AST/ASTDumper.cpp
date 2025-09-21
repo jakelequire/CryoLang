@@ -67,6 +67,10 @@ namespace Cryo
         case NodeKind::Program:
         case NodeKind::VariableDeclaration:
         case NodeKind::FunctionDeclaration:
+        case NodeKind::StructDeclaration:
+        case NodeKind::ClassDeclaration:
+        case NodeKind::TypeAliasDeclaration:
+        case NodeKind::ImplementationBlock:
             return Colors::DECLARATION;
 
         case NodeKind::BlockStatement:
@@ -478,6 +482,21 @@ namespace Cryo
         dump_child(node.index(), true);
     }
 
+    void ASTDumper::visit(MemberAccessNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "MemberAccess";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        // Dump object and member name
+        dump_child(node.object(), false);
+        print_prefix();
+        _output << "|-Member: " << node.member() << std::endl;
+    }
+
     void ASTDumper::visit(IfStatementNode &node)
     {
         print_prefix();
@@ -605,6 +624,263 @@ namespace Cryo
         if (node.declaration())
         {
             node.declaration()->accept(*this);
+        }
+    }
+
+    void ASTDumper::visit(StructFieldNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "StructField";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << " ";
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "'" << node.type_annotation() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(StructMethodNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "StructMethod";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        // Build and display method signature (same format as FunctionDecl)
+        _output << " ";
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "'(";
+
+        // Add parameter types
+        const auto &params = node.parameters();
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            if (i > 0)
+                _output << ", ";
+            _output << params[i]->type_annotation();
+        }
+
+        _output << ") -> " << node.return_type_annotation() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        // Dump parameters and body
+        if (!params.empty())
+        {
+            for (size_t i = 0; i < params.size(); ++i)
+            {
+                dump_child(params[i].get(), i == params.size() - 1 && !node.body());
+            }
+        }
+
+        if (node.body())
+        {
+            dump_child(node.body(), true);
+        }
+    }
+
+    void ASTDumper::visit(GenericParameterNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "GenericParam";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        const auto &constraints = node.constraints();
+        if (!constraints.empty())
+        {
+            _output << " : ";
+            for (size_t i = 0; i < constraints.size(); ++i)
+            {
+                if (i > 0) _output << " + ";
+                _output << constraints[i];
+            }
+        }
+
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(StructDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "StructDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        // Dump generic parameters, fields, and methods
+        const auto &generics = node.generic_parameters();
+        const auto &fields = node.fields();
+        const auto &methods = node.methods();
+
+        size_t total_children = generics.size() + fields.size() + methods.size();
+        size_t child_index = 0;
+
+        for (const auto &generic : generics)
+        {
+            dump_child(generic.get(), ++child_index == total_children);
+        }
+
+        for (const auto &field : fields)
+        {
+            dump_child(field.get(), ++child_index == total_children);
+        }
+
+        for (const auto &method : methods)
+        {
+            dump_child(method.get(), ++child_index == total_children);
+        }
+    }
+
+    void ASTDumper::visit(ClassDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ClassDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        if (!node.base_class().empty())
+        {
+            _output << " : ";
+            if (_use_colors)
+                _output << Colors::TYPE;
+            _output << node.base_class();
+            if (_use_colors)
+                _output << Colors::RESET;
+        }
+
+        _output << std::endl;
+
+        // Dump generic parameters, fields, and methods (similar to struct)
+        const auto &generics = node.generic_parameters();
+        const auto &fields = node.fields();
+        const auto &methods = node.methods();
+
+        size_t total_children = generics.size() + fields.size() + methods.size();
+        size_t child_index = 0;
+
+        for (const auto &generic : generics)
+        {
+            dump_child(generic.get(), ++child_index == total_children);
+        }
+
+        for (const auto &field : fields)
+        {
+            dump_child(field.get(), ++child_index == total_children);
+        }
+
+        for (const auto &method : methods)
+        {
+            dump_child(method.get(), ++child_index == total_children);
+        }
+    }
+
+    void ASTDumper::visit(TypeAliasDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "TypeAlias";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.alias_name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << " = ";
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "'" << node.target_type() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(ImplementationBlockNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ImplementationBlock";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " for ";
+
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "'" << node.target_type() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        // Dump field implementations and method implementations
+        const auto &fields = node.field_implementations();
+        const auto &methods = node.method_implementations();
+
+        size_t total_children = fields.size() + methods.size();
+        size_t child_index = 0;
+
+        for (const auto &field : fields)
+        {
+            dump_child(field.get(), ++child_index == total_children);
+        }
+
+        for (const auto &method : methods)
+        {
+            dump_child(method.get(), ++child_index == total_children);
         }
     }
 

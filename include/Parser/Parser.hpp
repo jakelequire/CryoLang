@@ -34,6 +34,9 @@ namespace Cryo
         std::vector<ParseError> _errors;
         DiagnosticManager *_diagnostic_manager;
         std::string _source_file;
+        
+        // Context tracking
+        bool _in_implementation_block = false;
 
     public:
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
@@ -74,6 +77,10 @@ namespace Cryo
         std::unique_ptr<ASTNode> parse_statement();
         std::unique_ptr<VariableDeclarationNode> parse_variable_declaration();
         std::unique_ptr<FunctionDeclarationNode> parse_function_declaration();
+        std::unique_ptr<StructDeclarationNode> parse_struct_declaration();
+        std::unique_ptr<ClassDeclarationNode> parse_class_declaration();
+        std::unique_ptr<TypeAliasDeclarationNode> parse_type_alias_declaration();
+        std::unique_ptr<ImplementationBlockNode> parse_implementation_block();
         std::unique_ptr<ReturnStatementNode> parse_return_statement();
         std::unique_ptr<BlockStatementNode> parse_block_statement();
         std::unique_ptr<ASTNode> parse_if_statement();
@@ -101,6 +108,7 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> parse_primary();
         std::unique_ptr<ExpressionNode> parse_call_expression(std::unique_ptr<ExpressionNode> expr);
         std::unique_ptr<ExpressionNode> parse_array_access(std::unique_ptr<ExpressionNode> expr);
+        std::unique_ptr<ExpressionNode> parse_member_access(std::unique_ptr<ExpressionNode> expr);
 
         // Literal parsing
         std::unique_ptr<LiteralNode> parse_number_literal();
@@ -111,6 +119,13 @@ namespace Cryo
 
         // Array literal parsing
         std::unique_ptr<ExpressionNode> parse_array_literal();
+
+        // Struct/Class parsing helpers
+        std::vector<std::unique_ptr<GenericParameterNode>> parse_generic_parameters();
+        std::unique_ptr<GenericParameterNode> parse_generic_parameter();
+        std::unique_ptr<StructFieldNode> parse_struct_field();
+        std::unique_ptr<StructMethodNode> parse_struct_method();
+        Visibility parse_visibility_modifier();
 
         // Utility methods
         bool is_type_token() const;

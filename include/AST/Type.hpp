@@ -383,6 +383,32 @@ namespace Cryo
         std::string to_string() const override { return "unknown"; }
     };
 
+    // Struct type (user-defined)
+    class StructType : public Type
+    {
+    public:
+        StructType(const std::string &name) : Type(TypeKind::Struct, name) {}
+
+        bool is_primitive() const override { return false; }
+        bool is_value_type() const override { return true; }
+        size_t size_bytes() const override { return sizeof(void*); } // Placeholder
+        size_t alignment() const override { return sizeof(void*); }
+        std::string to_string() const override { return _name; }
+    };
+
+    // Class type (user-defined)
+    class ClassType : public Type
+    {
+    public:
+        ClassType(const std::string &name) : Type(TypeKind::Class, name) {}
+
+        bool is_primitive() const override { return false; }
+        bool is_reference_type() const override { return true; }
+        size_t size_bytes() const override { return sizeof(void*); } // Pointer size
+        size_t alignment() const override { return sizeof(void*); }
+        std::string to_string() const override { return _name; }
+    };
+
     // Type factory and context for managing types
     class TypeContext
     {
@@ -398,6 +424,10 @@ namespace Cryo
         // Integer type cache
         std::unordered_map<int, std::unique_ptr<IntegerType>> _integer_types;
         std::unordered_map<int, std::unique_ptr<FloatType>> _float_types;
+        
+        // User-defined type cache
+        std::unordered_map<std::string, std::unique_ptr<StructType>> _struct_types;
+        std::unordered_map<std::string, std::unique_ptr<ClassType>> _class_types;
 
         // Complex type cache
         std::vector<std::unique_ptr<Type>> _complex_types;
@@ -433,6 +463,11 @@ namespace Cryo
         Type *create_pointer_type(Type *pointee_type);
         Type *create_optional_type(Type *wrapped_type);
         Type *create_function_type(Type *return_type, std::vector<Type *> param_types, bool is_variadic = false);
+
+        // Create user-defined types
+        Type *get_struct_type(const std::string &name);
+        Type *get_class_type(const std::string &name);
+        Type *get_generic_type(const std::string &name);
 
         // Type parsing utilities
         Type *parse_type_from_string(const std::string &type_str);

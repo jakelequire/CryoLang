@@ -105,6 +105,11 @@ namespace Cryo
         return std::make_unique<ArrayAccessNode>(loc, std::move(array), std::move(index));
     }
 
+    std::unique_ptr<MemberAccessNode> ASTBuilder::create_member_access(SourceLocation loc, std::unique_ptr<ExpressionNode> object, std::string member)
+    {
+        return std::make_unique<MemberAccessNode>(loc, std::move(object), std::move(member));
+    }
+
     std::unique_ptr<IfStatementNode> ASTBuilder::create_if_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> then_stmt, std::unique_ptr<StatementNode> else_stmt)
     {
         return std::make_unique<IfStatementNode>(loc, std::move(condition), std::move(then_stmt), std::move(else_stmt));
@@ -138,6 +143,42 @@ namespace Cryo
     std::unique_ptr<DeclarationStatementNode> ASTBuilder::create_declaration_statement(SourceLocation loc, std::unique_ptr<DeclarationNode> decl)
     {
         return std::make_unique<DeclarationStatementNode>(loc, std::move(decl));
+    }
+
+    // Struct and Class creation methods
+    std::unique_ptr<GenericParameterNode> ASTBuilder::create_generic_parameter(SourceLocation loc, std::string name)
+    {
+        return std::make_unique<GenericParameterNode>(loc, std::move(name));
+    }
+
+    std::unique_ptr<StructFieldNode> ASTBuilder::create_struct_field(SourceLocation loc, std::string name, std::string type_annotation, Visibility visibility)
+    {
+        return std::make_unique<StructFieldNode>(loc, std::move(name), std::move(type_annotation), visibility);
+    }
+
+    std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, std::string return_type, Visibility visibility, bool is_constructor)
+    {
+        return std::make_unique<StructMethodNode>(loc, std::move(name), std::move(return_type), visibility, is_constructor);
+    }
+
+    std::unique_ptr<StructDeclarationNode> ASTBuilder::create_struct_declaration(SourceLocation loc, std::string name)
+    {
+        return std::make_unique<StructDeclarationNode>(loc, std::move(name));
+    }
+
+    std::unique_ptr<ClassDeclarationNode> ASTBuilder::create_class_declaration(SourceLocation loc, std::string name)
+    {
+        return std::make_unique<ClassDeclarationNode>(loc, std::move(name));
+    }
+
+    std::unique_ptr<TypeAliasDeclarationNode> ASTBuilder::create_type_alias_declaration(SourceLocation loc, std::string alias_name, std::string target_type)
+    {
+        return std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), std::move(target_type));
+    }
+
+    std::unique_ptr<ImplementationBlockNode> ASTBuilder::create_implementation_block(SourceLocation loc, std::string target_type)
+    {
+        return std::make_unique<ImplementationBlockNode>(loc, std::move(target_type));
     }
 
     // Helper methods

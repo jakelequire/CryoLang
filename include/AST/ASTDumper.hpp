@@ -74,6 +74,7 @@ namespace Cryo
         void visit(CallExpressionNode &node) override;
         void visit(ArrayLiteralNode &node) override;
         void visit(ArrayAccessNode &node) override;
+        void visit(MemberAccessNode &node) override;
         void visit(IfStatementNode &node) override;
         void visit(WhileStatementNode &node) override;
         void visit(ForStatementNode &node) override;
@@ -81,6 +82,13 @@ namespace Cryo
         void visit(ContinueStatementNode &node) override;
         void visit(ExpressionStatementNode &node) override;
         void visit(DeclarationStatementNode &node) override;
+        void visit(StructDeclarationNode &node) override;
+        void visit(ClassDeclarationNode &node) override;
+        void visit(TypeAliasDeclarationNode &node) override;
+        void visit(ImplementationBlockNode &node) override;
+        void visit(GenericParameterNode &node) override;
+        void visit(StructFieldNode &node) override;
+        void visit(StructMethodNode &node) override;
 
     private:
         // Helper methods for traversing children

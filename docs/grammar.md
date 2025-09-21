@@ -1,6 +1,6 @@
 
 <program>        ::= { <statement> }
-<statement>      ::= <var-declaration> | <function-declaration> | <expression-statement> | <if-statement> | <while-statement> | <for-statement> | <break-statement> | <continue-statement> | <return-statement>
+<statement>      ::= <var-declaration> | <function-declaration> | <struct-declaration> | <class-declaration> | <type-alias-declaration> | <implementation-block> | <expression-statement> | <if-statement> | <while-statement> | <for-statement> | <break-statement> | <continue-statement> | <return-statement>
 
 <var-declaration> ::= ("const" | "mut") <identifier> ":" <type> ["=" <expression>] ";"
 
@@ -9,6 +9,25 @@
 <param>                 ::=  <identifier> ":" <type>
 <block>                 ::=  "{" { <statement> } "}"
 <visibility>            ::=  "public" | "private"
+
+<struct-declaration>    ::=  "type" "struct" <identifier> [<generic-params>] "{" { <struct-member> } "}"
+<class-declaration>     ::=  "class" <identifier> [<generic-params>] [":" <identifier>] "{" { <class-member> } "}"
+<type-alias-declaration>::=  "type" <identifier> "=" <type> ";"
+<implementation-block>  ::=  "implement" "struct" <identifier> "{" { <implementation-member> } "}"
+
+<generic-params>        ::=  "<" <generic-param> { "," <generic-param> } ">"
+<generic-param>         ::=  <identifier> [":" <type-constraint>]
+<type-constraint>       ::=  <type> { "+" <type> }
+
+<struct-member>         ::=  <struct-field> | <struct-method>
+<class-member>          ::=  [<visibility>] ( <struct-field> | <struct-method> )
+<implementation-member> ::=  <field-implementation> | <method-implementation>
+
+<struct-field>          ::=  [<visibility>] <identifier> ":" <type> ["=" <expression>] ";"
+<struct-method>         ::=  [<visibility>] <identifier> "(" [<param-list>] ")" ["->" <type>] [ <block> ] ";"
+
+<field-implementation>  ::=  <identifier> "=" <expression> ";"
+<method-implementation> ::=  <identifier> "(" [<param-list>] ")" ["->" <type>] <block>
 
 
 <expression-statement>    ::=  <expression> ";"

@@ -100,6 +100,9 @@ namespace Cryo
 
         // Current function return type (for return statement checking)
         Type *_current_function_return_type = nullptr;
+        
+        // Current struct type (for 'this' keyword resolution)
+        Type *_current_struct_type = nullptr;
 
         // Type checking state
         bool _in_function = false;
@@ -123,6 +126,13 @@ namespace Cryo
         // Visitor methods - Declarations
         void visit(VariableDeclarationNode &node) override;
         void visit(FunctionDeclarationNode &node) override;
+        void visit(StructDeclarationNode &node) override;
+        void visit(ClassDeclarationNode &node) override;
+        void visit(TypeAliasDeclarationNode &node) override;
+        void visit(ImplementationBlockNode &node) override;
+        void visit(GenericParameterNode &node) override;
+        void visit(StructFieldNode &node) override;
+        void visit(StructMethodNode &node) override;
 
         // Visitor methods - Statements
         void visit(BlockStatementNode &node) override;
@@ -138,6 +148,7 @@ namespace Cryo
         void visit(IdentifierNode &node) override;
         void visit(BinaryExpressionNode &node) override;
         void visit(CallExpressionNode &node) override;
+        void visit(MemberAccessNode &node) override;
 
     private:
         // Type inference and deduction

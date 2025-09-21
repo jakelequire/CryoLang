@@ -18,6 +18,11 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void MemberAccessNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     // Control flow statement visitor implementations
     void IfStatementNode::accept(ASTVisitor &visitor)
     {
@@ -120,6 +125,48 @@ namespace Cryo
     }
 
     void DeclarationStatementNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // GenericParameterNode visitor implementation
+    void GenericParameterNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // StructFieldNode visitor implementation
+    void StructFieldNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // StructMethodNode visitor implementation
+    void StructMethodNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // StructDeclarationNode visitor implementation
+    void StructDeclarationNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // ClassDeclarationNode visitor implementation
+    void ClassDeclarationNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // TypeAliasDeclarationNode visitor implementation
+    void TypeAliasDeclarationNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // ImplementationBlockNode visitor implementation
+    void ImplementationBlockNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);
     }
