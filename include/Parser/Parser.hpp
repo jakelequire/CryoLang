@@ -128,8 +128,8 @@ namespace Cryo
         // Struct/Class parsing helpers
         std::vector<std::unique_ptr<GenericParameterNode>> parse_generic_parameters();
         std::unique_ptr<GenericParameterNode> parse_generic_parameter();
-        std::unique_ptr<StructFieldNode> parse_struct_field();
-        std::unique_ptr<StructMethodNode> parse_struct_method(const std::string &struct_name = "");
+        std::unique_ptr<StructFieldNode> parse_struct_field(Visibility default_visibility = Visibility::Public);
+        std::unique_ptr<StructMethodNode> parse_struct_method(const std::string &struct_name = "", Visibility default_visibility = Visibility::Public);
         Visibility parse_visibility_modifier();
 
         // Enum parsing helpers

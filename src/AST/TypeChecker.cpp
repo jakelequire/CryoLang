@@ -46,6 +46,40 @@ namespace Cryo
         return true;
     }
 
+    bool TypedSymbolTable::declare_symbol(const std::string &name, Type *type,
+                                          SourceLocation loc, StructDeclarationNode *struct_node)
+    {
+        // Check for redefinition in current scope only
+        if (_symbols.find(name) != _symbols.end())
+        {
+            return false; // Symbol already exists
+        }
+
+        TypedSymbol symbol(name, type, loc, struct_node);
+        symbol.is_mutable = false;
+        symbol.is_initialized = true;
+
+        _symbols[name] = std::move(symbol);
+        return true;
+    }
+
+    bool TypedSymbolTable::declare_symbol(const std::string &name, Type *type,
+                                          SourceLocation loc, ClassDeclarationNode *class_node)
+    {
+        // Check for redefinition in current scope only
+        if (_symbols.find(name) != _symbols.end())
+        {
+            return false; // Symbol already exists
+        }
+
+        TypedSymbol symbol(name, type, loc, class_node);
+        symbol.is_mutable = false;
+        symbol.is_initialized = true;
+
+        _symbols[name] = std::move(symbol);
+        return true;
+    }
+
     TypedSymbol *TypedSymbolTable::lookup_symbol(const std::string &name)
     {
         // Search current scope
@@ -89,6 +123,393 @@ namespace Cryo
         {
             // If no parent scope, return a new empty table to avoid null pointer
             return std::make_unique<TypedSymbolTable>();
+        }
+    }
+
+    void TypedSymbolTable::print_type_table(std::ostream &os) const
+    {
+        // ANSI color codes for nice formatting
+        const std::string RESET = "\033[0m";
+        const std::string BOLD = "\033[1m";
+        const std::string CYAN = "\033[36m";
+        const std::string GREEN = "\033[32m";
+        const std::string YELLOW = "\033[33m";
+        const std::string BLUE = "\033[34m";
+        const std::string MAGENTA = "\033[35m";
+        const std::string RED = "\033[31m";
+
+        os << BOLD << CYAN << "\n+======================================================================================+" << RESET << std::endl;
+        os << BOLD << CYAN << "|                                    Type Table                                        |" << RESET << std::endl;
+        os << BOLD << CYAN << "+======================================================================================+" << RESET << std::endl;
+
+        if (_symbols.empty() && !_parent_scope)
+        {
+            os << "|  " << YELLOW << "No types found" << RESET << "                                                                       |" << std::endl;
+            os << BOLD << CYAN << "+======================================================================================+" << RESET << std::endl;
+            return;
+        }
+
+        // Count total symbols across all scopes
+        int total_symbols = 0;
+        const TypedSymbolTable *current = this;
+        while (current)
+        {
+            total_symbols += current->_symbols.size();
+            current = current->_parent_scope.get();
+        }
+
+        os << "|  Total symbols: " << BOLD << GREEN << total_symbols << RESET;
+        // Pad to align right side of box
+        std::string count_str = std::to_string(total_symbols);
+        for (int i = count_str.length(); i < 65; i++)
+        {
+            os << " ";
+        }
+        os << "|" << std::endl;
+        os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+----------+" << RESET << std::endl;
+        os << BOLD << CYAN << "|    TypeOf     |      Symbol      |           Type Signature            | Flags  | Location |" << RESET << std::endl;
+        os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+----------+" << RESET << std::endl;
+
+        // Print symbols from current and parent scopes
+        print_type_symbols(os, 0);
+
+        os << BOLD << CYAN << "+======================================================================================+" << RESET << std::endl;
+    }
+
+    void TypedSymbolTable::print_type_symbols(std::ostream &os, int scope_level) const
+    {
+        // ANSI color codes
+        const std::string RESET = "\033[0m";
+        const std::string BOLD = "\033[1m";
+        const std::string CYAN = "\033[36m";
+        const std::string GREEN = "\033[32m";
+        const std::string YELLOW = "\033[33m";
+        const std::string BLUE = "\033[34m";
+        const std::string MAGENTA = "\033[35m";
+        const std::string RED = "\033[31m";
+
+        // Print symbols in current scope
+        for (const auto &[name, symbol] : _symbols)
+        {
+            std::string type_category = determine_type_category(symbol.type);
+
+            // Only include: Struct, Class, Enum declarations, and Alias types
+            // Exclude: Functions, Primitives (enum variants), Arrays, Pointers, etc.
+            if (type_category != "Struct" && type_category != "Class" &&
+                type_category != "Enum" && type_category != "Alias")
+            {
+                continue; // Skip everything else
+            }
+
+            std::string type_signature = symbol.type ? symbol.type->to_string() : "unknown";
+            std::string flags = determine_flags(symbol);
+            std::string location = std::to_string(symbol.declaration_location.line()) +
+                                   ":" + std::to_string(symbol.declaration_location.column());
+
+            // Color code the type category
+            std::string colored_category;
+            if (type_category == "Struct" || type_category == "Class")
+            {
+                colored_category = MAGENTA + type_category + RESET;
+            }
+            else if (type_category == "Function")
+            {
+                colored_category = GREEN + type_category + RESET;
+            }
+            else if (type_category == "Enum")
+            {
+                colored_category = YELLOW + type_category + RESET;
+            }
+            else if (type_category == "Alias")
+            {
+                colored_category = CYAN + type_category + RESET;
+            }
+            else
+            {
+                colored_category = BLUE + type_category + RESET;
+            }
+
+            os << "| " << format_field_colored(colored_category, type_category, 13)
+               << " | " << format_field(name, 16)
+               << " | " << format_field(type_signature, 35)
+               << " | " << format_field(flags, 6)
+               << " | " << format_field(location, 8)
+               << " |" << std::endl;
+
+            // Print detailed information for complex types
+            print_type_details(os, symbol);
+        }
+
+        // Print symbols from parent scopes
+        if (_parent_scope)
+        {
+            _parent_scope->print_type_symbols(os, scope_level + 1);
+        }
+    }
+
+    std::string TypedSymbolTable::determine_type_category(Type *type) const
+    {
+        if (!type)
+            return "Unknown";
+
+        switch (type->kind())
+        {
+        case TypeKind::Struct:
+            return "Struct";
+        case TypeKind::Class:
+            return "Class";
+        case TypeKind::Function:
+            return "Function";
+        case TypeKind::Enum:
+            return "Enum";
+        case TypeKind::TypeAlias:
+            return "Alias";
+        case TypeKind::Integer:
+        case TypeKind::Float:
+        case TypeKind::Boolean:
+        case TypeKind::Char:
+        case TypeKind::String:
+        case TypeKind::Void:
+            return "Primitive";
+        case TypeKind::Array:
+            return "Array";
+        case TypeKind::Pointer:
+            return "Pointer";
+        case TypeKind::Reference:
+            return "Reference";
+        case TypeKind::Interface:
+            return "Interface";
+        case TypeKind::Union:
+            return "Union";
+        case TypeKind::Generic:
+            return "Generic";
+        case TypeKind::Optional:
+            return "Optional";
+        case TypeKind::Tuple:
+            return "Tuple";
+        case TypeKind::Auto:
+            return "Auto";
+        default:
+            return "Other";
+        }
+    }
+
+    std::string TypedSymbolTable::determine_flags(const TypedSymbol &symbol) const
+    {
+        std::string flags;
+
+        // For now, we'll add basic flags based on what we know
+        if (!symbol.is_mutable)
+        {
+            flags += "Im"; // Immutable
+        }
+
+        // TODO: Add more flags based on visibility, static nature, etc.
+        // This would need to be extended when we have more metadata
+
+        return flags.empty() ? "N/A" : flags;
+    }
+
+    void TypedSymbolTable::print_type_details(std::ostream &os, const TypedSymbol &symbol) const
+    {
+        const std::string RESET = "\033[0m";
+        const std::string BOLD = "\033[1m";
+        const std::string CYAN = "\033[36m";
+        const std::string GREEN = "\033[32m";
+        const std::string YELLOW = "\033[33m";
+
+        // For complex types like structs and classes, print their details if available
+        if (symbol.type && (symbol.type->kind() == TypeKind::Struct || symbol.type->kind() == TypeKind::Class))
+        {
+            // Use the same border as the main table header
+            os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+----------+" << RESET << std::endl;
+
+            // Properties section - spans across all columns (no right border)
+            os << "|   " << YELLOW << "Properties:" << RESET << std::endl;
+
+            // Helper function to get visibility string
+            auto get_visibility_string = [](Visibility vis) -> std::string
+            {
+                switch (vis)
+                {
+                case Visibility::Public:
+                    return "public";
+                case Visibility::Private:
+                    return "private";
+                case Visibility::Protected:
+                    return "protected";
+                default:
+                    return "public";
+                }
+            };
+
+            // Print struct fields
+            bool has_properties = false;
+            if (symbol.struct_node)
+            {
+                const auto &fields = symbol.struct_node->fields();
+                if (!fields.empty())
+                {
+                    has_properties = true;
+                    for (const auto &field : fields)
+                    {
+                        if (field)
+                        {
+                            std::string field_name = field->name();
+                            std::string field_type = field->type_annotation();
+                            std::string visibility = get_visibility_string(field->visibility());
+
+                            // For structs, all properties are public by default
+                            std::string property_line = "        " + visibility + " " + field_name + ": " + field_type;
+                            os << "|" << property_line << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // Print class fields
+            if (symbol.class_node)
+            {
+                const auto &fields = symbol.class_node->fields();
+                if (!fields.empty())
+                {
+                    has_properties = true;
+                    for (const auto &field : fields)
+                    {
+                        if (field)
+                        {
+                            std::string field_name = field->name();
+                            std::string field_type = field->type_annotation();
+                            std::string visibility = get_visibility_string(field->visibility());
+
+                            std::string property_line = "        " + visibility + " " + field_name + ": " + field_type;
+                            os << "|" << property_line << std::endl;
+                        }
+                    }
+                }
+            }
+
+            if (!has_properties)
+            {
+                os << "|        No properties defined" << std::endl;
+            }
+
+            // Methods section - no right border
+            os << "|   " << YELLOW << "Methods:" << RESET << std::endl;
+
+            // Print struct methods
+            bool has_methods = false;
+            if (symbol.struct_node)
+            {
+                const auto &methods = symbol.struct_node->methods();
+                if (!methods.empty())
+                {
+                    has_methods = true;
+                    for (const auto &method : methods)
+                    {
+                        if (method)
+                        {
+                            std::string method_name = method->name();
+                            std::string method_return_type = method->return_type_annotation();
+                            std::string visibility = get_visibility_string(method->visibility());
+
+                            // Build parameter signature
+                            std::string params = "(";
+                            const auto &parameters = method->parameters();
+                            for (size_t i = 0; i < parameters.size(); ++i)
+                            {
+                                if (i > 0)
+                                    params += ", ";
+                                if (parameters[i])
+                                {
+                                    std::string param_name = parameters[i]->name();
+                                    std::string param_type = parameters[i]->type_annotation();
+                                    params += param_name + ": " + param_type;
+                                }
+                            }
+                            params += ") -> " + method_return_type;
+
+                            // For structs, all methods are public by default
+                            std::string method_line = "        " + visibility + " " + method_name + params;
+                            os << "|" << method_line << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // Print class methods
+            if (symbol.class_node)
+            {
+                const auto &methods = symbol.class_node->methods();
+                if (!methods.empty())
+                {
+                    has_methods = true;
+                    for (const auto &method : methods)
+                    {
+                        if (method)
+                        {
+                            std::string method_name = method->name();
+                            std::string method_return_type = method->return_type_annotation();
+                            std::string visibility = get_visibility_string(method->visibility());
+
+                            // Build parameter signature
+                            std::string params = "(";
+                            const auto &parameters = method->parameters();
+                            for (size_t i = 0; i < parameters.size(); ++i)
+                            {
+                                if (i > 0)
+                                    params += ", ";
+                                if (parameters[i])
+                                {
+                                    std::string param_name = parameters[i]->name();
+                                    std::string param_type = parameters[i]->type_annotation();
+                                    params += param_name + ": " + param_type;
+                                }
+                            }
+                            params += ") -> " + method_return_type;
+
+                            std::string method_line = "        " + visibility + " " + method_name + params;
+                            os << "|" << method_line << std::endl;
+                        }
+                    }
+                }
+            }
+
+            if (!has_methods)
+            {
+                os << "|        No methods defined" << std::endl;
+            }
+
+            // Bottom border for this type's details
+            os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+----------+" << RESET << std::endl;
+        }
+    }
+
+    std::string TypedSymbolTable::format_field(const std::string &text, int width) const
+    {
+        if (text.length() >= width)
+        {
+            return text.substr(0, width);
+        }
+        else
+        {
+            std::string result = text;
+            result.resize(width, ' ');
+            return result;
+        }
+    }
+
+    std::string TypedSymbolTable::format_field_colored(const std::string &colored_text, const std::string &plain_text, int width) const
+    {
+        // Calculate padding based on plain text length, but return colored text
+        int padding = width - plain_text.length();
+        if (padding <= 0)
+        {
+            return colored_text.substr(0, width);
+        }
+        else
+        {
+            return colored_text + std::string(padding, ' ');
         }
     }
 
@@ -1052,7 +1473,7 @@ namespace Cryo
         // Register struct type in symbol table FIRST, before processing fields
         // This allows fields to reference this struct type or other struct types
         Type *struct_type = _type_context.get_struct_type(struct_name);
-        _symbol_table->declare_symbol(struct_name, struct_type, node.location(), false);
+        _symbol_table->declare_symbol(struct_name, struct_type, node.location(), &node);
 
         // Save previous struct type and set current for 'this' keyword in methods
         Type *previous_struct_type = _current_struct_type;
@@ -1116,7 +1537,7 @@ namespace Cryo
         // Register class type in symbol table FIRST, before processing fields
         // This allows fields to reference this class type or other class/struct types
         Type *class_type = _type_context.get_class_type(class_name);
-        _symbol_table->declare_symbol(class_name, class_type, node.location(), false);
+        _symbol_table->declare_symbol(class_name, class_type, node.location(), &node);
 
         // Save previous class type and set current for 'this' keyword in methods
         Type *previous_struct_type = _current_struct_type;

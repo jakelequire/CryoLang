@@ -1572,14 +1572,14 @@ namespace Cryo
                 if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
                 {
                     // It's a method
-                    auto method = parse_struct_method();
+                    auto method = parse_struct_method("", current_visibility);
                     // Note: We reuse StructMethodNode for class methods
                     class_decl->add_method(std::move(method));
                 }
                 else
                 {
                     // It's a field
-                    auto field = parse_struct_field();
+                    auto field = parse_struct_field(current_visibility);
                     class_decl->add_field(std::move(field));
                 }
             }
@@ -1836,12 +1836,12 @@ namespace Cryo
         return generic;
     }
 
-    std::unique_ptr<StructFieldNode> Parser::parse_struct_field()
+    std::unique_ptr<StructFieldNode> Parser::parse_struct_field(Visibility default_visibility)
     {
         SourceLocation start_loc = _current_token.location();
 
-        // Parse optional visibility (default is public for structs)
-        Visibility visibility = Visibility::Public;
+        // Parse optional visibility (use default if none provided)
+        Visibility visibility = default_visibility;
         if (is_visibility_modifier())
         {
             visibility = parse_visibility_modifier();
@@ -1868,12 +1868,12 @@ namespace Cryo
         return field;
     }
 
-    std::unique_ptr<StructMethodNode> Parser::parse_struct_method(const std::string &struct_name)
+    std::unique_ptr<StructMethodNode> Parser::parse_struct_method(const std::string &struct_name, Visibility default_visibility)
     {
         SourceLocation start_loc = _current_token.location();
 
-        // Parse optional visibility (default is public for structs)
-        Visibility visibility = Visibility::Public;
+        // Parse optional visibility (use default if none provided)
+        Visibility visibility = default_visibility;
         if (is_visibility_modifier())
         {
             visibility = parse_visibility_modifier();
