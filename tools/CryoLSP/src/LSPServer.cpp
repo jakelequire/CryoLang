@@ -1,4 +1,5 @@
 #include "LSPServer.hpp"
+#include "Logger.hpp"
 #include "Utils/file.hpp"
 #include <iostream>
 #include <sstream>
@@ -6,6 +7,8 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cctype>
+#include <thread>
+#include <chrono>
 
 namespace Cryo::LSP
 {
@@ -16,29 +19,39 @@ namespace Cryo::LSP
         _compiler = Cryo::create_compiler_instance();
         _compiler->set_debug_mode(false);
         
-        // Initialize message handler
-        _message_handler = std::make_unique<MessageHandler>();
+        // Initialize message handler with stdin/stdout
+        _message_handler = std::make_unique<MessageHandler>(std::cin, std::cout);
         
-        std::cerr << "[LSP] CryoLSP server created" << std::endl;
+        LOG_INFO("LSPServer", "CryoLSP server created - BUILD TIMESTAMP: " + std::string(__DATE__) + " " + std::string(__TIME__));
+        LOG_INFO("LSPServer", "Debug mode enabled - hover functionality active");
     }
 
     void LSPServer::run()
     {
-        std::cerr << "[LSP] Server listening for messages..." << std::endl;
+        LOG_INFO("LSPServer", "Server listening for messages...");
         
+        int message_count = 0;
         while (!_shutdown_requested && !_message_handler->is_shutdown_requested())
         {
             try 
             {
+                LOG_DEBUG("LSPServer", "Waiting for message #" + std::to_string(++message_count) + "...");
                 auto message = _message_handler->receive_message();
                 if (message.has_value())
                 {
+                    LOG_INFO("LSPServer", "Received message #" + std::to_string(message_count) + ", processing...");
                     process_message(message.value());
+                    LOG_DEBUG("LSPServer", "Finished processing message #" + std::to_string(message_count));
                 }
                 else
                 {
+                    LOG_DEBUG("LSPServer", "No message received, checking if should continue...");
                     // No more messages or error occurred
-                    break;
+                    if (_message_handler->is_shutdown_requested()) {
+                        LOG_INFO("LSPServer", "Message handler requested shutdown");
+                        break;
+                    }
+                    // Continue listening for more messages
                 }
             }
             catch (const std::exception& e)
@@ -53,10 +66,16 @@ namespace Cryo::LSP
     void LSPServer::process_message(const LSPMessage& message)
     {
         std::cerr << "[LSP] Processing method: " << message.method << std::endl;
+        std::cerr << "[LSP] Message type: " << static_cast<int>(message.type) << std::endl;
         
         if (message.method == "initialize")
         {
             handle_initialize(message.id.value_or(""));
+        }
+        else if (message.method == "initialized")
+        {
+            LOG_INFO("LSPServer", "Received 'initialized' notification - LSP handshake complete!");
+            handle_initialized();
         }
         else if (message.method == "shutdown")
         {
@@ -68,14 +87,19 @@ namespace Cryo::LSP
         }
         else if (message.method == "textDocument/didOpen")
         {
+            std::cerr << "[LSP] Document opened" << std::endl;
             handle_text_document_did_open(message.params_json.value_or(""));
         }
         else if (message.method == "textDocument/didChange")
         {
+            std::cerr << "[LSP] Document changed" << std::endl;
             handle_text_document_did_change(message.params_json.value_or(""));
         }
         else if (message.method == "textDocument/hover")
         {
+            std::cerr << "[LSP] *** HOVER REQUEST RECEIVED ***" << std::endl;
+            std::cerr << "[LSP] Request ID: " << message.id.value_or("NO_ID") << std::endl;
+            std::cerr << "[LSP] Params: " << message.params_json.value_or("NO_PARAMS") << std::endl;
             handle_text_document_hover(message.id.value_or(""), message.params_json.value_or(""));
         }
         else
@@ -86,19 +110,24 @@ namespace Cryo::LSP
 
     void LSPServer::handle_initialize(const std::string& request_id)
     {
-        std::string response = "{"
-            "\"capabilities\": {"
-                "\"textDocumentSync\": 1,"
-                "\"hoverProvider\": true,"
-                "\"completionProvider\": {"
-                    "\"triggerCharacters\": [\".\", \":\", \"@\"]"
-                "}"
-            "}"
-        "}";
+        // LSP response with compact JSON (no whitespace/newlines)
+        std::string response = R"({"capabilities":{"textDocumentSync":1,"hoverProvider":true},"serverInfo":{"name":"CryoLSP","version":"1.0.0"}})";
         
+        LOG_INFO("LSPServer", "Sending initialize response with server info and capabilities");
         _message_handler->send_response(request_id, response);
+        LOG_DEBUG("LSPServer", "Initialize response sent, length: " + std::to_string(response.length()));
+        
+        // Force flush all streams immediately
+        std::cout.flush();
+        std::cerr.flush();
+        fflush(stdout);
+        fflush(stderr);
+    }
+
+    void LSPServer::handle_initialized()
+    {
+        LOG_INFO("LSPServer", "LSP handshake completed - server is now fully ready!");
         _initialized = true;
-        std::cerr << "[LSP] Initialized with hover support" << std::endl;
     }
 
     void LSPServer::handle_shutdown(const std::string& request_id)
@@ -192,6 +221,7 @@ namespace Cryo::LSP
     void LSPServer::handle_text_document_hover(const std::string& request_id, const std::string& params_json)
     {
         std::cerr << "[LSP] Handling hover request with params: " << params_json << std::endl;
+        std::cerr << "[LSP] Request ID: " << request_id << std::endl;
         
         // Extract URI and position from JSON
         std::regex uri_regex("\"uri\":\\s*\"([^\"]+)\"");
@@ -207,11 +237,19 @@ namespace Cryo::LSP
             uri = match[1].str();
             std::cerr << "[LSP] Extracted URI: " << uri << std::endl;
         }
+        else
+        {
+            std::cerr << "[LSP] ERROR: Could not extract URI from params" << std::endl;
+        }
         
         if (std::regex_search(params_json, match, line_regex))
         {
             line = static_cast<uint32_t>(std::stoul(match[1].str()));
             std::cerr << "[LSP] Extracted line: " << line << std::endl;
+        }
+        else
+        {
+            std::cerr << "[LSP] ERROR: Could not extract line from params" << std::endl;
         }
         
         if (std::regex_search(params_json, match, char_regex))
@@ -219,20 +257,27 @@ namespace Cryo::LSP
             character = static_cast<uint32_t>(std::stoul(match[1].str()));
             std::cerr << "[LSP] Extracted character: " << character << std::endl;
         }
+        else
+        {
+            std::cerr << "[LSP] ERROR: Could not extract character from params" << std::endl;
+        }
         
         Position position(line, character);
+        std::cerr << "[LSP] Calling get_hover_info for position " << line << ":" << character << std::endl;
         auto hover_info = get_hover_info(uri, position);
         
         std::string response;
         if (hover_info.has_value())
         {
             std::cerr << "[LSP] Hover info found, sending response" << std::endl;
+            std::cerr << "[LSP] Hover content: " << hover_info->contents.value << std::endl;
             response = "{"
                 "\"contents\": {"
                     "\"kind\": \"" + hover_info->contents.kind + "\","
                     "\"value\": \"" + hover_info->contents.value + "\""
                 "}"
             "}";
+            std::cerr << "[LSP] Response JSON: " << response << std::endl;
         }
         else
         {
@@ -240,7 +285,9 @@ namespace Cryo::LSP
             response = "null";
         }
         
+        std::cerr << "[LSP] Sending response with ID: " << request_id << std::endl;
         _message_handler->send_response(request_id, response);
+        std::cerr << "[LSP] Response sent successfully" << std::endl;
     }
 
     void LSPServer::update_document(const std::string& uri, const std::string& content, int version)

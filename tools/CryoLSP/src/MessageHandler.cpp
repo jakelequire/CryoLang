@@ -1,7 +1,9 @@
 #include "MessageHandler.hpp"
+#include "Logger.hpp"
 #include <sstream>
 #include <regex>
 #include <algorithm>
+#include <cstdio>
 
 namespace Cryo::LSP
 {
@@ -12,31 +14,54 @@ namespace Cryo::LSP
 
     std::optional<LSPMessage> MessageHandler::receive_message()
     {
+        LOG_DEBUG("MessageHandler", "Waiting for incoming message...");
+        
         if (_shutdown_requested) {
+            LOG_DEBUG("MessageHandler", "Shutdown requested, not receiving messages");
             return std::nullopt;
         }
 
         auto raw_message = read_message();
         if (!raw_message) {
+            LOG_ERROR("MessageHandler", "Failed to read message or no message available");
             return std::nullopt;
         }
 
-        return parse_message(*raw_message);
+        LOG_DEBUG("MessageHandler", "Raw message received: " + *raw_message);
+        
+        auto parsed = parse_message(*raw_message);
+        if (parsed.has_value()) {
+            LOG_INFO("MessageHandler", "Successfully parsed message: " + parsed->method);
+        } else {
+            LOG_ERROR("MessageHandler", "Failed to parse message");
+        }
+        
+        return parsed;
     }
 
     std::optional<std::string> MessageHandler::read_message()
     {
+        LOG_DEBUG("MessageHandler", "Starting to read message...");
         std::string line;
         size_t content_length = 0;
 
         // Read headers until we find Content-Length and empty line
         while (std::getline(_input, line)) {
+            LOG_DEBUG("MessageHandler", "Read header line: '" + line + "'");
+            
+            // Check if input stream is still good
+            if (!_input.good() && !_input.eof()) {
+                LOG_ERROR("MessageHandler", "Input stream error while reading headers");
+                return std::nullopt;
+            }
+            
             // Remove \r if present (Windows line endings)
             if (!line.empty() && line.back() == '\r') {
                 line.pop_back();
             }
 
             if (line.empty()) {
+                LOG_DEBUG("MessageHandler", "Found empty line, headers complete");
                 // Empty line indicates end of headers
                 break;
             }
@@ -50,17 +75,27 @@ namespace Cryo::LSP
                 
                 try {
                     content_length = std::stoull(length_str);
+                    LOG_DEBUG("MessageHandler", "Parsed Content-Length: " + std::to_string(content_length));
                 } catch (const std::exception&) {
+                    LOG_ERROR("MessageHandler", "Invalid Content-Length: " + length_str);
                     return std::nullopt; // Invalid Content-Length
                 }
             }
         }
 
         if (content_length == 0) {
+            LOG_ERROR("MessageHandler", "No valid Content-Length found");
             return std::nullopt; // No valid Content-Length found
         }
 
+        // Check if input stream is still good before reading
+        if (!_input.good()) {
+            LOG_ERROR("MessageHandler", "Input stream is not in good state before reading content");
+            return std::nullopt;
+        }
+
         // Read the JSON content
+        LOG_DEBUG("MessageHandler", "Reading " + std::to_string(content_length) + " bytes of JSON content...");
         std::string content;
         content.resize(content_length);
         _input.read(&content[0], content_length);
@@ -94,7 +129,17 @@ namespace Cryo::LSP
 
         // Extract common fields
         if (has_id) {
-            message.id = extract_json_string(json_content, "id");
+            // Try to extract ID as string first, then as number
+            auto string_id = extract_json_string(json_content, "id");
+            if (string_id) {
+                message.id = *string_id;
+            } else {
+                // Try as number
+                auto int_id = extract_json_int(json_content, "id");
+                if (int_id) {
+                    message.id = std::to_string(*int_id);
+                }
+            }
         }
 
         if (has_method) {
@@ -129,10 +174,20 @@ namespace Cryo::LSP
     {
         std::string response = create_response(request_id, result_json);
         
+        LOG_INFO("MessageHandler", "Sending response to request ID: " + request_id);
+        LOG_DEBUG("MessageHandler", "Response length: " + std::to_string(response.length()));
+        LOG_DEBUG("MessageHandler", "Full response: " + response);
+        
         _output << "Content-Length: " << response.length() << "\r\n";
         _output << "\r\n";
         _output << response;
+        
+        // Aggressive flushing for Windows LSP compatibility
         _output.flush();
+        std::cout.flush();
+        fflush(stdout);
+        
+        LOG_DEBUG("MessageHandler", "Response sent and flushed (multiple methods)");
     }
 
     void MessageHandler::send_error(const std::string& request_id, int error_code, const std::string& error_message)
@@ -160,7 +215,15 @@ namespace Cryo::LSP
         std::ostringstream oss;
         oss << "{";
         oss << "\"jsonrpc\":\"2.0\",";
-        oss << "\"id\":\"" << id << "\",";
+        
+        // Check if ID is numeric
+        bool is_numeric = !id.empty() && std::all_of(id.begin(), id.end(), ::isdigit);
+        if (is_numeric) {
+            oss << "\"id\":" << id << ",";
+        } else {
+            oss << "\"id\":\"" << id << "\",";
+        }
+        
         oss << "\"result\":" << result_json;
         oss << "}";
         return oss.str();
