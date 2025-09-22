@@ -80,10 +80,6 @@ namespace Cryo::LSP
 
     void LSPServer::process_message(const LSPMessage& message)
     {
-        std::cerr << "\n=== MESSAGE RECEIVED ===" << std::endl;
-        std::cerr << "Method: " << message.method << std::endl;
-        std::cerr << "Type: " << static_cast<int>(message.type) << std::endl;
-        std::cerr << "=========================" << std::endl;
         std::cerr << "[LSP] Processing method: " << message.method << std::endl;
         std::cerr << "[LSP] Message type: " << static_cast<int>(message.type) << std::endl;
         
@@ -173,23 +169,7 @@ namespace Cryo::LSP
         LOG_INFO("LSPServer", "WORKAROUND: Force-completing initialization immediately (VS Code handshake issue)");
         _initialized = true;
         
-        // DEMO: Show hover functionality working by testing it directly
-        std::thread([this]() {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            LOG_INFO("LSPServer", "=== HOVER FUNCTIONALITY DEMO ===");
-            
-            // Test built-in types
-            std::vector<std::string> test_types = {"int", "string", "boolean", "float", "true", "false"};
-            for (const auto& type : test_types) {
-                auto hover_info = get_builtin_type_info(type);
-                if (!hover_info.empty()) {
-                    LOG_INFO("LSPServer", "✅ Hover for '" + type + "': " + hover_info.substr(0, 100) + "...");
-                }
-            }
-            
-            LOG_INFO("LSPServer", "=== Hover demo complete - functionality is working! ===");
-            LOG_INFO("LSPServer", "Try hovering over 'int', 'string', 'boolean', 'true', 'false' in your .cryo files");
-        }).detach();
+        // Demo logging disabled - hover functionality is working via extension
     }
 
     void LSPServer::handle_initialized()
