@@ -323,6 +323,18 @@ namespace Cryo
         }
     }
 
+    void CompilerInstance::dump_type_table(std::ostream &os) const
+    {
+        if (_type_checker)
+        {
+            _type_checker->print_type_table(os);
+        }
+        else
+        {
+            os << "No type checker available" << std::endl;
+        }
+    }
+
     void CompilerInstance::dump_type_errors(std::ostream &os) const
     {
         if (_type_checker && _type_checker->has_errors())

@@ -76,6 +76,7 @@ namespace Cryo
         void print_ast(std::ostream &os = std::cout, bool use_colors = true) const;
         void dump_ast(std::ostream &os = std::cout, bool use_colors = true) const;
         void dump_symbol_table(std::ostream &os = std::cout) const;
+        void dump_type_table(std::ostream &os = std::cout) const;
         void dump_type_errors(std::ostream &os = std::cout) const;
         void print_diagnostics(std::ostream &os = std::cerr) const;
         void clear();

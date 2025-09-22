@@ -51,6 +51,10 @@ namespace Cryo
     };
 
     // Symbol information for type checking
+    // Forward declarations for AST nodes
+    class StructDeclarationNode;
+    class ClassDeclarationNode;
+
     struct TypedSymbol
     {
         std::string name;
@@ -58,10 +62,19 @@ namespace Cryo
         SourceLocation declaration_location;
         bool is_mutable = false;
         bool is_initialized = false;
+        // Store AST node pointers for complex types to access their structure
+        StructDeclarationNode *struct_node = nullptr;
+        ClassDeclarationNode *class_node = nullptr;
 
         TypedSymbol() = default; // Default constructor for containers
         TypedSymbol(const std::string &n, Type *t, SourceLocation loc)
             : name(n), type(t), declaration_location(loc) {}
+
+        TypedSymbol(const std::string &n, Type *t, SourceLocation loc, StructDeclarationNode *snode)
+            : name(n), type(t), declaration_location(loc), struct_node(snode) {}
+
+        TypedSymbol(const std::string &n, Type *t, SourceLocation loc, ClassDeclarationNode *cnode)
+            : name(n), type(t), declaration_location(loc), class_node(cnode) {}
     };
 
     // Scoped symbol table for type checking
@@ -78,6 +91,10 @@ namespace Cryo
         // Symbol management
         bool declare_symbol(const std::string &name, Type *type,
                             SourceLocation loc, bool is_mutable = false);
+        bool declare_symbol(const std::string &name, Type *type,
+                            SourceLocation loc, StructDeclarationNode *struct_node);
+        bool declare_symbol(const std::string &name, Type *type,
+                            SourceLocation loc, ClassDeclarationNode *class_node);
         TypedSymbol *lookup_symbol(const std::string &name);
         bool is_symbol_defined(const std::string &name);
 
@@ -88,6 +105,20 @@ namespace Cryo
         // Utilities
         size_t symbol_count() const { return _symbols.size(); }
         bool has_parent() const { return _parent_scope != nullptr; }
+
+        // Access symbols for detailed inspection
+        const std::unordered_map<std::string, TypedSymbol> &get_symbols() const { return _symbols; }
+
+        // Type table display
+        void print_type_table(std::ostream &os = std::cout) const;
+
+    private:
+        void print_type_symbols(std::ostream &os, int scope_level) const;
+        std::string determine_type_category(Type *type) const;
+        std::string determine_flags(const TypedSymbol &symbol) const;
+        void print_type_details(std::ostream &os, const TypedSymbol &symbol) const;
+        std::string format_field(const std::string &text, int width) const;
+        std::string format_field_colored(const std::string &colored_text, const std::string &plain_text, int width) const;
     };
 
     // Type checker visitor
@@ -131,6 +162,9 @@ namespace Cryo
         const std::vector<TypeError> &errors() const { return _errors; }
         bool has_errors() const { return !_errors.empty(); }
         size_t error_count() const { return _errors.size(); }
+
+        // Type table access
+        void print_type_table(std::ostream &os = std::cout) const { _symbol_table->print_type_table(os); }
 
         // Visitor methods - Program
         void visit(ProgramNode &node) override;

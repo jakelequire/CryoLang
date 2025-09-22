@@ -27,6 +27,9 @@ int main(int argc, char *argv[])
             // Show the symbol table for debugging
             std::cout << "\nSymbol Table:" << std::endl;
             compiler->dump_symbol_table();
+
+            // Show the type table for debugging
+            compiler->dump_type_table();
         }
         else
         {
@@ -61,6 +64,9 @@ int main(int argc, char *argv[])
             // Show the symbol table for debugging
             std::cout << "\nSymbol Table:" << std::endl;
             compiler->dump_symbol_table();
+
+            // Show the type table for debugging
+            compiler->dump_type_table();
         }
         else
         {

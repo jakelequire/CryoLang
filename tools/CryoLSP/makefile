@@ -43,7 +43,8 @@ LSP_LIBS = \
 	$(MAIN_OBJ_DIR)/GDM/GDM.o \
 	$(MAIN_OBJ_DIR)/Lexer/lexer.o \
 	$(MAIN_OBJ_DIR)/Parser/Parser.o \
-	$(MAIN_OBJ_DIR)/Utils/file.o
+	$(MAIN_OBJ_DIR)/Utils/file.o \
+	$(MAIN_OBJ_DIR)/Utils/RuntimeHeaderParser.o
 
 .PHONY: all clean help
 
