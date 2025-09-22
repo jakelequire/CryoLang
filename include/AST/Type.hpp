@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_map>
 #include <optional>
+#include <algorithm>
 
 namespace Cryo
 {
@@ -420,8 +421,8 @@ namespace Cryo
         bool is_assignable_from(const Type &other) const override { return true; }
         bool is_convertible_to(const Type &other) const override { return true; }
 
-        size_t size_bytes() const override { return 0; }  // Size unknown until instantiation
-        size_t alignment() const override { return 1; }   // Alignment unknown until instantiation
+        size_t size_bytes() const override { return 0; } // Size unknown until instantiation
+        size_t alignment() const override { return 1; }  // Alignment unknown until instantiation
         std::string to_string() const override { return name(); }
     };
 
@@ -433,8 +434,8 @@ namespace Cryo
 
         bool is_primitive() const override { return false; }
         bool is_value_type() const override { return true; }
-        size_t size_bytes() const override { return sizeof(void*); } // Placeholder
-        size_t alignment() const override { return sizeof(void*); }
+        size_t size_bytes() const override { return sizeof(void *); } // Placeholder
+        size_t alignment() const override { return sizeof(void *); }
         std::string to_string() const override { return _name; }
     };
 
@@ -446,8 +447,8 @@ namespace Cryo
 
         bool is_primitive() const override { return false; }
         bool is_reference_type() const override { return true; }
-        size_t size_bytes() const override { return sizeof(void*); } // Pointer size
-        size_t alignment() const override { return sizeof(void*); }
+        size_t size_bytes() const override { return sizeof(void *); } // Pointer size
+        size_t alignment() const override { return sizeof(void *); }
         std::string to_string() const override { return _name; }
     };
 
@@ -464,17 +465,17 @@ namespace Cryo
 
         bool is_primitive() const override { return _is_simple_enum; }
         bool is_value_type() const override { return true; }
-        size_t size_bytes() const override 
-        { 
-            return _is_simple_enum ? sizeof(int) : sizeof(void*); // Simple enums are ints, complex ones are tagged unions
+        size_t size_bytes() const override
+        {
+            return _is_simple_enum ? sizeof(int) : sizeof(void *); // Simple enums are ints, complex ones are tagged unions
         }
-        size_t alignment() const override { return _is_simple_enum ? sizeof(int) : sizeof(void*); }
+        size_t alignment() const override { return _is_simple_enum ? sizeof(int) : sizeof(void *); }
         std::string to_string() const override { return _name; }
 
         const std::vector<std::string> &variants() const { return _variants; }
         bool is_simple_enum() const { return _is_simple_enum; }
-        
-        bool has_variant(const std::string &variant_name) const 
+
+        bool has_variant(const std::string &variant_name) const
         {
             return std::find(_variants.begin(), _variants.end(), variant_name) != _variants.end();
         }
@@ -495,7 +496,7 @@ namespace Cryo
         // Integer type cache
         std::unordered_map<int, std::unique_ptr<IntegerType>> _integer_types;
         std::unordered_map<int, std::unique_ptr<FloatType>> _float_types;
-        
+
         // User-defined type cache
         std::unordered_map<std::string, std::unique_ptr<StructType>> _struct_types;
         std::unordered_map<std::string, std::unique_ptr<ClassType>> _class_types;

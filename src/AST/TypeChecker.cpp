@@ -674,6 +674,32 @@ namespace Cryo
                                      "Logical NOT cannot be applied to non-boolean type: " + operand_type->to_string());
                     }
                 }
+                else if (op == TokenKind::TK_PLUSPLUS) // Increment operator (++ prefix or postfix)
+                {
+                    if (is_numeric_type(operand_type))
+                    {
+                        // For both prefix and postfix increment, the result type is the same as operand type
+                        node.set_type(operand_type->to_string());
+                    }
+                    else
+                    {
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Increment operator cannot be applied to non-numeric type: " + operand_type->to_string());
+                    }
+                }
+                else if (op == TokenKind::TK_MINUSMINUS) // Decrement operator (-- prefix or postfix)
+                {
+                    if (is_numeric_type(operand_type))
+                    {
+                        // For both prefix and postfix decrement, the result type is the same as operand type
+                        node.set_type(operand_type->to_string());
+                    }
+                    else
+                    {
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Decrement operator cannot be applied to non-numeric type: " + operand_type->to_string());
+                    }
+                }
                 else
                 {
                     report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
@@ -713,6 +739,16 @@ namespace Cryo
         // Check if callee is callable
         if (node.callee() && node.callee()->type().has_value())
         {
+            // Special handling for enum constructor calls (ScopeResolution as callee)
+            if (node.callee()->kind() == NodeKind::ScopeResolution)
+            {
+                // For enum constructors like Shape::Circle(5.0), the callee type is the enum type (Shape)
+                // and this should be treated as a constructor call that returns the enum type
+                std::string enum_type_str = node.callee()->type().value();
+                node.set_type(enum_type_str);
+                return;
+            }
+
             // Special handling for method calls (MemberAccess as callee)
             if (node.callee()->kind() == NodeKind::MemberAccess)
             {
@@ -788,20 +824,23 @@ namespace Cryo
 
         // Build the full type name including generic arguments
         std::string type_name = node.type_name();
-        
+
         // Handle generic types
-        if (!node.generic_args().empty()) {
+        if (!node.generic_args().empty())
+        {
             type_name += "<";
-            for (size_t i = 0; i < node.generic_args().size(); ++i) {
-                if (i > 0) type_name += ", ";
+            for (size_t i = 0; i < node.generic_args().size(); ++i)
+            {
+                if (i > 0)
+                    type_name += ", ";
                 type_name += node.generic_args()[i];
             }
             type_name += ">";
         }
-        
+
         // Look for the type definition in the symbol table
         TypedSymbol *type_symbol = _symbol_table->lookup_symbol(node.type_name());
-        
+
         if (type_symbol)
         {
             // The type exists, so the new expression is valid
@@ -814,16 +853,16 @@ namespace Cryo
                          "Undefined type '" + node.type_name() + "' in constructor call");
             node.set_type("unknown");
         }
-        
+
         // TODO: Add constructor argument validation
         // For now, we assume any struct/class can be constructed with any arguments
         // Later we can add proper constructor signature checking
     }
 
     // Helper function to substitute generic type parameters in a type string
-    std::string substitute_generic_type(const std::string& type_str, 
-                                       const std::string& object_type,
-                                       const std::string& base_type)
+    std::string substitute_generic_type(const std::string &type_str,
+                                        const std::string &object_type,
+                                        const std::string &base_type)
     {
         // Extract generic arguments from object_type (e.g., "GenericStruct<string>" -> ["string"])
         std::vector<std::string> generic_args;
@@ -834,7 +873,7 @@ namespace Cryo
             if (end_pos != std::string::npos && end_pos > start_pos)
             {
                 std::string args_str = object_type.substr(start_pos + 1, end_pos - start_pos - 1);
-                
+
                 // Simple parsing of comma-separated generic arguments
                 std::stringstream ss(args_str);
                 std::string arg;
@@ -856,13 +895,13 @@ namespace Cryo
         {
             return generic_args[0];
         }
-        
+
         // Handle U as second parameter for multi-parameter generics
         if (type_str == "U" && generic_args.size() >= 2)
         {
             return generic_args[1];
         }
-        
+
         // Return original type if no substitution needed
         return type_str;
     }
@@ -876,10 +915,10 @@ namespace Cryo
         }
 
         // Get the type of the object being accessed
-        std::string object_type = node.object() && node.object()->type().has_value() 
-                                  ? node.object()->type().value() 
-                                  : "unknown";
-        
+        std::string object_type = node.object() && node.object()->type().has_value()
+                                      ? node.object()->type().value()
+                                      : "unknown";
+
         if (object_type == "unknown")
         {
             node.set_type("unknown");
@@ -888,23 +927,23 @@ namespace Cryo
 
         // Get the member name
         std::string member_name = node.member();
-        
+
         // For generic types, extract the base type name for field/method lookup
         std::string lookup_type = object_type;
         size_t generic_pos = object_type.find('<');
-        if (generic_pos != std::string::npos) 
+        if (generic_pos != std::string::npos)
         {
             lookup_type = object_type.substr(0, generic_pos);
         }
 
         // Look up the type by name to get struct/class information
         Type *struct_type = lookup_variable_type(lookup_type);
-        if (!struct_type || (struct_type->kind() != TypeKind::Struct && 
-                            struct_type->kind() != TypeKind::Class && 
-                            struct_type->kind() != TypeKind::Generic))
+        if (!struct_type || (struct_type->kind() != TypeKind::Struct &&
+                             struct_type->kind() != TypeKind::Class &&
+                             struct_type->kind() != TypeKind::Generic))
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                       "Cannot access member of non-struct/class type: " + object_type);
+                         "Cannot access member of non-struct/class type: " + object_type);
             node.set_type("unknown");
             return;
         }
@@ -941,7 +980,7 @@ namespace Cryo
 
         // Field or method not found in struct
         report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                   "Unknown member '" + member_name + "' in type '" + object_type + "'");
+                     "Unknown member '" + member_name + "' in type '" + object_type + "'");
         node.set_type("unknown");
     }
 
@@ -949,27 +988,35 @@ namespace Cryo
     {
         const std::string &scope_name = node.scope_name();
         const std::string &member_name = node.member_name();
-        
-        // Look up the scope type (should be an enum)
-        Type *scope_type = lookup_variable_type(scope_name);
+
+        // Look up the scope type (should be an enum type)
+        TypedSymbol *scope_symbol = _symbol_table->lookup_symbol(scope_name);
+        if (!scope_symbol)
+        {
+            report_undefined_symbol(node.location(), scope_name);
+            node.set_type(_type_context.get_unknown_type()->to_string());
+            return;
+        }
+
+        Type *scope_type = scope_symbol->type;
         if (!scope_type)
         {
             report_undefined_symbol(node.location(), scope_name);
             node.set_type(_type_context.get_unknown_type()->to_string());
             return;
         }
-        
+
         // Verify it's an enum type
         if (scope_type->kind() != TypeKind::Enum)
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                       "Scope resolution '::' can only be used with enum types, got: " + scope_name);
+                         "Scope resolution '::' can only be used with enum types, got: " + scope_name);
             node.set_type(_type_context.get_unknown_type()->to_string());
             return;
         }
-        
-        // For enum scope resolution like Color::RED, the type should be Color
-        // TODO: In a more complete implementation, we would validate that RED is a valid variant of Color
+
+        // For enum scope resolution like Shape::Circle, the type should be Shape
+        // TODO: In a more complete implementation, we would validate that member_name is a valid variant
         // For now, we'll just set the type to the enum type
         node.set_type(scope_type->to_string());
     }
@@ -981,7 +1028,7 @@ namespace Cryo
     void TypeChecker::visit(StructDeclarationNode &node)
     {
         std::string struct_name = node.name();
-        
+
         // Check for redefinition
         if (_symbol_table->lookup_symbol(struct_name))
         {
@@ -997,7 +1044,7 @@ namespace Cryo
         // Save previous struct type and set current for 'this' keyword in methods
         Type *previous_struct_type = _current_struct_type;
         _current_struct_type = struct_type;
-        
+
         // Save previous struct name and set current for field tracking
         std::string previous_struct_name = _current_struct_name;
         _current_struct_name = struct_name;
@@ -1034,18 +1081,18 @@ namespace Cryo
 
         // Exit struct scope
         exit_scope();
-        
+
         // Restore previous struct type and struct name
         _current_struct_type = previous_struct_type;
         _current_struct_name = previous_struct_name;
-        
+
         node.set_type(struct_name);
     }
 
     void TypeChecker::visit(ClassDeclarationNode &node)
     {
         std::string class_name = node.name();
-        
+
         // Check for redefinition
         if (_symbol_table->lookup_symbol(class_name))
         {
@@ -1061,7 +1108,7 @@ namespace Cryo
         // Save previous class type and set current for 'this' keyword in methods
         Type *previous_struct_type = _current_struct_type;
         _current_struct_type = class_type;
-        
+
         // Save previous class name and set current for field/method tracking
         std::string previous_struct_name = _current_struct_name;
         _current_struct_name = class_name;
@@ -1093,7 +1140,7 @@ namespace Cryo
                 if (!base_class_type || base_class_type->kind() != TypeKind::Class)
                 {
                     report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                               "Base class must be a valid class type");
+                                 "Base class must be a valid class type");
                 }
             }
         }
@@ -1118,18 +1165,18 @@ namespace Cryo
 
         // Exit class scope
         exit_scope();
-        
+
         // Restore previous struct type and struct name
         _current_struct_type = previous_struct_type;
         _current_struct_name = previous_struct_name;
-        
+
         node.set_type(class_name);
     }
 
     void TypeChecker::visit(TypeAliasDeclarationNode &node)
     {
         std::string alias_name = node.alias_name();
-        
+
         // Check for redefinition
         if (_symbol_table->lookup_symbol(alias_name))
         {
@@ -1140,7 +1187,7 @@ namespace Cryo
         // Visit target type to ensure it's valid
         std::string target_type_str = node.target_type();
         Type *target_type = _type_context.parse_type_from_string(target_type_str);
-        
+
         if (target_type && target_type->kind() != TypeKind::Unknown)
         {
             // Register type alias in symbol table
@@ -1149,14 +1196,14 @@ namespace Cryo
         else
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                       "Invalid target type for type alias: " + target_type_str);
+                         "Invalid target type for type alias: " + target_type_str);
         }
     }
 
     void TypeChecker::visit(EnumDeclarationNode &node)
     {
         std::string enum_name = node.name();
-        
+
         // Check for redefinition
         if (_symbol_table->lookup_symbol(enum_name))
         {
@@ -1167,7 +1214,7 @@ namespace Cryo
         // Collect variant information
         std::vector<std::string> variant_names;
         bool is_simple_enum = node.is_simple_enum();
-        
+
         for (const auto &variant : node.variants())
         {
             if (variant)
@@ -1180,7 +1227,7 @@ namespace Cryo
         // Create enum type and register it
         Type *enum_type = _type_context.get_enum_type(enum_name, variant_names, is_simple_enum);
         _symbol_table->declare_symbol(enum_name, enum_type, node.location(), false);
-        
+
         // For simple enums (C-style), register each variant as a constant
         if (is_simple_enum)
         {
@@ -1204,7 +1251,7 @@ namespace Cryo
                 if (variant && !variant->is_simple_variant())
                 {
                     // Create a function type for the variant constructor
-                    std::vector<Type*> param_types;
+                    std::vector<Type *> param_types;
                     for (const auto &type_str : variant->associated_types())
                     {
                         Type *param_type = _type_context.parse_type_from_string(type_str);
@@ -1213,13 +1260,13 @@ namespace Cryo
                             param_types.push_back(param_type);
                         }
                     }
-                    
+
                     Type *variant_constructor = _type_context.create_function_type(enum_type, param_types);
                     _symbol_table->declare_symbol(variant->name(), variant_constructor, variant->location(), false);
                 }
             }
         }
-        
+
         // EnumDeclarationNode is a DeclarationNode, not ExpressionNode, so no set_type call needed
     }
 
@@ -1235,7 +1282,7 @@ namespace Cryo
                 if (!type || type->kind() == TypeKind::Unknown)
                 {
                     report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                               "Invalid type in enum variant: " + type_str);
+                                 "Invalid type in enum variant: " + type_str);
                 }
             }
         }
@@ -1246,7 +1293,7 @@ namespace Cryo
         // Get target type name as string
         std::string target_type_name = node.target_type();
         Type *target_type = nullptr;
-        
+
         if (!target_type_name.empty())
         {
             // Look up the target type in symbol table
@@ -1256,12 +1303,12 @@ namespace Cryo
                 report_undefined_symbol(node.location(), target_type_name);
                 return;
             }
-            
+
             // Verify it's a struct or class type
             if (target_type->kind() != TypeKind::Struct && target_type->kind() != TypeKind::Class)
             {
                 report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                           "Implementation block can only be applied to struct or class types");
+                             "Implementation block can only be applied to struct or class types");
                 return;
             }
         }
@@ -1286,7 +1333,7 @@ namespace Cryo
 
         // Exit implementation scope
         exit_scope();
-        
+
         // Restore previous struct type and name
         _current_struct_type = previous_struct_type;
         _current_struct_name = previous_struct_name;
@@ -1295,7 +1342,7 @@ namespace Cryo
     void TypeChecker::visit(GenericParameterNode &node)
     {
         std::string param_name = node.name();
-        
+
         // Check for redefinition within the same generic parameter list
         if (_symbol_table->lookup_symbol(param_name))
         {
@@ -1307,14 +1354,14 @@ namespace Cryo
         // For now, treat it as a placeholder type
         Type *generic_type = _type_context.get_generic_type(param_name);
         _symbol_table->declare_symbol(param_name, generic_type, node.location(), false);
-        
+
         node.set_type("generic<" + param_name + ">");
     }
 
     void TypeChecker::visit(StructFieldNode &node)
     {
         std::string field_name = node.name();
-        
+
         // Check for redefinition within the same struct
         if (_symbol_table->lookup_symbol(field_name))
         {
@@ -1325,24 +1372,24 @@ namespace Cryo
         // Get field type from type annotation
         std::string field_type_str = node.field_type();
         Type *field_type = _type_context.parse_type_from_string(field_type_str);
-        
+
         if (field_type && field_type->kind() != TypeKind::Unknown)
         {
             // Register field in current scope (struct/class scope)
             _symbol_table->declare_symbol(field_name, field_type, node.location(), node.is_mutable());
-            
+
             // Store field information for later member access resolution
             if (!_current_struct_name.empty())
             {
                 _struct_fields[_current_struct_name][field_name] = field_type;
             }
-            
+
             node.set_type(field_type_str);
         }
         else
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                       "Invalid field type: " + field_type_str);
+                         "Invalid field type: " + field_type_str);
             node.set_type("unknown");
         }
     }
@@ -1350,7 +1397,7 @@ namespace Cryo
     void TypeChecker::visit(StructMethodNode &node)
     {
         std::string method_name = node.name();
-        
+
         // Check for redefinition within the same struct/class
         if (_symbol_table->lookup_symbol(method_name))
         {
@@ -1359,15 +1406,15 @@ namespace Cryo
         }
 
         // Delegate to FunctionDeclarationNode visitor for most processing
-        visit(static_cast<FunctionDeclarationNode&>(node));
-        
+        visit(static_cast<FunctionDeclarationNode &>(node));
+
         // Store method information for member access resolution
         if (!_current_struct_name.empty())
         {
             // Get the return type from the node
             std::string return_type_str = node.return_type_annotation();
             Type *return_type = _type_context.parse_type_from_string(return_type_str);
-            
+
             if (return_type)
             {
                 _struct_methods[_current_struct_name][method_name] = return_type;
@@ -1635,6 +1682,101 @@ namespace Cryo
             << (actual ? actual->to_string() : "unknown") << "'";
         return oss.str();
     }
+
+    //===----------------------------------------------------------------------===//
+    // Match Statement Type Checking
+    //===----------------------------------------------------------------------===//
+
+    void TypeChecker::visit(MatchStatementNode &node)
+    {
+        // Visit the expression to match on
+        if (node.expr())
+        {
+            node.expr()->accept(*this);
+        }
+
+        // Visit all match arms
+        for (const auto &arm : node.arms())
+        {
+            if (arm)
+            {
+                arm->accept(*this);
+            }
+        }
+    }
+
+    void TypeChecker::visit(MatchArmNode &node)
+    {
+        // Visit the pattern
+        if (node.pattern())
+        {
+            node.pattern()->accept(*this);
+        }
+
+        // Enter new scope for the match arm body
+        enter_scope();
+
+        // Visit the body
+        if (node.body())
+        {
+            node.body()->accept(*this);
+        }
+
+        // Exit the scope
+        exit_scope();
+    }
+
+    void TypeChecker::visit(PatternNode &node)
+    {
+        // Pattern type checking would go here
+        // For now, just visit sub-patterns if they exist
+        // Pattern matching type checking would involve:
+        // - Checking pattern compatibility with matched expression type
+        // - Binding pattern variables to their inferred types
+        // - Ensuring exhaustiveness of match patterns
+    }
+
+    void TypeChecker::visit(EnumPatternNode &node)
+    {
+        // Enum pattern type checking
+        const std::string &enum_name = node.enum_name();
+        const std::string &variant_name = node.variant_name();
+
+        // Look up the enum type
+        TypedSymbol *enum_symbol = _symbol_table->lookup_symbol(enum_name);
+        if (!enum_symbol)
+        {
+            report_undefined_symbol(node.location(), enum_name);
+            return;
+        }
+
+        Type *enum_type = enum_symbol->type;
+        if (!enum_type || enum_type->kind() != TypeKind::Enum)
+        {
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                         "Expected enum type, got: " + enum_name);
+            return;
+        }
+
+        // TODO: In a more complete implementation, we would:
+        // - Verify that variant_name is a valid variant of the enum
+        // - Get the parameter types for this specific variant
+
+        // For now, bind pattern variables with inferred types based on common enum patterns
+        const auto &bound_vars = node.bound_variables();
+
+        for (const auto &var_name : bound_vars)
+        {
+            if (!var_name.empty())
+            {
+                // For enum patterns, we need to infer the type based on the enum variant
+                // For now, we'll use float for most numeric patterns (Circle(radius), Rectangle(width, height), etc.)
+                // TODO: Get actual parameter types from enum variant definition
+                Type *var_type = _type_context.get_default_float_type();
+
+                // Bind the variable in the current scope
+                _symbol_table->declare_symbol(var_name, var_type, node.location(), false);
+            }
+        }
+    }
 }
-
-

@@ -478,17 +478,20 @@ namespace Cryo
             _output << Colors::RESET;
         print_location(node.location());
         _output << " '" << node.type_name();
-        
+
         // Print generic arguments if any
-        if (!node.generic_args().empty()) {
+        if (!node.generic_args().empty())
+        {
             _output << "<";
-            for (size_t i = 0; i < node.generic_args().size(); ++i) {
-                if (i > 0) _output << ", ";
+            for (size_t i = 0; i < node.generic_args().size(); ++i)
+            {
+                if (i > 0)
+                    _output << ", ";
                 _output << node.generic_args()[i];
             }
             _output << ">";
         }
-        
+
         _output << "'" << std::endl;
 
         // Dump arguments
@@ -644,6 +647,86 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(MatchStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "MatchStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        // First dump the expression being matched
+        if (node.expr())
+        {
+            dump_child(node.expr(), node.arms().empty());
+        }
+
+        // Then dump all the match arms
+        const auto &arms = node.arms();
+        for (size_t i = 0; i < arms.size(); ++i)
+        {
+            dump_child(arms[i].get(), i == arms.size() - 1);
+        }
+    }
+
+    void ASTDumper::visit(MatchArmNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "MatchArm";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        bool has_pattern = node.pattern() != nullptr;
+        bool has_body = node.body() != nullptr;
+        int remaining = (has_pattern ? 1 : 0) + (has_body ? 1 : 0);
+
+        if (has_pattern)
+        {
+            dump_child(node.pattern(), --remaining == 0);
+        }
+        if (has_body)
+        {
+            dump_child(node.body(), --remaining == 0);
+        }
+    }
+
+    void ASTDumper::visit(PatternNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "Pattern";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(EnumPatternNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "EnumPattern "
+                << node.enum_name() << "::" << node.variant_name();
+
+        if (!node.bound_variables().empty())
+        {
+            _output << " (";
+            for (size_t i = 0; i < node.bound_variables().size(); ++i)
+            {
+                if (i > 0)
+                    _output << ", ";
+                _output << node.bound_variables()[i];
+            }
+            _output << ")";
+        }
+
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+    }
+
     void ASTDumper::visit(BreakStatementNode &node)
     {
         print_prefix();
@@ -786,7 +869,8 @@ namespace Cryo
             _output << " : ";
             for (size_t i = 0; i < constraints.size(); ++i)
             {
-                if (i > 0) _output << " + ";
+                if (i > 0)
+                    _output << " + ";
                 _output << constraints[i];
             }
         }
@@ -957,7 +1041,8 @@ namespace Cryo
             const auto &types = node.associated_types();
             for (size_t i = 0; i < types.size(); ++i)
             {
-                if (i > 0) _output << ", ";
+                if (i > 0)
+                    _output << ", ";
                 if (_use_colors)
                     _output << Colors::TYPE;
                 _output << types[i];
@@ -984,9 +1069,9 @@ namespace Cryo
         _output << node.scope_name();
         if (_use_colors)
             _output << Colors::RESET;
-        
+
         _output << "::";
-        
+
         if (_use_colors)
             _output << Colors::VALUE;
         _output << node.member_name();

@@ -178,7 +178,7 @@ namespace Cryo
         // Handle reference types (&type)
         if (_current_token.is(TokenKind::TK_AMP))
         {
-            advance(); // consume '&'
+            advance();                            // consume '&'
             std::string base_type = parse_type(); // recursive call
             return "&" + base_type;
         }
@@ -199,13 +199,13 @@ namespace Cryo
         {
             base_type += "<";
             advance(); // consume '<'
-            
+
             // Parse type arguments
             do
             {
                 std::string arg_type = parse_type();
                 base_type += arg_type;
-                
+
                 if (_current_token.is(TokenKind::TK_COMMA))
                 {
                     base_type += ",";
@@ -216,7 +216,7 @@ namespace Cryo
                     break;
                 }
             } while (true);
-            
+
             consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic type arguments");
             base_type += ">";
         }
@@ -244,7 +244,7 @@ namespace Cryo
         // Handle reference types (&type)
         if (_current_token.is(TokenKind::TK_AMP))
         {
-            advance(); // consume '&'
+            advance();                                 // consume '&'
             Type *base_type = parse_type_annotation(); // recursive call
             return _context.types().create_reference_type(base_type);
         }
@@ -259,26 +259,26 @@ namespace Cryo
         advance();
 
         Type *base_type;
-        
+
         // Handle identifiers (could be generic parameters or user-defined types)
         if (type_token.is(TokenKind::TK_IDENTIFIER))
         {
             std::string type_name = std::string(type_token.text());
-            
+
             // Check if this is a generic instantiation (e.g., SimpleGeneric<int>)
             if (_current_token.is(TokenKind::TK_L_ANGLE))
             {
                 // Parse generic type instantiation
                 advance(); // consume '<'
-                
-                std::vector<Type*> type_args;
-                
+
+                std::vector<Type *> type_args;
+
                 // Parse type arguments
                 do
                 {
                     Type *arg_type = parse_type_annotation();
                     type_args.push_back(arg_type);
-                    
+
                     if (_current_token.is(TokenKind::TK_COMMA))
                     {
                         advance(); // consume ','
@@ -288,19 +288,20 @@ namespace Cryo
                         break;
                     }
                 } while (true);
-                
+
                 consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic type arguments");
-                
+
                 // For now, create an instantiated generic type name
                 // TODO: In a more complete implementation, we would create proper instantiated types
                 std::string instantiated_name = type_name + "<";
                 for (size_t i = 0; i < type_args.size(); ++i)
                 {
-                    if (i > 0) instantiated_name += ",";
+                    if (i > 0)
+                        instantiated_name += ",";
                     instantiated_name += type_args[i]->to_string();
                 }
                 instantiated_name += ">";
-                
+
                 // Create or get the instantiated type
                 base_type = _context.types().get_struct_type(instantiated_name);
             }
@@ -450,6 +451,11 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_KW_FOR))
         {
             return parse_for_statement();
+        }
+
+        if (_current_token.is(TokenKind::TK_KW_MATCH))
+        {
+            return parse_match_statement();
         }
 
         if (_current_token.is(TokenKind::TK_KW_RETURN))
@@ -776,7 +782,8 @@ namespace Cryo
     std::unique_ptr<ExpressionNode> Parser::parse_unary()
     {
         if (_current_token.is(TokenKind::TK_MINUS) || _current_token.is(TokenKind::TK_EXCLAIM) ||
-            _current_token.is(TokenKind::TK_AMP) || _current_token.is(TokenKind::TK_STAR))
+            _current_token.is(TokenKind::TK_AMP) || _current_token.is(TokenKind::TK_STAR) ||
+            _current_token.is(TokenKind::TK_PLUSPLUS) || _current_token.is(TokenKind::TK_MINUSMINUS))
         {
             Token op = _current_token;
             advance();
@@ -817,17 +824,17 @@ namespace Cryo
         {
             Token this_token = _current_token;
             advance(); // consume 'this'
-            
+
             // Create a new token with TK_IDENTIFIER kind but same text/location
-            Token this_identifier_token(TokenKind::TK_IDENTIFIER, 
-                                      this_token.text(), 
-                                      this_token.location());
-            
+            Token this_identifier_token(TokenKind::TK_IDENTIFIER,
+                                        this_token.text(),
+                                        this_token.location());
+
             auto this_expr = _builder.create_identifier_node(this_identifier_token);
-            
+
             // Handle postfix expressions on 'this' (like this.member)
             std::unique_ptr<ExpressionNode> expr = std::move(this_expr);
-            
+
             // Chain multiple postfix operations
             while (true)
             {
@@ -852,38 +859,40 @@ namespace Cryo
                     break;
                 }
             }
-            
+
             return std::move(expr);
         }
 
         // Identifiers (can be function calls, variable references, or scope resolution)
         if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
-            auto identifier = parse_identifier();
-            
+            std::unique_ptr<ExpressionNode> expr = parse_identifier();
+
             // Check for scope resolution (Type::Member)
             if (_current_token.is(TokenKind::TK_COLONCOLON))
             {
                 advance(); // consume '::'
-                
+
                 if (!_current_token.is(TokenKind::TK_IDENTIFIER))
                 {
                     error("Expected identifier after '::'");
                     return nullptr;
                 }
-                
-                std::string scope_name = identifier->name();
+
+                // Get identifier name - need to cast to IdentifierNode to access name()
+                auto identifier_node = static_cast<IdentifierNode *>(expr.get());
+                std::string scope_name = identifier_node->name();
                 std::string member_name = std::string(_current_token.text());
-                SourceLocation loc = identifier->location();
-                
+                SourceLocation loc = identifier_node->location();
+
                 advance(); // consume member identifier
-                
-                // Create scope resolution node
-                return _builder.create_scope_resolution(loc, scope_name, member_name);
+
+                // Create scope resolution node and replace the expression
+                expr = _builder.create_scope_resolution(loc, scope_name, member_name);
             }
 
             // Handle postfix expressions (function calls, array access, etc.)
-            std::unique_ptr<ExpressionNode> expr = std::move(identifier);
+            // expr is already the right type, so we can continue with postfix operations
 
             // Chain multiple postfix operations (e.g., func()[0].method())
             while (true)
@@ -902,6 +911,13 @@ namespace Cryo
                 {
                     // Member access
                     expr = parse_member_access(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_PLUSPLUS) || _current_token.is(TokenKind::TK_MINUSMINUS))
+                {
+                    // Postfix increment/decrement
+                    Token op = _current_token;
+                    advance();
+                    expr = _builder.create_unary_expression(op, std::move(expr));
                 }
                 else
                 {
@@ -1110,6 +1126,112 @@ namespace Cryo
         return nullptr;
     }
 
+    std::unique_ptr<ASTNode> Parser::parse_match_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_MATCH, "Expected 'match'");
+
+        // Parse the expression to match on
+        auto expr = parse_expression();
+
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after match expression");
+
+        // Create the match statement
+        auto match_stmt = std::make_unique<MatchStatementNode>(start_loc, std::move(expr));
+
+        // Parse match arms
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            auto arm = parse_match_arm();
+            if (arm)
+            {
+                match_stmt->add_arm(std::move(arm));
+            }
+        }
+
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after match arms");
+
+        return std::move(match_stmt);
+    }
+
+    std::unique_ptr<MatchArmNode> Parser::parse_match_arm()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        // Parse the pattern
+        auto pattern = parse_pattern();
+
+        consume(TokenKind::TK_FATARROW, "Expected '=>' after pattern");
+
+        // Parse the body (should be a block statement)
+        auto body = parse_block_statement();
+
+        // Expect comma after match arm (optional for last arm)
+        if (_current_token.is(TokenKind::TK_COMMA))
+        {
+            advance();
+        }
+
+        return std::make_unique<MatchArmNode>(start_loc, std::move(pattern), std::move(body));
+    }
+
+    std::unique_ptr<PatternNode> Parser::parse_pattern()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        // For now, only handle enum patterns like Shape::Circle(radius)
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            std::string enum_name{_current_token.text()};
+            advance();
+
+            if (_current_token.is(TokenKind::TK_COLONCOLON))
+            {
+                advance();
+
+                if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                {
+                    std::string variant_name{_current_token.text()};
+                    advance();
+
+                    auto pattern = std::make_unique<EnumPatternNode>(start_loc, enum_name, variant_name);
+
+                    // Parse bound variables if present
+                    if (_current_token.is(TokenKind::TK_L_PAREN))
+                    {
+                        advance();
+
+                        while (!_current_token.is(TokenKind::TK_R_PAREN) && !is_at_end())
+                        {
+                            if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                            {
+                                pattern->add_bound_variable(std::string{_current_token.text()});
+                                advance();
+
+                                if (_current_token.is(TokenKind::TK_COMMA))
+                                {
+                                    advance();
+                                }
+                            }
+                            else
+                            {
+                                error("Expected identifier in pattern");
+                                break;
+                            }
+                        }
+
+                        consume(TokenKind::TK_R_PAREN, "Expected ')' after pattern variables");
+                    }
+
+                    return std::move(pattern);
+                }
+            }
+        }
+
+        error("Expected enum pattern");
+        return nullptr;
+    }
+
     std::unique_ptr<ASTNode> Parser::parse_break_statement()
     {
         SourceLocation start_loc = _current_token.location();
@@ -1230,18 +1352,19 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
             advance(); // consume '<'
-            
-            do {
+
+            do
+            {
                 // Accept both identifiers and type keywords (like string, int, float, etc.)
                 if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
                 {
                     error("Expected type name in generic arguments");
                     return nullptr;
                 }
-                
+
                 new_expr->add_generic_arg(std::string(_current_token.text()));
                 advance(); // consume type argument
-                
+
             } while (match(TokenKind::TK_COMMA));
 
             consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic arguments");
@@ -1287,7 +1410,7 @@ namespace Cryo
         {
             // Create member access node first
             auto member_access = _builder.create_member_access(access_location, std::move(expr), member_name);
-            
+
             // Then parse the function call with the member access as the callee
             return parse_call_expression(std::move(member_access));
         }
@@ -1339,27 +1462,27 @@ namespace Cryo
     std::unique_ptr<StructDeclarationNode> Parser::parse_struct_declaration()
     {
         SourceLocation start_loc = _current_token.location();
-        
+
         consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
         consume(TokenKind::TK_KW_STRUCT, "Expected 'struct'");
-        
+
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected struct name");
         std::string struct_name = std::string(name_token.text());
-        
+
         auto struct_decl = _builder.create_struct_declaration(start_loc, struct_name);
-        
+
         // Parse optional generic parameters
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
             auto generics = parse_generic_parameters();
-            for (auto& generic : generics)
+            for (auto &generic : generics)
             {
                 struct_decl->add_generic_parameter(std::move(generic));
             }
         }
-        
+
         consume(TokenKind::TK_L_BRACE, "Expected '{' after struct name");
-        
+
         // Parse struct members (fields and methods)
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
@@ -1367,7 +1490,7 @@ namespace Cryo
             {
                 // Check if it's a method (has parentheses) or field (has colon)
                 Token next = peek_next();
-                if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) && 
+                if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
                     next.is(TokenKind::TK_L_PAREN))
                 {
                     // It's a method
@@ -1381,13 +1504,13 @@ namespace Cryo
                     struct_decl->add_field(std::move(field));
                 }
             }
-            catch (const ParseError& e)
+            catch (const ParseError &e)
             {
                 _errors.push_back(e);
                 synchronize();
             }
         }
-        
+
         consume(TokenKind::TK_R_BRACE, "Expected '}' after struct body");
         return struct_decl;
     }
@@ -1395,30 +1518,30 @@ namespace Cryo
     std::unique_ptr<ClassDeclarationNode> Parser::parse_class_declaration()
     {
         SourceLocation start_loc = _current_token.location();
-        
+
         // Check if it's "type class" or just "class"
         if (_current_token.is(TokenKind::TK_KW_TYPE))
         {
             consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
         }
-        
+
         consume(TokenKind::TK_KW_CLASS, "Expected 'class'");
-        
+
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected class name");
         std::string class_name = std::string(name_token.text());
-        
+
         auto class_decl = _builder.create_class_declaration(start_loc, class_name);
-        
+
         // Parse optional generic parameters
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
             auto generics = parse_generic_parameters();
-            for (auto& generic : generics)
+            for (auto &generic : generics)
             {
                 class_decl->add_generic_parameter(std::move(generic));
             }
         }
-        
+
         // Parse optional base class
         if (_current_token.is(TokenKind::TK_COLON))
         {
@@ -1426,12 +1549,12 @@ namespace Cryo
             Token base_token = consume(TokenKind::TK_IDENTIFIER, "Expected base class name");
             class_decl->set_base_class(std::string(base_token.text()));
         }
-        
+
         consume(TokenKind::TK_L_BRACE, "Expected '{' after class declaration");
-        
+
         // Parse class members
         Visibility current_visibility = Visibility::Private; // Default for classes
-        
+
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
             try
@@ -1443,7 +1566,7 @@ namespace Cryo
                     consume(TokenKind::TK_COLON, "Expected ':' after visibility modifier");
                     continue;
                 }
-                
+
                 // Check if it's a method or field
                 Token next = peek_next();
                 if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
@@ -1460,13 +1583,13 @@ namespace Cryo
                     class_decl->add_field(std::move(field));
                 }
             }
-            catch (const ParseError& e)
+            catch (const ParseError &e)
             {
                 _errors.push_back(e);
                 synchronize();
             }
         }
-        
+
         consume(TokenKind::TK_R_BRACE, "Expected '}' after class body");
         return class_decl;
     }
@@ -1474,39 +1597,39 @@ namespace Cryo
     std::unique_ptr<TypeAliasDeclarationNode> Parser::parse_type_alias_declaration()
     {
         SourceLocation start_loc = _current_token.location();
-        
+
         consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
-        
+
         Token alias_token = consume(TokenKind::TK_IDENTIFIER, "Expected type alias name");
         std::string alias_name = std::string(alias_token.text());
-        
+
         consume(TokenKind::TK_EQUAL, "Expected '=' in type alias");
-        
+
         // Parse target type
         std::string target_type = parse_type();
-        
+
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after type alias");
-        
+
         return _builder.create_type_alias_declaration(start_loc, alias_name, target_type);
     }
 
     std::unique_ptr<EnumDeclarationNode> Parser::parse_enum_declaration()
     {
         SourceLocation start_loc = _current_token.location();
-        
+
         // Handle both "enum" and "type enum" syntax
         if (_current_token.is(TokenKind::TK_KW_TYPE))
         {
             consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
         }
-        
+
         consume(TokenKind::TK_KW_ENUM, "Expected 'enum'");
-        
+
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected enum name");
         std::string enum_name = std::string(name_token.text());
-        
+
         auto enum_decl = _builder.create_enum_declaration(start_loc, enum_name);
-        
+
         // Parse generic parameters if present
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
@@ -1516,9 +1639,9 @@ namespace Cryo
                 enum_decl->add_generic_parameter(std::move(param));
             }
         }
-        
+
         consume(TokenKind::TK_L_BRACE, "Expected '{' after enum name");
-        
+
         // Parse enum variants
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
@@ -1527,34 +1650,34 @@ namespace Cryo
             {
                 enum_decl->add_variant(std::move(variant));
             }
-            
+
             // Optional comma between variants
             if (_current_token.is(TokenKind::TK_COMMA))
             {
                 advance();
             }
         }
-        
+
         consume(TokenKind::TK_R_BRACE, "Expected '}' after enum body");
-        
+
         return enum_decl;
     }
 
     std::unique_ptr<EnumVariantNode> Parser::parse_enum_variant()
     {
         SourceLocation start_loc = _current_token.location();
-        
+
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected enum variant name");
         std::string variant_name = std::string(name_token.text());
-        
+
         // Check if this is a simple variant (C-style) or complex variant (Rust-style)
         if (_current_token.is(TokenKind::TK_L_PAREN))
         {
             // Complex variant with associated data: Bar(Baz)
             consume(TokenKind::TK_L_PAREN, "Expected '('");
-            
+
             std::vector<std::string> associated_types;
-            
+
             // Parse associated types
             if (!_current_token.is(TokenKind::TK_R_PAREN))
             {
@@ -1562,7 +1685,7 @@ namespace Cryo
                 {
                     std::string type = parse_type();
                     associated_types.push_back(type);
-                    
+
                     if (_current_token.is(TokenKind::TK_COMMA))
                     {
                         advance();
@@ -1573,9 +1696,9 @@ namespace Cryo
                     }
                 } while (!is_at_end());
             }
-            
+
             consume(TokenKind::TK_R_PAREN, "Expected ')' after variant types");
-            
+
             return _builder.create_enum_variant(start_loc, variant_name, associated_types);
         }
         else
@@ -1588,24 +1711,24 @@ namespace Cryo
     std::unique_ptr<ImplementationBlockNode> Parser::parse_implementation_block()
     {
         SourceLocation start_loc = _current_token.location();
-        
+
         consume(TokenKind::TK_KW_IMPLEMENT, "Expected 'implement'");
-        
+
         // Optional 'struct' keyword for backward compatibility
         if (_current_token.is(TokenKind::TK_KW_STRUCT))
         {
             advance(); // consume 'struct'
         }
-        
+
         Token target_token = consume(TokenKind::TK_IDENTIFIER, "Expected target type name");
         std::string target_type = std::string(target_token.text());
-        
+
         auto impl_block = _builder.create_implementation_block(start_loc, target_type);
-        
+
         consume(TokenKind::TK_L_BRACE, "Expected '{' after implement declaration");
-        
+
         // TODO: Add implementation block context tracking
-        
+
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
             try
@@ -1617,19 +1740,19 @@ namespace Cryo
                     // Field implementation: field_name = value;
                     Token field_token = consume(TokenKind::TK_IDENTIFIER, "Expected field name");
                     consume(TokenKind::TK_EQUAL, "Expected '=' in field implementation");
-                    
+
                     auto value = parse_expression();
                     consume(TokenKind::TK_SEMICOLON, "Expected ';' after field implementation");
-                    
+
                     // Create a field node with the default value
-                    auto field = _builder.create_struct_field(field_token.location(), 
-                                                             std::string(field_token.text()), 
-                                                             "auto", // Type will be inferred
-                                                             Visibility::Public);
+                    auto field = _builder.create_struct_field(field_token.location(),
+                                                              std::string(field_token.text()),
+                                                              "auto", // Type will be inferred
+                                                              Visibility::Public);
                     field->set_default_value(std::move(value));
                     impl_block->add_field_implementation(std::move(field));
                 }
-                else if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) && 
+                else if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
                          (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
                 {
                     // Method implementation
@@ -1642,15 +1765,15 @@ namespace Cryo
                     synchronize();
                 }
             }
-            catch (const ParseError& e)
+            catch (const ParseError &e)
             {
                 _errors.push_back(e);
                 synchronize();
             }
         }
-        
+
         consume(TokenKind::TK_R_BRACE, "Expected '}' after implementation block");
-        
+
         return impl_block;
     }
 
@@ -1658,16 +1781,16 @@ namespace Cryo
     std::vector<std::unique_ptr<GenericParameterNode>> Parser::parse_generic_parameters()
     {
         std::vector<std::unique_ptr<GenericParameterNode>> generics;
-        
+
         consume(TokenKind::TK_L_ANGLE, "Expected '<' for generics");
-        
+
         if (!_current_token.is(TokenKind::TK_R_ANGLE))
         {
             do
             {
                 auto generic = parse_generic_parameter();
                 generics.push_back(std::move(generic));
-                
+
                 if (_current_token.is(TokenKind::TK_COMMA))
                 {
                     advance(); // consume ','
@@ -1678,7 +1801,7 @@ namespace Cryo
                 }
             } while (!_current_token.is(TokenKind::TK_R_ANGLE) && !is_at_end());
         }
-        
+
         consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic parameters");
         return generics;
     }
@@ -1686,19 +1809,19 @@ namespace Cryo
     std::unique_ptr<GenericParameterNode> Parser::parse_generic_parameter()
     {
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected generic parameter name");
-        auto generic = _builder.create_generic_parameter(name_token.location(), 
-                                                        std::string(name_token.text()));
-        
+        auto generic = _builder.create_generic_parameter(name_token.location(),
+                                                         std::string(name_token.text()));
+
         // Parse optional constraints (T: Trait1 + Trait2)
         if (_current_token.is(TokenKind::TK_COLON))
         {
             advance(); // consume ':'
-            
+
             do
             {
                 Token constraint_token = consume(TokenKind::TK_IDENTIFIER, "Expected constraint type");
                 generic->add_constraint(std::string(constraint_token.text()));
-                
+
                 if (_current_token.is(TokenKind::TK_PLUS))
                 {
                     advance(); // consume '+'
@@ -1709,30 +1832,30 @@ namespace Cryo
                 }
             } while (!is_at_end());
         }
-        
+
         return generic;
     }
 
     std::unique_ptr<StructFieldNode> Parser::parse_struct_field()
     {
         SourceLocation start_loc = _current_token.location();
-        
+
         // Parse optional visibility (default is public for structs)
         Visibility visibility = Visibility::Public;
         if (is_visibility_modifier())
         {
             visibility = parse_visibility_modifier();
         }
-        
+
         Token field_token = consume(TokenKind::TK_IDENTIFIER, "Expected field name");
         std::string field_name = std::string(field_token.text());
-        
+
         consume(TokenKind::TK_COLON, "Expected ':' after field name");
-        
+
         std::string field_type = parse_type();
-        
+
         auto field = _builder.create_struct_field(start_loc, field_name, field_type, visibility);
-        
+
         // Parse optional default value
         if (_current_token.is(TokenKind::TK_EQUAL))
         {
@@ -1740,7 +1863,7 @@ namespace Cryo
             auto default_value = parse_expression();
             field->set_default_value(std::move(default_value));
         }
-        
+
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after field declaration");
         return field;
     }
@@ -1748,14 +1871,14 @@ namespace Cryo
     std::unique_ptr<StructMethodNode> Parser::parse_struct_method(const std::string &struct_name)
     {
         SourceLocation start_loc = _current_token.location();
-        
+
         // Parse optional visibility (default is public for structs)
         Visibility visibility = Visibility::Public;
         if (is_visibility_modifier())
         {
             visibility = parse_visibility_modifier();
         }
-        
+
         // Check for constructor
         bool is_constructor = false;
         if (_current_token.is(TokenKind::TK_KW_CONSTRUCTOR))
@@ -1763,10 +1886,10 @@ namespace Cryo
             is_constructor = true;
             advance();
         }
-        
+
         Token method_token;
         std::string method_name;
-        
+
         // Accept both identifiers and keywords as method names
         if (_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword())
         {
@@ -1779,18 +1902,18 @@ namespace Cryo
             error("Expected method name");
             return nullptr;
         }
-        
+
         consume(TokenKind::TK_L_PAREN, "Expected '(' after method name");
-        
+
         // Parse parameters
         std::vector<std::unique_ptr<VariableDeclarationNode>> params;
         if (!_current_token.is(TokenKind::TK_R_PAREN))
         {
             params = parse_parameter_list();
         }
-        
+
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
-        
+
         // Parse return type (optional for constructors)
         std::string return_type = "void";
         if (_current_token.is(TokenKind::TK_ARROW))
@@ -1802,28 +1925,28 @@ namespace Cryo
         {
             return_type = "void"; // Constructors don't have explicit return types
         }
-        
+
         auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor);
-        
+
         // Add parameters
-        for (auto& param : params)
+        for (auto &param : params)
         {
             method->add_parameter(std::move(param));
         }
-        
+
         // Parse optional body (for method implementations)
         if (_current_token.is(TokenKind::TK_L_BRACE))
         {
             auto body = parse_block_statement();
             method->set_body(std::unique_ptr<BlockStatementNode>(
-                dynamic_cast<BlockStatementNode*>(body.release())));
+                dynamic_cast<BlockStatementNode *>(body.release())));
         }
         else
         {
             // Method signature only
             consume(TokenKind::TK_SEMICOLON, "Expected ';' after method signature");
         }
-        
+
         return method;
     }
 
@@ -1844,7 +1967,7 @@ namespace Cryo
             advance();
             return Visibility::Protected;
         }
-        
+
         error("Expected visibility modifier");
         return Visibility::Public; // Default fallback
     }

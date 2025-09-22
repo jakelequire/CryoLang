@@ -34,7 +34,7 @@ namespace Cryo
         std::vector<ParseError> _errors;
         DiagnosticManager *_diagnostic_manager;
         std::string _source_file;
-        
+
         // Context tracking
         bool _in_implementation_block = false;
 
@@ -87,6 +87,9 @@ namespace Cryo
         std::unique_ptr<ASTNode> parse_if_statement();
         std::unique_ptr<ASTNode> parse_while_statement();
         std::unique_ptr<ASTNode> parse_for_statement();
+        std::unique_ptr<ASTNode> parse_match_statement();
+        std::unique_ptr<MatchArmNode> parse_match_arm();
+        std::unique_ptr<PatternNode> parse_pattern();
         std::unique_ptr<ASTNode> parse_break_statement();
         std::unique_ptr<ASTNode> parse_continue_statement();
         std::unique_ptr<ASTNode> parse_expression_statement();
