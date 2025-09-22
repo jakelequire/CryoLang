@@ -30,6 +30,7 @@ namespace Cryo::LSP
         // Message processing
         void process_message(const LSPMessage& message);
         void handle_initialize(const std::string& request_id);
+        void handle_initialized();
         void handle_shutdown(const std::string& request_id);
         void handle_exit();
         void handle_text_document_did_open(const std::string& params_json);

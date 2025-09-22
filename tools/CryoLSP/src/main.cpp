@@ -36,6 +36,22 @@ void signal_handler(int signal) {
 int main(int argc, char* argv[])
 {
     try {
+        // Critical Windows LSP stdio setup - prevent buffering deadlocks
+        std::ios_base::sync_with_stdio(false);
+        std::cin.tie(nullptr);
+        std::cout.tie(nullptr);
+        std::cerr.tie(nullptr);
+        
+        // Force unbuffered I/O (essential for LSP handshake on Windows)
+        std::setvbuf(stdin, nullptr, _IONBF, 0);
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+        
+        // Additional Windows-specific buffering fixes
+        std::cin.rdbuf()->pubsetbuf(nullptr, 0);
+        std::cout.rdbuf()->pubsetbuf(nullptr, 0);
+        std::cerr.rdbuf()->pubsetbuf(nullptr, 0);
+        
         // Set up signal handlers for graceful shutdown
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
