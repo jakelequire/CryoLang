@@ -80,6 +80,10 @@ namespace Cryo
         void visit(IfStatementNode &node) override;
         void visit(WhileStatementNode &node) override;
         void visit(ForStatementNode &node) override;
+        void visit(MatchStatementNode &node) override;
+        void visit(MatchArmNode &node) override;
+        void visit(PatternNode &node) override;
+        void visit(EnumPatternNode &node) override;
         void visit(BreakStatementNode &node) override;
         void visit(ContinueStatementNode &node) override;
         void visit(ExpressionStatementNode &node) override;

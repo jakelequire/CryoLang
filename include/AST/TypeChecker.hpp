@@ -100,10 +100,10 @@ namespace Cryo
 
         // Current function return type (for return statement checking)
         Type *_current_function_return_type = nullptr;
-        
+
         // Current struct type (for 'this' keyword resolution)
         Type *_current_struct_type = nullptr;
-        
+
         // Current struct name (for field tracking)
         std::string _current_struct_name;
 
@@ -112,10 +112,10 @@ namespace Cryo
         bool _in_loop = false;
 
         // Struct field tracking - maps struct name -> field name -> field type
-        std::unordered_map<std::string, std::unordered_map<std::string, Type*>> _struct_fields;
-        
+        std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _struct_fields;
+
         // Struct method tracking - maps struct name -> method name -> return type
-        std::unordered_map<std::string, std::unordered_map<std::string, Type*>> _struct_methods;
+        std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _struct_methods;
 
     public:
         TypeChecker(TypeContext &type_ctx);
@@ -163,6 +163,12 @@ namespace Cryo
         void visit(NewExpressionNode &node) override;
         void visit(MemberAccessNode &node) override;
         void visit(ScopeResolutionNode &node) override;
+
+        // Visitor methods - Match Statements
+        void visit(MatchStatementNode &node) override;
+        void visit(MatchArmNode &node) override;
+        void visit(PatternNode &node) override;
+        void visit(EnumPatternNode &node) override;
 
     private:
         // Type inference and deduction

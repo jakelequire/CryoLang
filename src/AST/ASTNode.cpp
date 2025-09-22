@@ -49,6 +49,26 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void MatchStatementNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    void MatchArmNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    void PatternNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    void EnumPatternNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     void BreakStatementNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);

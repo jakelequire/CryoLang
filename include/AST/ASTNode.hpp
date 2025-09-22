@@ -12,6 +12,11 @@ namespace Cryo
     // Forward declaration for visitor pattern
     class ASTVisitor;
 
+    // Forward declarations for pattern matching
+    class MatchArmNode;
+    class PatternNode;
+    class EnumPatternNode;
+
     enum class NodeKind
     {
         // Base categories
@@ -38,6 +43,7 @@ namespace Cryo
         IfStatement,
         WhileStatement,
         ForStatement,
+        MatchStatement,
         BreakStatement,
         ContinueStatement,
         ExpressionStatement,
@@ -54,6 +60,11 @@ namespace Cryo
 
         // Top-level
         Program,
+
+        // Pattern matching specific
+        MatchArm,
+        Pattern,
+        EnumPattern,
 
         Unknown
     };
@@ -200,7 +211,7 @@ namespace Cryo
 
     public:
         UnaryExpressionNode(NodeKind kind, SourceLocation loc, Token op,
-                           std::unique_ptr<ExpressionNode> operand)
+                            std::unique_ptr<ExpressionNode> operand)
             : ExpressionNode(kind, loc), _operator(op), _operand(std::move(operand)) {}
 
         const Token &operator_token() const { return _operator; }
@@ -517,7 +528,8 @@ namespace Cryo
                 os << " : ";
                 for (size_t i = 0; i < _constraints.size(); ++i)
                 {
-                    if (i > 0) os << " + ";
+                    if (i > 0)
+                        os << " + ";
                     os << _constraints[i];
                 }
             }
@@ -537,10 +549,10 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> _default_value;
 
     public:
-        StructFieldNode(SourceLocation loc, std::string name, std::string type_annotation, 
-                       Visibility visibility = Visibility::Public)
-            : DeclarationNode(NodeKind::VariableDeclaration, loc), 
-              _name(std::move(name)), _type_annotation(std::move(type_annotation)), 
+        StructFieldNode(SourceLocation loc, std::string name, std::string type_annotation,
+                        Visibility visibility = Visibility::Public)
+            : DeclarationNode(NodeKind::VariableDeclaration, loc),
+              _name(std::move(name)), _type_annotation(std::move(type_annotation)),
               _visibility(visibility) {}
 
         const std::string &name() const { return _name; }
@@ -561,8 +573,10 @@ namespace Cryo
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "Field: ";
-            if (_visibility == Visibility::Private) os << "private ";
-            else if (_visibility == Visibility::Protected) os << "protected ";
+            if (_visibility == Visibility::Private)
+                os << "private ";
+            else if (_visibility == Visibility::Protected)
+                os << "protected ";
             os << _name << ": " << _type_annotation;
             if (_default_value)
             {
@@ -584,7 +598,7 @@ namespace Cryo
 
     public:
         StructMethodNode(SourceLocation loc, std::string name, std::string return_type,
-                        Visibility visibility = Visibility::Public, bool is_constructor = false)
+                         Visibility visibility = Visibility::Public, bool is_constructor = false)
             : FunctionDeclarationNode(loc, std::move(name), std::move(return_type)),
               _visibility(visibility), _is_constructor(is_constructor) {}
 
@@ -594,10 +608,13 @@ namespace Cryo
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "Method: ";
-            if (_visibility == Visibility::Private) os << "private ";
-            else if (_visibility == Visibility::Protected) os << "protected ";
-            if (_is_constructor) os << "constructor ";
-            
+            if (_visibility == Visibility::Private)
+                os << "private ";
+            else if (_visibility == Visibility::Protected)
+                os << "protected ";
+            if (_is_constructor)
+                os << "constructor ";
+
             // Call parent print method
             FunctionDeclarationNode::print(os, 0);
         }
@@ -648,7 +665,8 @@ namespace Cryo
                 os << "<";
                 for (size_t i = 0; i < _generic_parameters.size(); ++i)
                 {
-                    if (i > 0) os << ", ";
+                    if (i > 0)
+                        os << ", ";
                     os << _generic_parameters[i]->name();
                 }
                 os << ">";
@@ -729,7 +747,8 @@ namespace Cryo
                 os << "<";
                 for (size_t i = 0; i < _generic_parameters.size(); ++i)
                 {
-                    if (i > 0) os << ", ";
+                    if (i > 0)
+                        os << ", ";
                     os << _generic_parameters[i]->name();
                 }
                 os << ">";
@@ -783,7 +802,7 @@ namespace Cryo
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "TypeAlias: " << _alias_name 
+            os << std::string(indent, ' ') << "TypeAlias: " << _alias_name
                << " = " << _target_type << std::endl;
         }
 
@@ -796,33 +815,36 @@ namespace Cryo
     private:
         std::string _name;
         std::vector<std::string> _associated_types; // Empty for simple variants like NAME_1
-        
+
     public:
         EnumVariantNode(SourceLocation loc, std::string name)
             : DeclarationNode(NodeKind::Declaration, loc), _name(std::move(name)) {}
-            
+
         EnumVariantNode(SourceLocation loc, std::string name, std::vector<std::string> associated_types)
-            : DeclarationNode(NodeKind::Declaration, loc), _name(std::move(name)), 
+            : DeclarationNode(NodeKind::Declaration, loc), _name(std::move(name)),
               _associated_types(std::move(associated_types)) {}
-              
+
         const std::string &name() const { return _name; }
         const std::vector<std::string> &associated_types() const { return _associated_types; }
         bool is_simple_variant() const { return _associated_types.empty(); }
-        
+
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "EnumVariant: " << _name;
-            if (!_associated_types.empty()) {
+            if (!_associated_types.empty())
+            {
                 os << "(";
-                for (size_t i = 0; i < _associated_types.size(); ++i) {
-                    if (i > 0) os << ", ";
+                for (size_t i = 0; i < _associated_types.size(); ++i)
+                {
+                    if (i > 0)
+                        os << ", ";
                     os << _associated_types[i];
                 }
                 os << ")";
             }
             os << std::endl;
         }
-        
+
         void accept(ASTVisitor &visitor) override;
     };
 
@@ -833,54 +855,59 @@ namespace Cryo
         std::string _name;
         std::vector<std::unique_ptr<EnumVariantNode>> _variants;
         std::vector<std::unique_ptr<GenericParameterNode>> _generic_parameters;
-        
+
     public:
         EnumDeclarationNode(SourceLocation loc, std::string name)
             : DeclarationNode(NodeKind::EnumDeclaration, loc), _name(std::move(name)) {}
-            
+
         const std::string &name() const { return _name; }
         const std::vector<std::unique_ptr<EnumVariantNode>> &variants() const { return _variants; }
         const std::vector<std::unique_ptr<GenericParameterNode>> &generic_parameters() const { return _generic_parameters; }
-        
+
         void add_variant(std::unique_ptr<EnumVariantNode> variant)
         {
             _variants.push_back(std::move(variant));
         }
-        
+
         void add_generic_parameter(std::unique_ptr<GenericParameterNode> param)
         {
             _generic_parameters.push_back(std::move(param));
         }
-        
+
         // Check if this is a simple C-style enum (all variants are simple)
         bool is_simple_enum() const
         {
             return std::all_of(_variants.begin(), _variants.end(),
-                             [](const auto &variant) { return variant->is_simple_variant(); });
+                               [](const auto &variant)
+                               { return variant->is_simple_variant(); });
         }
-        
+
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "EnumDeclaration: " << _name;
-            
-            if (!_generic_parameters.empty()) {
+
+            if (!_generic_parameters.empty())
+            {
                 os << "<";
-                for (size_t i = 0; i < _generic_parameters.size(); ++i) {
-                    if (i > 0) os << ", ";
+                for (size_t i = 0; i < _generic_parameters.size(); ++i)
+                {
+                    if (i > 0)
+                        os << ", ";
                     os << "T" << i; // Simplified for now
                 }
                 os << ">";
             }
-            
+
             os << " {" << std::endl;
-            
-            for (const auto &variant : _variants) {
+
+            for (const auto &variant : _variants)
+            {
                 variant->print(os, indent + 4);
             }
-            
+
             os << std::string(indent, ' ') << "}" << std::endl;
         }
-        
+
         void accept(ASTVisitor &visitor) override;
     };
 
@@ -993,7 +1020,7 @@ namespace Cryo
         const std::vector<std::unique_ptr<ExpressionNode>> &arguments() const { return _arguments; }
 
         void add_generic_arg(const std::string &type) { _generic_args.push_back(type); }
-        
+
         void add_argument(std::unique_ptr<ExpressionNode> arg)
         {
             _arguments.push_back(std::move(arg));
@@ -1002,20 +1029,26 @@ namespace Cryo
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "NewExpression: " << _type_name;
-            if (!_generic_args.empty()) {
+            if (!_generic_args.empty())
+            {
                 os << "<";
-                for (size_t i = 0; i < _generic_args.size(); ++i) {
-                    if (i > 0) os << ", ";
+                for (size_t i = 0; i < _generic_args.size(); ++i)
+                {
+                    if (i > 0)
+                        os << ", ";
                     os << _generic_args[i];
                 }
                 os << ">";
             }
             os << std::endl;
-            
-            if (!_arguments.empty()) {
+
+            if (!_arguments.empty())
+            {
                 os << std::string(indent + 2, ' ') << "Arguments:" << std::endl;
-                for (const auto &arg : _arguments) {
-                    if (arg) arg->print(os, indent + 4);
+                for (const auto &arg : _arguments)
+                {
+                    if (arg)
+                        arg->print(os, indent + 4);
                 }
             }
         }
@@ -1137,7 +1170,7 @@ namespace Cryo
 
     public:
         ScopeResolutionNode(SourceLocation loc, std::string scope_name, std::string member_name)
-            : ExpressionNode(NodeKind::ScopeResolution, loc), 
+            : ExpressionNode(NodeKind::ScopeResolution, loc),
               _scope_name(std::move(scope_name)), _member_name(std::move(member_name)) {}
 
         const std::string &scope_name() const { return _scope_name; }
@@ -1145,7 +1178,7 @@ namespace Cryo
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "ScopeResolution: " << _scope_name 
+            os << std::string(indent, ' ') << "ScopeResolution: " << _scope_name
                << "::" << _member_name << std::endl;
         }
 
@@ -1273,6 +1306,124 @@ namespace Cryo
             {
                 os << std::string(indent + 2, ' ') << "Body:" << std::endl;
                 _body->print(os, indent + 4);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Base pattern class
+    class PatternNode : public ASTNode
+    {
+    public:
+        PatternNode(NodeKind kind, SourceLocation loc) : ASTNode(kind, loc) {}
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Enum pattern (e.g., Shape::Circle(radius))
+    class EnumPatternNode : public PatternNode
+    {
+    private:
+        std::string _enum_name;
+        std::string _variant_name;
+        std::vector<std::string> _bound_variables;
+
+    public:
+        EnumPatternNode(SourceLocation loc, const std::string &enum_name, const std::string &variant_name)
+            : PatternNode(NodeKind::EnumPattern, loc), _enum_name(enum_name), _variant_name(variant_name) {}
+
+        void add_bound_variable(const std::string &var_name)
+        {
+            _bound_variables.push_back(var_name);
+        }
+
+        const std::string &enum_name() const { return _enum_name; }
+        const std::string &variant_name() const { return _variant_name; }
+        const std::vector<std::string> &bound_variables() const { return _bound_variables; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "EnumPattern " << _enum_name << "::" << _variant_name;
+            if (!_bound_variables.empty())
+            {
+                os << " (";
+                for (size_t i = 0; i < _bound_variables.size(); ++i)
+                {
+                    if (i > 0)
+                        os << ", ";
+                    os << _bound_variables[i];
+                }
+                os << ")";
+            }
+            os << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Match arm
+    class MatchArmNode : public ASTNode
+    {
+    private:
+        std::unique_ptr<PatternNode> _pattern;
+        std::unique_ptr<StatementNode> _body;
+
+    public:
+        MatchArmNode(SourceLocation loc, std::unique_ptr<PatternNode> pattern, std::unique_ptr<StatementNode> body)
+            : ASTNode(NodeKind::MatchArm, loc), _pattern(std::move(pattern)), _body(std::move(body)) {}
+
+        PatternNode *pattern() const { return _pattern.get(); }
+        StatementNode *body() const { return _body.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "MatchArm" << std::endl;
+            if (_pattern)
+            {
+                os << std::string(indent + 2, ' ') << "Pattern:" << std::endl;
+                _pattern->print(os, indent + 4);
+            }
+            if (_body)
+            {
+                os << std::string(indent + 2, ' ') << "Body:" << std::endl;
+                _body->print(os, indent + 4);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Match statement
+    class MatchStatementNode : public StatementNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _expr;
+        std::vector<std::unique_ptr<MatchArmNode>> _arms;
+
+    public:
+        MatchStatementNode(SourceLocation loc, std::unique_ptr<ExpressionNode> expr)
+            : StatementNode(NodeKind::MatchStatement, loc), _expr(std::move(expr)) {}
+
+        void add_arm(std::unique_ptr<MatchArmNode> arm)
+        {
+            _arms.push_back(std::move(arm));
+        }
+
+        ExpressionNode *expr() const { return _expr.get(); }
+        const std::vector<std::unique_ptr<MatchArmNode>> &arms() const { return _arms; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "Match" << std::endl;
+            if (_expr)
+            {
+                os << std::string(indent + 2, ' ') << "Expression:" << std::endl;
+                _expr->print(os, indent + 4);
+            }
+            for (const auto &arm : _arms)
+            {
+                os << std::string(indent + 2, ' ') << "Arm:" << std::endl;
+                arm->print(os, indent + 4);
             }
         }
 
