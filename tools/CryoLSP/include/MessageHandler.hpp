@@ -32,6 +32,7 @@ namespace Cryo::LSP
         
         // JSON helpers (we'll use a simple JSON parser for now)
         std::optional<std::string> extract_json_string(const std::string& json, const std::string& key);
+        std::optional<std::string> extract_json_object(const std::string& json, const std::string& key);
         std::optional<int> extract_json_int(const std::string& json, const std::string& key);
         bool has_json_key(const std::string& json, const std::string& key);
 

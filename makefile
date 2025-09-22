@@ -167,6 +167,7 @@ rebuild:
 .PHONY: all
 all: 
 	@$(MAKE) timed-build
+	@$(MAKE) tools
 
 run: $(MAIN_BIN)
 	@$(MAIN_BIN)

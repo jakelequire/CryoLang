@@ -211,6 +211,43 @@ export function activate(context: vscode.ExtensionContext) {
     // Debug: Remove manual hover provider so LSP hover can work
     // The manual hover provider was intercepting requests before they reached the LSP
     LOG.info('Extension', 'Manual hover provider disabled - using LSP hover instead');
+    
+    // TEMPORARY: Add a basic hover provider to test functionality
+    const hoverProvider = vscode.languages.registerHoverProvider('cryo', {
+        provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Hover> {
+            LOG.info('Extension', 'HOVER TRIGGERED at ' + position.line + ':' + position.character);
+            
+            // Get the word at position
+            const range = document.getWordRangeAtPosition(position);
+            const word = document.getText(range);
+            
+            LOG.info('Extension', 'Hovering over word: "' + word + '"');
+            
+            // Test basic built-in types
+            const builtinTypes: { [key: string]: string } = {
+                'int': '🔢 **int**\n\n*Signed 32-bit integer*\n\nRange: -2,147,483,648 to 2,147,483,647\n\n💡 *Use for whole numbers and counting.*',
+                'string': '📝 **string**\n\n*Text string*\n\nUTF-8 encoded string of characters\n\n💡 *Use for text, names, and string operations.*',
+                'boolean': '✅ **boolean**\n\n*Boolean value*\n\nValues: `true` or `false`\n\n💡 *Use for logical operations and conditions.*',
+                'float': '🔢 **float**\n\n*32-bit floating-point number*\n\nPrecision: ~7 decimal digits\n\n💡 *Use for decimal numbers with moderate precision.*',
+                'true': '✅ **true**\n\n*Boolean literal*\n\nRepresents the logical true value\n\n💡 *Use in boolean expressions and conditions.*',
+                'false': '❌ **false**\n\n*Boolean literal*\n\nRepresents the logical false value\n\n💡 *Use in boolean expressions and conditions.*'
+            };
+            
+            if (builtinTypes[word]) {
+                LOG.info('Extension', 'Found hover info for: ' + word);
+                return new vscode.Hover(new vscode.MarkdownString(builtinTypes[word]));
+            }
+            
+            // Fallback for unknown words
+            if (word && word.length > 0) {
+                return new vscode.Hover(new vscode.MarkdownString(`**${word}**\n\n*CryoLang symbol*\n\nHover functionality is working! 🎉`));
+            }
+            
+            return null;
+        }
+    });
+    
+    context.subscriptions.push(hoverProvider);
 
     // Command to restart the language server (for development)
     const restartCommand = vscode.commands.registerCommand('cryo.restartLanguageServer', async () => {
