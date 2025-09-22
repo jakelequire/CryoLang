@@ -707,14 +707,9 @@ namespace Cryo
 
     void TypeChecker::visit(BlockStatementNode &node)
     {
-        // Only enter a new scope if we're not already in a function scope
-        // Function parameters and body variables should share the same scope
-        bool should_create_scope = !_in_function;
-
-        if (should_create_scope)
-        {
-            enter_scope();
-        }
+        // Always create a new scope for block statements to ensure proper variable scoping
+        // This is essential for detecting out-of-scope variable references
+        enter_scope();
 
         for (const auto &stmt : node.statements())
         {
@@ -724,10 +719,7 @@ namespace Cryo
             }
         }
 
-        if (should_create_scope)
-        {
-            exit_scope();
-        }
+        exit_scope();
     }
 
     void TypeChecker::visit(ReturnStatementNode &node)
