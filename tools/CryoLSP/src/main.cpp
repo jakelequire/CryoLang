@@ -3,6 +3,11 @@
 #include <exception>
 #include <signal.h>
 #include <memory>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 // Global server instance for signal handling
 std::unique_ptr<Cryo::LSP::LSPServer> g_server = nullptr;
@@ -36,6 +41,44 @@ void signal_handler(int signal) {
 int main(int argc, char* argv[])
 {
     try {
+        // Check for socket mode
+        bool use_socket = false;
+        int socket_port = 7777;
+        
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg == "--socket" && i + 1 < argc) {
+                // Handle --socket <port> format
+                use_socket = true;
+                socket_port = std::atoi(argv[i + 1]);
+                std::cerr << "[LSP] Using TCP socket mode on port " << socket_port << std::endl;
+                break;
+            } else if (arg.find("--socket=") == 0) {
+                // Handle --socket=<port> format (VS Code automatically adds this)
+                use_socket = true;
+                socket_port = std::atoi(arg.substr(9).c_str());
+                std::cerr << "[LSP] Using TCP socket mode on port " << socket_port << std::endl;
+                break;
+            }
+        }
+        
+        if (!use_socket) {
+            std::cerr << "[LSP] Using stdio mode (default)" << std::endl;
+        }
+        
+        // Log process info for debugging
+        std::cerr << "[LSP] CryoLSP server starting..." << std::endl;
+        #ifdef _WIN32
+        std::cerr << "[LSP] Process ID: " << GetCurrentProcessId() << std::endl;
+        #else
+        std::cerr << "[LSP] Process ID: " << getpid() << std::endl;
+        #endif
+        std::cerr << "[LSP] Command line args: ";
+        for (int i = 0; i < argc; i++) {
+            std::cerr << argv[i] << " ";
+        }
+        std::cerr << std::endl;
+        
         // Critical Windows LSP stdio setup - prevent buffering deadlocks
         std::ios_base::sync_with_stdio(false);
         std::cin.tie(nullptr);
@@ -60,7 +103,11 @@ int main(int argc, char* argv[])
 #endif
 
         // Create and run the LSP server
-        g_server = std::make_unique<Cryo::LSP::LSPServer>();
+        if (use_socket) {
+            g_server = std::make_unique<Cryo::LSP::LSPServer>(socket_port);
+        } else {
+            g_server = std::make_unique<Cryo::LSP::LSPServer>();
+        }
         
         std::cerr << "[LSP] CryoLSP server starting..." << std::endl;
         
