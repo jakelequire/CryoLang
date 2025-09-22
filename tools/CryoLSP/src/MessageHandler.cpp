@@ -4,6 +4,8 @@
 #include <regex>
 #include <algorithm>
 #include <cstdio>
+#include <thread>
+#include <chrono>
 
 namespace Cryo::LSP
 {
@@ -42,16 +44,46 @@ namespace Cryo::LSP
     std::optional<std::string> MessageHandler::read_message()
     {
         LOG_DEBUG("MessageHandler", "Starting to read message...");
+        
         std::string line;
         size_t content_length = 0;
 
         // Read headers until we find Content-Length and empty line
-        while (std::getline(_input, line)) {
+        while (true) {
+            // Check if input is available without blocking
+            if (!_input.rdbuf()->in_avail()) {
+                // No input available, check if stream is closed
+                if (_input.peek() == EOF) {
+                    LOG_DEBUG("MessageHandler", "No input available and EOF reached");
+                    return std::nullopt;
+                }
+                // Sleep briefly and try again to avoid busy-waiting
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            
+            // Input is available, try to read a line
+            if (!std::getline(_input, line)) {
+                LOG_DEBUG("MessageHandler", "Failed to read line or EOF reached");
+                return std::nullopt;
+            }
             LOG_DEBUG("MessageHandler", "Read header line: '" + line + "'");
             
             // Check if input stream is still good
             if (!_input.good() && !_input.eof()) {
                 LOG_ERROR("MessageHandler", "Input stream error while reading headers");
+                return std::nullopt;
+            }
+            
+            // Add extra debugging for empty reads
+            if (_input.eof()) {
+                LOG_DEBUG("MessageHandler", "Reached EOF while reading headers");
+                return std::nullopt;
+            }
+            
+            // Check if input is ready to avoid indefinite blocking
+            if (!_input.rdbuf()->in_avail() && _input.peek() == std::istream::traits_type::eof()) {
+                LOG_DEBUG("MessageHandler", "No more input available");
                 return std::nullopt;
             }
             
@@ -133,11 +165,15 @@ namespace Cryo::LSP
             auto string_id = extract_json_string(json_content, "id");
             if (string_id) {
                 message.id = *string_id;
+                std::cerr << "[DEBUG] Extracted string ID: " << *string_id << std::endl;
             } else {
                 // Try as number
                 auto int_id = extract_json_int(json_content, "id");
                 if (int_id) {
                     message.id = std::to_string(*int_id);
+                    std::cerr << "[DEBUG] Extracted int ID: " << *int_id << std::endl;
+                } else {
+                    std::cerr << "[DEBUG] Failed to extract ID from: " << json_content << std::endl;
                 }
             }
         }
@@ -152,8 +188,15 @@ namespace Cryo::LSP
 
         // Extract params (for requests and notifications)
         if (has_json_key(json_content, "params")) {
-            // For now, store raw JSON - we'll parse specific params as needed
-            message.params_json = json_content; // Full message for now
+            auto params = extract_json_object(json_content, "params");
+            if (params) {
+                message.params_json = *params;
+                std::cerr << "[DEBUG] Extracted params: " << *params << std::endl;
+            } else {
+                std::cerr << "[DEBUG] Failed to extract params object" << std::endl;
+            }
+        } else {
+            std::cerr << "[DEBUG] No params key found in: " << json_content << std::endl;
         }
 
         // Extract result (for responses)
@@ -252,6 +295,47 @@ namespace Cryo::LSP
         oss << "\"params\":" << params_json;
         oss << "}";
         return oss.str();
+    }
+
+    std::optional<std::string> MessageHandler::extract_json_object(const std::string& json, const std::string& key)
+    {
+        // Look for "key":{ ... } pattern
+        std::string pattern = "\"" + key + "\"\\s*:\\s*\\{";
+        std::regex start_regex(pattern);
+        std::smatch match;
+        
+        if (!std::regex_search(json, match, start_regex)) {
+            return std::nullopt;
+        }
+        
+        size_t start_pos = match.position() + match.length() - 1; // Position of the opening '{'
+        size_t brace_count = 1;
+        size_t pos = start_pos + 1;
+        
+        // Find the matching closing brace
+        while (pos < json.length() && brace_count > 0) {
+            if (json[pos] == '{') {
+                brace_count++;
+            } else if (json[pos] == '}') {
+                brace_count--;
+            } else if (json[pos] == '"') {
+                // Skip string literals to avoid counting braces inside strings
+                pos++;
+                while (pos < json.length() && json[pos] != '"') {
+                    if (json[pos] == '\\') {
+                        pos++; // Skip escaped character
+                    }
+                    pos++;
+                }
+            }
+            pos++;
+        }
+        
+        if (brace_count == 0) {
+            return json.substr(start_pos, pos - start_pos);
+        }
+        
+        return std::nullopt;
     }
 
     // Simple JSON extraction helpers (basic implementation)

@@ -16,6 +16,17 @@ namespace Cryo::LSP
         ~LSPServer() = default;
 
         void run();
+        
+        // Public test methods for debugging
+        std::optional<Hover> test_get_hover_info(const std::string& uri, const Position& position) {
+            return get_hover_info(uri, position);
+        }
+        std::string test_get_builtin_type_info(const std::string& type_name) {
+            return get_builtin_type_info(type_name);
+        }
+        void test_load_document(const std::string& uri, const std::string& content) {
+            update_document(uri, content, 1);
+        }
 
     private:
         std::unique_ptr<Cryo::CompilerInstance> _compiler;
