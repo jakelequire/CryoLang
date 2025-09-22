@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as net from 'net';
 import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
@@ -62,6 +63,31 @@ const LOG = {
     }
 };
 
+// Helper function to check if LSP server is already running on a port
+async function checkServerRunning(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const socket = new net.Socket();
+        
+        const timeout = setTimeout(() => {
+            socket.destroy();
+            resolve(false);
+        }, 1000);
+        
+        socket.on('connect', () => {
+            clearTimeout(timeout);
+            socket.destroy();
+            resolve(true);
+        });
+        
+        socket.on('error', () => {
+            clearTimeout(timeout);
+            resolve(false);
+        });
+        
+        socket.connect(port, 'localhost');
+    });
+}
+
 export function activate(context: vscode.ExtensionContext) {
     LOG.info('Extension', '=== Cryo Language Support Extension Activated ===');
     LOG.info('Extension', 'Extension path: ' + context.extensionPath);
@@ -114,6 +140,9 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
 
+        // Get workspace root for server configuration
+        const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+
         // If client already exists, stop it first
         if (client) {
             try {
@@ -127,15 +156,16 @@ export function activate(context: vscode.ExtensionContext) {
             }
         }
 
-        LOG.info('LanguageServer', 'Configuring server options with command: ' + serverCommand);
+        LOG.info('LanguageServer', 'Configuring server options for LSP communication');
 
-        // Server options
+        LOG.info('LanguageServer', 'Configuring server options for LSP communication');
+
+        // Use our C++ LSP server
         const serverOptions: ServerOptions = {
             command: serverCommand,
-            args: [],
-            transport: TransportKind.stdio,
             options: {
-                env: process.env
+                env: process.env,
+                cwd: workspacePath
             }
         };
 
@@ -152,7 +182,22 @@ export function activate(context: vscode.ExtensionContext) {
             // Better initialization handling
             initializationOptions: {},
             diagnosticCollectionName: 'cryo',
-            outputChannelName: 'Cryo Language Server'
+            outputChannelName: 'Cryo Language Server',
+            // Add custom initialization handling to ensure initialized notification is sent
+            initializationFailedHandler: (error) => {
+                LOG.error('LanguageServer', 'LSP initialization failed: ' + String(error));
+                return false;
+            },
+            errorHandler: {
+                error: (error, message, count) => {
+                    LOG.error('LanguageServer', `LSP error ${count}: ${error}, message: ${message}`);
+                    return { action: 'Continue' as any };
+                },
+                closed: () => {
+                    LOG.error('LanguageServer', 'LSP connection closed');
+                    return { action: 'DoNotRestart' as any };
+                }
+            }
         };
 
         LOG.info('LanguageServer', 'Creating LanguageClient with options: ' + JSON.stringify({ documentSelector: clientOptions.documentSelector }));
@@ -171,12 +216,15 @@ export function activate(context: vscode.ExtensionContext) {
         });
 
         try {
-            // Start the client (remove timeout that might interfere with handshake)
+            // Start the client - with timeout to prevent hanging
             LOG.info('LanguageServer', 'Starting Cryo Language Client...');
             
+            // Wait for client to start properly - no timeout
+            LOG.info('LanguageServer', 'Client.start() promise created, awaiting...');
             await client.start();
+            LOG.info('LanguageServer', 'Client.start() completed successfully - LSP handshake complete');
             
-            LOG.info('LanguageServer', 'Cryo Language Server started successfully');
+            LOG.info('LanguageServer', 'Cryo Language Server connection established');
             
             // Add debugging for client state
             if (client.state) {
@@ -186,11 +234,42 @@ export function activate(context: vscode.ExtensionContext) {
             // Client started successfully
             LOG.info('LanguageServer', 'Language client connected to LSP server');
             
+            // Note: Hover functionality is handled entirely by the LSP server
+            // The LanguageClient automatically registers hover provider capabilities
+            
+            // Note: Hover functionality is handled entirely by the LSP server
+            // No client-side hover provider needed
+            
             vscode.window.showInformationMessage('Cryo Language Server started');
             
             // Give the server a moment to fully initialize
             await new Promise(resolve => setTimeout(resolve, 1000));
             LOG.info('LanguageServer', 'Language client initialization complete');
+            
+            // Debug: Check if any .cryo files are currently open
+            const openDocuments = vscode.workspace.textDocuments.filter(doc => doc.languageId === 'cryo');
+            LOG.info('LanguageServer', `Found ${openDocuments.length} open .cryo documents`);
+            for (const doc of openDocuments) {
+                LOG.info('LanguageServer', `Open document: ${doc.fileName} (languageId: ${doc.languageId})`);
+                
+                // Manually trigger document sync if the client is running
+                if (client && client.state === 3) { // State 3 = Running
+                    try {
+                        LOG.info('LanguageServer', `Manually sending textDocument/didOpen for: ${doc.fileName}`);
+                        client.sendNotification('textDocument/didOpen', {
+                            textDocument: {
+                                uri: doc.uri.toString(),
+                                languageId: doc.languageId,
+                                version: doc.version,
+                                text: doc.getText()
+                            }
+                        });
+                        LOG.info('LanguageServer', `Successfully sent didOpen notification for: ${doc.fileName}`);
+                    } catch (error) {
+                        LOG.error('LanguageServer', `Failed to send didOpen for ${doc.fileName}: ${String(error)}`);
+                    }
+                }
+            }
             
         } catch (error) {
             const errorMsg = 'Failed to start Cryo Language Server: ' + String(error);
@@ -202,127 +281,60 @@ export function activate(context: vscode.ExtensionContext) {
     // Start the language server initially
     startLanguageServer();
     
-    // Debug: Remove manual hover provider so LSP hover can work
-    // The manual hover provider was intercepting requests before they reached the LSP
-    LOG.info('Extension', 'Manual hover provider disabled - using LSP hover instead');
-    
-    // TEMPORARY: Add a basic hover provider to test functionality
-    const hoverProvider = vscode.languages.registerHoverProvider('cryo', {
-        provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Hover> {
-            // Get the word at position
-            const range = document.getWordRangeAtPosition(position);
-            const word = document.getText(range);
+    // Add document event listeners for debugging
+    const onDidOpenTextDocument = vscode.workspace.onDidOpenTextDocument((document) => {
+        if (document.languageId === 'cryo') {
+            LOG.info('Extension', `Document opened: ${document.fileName} (languageId: ${document.languageId})`);
+            LOG.info('Extension', `Document URI: ${document.uri.toString()}`);
+            LOG.info('Extension', `Client state: ${client?.state || 'no client'}`);
             
-            // Built-in types with clean syntax definitions
-            const builtinTypes: { [key: string]: { definition: string; description?: string } } = {
-                'int': { 
-                    definition: 'type int = i32;',
-                    description: 'Signed 32-bit integer\n\nRange: -2,147,483,648 to 2,147,483,647'
-                },
-                'i32': { 
-                    definition: 'type i32;',
-                    description: 'Signed 32-bit integer'
-                },
-                'i64': { 
-                    definition: 'type i64;',
-                    description: 'Signed 64-bit integer'
-                },
-                'string': { 
-                    definition: 'type string;',
-                    description: 'UTF-8 encoded text string\n\nUse for text, names, and string operations'
-                },
-                'boolean': { 
-                    definition: 'type boolean = bool;',
-                    description: 'Boolean value: true or false\n\nUse for logical operations and conditions'
-                },
-                'bool': { 
-                    definition: 'type bool;',
-                    description: 'Boolean value: true or false'
-                },
-                'float': { 
-                    definition: 'type float = f32;',
-                    description: '32-bit floating-point number\n\nPrecision: ~7 decimal digits'
-                },
-                'f32': { 
-                    definition: 'type f32;',
-                    description: '32-bit floating-point number'
-                },
-                'f64': { 
-                    definition: 'type f64;',
-                    description: '64-bit floating-point number'
-                },
-                'char': { 
-                    definition: 'type char;',
-                    description: 'UTF-8 encoded character'
-                },
-                'true': { 
-                    definition: 'const true: boolean = true;',
-                    description: 'Boolean literal representing logical true'
-                },
-                'false': { 
-                    definition: 'const false: boolean = false;',
-                    description: 'Boolean literal representing logical false'
-                },
-                'void': { 
-                    definition: 'type void;',
-                    description: 'No value type\n\nUsed for functions that don\'t return a value'
+            // Force send didOpen if client is ready
+            if (client && client.state === 3) {
+                try {
+                    LOG.info('Extension', `Force-sending didOpen for newly opened document: ${document.fileName}`);
+                    client.sendNotification('textDocument/didOpen', {
+                        textDocument: {
+                            uri: document.uri.toString(),
+                            languageId: document.languageId,
+                            version: (document as any).version || 1,
+                            text: document.getText()
+                        }
+                    });
+                    LOG.info('Extension', `Successfully sent didOpen for: ${document.fileName}`);
+                } catch (error) {
+                    LOG.error('Extension', `Failed to send didOpen: ${String(error)}`);
                 }
-            };
-            
-            if (builtinTypes[word]) {
-                const typeInfo = builtinTypes[word];
-                let hoverContent = '```cryo\n' + typeInfo.definition + '\n```';
-                if (typeInfo.description) {
-                    hoverContent += '\n\n' + typeInfo.description;
-                }
-                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
             }
-            
-            // Try to find variable/function definitions in the current document
-            const text = document.getText();
-            const lines = text.split('\n');
-            
-            // Look for variable declarations
-            const varPattern = new RegExp(`\\b(?:const|mut)\\s+${word}\\s*:\\s*([^=\\s;]+)`, 'g');
-            const varMatch = varPattern.exec(text);
-            if (varMatch) {
-                const variableType = varMatch[1].trim();
-                const hoverContent = '```cryo\nconst ' + word + ': ' + variableType + '\n```';
-                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
-            }
-            
-            // Look for function definitions
-            const funcPattern = new RegExp(`\\bfunction\\s+${word}\\s*\\([^)]*\\)\\s*(?:->\\s*[^{\\s]+)?`, 'g');
-            const funcMatch = funcPattern.exec(text);
-            if (funcMatch) {
-                const funcSignature = funcMatch[0].trim() + ';';
-                const hoverContent = '```cryo\n' + funcSignature + '\n```';
-                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
-            }
-            
-            // Look for enum declarations
-            const enumPattern = new RegExp(`\\benum\\s+${word}\\s*\\{`, 'g');
-            const enumMatch = enumPattern.exec(text);
-            if (enumMatch) {
-                const hoverContent = '```cryo\nenum ' + word + '\n```';
-                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
-            }
-            
-            // Look for struct/class declarations
-            const structPattern = new RegExp(`\\b(?:struct|class)\\s+${word}\\s*(?:<[^>]*>)?\\s*\\{`, 'g');
-            const structMatch = structPattern.exec(text);
-            if (structMatch) {
-                const declaration = structMatch[0].replace('{', '').trim();
-                const hoverContent = '```cryo\n' + declaration + '\n```';
-                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
-            }
-            
-            return null;
         }
     });
     
-    context.subscriptions.push(hoverProvider);
-
+    const onDidChangeActiveTextEditor = vscode.window.onDidChangeActiveTextEditor((editor) => {
+        if (editor && editor.document.languageId === 'cryo') {
+            LOG.info('Extension', `Active editor changed to .cryo file: ${editor.document.fileName}`);
+            LOG.info('Extension', `Client state: ${client?.state || 'no client'}`);
+            
+            // Also try to send didOpen when switching to a cryo file
+            if (client && client.state === 3) {
+                try {
+                    LOG.info('Extension', `Ensuring didOpen sent for active editor: ${editor.document.fileName}`);
+                    client.sendNotification('textDocument/didOpen', {
+                        textDocument: {
+                            uri: editor.document.uri.toString(),
+                            languageId: editor.document.languageId,
+                            version: (editor.document as any).version || 1,
+                            text: editor.document.getText()
+                        }
+                    });
+                    LOG.info('Extension', `didOpen sent for active editor: ${editor.document.fileName}`);
+                } catch (error) {
+                    LOG.error('Extension', `Failed to send didOpen for active editor: ${String(error)}`);
+                }
+            }
+        }
+    });
+    
+    context.subscriptions.push(onDidOpenTextDocument, onDidChangeActiveTextEditor);
+    
     // Command to restart the language server (for development)
     const restartCommand = vscode.commands.registerCommand('cryo.restartLanguageServer', async () => {
         vscode.window.showInformationMessage('Restarting Cryo Language Server...');

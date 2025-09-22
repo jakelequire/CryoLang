@@ -13,9 +13,18 @@ namespace Cryo::LSP
     {
     public:
         LSPServer();
+        LSPServer(int socket_port); // Constructor for socket mode
         ~LSPServer() = default;
 
         void run();
+        
+    private:
+        void run_socket_mode();
+        void run_stdio_mode();
+        void run_socket_communication(int client_socket);
+        void handle_socket_initialize(int client_socket);
+        void handle_socket_did_open(int client_socket, const std::string& json_content);
+        void handle_socket_hover(int client_socket, const std::string& json_content);
         
         // Public test methods for debugging
         std::optional<Hover> test_get_hover_info(const std::string& uri, const Position& position) {
@@ -33,6 +42,8 @@ namespace Cryo::LSP
         std::unique_ptr<MessageHandler> _message_handler;
         bool _initialized;
         bool _shutdown_requested;
+        bool _use_socket;
+        int _socket_port;
         
         // Document tracking
         std::unordered_map<std::string, std::string> _document_contents;

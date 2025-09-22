@@ -12,6 +12,13 @@ namespace Cryo::LSP
     MessageHandler::MessageHandler(std::istream& input, std::ostream& output)
         : _input(input), _output(output)
     {
+        // Synchronize with stdio - very important for Windows
+        std::ios::sync_with_stdio(false);
+        
+        // Make sure cin is untied from cout (reduces buffering issues)
+        std::cin.tie(nullptr);
+        
+        LOG_DEBUG("MessageHandler", "MessageHandler created with stdio synchronization disabled");
     }
 
     std::optional<LSPMessage> MessageHandler::receive_message()
@@ -45,97 +52,83 @@ namespace Cryo::LSP
     {
         LOG_DEBUG("MessageHandler", "Starting to read message...");
         
-        std::string line;
         size_t content_length = 0;
-
-        // Read headers until we find Content-Length and empty line
+        std::string current_line;
+        
+        // Clear any error flags before reading
+        _input.clear();
+        
+        // Read headers character by character to avoid getline() blocking issues
         while (true) {
-            // Check if input is available without blocking
-            if (!_input.rdbuf()->in_avail()) {
-                // No input available, check if stream is closed
-                if (_input.peek() == EOF) {
-                    LOG_DEBUG("MessageHandler", "No input available and EOF reached");
-                    return std::nullopt;
+            char ch;
+            if (!_input.get(ch)) {
+                if (_input.eof()) {
+                    LOG_DEBUG("MessageHandler", "EOF reached while reading headers");
+                } else {
+                    LOG_DEBUG("MessageHandler", "Failed to read character from input stream");
                 }
-                // Sleep briefly and try again to avoid busy-waiting
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                continue;
-            }
-            
-            // Input is available, try to read a line
-            if (!std::getline(_input, line)) {
-                LOG_DEBUG("MessageHandler", "Failed to read line or EOF reached");
-                return std::nullopt;
-            }
-            LOG_DEBUG("MessageHandler", "Read header line: '" + line + "'");
-            
-            // Check if input stream is still good
-            if (!_input.good() && !_input.eof()) {
-                LOG_ERROR("MessageHandler", "Input stream error while reading headers");
                 return std::nullopt;
             }
             
-            // Add extra debugging for empty reads
-            if (_input.eof()) {
-                LOG_DEBUG("MessageHandler", "Reached EOF while reading headers");
-                return std::nullopt;
-            }
-            
-            // Check if input is ready to avoid indefinite blocking
-            if (!_input.rdbuf()->in_avail() && _input.peek() == std::istream::traits_type::eof()) {
-                LOG_DEBUG("MessageHandler", "No more input available");
-                return std::nullopt;
-            }
-            
-            // Remove \r if present (Windows line endings)
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-
-            if (line.empty()) {
-                LOG_DEBUG("MessageHandler", "Found empty line, headers complete");
-                // Empty line indicates end of headers
-                break;
-            }
-
-            // Parse Content-Length header
-            if (line.find("Content-Length:") == 0) {
-                std::string length_str = line.substr(15); // Skip "Content-Length:"
-                // Remove leading/trailing whitespace
-                length_str.erase(0, length_str.find_first_not_of(" \t"));
-                length_str.erase(length_str.find_last_not_of(" \t\r\n") + 1);
+            // Handle line endings - collect characters until we have a complete line
+            if (ch == '\n') {
+                // Remove trailing \r if present (Windows CRLF)
+                if (!current_line.empty() && current_line.back() == '\r') {
+                    current_line.pop_back();
+                }
                 
-                try {
-                    content_length = std::stoull(length_str);
-                    LOG_DEBUG("MessageHandler", "Parsed Content-Length: " + std::to_string(content_length));
-                } catch (const std::exception&) {
-                    LOG_ERROR("MessageHandler", "Invalid Content-Length: " + length_str);
-                    return std::nullopt; // Invalid Content-Length
+                LOG_DEBUG("MessageHandler", "Read header line: '" + current_line + "'");
+                
+                // Empty line signals end of headers
+                if (current_line.empty()) {
+                    LOG_DEBUG("MessageHandler", "Found empty line, headers complete");
+                    break;
                 }
+                
+                // Parse Content-Length header
+                if (current_line.find("Content-Length:") == 0) {
+                    std::string length_str = current_line.substr(15);
+                    // Remove leading/trailing whitespace
+                    length_str.erase(0, length_str.find_first_not_of(" \t"));
+                    length_str.erase(length_str.find_last_not_of(" \t\r\n") + 1);
+                    
+                    try {
+                        content_length = std::stoull(length_str);
+                        LOG_DEBUG("MessageHandler", "Parsed Content-Length: " + std::to_string(content_length));
+                    } catch (const std::exception&) {
+                        LOG_ERROR("MessageHandler", "Invalid Content-Length: " + length_str);
+                        return std::nullopt;
+                    }
+                }
+                
+                // Reset for next line
+                current_line.clear();
+            } else {
+                // Add character to current line
+                current_line += ch;
             }
         }
 
         if (content_length == 0) {
             LOG_ERROR("MessageHandler", "No valid Content-Length found");
-            return std::nullopt; // No valid Content-Length found
-        }
-
-        // Check if input stream is still good before reading
-        if (!_input.good()) {
-            LOG_ERROR("MessageHandler", "Input stream is not in good state before reading content");
             return std::nullopt;
         }
 
-        // Read the JSON content
+        // Read the JSON content character by character
         LOG_DEBUG("MessageHandler", "Reading " + std::to_string(content_length) + " bytes of JSON content...");
         std::string content;
-        content.resize(content_length);
-        _input.read(&content[0], content_length);
-
-        if (_input.gcount() != static_cast<std::streamsize>(content_length)) {
-            return std::nullopt; // Failed to read expected amount
+        content.reserve(content_length);
+        
+        for (size_t i = 0; i < content_length; ++i) {
+            char ch;
+            if (!_input.get(ch)) {
+                LOG_ERROR("MessageHandler", "Failed to read JSON content at position " + std::to_string(i));
+                return std::nullopt;
+            }
+            content += ch;
         }
 
+        LOG_DEBUG("MessageHandler", "Successfully read message: " + content);
         return content;
     }
 
