@@ -37,14 +37,25 @@ namespace Cryo
     private:
         std::unordered_map<std::string, Symbol> symbols_;
         std::unique_ptr<SymbolTable> parent_scope_;
+        TypeContext *type_context_; // Add TypeContext for creating function types
 
     public:
-        SymbolTable(std::unique_ptr<SymbolTable> parent = nullptr)
-            : parent_scope_(std::move(parent)) {}
+        SymbolTable(std::unique_ptr<SymbolTable> parent = nullptr, TypeContext *type_context = nullptr)
+            : parent_scope_(std::move(parent)), type_context_(type_context) {}
 
         // Symbol management
         bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type = nullptr, const std::string &scope = "Global");
         Symbol *lookup_symbol(const std::string &name);
+
+        // Access symbols for copying to other symbol tables
+        const std::unordered_map<std::string, Symbol> &get_symbols() const { return symbols_; }
+
+        // Built-in function registration
+        bool declare_builtin_function(const std::string &name, const std::string &signature, TypeContext &type_context);
+        bool declare_builtin_type(const std::string &name, const std::string &description = "");
+
+        // Type context management
+        void set_type_context(TypeContext *type_context) { type_context_ = type_context; }
 
         // Scope management
         std::unique_ptr<SymbolTable> enter_scope();
@@ -58,5 +69,10 @@ namespace Cryo
         std::string get_symbol_kind_string(SymbolKind kind) const;
         void print_symbols_table(std::ostream &os, int scope_level) const;
         std::string format_field(const std::string &text, int width) const;
+
+        // Function signature parsing for built-ins
+        Type *parse_function_signature(const std::string &signature, TypeContext &type_context);
+        Type *convert_string_to_type(const std::string &type_str, TypeContext &type_context);
+        std::string trim(const std::string &str);
     };
 }

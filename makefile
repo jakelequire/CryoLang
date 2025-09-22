@@ -180,5 +180,36 @@ clean:
 	@$(PYTHON) ./scripts/clean.py
 	@$(MAKE) -C tools/CryoLSP clean 2>/dev/null || true
 
-.PHONY: debug clean all lsp tools
+# Test targets
+.PHONY: test test-quick test-verbose test-category test-file
+test: $(MAIN_BIN)
+	@echo "Running CryoLang test suite..."
+	@$(PYTHON) test/test_runner.py
+
+test-quick: $(MAIN_BIN)
+	@echo "Running CryoLang test suite (fail-fast mode)..."
+	@$(PYTHON) test/test_runner.py --fail-fast
+
+test-verbose: $(MAIN_BIN)
+	@echo "Running CryoLang test suite (verbose)..."
+	@$(PYTHON) test/test_runner.py --verbose --show-failures
+
+test-category: $(MAIN_BIN)
+	@echo "Usage: make test-category CATEGORIES='functions control-flow'"
+	@echo "Available categories: functions variables control-flow data-types generics memory"
+ifdef CATEGORIES
+	@$(PYTHON) test/test_runner.py --categories $(CATEGORIES)
+else
+	@echo "Please specify CATEGORIES variable"
+endif
+
+test-file: $(MAIN_BIN)
+	@echo "Usage: make test-file FILE='test/test-cases/functions/basic_functions.cryo'"
+ifdef FILE
+	@$(PYTHON) test/test_runner.py --file $(FILE)
+else
+	@echo "Please specify FILE variable"
+endif
+
+.PHONY: debug clean all lsp tools test test-quick test-verbose test-category test-file
 .NOTPARALLEL: clean clean-% libs

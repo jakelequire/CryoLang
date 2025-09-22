@@ -1,4 +1,5 @@
 #include "AST/TypeChecker.hpp"
+#include "AST/SymbolTable.hpp"
 #include "Lexer/lexer.hpp"
 #include <sstream>
 #include <algorithm>
@@ -99,6 +100,18 @@ namespace Cryo
         : _type_context(type_ctx)
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
+    }
+
+    void TypeChecker::load_builtin_symbols(const SymbolTable &main_symbol_table)
+    {
+        // Copy all built-in function symbols from main symbol table
+        for (const auto &[name, symbol] : main_symbol_table.get_symbols())
+        {
+            if (symbol.kind == SymbolKind::Function && symbol.data_type != nullptr)
+            {
+                _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
+            }
+        }
     }
 
     void TypeChecker::check_program(ProgramNode &program)

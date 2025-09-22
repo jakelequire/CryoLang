@@ -121,6 +121,9 @@ namespace Cryo
         TypeChecker(TypeContext &type_ctx);
         ~TypeChecker() = default;
 
+        // Load built-in functions from main SymbolTable
+        void load_builtin_symbols(const SymbolTable &main_symbol_table);
+
         // Main entry point
         void check_program(ProgramNode &program);
 

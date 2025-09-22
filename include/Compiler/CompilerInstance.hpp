@@ -9,6 +9,7 @@
 #include "AST/TypeChecker.hpp"
 #include "GDM/GDM.hpp"
 #include "Utils/file.hpp"
+#include "Utils/RuntimeHeaderParser.hpp"
 #include <memory>
 #include <string>
 #include <vector>
@@ -81,6 +82,7 @@ namespace Cryo
 
     private:
         void initialize_components();
+        void initialize_standard_library(); // Initialize built-in functions and types
         void reset_state();
         bool parse_source_from_file(std::unique_ptr<File> file);
         void populate_symbol_table(ASTNode *node);
