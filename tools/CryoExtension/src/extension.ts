@@ -79,13 +79,7 @@ export function activate(context: vscode.ExtensionContext) {
     
     // Listen for active editor changes to see language ID
     const editorChangeDisposable = vscode.window.onDidChangeActiveTextEditor((editor) => {
-        if (editor && editor.document.fileName.endsWith('.cryo')) {
-            LOG.info('Extension', 'Cryo file opened: ' + JSON.stringify({
-                fileName: editor.document.fileName,
-                languageId: editor.document.languageId,
-                uri: editor.document.uri.toString()
-            }));
-        }
+        // Logging disabled - hover functionality is working
     });
 
     // Try multiple possible paths for the LSP server executable
@@ -215,32 +209,112 @@ export function activate(context: vscode.ExtensionContext) {
     // TEMPORARY: Add a basic hover provider to test functionality
     const hoverProvider = vscode.languages.registerHoverProvider('cryo', {
         provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Hover> {
-            LOG.info('Extension', 'HOVER TRIGGERED at ' + position.line + ':' + position.character);
-            
             // Get the word at position
             const range = document.getWordRangeAtPosition(position);
             const word = document.getText(range);
             
-            LOG.info('Extension', 'Hovering over word: "' + word + '"');
-            
-            // Test basic built-in types
-            const builtinTypes: { [key: string]: string } = {
-                'int': '🔢 **int**\n\n*Signed 32-bit integer*\n\nRange: -2,147,483,648 to 2,147,483,647\n\n💡 *Use for whole numbers and counting.*',
-                'string': '📝 **string**\n\n*Text string*\n\nUTF-8 encoded string of characters\n\n💡 *Use for text, names, and string operations.*',
-                'boolean': '✅ **boolean**\n\n*Boolean value*\n\nValues: `true` or `false`\n\n💡 *Use for logical operations and conditions.*',
-                'float': '🔢 **float**\n\n*32-bit floating-point number*\n\nPrecision: ~7 decimal digits\n\n💡 *Use for decimal numbers with moderate precision.*',
-                'true': '✅ **true**\n\n*Boolean literal*\n\nRepresents the logical true value\n\n💡 *Use in boolean expressions and conditions.*',
-                'false': '❌ **false**\n\n*Boolean literal*\n\nRepresents the logical false value\n\n💡 *Use in boolean expressions and conditions.*'
+            // Built-in types with clean syntax definitions
+            const builtinTypes: { [key: string]: { definition: string; description?: string } } = {
+                'int': { 
+                    definition: 'type int = i32;',
+                    description: 'Signed 32-bit integer\n\nRange: -2,147,483,648 to 2,147,483,647'
+                },
+                'i32': { 
+                    definition: 'type i32;',
+                    description: 'Signed 32-bit integer'
+                },
+                'i64': { 
+                    definition: 'type i64;',
+                    description: 'Signed 64-bit integer'
+                },
+                'string': { 
+                    definition: 'type string;',
+                    description: 'UTF-8 encoded text string\n\nUse for text, names, and string operations'
+                },
+                'boolean': { 
+                    definition: 'type boolean = bool;',
+                    description: 'Boolean value: true or false\n\nUse for logical operations and conditions'
+                },
+                'bool': { 
+                    definition: 'type bool;',
+                    description: 'Boolean value: true or false'
+                },
+                'float': { 
+                    definition: 'type float = f32;',
+                    description: '32-bit floating-point number\n\nPrecision: ~7 decimal digits'
+                },
+                'f32': { 
+                    definition: 'type f32;',
+                    description: '32-bit floating-point number'
+                },
+                'f64': { 
+                    definition: 'type f64;',
+                    description: '64-bit floating-point number'
+                },
+                'char': { 
+                    definition: 'type char;',
+                    description: 'UTF-8 encoded character'
+                },
+                'true': { 
+                    definition: 'const true: boolean = true;',
+                    description: 'Boolean literal representing logical true'
+                },
+                'false': { 
+                    definition: 'const false: boolean = false;',
+                    description: 'Boolean literal representing logical false'
+                },
+                'void': { 
+                    definition: 'type void;',
+                    description: 'No value type\n\nUsed for functions that don\'t return a value'
+                }
             };
             
             if (builtinTypes[word]) {
-                LOG.info('Extension', 'Found hover info for: ' + word);
-                return new vscode.Hover(new vscode.MarkdownString(builtinTypes[word]));
+                const typeInfo = builtinTypes[word];
+                let hoverContent = '```cryo\n' + typeInfo.definition + '\n```';
+                if (typeInfo.description) {
+                    hoverContent += '\n\n' + typeInfo.description;
+                }
+                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
             }
             
-            // Fallback for unknown words
-            if (word && word.length > 0) {
-                return new vscode.Hover(new vscode.MarkdownString(`**${word}**\n\n*CryoLang symbol*\n\nHover functionality is working! 🎉`));
+            // Try to find variable/function definitions in the current document
+            const text = document.getText();
+            const lines = text.split('\n');
+            
+            // Look for variable declarations
+            const varPattern = new RegExp(`\\b(?:const|mut)\\s+${word}\\s*:\\s*([^=\\s;]+)`, 'g');
+            const varMatch = varPattern.exec(text);
+            if (varMatch) {
+                const variableType = varMatch[1].trim();
+                const hoverContent = '```cryo\nconst ' + word + ': ' + variableType + '\n```';
+                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
+            }
+            
+            // Look for function definitions
+            const funcPattern = new RegExp(`\\bfunction\\s+${word}\\s*\\([^)]*\\)\\s*(?:->\\s*[^{\\s]+)?`, 'g');
+            const funcMatch = funcPattern.exec(text);
+            if (funcMatch) {
+                const funcSignature = funcMatch[0].trim() + ';';
+                const hoverContent = '```cryo\n' + funcSignature + '\n```';
+                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
+            }
+            
+            // Look for enum declarations
+            const enumPattern = new RegExp(`\\benum\\s+${word}\\s*\\{`, 'g');
+            const enumMatch = enumPattern.exec(text);
+            if (enumMatch) {
+                const hoverContent = '```cryo\nenum ' + word + '\n```';
+                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
+            }
+            
+            // Look for struct/class declarations
+            const structPattern = new RegExp(`\\b(?:struct|class)\\s+${word}\\s*(?:<[^>]*>)?\\s*\\{`, 'g');
+            const structMatch = structPattern.exec(text);
+            if (structMatch) {
+                const declaration = structMatch[0].replace('{', '').trim();
+                const hoverContent = '```cryo\n' + declaration + '\n```';
+                return new vscode.Hover(new vscode.MarkdownString(hoverContent));
             }
             
             return null;
