@@ -17,11 +17,20 @@ namespace Cryo
         _symbol_table = std::make_unique<SymbolTable>();
         _diagnostic_manager = std::make_unique<DiagnosticManager>();
 
+        // Set the type context in symbol table so it can create proper function types
+        _symbol_table->set_type_context(&_ast_context->types());
+
         // Create type checker with the AST context's type context
         _type_checker = std::make_unique<TypeChecker>(_ast_context->types());
 
         // Configure diagnostic manager
         _diagnostic_manager->set_formatter_options(true, true, 2);
+
+        // Initialize standard library built-ins
+        initialize_standard_library();
+
+        // Copy built-in symbols to TypeChecker's symbol table
+        _type_checker->load_builtin_symbols(*_symbol_table);
 
         // Lexer and Parser will be created when we have a file to work with
     }
@@ -468,6 +477,48 @@ namespace Cryo
 
         signature += ") -> " + func_decl->return_type_annotation();
         return signature;
+    }
+
+    void CompilerInstance::initialize_standard_library()
+    {
+        // Use header parser to automatically load runtime functions
+        RuntimeHeaderParser parser;
+        std::string runtime_header_path = "/workspaces/CryoLang/runtime/include/cryo_runtime.h";
+
+        if (parser.parse_runtime_headers(runtime_header_path))
+        {
+            // Register all parsed functions
+            for (const auto &func : parser.get_functions())
+            {
+                if (_debug_mode)
+                {
+                    std::cout << "Registering built-in function: " << func.cryo_name
+                              << " " << func.signature << " -> " << func.name << std::endl;
+                }
+                _symbol_table->declare_builtin_function(func.cryo_name, func.signature, _ast_context->types());
+            }
+
+            // Register all parsed types
+            for (const auto &type : parser.get_types())
+            {
+                if (_debug_mode)
+                {
+                    std::cout << "Registering built-in type: " << type.name << std::endl;
+                }
+                _symbol_table->declare_builtin_type(type.name, type.description);
+            }
+
+            if (_debug_mode)
+            {
+                std::cout << "Standard library initialized with " << parser.get_functions().size()
+                          << " built-in functions and " << parser.get_types().size()
+                          << " built-in types" << std::endl;
+            }
+        }
+        else
+        {
+            std::cerr << "Failed to parse runtime headers - falling back to empty standard library" << std::endl;
+        }
     }
 
     std::unique_ptr<CompilerInstance> create_compiler_instance()
