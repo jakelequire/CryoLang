@@ -397,7 +397,7 @@ namespace Cryo::CLI
     // Utility Functions
     // ================================================================
 
-    std::unique_ptr<CLIRunner> create_default_cli()
+    std::unique_ptr<CLIRunner> create_cli()
     {
         auto cli = std::make_unique<CLIRunner>("Cryo", "0.1.0");
         cli->set_description("A modern systems programming language with safety and performance.");
