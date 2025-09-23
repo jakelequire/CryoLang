@@ -25,7 +25,7 @@ C_SOURCES = cryo_runtime.c
 OBJECTS = $(BUILD_DIR)/cryo_runtime.o
 
 # Compiler flags specific to runtime
-RUNTIME_CFLAGS = $(CFLAGS) -fPIC -I$(INCLUDE_DIR)
+RUNTIME_CFLAGS = $(CFLAGS) -I$(INCLUDE_DIR)
 RUNTIME_LDFLAGS = -lm  # Link math library
 
 # OS-specific library extension
