@@ -129,7 +129,7 @@ endif
 # Main target
 $(MAIN_BIN): $(ALL_OBJS)
 ifeq ($(OS), Windows_NT)
-	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
+	@if not exist "$(subst /,\,$(dir $@))" $(MKDIR) "$(subst /,\,$(dir $@))"
 else
 	@$(MKDIR) $(dir $@)
 endif
