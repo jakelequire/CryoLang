@@ -8,6 +8,8 @@
 #include "AST/ASTDumper.hpp"
 #include "AST/TypeChecker.hpp"
 #include "GDM/GDM.hpp"
+#include "Codegen/CodeGenerator.hpp"
+#include "Linker/CryoLinker.hpp"
 #include "Utils/file.hpp"
 #include "Utils/RuntimeHeaderParser.hpp"
 #include <memory>
@@ -21,7 +23,7 @@ namespace Cryo
      *
      * The CompilerInstance manages the lifecycle and coordination of all
      * major compilation components. It provides a unified interface for
-     * the compilation process from source code to AST.
+     * the compilation process from source code to final executable.
      */
     class CompilerInstance
     {
@@ -33,6 +35,8 @@ namespace Cryo
         std::unique_ptr<SymbolTable> _symbol_table;
         std::unique_ptr<DiagnosticManager> _diagnostic_manager;
         std::unique_ptr<TypeChecker> _type_checker;
+        std::unique_ptr<Cryo::Codegen::CodeGenerator> _codegen;
+        std::unique_ptr<Cryo::Linker::CryoLinker> _linker;
 
         // Compilation state
         std::string _source_file;
@@ -56,6 +60,11 @@ namespace Cryo
         bool compile_file(const std::string &source_file);
         bool parse_source(const std::string &source_code);
 
+        // Code generation and linking
+        bool generate_ir();
+        bool generate_output(const std::string &output_path,
+                             Cryo::Linker::CryoLinker::LinkTarget target = Cryo::Linker::CryoLinker::LinkTarget::Executable);
+
         // Phase-by-phase access (for testing/debugging)
         bool tokenize();
         bool parse();
@@ -68,6 +77,8 @@ namespace Cryo
         SymbolTable *symbol_table() const { return _symbol_table.get(); }
         DiagnosticManager *diagnostic_manager() const { return _diagnostic_manager.get(); }
         TypeChecker *type_checker() const { return _type_checker.get(); }
+        Cryo::Codegen::CodeGenerator *codegen() const { return _codegen.get(); }
+        Cryo::Linker::CryoLinker *linker() const { return _linker.get(); }
 
         // Namespace context
         void set_namespace_context(const std::string &namespace_name);
@@ -83,6 +94,7 @@ namespace Cryo
         void dump_symbol_table(std::ostream &os = std::cout) const;
         void dump_type_table(std::ostream &os = std::cout) const;
         void dump_type_errors(std::ostream &os = std::cout) const;
+        void dump_ir(std::ostream &os = std::cout) const;
         void print_diagnostics(std::ostream &os = std::cerr) const;
         void clear();
 

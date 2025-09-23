@@ -24,6 +24,12 @@ namespace Cryo
         // Create type checker with the AST context's type context
         _type_checker = std::make_unique<TypeChecker>(_ast_context->types());
 
+        // Create codegen after AST context and symbol table
+        _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table);
+
+        // Create linker with symbol table reference
+        _linker = std::make_unique<Cryo::Linker::CryoLinker>(*_symbol_table);
+
         // Configure diagnostic manager
         _diagnostic_manager->set_formatter_options(true, true, 2);
 
@@ -136,6 +142,19 @@ namespace Cryo
                 return false;
             }
 
+            // Phase 6: Generate IR (for testing and integration)
+            if (_debug_mode)
+            {
+                std::cout << "Generating IR..." << std::endl;
+            }
+
+            if (!generate_ir())
+            {
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::CodeGen,
+                                                  "IR generation failed", SourceRange{}, file_path);
+                return false;
+            }
+
             if (_debug_mode)
             {
                 std::cout << "=== Compilation Completed ===" << std::endl;
@@ -198,7 +217,7 @@ namespace Cryo
         try
         {
             _ast_root = _parser->parse_program();
-            
+
             // Capture namespace context from parser after successful parsing
             if (_ast_root && !_parser->current_namespace().empty() && _parser->current_namespace() != "Global")
             {
@@ -208,7 +227,7 @@ namespace Cryo
                     std::cout << "Parsed namespace: " << _parser->current_namespace() << std::endl;
                 }
             }
-            
+
             return _ast_root != nullptr;
         }
         catch (const std::exception &e)
@@ -296,6 +315,94 @@ namespace Cryo
         }
     }
 
+    bool CompilerInstance::generate_ir()
+    {
+        if (!_ast_root)
+        {
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::CodeGen,
+                                              "No AST available for code generation", SourceRange{}, _source_file);
+            return false;
+        }
+
+        if (!_codegen)
+        {
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::CodeGen,
+                                              "CodeGenerator not initialized", SourceRange{}, _source_file);
+            return false;
+        }
+
+        try
+        {
+            bool success = _codegen->generate_ir(_ast_root.get());
+
+            if (!success)
+            {
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::CodeGen,
+                                                  "Code generation failed: " + _codegen->get_last_error(),
+                                                  SourceRange{}, _source_file);
+            }
+
+            return success;
+        }
+        catch (const std::exception &e)
+        {
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::CodeGen,
+                                              std::string("Code generation exception: ") + e.what(),
+                                              SourceRange{}, _source_file);
+            return false;
+        }
+    }
+
+    bool CompilerInstance::generate_output(const std::string &output_path,
+                                           Cryo::Linker::CryoLinker::LinkTarget target)
+    {
+        // First generate IR if not already done
+        if (!_codegen->get_module())
+        {
+            if (!generate_ir())
+            {
+                return false;
+            }
+        }
+
+        if (!_linker)
+        {
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
+                                              "Linker not initialized", SourceRange{}, _source_file);
+            return false;
+        }
+
+        try
+        {
+            // Get generated module and link
+            llvm::Module *module = _codegen->get_module();
+            if (!module)
+            {
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::CodeGen,
+                                                  "No LLVM module generated", SourceRange{}, _source_file);
+                return false;
+            }
+
+            bool success = _linker->link_modules({module}, output_path, target);
+
+            if (!success)
+            {
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
+                                                  "Linking failed: " + _linker->get_last_error(),
+                                                  SourceRange{}, _source_file);
+            }
+
+            return success;
+        }
+        catch (const std::exception &e)
+        {
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
+                                              std::string("Linking exception: ") + e.what(),
+                                              SourceRange{}, _source_file);
+            return false;
+        }
+    }
+
     bool CompilerInstance::has_errors() const
     {
         return _diagnostic_manager && _diagnostic_manager->has_errors();
@@ -366,6 +473,24 @@ namespace Cryo
         else
         {
             os << "No type errors found." << std::endl;
+        }
+    }
+
+    void CompilerInstance::dump_ir(std::ostream &os) const
+    {
+        if (_codegen && _codegen->get_module())
+        {
+            llvm::Module *module = _codegen->get_module();
+
+            // Use LLVM's raw_ostream to print to string, then output to our stream
+            std::string ir_str;
+            llvm::raw_string_ostream string_stream(ir_str);
+            module->print(string_stream, nullptr);
+            os << string_stream.str();
+        }
+        else
+        {
+            os << "No LLVM IR available (module not generated)" << std::endl;
         }
     }
 
@@ -512,7 +637,7 @@ namespace Cryo
     {
         // Parse runtime.cryo file to load extern function declarations
         std::string runtime_cryo_path = "./runtime/runtime.cryo";
-        
+
         // Check if runtime.cryo exists in the current directory
         if (!std::filesystem::exists(runtime_cryo_path))
         {
@@ -531,12 +656,12 @@ namespace Cryo
             }
 
             std::string content((std::istreambuf_iterator<char>(file)),
-                               std::istreambuf_iterator<char>());
+                                std::istreambuf_iterator<char>());
             file.close();
 
             // Create a File object for the Lexer using the factory function
             auto file_obj = make_file_from_string("./runtime/runtime.cryo", content);
-            
+
             // Create lexer and parser
             auto lexer = std::make_unique<Lexer>(std::move(file_obj));
             Parser parser(std::move(lexer), *_ast_context);
@@ -549,14 +674,14 @@ namespace Cryo
             }
 
             // Process extern blocks in the runtime file
-            for (const auto& node : program->statements())
+            for (const auto &node : program->statements())
             {
-                if (auto extern_block = dynamic_cast<ExternBlockNode*>(node.get()))
+                if (auto extern_block = dynamic_cast<ExternBlockNode *>(node.get()))
                 {
                     // Process each function declaration in the extern block
-                    for (const auto& func_decl : extern_block->function_declarations())
+                    for (const auto &func_decl : extern_block->function_declarations())
                     {
-                        if (auto func = dynamic_cast<FunctionDeclarationNode*>(func_decl.get()))
+                        if (auto func = dynamic_cast<FunctionDeclarationNode *>(func_decl.get()))
                         {
                             // Build function signature
                             std::string signature = "(" + func->return_type_annotation() + ")";
@@ -565,7 +690,8 @@ namespace Cryo
                                 signature = "(";
                                 for (size_t i = 0; i < func->parameters().size(); ++i)
                                 {
-                                    if (i > 0) signature += ", ";
+                                    if (i > 0)
+                                        signature += ", ";
                                     signature += func->parameters()[i]->type_annotation();
                                 }
                                 signature += ") -> " + func->return_type_annotation();
@@ -585,7 +711,7 @@ namespace Cryo
 
             std::cout << "Standard library initialized from runtime.cryo" << std::endl;
         }
-        catch (const std::exception& e)
+        catch (const std::exception &e)
         {
             std::cerr << "Error parsing runtime.cryo: " << e.what() << std::endl;
         }

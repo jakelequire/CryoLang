@@ -33,7 +33,7 @@ namespace Cryo::CLI
         CLIArgument(const std::string &name, const std::string &desc, bool req = false)
             : name(name), description(desc), required(req) {}
 
-        CLIArgument &flag() 
+        CLIArgument &flag()
         {
             is_flag = true;
             return *this;
@@ -87,6 +87,7 @@ namespace Cryo::CLI
         // Enhanced accessors for compilation flags
         bool show_ast() const { return get_flag("ast") || get_flag("show-ast"); }
         bool show_symbols() const { return get_flag("symbols") || get_flag("show-symbols"); }
+        bool show_ir() const { return get_flag("ir") || get_flag("show-ir"); }
         bool compile_only() const { return get_flag("c") || get_flag("compile-only"); }
         std::string output_file() const { return get_arg("o", get_arg("output", "")); }
         std::string input_file() const { return positional().empty() ? "" : positional()[0]; }
