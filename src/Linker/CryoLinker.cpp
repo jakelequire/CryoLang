@@ -300,7 +300,7 @@ namespace Cryo::Linker
         auto cpu = "generic";
         auto features = "";
         llvm::TargetOptions opt;
-        auto rm = std::make_optional<llvm::Reloc::Model>();
+        auto rm = std::make_optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
         auto target_machine = std::unique_ptr<llvm::TargetMachine>(
             target->createTargetMachine(target_triple, cpu, features, opt, rm));
 
@@ -484,6 +484,10 @@ namespace Cryo::Linker
         // Build the linker command
         std::vector<std::string> full_command;
         full_command.push_back("clang"); // Use clang as the linker driver
+
+        // Add PIE-related flags to fix position-independent executable issues
+        full_command.push_back("-fPIE");
+        full_command.push_back("-pie");
 
         // Add all the linker arguments
         for (const auto &arg : args)
