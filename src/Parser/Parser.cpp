@@ -51,7 +51,7 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_KW_NAMESPACE))
         {
             std::string namespace_name = parse_namespace();
-            // TODO: Store namespace information in program node or context
+            _current_namespace = namespace_name; // Store the namespace in parser state
         }
 
         // Parse statements until EOF
@@ -351,23 +351,24 @@ namespace Cryo
 
         std::string namespace_name;
 
-        // Parse namespace identifier (can be dotted like Examples.BinOp)
+        // Parse namespace identifier (can be scoped like Std::Runtime)
         if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
             namespace_name = std::string(_current_token.text());
             advance();
 
-            while (_current_token.is(TokenKind::TK_PERIOD))
+            // Support :: separator for C++ style namespace scoping
+            while (_current_token.is(TokenKind::TK_COLONCOLON))
             {
-                advance(); // consume '.'
+                advance(); // consume '::'
                 if (_current_token.is(TokenKind::TK_IDENTIFIER))
                 {
-                    namespace_name += "." + std::string(_current_token.text());
+                    namespace_name += "::" + std::string(_current_token.text());
                     advance();
                 }
                 else
                 {
-                    error("Expected identifier after '.'");
+                    error("Expected identifier after '::'");
                     break;
                 }
             }
@@ -429,6 +430,12 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_KW_IMPLEMENT))
         {
             return parse_implementation_block();
+        }
+
+        // Extern block
+        if (_current_token.is(TokenKind::TK_KW_EXTERN))
+        {
+            return parse_extern_block();
         }
 
         // Function declarations
@@ -581,6 +588,50 @@ namespace Cryo
         auto body = parse_block_statement();
         func_decl->set_body(std::unique_ptr<BlockStatementNode>(
             dynamic_cast<BlockStatementNode *>(body.release())));
+
+        return func_decl;
+    }
+
+    std::unique_ptr<FunctionDeclarationNode> Parser::parse_extern_function_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        consume(TokenKind::TK_KW_FUNCTION, "Expected 'function'");
+
+        // Parse function name
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
+        std::string func_name = std::string(name_token.text());
+
+        // Parse parameter list
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
+
+        std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+        if (!_current_token.is(TokenKind::TK_R_PAREN))
+        {
+            params = parse_parameter_list();
+        }
+
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
+
+        // Parse return type
+        Type *return_type = _context.types().get_void_type();
+        if (_current_token.is(TokenKind::TK_ARROW))
+        {
+            advance(); // consume '->'
+            return_type = parse_type_annotation();
+        }
+
+        // Create function declaration with type information (extern functions are public by default)
+        auto func_decl = _builder.create_function_declaration(start_loc, func_name, return_type->to_string(), true);
+
+        // Add parameters to function
+        for (auto &param : params)
+        {
+            func_decl->add_parameter(std::move(param));
+        }
+
+        // Extern functions don't have bodies, they end with semicolon
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after extern function declaration");
 
         return func_decl;
     }
@@ -868,8 +919,8 @@ namespace Cryo
         {
             std::unique_ptr<ExpressionNode> expr = parse_identifier();
 
-            // Check for scope resolution (Type::Member)
-            if (_current_token.is(TokenKind::TK_COLONCOLON))
+            // Handle multi-level scope resolution (e.g., Std::Runtime::function)
+            while (_current_token.is(TokenKind::TK_COLONCOLON))
             {
                 advance(); // consume '::'
 
@@ -879,16 +930,32 @@ namespace Cryo
                     return nullptr;
                 }
 
-                // Get identifier name - need to cast to IdentifierNode to access name()
-                auto identifier_node = static_cast<IdentifierNode *>(expr.get());
-                std::string scope_name = identifier_node->name();
                 std::string member_name = std::string(_current_token.text());
-                SourceLocation loc = identifier_node->location();
+                SourceLocation loc;
+
+                // If expr is already a ScopeResolutionNode, build on it
+                if (auto scope_node = dynamic_cast<ScopeResolutionNode*>(expr.get()))
+                {
+                    // For multi-level resolution like Std::Runtime::function
+                    // Combine the existing scope with the new member
+                    std::string full_scope = scope_node->scope_name() + "::" + scope_node->member_name();
+                    loc = scope_node->location();
+                    expr = _builder.create_scope_resolution(loc, full_scope, member_name);
+                }
+                else if (auto identifier_node = dynamic_cast<IdentifierNode*>(expr.get()))
+                {
+                    // First level scope resolution like Std::Runtime
+                    std::string scope_name = identifier_node->name();
+                    loc = identifier_node->location();
+                    expr = _builder.create_scope_resolution(loc, scope_name, member_name);
+                }
+                else
+                {
+                    error("Invalid scope resolution expression");
+                    return nullptr;
+                }
 
                 advance(); // consume member identifier
-
-                // Create scope resolution node and replace the expression
-                expr = _builder.create_scope_resolution(loc, scope_name, member_name);
             }
 
             // Handle postfix expressions (function calls, array access, etc.)
@@ -1494,7 +1561,7 @@ namespace Cryo
                     next.is(TokenKind::TK_L_PAREN))
                 {
                     // It's a method
-                    auto method = parse_struct_method();
+                    auto method = parse_struct_method(struct_name);
                     struct_decl->add_method(std::move(method));
                 }
                 else
@@ -1572,7 +1639,7 @@ namespace Cryo
                 if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
                 {
                     // It's a method
-                    auto method = parse_struct_method("", current_visibility);
+                    auto method = parse_struct_method(class_name, current_visibility);
                     // Note: We reuse StructMethodNode for class methods
                     class_decl->add_method(std::move(method));
                 }
@@ -1756,7 +1823,7 @@ namespace Cryo
                          (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
                 {
                     // Method implementation
-                    auto method = parse_struct_method();
+                    auto method = parse_struct_method(target_type);
                     impl_block->add_method_implementation(std::move(method));
                 }
                 else
@@ -1775,6 +1842,55 @@ namespace Cryo
         consume(TokenKind::TK_R_BRACE, "Expected '}' after implementation block");
 
         return impl_block;
+    }
+
+    std::unique_ptr<ExternBlockNode> Parser::parse_extern_block()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        consume(TokenKind::TK_KW_EXTERN, "Expected 'extern'");
+
+        // Parse linkage specifier (e.g., "C")
+        Token linkage_token = consume(TokenKind::TK_STRING_LITERAL, "Expected linkage specifier (e.g., \"C\")");
+        std::string linkage_type = std::string(linkage_token.text());
+        
+        // Remove quotes from linkage type
+        if (linkage_type.length() >= 2 && linkage_type.front() == '"' && linkage_type.back() == '"')
+        {
+            linkage_type = linkage_type.substr(1, linkage_type.length() - 2);
+        }
+
+        auto extern_block = _builder.create_extern_block(start_loc, linkage_type);
+
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after extern linkage");
+
+        // Parse function declarations within the extern block
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            try
+            {
+                // Parse function declaration (should be function signatures only)
+                if (_current_token.is(TokenKind::TK_KW_FUNCTION))
+                {
+                    auto func_decl = parse_extern_function_declaration();
+                    extern_block->add_function_declaration(std::move(func_decl));
+                }
+                else
+                {
+                    error("Expected function declaration in extern block");
+                    synchronize();
+                }
+            }
+            catch (const ParseError &e)
+            {
+                _errors.push_back(e);
+                synchronize();
+            }
+        }
+
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after extern block");
+
+        return extern_block;
     }
 
     // Struct/Class helper parsing methods
@@ -1901,6 +2017,12 @@ namespace Cryo
         {
             error("Expected method name");
             return nullptr;
+        }
+
+        // Check for C++-style constructor (method name matches class/struct name)
+        if (!is_constructor && !struct_name.empty() && method_name == struct_name)
+        {
+            is_constructor = true;
         }
 
         consume(TokenKind::TK_L_PAREN, "Expected '(' after method name");

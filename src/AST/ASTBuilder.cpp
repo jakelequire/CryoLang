@@ -216,6 +216,11 @@ namespace Cryo
         return std::make_unique<ImplementationBlockNode>(loc, std::move(target_type));
     }
 
+    std::unique_ptr<ExternBlockNode> ASTBuilder::create_extern_block(SourceLocation loc, std::string linkage_type)
+    {
+        return std::make_unique<ExternBlockNode>(loc, std::move(linkage_type));
+    }
+
     // Helper methods
     bool ASTBuilder::is_literal_token(TokenKind kind) const
     {

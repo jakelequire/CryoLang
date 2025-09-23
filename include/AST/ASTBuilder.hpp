@@ -61,6 +61,7 @@ namespace Cryo
         std::unique_ptr<EnumVariantNode> create_enum_variant(SourceLocation loc, std::string name, std::vector<std::string> associated_types);
         std::unique_ptr<TypeAliasDeclarationNode> create_type_alias_declaration(SourceLocation loc, std::string alias_name, std::string target_type);
         std::unique_ptr<ImplementationBlockNode> create_implementation_block(SourceLocation loc, std::string target_type);
+        std::unique_ptr<ExternBlockNode> create_extern_block(SourceLocation loc, std::string linkage_type);
 
         // Helper methods
     private:

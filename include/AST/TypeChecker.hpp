@@ -148,6 +148,9 @@ namespace Cryo
         // Struct method tracking - maps struct name -> method name -> return type
         std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _struct_methods;
 
+        // Reference to main symbol table (for scope resolution lookups)
+        const SymbolTable *_main_symbol_table = nullptr;
+
     public:
         TypeChecker(TypeContext &type_ctx);
         ~TypeChecker() = default;
@@ -178,6 +181,7 @@ namespace Cryo
         void visit(EnumVariantNode &node) override;
         void visit(TypeAliasDeclarationNode &node) override;
         void visit(ImplementationBlockNode &node) override;
+        void visit(ExternBlockNode &node) override;
         void visit(GenericParameterNode &node) override;
         void visit(StructFieldNode &node) override;
         void visit(StructMethodNode &node) override;

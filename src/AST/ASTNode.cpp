@@ -218,4 +218,10 @@ namespace Cryo
     {
         visitor.visit(*this);
     }
+
+    // ExternBlockNode visitor implementation
+    void ExternBlockNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
 }

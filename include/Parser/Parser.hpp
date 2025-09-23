@@ -37,6 +37,7 @@ namespace Cryo
 
         // Context tracking
         bool _in_implementation_block = false;
+        std::string _current_namespace = "Global"; // Current namespace context
 
     public:
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
@@ -48,6 +49,9 @@ namespace Cryo
         // Error handling
         const std::vector<ParseError> &errors() const { return _errors; }
         bool has_errors() const { return !_errors.empty(); }
+
+        // Namespace access
+        const std::string &current_namespace() const { return _current_namespace; }
 
     private:
         // Diagnostic reporting
@@ -77,11 +81,13 @@ namespace Cryo
         std::unique_ptr<ASTNode> parse_statement();
         std::unique_ptr<VariableDeclarationNode> parse_variable_declaration();
         std::unique_ptr<FunctionDeclarationNode> parse_function_declaration();
+        std::unique_ptr<FunctionDeclarationNode> parse_extern_function_declaration();
         std::unique_ptr<StructDeclarationNode> parse_struct_declaration();
         std::unique_ptr<ClassDeclarationNode> parse_class_declaration();
         std::unique_ptr<EnumDeclarationNode> parse_enum_declaration();
         std::unique_ptr<TypeAliasDeclarationNode> parse_type_alias_declaration();
         std::unique_ptr<ImplementationBlockNode> parse_implementation_block();
+        std::unique_ptr<ExternBlockNode> parse_extern_block();
         std::unique_ptr<ReturnStatementNode> parse_return_statement();
         std::unique_ptr<BlockStatementNode> parse_block_statement();
         std::unique_ptr<ASTNode> parse_if_statement();

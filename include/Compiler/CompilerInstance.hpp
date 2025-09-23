@@ -38,6 +38,7 @@ namespace Cryo
         std::string _source_file;
         std::vector<std::string> _include_paths;
         bool _debug_mode;
+        std::string _current_namespace; // Current namespace context
 
         // Results
         std::unique_ptr<ProgramNode> _ast_root;
@@ -67,6 +68,10 @@ namespace Cryo
         SymbolTable *symbol_table() const { return _symbol_table.get(); }
         DiagnosticManager *diagnostic_manager() const { return _diagnostic_manager.get(); }
         TypeChecker *type_checker() const { return _type_checker.get(); }
+
+        // Namespace context
+        void set_namespace_context(const std::string &namespace_name);
+        const std::string &get_namespace_context() const { return _current_namespace; }
 
         // Results access
         ProgramNode *ast_root() const { return _ast_root.get(); }

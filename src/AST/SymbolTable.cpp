@@ -18,13 +18,13 @@ namespace Cryo
         return true;
     }
 
-    Symbol *SymbolTable::lookup_symbol(const std::string &name)
+    Symbol *SymbolTable::lookup_symbol(const std::string &name) const
     {
         // Check current scope first
         auto it = symbols_.find(name);
         if (it != symbols_.end())
         {
-            return &it->second;
+            return const_cast<Symbol *>(&it->second);
         }
 
         // Check parent scopes
@@ -173,22 +173,29 @@ namespace Cryo
         }
     }
 
-    // Built-in function registration and parsing methods
     bool SymbolTable::declare_builtin_function(const std::string &name, const std::string &signature, TypeContext &type_context)
+    {
+        return declare_builtin_function(name, signature, type_context, "global");
+    }
+
+    bool SymbolTable::declare_builtin_function(const std::string &name, const std::string &signature, TypeContext &type_context, const std::string &namespace_scope)
     {
         // Parse the function signature to create proper Type
         Type *function_type = parse_function_signature(signature, type_context);
         if (!function_type)
         {
+            std::cout << "    ERROR: Failed to parse function signature for " << name << std::endl;
             return false;
         }
-
         // Create a dummy source location for built-ins
         SourceLocation loc(0, 0);
 
-        // Register the built-in function
-        bool result = declare_symbol(name, SymbolKind::Function, loc, function_type, "global");
-
+        // Register the built-in function with the specified namespace scope
+        bool result = declare_symbol(name, SymbolKind::Function, loc, function_type, namespace_scope);
+        if (!result)
+        {
+            std::cout << "    WARNING: Built-in function already declared: " << name << std::endl;
+        }
         return result;
     }
 
@@ -262,11 +269,11 @@ namespace Cryo
     {
         std::string clean_type = trim(type_str);
 
-        if (clean_type == "int")
+        if (clean_type == "int" || clean_type == "i32")
         {
             return type_context.get_int_type();
         }
-        else if (clean_type == "float")
+        else if (clean_type == "float" || clean_type == "f32")
         {
             return type_context.get_default_float_type();
         }

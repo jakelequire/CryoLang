@@ -35,6 +35,7 @@ namespace Cryo
     class ClassDeclarationNode;
     class TypeAliasDeclarationNode;
     class ImplementationBlockNode;
+    class ExternBlockNode;
     class StructFieldNode;
     class StructMethodNode;
 
@@ -80,6 +81,7 @@ namespace Cryo
         virtual void visit(EnumVariantNode &node) = 0;
         virtual void visit(TypeAliasDeclarationNode &node) = 0;
         virtual void visit(ImplementationBlockNode &node) = 0;
+        virtual void visit(ExternBlockNode &node) = 0;
         virtual void visit(GenericParameterNode &node) = 0;
         virtual void visit(StructFieldNode &node) = 0;
         virtual void visit(StructMethodNode &node) = 0;
@@ -125,6 +127,7 @@ namespace Cryo
         void visit(EnumVariantNode &node) override {}
         void visit(TypeAliasDeclarationNode &node) override {}
         void visit(ImplementationBlockNode &node) override {}
+        void visit(ExternBlockNode &node) override {}
         void visit(GenericParameterNode &node) override {}
         void visit(StructFieldNode &node) override {}
         void visit(StructMethodNode &node) override {}
