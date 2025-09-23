@@ -539,8 +539,8 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::CallExpressionNode &node)
     {
-        // TODO: Implement function calls
-        register_value(&node, nullptr);
+        llvm::Value *call_result = generate_function_call(&node);
+        register_value(&node, call_result);
     }
 
     void CodegenVisitor::visit(Cryo::NewExpressionNode &node)
@@ -1072,7 +1072,133 @@ namespace Cryo::Codegen
         }
     }
     llvm::Value *CodegenVisitor::generate_unary_operation(Cryo::UnaryExpressionNode *node) { return nullptr; }
-    llvm::Value *CodegenVisitor::generate_function_call(Cryo::CallExpressionNode *node) { return nullptr; }
+    llvm::Value *CodegenVisitor::generate_function_call(Cryo::CallExpressionNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        auto &builder = _context_manager.get_builder();
+        auto *module = _context_manager.get_module();
+
+        // Get the function name from the callee
+        std::string function_name;
+        if (auto *identifier = dynamic_cast<IdentifierNode *>(node->callee()))
+        {
+            // Handle simple function name
+            function_name = identifier->name();
+        }
+        else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
+        {
+            // Handle namespaced calls like Std::Runtime::print_int
+            // For now, extract the final function name and map to C runtime
+            function_name = extract_function_name_from_member_access(member_access);
+        }
+        else if (auto *scope_resolution = dynamic_cast<ScopeResolutionNode *>(node->callee()))
+        {
+            // Handle scope resolution like Std::Runtime::print_int
+            function_name = scope_resolution->scope_name() + "::" + scope_resolution->member_name();
+        }
+        else
+        {
+            std::cerr << "Unsupported function call type" << std::endl;
+            return nullptr;
+        }
+
+        // Map Cryo function names to C runtime function names
+        std::string c_function_name = map_cryo_to_c_function(function_name);
+
+        // Look up the function in the module
+        llvm::Function *function = module->getFunction(c_function_name);
+        if (!function)
+        {
+            // Function not declared yet, create a declaration
+            function = create_runtime_function_declaration(c_function_name, node);
+            if (!function)
+            {
+                std::cerr << "Failed to create function declaration for: " << c_function_name << std::endl;
+                return nullptr;
+            }
+        }
+
+        // Generate arguments
+        std::vector<llvm::Value *> args;
+        for (const auto &arg : node->arguments())
+        {
+            arg->accept(*this);
+            llvm::Value *arg_value = get_generated_value(arg.get());
+            if (arg_value)
+            {
+                args.push_back(arg_value);
+            }
+        }
+
+        // Create the function call
+        return builder.CreateCall(function, args);
+    }
+
+    std::string CodegenVisitor::extract_function_name_from_member_access(MemberAccessNode *node)
+    {
+        if (!node)
+            return "";
+
+        // For Std::Runtime::print_int, we want "print_int"
+        // This is a simplified extraction - just get the final member name
+        return node->member();
+    }
+
+    std::string CodegenVisitor::map_cryo_to_c_function(const std::string &cryo_name)
+    {
+        // Map Cryo runtime function names to C function names
+        static std::unordered_map<std::string, std::string> name_map = {
+            {"print_int", "cryo_print_int"},
+            {"Std::Runtime::print_int", "cryo_print_int"},
+            {"print_float", "cryo_print_float"},
+            {"Std::Runtime::print_float", "cryo_print_float"},
+            {"print_bool", "cryo_print_bool"},
+            {"Std::Runtime::print_bool", "cryo_print_bool"},
+            {"print_char", "cryo_print_char"},
+            {"Std::Runtime::print_char", "cryo_print_char"},
+            {"print", "cryo_print"},
+            {"Std::Runtime::print", "cryo_print"},
+            {"println", "cryo_println"},
+            {"Std::Runtime::println", "cryo_println"}};
+
+        auto it = name_map.find(cryo_name);
+        if (it != name_map.end())
+        {
+            return it->second;
+        }
+
+        // For non-runtime functions, use the original name
+        return cryo_name;
+    }
+
+    llvm::Function *CodegenVisitor::create_runtime_function_declaration(const std::string &c_name, CallExpressionNode *call_node)
+    {
+        auto *module = _context_manager.get_module();
+        auto &context = _context_manager.get_context();
+
+        // Create function signatures based on the C runtime functions
+        if (c_name == "cryo_print_int")
+        {
+            // void cryo_print_int(int value)
+            llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+            llvm::Type *void_type = llvm::Type::getVoidTy(context);
+            llvm::FunctionType *func_type = llvm::FunctionType::get(void_type, {int_type}, false);
+            return llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, c_name, module);
+        }
+        else if (c_name == "cryo_print_float")
+        {
+            // void cryo_print_float(double value)
+            llvm::Type *double_type = llvm::Type::getDoubleTy(context);
+            llvm::Type *void_type = llvm::Type::getVoidTy(context);
+            llvm::FunctionType *func_type = llvm::FunctionType::get(void_type, {double_type}, false);
+            return llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, c_name, module);
+        }
+        // Add more runtime function declarations as needed
+
+        return nullptr;
+    }
     llvm::Value *CodegenVisitor::generate_array_access(Cryo::ArrayAccessNode *node) { return nullptr; }
     llvm::Value *CodegenVisitor::generate_member_access(Cryo::MemberAccessNode *node) { return nullptr; }
     void CodegenVisitor::generate_if_statement(Cryo::IfStatementNode *node) {}

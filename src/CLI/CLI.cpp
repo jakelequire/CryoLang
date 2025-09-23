@@ -1,6 +1,7 @@
 #include "CLI/CLI.hpp"
 #include "CLI/Commands.hpp"
 #include "Compiler/CompilerInstance.hpp"
+#include "Linker/CryoLinker.hpp"
 #include <iostream>
 #include <algorithm>
 #include <sstream>
@@ -354,6 +355,25 @@ namespace Cryo::CLI
             {
                 std::cout << "\nGenerated LLVM IR:" << std::endl;
                 compiler->dump_ir();
+            }
+
+            // Generate executable if output file is specified and not compile-only mode
+            if (!args.output_file().empty() && !args.compile_only())
+            {
+                std::cout << "\nGenerating executable: " << args.output_file() << std::endl;
+
+                auto target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
+
+                if (compiler->generate_output(args.output_file(), target))
+                {
+                    std::cout << "✓ Executable generated successfully: " << args.output_file() << std::endl;
+                }
+                else
+                {
+                    std::cerr << "\n❌ Executable generation failed!" << std::endl;
+                    compiler->print_diagnostics();
+                    return 1;
+                }
             }
 
             // If no specific flags requested, show minimal output for clang-like behavior
