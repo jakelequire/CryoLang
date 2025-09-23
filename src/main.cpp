@@ -5,7 +5,6 @@
 
 int main(int argc, char *argv[])
 {
-    // Create and run the CLI system
-    auto cli = Cryo::CLI::create_default_cli();
+    auto cli = Cryo::CLI::create_cli();
     return cli->run(argc, argv);
 }

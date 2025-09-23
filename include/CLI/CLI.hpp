@@ -208,6 +208,6 @@ namespace Cryo::CLI
     /**
      * @brief Creates and returns a configured CLI runner with default commands
      */
-    std::unique_ptr<CLIRunner> create_default_cli();
+    std::unique_ptr<CLIRunner> create_cli();
 
 } // namespace Cryo::CLI
