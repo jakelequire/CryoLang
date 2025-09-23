@@ -525,14 +525,23 @@ namespace Cryo
 
     void TypeChecker::load_builtin_symbols(const SymbolTable &main_symbol_table)
     {
+        // Store reference to main symbol table for scope lookups
+        _main_symbol_table = &main_symbol_table;
+
+        std::cout << "Loading builtin symbols into TypeChecker..." << std::endl;
+        std::cout << "Main symbol table has " << main_symbol_table.get_symbols().size() << " symbols" << std::endl;
+        
         // Copy all built-in function symbols from main symbol table
+        int copied_count = 0;
         for (const auto &[name, symbol] : main_symbol_table.get_symbols())
         {
             if (symbol.kind == SymbolKind::Function && symbol.data_type != nullptr)
             {
                 _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
+                copied_count++;
             }
         }
+        std::cout << "Copied " << copied_count << " builtin functions to TypeChecker symbol table" << std::endl;
     }
 
     void TypeChecker::check_program(ProgramNode &program)
@@ -1415,11 +1424,25 @@ namespace Cryo
         const std::string &scope_name = node.scope_name();
         const std::string &member_name = node.member_name();
 
+        // First, try to look up the member name in main symbol table and check if it has the correct scope
+        if (_main_symbol_table)
+        {
+            Symbol *symbol = _main_symbol_table->lookup_symbol(member_name);
+            if (symbol && symbol->scope == scope_name)
+            {
+                // This is a namespace function call like Std::Runtime::cryo_print_int
+                node.set_type(symbol->data_type->to_string());
+                return;
+            }
+        }
+
+        // If not found, try the old enum-based approach
         // Look up the scope type (should be an enum type)
         TypedSymbol *scope_symbol = _symbol_table->lookup_symbol(scope_name);
         if (!scope_symbol)
         {
-            report_undefined_symbol(node.location(), scope_name);
+            std::string qualified_name = scope_name + "::" + member_name;
+            report_undefined_symbol(node.location(), qualified_name);
             node.set_type(_type_context.get_unknown_type()->to_string());
             return;
         }
@@ -1436,7 +1459,7 @@ namespace Cryo
         if (scope_type->kind() != TypeKind::Enum)
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Scope resolution '::' can only be used with enum types, got: " + scope_name);
+                         "Scope resolution '::' can only be used with enum types or namespace functions, got: " + scope_name);
             node.set_type(_type_context.get_unknown_type()->to_string());
             return;
         }
@@ -1765,6 +1788,18 @@ namespace Cryo
         _current_struct_name = previous_struct_name;
     }
 
+    void TypeChecker::visit(ExternBlockNode &node)
+    {
+        // Process all function declarations in the extern block
+        for (const auto &function : node.function_declarations())
+        {
+            if (function)
+            {
+                function->accept(*this);
+            }
+        }
+    }
+
     void TypeChecker::visit(GenericParameterNode &node)
     {
         std::string param_name = node.name();
@@ -1824,21 +1859,101 @@ namespace Cryo
     {
         std::string method_name = node.name();
 
-        // Check for redefinition within the same struct/class
-        if (_symbol_table->lookup_symbol(method_name))
+        // Check if this is a constructor (method name matches the current struct/class name)
+        bool is_constructor = !_current_struct_name.empty() && method_name == _current_struct_name;
+
+        // Check for redefinition within the same struct/class (but allow constructors)
+        if (!is_constructor && _symbol_table->lookup_symbol(method_name))
         {
             report_redefined_symbol(node.location(), method_name);
             return;
         }
 
-        // Delegate to FunctionDeclarationNode visitor for most processing
-        visit(static_cast<FunctionDeclarationNode &>(node));
+        // Special handling for constructors to avoid name conflicts with struct/class type
+        if (is_constructor)
+        {
+            // Process constructor parameters and body manually to avoid registering
+            // the constructor function with the same name as the struct/class type
+            
+            const std::string &func_name = node.name();
+
+            // Parse return type from node annotation (constructors have void return typically)
+            const std::string &return_type_str = node.return_type_annotation().empty() 
+                ? "void" : node.return_type_annotation();
+            Type *return_type = _type_context.parse_type_from_string(return_type_str);
+
+            if (!return_type)
+            {
+                report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                             "Unable to parse return type: " + return_type_str);
+                return_type = _type_context.get_unknown_type();
+            }
+
+            // Collect parameter types
+            std::vector<Type *> param_types;
+            for (const auto &param : node.parameters())
+            {
+                if (param)
+                {
+                    const std::string &param_type_str = param->type_annotation();
+                    Type *param_type = _type_context.parse_type_from_string(param_type_str);
+                    if (!param_type)
+                    {
+                        report_error(TypeError::ErrorKind::InvalidOperation, param->location(),
+                                     "Unable to parse parameter type: " + param_type_str);
+                        param_type = _type_context.get_unknown_type();
+                    }
+                    param_types.push_back(param_type);
+                }
+            }
+
+            // Create function type
+            FunctionType *func_type = static_cast<FunctionType *>(
+                _type_context.create_function_type(return_type, param_types));
+
+            // DO NOT declare constructor function in symbol table to avoid name conflict
+            // The struct/class type is already declared with this name
+
+            // Enter function scope for parameter and body checking
+            enter_scope();
+            _in_function = true;
+            _current_function_return_type = return_type;
+
+            // Declare parameters in function scope
+            for (const auto &param : node.parameters())
+            {
+                if (param)
+                {
+                    param->accept(*this);
+                }
+            }
+
+            // Check function body
+            if (node.body())
+            {
+                node.body()->accept(*this);
+            }
+
+            // Exit function scope
+            _current_function_return_type = nullptr;
+            _in_function = false;
+            exit_scope();
+        }
+        else
+        {
+            // Delegate to FunctionDeclarationNode visitor for regular methods
+            visit(static_cast<FunctionDeclarationNode &>(node));
+        }
 
         // Store method information for member access resolution
         if (!_current_struct_name.empty())
         {
             // Get the return type from the node
             std::string return_type_str = node.return_type_annotation();
+            if (return_type_str.empty() && is_constructor)
+            {
+                return_type_str = "void";  // Constructors typically return void
+            }
             Type *return_type = _type_context.parse_type_from_string(return_type_str);
 
             if (return_type)

@@ -57,6 +57,7 @@ namespace Cryo
         EnumDeclaration,
         TypeAliasDeclaration,
         ImplementationBlock,
+        ExternBlock,
 
         // Top-level
         Program,
@@ -958,6 +959,43 @@ namespace Cryo
                 {
                     if (method)
                         method->print(os, indent + 4);
+                }
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // External linkage block (extern "C" { ... })
+    class ExternBlockNode : public DeclarationNode
+    {
+    private:
+        std::string _linkage_type;  // "C" or other linkage types
+        std::vector<std::unique_ptr<FunctionDeclarationNode>> _function_declarations;
+
+    public:
+        ExternBlockNode(SourceLocation loc, std::string linkage_type)
+            : DeclarationNode(NodeKind::ExternBlock, loc), _linkage_type(std::move(linkage_type)) {}
+
+        const std::string &linkage_type() const { return _linkage_type; }
+        const std::vector<std::unique_ptr<FunctionDeclarationNode>> &function_declarations() const { return _function_declarations; }
+
+        void add_function_declaration(std::unique_ptr<FunctionDeclarationNode> func_decl)
+        {
+            _function_declarations.push_back(std::move(func_decl));
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "ExternBlock linkage=\"" << _linkage_type << "\"" << std::endl;
+
+            if (!_function_declarations.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Function Declarations:" << std::endl;
+                for (const auto &func : _function_declarations)
+                {
+                    if (func)
+                        func->print(os, indent + 4);
                 }
             }
         }

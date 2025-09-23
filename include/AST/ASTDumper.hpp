@@ -22,6 +22,8 @@ namespace Cryo
         const std::string TYPE = "\033[1;31m";        // Bold Red
         const std::string LOCATION = "\033[90m";      // Dark Gray
         const std::string VALUE = "\033[1;37m";       // Bold White
+        const std::string COMMENT = "\033[90m";       // Dark Gray
+        const std::string ANNOTATION = "\033[95m";   // Light Magenta
 
         // Tree drawing colors
         const std::string TREE = "\033[37m"; // Light Gray
@@ -43,6 +45,7 @@ namespace Cryo
         std::vector<bool> _is_last_stack;
         bool _use_colors;
         int _current_level;
+        bool _in_class_context; // Track if we're currently inside a ClassDeclarationNode
 
         // Helper methods
         void print_prefix();
@@ -95,6 +98,7 @@ namespace Cryo
         void visit(TypeAliasDeclarationNode &node) override;
         void visit(ScopeResolutionNode &node) override;
         void visit(ImplementationBlockNode &node) override;
+        void visit(ExternBlockNode &node) override;
         void visit(GenericParameterNode &node) override;
         void visit(StructFieldNode &node) override;
         void visit(StructMethodNode &node) override;

@@ -45,13 +45,14 @@ namespace Cryo
 
         // Symbol management
         bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type = nullptr, const std::string &scope = "Global");
-        Symbol *lookup_symbol(const std::string &name);
+        Symbol *lookup_symbol(const std::string &name) const;
 
         // Access symbols for copying to other symbol tables
         const std::unordered_map<std::string, Symbol> &get_symbols() const { return symbols_; }
 
         // Built-in function registration
         bool declare_builtin_function(const std::string &name, const std::string &signature, TypeContext &type_context);
+        bool declare_builtin_function(const std::string &name, const std::string &signature, TypeContext &type_context, const std::string &namespace_scope);
         bool declare_builtin_type(const std::string &name, const std::string &description = "");
 
         // Type context management

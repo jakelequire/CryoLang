@@ -2,6 +2,7 @@
 #include "Utils/file.hpp"
 #include <iostream>
 #include <fstream>
+#include <filesystem>
 
 namespace Cryo
 {
@@ -43,6 +44,11 @@ namespace Cryo
     void CompilerInstance::add_include_path(const std::string &path)
     {
         _include_paths.push_back(path);
+    }
+
+    void CompilerInstance::set_namespace_context(const std::string &namespace_name)
+    {
+        _current_namespace = namespace_name;
     }
 
     bool CompilerInstance::compile_file(const std::string &source_file)
@@ -192,6 +198,17 @@ namespace Cryo
         try
         {
             _ast_root = _parser->parse_program();
+            
+            // Capture namespace context from parser after successful parsing
+            if (_ast_root && !_parser->current_namespace().empty() && _parser->current_namespace() != "Global")
+            {
+                set_namespace_context(_parser->current_namespace());
+                if (_debug_mode)
+                {
+                    std::cout << "Parsed namespace: " << _parser->current_namespace() << std::endl;
+                }
+            }
+            
             return _ast_root != nullptr;
         }
         catch (const std::exception &e)
@@ -493,43 +510,84 @@ namespace Cryo
 
     void CompilerInstance::initialize_standard_library()
     {
-        // Use header parser to automatically load runtime functions
-        RuntimeHeaderParser parser;
-        std::string runtime_header_path = "/workspaces/CryoLang/runtime/include/cryo_runtime.h";
-
-        if (parser.parse_runtime_headers(runtime_header_path))
+        // Parse runtime.cryo file to load extern function declarations
+        std::string runtime_cryo_path = "./runtime/runtime.cryo";
+        
+        // Check if runtime.cryo exists in the current directory
+        if (!std::filesystem::exists(runtime_cryo_path))
         {
-            // Register all parsed functions
-            for (const auto &func : parser.get_functions())
-            {
-                if (_debug_mode)
-                {
-                    std::cout << "Registering built-in function: " << func.cryo_name
-                              << " " << func.signature << " -> " << func.name << std::endl;
-                }
-                _symbol_table->declare_builtin_function(func.cryo_name, func.signature, _ast_context->types());
-            }
-
-            // Register all parsed types
-            for (const auto &type : parser.get_types())
-            {
-                if (_debug_mode)
-                {
-                    std::cout << "Registering built-in type: " << type.name << std::endl;
-                }
-                _symbol_table->declare_builtin_type(type.name, type.description);
-            }
-
-            if (_debug_mode)
-            {
-                std::cout << "Standard library initialized with " << parser.get_functions().size()
-                          << " built-in functions and " << parser.get_types().size()
-                          << " built-in types" << std::endl;
-            }
+            std::cerr << "runtime.cryo not found, falling back to empty standard library" << std::endl;
+            return;
         }
-        else
+
+        try
         {
-            std::cerr << "Failed to parse runtime headers - falling back to empty standard library" << std::endl;
+            // Read the runtime.cryo file
+            std::ifstream file(runtime_cryo_path);
+            if (!file.is_open())
+            {
+                std::cerr << "Could not open runtime file: " << runtime_cryo_path << std::endl;
+                return;
+            }
+
+            std::string content((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+            file.close();
+
+            // Create a File object for the Lexer using the factory function
+            auto file_obj = make_file_from_string("./runtime/runtime.cryo", content);
+            
+            // Create lexer and parser
+            auto lexer = std::make_unique<Lexer>(std::move(file_obj));
+            Parser parser(std::move(lexer), *_ast_context);
+
+            auto program = parser.parse_program();
+            if (!program)
+            {
+                std::cerr << "Failed to parse runtime file: " << runtime_cryo_path << std::endl;
+                return;
+            }
+
+            // Process extern blocks in the runtime file
+            for (const auto& node : program->statements())
+            {
+                if (auto extern_block = dynamic_cast<ExternBlockNode*>(node.get()))
+                {
+                    // Process each function declaration in the extern block
+                    for (const auto& func_decl : extern_block->function_declarations())
+                    {
+                        if (auto func = dynamic_cast<FunctionDeclarationNode*>(func_decl.get()))
+                        {
+                            // Build function signature
+                            std::string signature = "(" + func->return_type_annotation() + ")";
+                            if (!func->parameters().empty())
+                            {
+                                signature = "(";
+                                for (size_t i = 0; i < func->parameters().size(); ++i)
+                                {
+                                    if (i > 0) signature += ", ";
+                                    signature += func->parameters()[i]->type_annotation();
+                                }
+                                signature += ") -> " + func->return_type_annotation();
+                            }
+                            else
+                            {
+                                signature = "() -> " + func->return_type_annotation();
+                            }
+
+                            // Register the function in the symbol table with runtime namespace scope
+                            std::string runtime_namespace = "Std::Runtime"; // Use the same namespace as in runtime.cryo
+                            _symbol_table->declare_builtin_function(func->name(), signature, _ast_context->types(), runtime_namespace);
+                        }
+                    }
+                }
+            }
+
+            std::cout << "Standard library initialized from runtime.cryo" << std::endl;
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "Error parsing runtime.cryo: " << e.what() << std::endl;
         }
     }
 

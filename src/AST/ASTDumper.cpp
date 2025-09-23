@@ -4,7 +4,7 @@
 namespace Cryo
 {
     ASTDumper::ASTDumper(std::ostream &output, bool use_colors)
-        : _output(output), _use_colors(use_colors), _current_level(0)
+        : _output(output), _use_colors(use_colors), _current_level(0), _in_class_context(false)
     {
     }
 
@@ -18,6 +18,7 @@ namespace Cryo
 
         _is_last_stack.clear();
         _current_level = 0;
+        _in_class_context = false;
 
         // Start the dump - cast away const for visitor pattern
         const_cast<ASTNode *>(node)->accept(*this);
@@ -71,6 +72,7 @@ namespace Cryo
         case NodeKind::ClassDeclaration:
         case NodeKind::TypeAliasDeclaration:
         case NodeKind::ImplementationBlock:
+        case NodeKind::ExternBlock:
             return Colors::DECLARATION;
 
         case NodeKind::BlockStatement:
@@ -831,6 +833,51 @@ namespace Cryo
         if (_use_colors)
             _output << Colors::RESET;
 
+        // Add annotations for class methods only
+        if (_in_class_context)
+        {
+            if (node.is_constructor())
+            {
+                _output << " ";
+                if (_use_colors)
+                    _output << Colors::BOLD << Colors::ANNOTATION;
+                _output << "@constructor";
+                if (_use_colors)
+                    _output << Colors::RESET;
+            }
+            else
+            {
+                // Add visibility annotation for non-constructor methods
+                switch (node.visibility())
+                {
+                case Visibility::Public:
+                    _output << " ";
+                    if (_use_colors)
+                        _output << Colors::BOLD << Colors::ANNOTATION;
+                    _output << "@public";
+                    if (_use_colors)
+                        _output << Colors::RESET;
+                    break;
+                case Visibility::Private:
+                    _output << " ";
+                    if (_use_colors)
+                        _output << Colors::BOLD << Colors::ANNOTATION;
+                    _output << "@private";
+                    if (_use_colors)
+                        _output << Colors::RESET;
+                    break;
+                case Visibility::Protected:
+                    _output << " ";
+                    if (_use_colors)
+                        _output << Colors::BOLD << Colors::ANNOTATION;
+                    _output << "@protected";
+                    if (_use_colors)
+                        _output << Colors::RESET;
+                    break;
+                }
+            }
+        }
+
         _output << std::endl;
 
         // Dump parameters and body
@@ -946,6 +993,10 @@ namespace Cryo
 
         _output << std::endl;
 
+        // Set class context for method annotations
+        bool previous_class_context = _in_class_context;
+        _in_class_context = true;
+
         // Dump generic parameters, fields, and methods (similar to struct)
         const auto &generics = node.generic_parameters();
         const auto &fields = node.fields();
@@ -968,6 +1019,9 @@ namespace Cryo
         {
             dump_child(method.get(), ++child_index == total_children);
         }
+
+        // Restore previous context
+        _in_class_context = previous_class_context;
     }
 
     void ASTDumper::visit(TypeAliasDeclarationNode &node)
@@ -1113,6 +1167,32 @@ namespace Cryo
         for (const auto &method : methods)
         {
             dump_child(method.get(), ++child_index == total_children);
+        }
+    }
+
+    void ASTDumper::visit(ExternBlockNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ExternBlock";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " linkage: ";
+
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "\"" << node.linkage_type() << "\"";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        // Dump function declarations
+        const auto &functions = node.function_declarations();
+
+        for (size_t i = 0; i < functions.size(); ++i)
+        {
+            dump_child(functions[i].get(), i == functions.size() - 1);
         }
     }
 
