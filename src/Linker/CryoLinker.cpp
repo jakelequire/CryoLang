@@ -1,0 +1,506 @@
+#include "Linker/CryoLinker.hpp"
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Type.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
+#include <llvm/Support/Program.h>
+#include <iostream>
+#include <filesystem>
+#include <cstdlib>
+
+namespace Cryo::Linker
+{
+    //===================================================================
+    // Construction and Configuration
+    //===================================================================
+
+    CryoLinker::CryoLinker(Cryo::SymbolTable& symbol_table)
+        : _symbol_table(symbol_table)
+        , _link_mode(LinkMode::Dynamic)
+        , _entry_point("main")
+        , _debug_symbols(false)
+        , _optimization_level(2)
+        , _runtime_linking_enabled(true)
+        , _runtime_library_name("cryoruntime")
+        , _has_errors(false)
+        , _initialized(false)
+        , _modules_linked(0)
+        , _objects_linked(0)
+        , _libraries_linked(0)
+    {
+        // Set default target triple based on current platform
+        #if defined(_WIN32) || defined(_WIN64)
+            _target_triple = "x86_64-pc-windows-msvc";
+        #elif defined(__APPLE__)
+            _target_triple = "x86_64-apple-macosx";
+        #else
+            _target_triple = "x86_64-pc-linux-gnu";
+        #endif
+    }
+
+    //===================================================================
+    // Primary Linking Interface
+    //===================================================================
+
+    bool CryoLinker::link_modules(
+        const std::vector<llvm::Module*>& modules,
+        const std::string& output_path,
+        LinkTarget target)
+    {
+        clear_errors();
+
+        if (!_initialized && !initialize_runtime()) {
+            report_error("Failed to initialize runtime functions");
+            return false;
+        }
+
+        if (modules.empty()) {
+            report_error("No modules provided for linking");
+            return false;
+        }
+
+        // For now, we support single module linking
+        // TODO: Implement multi-module linking
+        if (modules.size() > 1) {
+            report_error("Multi-module linking not yet implemented");
+            return false;
+        }
+
+        llvm::Module* module = modules[0];
+
+        // Generate appropriate output based on target type
+        switch (target) {
+            case LinkTarget::Executable:
+                return generate_executable(module, output_path);
+            case LinkTarget::SharedLibrary:
+                return generate_shared_library(module, output_path);
+            case LinkTarget::StaticLibrary:
+                return generate_static_library(module, output_path);
+            case LinkTarget::ObjectFile:
+                return generate_object_file(module, output_path);
+        }
+
+        return false;
+    }
+
+    void CryoLinker::add_object_file(const std::string& object_path) {
+        _object_files.push_back(object_path);
+    }
+
+    void CryoLinker::add_library(const std::string& library_name, bool is_static) {
+        _libraries.emplace_back(library_name, is_static);
+    }
+
+    void CryoLinker::add_library_path(const std::string& path) {
+        _library_paths.push_back(path);
+    }
+
+    //===================================================================
+    // Runtime Library Integration
+    //===================================================================
+
+    bool CryoLinker::initialize_runtime() {
+        if (_initialized) {
+            return true;
+        }
+
+        clear_errors();
+
+        if (!initialize_runtime_functions()) {
+            report_error("Failed to initialize runtime function registry");
+            return false;
+        }
+
+        _initialized = true;
+        return true;
+    }
+
+    void CryoLinker::add_runtime_path(const std::string& path) {
+        _runtime_paths.push_back(path);
+    }
+
+    void CryoLinker::set_runtime_library_name(const std::string& name) {
+        _runtime_library_name = name;
+    }
+
+    void CryoLinker::enable_runtime_linking(bool enable) {
+        _runtime_linking_enabled = enable;
+    }
+
+    llvm::Function* CryoLinker::declare_runtime_function(llvm::Module* module, const std::string& cryo_name) {
+        auto it = _runtime_functions.find(cryo_name);
+        if (it == _runtime_functions.end()) {
+            return nullptr;
+        }
+
+        const RuntimeFunction& runtime_func = it->second;
+        
+        // Check if function is already declared in this module
+        if (llvm::Function* existing = module->getFunction(runtime_func.runtime_name)) {
+            return existing;
+        }
+
+        // Create function declaration
+        llvm::Function* func = llvm::Function::Create(
+            runtime_func.type,
+            llvm::Function::ExternalLinkage,
+            runtime_func.runtime_name,
+            module
+        );
+
+        return func;
+    }
+
+    const CryoLinker::RuntimeFunction* CryoLinker::get_runtime_function(const std::string& cryo_name) {
+        auto it = _runtime_functions.find(cryo_name);
+        return (it != _runtime_functions.end()) ? &it->second : nullptr;
+    }
+
+    bool CryoLinker::is_runtime_function(const std::string& name) {
+        return _runtime_functions.find(name) != _runtime_functions.end();
+    }
+
+    //===================================================================
+    // Configuration
+    //===================================================================
+
+    void CryoLinker::set_link_mode(LinkMode mode) {
+        _link_mode = mode;
+    }
+
+    void CryoLinker::set_target_triple(const std::string& triple) {
+        _target_triple = triple;
+    }
+
+    void CryoLinker::set_debug_symbols(bool enable) {
+        _debug_symbols = enable;
+    }
+
+    void CryoLinker::set_optimization_level(int level) {
+        _optimization_level = std::max(0, std::min(3, level));
+    }
+
+    void CryoLinker::add_linker_flag(const std::string& flag) {
+        _linker_flags.push_back(flag);
+    }
+
+    void CryoLinker::set_entry_point(const std::string& entry_point) {
+        _entry_point = entry_point;
+    }
+
+    //===================================================================
+    // Output Format Support
+    //===================================================================
+
+    bool CryoLinker::generate_executable(llvm::Module* module, const std::string& output_path) {
+        // For now, this is a placeholder implementation
+        // TODO: Implement actual executable generation using LLVM
+        report_error("Executable generation not yet implemented");
+        return false;
+    }
+
+    bool CryoLinker::generate_shared_library(llvm::Module* module, const std::string& output_path) {
+        // TODO: Implement shared library generation
+        report_error("Shared library generation not yet implemented");
+        return false;
+    }
+
+    bool CryoLinker::generate_static_library(llvm::Module* module, const std::string& output_path) {
+        // TODO: Implement static library generation
+        report_error("Static library generation not yet implemented");
+        return false;
+    }
+
+    bool CryoLinker::generate_object_file(llvm::Module* module, const std::string& output_path) {
+        // TODO: Implement object file generation using LLVM
+        report_error("Object file generation not yet implemented");
+        return false;
+    }
+
+    //===================================================================
+    // Cross-Platform Support
+    //===================================================================
+
+    std::string CryoLinker::get_system_linker() {
+        #if defined(_WIN32) || defined(_WIN64)
+            return "link.exe";
+        #else
+            return "ld";
+        #endif
+    }
+
+    std::string CryoLinker::get_library_extension(bool is_shared) const {
+        #if defined(_WIN32) || defined(_WIN64)
+            return is_shared ? ".dll" : ".lib";
+        #elif defined(__APPLE__)
+            return is_shared ? ".dylib" : ".a";
+        #else
+            return is_shared ? ".so" : ".a";
+        #endif
+    }
+
+    std::string CryoLinker::get_executable_extension() {
+        #if defined(_WIN32) || defined(_WIN64)
+            return ".exe";
+        #else
+            return "";
+        #endif
+    }
+
+    //===================================================================
+    // Diagnostics and Debugging
+    //===================================================================
+
+    void CryoLinker::print_link_info(std::ostream& os) const {
+        os << "=== CryoLinker Configuration ===\n";
+        os << "Target Triple: " << _target_triple << "\n";
+        os << "Link Mode: " << static_cast<int>(_link_mode) << "\n";
+        os << "Entry Point: " << _entry_point << "\n";
+        os << "Debug Symbols: " << (_debug_symbols ? "enabled" : "disabled") << "\n";
+        os << "Optimization Level: " << _optimization_level << "\n";
+        os << "Runtime Linking: " << (_runtime_linking_enabled ? "enabled" : "disabled") << "\n";
+        os << "Runtime Library: " << _runtime_library_name << "\n";
+        
+        os << "\nObject Files (" << _object_files.size() << "):\n";
+        for (const auto& obj : _object_files) {
+            os << "  " << obj << "\n";
+        }
+
+        os << "\nLibraries (" << _libraries.size() << "):\n";
+        for (const auto& [name, is_static] : _libraries) {
+            os << "  " << name << " (" << (is_static ? "static" : "dynamic") << ")\n";
+        }
+
+        os << "\nLibrary Paths (" << _library_paths.size() << "):\n";
+        for (const auto& path : _library_paths) {
+            os << "  " << path << "\n";
+        }
+    }
+
+    void CryoLinker::print_stats(std::ostream& os) const {
+        os << "=== CryoLinker Statistics ===\n";
+        os << "Modules Linked: " << _modules_linked << "\n";
+        os << "Objects Linked: " << _objects_linked << "\n";
+        os << "Libraries Linked: " << _libraries_linked << "\n";
+        os << "Runtime Functions Registered: " << _runtime_functions.size() << "\n";
+    }
+
+    std::vector<std::string> CryoLinker::get_linker_args() const {
+        std::vector<std::string> args;
+
+        // Add linker flags
+        args.insert(args.end(), _linker_flags.begin(), _linker_flags.end());
+
+        // Add library paths
+        for (const auto& path : _library_paths) {
+            args.push_back("-L" + path);
+        }
+
+        // Add libraries
+        for (const auto& [name, is_static] : _libraries) {
+            if (is_static) {
+                args.push_back("-Wl,-Bstatic");
+            }
+            args.push_back("-l" + name);
+            if (is_static) {
+                args.push_back("-Wl,-Bdynamic");
+            }
+        }
+
+        // Add runtime library if enabled
+        if (_runtime_linking_enabled) {
+            std::string runtime_path = find_runtime_library();
+            if (!runtime_path.empty()) {
+                args.push_back(runtime_path);
+            }
+        }
+
+        return args;
+    }
+
+    //===================================================================
+    // Private Methods
+    //===================================================================
+
+    bool CryoLinker::initialize_runtime_functions() {
+        // TODO: Initialize runtime function registry with actual function signatures
+        // For now, this is a placeholder
+        return true;
+    }
+
+    void CryoLinker::register_runtime_function(
+        const std::string& cryo_name,
+        const std::string& runtime_name,
+        llvm::Type* return_type,
+        const std::vector<llvm::Type*>& param_types,
+        bool is_variadic,
+        const std::string& description)
+    {
+        RuntimeFunction func;
+        func.cryo_name = cryo_name;
+        func.runtime_name = runtime_name;
+        func.is_variadic = is_variadic;
+        func.description = description;
+
+        // Create function type
+        // Note: This requires LLVM context, which should be provided by the code generator
+        // For now, we store nullptrs and will populate them when needed
+        func.type = nullptr;
+        func.declaration = nullptr;
+
+        _runtime_functions[cryo_name] = func;
+    }
+
+    bool CryoLinker::execute_linker_command(const std::vector<std::string>& args) {
+        // TODO: Implement system linker execution
+        report_error("System linker execution not yet implemented");
+        return false;
+    }
+
+    std::vector<std::string> CryoLinker::build_linker_args(
+        const std::string& output_path,
+        LinkTarget target,
+        const std::vector<std::string>& input_files)
+    {
+        std::vector<std::string> args;
+
+        // Add output specification
+        args.push_back("-o");
+        args.push_back(output_path);
+
+        // Add input files
+        args.insert(args.end(), input_files.begin(), input_files.end());
+
+        // Add target-specific flags
+        switch (target) {
+            case LinkTarget::SharedLibrary:
+                args.push_back("-shared");
+                break;
+            case LinkTarget::StaticLibrary:
+                // Static libraries use 'ar' not 'ld'
+                break;
+            default:
+                break;
+        }
+
+        // Add debug symbols if enabled
+        if (_debug_symbols) {
+            args.push_back("-g");
+        }
+
+        return args;
+    }
+
+    std::string CryoLinker::find_runtime_library() const {
+        std::string lib_name = "lib" + _runtime_library_name;
+        std::string extension = get_library_extension(_link_mode == LinkMode::Dynamic);
+        std::string full_name = lib_name + extension;
+
+        // Check runtime paths
+        for (const auto& path : _runtime_paths) {
+            std::filesystem::path lib_path = std::filesystem::path(path) / full_name;
+            if (std::filesystem::exists(lib_path)) {
+                return lib_path.string();
+            }
+        }
+
+        // Check default paths
+        auto default_paths = get_default_runtime_paths();
+        for (const auto& path : default_paths) {
+            std::filesystem::path lib_path = std::filesystem::path(path) / full_name;
+            if (std::filesystem::exists(lib_path)) {
+                return lib_path.string();
+            }
+        }
+
+        return "";
+    }
+
+    void CryoLinker::report_error(const std::string& message) {
+        _has_errors = true;
+        _last_error = message;
+    }
+
+    void CryoLinker::clear_errors() {
+        _has_errors = false;
+        _last_error.clear();
+    }
+
+    // Placeholder implementations for LLVM type getters
+    // These would need proper LLVM context in a real implementation
+    llvm::Type* CryoLinker::get_i8_type() { return nullptr; }
+    llvm::Type* CryoLinker::get_i32_type() { return nullptr; }
+    llvm::Type* CryoLinker::get_i64_type() { return nullptr; }
+    llvm::Type* CryoLinker::get_f64_type() { return nullptr; }
+    llvm::Type* CryoLinker::get_void_type() { return nullptr; }
+    llvm::PointerType* CryoLinker::get_i8_ptr_type() { return nullptr; }
+
+    //=======================================================================
+    // Factory Functions
+    //=======================================================================
+
+    std::unique_ptr<CryoLinker> create_default_linker(Cryo::SymbolTable& symbol_table) {
+        return std::make_unique<CryoLinker>(symbol_table);
+    }
+
+    std::unique_ptr<CryoLinker> create_target_linker(
+        const std::string& target_triple,
+        Cryo::SymbolTable& symbol_table)
+    {
+        auto linker = std::make_unique<CryoLinker>(symbol_table);
+        linker->set_target_triple(target_triple);
+        return linker;
+    }
+
+    //=======================================================================
+    // Utility Functions
+    //=======================================================================
+
+    std::vector<std::string> get_default_runtime_paths() {
+        std::vector<std::string> paths;
+
+        // Add common runtime library paths
+        paths.push_back("./bin");
+        paths.push_back("../runtime/build");
+        paths.push_back("/usr/local/lib");
+        paths.push_back("/usr/lib");
+
+        #if defined(_WIN32) || defined(_WIN64)
+            paths.push_back("C:\\Program Files\\CryoLang\\lib");
+        #endif
+
+        return paths;
+    }
+
+    bool runtime_library_exists(const std::string& path, const std::string& library_name) {
+        std::filesystem::path lib_path = std::filesystem::path(path) / ("lib" + library_name + ".a");
+        if (std::filesystem::exists(lib_path)) {
+            return true;
+        }
+
+        lib_path = std::filesystem::path(path) / ("lib" + library_name + ".so");
+        if (std::filesystem::exists(lib_path)) {
+            return true;
+        }
+
+        #if defined(_WIN32) || defined(_WIN64)
+            lib_path = std::filesystem::path(path) / (library_name + ".lib");
+            if (std::filesystem::exists(lib_path)) {
+                return true;
+            }
+
+            lib_path = std::filesystem::path(path) / (library_name + ".dll");
+            if (std::filesystem::exists(lib_path)) {
+                return true;
+            }
+        #elif defined(__APPLE__)
+            lib_path = std::filesystem::path(path) / ("lib" + library_name + ".dylib");
+            if (std::filesystem::exists(lib_path)) {
+                return true;
+            }
+        #endif
+
+        return false;
+    }
+
+} // namespace Cryo::Linker

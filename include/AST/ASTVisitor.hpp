@@ -17,9 +17,11 @@ namespace Cryo
     class VariableDeclarationNode;
     class FunctionDeclarationNode;
     class CallExpressionNode;
+    class NewExpressionNode;
     class ArrayLiteralNode;
     class ArrayAccessNode;
     class MemberAccessNode;
+    class ScopeResolutionNode;
     class IfStatementNode;
     class WhileStatementNode;
     class ForStatementNode;
@@ -33,9 +35,12 @@ namespace Cryo
     class DeclarationStatementNode;
     class StructDeclarationNode;
     class ClassDeclarationNode;
+    class EnumDeclarationNode;
+    class EnumVariantNode;
     class TypeAliasDeclarationNode;
     class ImplementationBlockNode;
     class ExternBlockNode;
+    class GenericParameterNode;
     class StructFieldNode;
     class StructMethodNode;
 

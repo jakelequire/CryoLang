@@ -9,7 +9,7 @@ namespace Cryo::Codegen
 {
     /**
      * @brief Target-specific configuration for code generation
-     * 
+     *
      * TargetConfig encapsulates all target-specific settings needed for
      * LLVM code generation. This includes target triple, CPU features,
      * ABI conventions, optimization preferences, and platform-specific
@@ -23,9 +23,9 @@ namespace Cryo::Codegen
          */
         enum class CodeModel
         {
-            Small,    ///< Small code model (default)
-            Medium,   ///< Medium code model
-            Large     ///< Large code model
+            Small,  ///< Small code model (default)
+            Medium, ///< Medium code model
+            Large   ///< Large code model
         };
 
         /**
@@ -33,9 +33,9 @@ namespace Cryo::Codegen
          */
         enum class RelocationModel
         {
-            Static,   ///< Static relocation
-            PIC,      ///< Position Independent Code
-            DynamicNoPie  ///< Dynamic without PIE
+            Static,      ///< Static relocation
+            PIC,         ///< Position Independent Code
+            DynamicNoPie ///< Dynamic without PIE
         };
 
         /**
@@ -43,9 +43,9 @@ namespace Cryo::Codegen
          */
         enum class OptimizationLevel
         {
-            None = 0,   ///< No optimization
-            Less = 1,   ///< Minimal optimization
-            Default = 2,///< Default optimization
+            None = 0,      ///< No optimization
+            Less = 1,      ///< Minimal optimization
+            Default = 2,   ///< Default optimization
             Aggressive = 3 ///< Aggressive optimization
         };
 
@@ -62,7 +62,7 @@ namespace Cryo::Codegen
          * @brief Construct with specific target triple
          * @param target_triple Target triple string
          */
-        explicit TargetConfig(const std::string& target_triple);
+        explicit TargetConfig(const std::string &target_triple);
 
         ~TargetConfig() = default;
 
@@ -74,40 +74,40 @@ namespace Cryo::Codegen
          * @brief Set target triple
          * @param triple Target triple (e.g., "x86_64-pc-windows-msvc")
          */
-        void set_target_triple(const std::string& triple);
+        void set_target_triple(const std::string &triple);
 
         /**
          * @brief Get target triple
          */
-        const std::string& get_target_triple() const { return _target_triple; }
+        const std::string &get_target_triple() const { return _target_triple; }
 
         /**
          * @brief Set CPU target
          * @param cpu CPU name (e.g., "x86-64", "generic")
          */
-        void set_cpu(const std::string& cpu);
+        void set_cpu(const std::string &cpu);
 
         /**
          * @brief Get CPU target
          */
-        const std::string& get_cpu() const { return _cpu; }
+        const std::string &get_cpu() const { return _cpu; }
 
         /**
          * @brief Set target features
          * @param features Comma-separated feature list
          */
-        void set_features(const std::string& features);
+        void set_features(const std::string &features);
 
         /**
          * @brief Get target features
          */
-        const std::string& get_features() const { return _features; }
+        const std::string &get_features() const { return _features; }
 
         /**
          * @brief Add individual feature
          * @param feature Feature to add (with + or - prefix)
          */
-        void add_feature(const std::string& feature);
+        void add_feature(const std::string &feature);
 
         //===================================================================
         // Code Generation Options
@@ -225,16 +225,16 @@ namespace Cryo::Codegen
         /**
          * @brief Set runtime library paths
          */
-        void set_runtime_paths(const std::vector<std::string>& paths) { _runtime_paths = paths; }
-        void add_runtime_path(const std::string& path) { _runtime_paths.push_back(path); }
-        const std::vector<std::string>& get_runtime_paths() const { return _runtime_paths; }
+        void set_runtime_paths(const std::vector<std::string> &paths) { _runtime_paths = paths; }
+        void add_runtime_path(const std::string &path) { _runtime_paths.push_back(path); }
+        const std::vector<std::string> &get_runtime_paths() const { return _runtime_paths; }
 
         /**
          * @brief Set system library paths
          */
-        void set_system_lib_paths(const std::vector<std::string>& paths) { _system_lib_paths = paths; }
-        void add_system_lib_path(const std::string& path) { _system_lib_paths.push_back(path); }
-        const std::vector<std::string>& get_system_lib_paths() const { return _system_lib_paths; }
+        void set_system_lib_paths(const std::vector<std::string> &paths) { _system_lib_paths = paths; }
+        void add_system_lib_path(const std::string &path) { _system_lib_paths.push_back(path); }
+        const std::vector<std::string> &get_system_lib_paths() const { return _system_lib_paths; }
 
         /**
          * @brief Set static linking preference
@@ -321,7 +321,7 @@ namespace Cryo::Codegen
         /**
          * @brief Parse target triple components
          */
-        void parse_target_triple();
+        void parse_target_triple() const;
 
         /**
          * @brief Cached triple components
@@ -344,11 +344,11 @@ namespace Cryo::Codegen
     /**
      * @brief Get default features for CPU
      */
-    std::string get_default_cpu_features(const std::string& cpu);
+    std::string get_default_cpu_features(const std::string &cpu);
 
     /**
      * @brief Check if target triple is supported by LLVM
      */
-    bool is_target_triple_supported(const std::string& triple);
+    bool is_target_triple_supported(const std::string &triple);
 
 } // namespace Cryo::Codegen

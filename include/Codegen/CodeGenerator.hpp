@@ -7,7 +7,6 @@
 #include "GDM/GDM.hpp"
 #include "Codegen/LLVMContext.hpp"
 #include "Codegen/CodegenVisitor.hpp"
-#include "Codegen/RuntimeLinker.hpp"
 #include "Codegen/TargetConfig.hpp"
 #include "Codegen/OptimizationManager.hpp"
 
@@ -23,27 +22,25 @@ namespace Cryo::Codegen
 {
     /**
      * @brief Central code generation orchestrator for CryoLang
-     * 
+     *
      * The CodeGenerator is the primary interface for converting CryoLang AST
      * into LLVM IR and eventually machine code. It coordinates all codegen
      * components and maintains compilation state.
-     * 
+     *
      * Key responsibilities:
      * - AST to LLVM IR translation
-     * - Symbol resolution and linking
      * - Target-specific code generation
-     * - Runtime library integration
      * - Optimization pipeline management
      * - Debug information generation
-     * 
+     *
      * Architecture:
      * ┌─────────────────────────────────────────────────────────────────┐
      * │                      CodeGenerator                              │
      * ├─────────────────────────────────────────────────────────────────┤
      * │  • LLVMContextManager    • CodegenVisitor                      │
-     * │  • RuntimeLinker         • TargetConfig                        │
-     * │  • OptimizationManager   • DebugInfoGenerator                  │
-     * │  • ObjectFileEmitter     • ModuleManager                       │
+     * │  • TargetConfig          • OptimizationManager                 │
+     * │  • DebugInfoGenerator    • ModuleManager                       │
+     * │  • ObjectFileEmitter     • TypeMapper                          │
      * └─────────────────────────────────────────────────────────────────┘
      */
     class CodeGenerator
@@ -52,7 +49,7 @@ namespace Cryo::Codegen
         //===================================================================
         // Construction & Configuration
         //===================================================================
-        
+
         /**
          * @brief Construct CodeGenerator with target configuration
          * @param target_config Target-specific compilation settings
@@ -61,17 +58,16 @@ namespace Cryo::Codegen
          */
         CodeGenerator(
             std::unique_ptr<TargetConfig> target_config,
-            Cryo::ASTContext& ast_context,
-            Cryo::SymbolTable& symbol_table
-        );
-        
+            Cryo::ASTContext &ast_context,
+            Cryo::SymbolTable &symbol_table);
+
         ~CodeGenerator();
 
         // No copy/move for now - manage LLVM resources carefully
-        CodeGenerator(const CodeGenerator&) = delete;
-        CodeGenerator& operator=(const CodeGenerator&) = delete;
-        CodeGenerator(CodeGenerator&&) = delete;
-        CodeGenerator& operator=(CodeGenerator&&) = delete;
+        CodeGenerator(const CodeGenerator &) = delete;
+        CodeGenerator &operator=(const CodeGenerator &) = delete;
+        CodeGenerator(CodeGenerator &&) = delete;
+        CodeGenerator &operator=(CodeGenerator &&) = delete;
 
         //===================================================================
         // Core Code Generation Interface
@@ -82,7 +78,7 @@ namespace Cryo::Codegen
          * @param program_node Root AST node to generate code for
          * @return Success status
          */
-        bool generate_ir(Cryo::ProgramNode* program_node);
+        bool generate_ir(Cryo::ProgramNode *program_node);
 
         /**
          * @brief Generate optimized LLVM IR
@@ -96,22 +92,14 @@ namespace Cryo::Codegen
          * @param output_path Path for generated object file
          * @return Success status
          */
-        bool emit_object_file(const std::string& output_path);
-
-        /**
-         * @brief Emit executable
-         * @param output_path Path for generated executable
-         * @param link_runtime Whether to link CryoLang runtime
-         * @return Success status
-         */
-        bool emit_executable(const std::string& output_path, bool link_runtime = true);
+        bool emit_object_file(const std::string &output_path);
 
         /**
          * @brief Emit LLVM IR to file (for debugging/inspection)
          * @param output_path Path for IR file
          * @return Success status
          */
-        bool emit_llvm_ir(const std::string& output_path);
+        bool emit_llvm_ir(const std::string &output_path);
 
         //===================================================================
         // Configuration & State Management
@@ -120,12 +108,12 @@ namespace Cryo::Codegen
         /**
          * @brief Set target triple (e.g., "x86_64-pc-windows-msvc")
          */
-        void set_target_triple(const std::string& triple);
+        void set_target_triple(const std::string &triple);
 
         /**
          * @brief Set CPU target (e.g., "x86-64", "generic")
          */
-        void set_cpu_target(const std::string& cpu);
+        void set_cpu_target(const std::string &cpu);
 
         /**
          * @brief Enable/disable debug information generation
@@ -138,14 +126,9 @@ namespace Cryo::Codegen
         void set_optimization_level(int level);
 
         /**
-         * @brief Add runtime library search path
-         */
-        void add_runtime_path(const std::string& path);
-
-        /**
          * @brief Set code model (small, medium, large)
          */
-        void set_code_model(const std::string& model);
+        void set_code_model(const std::string &model);
 
         //===================================================================
         // Component Access (for advanced usage)
@@ -154,22 +137,17 @@ namespace Cryo::Codegen
         /**
          * @brief Get LLVM module (for inspection/advanced manipulation)
          */
-        llvm::Module* get_module() const;
+        llvm::Module *get_module() const;
 
         /**
          * @brief Get LLVM context manager
          */
-        LLVMContextManager* get_context_manager() const;
-
-        /**
-         * @brief Get runtime linker
-         */
-        RuntimeLinker* get_runtime_linker() const;
+        LLVMContextManager *get_context_manager() const;
 
         /**
          * @brief Get target configuration
          */
-        TargetConfig* get_target_config() const;
+        TargetConfig *get_target_config() const;
 
         //===================================================================
         // Diagnostic & Debugging
@@ -184,17 +162,17 @@ namespace Cryo::Codegen
         /**
          * @brief Print LLVM IR to stream
          */
-        void print_ir(std::ostream& os) const;
+        void print_ir(std::ostream &os) const;
 
         /**
          * @brief Print compilation statistics
          */
-        void print_stats(std::ostream& os) const;
+        void print_stats(std::ostream &os) const;
 
         /**
          * @brief Get last error message
          */
-        const std::string& get_last_error() const;
+        const std::string &get_last_error() const;
 
         /**
          * @brief Check if codegen has errors
@@ -209,18 +187,17 @@ namespace Cryo::Codegen
         // Core components
         std::unique_ptr<LLVMContextManager> _context_manager;
         std::unique_ptr<CodegenVisitor> _visitor;
-        std::unique_ptr<RuntimeLinker> _runtime_linker;
         std::unique_ptr<TargetConfig> _target_config;
         std::unique_ptr<OptimizationManager> _optimization_manager;
 
         // LLVM components (managed by context manager)
-        llvm::Module* _module;
-        llvm::IRBuilder<>* _builder;
-        llvm::TargetMachine* _target_machine;
+        llvm::Module *_module;
+        llvm::IRBuilder<> *_builder;
+        llvm::TargetMachine *_target_machine;
 
         // Frontend context references
-        Cryo::ASTContext& _ast_context;
-        Cryo::SymbolTable& _symbol_table;
+        Cryo::ASTContext &_ast_context;
+        Cryo::SymbolTable &_symbol_table;
 
         // Compilation state
         std::string _module_name;
@@ -251,12 +228,7 @@ namespace Cryo::Codegen
         /**
          * @brief Initialize module with metadata
          */
-        bool initialize_module(const std::string& module_name);
-
-        /**
-         * @brief Setup runtime function declarations
-         */
-        bool setup_runtime_functions();
+        bool initialize_module(const std::string &module_name);
 
         /**
          * @brief Perform final IR validation and cleanup
@@ -266,7 +238,7 @@ namespace Cryo::Codegen
         /**
          * @brief Report codegen error
          */
-        void report_error(const std::string& message);
+        void report_error(const std::string &message);
 
         /**
          * @brief Clear error state
@@ -285,9 +257,8 @@ namespace Cryo::Codegen
      * @return Unique pointer to CodeGenerator instance
      */
     std::unique_ptr<CodeGenerator> create_default_codegen(
-        Cryo::ASTContext& ast_context,
-        Cryo::SymbolTable& symbol_table
-    );
+        Cryo::ASTContext &ast_context,
+        Cryo::SymbolTable &symbol_table);
 
     /**
      * @brief Create a CodeGenerator for specific target
@@ -297,9 +268,8 @@ namespace Cryo::Codegen
      * @return Unique pointer to CodeGenerator instance
      */
     std::unique_ptr<CodeGenerator> create_target_codegen(
-        const std::string& target_triple,
-        Cryo::ASTContext& ast_context,
-        Cryo::SymbolTable& symbol_table
-    );
+        const std::string &target_triple,
+        Cryo::ASTContext &ast_context,
+        Cryo::SymbolTable &symbol_table);
 
 } // namespace Cryo::Codegen

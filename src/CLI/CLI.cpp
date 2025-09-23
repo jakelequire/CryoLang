@@ -69,7 +69,7 @@ namespace Cryo::CLI
             if (is_flag(arg))
             {
                 std::string flag_name = normalize_flag(arg);
-                
+
                 // Check if it's a flag with value (--flag=value)
                 size_t eq_pos = flag_name.find('=');
                 if (eq_pos != std::string::npos)
@@ -87,6 +87,7 @@ namespace Cryo::CLI
                 else if (flag_name == "c" || flag_name == "compile-only" ||
                          flag_name == "ast" || flag_name == "show-ast" ||
                          flag_name == "symbols" || flag_name == "show-symbols" ||
+                         flag_name == "ir" || flag_name == "show-ir" ||
                          flag_name == "help" || flag_name == "h" ||
                          flag_name == "version" || flag_name == "v")
                 {
@@ -214,7 +215,7 @@ namespace Cryo::CLI
         std::string first_arg = argv[1];
 
         // Check if it's a direct file compilation with or without flags
-        if (is_cryo_file(first_arg) || 
+        if (is_cryo_file(first_arg) ||
             (args.positional_count() > 0 && is_cryo_file(args.input_file())) ||
             (first_arg.find('.') != std::string::npos && first_arg != "help" && find_command(first_arg) == nullptr))
         {
@@ -268,6 +269,7 @@ namespace Cryo::CLI
         std::cout << "Compilation flags:\n";
         std::cout << "  --ast                               Show AST during compilation\n";
         std::cout << "  --symbols                           Show symbol table during compilation\n";
+        std::cout << "  --ir                                Show generated LLVM IR\n";
         std::cout << "  -c, --compile-only                  Compile only, don't link\n";
         std::cout << "  -o, --output <file>                 Output file name\n\n";
 
@@ -300,7 +302,7 @@ namespace Cryo::CLI
     int CLIRunner::execute_file_compilation(const ParsedArgs &args)
     {
         std::string file_path = args.input_file();
-        
+
         if (file_path.empty())
         {
             std::cerr << "Error: No input file specified" << std::endl;
@@ -315,7 +317,7 @@ namespace Cryo::CLI
 
         std::cout << "Cryo Compiler v" << _version << std::endl;
         std::cout << "Compiling: " << file_path;
-        
+
         std::string output = args.output_file();
         if (!output.empty())
         {
@@ -348,6 +350,12 @@ namespace Cryo::CLI
                 compiler->dump_type_table();
             }
 
+            if (args.show_ir())
+            {
+                std::cout << "\nGenerated LLVM IR:" << std::endl;
+                compiler->dump_ir();
+            }
+
             // If no specific flags requested, show minimal output for clang-like behavior
             if (!has_compilation_flags(args))
             {
@@ -369,17 +377,17 @@ namespace Cryo::CLI
         // Legacy method - create ParsedArgs and delegate
         ParsedArgs args;
         args.add_positional(file_path);
-        
+
         // For backward compatibility, show AST and symbols like before
         args.set_flag("ast", true);
         args.set_flag("symbols", true);
-        
+
         return execute_file_compilation(args);
     }
 
     bool CLIRunner::has_compilation_flags(const ParsedArgs &args) const
     {
-        return args.show_ast() || args.show_symbols() || args.compile_only() || !args.output_file().empty();
+        return args.show_ast() || args.show_symbols() || args.show_ir() || args.compile_only() || !args.output_file().empty();
     }
 
     bool CLIRunner::is_cryo_file(const std::string &path) const
