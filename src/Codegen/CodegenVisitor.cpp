@@ -431,6 +431,13 @@ namespace Cryo::Codegen
         case TokenKind::TK_STRING_LITERAL:
         {
             std::string str_val = node.value();
+
+            // Remove surrounding quotes if they exist
+            if (str_val.length() >= 2 && str_val.front() == '"' && str_val.back() == '"')
+            {
+                str_val = str_val.substr(1, str_val.length() - 2);
+            }
+
             literal_value = _context_manager.get_builder().CreateGlobalStringPtr(str_val);
             break;
         }
@@ -1148,56 +1155,90 @@ namespace Cryo::Codegen
 
     std::string CodegenVisitor::map_cryo_to_c_function(const std::string &cryo_name)
     {
-        // Map Cryo runtime function names to C function names
-        static std::unordered_map<std::string, std::string> name_map = {
-            {"print_int", "cryo_print_int"},
-            {"Std::Runtime::print_int", "cryo_print_int"},
-            {"print_float", "cryo_print_float"},
-            {"Std::Runtime::print_float", "cryo_print_float"},
-            {"print_bool", "cryo_print_bool"},
-            {"Std::Runtime::print_bool", "cryo_print_bool"},
-            {"print_char", "cryo_print_char"},
-            {"Std::Runtime::print_char", "cryo_print_char"},
-            {"print", "cryo_print"},
-            {"Std::Runtime::print", "cryo_print"},
-            {"println", "cryo_println"},
-            {"Std::Runtime::println", "cryo_println"}};
-
-        auto it = name_map.find(cryo_name);
-        if (it != name_map.end())
-        {
-            return it->second;
-        }
-
-        // For non-runtime functions, use the original name
+        // TODO: This should be replaced with a proper symbol table lookup
+        // that gets the C function name from the symbol's metadata
+        // For now, return the original name and let the linker handle it
         return cryo_name;
     }
 
     llvm::Function *CodegenVisitor::create_runtime_function_declaration(const std::string &c_name, CallExpressionNode *call_node)
     {
-        auto *module = _context_manager.get_module();
-        auto &context = _context_manager.get_context();
+        // Handle scoped function names like "Std::Runtime::print_int"
+        std::string symbol_name = c_name;
+        std::string scope_name = "Global";
 
-        // Create function signatures based on the C runtime functions
-        if (c_name == "cryo_print_int")
+        // Find the last "::" to separate scope from member name
+        size_t last_scope_pos = c_name.rfind("::");
+        if (last_scope_pos != std::string::npos)
         {
-            // void cryo_print_int(int value)
-            llvm::Type *int_type = llvm::Type::getInt32Ty(context);
-            llvm::Type *void_type = llvm::Type::getVoidTy(context);
-            llvm::FunctionType *func_type = llvm::FunctionType::get(void_type, {int_type}, false);
-            return llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, c_name, module);
+            // Extract scope and member name
+            scope_name = c_name.substr(0, last_scope_pos);
+            symbol_name = c_name.substr(last_scope_pos + 2);
         }
-        else if (c_name == "cryo_print_float")
-        {
-            // void cryo_print_float(double value)
-            llvm::Type *double_type = llvm::Type::getDoubleTy(context);
-            llvm::Type *void_type = llvm::Type::getVoidTy(context);
-            llvm::FunctionType *func_type = llvm::FunctionType::get(void_type, {double_type}, false);
-            return llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, c_name, module);
-        }
-        // Add more runtime function declarations as needed
 
-        return nullptr;
+        // Look up the function in the symbol table
+        Symbol *symbol = nullptr;
+
+        // First try to find by the full name
+        symbol = _symbol_table.lookup_symbol(c_name);
+
+        // If not found, try to find by the member name
+        if (!symbol)
+        {
+            symbol = _symbol_table.lookup_symbol(symbol_name);
+
+            // Verify the scope matches if we found a symbol
+            if (symbol && symbol->scope != scope_name)
+            {
+                symbol = nullptr; // Wrong scope, keep looking
+            }
+        }
+
+        if (!symbol || symbol->kind != SymbolKind::Function)
+        {
+            std::cerr << "Error: Function " << c_name << " not found in symbol table" << std::endl;
+            return nullptr;
+        }
+
+        // Cast the symbol's data_type to FunctionType
+        FunctionType *func_type = dynamic_cast<FunctionType *>(symbol->data_type);
+        if (!func_type)
+        {
+            std::cerr << "Error: Symbol " << c_name << " is not a function type" << std::endl;
+            return nullptr;
+        }
+
+        // Convert return type
+        llvm::Type *llvm_return_type = _type_mapper->map_type(func_type->return_type().get());
+        if (!llvm_return_type)
+        {
+            std::cerr << "Error: Failed to map return type for function " << c_name << std::endl;
+            return nullptr;
+        }
+
+        // Convert parameter types
+        std::vector<llvm::Type *> llvm_param_types;
+        for (const auto &param_type : func_type->parameter_types())
+        {
+            llvm::Type *llvm_param_type = _type_mapper->map_type(param_type.get());
+            if (!llvm_param_type)
+            {
+                std::cerr << "Error: Failed to map parameter type for function " << c_name << std::endl;
+                return nullptr;
+            }
+            llvm_param_types.push_back(llvm_param_type);
+        }
+
+        // Create the function type
+        llvm::FunctionType *function_type = llvm::FunctionType::get(
+            llvm_return_type, llvm_param_types, func_type->is_variadic());
+
+        // Create the function declaration with the simple member name (not the full scoped name)
+        // This matches the C function name in the runtime library
+        llvm::Function *function = llvm::Function::Create(
+            function_type, llvm::Function::ExternalLinkage, symbol_name, _context_manager.get_module());
+
+        return function;
     }
     llvm::Value *CodegenVisitor::generate_array_access(Cryo::ArrayAccessNode *node) { return nullptr; }
     llvm::Value *CodegenVisitor::generate_member_access(Cryo::MemberAccessNode *node) { return nullptr; }
