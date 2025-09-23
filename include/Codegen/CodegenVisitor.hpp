@@ -254,6 +254,11 @@ namespace Cryo::Codegen
         llvm::Value *generate_array_access(Cryo::ArrayAccessNode *node);
         llvm::Value *generate_member_access(Cryo::MemberAccessNode *node);
 
+        // Function call helpers
+        std::string extract_function_name_from_member_access(Cryo::MemberAccessNode *node);
+        std::string map_cryo_to_c_function(const std::string &cryo_name);
+        llvm::Function *create_runtime_function_declaration(const std::string &c_name, Cryo::CallExpressionNode *call_node);
+
         // Control flow generation
         void generate_if_statement(Cryo::IfStatementNode *node);
         void generate_while_loop(Cryo::WhileStatementNode *node);
