@@ -16,13 +16,17 @@ namespace Cryo::Codegen
         }
     }
 
-    void ValueContext::set_value(const std::string &name, llvm::Value *value, llvm::AllocaInst *alloca)
+    void ValueContext::set_value(const std::string &name, llvm::Value *value, llvm::AllocaInst *alloca, llvm::Type *alloca_type)
     {
         auto &current_scope = get_current_scope();
         current_scope.values[name] = value;
         if (alloca)
         {
             current_scope.allocas[name] = alloca;
+        }
+        if (alloca_type)
+        {
+            current_scope.alloca_types[name] = alloca_type;
         }
     }
 
@@ -36,6 +40,22 @@ namespace Cryo::Codegen
     {
         auto result = search_scopes(name);
         return result.second;
+    }
+
+    llvm::Type *ValueContext::get_alloca_type(const std::string &name)
+    {
+        // Search through scope stack from most recent to oldest
+        for (auto it = _scope_stack.rbegin(); it != _scope_stack.rend(); ++it)
+        {
+            auto type_it = it->alloca_types.find(name);
+            if (type_it != it->alloca_types.end())
+            {
+                return type_it->second;
+            }
+        }
+
+        // Not found in any scope
+        return nullptr;
     }
 
     bool ValueContext::has_value(const std::string &name)

@@ -221,6 +221,7 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Function *> _functions;
         std::unordered_map<std::string, llvm::Type *> _types;
         std::unordered_map<std::string, llvm::GlobalVariable *> _globals;
+        std::unordered_map<std::string, llvm::Type *> _global_types; // Track global variable element types
 
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
@@ -269,7 +270,7 @@ namespace Cryo::Codegen
         llvm::AllocaInst *create_entry_block_alloca(llvm::Function *function,
                                                     llvm::Type *type,
                                                     const std::string &name);
-        llvm::Value *create_load(llvm::Value *ptr, const std::string &name = "");
+        llvm::Value *create_load(llvm::Value *ptr, llvm::Type *element_type = nullptr, const std::string &name = "");
         void create_store(llvm::Value *value, llvm::Value *ptr);
 
         // Scope management

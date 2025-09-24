@@ -19,6 +19,7 @@ namespace Cryo::Codegen
         // Initialize common types in cache
         register_type("void", get_void_type());
         register_type("bool", get_boolean_type());
+        register_type("boolean", get_boolean_type()); // Support CryoLang keyword
         register_type("char", get_char_type());
         register_type("string", get_string_type());
 
@@ -38,7 +39,7 @@ namespace Cryo::Codegen
         // Float types
         register_type("f32", get_float_type(32));
         register_type("f64", get_float_type(64));
-        register_type("float", get_float_type(64)); // Default float
+        register_type("float", get_float_type(32)); // Default float
     }
 
     //===================================================================
@@ -74,7 +75,7 @@ namespace Cryo::Codegen
             llvm_type = get_integer_type(32); // Default int for now
             break;
         case Cryo::TypeKind::Float:
-            llvm_type = get_float_type(64); // Default float for now
+            llvm_type = get_float_type(32); // Default float is now 32-bit
             break;
         case Cryo::TypeKind::Char:
             llvm_type = get_char_type();
@@ -440,7 +441,7 @@ namespace Cryo::Codegen
         case Cryo::TypeKind::Integer:
             return get_integer_type(32); // Default int
         case Cryo::TypeKind::Float:
-            return get_float_type(64); // Default float
+            return get_float_type(32); // Default float is 32-bit
         case Cryo::TypeKind::Char:
             return get_char_type();
         case Cryo::TypeKind::String:

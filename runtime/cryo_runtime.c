@@ -6,22 +6,22 @@
 
 void print_int(int value)
 {
-    printf("%d", value);
+    printf("%d\n", value);
 }
 
 void print_float(float value)
 {
-    printf("%f", value);
+    printf("%f\n", value);
 }
 
 void print_bool(bool value)
 {
-    printf("%s", value ? "true" : "false");
+    printf("%s\n", value ? "true" : "false");
 }
 
 void print_char(char value)
 {
-    printf("%c", value);
+    printf("%c\n", value);
 }
 
 void print(const char *str)
