@@ -2937,6 +2937,9 @@ namespace Cryo::Codegen
             // Register the binding in the current scope
             current_scope().local_allocas[binding_name] = binding_alloca;
 
+            // Also register with value context so it can be found during identifier lookup
+            _value_context->set_value(binding_name, binding_alloca, binding_alloca, llvm::Type::getFloatTy(context));
+
             std::cout << "[CodegenVisitor] Created binding: " << binding_name << std::endl;
         }
     }
