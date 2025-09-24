@@ -221,7 +221,8 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Function *> _functions;
         std::unordered_map<std::string, llvm::Type *> _types;
         std::unordered_map<std::string, llvm::GlobalVariable *> _globals;
-        std::unordered_map<std::string, llvm::Type *> _global_types; // Track global variable element types
+        std::unordered_map<std::string, llvm::Type *> _global_types;   // Track global variable element types
+        std::unordered_map<std::string, llvm::Value *> _enum_variants; // Track enum variants for scope resolution
 
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
@@ -252,6 +253,17 @@ namespace Cryo::Codegen
         llvm::Type *generate_class_type(Cryo::ClassDeclarationNode *node);
         llvm::Type *generate_enum_type(Cryo::EnumDeclarationNode *node);
 
+        // Enum generation helpers
+        void generate_simple_enum_constants(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type);
+        void generate_complex_enum_constructors(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type);
+        void generate_simple_variant_in_complex_enum(Cryo::EnumDeclarationNode *enum_decl,
+                                                     Cryo::EnumVariantNode *variant,
+                                                     int discriminant);
+        void generate_complex_variant_constructor(Cryo::EnumDeclarationNode *enum_decl,
+                                                  Cryo::EnumVariantNode *variant,
+                                                  int discriminant);
+        void register_enum_variant(const std::string &enum_name, const std::string &variant_name, llvm::Value *value);
+
         // Expression generation helpers
         llvm::Value *generate_binary_operation(Cryo::BinaryExpressionNode *node);
         llvm::Value *generate_unary_operation(Cryo::UnaryExpressionNode *node);
@@ -269,6 +281,12 @@ namespace Cryo::Codegen
         void generate_while_loop(Cryo::WhileStatementNode *node);
         void generate_for_loop(Cryo::ForStatementNode *node);
         void generate_match_statement(Cryo::MatchStatementNode *node);
+
+        // Match statement helpers
+        llvm::Value *extract_enum_discriminant(llvm::Value *enum_value);
+        int get_pattern_discriminant(Cryo::PatternNode *pattern);
+        void generate_match_arm(Cryo::MatchArmNode *arm, llvm::Value *match_value);
+        void extract_pattern_bindings(Cryo::EnumPatternNode *pattern, llvm::Value *enum_value);
 
         // Memory management
         llvm::AllocaInst *create_entry_block_alloca(llvm::Function *function,

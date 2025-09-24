@@ -316,6 +316,21 @@ namespace Cryo::Codegen
         llvm::StructType *create_opaque_struct(const std::string &name);
 
         /**
+         * @brief Create tagged union type for complex enums
+         * @param enum_type The enum type to create tagged union for
+         * @return Tagged union LLVM struct type
+         */
+        llvm::Type *create_tagged_union_type(Cryo::EnumType *enum_type);
+
+        /**
+         * @brief Create tagged union type with specific payload size
+         * @param name Name for the tagged union type
+         * @param payload_size Size of the payload union in bytes
+         * @return Tagged union LLVM struct type
+         */
+        llvm::StructType *create_tagged_union_type(const std::string &name, size_t payload_size);
+
+        /**
          * @brief Report type mapping error
          */
         void report_error(const std::string &message);
