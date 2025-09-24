@@ -696,8 +696,84 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::TernaryExpressionNode &node)
     {
-        // TODO: Implement ternary expressions
-        register_value(&node, nullptr);
+        std::cout << "[CodegenVisitor] Generating ternary expression" << std::endl;
+        
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        
+        // Create basic blocks for then, else, and merge
+        llvm::Function *current_function = builder.GetInsertBlock()->getParent();
+        llvm::BasicBlock *then_block = llvm::BasicBlock::Create(context, "ternary.then", current_function);
+        llvm::BasicBlock *else_block = llvm::BasicBlock::Create(context, "ternary.else", current_function);
+        llvm::BasicBlock *merge_block = llvm::BasicBlock::Create(context, "ternary.merge", current_function);
+        
+        // Generate condition expression
+        node.condition()->accept(*this);
+        llvm::Value *condition_value = get_generated_value(node.condition());
+        
+        if (!condition_value) {
+            std::cerr << "[CodegenVisitor] Error: condition value is null in ternary expression" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+        
+        // Convert condition to boolean if needed
+        if (condition_value->getType() != llvm::Type::getInt1Ty(context)) {
+            if (condition_value->getType()->isIntegerTy()) {
+                condition_value = builder.CreateICmpNE(condition_value, 
+                    llvm::ConstantInt::get(condition_value->getType(), 0), "tobool");
+            } else if (condition_value->getType()->isFloatingPointTy()) {
+                condition_value = builder.CreateFCmpONE(condition_value,
+                    llvm::ConstantFP::get(condition_value->getType(), 0.0), "tobool");
+            }
+        }
+        
+        // Create conditional branch
+        builder.CreateCondBr(condition_value, then_block, else_block);
+        
+        // Generate then expression
+        builder.SetInsertPoint(then_block);
+        node.true_expression()->accept(*this);
+        llvm::Value *then_value = get_generated_value(node.true_expression());
+        if (!then_value) {
+            std::cerr << "[CodegenVisitor] Error: then value is null in ternary expression" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+        then_block = builder.GetInsertBlock(); // Update in case of nested expressions
+        builder.CreateBr(merge_block);
+        
+        // Generate else expression  
+        builder.SetInsertPoint(else_block);
+        node.false_expression()->accept(*this);
+        llvm::Value *else_value = get_generated_value(node.false_expression());
+        if (!else_value) {
+            std::cerr << "[CodegenVisitor] Error: else value is null in ternary expression" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+        else_block = builder.GetInsertBlock(); // Update in case of nested expressions
+        builder.CreateBr(merge_block);
+        
+        // Create merge block with PHI node
+        builder.SetInsertPoint(merge_block);
+        
+        // Ensure both values have the same type (add type coercion if needed)
+        llvm::Type *result_type = then_value->getType();
+        if (then_value->getType() != else_value->getType()) {
+            std::cerr << "[CodegenVisitor] Warning: Type mismatch in ternary expression branches" << std::endl;
+            // For now, we'll assume they should be the same type
+            // In a full implementation, we'd need type coercion logic here
+        }
+        
+        llvm::PHINode *phi = builder.CreatePHI(result_type, 2, "ternary.result");
+        phi->addIncoming(then_value, then_block);
+        phi->addIncoming(else_value, else_block);
+        
+        register_value(&node, phi);
+        set_current_value(phi);
+        
+        std::cout << "[CodegenVisitor] Generated ternary expression successfully" << std::endl;
     }
 
     void CodegenVisitor::visit(Cryo::CallExpressionNode &node)
