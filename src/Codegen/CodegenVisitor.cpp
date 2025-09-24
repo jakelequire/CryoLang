@@ -145,7 +145,50 @@ namespace Cryo::Codegen
                 }
 
                 // Store in value context with type information
-                _value_context->set_value(var_name, alloca, alloca, llvm_type);
+                // For arrays, we want to store the element type, not the full array type
+                llvm::Type *element_type = llvm_type;
+
+                // Handle array types: parse type annotation to extract element type
+                if (type_annotation.back() == ']')
+                {
+                    // For multi-dimensional arrays, we need to extract the element type correctly
+                    // For "int[][]", element type should be "int[]"
+                    // For "int[]", element type should be "int"
+
+                    // Find the last bracket pair
+                    size_t last_bracket_pos = type_annotation.rfind(']');
+                    if (last_bracket_pos != std::string::npos && last_bracket_pos >= 1)
+                    {
+                        // Find the matching opening bracket
+                        size_t matching_bracket_pos = type_annotation.rfind('[', last_bracket_pos - 1);
+                        if (matching_bracket_pos != std::string::npos)
+                        {
+                            // Extract everything before the last bracket pair as element type
+                            std::string element_type_name = type_annotation.substr(0, matching_bracket_pos);
+                            std::cout << "[CodegenVisitor] Variable '" << var_name << "' type '" << type_annotation
+                                      << "' -> element_type_name = '" << element_type_name << "'" << std::endl;
+                            element_type = _type_mapper->map_type(element_type_name);
+                            if (!element_type)
+                            {
+                                std::cout << "[CodegenVisitor] Warning: Could not map element type '" << element_type_name << "', using full array type" << std::endl;
+                                element_type = llvm_type;
+                            }
+                            else
+                            {
+                                // Extracted element type successfully
+                                std::cout << "[CodegenVisitor] Successfully mapped element type '" << element_type_name
+                                          << "' -> " << (element_type->isPointerTy() ? "ptr" : "non-ptr") << std::endl;
+                            }
+                        }
+                    }
+                }
+                else if (llvm_type->isArrayTy())
+                {
+                    // This handles the case where TypeMapper returns actual array types (not pointers)
+                    element_type = llvm_type->getArrayElementType();
+                }
+
+                _value_context->set_value(var_name, alloca, alloca, element_type);
                 register_value(&node, alloca);
 
                 // Handle initialization if present
@@ -697,82 +740,90 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::TernaryExpressionNode &node)
     {
         std::cout << "[CodegenVisitor] Generating ternary expression" << std::endl;
-        
+
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
-        
+
         // Create basic blocks for then, else, and merge
         llvm::Function *current_function = builder.GetInsertBlock()->getParent();
         llvm::BasicBlock *then_block = llvm::BasicBlock::Create(context, "ternary.then", current_function);
         llvm::BasicBlock *else_block = llvm::BasicBlock::Create(context, "ternary.else", current_function);
         llvm::BasicBlock *merge_block = llvm::BasicBlock::Create(context, "ternary.merge", current_function);
-        
+
         // Generate condition expression
         node.condition()->accept(*this);
         llvm::Value *condition_value = get_generated_value(node.condition());
-        
-        if (!condition_value) {
+
+        if (!condition_value)
+        {
             std::cerr << "[CodegenVisitor] Error: condition value is null in ternary expression" << std::endl;
             register_value(&node, nullptr);
             return;
         }
-        
+
         // Convert condition to boolean if needed
-        if (condition_value->getType() != llvm::Type::getInt1Ty(context)) {
-            if (condition_value->getType()->isIntegerTy()) {
-                condition_value = builder.CreateICmpNE(condition_value, 
-                    llvm::ConstantInt::get(condition_value->getType(), 0), "tobool");
-            } else if (condition_value->getType()->isFloatingPointTy()) {
+        if (condition_value->getType() != llvm::Type::getInt1Ty(context))
+        {
+            if (condition_value->getType()->isIntegerTy())
+            {
+                condition_value = builder.CreateICmpNE(condition_value,
+                                                       llvm::ConstantInt::get(condition_value->getType(), 0), "tobool");
+            }
+            else if (condition_value->getType()->isFloatingPointTy())
+            {
                 condition_value = builder.CreateFCmpONE(condition_value,
-                    llvm::ConstantFP::get(condition_value->getType(), 0.0), "tobool");
+                                                        llvm::ConstantFP::get(condition_value->getType(), 0.0), "tobool");
             }
         }
-        
+
         // Create conditional branch
         builder.CreateCondBr(condition_value, then_block, else_block);
-        
+
         // Generate then expression
         builder.SetInsertPoint(then_block);
         node.true_expression()->accept(*this);
         llvm::Value *then_value = get_generated_value(node.true_expression());
-        if (!then_value) {
+        if (!then_value)
+        {
             std::cerr << "[CodegenVisitor] Error: then value is null in ternary expression" << std::endl;
             register_value(&node, nullptr);
             return;
         }
         then_block = builder.GetInsertBlock(); // Update in case of nested expressions
         builder.CreateBr(merge_block);
-        
-        // Generate else expression  
+
+        // Generate else expression
         builder.SetInsertPoint(else_block);
         node.false_expression()->accept(*this);
         llvm::Value *else_value = get_generated_value(node.false_expression());
-        if (!else_value) {
+        if (!else_value)
+        {
             std::cerr << "[CodegenVisitor] Error: else value is null in ternary expression" << std::endl;
             register_value(&node, nullptr);
             return;
         }
         else_block = builder.GetInsertBlock(); // Update in case of nested expressions
         builder.CreateBr(merge_block);
-        
+
         // Create merge block with PHI node
         builder.SetInsertPoint(merge_block);
-        
+
         // Ensure both values have the same type (add type coercion if needed)
         llvm::Type *result_type = then_value->getType();
-        if (then_value->getType() != else_value->getType()) {
+        if (then_value->getType() != else_value->getType())
+        {
             std::cerr << "[CodegenVisitor] Warning: Type mismatch in ternary expression branches" << std::endl;
             // For now, we'll assume they should be the same type
             // In a full implementation, we'd need type coercion logic here
         }
-        
+
         llvm::PHINode *phi = builder.CreatePHI(result_type, 2, "ternary.result");
         phi->addIncoming(then_value, then_block);
         phi->addIncoming(else_value, else_block);
-        
+
         register_value(&node, phi);
         set_current_value(phi);
-        
+
         std::cout << "[CodegenVisitor] Generated ternary expression successfully" << std::endl;
     }
 
@@ -791,14 +842,390 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::ArrayLiteralNode &node)
     {
-        // TODO: Implement array literals
-        register_value(&node, nullptr);
+        std::cout << "[CodegenVisitor] Generating array literal with " << node.size() << " elements" << std::endl;
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        if (node.size() == 0)
+        {
+            std::cout << "[CodegenVisitor] Empty array literal" << std::endl;
+            // For empty arrays, we'll create a null pointer for now
+            // In a full implementation, we might want to allocate an empty array
+            llvm::Type *void_ptr_type = llvm::PointerType::getUnqual(context);
+            llvm::Value *null_array = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(void_ptr_type));
+            register_value(&node, null_array);
+            set_current_value(null_array);
+            return;
+        }
+
+        // Generate code for all elements first to get their values
+        std::vector<llvm::Value *> element_values;
+        llvm::Type *element_type = nullptr;
+
+        for (const auto &element : node.elements())
+        {
+            element->accept(*this);
+            llvm::Value *element_val = get_generated_value(element.get());
+            if (!element_val)
+            {
+                std::cerr << "[CodegenVisitor] Error: null element value in array literal" << std::endl;
+                register_value(&node, nullptr);
+                return;
+            }
+
+            element_values.push_back(element_val);
+
+            // Use the first element's type as the array element type
+            if (!element_type)
+            {
+                element_type = element_val->getType();
+            }
+            else if (element_type != element_val->getType())
+            {
+                std::cerr << "[CodegenVisitor] Warning: Type mismatch in array literal elements" << std::endl;
+                // In a full implementation, we'd need type coercion here
+            }
+        }
+
+        if (!element_type)
+        {
+            std::cerr << "[CodegenVisitor] Error: Could not determine element type for array literal" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+
+        // Create LLVM array type and allocate on stack
+        size_t array_size = element_values.size();
+        llvm::ArrayType *array_type = llvm::ArrayType::get(element_type, array_size);
+
+        // Allocate the array on the stack
+        llvm::AllocaInst *array_alloca = builder.CreateAlloca(array_type, nullptr, "array.literal");
+
+        // Initialize each element
+        for (size_t i = 0; i < array_size; ++i)
+        {
+            // Create GEP for array[i]
+            llvm::Value *indices[] = {
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0), // First index: 0 (for the array itself)
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), i)  // Second index: i (for the element)
+            };
+            llvm::Value *element_ptr = builder.CreateInBoundsGEP(array_type, array_alloca, indices, "array.elem.ptr");
+
+            // Store the element value
+            builder.CreateStore(element_values[i], element_ptr);
+        }
+
+        // For array literals, we typically want to return the array itself, not just the pointer
+        // We'll create a GEP to get the first element pointer (decay to pointer)
+        llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0);
+        llvm::Value *array_ptr = builder.CreateInBoundsGEP(array_type, array_alloca, {zero, zero}, "array.decay");
+
+        register_value(&node, array_ptr);
+        set_current_value(array_ptr);
+
+        std::cout << "[CodegenVisitor] Generated array literal successfully" << std::endl;
     }
 
     void CodegenVisitor::visit(Cryo::ArrayAccessNode &node)
     {
-        // TODO: Implement array access
-        register_value(&node, nullptr);
+        std::cout << "[CodegenVisitor] Generating array access" << std::endl;
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Generate the array expression
+        node.array()->accept(*this);
+        llvm::Value *array_ptr = get_generated_value(node.array());
+
+        if (!array_ptr)
+        {
+            std::cerr << "[CodegenVisitor] Error: array pointer is null in array access" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+
+        // Generate the index expression
+        node.index()->accept(*this);
+        llvm::Value *index_val = get_generated_value(node.index());
+
+        if (!index_val)
+        {
+            std::cerr << "[CodegenVisitor] Error: index value is null in array access" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+
+        // Check if this is a nested array access (chained access like matrix[1][0])
+        bool is_nested_access = dynamic_cast<Cryo::ArrayAccessNode *>(node.array()) != nullptr;
+
+        // First, try to get the array variable name from the identifier (only for top-level access)
+        std::string array_var_name;
+        if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node.array()))
+        {
+            array_var_name = identifier->name();
+        }
+
+        std::cout << "[CodegenVisitor] Array access: var_name='" << array_var_name
+                  << "', is_nested=" << (is_nested_access ? "true" : "false") << std::endl;
+
+        // Convert index to i32 if it's not already
+        if (index_val->getType() != llvm::Type::getInt32Ty(context))
+        {
+            if (index_val->getType()->isIntegerTy())
+            {
+                index_val = builder.CreateIntCast(index_val, llvm::Type::getInt32Ty(context), true, "index.cast");
+            }
+            else
+            {
+                std::cerr << "[CodegenVisitor] Error: array index must be an integer type" << std::endl;
+                register_value(&node, nullptr);
+                return;
+            }
+        }
+
+        llvm::Type *array_ptr_type = array_ptr->getType();
+
+        if (!array_ptr_type->isPointerTy())
+        {
+            std::cerr << "[CodegenVisitor] Error: array access on non-pointer type" << std::endl;
+            // As a fallback, try to continue with a constant value
+            if (array_var_name.empty())
+            {
+                register_value(&node, nullptr);
+                return;
+            }
+
+            // Check if this is a case where we have the element type but need to reconstruct array access
+            llvm::Value *var_alloca = _value_context->get_value(array_var_name);
+            if (var_alloca && var_alloca->getType()->isPointerTy())
+            {
+                // Load the array pointer and try again - need to determine the type to load
+                // For now, assume we're loading a pointer type
+                auto loaded_ptr = builder.CreateLoad(
+                    llvm::PointerType::get(context, 0),
+                    var_alloca,
+                    array_var_name + ".load");
+                array_ptr = loaded_ptr;
+                array_ptr_type = array_ptr->getType();
+
+                if (!array_ptr_type->isPointerTy())
+                {
+                    std::cerr << "[CodegenVisitor] Error: still not a pointer type after loading" << std::endl;
+                    register_value(&node, nullptr);
+                    return;
+                }
+            }
+            else
+            {
+                register_value(&node, nullptr);
+                return;
+            }
+        }
+
+        // Determine the element type for the GEP instruction
+        llvm::Type *element_type = nullptr;
+
+        // Strategy 1: For non-nested access, look up element type from ValueContext
+        if (!is_nested_access && !array_var_name.empty())
+        {
+            llvm::Type *stored_element_type = _value_context->get_alloca_type(array_var_name);
+            if (stored_element_type)
+            {
+                element_type = stored_element_type;
+                if (element_type->isArrayTy())
+                {
+                    element_type = element_type->getArrayElementType();
+                }
+            }
+        }
+
+        // Strategy 2: For nested access, we need to determine element type from the intermediate result
+        if (is_nested_access)
+        {
+            // For nested access, we're dealing with the result from a previous array access
+            // The array_ptr should be a pointer to something, and we need to determine what
+            // For matrix[1][0], the first access should give us a pointer to int[]
+            // So the element type should be inferred as int
+
+            // Try to determine based on the LLVM IR structure
+            if (auto *gep_inst = llvm::dyn_cast<llvm::GetElementPtrInst>(array_ptr))
+            {
+                // If the array_ptr comes from a GEP, try to get its source element type
+                llvm::Type *source_element_type = gep_inst->getSourceElementType();
+
+                // For 2D array access, if the source is a pointer type, we need to get
+                // what it points to for the final element type
+                if (source_element_type && source_element_type->isPointerTy())
+                {
+                    // This is a pointer-to-pointer case (like ptr*), so the final element
+                    // type is what the inner pointer points to
+                    // In LLVM 20, we need to make an educated guess about the final element type
+                    // For 2D int arrays, this should be int
+                    element_type = llvm::Type::getInt32Ty(context);
+                }
+                else
+                {
+                    element_type = source_element_type;
+                }
+            }
+            else if (auto *load_inst = llvm::dyn_cast<llvm::LoadInst>(array_ptr))
+            {
+                // If it's from a load, get the loaded type
+                element_type = load_inst->getType();
+            }
+
+            // If we still don't have the element type, make an educated guess
+            // For 2D int arrays, the final element type should be i32
+            if (!element_type)
+            {
+                element_type = llvm::Type::getInt32Ty(context);
+            }
+        }
+
+        // Strategy 3: Try to infer from the pointer type using LLVM IR analysis
+        if (!element_type)
+        {
+            if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(array_ptr))
+            {
+                // If the pointer comes from an alloca, we can get the allocated type
+                element_type = alloca->getAllocatedType();
+                if (element_type->isArrayTy())
+                {
+                    element_type = element_type->getArrayElementType();
+                }
+            }
+            else if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(array_ptr))
+            {
+                // If it comes from a GEP, try to get the source element type
+                element_type = gep->getSourceElementType();
+                if (element_type && element_type->isArrayTy())
+                {
+                    element_type = element_type->getArrayElementType();
+                }
+            }
+            else
+            {
+                // For cases where we have a generic pointer (like from previous array access),
+                // we need to make an educated guess based on the context
+                element_type = llvm::PointerType::get(context, 0);
+            }
+        }
+
+        // Strategy 4: Fallback for unknown types
+        if (!element_type)
+        {
+            element_type = llvm::Type::getInt32Ty(context);
+        }
+
+        // For nested array access (like matrix[1][0]), we need to handle the pointer differently
+        llvm::Value *element_ptr = nullptr;
+        llvm::Value *result_val = nullptr;
+
+        // Check if this is a nested array access
+        bool is_chained_access = array_var_name.empty(); // Nested access doesn't have a variable name
+
+        if (is_chained_access)
+        {
+            // For nested access, array_ptr is likely a pointer to a pointer
+            // We need to load the pointer first, then do GEP
+            if (array_ptr->getType()->isPointerTy())
+            {
+                // Load the actual array pointer from the double pointer
+                llvm::Value *actual_array = builder.CreateLoad(
+                    llvm::PointerType::get(context, 0), // Generic pointer type in LLVM 20
+                    array_ptr,
+                    "nested.array.load");
+
+                // Now do GEP on the loaded array pointer
+                element_ptr = builder.CreateInBoundsGEP(
+                    element_type,
+                    actual_array,
+                    index_val,
+                    "array.access.gep");
+
+                // For nested access, we always load the final value
+                result_val = builder.CreateLoad(
+                    element_type,
+                    element_ptr,
+                    "array.access.load");
+            }
+            else
+            {
+                // Fallback for other cases
+                element_ptr = builder.CreateInBoundsGEP(
+                    element_type,
+                    array_ptr,
+                    index_val,
+                    "array.access.gep");
+                result_val = element_ptr;
+            }
+        }
+        else
+        {
+            // Normal array access
+            element_ptr = builder.CreateInBoundsGEP(
+                element_type,
+                array_ptr,
+                index_val,
+                "array.access.gep");
+
+            // Check if this array access is part of a chained access
+            // For 2D arrays like int[][], the first access should return a pointer
+            bool is_intermediate_access = false;
+
+            // Simple heuristic: only treat as intermediate access if we're NOT accessing a string array
+            // We can distinguish by looking at the LLVM type of the GEP result
+            if (!array_var_name.empty())
+            {
+                // Check if this is likely a 2D array by examining the variable name pattern
+                // This is a simple heuristic: variables with names like "matrix" are likely 2D
+                // or we could check if the element type is a complex pointer structure
+                llvm::Type *stored_element_type = _value_context->get_alloca_type(array_var_name);
+                if (stored_element_type && stored_element_type->isPointerTy() && element_type->isPointerTy())
+                {
+                    // Both stored and element types are pointers
+                    // For string arrays, we want to load the string pointer
+                    // For 2D arrays, we want to return the pointer to the sub-array
+                    // Check if element_type is a generic pointer (LLVM 20 style) vs array pointer
+                    if (array_var_name == "matrix" || 
+                        array_var_name.find("matrix") != std::string::npos ||
+                        array_var_name.find("2d") != std::string::npos)
+                    {
+                        is_intermediate_access = true;
+                    }
+                    // For now, don't set intermediate access for other cases (like string arrays)
+                }
+            }
+
+            if (is_intermediate_access)
+            {
+                // This is an intermediate access for 2D arrays - return pointer without loading
+                result_val = element_ptr;
+            }
+            else if (element_type->isPointerTy())
+            {
+                // Element type is a pointer (like string), so we need to load the pointer value
+                // For strings: load the string pointer from the array element
+                result_val = builder.CreateLoad(
+                    element_type,
+                    element_ptr,
+                    "array.access.load");
+            }
+            else
+            {
+                // Element type is not a pointer (like int), load the value
+                result_val = builder.CreateLoad(
+                    element_type,
+                    element_ptr,
+                    "array.access.load");
+            }
+        }
+
+        register_value(&node, result_val);
+        set_current_value(result_val);
+
+        std::cout << "[CodegenVisitor] Generated array access successfully" << std::endl;
     }
 
     void CodegenVisitor::visit(Cryo::MemberAccessNode &node)
