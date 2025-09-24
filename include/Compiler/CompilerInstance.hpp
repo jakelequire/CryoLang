@@ -42,6 +42,7 @@ namespace Cryo
         std::string _source_file;
         std::vector<std::string> _include_paths;
         bool _debug_mode;
+        bool _show_ast_before_ir;
         std::string _current_namespace; // Current namespace context
 
         // Results
@@ -55,6 +56,7 @@ namespace Cryo
         void set_source_file(const std::string &file_path);
         void add_include_path(const std::string &path);
         void set_debug_mode(bool enable) { _debug_mode = enable; }
+        void set_show_ast_before_ir(bool show) { _show_ast_before_ir = show; }
 
         // Main compilation phases
         bool compile_file(const std::string &source_file);

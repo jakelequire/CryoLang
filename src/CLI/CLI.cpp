@@ -333,16 +333,18 @@ namespace Cryo::CLI
         auto compiler = Cryo::create_compiler_instance();
         compiler->set_debug_mode(true);
 
+        // Set AST printing flag if requested
+        if (args.show_ast())
+        {
+            compiler->set_show_ast_before_ir(true);
+        }
+
         if (compiler->compile_file(file_path))
         {
             std::cout << "\n✓ Compilation successful!" << std::endl;
 
             // Show outputs based on requested flags
-            if (args.show_ast())
-            {
-                std::cout << "\nGenerated AST:" << std::endl;
-                compiler->dump_ast();
-            }
+            // Note: AST is already shown before IR generation if --ast flag was used
 
             if (args.show_symbols())
             {

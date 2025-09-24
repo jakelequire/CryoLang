@@ -144,8 +144,8 @@ namespace Cryo::Codegen
                     return;
                 }
 
-                // Store in value context
-                _value_context->set_value(var_name, alloca, alloca);
+                // Store in value context with type information
+                _value_context->set_value(var_name, alloca, alloca, llvm_type);
                 register_value(&node, alloca);
 
                 // Handle initialization if present
@@ -417,15 +417,78 @@ namespace Cryo::Codegen
         {
         case TokenKind::TK_NUMERIC_CONSTANT:
         {
-            // Simple integer for now
-            int64_t int_val = std::stoll(node.value());
-            literal_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
+            std::string value_str = node.value();
+
+            // Check if it's a float (contains decimal point)
+            if (value_str.find('.') != std::string::npos)
+            {
+                // Float literal
+                float float_val = std::stof(value_str);
+                literal_value = llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_ctx), float_val);
+            }
+            else
+            {
+                // Integer literal
+                int64_t int_val = std::stoll(value_str);
+                literal_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
+            }
             break;
         }
         case TokenKind::TK_BOOLEAN_LITERAL:
+        case TokenKind::TK_KW_TRUE:
+        case TokenKind::TK_KW_FALSE:
         {
             bool bool_val = (node.value() == "true");
             literal_value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_ctx), bool_val);
+            break;
+        }
+        case TokenKind::TK_CHAR_CONSTANT:
+        {
+            std::string char_val = node.value();
+
+            // Handle character literals like 'A', '\n', etc.
+            char actual_char = 0;
+            if (char_val.length() >= 3 && char_val.front() == '\'' && char_val.back() == '\'')
+            {
+                // Extract the character between the quotes
+                std::string inner = char_val.substr(1, char_val.length() - 2);
+                if (inner.length() == 1)
+                {
+                    actual_char = inner[0];
+                }
+                else if (inner.length() == 2 && inner[0] == '\\')
+                {
+                    // Handle escape sequences
+                    switch (inner[1])
+                    {
+                    case 'n':
+                        actual_char = '\n';
+                        break;
+                    case 't':
+                        actual_char = '\t';
+                        break;
+                    case 'r':
+                        actual_char = '\r';
+                        break;
+                    case '\\':
+                        actual_char = '\\';
+                        break;
+                    case '\'':
+                        actual_char = '\'';
+                        break;
+                    case '\"':
+                        actual_char = '\"';
+                        break;
+                    case '0':
+                        actual_char = '\0';
+                        break;
+                    default:
+                        actual_char = inner[1];
+                        break; // Fallback
+                    }
+                }
+            }
+            literal_value = llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_ctx), actual_char);
             break;
         }
         case TokenKind::TK_STRING_LITERAL:
@@ -464,7 +527,9 @@ namespace Cryo::Codegen
                 // Load the variable value if it's an alloca
                 if (llvm::isa<llvm::AllocaInst>(var_alloca))
                 {
-                    llvm::Value *loaded_value = create_load(var_alloca, identifier + ".load");
+                    // Get the proper element type for the alloca
+                    llvm::Type *element_type = _value_context->get_alloca_type(identifier);
+                    llvm::Value *loaded_value = create_load(var_alloca, element_type, identifier + ".load");
                     set_current_value(loaded_value);
                     register_value(&node, loaded_value);
                 }
@@ -481,7 +546,15 @@ namespace Cryo::Codegen
             auto global_it = _globals.find(identifier);
             if (global_it != _globals.end())
             {
-                llvm::Value *loaded_value = create_load(global_it->second, identifier + ".global.load");
+                // Look up the element type for this global
+                llvm::Type *element_type = nullptr;
+                auto global_type_it = _global_types.find(identifier);
+                if (global_type_it != _global_types.end())
+                {
+                    element_type = global_type_it->second;
+                }
+
+                llvm::Value *loaded_value = create_load(global_it->second, element_type, identifier + ".global.load");
                 set_current_value(loaded_value);
                 register_value(&node, loaded_value);
                 return;
@@ -707,8 +780,11 @@ namespace Cryo::Codegen
         if (!node || !function || !node->body())
             return false;
 
+        // Debug output
+
         try
         {
+
             // Create function context
             _current_function = std::make_unique<FunctionContext>(function, node);
 
@@ -718,16 +794,40 @@ namespace Cryo::Codegen
             _current_function->entry_block = entry_block;
 
             // Create return block (for functions with return statements)
-            if (!function->getReturnType()->isVoidTy())
+            // Validate function pointer before using it
+            if (!function || function == nullptr)
             {
+                report_error("Function pointer is null in generate_function_body");
+                return false;
+            }
+
+            // Use AST node to determine return type instead of LLVM function
+            // This avoids potential LLVM function corruption
+            std::string return_type_str = node->return_type_annotation();
+            bool is_void_function = (return_type_str == "void");
+
+            if (!is_void_function)
+            {
+
                 _current_function->return_block = llvm::BasicBlock::Create(
                     _context_manager.get_context(), "return", function);
 
                 // Create alloca for return value
                 auto &builder = _context_manager.get_builder();
                 builder.SetInsertPoint(entry_block);
-                _current_function->return_value_alloca = builder.CreateAlloca(
-                    function->getReturnType(), nullptr, "retval");
+
+                // Map the return type from AST
+                llvm::Type *llvm_return_type = _type_mapper->map_type(return_type_str);
+                if (llvm_return_type)
+                {
+                    _current_function->return_value_alloca = builder.CreateAlloca(
+                        llvm_return_type, nullptr, "retval");
+                }
+                else
+                {
+                    report_error("Failed to map return type: " + return_type_str);
+                    return false;
+                }
             }
 
             // Set insertion point to entry block
@@ -736,34 +836,45 @@ namespace Cryo::Codegen
             // Enter function scope BEFORE registering parameters
             enter_scope(entry_block);
 
-            // Create allocas and store parameter values
-            auto param_it = node->parameters().begin();
-            for (auto &arg : function->args())
+            // Create allocas and store parameter values using AST information instead of LLVM function args
+            // This avoids accessing the potentially corrupted LLVM function object
+            auto arg_it = function->arg_begin();
+            for (const auto &param_ptr : node->parameters())
             {
-                if (param_it != node->parameters().end())
+                if (auto var_decl = param_ptr.get())
                 {
-                    if (auto var_decl = param_it->get())
+                    std::string param_name = var_decl->name();
+                    std::string param_type_annotation = var_decl->type_annotation();
+
+                    // Map the parameter type from AST
+                    llvm::Type *param_type = _type_mapper->map_type(param_type_annotation);
+                    if (!param_type)
                     {
-                        // Use the parameter name from the AST node, not the LLVM argument
-                        std::string param_name = var_decl->name();
-
-                        // Set the LLVM argument name to match
-                        arg.setName(param_name);
-
-                        // Create alloca for parameter
-                        llvm::AllocaInst *alloca = create_entry_block_alloca(
-                            function, arg.getType(), param_name);
-
-                        if (alloca)
-                        {
-                            // Store parameter value
-                            create_store(&arg, alloca);
-
-                            // Register in value context using the correct parameter name
-                            _value_context->set_value(param_name, alloca, alloca);
-                        }
+                        report_error("Failed to map parameter type: " + param_name + " (" + param_type_annotation + ")");
+                        return false;
                     }
-                    ++param_it;
+
+                    // Create alloca for parameter
+                    llvm::AllocaInst *alloca = create_entry_block_alloca(
+                        function, param_type, param_name);
+
+                    if (alloca)
+                    {
+                        // Store the actual parameter value into the alloca
+                        if (arg_it != function->arg_end())
+                        {
+                            _context_manager.get_builder().CreateStore(&*arg_it, alloca);
+                            ++arg_it;
+                        }
+
+                        // Register the parameter in value context with proper type information
+                        _value_context->set_value(param_name, alloca, alloca, param_type);
+                    }
+                    else
+                    {
+                        report_error("Failed to create alloca for parameter: " + param_name);
+                        return false;
+                    }
                 }
             }
 
@@ -776,34 +887,55 @@ namespace Cryo::Codegen
             // Ensure proper termination
             auto &builder = _context_manager.get_builder();
 
-            if (!entry_block->getTerminator())
+            // Instead of checking the potentially corrupted entry_block,
+            // try to get the current basic block from the builder
+            llvm::BasicBlock *current_block = builder.GetInsertBlock();
+
+            // Only add termination if the current block doesn't already have one
+            if (current_block && !current_block->getTerminator())
             {
-                if (function->getReturnType()->isVoidTy())
+                // For void functions, we can try to add a void return if needed
+                if (is_void_function)
                 {
-                    builder.SetInsertPoint(entry_block);
                     builder.CreateRetVoid();
-                }
-                else if (_current_function->return_block && _current_function->return_value_alloca)
-                {
-                    // Jump to return block
-                    builder.SetInsertPoint(entry_block);
-                    builder.CreateBr(_current_function->return_block);
                 }
                 else
                 {
-                    // Return zero/null value
-                    builder.SetInsertPoint(entry_block);
-                    builder.CreateRet(llvm::Constant::getNullValue(function->getReturnType()));
+                    // For non-void functions, create a default return value
+                    llvm::Type *llvm_return_type = _type_mapper->map_type(return_type_str);
+                    if (llvm_return_type)
+                    {
+                        builder.CreateRet(llvm::Constant::getNullValue(llvm_return_type));
+                    }
+                    else
+                    {
+                        // Fallback to void return
+                        builder.CreateRetVoid();
+                    }
                 }
             }
 
-            // Also check return block if it exists
-            if (_current_function->return_block && !_current_function->return_block->getTerminator())
+            // Skip the return block handling for now to avoid corruption issues
+            // Most functions should have proper termination from the body generation
+
+            // However, we need to handle return blocks for non-void functions
+            if (_current_function->return_block && !is_void_function)
             {
-                // Generate return block terminator
-                builder.SetInsertPoint(_current_function->return_block);
-                llvm::Value *ret_val = create_load(_current_function->return_value_alloca, "retval");
-                builder.CreateRet(ret_val);
+                // Load the return value from the return value alloca and return it
+                llvm::Type *llvm_return_type = _type_mapper->map_type(return_type_str);
+                if (llvm_return_type && _current_function->return_value_alloca)
+                {
+                    builder.SetInsertPoint(_current_function->return_block);
+                    // Load from the return value alloca that was created earlier
+                    auto retValue = create_load(_current_function->return_value_alloca, llvm_return_type, "retval.load");
+                    builder.CreateRet(retValue);
+                }
+                else
+                {
+                    // Fallback: return default value
+                    builder.SetInsertPoint(_current_function->return_block);
+                    builder.CreateRet(llvm::Constant::getNullValue(llvm_return_type));
+                }
             }
 
             // Clean up function context
@@ -829,6 +961,50 @@ namespace Cryo::Codegen
 
         try
         {
+            auto &builder = _context_manager.get_builder();
+            llvm::Value *result = nullptr;
+            TokenKind op_kind = node->operator_token().kind();
+
+            // Handle assignment operations specially - don't evaluate left side as regular expression
+            if (op_kind == TokenKind::TK_EQUAL)
+            {
+                // For assignment, get the variable address directly without loading its value
+                if (auto *left_identifier = dynamic_cast<IdentifierNode *>(node->left()))
+                {
+                    // Look up the variable in the current scope
+                    std::string var_name = left_identifier->name();
+                    llvm::Value *var_alloca = _value_context->get_alloca(var_name);
+
+                    if (!var_alloca)
+                    {
+                        report_error("Assignment to undefined variable: " + var_name);
+                        return nullptr;
+                    }
+
+                    // Generate right operand
+                    node->right()->accept(*this);
+                    llvm::Value *right_val = get_current_value();
+
+                    if (!right_val)
+                    {
+                        report_error("Failed to generate right operand of assignment");
+                        return nullptr;
+                    }
+
+                    // Store the right side value to the variable
+                    create_store(right_val, var_alloca);
+
+                    // The result of assignment is the assigned value
+                    return right_val;
+                }
+                else
+                {
+                    report_error("Invalid left-hand side in assignment expression");
+                    return nullptr;
+                }
+            }
+
+            // For non-assignment operations, generate both operands normally
             // Generate left operand
             node->left()->accept(*this);
             llvm::Value *left_val = get_current_value();
@@ -848,12 +1024,6 @@ namespace Cryo::Codegen
                 report_error("Failed to generate right operand of binary expression");
                 return nullptr;
             }
-
-            auto &builder = _context_manager.get_builder();
-            llvm::Value *result = nullptr;
-
-            // Get the token kind from the operator token
-            TokenKind op_kind = node->operator_token().kind();
 
             // Handle binary operations based on operator token
             switch (op_kind)
@@ -1065,6 +1235,7 @@ namespace Cryo::Codegen
             case TokenKind::TK_PIPEPIPE:
                 result = builder.CreateOr(left_val, right_val, "or.tmp");
                 break;
+
             default:
                 report_error("Unsupported binary operator: " + node->operator_token().to_string());
                 return nullptr;
@@ -1114,8 +1285,17 @@ namespace Cryo::Codegen
         // Map Cryo function names to C runtime function names
         std::string c_function_name = map_cryo_to_c_function(function_name);
 
-        // Look up the function in the module
-        llvm::Function *function = module->getFunction(c_function_name);
+        // Extract the simple function name for LLVM module lookup
+        // Functions are stored with their simple names (e.g., "println", not "Std::Runtime::println")
+        std::string simple_function_name = c_function_name;
+        size_t last_scope_pos = c_function_name.rfind("::");
+        if (last_scope_pos != std::string::npos)
+        {
+            simple_function_name = c_function_name.substr(last_scope_pos + 2);
+        }
+
+        // Look up the function in the module using the simple name
+        llvm::Function *function = module->getFunction(simple_function_name);
         if (!function)
         {
             // Function not declared yet, create a declaration
@@ -1280,7 +1460,7 @@ namespace Cryo::Codegen
         }
     }
 
-    llvm::Value *CodegenVisitor::create_load(llvm::Value *ptr, const std::string &name)
+    llvm::Value *CodegenVisitor::create_load(llvm::Value *ptr, llvm::Type *element_type, const std::string &name)
     {
         if (!ptr)
             return nullptr;
@@ -1288,12 +1468,9 @@ namespace Cryo::Codegen
         try
         {
             auto &builder = _context_manager.get_builder();
-            // For LLVM 20, we need to provide the element type explicitly
-            llvm::Type *element_type = nullptr;
-            if (ptr->getType()->isPointerTy())
+            // Use provided element type, fallback to i32 if not provided
+            if (!element_type)
             {
-                // For opaque pointers in LLVM 20, we need to infer the type
-                // This is a simplified approach - in practice, we'd track the original type
                 element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
             }
             return builder.CreateLoad(element_type, ptr, name);
@@ -1304,7 +1481,6 @@ namespace Cryo::Codegen
             return nullptr;
         }
     }
-
     void CodegenVisitor::create_store(llvm::Value *value, llvm::Value *ptr)
     {
         if (!value || !ptr)

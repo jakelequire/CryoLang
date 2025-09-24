@@ -7,7 +7,7 @@
 namespace Cryo
 {
     CompilerInstance::CompilerInstance()
-        : _debug_mode(false)
+        : _debug_mode(false), _show_ast_before_ir(false)
     {
         initialize_components();
     }
@@ -146,6 +146,13 @@ namespace Cryo
             if (_debug_mode)
             {
                 std::cout << "Generating IR..." << std::endl;
+            }
+
+            // Print AST if requested before IR generation
+            if (_show_ast_before_ir)
+            {
+                std::cout << "\nGenerated AST:" << std::endl;
+                dump_ast();
             }
 
             if (!generate_ir())

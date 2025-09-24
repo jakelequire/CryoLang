@@ -56,7 +56,7 @@ namespace Cryo::CLI::Commands
             std::cout << "Build Information:" << std::endl;
             std::cout << "  Built with: Clang++ (C++23)" << std::endl;
             std::cout << "  LLVM Support: Yes" << std::endl;
-            std::cout << "  Platform: " 
+            std::cout << "  Platform: "
 #ifdef _WIN32
                       << "Windows"
 #elif __linux__
@@ -138,6 +138,12 @@ namespace Cryo::CLI::Commands
         auto compiler = Cryo::create_compiler_instance();
         compiler->set_debug_mode(debug);
 
+        // Set AST printing flag if requested
+        if (args.get_flag("ast"))
+        {
+            compiler->set_show_ast_before_ir(true);
+        }
+
         // Compile
         bool success = compiler->compile_file(input_file);
 
@@ -155,11 +161,7 @@ namespace Cryo::CLI::Commands
         if (success)
         {
             // Show requested outputs
-            if (args.get_flag("ast"))
-            {
-                std::cout << "\nGenerated AST:" << std::endl;
-                compiler->dump_ast();
-            }
+            // Note: AST is already shown before IR generation if --ast flag was used
 
             if (args.get_flag("symbols"))
             {
@@ -292,16 +294,17 @@ namespace Cryo::CLI::Commands
         // Create compiler instance
         auto compiler = Cryo::create_compiler_instance();
         compiler->set_debug_mode(false);
+        // Don't set show_ast_before_ir for this command as it handles AST printing specially
 
         // Parse file
         if (compiler->compile_file(input_file))
         {
             std::cout << "AST for '" << input_file << "':" << std::endl;
             std::cout << std::string(50, '=') << std::endl;
-            
+
             bool use_colors = args.get_flag("colors");
             compiler->dump_ast(std::cout, use_colors);
-            
+
             return 0;
         }
         else
@@ -347,7 +350,7 @@ namespace Cryo::CLI::Commands
 
         std::cout << "Tokens for '" << input_file << "':" << std::endl;
         std::cout << std::string(50, '=') << std::endl;
-        
+
         // Note: This would require access to just the lexer
         // For now, we'll indicate it's not fully implemented
         std::cout << "Token output is not yet fully implemented." << std::endl;
@@ -399,11 +402,11 @@ namespace Cryo::CLI::Commands
             std::cout << "Symbol table for '" << input_file << "':" << std::endl;
             std::cout << std::string(50, '=') << std::endl;
             compiler->dump_symbol_table();
-            
+
             std::cout << "\nType table:" << std::endl;
             std::cout << std::string(50, '=') << std::endl;
             compiler->dump_type_table();
-            
+
             return 0;
         }
         else
@@ -458,7 +461,7 @@ namespace Cryo::CLI::Commands
     {
         std::cout << "System Information" << std::endl;
         std::cout << std::string(20, '=') << std::endl;
-        
+
         std::cout << "Platform: "
 #ifdef _WIN32
                   << "Windows"
