@@ -226,6 +226,10 @@ namespace Cryo::Codegen
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
 
+        // Loop context for break/continue
+        llvm::BasicBlock *_current_loop_exit = nullptr;
+        llvm::BasicBlock *_current_loop_continue = nullptr;
+
         //===================================================================
         // Error State
         //===================================================================

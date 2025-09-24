@@ -311,12 +311,34 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::BlockStatementNode &node)
     {
+        auto &builder = _context_manager.get_builder();
+        llvm::BasicBlock *currentBlock = builder.GetInsertBlock();
+
         for (auto &statement : node.statements())
         {
             if (statement)
             {
                 statement->accept(*this);
             }
+        }
+
+        // After processing all statements in the block, make sure the current basic block
+        // has a terminator if it doesn't already have one. This is important for nested
+        // control flow where the block might end with a control flow statement.
+        llvm::BasicBlock *finalBlock = builder.GetInsertBlock();
+        if (finalBlock && !finalBlock->getTerminator())
+        {
+            // The block doesn't have a terminator. This can happen when the last statement
+            // in the block is a control flow statement (like if-else) that leaves us in
+            // a merge block without a terminator.
+            //
+            // Since we're in a block statement (compound statement), we should continue
+            // with the next instruction after the block. However, if this block is the
+            // body of an if statement or loop, the parent control structure will handle
+            // the terminator.
+            //
+            // For now, we'll let the parent control structure handle this case.
+            // If we're at function level, the function will add a return.
         }
     }
 
@@ -366,20 +388,33 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::IfStatementNode &node)
     {
-        // TODO: Implement if statement generation
-        register_value(&node, nullptr);
+        try
+        {
+            generate_if_statement(&node);
+            register_value(&node, nullptr);
+        }
+        catch (const std::exception &e)
+        {
+            report_error("Exception in if statement: " + std::string(e.what()), &node);
+        }
     }
 
     void CodegenVisitor::visit(Cryo::WhileStatementNode &node)
     {
-        // TODO: Implement while loop generation
-        register_value(&node, nullptr);
+        try
+        {
+            generate_while_loop(&node);
+            register_value(&node, nullptr);
+        }
+        catch (const std::exception &e)
+        {
+            report_error("Exception in while loop: " + std::string(e.what()), &node);
+        }
     }
 
     void CodegenVisitor::visit(Cryo::ForStatementNode &node)
     {
-        // TODO: Implement for loop generation
-        register_value(&node, nullptr);
+        generate_for_loop(&node);
     }
 
     void CodegenVisitor::visit(Cryo::MatchStatementNode &node)
@@ -398,13 +433,53 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::BreakStatementNode &node)
     {
-        // TODO: Implement break statement generation
+        auto &builder = _context_manager.get_builder();
+
+        if (_loop_stack.empty())
+        {
+            std::cerr << "[ERROR] Break statement used outside of loop context" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+
+        // Get the current loop context
+        const auto &loop_context = _loop_stack.top();
+
+        // Create branch to the loop exit block
+        builder.CreateBr(loop_context.break_block);
+
+        // Create a new basic block for any unreachable code after break
+        // This is needed because LLVM requires all basic blocks to end with a terminator
+        llvm::Function *function = builder.GetInsertBlock()->getParent();
+        llvm::BasicBlock *unreachableBlock = llvm::BasicBlock::Create(_context_manager.get_context(), "after.break", function);
+        builder.SetInsertPoint(unreachableBlock);
+
         register_value(&node, nullptr);
     }
 
     void CodegenVisitor::visit(Cryo::ContinueStatementNode &node)
     {
-        // TODO: Implement continue statement generation
+        auto &builder = _context_manager.get_builder();
+
+        if (_loop_stack.empty())
+        {
+            std::cerr << "[ERROR] Continue statement used outside of loop context" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+
+        // Get the current loop context
+        const auto &loop_context = _loop_stack.top();
+
+        // Create branch to the loop continue block (increment in for loop, condition in while loop)
+        builder.CreateBr(loop_context.continue_block);
+
+        // Create a new basic block for any unreachable code after continue
+        // This is needed because LLVM requires all basic blocks to end with a terminator
+        llvm::Function *function = builder.GetInsertBlock()->getParent();
+        llvm::BasicBlock *unreachableBlock = llvm::BasicBlock::Create(_context_manager.get_context(), "after.continue", function);
+        builder.SetInsertPoint(unreachableBlock);
+
         register_value(&node, nullptr);
     }
 
@@ -607,8 +682,16 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::UnaryExpressionNode &node)
     {
-        // TODO: Implement unary expressions
-        register_value(&node, nullptr);
+        try
+        {
+            llvm::Value *unary_result = generate_unary_operation(&node);
+            set_current_value(unary_result);
+            register_value(&node, unary_result);
+        }
+        catch (const std::exception &e)
+        {
+            report_error("Exception in unary expression: " + std::string(e.what()), &node);
+        }
     }
 
     void CodegenVisitor::visit(Cryo::TernaryExpressionNode &node)
@@ -620,6 +703,7 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::CallExpressionNode &node)
     {
         llvm::Value *call_result = generate_function_call(&node);
+        set_current_value(call_result); // Set the current value for expressions
         register_value(&node, call_result);
     }
 
@@ -1249,7 +1333,127 @@ namespace Cryo::Codegen
             return nullptr;
         }
     }
-    llvm::Value *CodegenVisitor::generate_unary_operation(Cryo::UnaryExpressionNode *node) { return nullptr; }
+    llvm::Value *CodegenVisitor::generate_unary_operation(Cryo::UnaryExpressionNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        auto &builder = _context_manager.get_builder();
+        auto operand = node->operand();
+        if (!operand)
+        {
+            std::cerr << "[ERROR] Unary expression missing operand" << std::endl;
+            return nullptr;
+        }
+
+        // Get the operator type
+        std::string operator_str = node->operator_token().to_string();
+
+        // Handle increment and decrement operators
+        if (operator_str == "++" || operator_str == "--")
+        {
+            // For increment/decrement, operand should be a variable (identifier)
+            auto identifierNode = dynamic_cast<Cryo::IdentifierNode *>(operand);
+            if (!identifierNode)
+            {
+                std::cerr << "[ERROR] Increment/decrement can only be applied to variables" << std::endl;
+                return nullptr;
+            }
+
+            std::string varName = identifierNode->name();
+
+            // Look up the variable in the value context
+            auto varValue = _value_context->get_alloca(varName);
+            if (!varValue)
+            {
+                std::cerr << "[ERROR] Undefined variable in increment/decrement: " << varName << std::endl;
+                return nullptr;
+            }
+
+            // Load the current value
+            llvm::Value *currentValue = builder.CreateLoad(varValue->getAllocatedType(), varValue, varName + ".load");
+
+            // Generate increment or decrement
+            llvm::Value *newValue = nullptr;
+            if (operator_str == "++")
+            {
+                if (currentValue->getType()->isIntegerTy())
+                {
+                    newValue = builder.CreateAdd(currentValue, llvm::ConstantInt::get(currentValue->getType(), 1), "inc");
+                }
+                else if (currentValue->getType()->isFloatingPointTy())
+                {
+                    newValue = builder.CreateFAdd(currentValue, llvm::ConstantFP::get(currentValue->getType(), 1.0), "inc");
+                }
+                else
+                {
+                    std::cerr << "[ERROR] Cannot increment non-numeric type" << std::endl;
+                    return nullptr;
+                }
+            }
+            else // "--"
+            {
+                if (currentValue->getType()->isIntegerTy())
+                {
+                    newValue = builder.CreateSub(currentValue, llvm::ConstantInt::get(currentValue->getType(), 1), "dec");
+                }
+                else if (currentValue->getType()->isFloatingPointTy())
+                {
+                    newValue = builder.CreateFSub(currentValue, llvm::ConstantFP::get(currentValue->getType(), 1.0), "dec");
+                }
+                else
+                {
+                    std::cerr << "[ERROR] Cannot decrement non-numeric type" << std::endl;
+                    return nullptr;
+                }
+            }
+
+            // Store the new value back
+            builder.CreateStore(newValue, varValue);
+
+            // For now, assume postfix increment/decrement (return original value)
+            // TODO: Add support for prefix vs postfix based on AST node information
+            return currentValue;
+        }
+
+        // Handle other unary operators
+        operand->accept(*this);
+        llvm::Value *operandValue = get_generated_value(operand);
+        if (!operandValue)
+        {
+            std::cerr << "[ERROR] Failed to generate operand for unary expression" << std::endl;
+            return nullptr;
+        }
+
+        // Handle other unary operators
+        if (operator_str == "-")
+        {
+            if (operandValue->getType()->isIntegerTy())
+            {
+                return builder.CreateNeg(operandValue, "neg");
+            }
+            else if (operandValue->getType()->isFloatingPointTy())
+            {
+                return builder.CreateFNeg(operandValue, "fneg");
+            }
+        }
+        else if (operator_str == "!")
+        {
+            if (operandValue->getType() == llvm::Type::getInt1Ty(_context_manager.get_context()))
+            {
+                return builder.CreateNot(operandValue, "not");
+            }
+            else
+            {
+                // Convert to boolean first
+                llvm::Value *boolValue = builder.CreateICmpNE(operandValue, llvm::ConstantInt::get(operandValue->getType(), 0), "tobool");
+                return builder.CreateNot(boolValue, "not");
+            }
+        }
+
+        std::cerr << "[ERROR] Unsupported unary operator: " << operator_str << std::endl;
+        return nullptr;
+    }
     llvm::Value *CodegenVisitor::generate_function_call(Cryo::CallExpressionNode *node)
     {
         if (!node)
@@ -1422,9 +1626,241 @@ namespace Cryo::Codegen
     }
     llvm::Value *CodegenVisitor::generate_array_access(Cryo::ArrayAccessNode *node) { return nullptr; }
     llvm::Value *CodegenVisitor::generate_member_access(Cryo::MemberAccessNode *node) { return nullptr; }
-    void CodegenVisitor::generate_if_statement(Cryo::IfStatementNode *node) {}
-    void CodegenVisitor::generate_while_loop(Cryo::WhileStatementNode *node) {}
-    void CodegenVisitor::generate_for_loop(Cryo::ForStatementNode *node) {}
+    void CodegenVisitor::generate_if_statement(Cryo::IfStatementNode *node)
+    {
+        if (!node)
+            return;
+
+        auto &builder = _context_manager.get_builder();
+        llvm::Function *function = builder.GetInsertBlock()->getParent();
+
+        // Create basic blocks for control flow
+        llvm::BasicBlock *then_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.then", function);
+        llvm::BasicBlock *else_block = nullptr;
+        llvm::BasicBlock *merge_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.end", function);
+
+        // Create else block if there's an else clause
+        if (node->else_statement())
+        {
+            else_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.else", function);
+        }
+
+        // Generate condition expression
+        node->condition()->accept(*this);
+        llvm::Value *condition_val = get_current_value();
+
+        if (!condition_val)
+        {
+            report_error("Failed to generate if condition");
+            return;
+        }
+
+        // Convert condition to i1 if needed
+        if (!condition_val->getType()->isIntegerTy(1))
+        {
+            if (condition_val->getType()->isIntegerTy())
+            {
+                condition_val = builder.CreateICmpNE(condition_val,
+                                                     llvm::ConstantInt::get(condition_val->getType(), 0), "tobool");
+            }
+            else
+            {
+                report_error("Invalid condition type in if statement");
+                return;
+            }
+        }
+
+        // Branch based on condition
+        if (else_block)
+        {
+            builder.CreateCondBr(condition_val, then_block, else_block);
+        }
+        else
+        {
+            builder.CreateCondBr(condition_val, then_block, merge_block);
+        }
+
+        // Generate then block
+        builder.SetInsertPoint(then_block);
+        enter_scope(then_block);
+        node->then_statement()->accept(*this);
+        exit_scope();
+
+        // Ensure the current block (which might not be then_block if the statement
+        // contained nested control flow) ends with a branch to merge
+        llvm::BasicBlock *currentBlock = builder.GetInsertBlock();
+        if (currentBlock && !currentBlock->getTerminator())
+        {
+            builder.CreateBr(merge_block);
+        }
+
+        // Generate else block if present
+        if (else_block && node->else_statement())
+        {
+            builder.SetInsertPoint(else_block);
+            enter_scope(else_block);
+            node->else_statement()->accept(*this);
+            exit_scope();
+
+            // Ensure the current block ends with a branch to merge
+            llvm::BasicBlock *currentElseBlock = builder.GetInsertBlock();
+            if (currentElseBlock && !currentElseBlock->getTerminator())
+            {
+                builder.CreateBr(merge_block);
+            }
+        }
+
+        // Continue with merge block
+        builder.SetInsertPoint(merge_block);
+    }
+    void CodegenVisitor::generate_while_loop(Cryo::WhileStatementNode *node)
+    {
+        if (!node)
+            return;
+
+        auto &builder = _context_manager.get_builder();
+        llvm::Function *function = builder.GetInsertBlock()->getParent();
+
+        // Create basic blocks for the loop
+        llvm::BasicBlock *condition_block = llvm::BasicBlock::Create(_context_manager.get_context(), "while.cond", function);
+        llvm::BasicBlock *body_block = llvm::BasicBlock::Create(_context_manager.get_context(), "while.body", function);
+        llvm::BasicBlock *exit_block = llvm::BasicBlock::Create(_context_manager.get_context(), "while.end", function);
+
+        // Create loop context for break/continue
+        LoopContext loop_ctx(condition_block, body_block, condition_block, exit_block);
+        _loop_stack.push(loop_ctx);
+
+        // Jump to condition block
+        builder.CreateBr(condition_block);
+
+        // Generate condition block
+        builder.SetInsertPoint(condition_block);
+        node->condition()->accept(*this);
+        llvm::Value *condition_val = get_current_value();
+
+        if (!condition_val)
+        {
+            report_error("Failed to generate while loop condition");
+            return;
+        }
+
+        // Convert condition to i1 if needed
+        if (!condition_val->getType()->isIntegerTy(1))
+        {
+            if (condition_val->getType()->isIntegerTy())
+            {
+                condition_val = builder.CreateICmpNE(condition_val,
+                                                     llvm::ConstantInt::get(condition_val->getType(), 0), "tobool");
+            }
+            else
+            {
+                report_error("Invalid condition type in while loop");
+                return;
+            }
+        }
+
+        // Conditional branch: if true go to body, else exit
+        builder.CreateCondBr(condition_val, body_block, exit_block);
+
+        // Generate body block
+        builder.SetInsertPoint(body_block);
+        enter_scope(body_block);
+        node->body()->accept(*this);
+        exit_scope();
+
+        // Ensure body block ends with a branch back to condition
+        if (!body_block->getTerminator())
+        {
+            builder.CreateBr(condition_block);
+        }
+
+        // Restore loop context
+        _loop_stack.pop();
+
+        // Continue with exit block
+        builder.SetInsertPoint(exit_block);
+    }
+    void CodegenVisitor::generate_for_loop(Cryo::ForStatementNode *node)
+    {
+        if (!node)
+            return;
+
+        auto &builder = _context_manager.get_builder();
+        llvm::Function *function = builder.GetInsertBlock()->getParent();
+        if (!function)
+            return;
+
+        // Create basic blocks for the for loop
+        llvm::BasicBlock *loopCondition = llvm::BasicBlock::Create(_context_manager.get_context(), "for.cond", function);
+        llvm::BasicBlock *loopBody = llvm::BasicBlock::Create(_context_manager.get_context(), "for.body", function);
+        llvm::BasicBlock *loopIncrement = llvm::BasicBlock::Create(_context_manager.get_context(), "for.inc", function);
+        llvm::BasicBlock *afterLoop = llvm::BasicBlock::Create(_context_manager.get_context(), "for.end", function);
+
+        // Create loop context for break/continue
+        LoopContext loop_ctx(loopCondition, loopBody, loopIncrement, afterLoop);
+        _loop_stack.push(loop_ctx);
+
+        // Generate the initialization statement
+        if (node->init())
+        {
+            node->init()->accept(*this);
+        }
+
+        // Branch to the condition block
+        builder.CreateBr(loopCondition);
+
+        // Generate loop condition
+        builder.SetInsertPoint(loopCondition);
+        if (node->condition())
+        {
+            node->condition()->accept(*this);
+            llvm::Value *condValue = get_generated_value(node->condition());
+            if (!condValue)
+            {
+                std::cerr << "[ERROR] Failed to generate condition for for loop" << std::endl;
+                return;
+            }
+
+            // Ensure condition is boolean
+            if (condValue->getType() != llvm::Type::getInt1Ty(_context_manager.get_context()))
+            {
+                condValue = builder.CreateICmpNE(condValue, llvm::ConstantInt::get(condValue->getType(), 0), "for.cond.bool");
+            }
+
+            builder.CreateCondBr(condValue, loopBody, afterLoop);
+        }
+        else
+        {
+            // No condition means infinite loop
+            builder.CreateBr(loopBody);
+        }
+
+        // Generate loop body
+        builder.SetInsertPoint(loopBody);
+        if (node->body())
+        {
+            node->body()->accept(*this);
+        }
+
+        // After body, branch to increment
+        builder.CreateBr(loopIncrement);
+
+        // Generate loop increment
+        builder.SetInsertPoint(loopIncrement);
+        if (node->update())
+        {
+            node->update()->accept(*this);
+        }
+
+        // After increment, branch back to condition
+        builder.CreateBr(loopCondition);
+
+        // Continue with code after the loop
+        builder.SetInsertPoint(afterLoop);
+
+        // Restore previous loop context
+        _loop_stack.pop();
+    }
     void CodegenVisitor::generate_match_statement(Cryo::MatchStatementNode *node) {}
     // Memory management implementation
     llvm::AllocaInst *CodegenVisitor::create_entry_block_alloca(llvm::Function *function, llvm::Type *type, const std::string &name)
