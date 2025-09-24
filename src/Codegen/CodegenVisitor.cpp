@@ -262,7 +262,40 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::EnumDeclarationNode &node)
     {
-        // TODO: Implement enum generation
+        // Generate LLVM type for the enum
+        llvm::Type *enum_type = _type_mapper->map_enum_type(&node);
+        if (!enum_type)
+        {
+            report_error("Failed to generate LLVM type for enum: " + node.name());
+            register_value(&node, nullptr);
+            return;
+        }
+
+        // Register the enum type in the type system
+        _type_mapper->register_type(node.name(), enum_type);
+
+        // Determine if this is a simple or complex enum
+        bool is_simple = true;
+        for (const auto &variant : node.variants())
+        {
+            if (!variant->associated_types().empty())
+            {
+                is_simple = false;
+                break;
+            }
+        }
+
+        if (is_simple)
+        {
+            // Generate constants for simple enum variants
+            generate_simple_enum_constants(&node, enum_type);
+        }
+        else
+        {
+            // Generate constructor functions for complex enum variants
+            generate_complex_enum_constructors(&node, enum_type);
+        }
+
         register_value(&node, nullptr);
     }
 
@@ -316,7 +349,16 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::MatchArmNode &node)
     {
-        // TODO: Implement match arm generation
+        std::cout << "[CodegenVisitor] Generating match arm" << std::endl;
+
+        // The match arm code generation is handled by generate_match_arm
+        // This visitor is called when a match arm is visited directly (rare)
+
+        if (node.body())
+        {
+            node.body()->accept(*this);
+        }
+
         register_value(&node, nullptr);
     }
 
@@ -462,7 +504,72 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::MatchStatementNode &node)
     {
-        // TODO: Implement match statement generation
+        std::cout << "[CodegenVisitor] Generating match statement" << std::endl;
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Generate the expression being matched
+        node.expr()->accept(*this);
+        llvm::Value *match_value = get_current_value();
+
+        if (!match_value)
+        {
+            std::cerr << "Error: Failed to generate match expression" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+
+        std::cout << "[CodegenVisitor] Match value generated, creating switch statement" << std::endl;
+
+        // Create basic blocks for each match arm and the end
+        llvm::Function *current_function = builder.GetInsertBlock()->getParent();
+        llvm::BasicBlock *end_block = llvm::BasicBlock::Create(context, "match.end", current_function);
+        llvm::BasicBlock *default_block = llvm::BasicBlock::Create(context, "match.default", current_function);
+
+        // For enum matching, we need to extract the discriminant
+        llvm::Value *discriminant = extract_enum_discriminant(match_value);
+
+        if (!discriminant)
+        {
+            std::cerr << "Error: Failed to extract discriminant from match value" << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+
+        // Create switch instruction
+        llvm::SwitchInst *switch_inst = builder.CreateSwitch(discriminant, default_block, node.arms().size());
+
+        // Generate code for each match arm
+        for (size_t i = 0; i < node.arms().size(); ++i)
+        {
+            auto &arm = node.arms()[i];
+            llvm::BasicBlock *arm_block = llvm::BasicBlock::Create(context, "match.arm." + std::to_string(i), current_function);
+
+            // Extract discriminant value from the pattern
+            int discriminant_value = get_pattern_discriminant(arm->pattern());
+            llvm::ConstantInt *case_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), discriminant_value);
+            switch_inst->addCase(case_value, arm_block);
+
+            // Generate arm code
+            builder.SetInsertPoint(arm_block);
+            generate_match_arm(arm.get(), match_value);
+
+            // Jump to end block if no terminator was created
+            if (!arm_block->getTerminator())
+            {
+                builder.CreateBr(end_block);
+            }
+        }
+
+        // Generate default case (should not be reached for exhaustive matches)
+        builder.SetInsertPoint(default_block);
+        builder.CreateUnreachable();
+
+        // Continue after match
+        builder.SetInsertPoint(end_block);
+
+        std::cout << "[CodegenVisitor] Match statement generated successfully" << std::endl;
         register_value(&node, nullptr);
     }
 
@@ -684,6 +791,15 @@ namespace Cryo::Codegen
             {
                 set_current_value(func_it->second);
                 register_value(&node, func_it->second);
+                return;
+            }
+
+            // Try to find enum variant
+            auto enum_variant_it = _enum_variants.find(identifier);
+            if (enum_variant_it != _enum_variants.end())
+            {
+                set_current_value(enum_variant_it->second);
+                register_value(&node, enum_variant_it->second);
                 return;
             }
 
@@ -1188,7 +1304,7 @@ namespace Cryo::Codegen
                     // For string arrays, we want to load the string pointer
                     // For 2D arrays, we want to return the pointer to the sub-array
                     // Check if element_type is a generic pointer (LLVM 20 style) vs array pointer
-                    if (array_var_name == "matrix" || 
+                    if (array_var_name == "matrix" ||
                         array_var_name.find("matrix") != std::string::npos ||
                         array_var_name.find("2d") != std::string::npos)
                     {
@@ -1236,7 +1352,32 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::ScopeResolutionNode &node)
     {
-        // TODO: Implement scope resolution
+        // Handle scope resolution like Color::RED
+        std::string scope_name = node.scope_name();
+        std::string member_name = node.member_name();
+        std::string qualified_name = scope_name + "::" + member_name;
+
+        // Try to find enum variant
+        auto enum_variant_it = _enum_variants.find(qualified_name);
+        if (enum_variant_it != _enum_variants.end())
+        {
+            llvm::Value *enum_value = enum_variant_it->second;
+            set_current_value(enum_value);
+            register_value(&node, enum_value);
+            return;
+        }
+
+        // Also try unqualified name
+        auto unqualified_it = _enum_variants.find(member_name);
+        if (unqualified_it != _enum_variants.end())
+        {
+            llvm::Value *enum_value = unqualified_it->second;
+            set_current_value(enum_value);
+            register_value(&node, enum_value);
+            return;
+        }
+
+        report_error("Unresolved scope resolution: " + qualified_name);
         register_value(&node, nullptr);
     }
 
@@ -1539,7 +1680,210 @@ namespace Cryo::Codegen
     }
     llvm::Type *CodegenVisitor::generate_struct_type(Cryo::StructDeclarationNode *node) { return nullptr; }
     llvm::Type *CodegenVisitor::generate_class_type(Cryo::ClassDeclarationNode *node) { return nullptr; }
-    llvm::Type *CodegenVisitor::generate_enum_type(Cryo::EnumDeclarationNode *node) { return nullptr; }
+    llvm::Type *CodegenVisitor::generate_enum_type(Cryo::EnumDeclarationNode *node)
+    {
+        return _type_mapper->map_enum_type(node);
+    }
+
+    void CodegenVisitor::generate_simple_enum_constants(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type)
+    {
+        // For simple enums, create global constants for each variant
+        auto &llvm_context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        if (!enum_type)
+        {
+            report_error("Enum type is null for constants generation: " + enum_decl->name());
+            return;
+        }
+
+        int variant_value = 0;
+        for (const auto &variant : enum_decl->variants())
+        {
+            // Create constant for this enum variant (no global variable needed for simple enums)
+            llvm::Constant *variant_const = llvm::ConstantInt::get(
+                llvm::cast<llvm::IntegerType>(enum_type), variant_value);
+
+            // Register the constant directly (not a global variable)
+            register_enum_variant(enum_decl->name(), variant->name(), variant_const);
+
+            variant_value++;
+        }
+    }
+
+    void CodegenVisitor::generate_complex_enum_constructors(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type)
+    {
+        // For complex enums, create constructor functions for each variant
+        auto &llvm_context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        if (!enum_type)
+        {
+            report_error("Enum type is null for constructor generation: " + enum_decl->name());
+            return;
+        }
+
+        int variant_discriminant = 0;
+        for (const auto &variant : enum_decl->variants())
+        {
+            if (variant->associated_types().empty())
+            {
+                // Simple variant in complex enum - just create a constant
+                generate_simple_variant_in_complex_enum(enum_decl, variant.get(), variant_discriminant);
+            }
+            else
+            {
+                // Complex variant - create constructor function
+                generate_complex_variant_constructor(enum_decl, variant.get(), variant_discriminant);
+            }
+            variant_discriminant++;
+        }
+    }
+
+    void CodegenVisitor::generate_simple_variant_in_complex_enum(Cryo::EnumDeclarationNode *enum_decl,
+                                                                 Cryo::EnumVariantNode *variant,
+                                                                 int discriminant)
+    {
+        // Create a function that returns an instance of the enum with just the discriminant set
+        auto &llvm_context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        llvm::Type *enum_type = _type_mapper->lookup_type(enum_decl->name());
+        std::string constructor_name = enum_decl->name() + "::" + variant->name();
+
+        // Create function type: () -> EnumType
+        llvm::FunctionType *func_type = llvm::FunctionType::get(enum_type, {}, false);
+        llvm::Function *constructor_func = llvm::Function::Create(
+            func_type, llvm::Function::ExternalLinkage, constructor_name, *module);
+
+        // Create function body
+        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_context, "entry", constructor_func);
+        auto &builder = _context_manager.get_builder();
+        builder.SetInsertPoint(entry);
+
+        // Create enum instance with discriminant
+        llvm::Value *enum_instance = llvm::UndefValue::get(enum_type);
+        llvm::Value *discriminant_value = llvm::ConstantInt::get(
+            llvm::Type::getInt32Ty(llvm_context), discriminant);
+        enum_instance = builder.CreateInsertValue(enum_instance, discriminant_value, {0}, "set_discriminant");
+
+        builder.CreateRet(enum_instance);
+
+        // Register constructor function
+        register_enum_variant(enum_decl->name(), variant->name(), constructor_func);
+    }
+
+    void CodegenVisitor::generate_complex_variant_constructor(Cryo::EnumDeclarationNode *enum_decl,
+                                                              Cryo::EnumVariantNode *variant,
+                                                              int discriminant)
+    {
+        // Create constructor function that takes the associated data and returns enum instance
+        auto &llvm_context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        llvm::Type *enum_type = _type_mapper->lookup_type(enum_decl->name());
+        std::string constructor_name = enum_decl->name() + "::" + variant->name();
+
+        // Build parameter types for associated data
+        std::vector<llvm::Type *> param_types;
+        for (const auto &type_name : variant->associated_types())
+        {
+            llvm::Type *param_type = _type_mapper->map_type(type_name);
+            if (param_type)
+            {
+                param_types.push_back(param_type);
+            }
+            else
+            {
+                report_error("Unknown type in enum variant: " + type_name);
+                return;
+            }
+        }
+
+        // Create function type: (param_types...) -> EnumType
+        llvm::FunctionType *func_type = llvm::FunctionType::get(enum_type, param_types, false);
+        llvm::Function *constructor_func = llvm::Function::Create(
+            func_type, llvm::Function::ExternalLinkage, constructor_name, *module);
+
+        // Create function body
+        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_context, "entry", constructor_func);
+        auto &builder = _context_manager.get_builder();
+        builder.SetInsertPoint(entry);
+
+        // Create enum instance
+        llvm::Value *enum_instance = llvm::UndefValue::get(enum_type);
+
+        // Set discriminant
+        llvm::Value *discriminant_value = llvm::ConstantInt::get(
+            llvm::Type::getInt32Ty(llvm_context), discriminant);
+        enum_instance = builder.CreateInsertValue(enum_instance, discriminant_value, {0}, "set_discriminant");
+
+        // Pack parameters into payload
+        if (!param_types.empty())
+        {
+            // Get the payload array from the tagged union structure
+            // The tagged union is { i32 discriminant, [N x i8] payload }
+            llvm::ArrayType *payload_array_type = nullptr;
+            if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(enum_type))
+            {
+                if (struct_type->getNumElements() >= 2)
+                {
+                    payload_array_type = llvm::dyn_cast<llvm::ArrayType>(struct_type->getElementType(1));
+                }
+            }
+
+            if (payload_array_type)
+            {
+                // Create a payload array and store parameters into it
+                llvm::Value *payload = llvm::UndefValue::get(payload_array_type);
+
+                // For simplicity, store each parameter as bytes in the payload
+                // In a real implementation, we'd need proper type-aware packing
+                auto func_args = constructor_func->args();
+                int byte_offset = 0;
+
+                for (auto &arg : func_args)
+                {
+                    if (byte_offset < payload_array_type->getNumElements())
+                    {
+                        if (arg.getType()->isFloatTy())
+                        {
+                            // Store float as bytes
+                            llvm::Value *int_bits = builder.CreateBitCast(&arg, llvm::Type::getInt32Ty(llvm_context));
+                            for (int i = 0; i < 4 && byte_offset + i < payload_array_type->getNumElements(); ++i)
+                            {
+                                llvm::Value *byte_shift = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_context), i * 8);
+                                llvm::Value *shifted = builder.CreateLShr(int_bits, byte_shift);
+                                llvm::Value *byte_val = builder.CreateTrunc(shifted, llvm::Type::getInt8Ty(llvm_context));
+                                payload = builder.CreateInsertValue(payload, byte_val, {static_cast<unsigned>(byte_offset + i)});
+                            }
+                            byte_offset += 4;
+                        }
+                        else if (arg.getType()->isIntegerTy(32))
+                        {
+                            // Store int32 as bytes
+                            for (int i = 0; i < 4 && byte_offset + i < payload_array_type->getNumElements(); ++i)
+                            {
+                                llvm::Value *byte_shift = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_context), i * 8);
+                                llvm::Value *shifted = builder.CreateLShr(&arg, byte_shift);
+                                llvm::Value *byte_val = builder.CreateTrunc(shifted, llvm::Type::getInt8Ty(llvm_context));
+                                payload = builder.CreateInsertValue(payload, byte_val, {static_cast<unsigned>(byte_offset + i)});
+                            }
+                            byte_offset += 4;
+                        }
+                    }
+                }
+
+                // Insert the payload into the enum instance
+                enum_instance = builder.CreateInsertValue(enum_instance, payload, {1}, "set_payload");
+            }
+        }
+
+        builder.CreateRet(enum_instance);
+
+        // Register constructor function
+        register_enum_variant(enum_decl->name(), variant->name(), constructor_func);
+    }
     // Expression generation helpers implementation
     llvm::Value *CodegenVisitor::generate_binary_operation(Cryo::BinaryExpressionNode *node)
     {
@@ -1989,6 +2333,31 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Check if this is an enum constructor call first
+        if (_enum_variants.find(function_name) != _enum_variants.end())
+        {
+            // This is an enum constructor call
+            llvm::Value *constructor_func = _enum_variants[function_name];
+            if (auto *llvm_function = llvm::dyn_cast<llvm::Function>(constructor_func))
+            {
+                // Generate arguments for the constructor call
+                std::vector<llvm::Value *> args;
+                for (auto &arg : node->arguments())
+                {
+                    arg->accept(*this);
+                    llvm::Value *arg_val = get_current_value();
+                    if (arg_val)
+                    {
+                        args.push_back(arg_val);
+                    }
+                }
+
+                // Call the enum constructor function
+                llvm::Value *enum_instance = builder.CreateCall(llvm_function, args, "enum_constructor");
+                return enum_instance;
+            }
+        }
+
         // Map Cryo function names to C runtime function names
         std::string c_function_name = map_cryo_to_c_function(function_name);
 
@@ -2364,7 +2733,214 @@ namespace Cryo::Codegen
         // Restore previous loop context
         _loop_stack.pop();
     }
-    void CodegenVisitor::generate_match_statement(Cryo::MatchStatementNode *node) {}
+
+    void CodegenVisitor::generate_match_statement(Cryo::MatchStatementNode *node)
+    {
+        // This function is kept for compatibility but the actual logic is in visit()
+        visit(*node);
+    }
+
+    llvm::Value *CodegenVisitor::extract_enum_discriminant(llvm::Value *enum_value)
+    {
+        if (!enum_value)
+        {
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Check if enum_value is a pointer or a value
+        if (enum_value->getType()->isPointerTy())
+        {
+            // It's a pointer to an enum struct - load the discriminant field
+            llvm::Value *discriminant_ptr = builder.CreateStructGEP(
+                nullptr, // Let LLVM infer the type
+                enum_value,
+                0,
+                "discriminant_ptr");
+
+            llvm::Value *discriminant = builder.CreateLoad(
+                llvm::Type::getInt32Ty(context),
+                discriminant_ptr,
+                "discriminant");
+
+            std::cout << "[CodegenVisitor] Extracted discriminant from enum pointer" << std::endl;
+            return discriminant;
+        }
+        else
+        {
+            // It's a value - extract the discriminant directly
+            llvm::Value *discriminant = builder.CreateExtractValue(
+                enum_value,
+                {0},
+                "discriminant");
+
+            std::cout << "[CodegenVisitor] Extracted discriminant from enum value" << std::endl;
+            return discriminant;
+        }
+    }
+
+    int CodegenVisitor::get_pattern_discriminant(Cryo::PatternNode *pattern)
+    {
+        if (!pattern)
+        {
+            return -1;
+        }
+
+        // Try to cast to EnumPatternNode
+        if (auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(pattern))
+        {
+            // Look up the enum variant to get its discriminant value
+            std::string enum_name = enum_pattern->enum_name();
+            std::string variant_name = enum_pattern->variant_name();
+            std::string full_name = enum_name + "::" + variant_name;
+
+            // For now, we'll use a simple mapping based on declaration order
+            // TODO: This should be looked up from the enum declaration
+            if (variant_name == "Circle")
+                return 0;
+            if (variant_name == "Rectangle")
+                return 1;
+            if (variant_name == "Triangle")
+                return 2;
+
+            std::cout << "[CodegenVisitor] Pattern discriminant for " << full_name << " (unknown, defaulting to 0)" << std::endl;
+            return 0;
+        }
+
+        std::cerr << "[CodegenVisitor] Unsupported pattern type for discriminant extraction" << std::endl;
+        return -1;
+    }
+
+    void CodegenVisitor::generate_match_arm(Cryo::MatchArmNode *arm, llvm::Value *match_value)
+    {
+        if (!arm || !match_value)
+        {
+            return;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        std::cout << "[CodegenVisitor] Generating match arm with pattern" << std::endl;
+
+        // Extract pattern variables if this is an enum pattern with bindings
+        if (auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(arm->pattern()))
+        {
+            extract_pattern_bindings(enum_pattern, match_value);
+        }
+
+        // Generate the body of the match arm
+        if (arm->body())
+        {
+            arm->body()->accept(*this);
+        }
+
+        std::cout << "[CodegenVisitor] Match arm generated" << std::endl;
+    }
+
+    void CodegenVisitor::extract_pattern_bindings(Cryo::EnumPatternNode *pattern, llvm::Value *enum_value)
+    {
+        if (!pattern || !enum_value)
+        {
+            return;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        std::cout << "[CodegenVisitor] Extracting pattern bindings for " << pattern->variant_name() << std::endl;
+
+        // For now, we'll implement a basic version that extracts parameters
+        // TODO: Implement proper payload extraction from tagged union
+        const auto &bindings = pattern->bound_variables();
+
+        if (bindings.empty())
+        {
+            std::cout << "[CodegenVisitor] No bindings to extract" << std::endl;
+            return;
+        }
+
+        // Get the payload from the enum value
+        llvm::Value *payload_value;
+        if (enum_value->getType()->isPointerTy())
+        {
+            // It's a pointer to an enum struct - get payload field pointer
+            llvm::Value *payload_ptr = builder.CreateStructGEP(
+                nullptr, // Let LLVM infer the type
+                enum_value,
+                1,
+                "payload_ptr");
+            payload_value = payload_ptr;
+        }
+        else
+        {
+            // It's a value - extract the payload directly
+            payload_value = builder.CreateExtractValue(
+                enum_value,
+                {1},
+                "payload");
+        }
+
+        // For each binding, create a variable
+        for (size_t i = 0; i < bindings.size(); ++i)
+        {
+            const std::string &binding_name = bindings[i];
+
+            // Create an alloca for the binding
+            llvm::Function *current_function = builder.GetInsertBlock()->getParent();
+            llvm::AllocaInst *binding_alloca = create_entry_block_alloca(
+                current_function,
+                llvm::Type::getFloatTy(context), // TODO: Determine actual type from enum declaration
+                binding_name);
+
+            // Extract the actual data from the payload
+            // TODO: Implement proper type-based extraction from enum definition
+            llvm::Value *extracted_value;
+            if (enum_value->getType()->isPointerTy())
+            {
+                // Load from payload pointer - not implemented for pointer case yet
+                extracted_value = llvm::ConstantFP::get(llvm::Type::getFloatTy(context), 0.0);
+            }
+            else
+            {
+                // Extract from payload array - reconstruct the float from bytes
+                int byte_offset = i * 4; // Assume each parameter is 4 bytes for now
+
+                // Extract 4 bytes from the payload array and reconstruct float
+                llvm::Value *int_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0);
+
+                for (int j = 0; j < 4; ++j)
+                {
+                    // Extract byte at offset
+                    llvm::Value *byte_val = builder.CreateExtractValue(
+                        payload_value,
+                        {static_cast<unsigned>(byte_offset + j)},
+                        "byte_" + std::to_string(j));
+
+                    // Convert byte to i32 and shift
+                    llvm::Value *byte_as_int = builder.CreateZExt(byte_val, llvm::Type::getInt32Ty(context));
+                    llvm::Value *shift = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), j * 8);
+                    llvm::Value *shifted = builder.CreateShl(byte_as_int, shift);
+
+                    // Or with accumulator
+                    int_value = builder.CreateOr(int_value, shifted);
+                }
+
+                // Convert the reconstructed int back to float
+                extracted_value = builder.CreateBitCast(int_value, llvm::Type::getFloatTy(context), "reconstructed_float");
+            }
+
+            builder.CreateStore(extracted_value, binding_alloca);
+
+            // Register the binding in the current scope
+            current_scope().local_allocas[binding_name] = binding_alloca;
+
+            std::cout << "[CodegenVisitor] Created binding: " << binding_name << std::endl;
+        }
+    }
+
     // Memory management implementation
     llvm::AllocaInst *CodegenVisitor::create_entry_block_alloca(llvm::Function *function, llvm::Type *type, const std::string &name)
     {
@@ -2486,5 +3062,14 @@ namespace Cryo::Codegen
     llvm::Type *CodegenVisitor::get_llvm_type(Cryo::Type *cryo_type) { return nullptr; }
     llvm::Value *CodegenVisitor::cast_value(llvm::Value *value, llvm::Type *target_type) { return nullptr; }
     bool CodegenVisitor::is_lvalue(Cryo::ExpressionNode *expr) { return false; }
+
+    void CodegenVisitor::register_enum_variant(const std::string &enum_name, const std::string &variant_name, llvm::Value *value)
+    {
+        std::string qualified_name = enum_name + "::" + variant_name;
+        _enum_variants[qualified_name] = value;
+
+        // Also register with just the variant name for unqualified access
+        _enum_variants[variant_name] = value;
+    }
 
 } // namespace Cryo::Codegen

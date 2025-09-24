@@ -5,6 +5,7 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/Support/Casting.h>
 #include <iostream>
+#include <set>
 
 namespace Cryo::Codegen
 {
@@ -103,6 +104,20 @@ namespace Cryo::Codegen
             // TODO: Extract struct info from cryo_type
             llvm_type = nullptr; // Placeholder for now
             break;
+        case Cryo::TypeKind::Enum:
+        {
+            // Cast to EnumType to access enum-specific methods
+            auto enum_type = static_cast<Cryo::EnumType *>(cryo_type);
+            if (enum_type->is_simple_enum())
+            {
+                llvm_type = get_integer_type(32); // Simple enum -> i32
+            }
+            else
+            {
+                llvm_type = create_tagged_union_type(enum_type);
+            }
+            break;
+        }
         default:
             report_error("Unsupported type kind: " + std::to_string(static_cast<int>(cryo_type->kind())));
             return nullptr;
@@ -118,7 +133,18 @@ namespace Cryo::Codegen
 
     llvm::Type *TypeMapper::map_type(const std::string &type_name)
     {
-        return lookup_type(type_name);
+        // Check cache first
+        llvm::Type *cached_type = lookup_type(type_name);
+        if (cached_type)
+        {
+            return cached_type;
+        }
+
+        // For enum types that aren't cached yet, we need a way to identify them
+        // This is a temporary solution - ideally enum types would be registered
+        // during enum declaration processing
+
+        return nullptr; // Type not found
     }
 
     llvm::FunctionType *TypeMapper::map_function_type(
@@ -551,9 +577,87 @@ namespace Cryo::Codegen
     // These methods would extract specific type information from Cryo::Type objects
     // For now they are placeholders until the full Type system integration
 
-    //=======================================================================
+    //===================================================================
+    // Enum Type Mapping
+    //===================================================================
+
+    llvm::Type *TypeMapper::map_enum_type(Cryo::EnumDeclarationNode *enum_decl)
+    {
+        if (!enum_decl)
+        {
+            report_error("Cannot map null enum declaration");
+            return nullptr;
+        }
+
+        // Get the enum name
+        std::string enum_name = enum_decl->name();
+
+        // Skip cache lookup to avoid recursion issues
+        // TODO: Implement proper caching without recursion
+
+        // Analyze enum variants to determine if simple or complex
+        bool is_simple = true;
+        size_t max_payload_size = 0;
+
+        for (const auto &variant : enum_decl->variants())
+        {
+            if (!variant->associated_types().empty())
+            {
+                is_simple = false;
+
+                // Calculate payload size for this variant
+                size_t variant_payload_size = 0;
+                for (const auto &type_name : variant->associated_types())
+                {
+                    // For now, assume each type is 8 bytes (will improve with proper type size calculation)
+                    variant_payload_size += 8;
+                }
+                max_payload_size = std::max(max_payload_size, variant_payload_size);
+            }
+        }
+
+        llvm::Type *enum_type;
+        if (is_simple)
+        {
+            // Simple enum -> just an integer
+            enum_type = get_integer_type(32);
+        }
+        else
+        {
+            // Complex enum -> tagged union (discriminant + payload)
+            enum_type = create_tagged_union_type(enum_name, max_payload_size);
+        }
+
+        // Register in cache
+        register_type(enum_name, enum_type);
+
+        return enum_type;
+    }
+
+    llvm::Type *TypeMapper::create_tagged_union_type(Cryo::EnumType *enum_type)
+    {
+        // Create tagged union for complex enum
+        std::string enum_name = enum_type->name();
+        size_t max_payload_size = 8; // Default for now, should calculate properly
+
+        return create_tagged_union_type(enum_name, max_payload_size);
+    }
+
+    llvm::StructType *TypeMapper::create_tagged_union_type(const std::string &name, size_t payload_size)
+    {
+        auto &llvm_context = _context_manager.get_context();
+
+        // Create struct type: { i32 discriminant, [payload_size x i8] payload }
+        std::vector<llvm::Type *> fields;
+        fields.push_back(get_integer_type(32));                                // discriminant
+        fields.push_back(llvm::ArrayType::get(get_char_type(), payload_size)); // payload
+
+        return llvm::StructType::create(llvm_context, fields, name + "_tagged_union");
+    }
+
+    //===================================================================
     // Utility Functions
-    //=======================================================================
+    //===================================================================
 
     llvm::CallingConv::ID map_calling_convention(const std::string &cryo_cc)
     {
