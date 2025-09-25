@@ -27,6 +27,8 @@ namespace Cryo
     class WhileStatementNode;
     class ForStatementNode;
     class MatchStatementNode;
+    class SwitchStatementNode;
+    class CaseStatementNode;
     class MatchArmNode;
     class PatternNode;
     class EnumPatternNode;
@@ -75,6 +77,8 @@ namespace Cryo
         virtual void visit(WhileStatementNode &node) = 0;
         virtual void visit(ForStatementNode &node) = 0;
         virtual void visit(MatchStatementNode &node) = 0;
+        virtual void visit(SwitchStatementNode &node) = 0;
+        virtual void visit(CaseStatementNode &node) = 0;
         virtual void visit(MatchArmNode &node) = 0;
         virtual void visit(PatternNode &node) = 0;
         virtual void visit(EnumPatternNode &node) = 0;
@@ -122,6 +126,8 @@ namespace Cryo
         void visit(WhileStatementNode &node) override {}
         void visit(ForStatementNode &node) override {}
         void visit(MatchStatementNode &node) override {}
+        void visit(SwitchStatementNode &node) override {}
+        void visit(CaseStatementNode &node) override {}
         void visit(MatchArmNode &node) override {}
         void visit(PatternNode &node) override {}
         void visit(EnumPatternNode &node) override {}

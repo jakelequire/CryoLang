@@ -229,4 +229,16 @@ namespace Cryo
     {
         visitor.visit(*this);
     }
+
+    // SwitchStatementNode visitor implementation
+    void SwitchStatementNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // CaseStatementNode visitor implementation
+    void CaseStatementNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
 }

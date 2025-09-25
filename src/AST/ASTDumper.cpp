@@ -80,6 +80,8 @@ namespace Cryo
         case NodeKind::IfStatement:
         case NodeKind::WhileStatement:
         case NodeKind::ForStatement:
+        case NodeKind::SwitchStatement:
+        case NodeKind::CaseStatement:
         case NodeKind::BreakStatement:
         case NodeKind::ContinueStatement:
         case NodeKind::ExpressionStatement:
@@ -1229,6 +1231,64 @@ namespace Cryo
         for (size_t i = 0; i < functions.size(); ++i)
         {
             dump_child(functions[i].get(), i == functions.size() - 1);
+        }
+    }
+
+    void ASTDumper::visit(SwitchStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "SwitchStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        bool has_cases = !node.cases().empty();
+
+        // First dump the expression being switched on
+        dump_child(node.expression(), !has_cases);
+
+        // Then dump all the case statements (including default cases)
+        const auto &cases = node.cases();
+        for (size_t i = 0; i < cases.size(); ++i)
+        {
+            bool is_last = (i == cases.size() - 1);
+            dump_child(cases[i].get(), is_last);
+        }
+    }
+
+    void ASTDumper::visit(CaseStatementNode &node)
+    {
+        print_prefix();
+        if (node.is_default())
+        {
+            _output << get_node_color(node.kind()) << "DefaultCase";
+        }
+        else
+        {
+            _output << get_node_color(node.kind()) << "Case";
+        }
+
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        bool has_value = !node.is_default() && node.value() != nullptr;
+        bool has_body = !node.statements().empty();
+
+        // If it's a regular case (not default), dump the case value
+        if (has_value)
+        {
+            dump_child(node.value(), !has_body);
+        }
+
+        // Dump the case body statements
+        const auto &statements = node.statements();
+        for (size_t i = 0; i < statements.size(); ++i)
+        {
+            bool is_last = (i == statements.size() - 1);
+            dump_child(statements[i].get(), is_last);
         }
     }
 
