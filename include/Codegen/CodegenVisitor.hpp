@@ -223,6 +223,7 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::GlobalVariable *> _globals;
         std::unordered_map<std::string, llvm::Type *> _global_types;   // Track global variable element types
         std::unordered_map<std::string, llvm::Value *> _enum_variants; // Track enum variants for scope resolution
+        std::unordered_map<std::string, std::string> _variable_types;  // Track variable name -> type annotation string
 
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
