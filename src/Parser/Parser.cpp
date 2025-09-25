@@ -1,5 +1,6 @@
 #include "Parser/Parser.hpp"
 #include <iostream>
+#include <cctype>
 
 namespace Cryo
 {
@@ -919,6 +920,137 @@ namespace Cryo
         {
             std::unique_ptr<ExpressionNode> expr = parse_identifier();
 
+            // Check if this might be a generic type constructor like Pair<int, string>
+            if (_current_token.is(TokenKind::TK_L_ANGLE))
+            {
+                // Look ahead to see if this is followed by parentheses (constructor call)
+                // We need to peek ahead to see if there are parentheses after the generic args
+                if (auto identifier_node = dynamic_cast<IdentifierNode *>(expr.get()))
+                {
+                    // Use a simple heuristic: only try to parse generics if the identifier starts with uppercase
+                    // This avoids conflicts with comparison operators in most cases
+                    std::string type_name = identifier_node->name();
+                    SourceLocation type_location = identifier_node->location();
+
+                    if (!type_name.empty() && std::isupper(type_name[0]))
+                    {
+                        // Parse generic arguments
+                        advance(); // consume '<'
+                        std::vector<std::string> generic_args;
+
+                        do
+                        {
+                            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
+                            {
+                                error("Expected type name in generic arguments");
+                                return nullptr;
+                            }
+
+                            generic_args.push_back(std::string(_current_token.text()));
+                            advance(); // consume type argument
+
+                        } while (match(TokenKind::TK_COMMA));
+
+                        consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic arguments");
+
+                        // Check if this is followed by parentheses (constructor call)
+                        if (_current_token.is(TokenKind::TK_L_PAREN))
+                        {
+                            // Parse the constructor call with arguments
+                            advance(); // consume '('
+
+                            // Check if this is a struct literal ({field: value})
+                            if (_current_token.is(TokenKind::TK_L_BRACE))
+                            {
+                                // This is a struct literal
+                                advance(); // consume '{'
+
+                                auto struct_literal = _builder.create_struct_literal(type_location, type_name);
+
+                                // Add generic arguments to struct literal
+                                for (const auto &generic_arg : generic_args)
+                                {
+                                    struct_literal->add_generic_arg(generic_arg);
+                                }
+
+                                // Parse field initializers
+                                if (!_current_token.is(TokenKind::TK_R_BRACE))
+                                {
+                                    do
+                                    {
+                                        // Parse field name
+                                        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                                        {
+                                            error("Expected field name in struct literal");
+                                            return nullptr;
+                                        }
+
+                                        std::string field_name = std::string(_current_token.text());
+                                        advance(); // consume field name
+
+                                        consume(TokenKind::TK_COLON, "Expected ':' after field name");
+
+                                        // Parse field value
+                                        auto field_value = parse_expression();
+                                        if (!field_value)
+                                        {
+                                            error("Expected expression for field value");
+                                            return nullptr;
+                                        }
+
+                                        // Create field initializer
+                                        auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                                        struct_literal->add_field_initializer(std::move(field_init));
+
+                                    } while (match(TokenKind::TK_COMMA));
+                                }
+
+                                consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
+                                consume(TokenKind::TK_R_PAREN, "Expected ')' after struct literal");
+
+                                expr = std::move(struct_literal);
+                            }
+                            else
+                            {
+                                // Regular constructor call - create NewExpressionNode and parse arguments
+                                auto new_expr = _builder.create_new_expression(type_location, type_name);
+
+                                // Add generic arguments
+                                for (const auto &generic_arg : generic_args)
+                                {
+                                    new_expr->add_generic_arg(generic_arg);
+                                }
+
+                                // Parse constructor arguments (if any)
+                                if (!_current_token.is(TokenKind::TK_R_PAREN))
+                                {
+                                    do
+                                    {
+                                        auto arg = parse_expression();
+                                        if (!arg)
+                                        {
+                                            error("Expected expression in constructor arguments");
+                                            return nullptr;
+                                        }
+                                        new_expr->add_argument(std::move(arg));
+
+                                    } while (match(TokenKind::TK_COMMA));
+                                }
+
+                                consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
+                                expr = std::move(new_expr);
+                            }
+                        }
+                        else
+                        {
+                            // Not a constructor call, this is an error for now
+                            error("Generic type expressions are only supported for constructor calls");
+                            return nullptr;
+                        }
+                    }
+                }
+            }
+
             // Handle multi-level scope resolution (e.g., Std::Runtime::function)
             while (_current_token.is(TokenKind::TK_COLONCOLON))
             {
@@ -934,7 +1066,7 @@ namespace Cryo
                 SourceLocation loc;
 
                 // If expr is already a ScopeResolutionNode, build on it
-                if (auto scope_node = dynamic_cast<ScopeResolutionNode*>(expr.get()))
+                if (auto scope_node = dynamic_cast<ScopeResolutionNode *>(expr.get()))
                 {
                     // For multi-level resolution like Std::Runtime::function
                     // Combine the existing scope with the new member
@@ -942,7 +1074,7 @@ namespace Cryo
                     loc = scope_node->location();
                     expr = _builder.create_scope_resolution(loc, full_scope, member_name);
                 }
-                else if (auto identifier_node = dynamic_cast<IdentifierNode*>(expr.get()))
+                else if (auto identifier_node = dynamic_cast<IdentifierNode *>(expr.get()))
                 {
                     // First level scope resolution like Std::Runtime
                     std::string scope_name = identifier_node->name();
@@ -1440,22 +1572,77 @@ namespace Cryo
         // Parse constructor arguments
         consume(TokenKind::TK_L_PAREN, "Expected '(' after type name");
 
-        if (!_current_token.is(TokenKind::TK_R_PAREN))
+        // Check if this is a struct literal ({field: value})
+        if (_current_token.is(TokenKind::TK_L_BRACE))
         {
-            do
+            // This is a struct literal, not a regular constructor call
+            advance(); // consume '{'
+
+            auto struct_literal = _builder.create_struct_literal(new_location, type_name);
+
+            // Copy generic arguments to struct literal
+            for (const auto &generic_arg : new_expr->generic_args())
             {
-                // Parse positional arguments (no named parameter support)
-                auto arg = parse_expression();
-                if (arg)
+                struct_literal->add_generic_arg(generic_arg);
+            }
+
+            // Parse field initializers
+            if (!_current_token.is(TokenKind::TK_R_BRACE))
+            {
+                do
                 {
-                    new_expr->add_argument(std::move(arg));
-                }
-            } while (match(TokenKind::TK_COMMA));
+                    // Parse field name
+                    if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                    {
+                        error("Expected field name in struct literal");
+                        return nullptr;
+                    }
+
+                    std::string field_name = std::string(_current_token.text());
+                    advance(); // consume field name
+
+                    consume(TokenKind::TK_COLON, "Expected ':' after field name");
+
+                    // Parse field value
+                    auto field_value = parse_expression();
+                    if (!field_value)
+                    {
+                        error("Expected expression for field value");
+                        return nullptr;
+                    }
+
+                    // Create field initializer
+                    auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                    struct_literal->add_field_initializer(std::move(field_init));
+
+                } while (match(TokenKind::TK_COMMA));
+            }
+
+            consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
+            consume(TokenKind::TK_R_PAREN, "Expected ')' after struct literal");
+
+            return struct_literal;
         }
+        else
+        {
+            // Regular constructor call with positional arguments
+            if (!_current_token.is(TokenKind::TK_R_PAREN))
+            {
+                do
+                {
+                    // Parse positional arguments (no named parameter support)
+                    auto arg = parse_expression();
+                    if (arg)
+                    {
+                        new_expr->add_argument(std::move(arg));
+                    }
+                } while (match(TokenKind::TK_COMMA));
+            }
 
-        consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
+            consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
 
-        return new_expr;
+            return new_expr;
+        }
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_member_access(std::unique_ptr<ExpressionNode> expr)
@@ -1853,7 +2040,7 @@ namespace Cryo
         // Parse linkage specifier (e.g., "C")
         Token linkage_token = consume(TokenKind::TK_STRING_LITERAL, "Expected linkage specifier (e.g., \"C\")");
         std::string linkage_type = std::string(linkage_token.text());
-        
+
         // Remove quotes from linkage type
         if (linkage_type.length() >= 2 && linkage_type.front() == '"' && linkage_type.back() == '"')
         {

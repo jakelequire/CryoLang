@@ -23,7 +23,7 @@ namespace Cryo
         const std::string LOCATION = "\033[90m";      // Dark Gray
         const std::string VALUE = "\033[1;37m";       // Bold White
         const std::string COMMENT = "\033[90m";       // Dark Gray
-        const std::string ANNOTATION = "\033[95m";   // Light Magenta
+        const std::string ANNOTATION = "\033[95m";    // Light Magenta
 
         // Tree drawing colors
         const std::string TREE = "\033[37m"; // Light Gray
@@ -77,6 +77,7 @@ namespace Cryo
         void visit(FunctionDeclarationNode &node) override;
         void visit(CallExpressionNode &node) override;
         void visit(NewExpressionNode &node) override;
+        void visit(StructLiteralNode &node) override;
         void visit(ArrayLiteralNode &node) override;
         void visit(ArrayAccessNode &node) override;
         void visit(MemberAccessNode &node) override;
