@@ -53,6 +53,13 @@ LSP_LIBS = \
 	$(MAIN_OBJ_DIR)/Utils/file.o \
 	$(MAIN_OBJ_DIR)/Utils/RuntimeHeaderParser.o
 
+# OS-specific socket libraries
+ifeq ($(OS), Windows_NT)
+    SOCKET_LIBS = -lws2_32 -lwsock32
+else
+    SOCKET_LIBS = 
+endif
+
 .PHONY: all clean help
 
 # Default target
@@ -75,7 +82,7 @@ $(LSP_OBJ_DIR)/%.o: $(LSP_SRC_DIR)/%.cpp | $(LSP_OBJ_DIR)
 # Link the LSP executable
 $(LSP_BIN_DIR)/$(LSP_TARGET): $(LSP_OBJECTS) | check-main-libs
 	@echo "Linking CryoLSP..."
-	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJECTS) $(LSP_LIBS) -o $@ $(LDFLAGS)
+	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJECTS) $(LSP_LIBS) -o $@ $(LDFLAGS) $(SOCKET_LIBS)
 	@echo "✓ CryoLSP built successfully: $(LSP_BIN_DIR)/$(LSP_TARGET)"
 
 # Check that main compiler libraries exist
