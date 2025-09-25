@@ -89,13 +89,28 @@ namespace Cryo::Codegen
             llvm_type = nullptr; // Placeholder for now
             break;
         case Cryo::TypeKind::Pointer:
-            // TODO: Extract pointee type from cryo_type
-            llvm_type = nullptr; // Placeholder for now
+        {
+            // Cast to PointerType to access pointee_type
+            auto pointer_type = static_cast<Cryo::PointerType *>(cryo_type);
+            llvm::Type *pointee_llvm_type = map_type(pointer_type->pointee_type().get());
+            if (pointee_llvm_type)
+            {
+                llvm_type = llvm::PointerType::get(pointee_llvm_type, 0);
+            }
             break;
+        }
         case Cryo::TypeKind::Reference:
-            // TODO: Extract referenced type from cryo_type
-            llvm_type = nullptr; // Placeholder for now
+        {
+            // Cast to ReferenceType to access referent_type
+            auto reference_type = static_cast<Cryo::ReferenceType *>(cryo_type);
+            llvm::Type *referent_llvm_type = map_type(reference_type->referent_type().get());
+            if (referent_llvm_type)
+            {
+                // In LLVM, references are implemented as pointers
+                llvm_type = llvm::PointerType::get(referent_llvm_type, 0);
+            }
             break;
+        }
         case Cryo::TypeKind::Function:
             // TODO: Extract function signature from cryo_type
             llvm_type = nullptr; // Placeholder for now
@@ -138,6 +153,46 @@ namespace Cryo::Codegen
         if (cached_type)
         {
             return cached_type;
+        }
+
+        // Handle pointer types: "int*" -> pointer to int
+        if (!type_name.empty() && type_name.back() == '*')
+        {
+            std::string base_type = type_name.substr(0, type_name.length() - 1);
+            // Trim whitespace
+            while (!base_type.empty() && std::isspace(base_type.back()))
+            {
+                base_type.pop_back();
+            }
+            
+            llvm::Type *pointee_type = map_type(base_type);
+            if (pointee_type)
+            {
+                llvm::Type *pointer_type = llvm::PointerType::get(pointee_type, 0);
+                register_type(type_name, pointer_type);
+                return pointer_type;
+            }
+            return nullptr;
+        }
+
+        // Handle reference types: "&int" -> pointer to int (references implemented as pointers in LLVM)
+        if (!type_name.empty() && type_name.front() == '&')
+        {
+            std::string base_type = type_name.substr(1);
+            // Trim whitespace
+            while (!base_type.empty() && std::isspace(base_type.front()))
+            {
+                base_type.erase(0, 1);
+            }
+            
+            llvm::Type *referent_type = map_type(base_type);
+            if (referent_type)
+            {
+                llvm::Type *reference_type = llvm::PointerType::get(referent_type, 0);
+                register_type(type_name, reference_type);
+                return reference_type;
+            }
+            return nullptr;
         }
 
         // For enum types that aren't cached yet, we need a way to identify them
