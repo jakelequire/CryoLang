@@ -466,6 +466,11 @@ namespace Cryo
             return parse_match_statement();
         }
 
+        if (_current_token.is(TokenKind::TK_KW_SWITCH))
+        {
+            return parse_switch_statement();
+        }
+
         if (_current_token.is(TokenKind::TK_KW_RETURN))
         {
             return parse_return_statement();
@@ -1351,6 +1356,74 @@ namespace Cryo
         consume(TokenKind::TK_R_BRACE, "Expected '}' after match arms");
 
         return std::move(match_stmt);
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_switch_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_SWITCH, "Expected 'switch'");
+
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after switch");
+        auto expr = parse_expression();
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after switch expression");
+
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after switch expression");
+
+        std::vector<std::unique_ptr<CaseStatementNode>> cases;
+
+        // Parse case statements
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            auto case_stmt = parse_case_statement();
+            if (case_stmt)
+            {
+                cases.push_back(std::move(case_stmt));
+            }
+        }
+
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after switch cases");
+
+        return std::make_unique<SwitchStatementNode>(start_loc, std::move(expr), std::move(cases));
+    }
+
+    std::unique_ptr<CaseStatementNode> Parser::parse_case_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        std::unique_ptr<ExpressionNode> value = nullptr;
+
+        if (_current_token.is(TokenKind::TK_KW_CASE))
+        {
+            advance(); // consume 'case'
+            value = parse_expression();
+            consume(TokenKind::TK_COLON, "Expected ':' after case value");
+        }
+        else if (_current_token.is(TokenKind::TK_KW_DEFAULT))
+        {
+            advance(); // consume 'default'
+            consume(TokenKind::TK_COLON, "Expected ':' after default");
+            // value remains nullptr for default case
+        }
+        else
+        {
+            error("Expected 'case' or 'default'");
+            return nullptr;
+        }
+
+        // Parse statements until we hit another case, default, or closing brace
+        std::vector<std::unique_ptr<StatementNode>> statements;
+        while (!_current_token.is(TokenKind::TK_KW_CASE) &&
+               !_current_token.is(TokenKind::TK_KW_DEFAULT) &&
+               !_current_token.is(TokenKind::TK_R_BRACE) &&
+               !is_at_end())
+        {
+            auto stmt = parse_statement();
+            if (auto statement_node = dynamic_cast<StatementNode *>(stmt.release()))
+            {
+                statements.push_back(std::unique_ptr<StatementNode>(statement_node));
+            }
+        }
+
+        return std::make_unique<CaseStatementNode>(start_loc, std::move(value), std::move(statements));
     }
 
     std::unique_ptr<MatchArmNode> Parser::parse_match_arm()

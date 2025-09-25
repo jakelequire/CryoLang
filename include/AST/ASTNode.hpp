@@ -16,6 +16,10 @@ namespace Cryo
     class MatchArmNode;
     class PatternNode;
     class EnumPatternNode;
+    
+    // Forward declarations for switch statements
+    class SwitchStatementNode;
+    class CaseStatementNode;
 
     enum class NodeKind
     {
@@ -45,6 +49,8 @@ namespace Cryo
         WhileStatement,
         ForStatement,
         MatchStatement,
+        SwitchStatement,
+        CaseStatement,
         BreakStatement,
         ContinueStatement,
         ExpressionStatement,
@@ -1537,6 +1543,80 @@ namespace Cryo
             {
                 os << std::string(indent + 2, ' ') << "Arm:" << std::endl;
                 arm->print(os, indent + 4);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Case statement
+    class CaseStatementNode : public StatementNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _value;        // Value to match (nullptr for default case)
+        std::vector<std::unique_ptr<StatementNode>> _statements; // Statements in this case
+
+    public:
+        CaseStatementNode(SourceLocation loc, std::unique_ptr<ExpressionNode> value,
+                         std::vector<std::unique_ptr<StatementNode>> statements)
+            : StatementNode(NodeKind::CaseStatement, loc), _value(std::move(value)),
+              _statements(std::move(statements)) {}
+
+        // Constructor for default case
+        CaseStatementNode(SourceLocation loc, std::vector<std::unique_ptr<StatementNode>> statements)
+            : StatementNode(NodeKind::CaseStatement, loc), _value(nullptr),
+              _statements(std::move(statements)) {}
+
+        ExpressionNode *value() const { return _value.get(); }
+        const std::vector<std::unique_ptr<StatementNode>>& statements() const { return _statements; }
+        bool is_default() const { return _value == nullptr; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            if (is_default()) {
+                os << std::string(indent, ' ') << "Default:" << std::endl;
+            } else {
+                os << std::string(indent, ' ') << "Case:" << std::endl;
+                if (_value) {
+                    os << std::string(indent + 2, ' ') << "Value:" << std::endl;
+                    _value->print(os, indent + 4);
+                }
+            }
+            os << std::string(indent + 2, ' ') << "Statements:" << std::endl;
+            for (const auto& stmt : _statements) {
+                stmt->print(os, indent + 4);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Switch statement
+    class SwitchStatementNode : public StatementNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _expression;
+        std::vector<std::unique_ptr<CaseStatementNode>> _cases;
+
+    public:
+        SwitchStatementNode(SourceLocation loc, std::unique_ptr<ExpressionNode> expression,
+                           std::vector<std::unique_ptr<CaseStatementNode>> cases)
+            : StatementNode(NodeKind::SwitchStatement, loc), _expression(std::move(expression)),
+              _cases(std::move(cases)) {}
+
+        ExpressionNode *expression() const { return _expression.get(); }
+        const std::vector<std::unique_ptr<CaseStatementNode>>& cases() const { return _cases; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "Switch:" << std::endl;
+            if (_expression) {
+                os << std::string(indent + 2, ' ') << "Expression:" << std::endl;
+                _expression->print(os, indent + 4);
+            }
+            os << std::string(indent + 2, ' ') << "Cases:" << std::endl;
+            for (const auto& case_stmt : _cases) {
+                case_stmt->print(os, indent + 4);
             }
         }
 

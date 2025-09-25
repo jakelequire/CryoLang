@@ -98,6 +98,8 @@ namespace Cryo::Codegen
         void visit(Cryo::WhileStatementNode &node) override;
         void visit(Cryo::ForStatementNode &node) override;
         void visit(Cryo::MatchStatementNode &node) override;
+        void visit(Cryo::SwitchStatementNode &node) override;
+        void visit(Cryo::CaseStatementNode &node) override;
         void visit(Cryo::MatchArmNode &node) override;
         void visit(Cryo::PatternNode &node) override;
         void visit(Cryo::EnumPatternNode &node) override;
@@ -293,6 +295,10 @@ namespace Cryo::Codegen
         void generate_while_loop(Cryo::WhileStatementNode *node);
         void generate_for_loop(Cryo::ForStatementNode *node);
         void generate_match_statement(Cryo::MatchStatementNode *node);
+        void generate_switch_statement(Cryo::SwitchStatementNode *node);
+        void generate_string_switch(Cryo::SwitchStatementNode *node, llvm::Value *switch_value);
+        void generate_integer_switch(Cryo::SwitchStatementNode *node, llvm::Value *switch_value);
+        void generate_case_statement(Cryo::CaseStatementNode *node, llvm::SwitchInst *switch_inst, llvm::BasicBlock *end_block);
 
         // Match statement helpers
         llvm::Value *extract_enum_discriminant(llvm::Value *enum_value);

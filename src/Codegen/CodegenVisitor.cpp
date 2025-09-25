@@ -975,6 +975,26 @@ namespace Cryo::Codegen
         register_value(&node, nullptr);
     }
 
+    void CodegenVisitor::visit(Cryo::SwitchStatementNode &node)
+    {
+        try
+        {
+            generate_switch_statement(&node);
+            register_value(&node, nullptr);
+        }
+        catch (const std::exception &e)
+        {
+            report_error("Exception in switch statement: " + std::string(e.what()), &node);
+        }
+    }
+
+    void CodegenVisitor::visit(Cryo::CaseStatementNode &node)
+    {
+        // Case statements are handled as part of switch statement generation
+        // This visit method should not be called directly
+        report_error("CaseStatementNode visit called directly - should be handled by SwitchStatementNode", &node);
+    }
+
     void CodegenVisitor::visit(Cryo::ExpressionStatementNode &node)
     {
         if (node.expression())
@@ -3880,6 +3900,301 @@ namespace Cryo::Codegen
 
         // Restore previous loop context
         _loop_stack.pop();
+    }
+
+    void CodegenVisitor::generate_switch_statement(Cryo::SwitchStatementNode *node)
+    {
+        if (!node)
+            return;
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Function *function = builder.GetInsertBlock()->getParent();
+
+        // Generate the switch expression
+        node->expression()->accept(*this);
+        llvm::Value *switch_value = get_current_value();
+
+        if (!switch_value)
+        {
+            report_error("Failed to generate switch expression");
+            return;
+        }
+
+        // Check if this is a string switch (pointer type)
+        bool is_string_switch = switch_value->getType()->isPointerTy();
+
+        if (is_string_switch)
+        {
+            // Handle string switch using if-else chain with strcmp
+            generate_string_switch(node, switch_value);
+        }
+        else
+        {
+            // Handle integer switch using LLVM switch instruction
+            generate_integer_switch(node, switch_value);
+        }
+    }
+
+    void CodegenVisitor::generate_string_switch(Cryo::SwitchStatementNode *node, llvm::Value *switch_value)
+    {
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Function *function = builder.GetInsertBlock()->getParent();
+
+        // Create basic blocks
+        llvm::BasicBlock *end_block = llvm::BasicBlock::Create(context, "switch.end", function);
+        llvm::BasicBlock *default_block = nullptr;
+
+        // Check if there's a default case
+        for (const auto &case_stmt : node->cases())
+        {
+            if (case_stmt->is_default())
+            {
+                default_block = llvm::BasicBlock::Create(context, "switch.default", function);
+                break;
+            }
+        }
+
+        // If no default case, create one that just branches to end
+        if (!default_block)
+        {
+            default_block = llvm::BasicBlock::Create(context, "switch.default", function);
+        }
+
+        // Get or create strcmp function
+        llvm::Function *strcmp_func = _context_manager.get_module()->getFunction("strcmp");
+        if (!strcmp_func)
+        {
+            // Create strcmp function declaration
+            llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+            llvm::Type *char_ptr_type = llvm::Type::getInt8Ty(context)->getPointerTo();
+            llvm::FunctionType *strcmp_type = llvm::FunctionType::get(int_type, {char_ptr_type, char_ptr_type}, false);
+            strcmp_func = llvm::Function::Create(strcmp_type, llvm::Function::ExternalLinkage, "strcmp", *_context_manager.get_module());
+        }
+
+        llvm::BasicBlock *current_check_block = builder.GetInsertBlock();
+
+        // Process each case in order
+        std::vector<std::pair<llvm::BasicBlock *, llvm::BasicBlock *>> case_blocks; // (check_block, case_block)
+
+        // Create all the blocks first
+        for (size_t i = 0; i < node->cases().size(); ++i)
+        {
+            auto &case_stmt = node->cases()[i];
+
+            if (!case_stmt->is_default())
+            {
+                llvm::BasicBlock *check_block = (i == 0) ? current_check_block : llvm::BasicBlock::Create(context, "switch.case.check." + std::to_string(i), function);
+                llvm::BasicBlock *case_block = llvm::BasicBlock::Create(context, "switch.case." + std::to_string(i), function);
+                case_blocks.push_back({check_block, case_block});
+            }
+        }
+
+        // Process cases
+        size_t case_index = 0;
+        for (size_t i = 0; i < node->cases().size(); ++i)
+        {
+            auto &case_stmt = node->cases()[i];
+
+            if (case_stmt->is_default())
+            {
+                continue; // Handle default separately
+            }
+
+            llvm::BasicBlock *check_block = case_blocks[case_index].first;
+            llvm::BasicBlock *case_block = case_blocks[case_index].second;
+
+            // Set up the check block
+            builder.SetInsertPoint(check_block);
+
+            // Generate the case value
+            case_stmt->value()->accept(*this);
+            llvm::Value *case_value = get_current_value();
+
+            if (!case_value || !case_value->getType()->isPointerTy())
+            {
+                report_error("String switch case value must be a string literal");
+                case_index++;
+                continue;
+            }
+
+            // Call strcmp to compare switch_value with case_value
+            llvm::Value *strcmp_args[] = {switch_value, case_value};
+            llvm::Value *cmp_result = builder.CreateCall(strcmp_func, strcmp_args, "strcmp.result");
+
+            // Check if strcmp result is 0 (strings are equal)
+            llvm::Value *is_equal = builder.CreateICmpEQ(cmp_result,
+                                                         llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0), "str.eq");
+
+            // Determine next block
+            llvm::BasicBlock *next_block;
+            if (case_index + 1 < case_blocks.size())
+            {
+                next_block = case_blocks[case_index + 1].first;
+            }
+            else
+            {
+                next_block = default_block;
+            }
+
+            // Branch to case block if equal, otherwise to next case
+            builder.CreateCondBr(is_equal, case_block, next_block);
+
+            // Generate code for this case
+            builder.SetInsertPoint(case_block);
+            for (const auto &stmt : case_stmt->statements())
+            {
+                stmt->accept(*this);
+            }
+
+            // Check if the last statement is a break/return
+            if (!case_block->getTerminator())
+            {
+                builder.CreateBr(end_block);
+            }
+
+            case_index++;
+        }
+
+        // Handle default case
+        builder.SetInsertPoint(default_block);
+        bool found_default = false;
+        for (const auto &case_stmt : node->cases())
+        {
+            if (case_stmt->is_default())
+            {
+                for (const auto &stmt : case_stmt->statements())
+                {
+                    stmt->accept(*this);
+                }
+                found_default = true;
+                break;
+            }
+        }
+
+        // Ensure default block has a terminator
+        if (!default_block->getTerminator())
+        {
+            builder.CreateBr(end_block);
+        }
+
+        // Continue with the end block
+        builder.SetInsertPoint(end_block);
+    }
+
+    void CodegenVisitor::generate_integer_switch(Cryo::SwitchStatementNode *node, llvm::Value *switch_value)
+    {
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Function *function = builder.GetInsertBlock()->getParent();
+
+        // Create basic blocks
+        llvm::BasicBlock *end_block = llvm::BasicBlock::Create(context, "switch.end", function);
+        llvm::BasicBlock *default_block = nullptr;
+
+        // Find if there's a default case
+        for (const auto &case_stmt : node->cases())
+        {
+            if (case_stmt->is_default())
+            {
+                default_block = llvm::BasicBlock::Create(context, "switch.default", function);
+                break;
+            }
+        }
+
+        // If no default case found, create one that branches to end
+        if (!default_block)
+        {
+            default_block = llvm::BasicBlock::Create(context, "switch.default", function);
+        }
+
+        // Create the switch instruction
+        llvm::SwitchInst *switch_inst = builder.CreateSwitch(switch_value, default_block, node->cases().size());
+
+        // Generate code for each case
+        for (size_t i = 0; i < node->cases().size(); ++i)
+        {
+            auto &case_stmt = node->cases()[i];
+
+            if (case_stmt->is_default())
+            {
+                // Handle default case
+                builder.SetInsertPoint(default_block);
+
+                // Generate statements for default case
+                for (const auto &stmt : case_stmt->statements())
+                {
+                    stmt->accept(*this);
+                }
+
+                // Check if the last statement is a break/return
+                if (!default_block->getTerminator())
+                {
+                    builder.CreateBr(end_block);
+                }
+            }
+            else
+            {
+                // Handle regular case
+                llvm::BasicBlock *case_block = llvm::BasicBlock::Create(context,
+                                                                        "switch.case." + std::to_string(i), function);
+
+                // Generate the case value and add to switch
+                case_stmt->value()->accept(*this);
+                llvm::Value *case_value = get_current_value();
+
+                if (case_value && llvm::isa<llvm::ConstantInt>(case_value))
+                {
+                    switch_inst->addCase(llvm::cast<llvm::ConstantInt>(case_value), case_block);
+                }
+                else
+                {
+                    // Convert the case value to a constant integer if possible
+                    if (auto const_int = llvm::dyn_cast<llvm::ConstantInt>(case_value))
+                    {
+                        switch_inst->addCase(const_int, case_block);
+                    }
+                    else
+                    {
+                        report_error("Switch case value must be a constant integer");
+                        continue;
+                    }
+                }
+
+                // Generate code for this case
+                builder.SetInsertPoint(case_block);
+
+                for (const auto &stmt : case_stmt->statements())
+                {
+                    stmt->accept(*this);
+                }
+
+                // Check if the last statement is a break/return
+                if (!case_block->getTerminator())
+                {
+                    builder.CreateBr(end_block);
+                }
+            }
+        }
+
+        // Handle empty default case (just branch to end)
+        if (!default_block->getTerminator())
+        {
+            builder.SetInsertPoint(default_block);
+            builder.CreateBr(end_block);
+        }
+
+        // Continue with the end block
+        builder.SetInsertPoint(end_block);
+    }
+
+    void CodegenVisitor::generate_case_statement(Cryo::CaseStatementNode *node, llvm::SwitchInst *switch_inst, llvm::BasicBlock *end_block)
+    {
+        // This method is not used in the current implementation
+        // Cases are handled directly in generate_switch_statement
+        // This is kept for interface completeness
+        report_error("generate_case_statement called directly - cases are handled in generate_switch_statement");
     }
 
     void CodegenVisitor::generate_match_statement(Cryo::MatchStatementNode *node)
