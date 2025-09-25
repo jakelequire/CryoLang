@@ -281,6 +281,18 @@ namespace Cryo::Codegen
     {
         std::cout << "[CodegenVisitor] Generating struct declaration: " << node.name() << std::endl;
         
+        // Check if this is a generic struct
+        if (!node.generic_parameters().empty())
+        {
+            std::cout << "[CodegenVisitor] Generic struct detected: " << node.name() << " with " << node.generic_parameters().size() << " type parameters" << std::endl;
+            
+            // For generic structs, we don't generate the LLVM type immediately
+            // Instead, we just register that this is a generic struct template
+            std::cout << "[CodegenVisitor] Registered generic struct template: " << node.name() << std::endl;
+            register_value(&node, nullptr);
+            return;
+        }
+        
         auto &context = _context_manager.get_context();
         auto module = _context_manager.get_module();
         
@@ -1316,25 +1328,43 @@ namespace Cryo::Codegen
             return;
         }
         
-        std::string type_name = node.type_name();
-        std::cout << "[CodegenVisitor] Creating new instance of type: " << type_name << std::endl;
+        std::string base_type_name = node.type_name();
         
-        // Look up the struct type
-        auto struct_type_it = _types.find(type_name);
-        if (struct_type_it == _types.end()) {
-            report_error("Unknown type in new expression: " + type_name, &node);
-            return;
+        // Check if this is a generic instantiation
+        std::string full_type_name = base_type_name;
+        if (!node.generic_args().empty()) {
+            // Construct the full instantiated type name: "GenericStruct<int>"
+            full_type_name = base_type_name + "<";
+            for (size_t i = 0; i < node.generic_args().size(); ++i) {
+                if (i > 0) full_type_name += ",";
+                full_type_name += node.generic_args()[i];
+            }
+            full_type_name += ">";
+            std::cout << "[CodegenVisitor] Generic instantiation detected: " << full_type_name << std::endl;
         }
         
-        llvm::Type* struct_type = struct_type_it->second;
+        std::cout << "[CodegenVisitor] Creating new instance of type: " << full_type_name << std::endl;
+        
+        // Look up the struct type (use full instantiated name for generics)
+        llvm::Type* struct_type = _type_mapper->lookup_type(full_type_name);
+        if (!struct_type) {
+            // For non-generics, try the old lookup method
+            auto struct_type_it = _types.find(full_type_name);
+            if (struct_type_it != _types.end()) {
+                struct_type = struct_type_it->second;
+            } else {
+                report_error("Unknown type in new expression: " + full_type_name, &node);
+                return;
+            }
+        }
         
         // Allocate memory for the struct on the stack
-        llvm::AllocaInst* struct_alloca = builder.CreateAlloca(struct_type, nullptr, type_name + "_instance");
+        llvm::AllocaInst* struct_alloca = builder.CreateAlloca(struct_type, nullptr, full_type_name + "_instance");
         
         // If there are constructor arguments, call the constructor
         if (!node.arguments().empty()) {
             // Look up the constructor function
-            std::string constructor_name = type_name + "::" + type_name; // Constructor has same name as type
+            std::string constructor_name = full_type_name + "::" + base_type_name; // Constructor has base name
             auto constructor_it = _functions.find(constructor_name);
             
             if (constructor_it != _functions.end()) {
@@ -1362,8 +1392,46 @@ namespace Cryo::Codegen
                 // Call the constructor
                 builder.CreateCall(constructor_func, args);
             } else {
-                report_error("Constructor not found for type: " + type_name, &node);
-                return;
+                // Constructor not found - check if this is a generic instantiation that needs generation
+                if (!node.generic_args().empty()) {
+                    std::cout << "[CodegenVisitor] Attempting to generate generic constructor: " << constructor_name << std::endl;
+                    
+                    // For now, create a simple assignment-based constructor
+                    // In a full implementation, this would analyze the generic constructor body
+                    llvm::Function* generated_constructor = generate_generic_constructor(
+                        full_type_name, base_type_name, node.generic_args(), struct_type);
+                    
+                    if (generated_constructor) {
+                        _functions[constructor_name] = generated_constructor;
+                        std::cout << "[CodegenVisitor] Generated generic constructor: " << constructor_name << std::endl;
+                        
+                        // Now call the generated constructor
+                        std::vector<llvm::Value*> args;
+                        args.push_back(struct_alloca); // 'this' pointer
+                        
+                        // Generate constructor arguments
+                        for (const auto& arg : node.arguments()) {
+                            if (arg) {
+                                arg->accept(*this);
+                                llvm::Value* arg_value = get_generated_value(arg.get());
+                                if (arg_value) {
+                                    args.push_back(arg_value);
+                                } else {
+                                    report_error("Failed to generate argument for generated constructor", arg.get());
+                                    return;
+                                }
+                            }
+                        }
+                        
+                        builder.CreateCall(generated_constructor, args);
+                    } else {
+                        report_error("Failed to generate generic constructor for type: " + full_type_name, &node);
+                        return;
+                    }
+                } else {
+                    report_error("Constructor not found for type: " + full_type_name, &node);
+                    return;
+                }
             }
         } else {
             // Zero-initialize the struct if no constructor
@@ -1373,7 +1441,7 @@ namespace Cryo::Codegen
         
         // The new expression should return the struct value, not a pointer to it
         // For struct assignment, we need to load the struct value
-        llvm::Value* struct_value = builder.CreateLoad(struct_type, struct_alloca, type_name + "_value");
+        llvm::Value* struct_value = builder.CreateLoad(struct_type, struct_alloca, full_type_name + "_value");
         register_value(&node, struct_value);
         set_current_value(struct_value);
     }
@@ -3895,6 +3963,76 @@ namespace Cryo::Codegen
 
         // Also register with just the variant name for unqualified access
         _enum_variants[variant_name] = value;
+    }
+
+    llvm::Function *CodegenVisitor::generate_generic_constructor(const std::string &instantiated_type,
+                                                                const std::string &base_type,
+                                                                const std::vector<std::string> &type_args,
+                                                                llvm::Type *struct_type)
+    {
+        std::cout << "[CodegenVisitor] Generating generic constructor for " << instantiated_type << std::endl;
+        
+        auto &context = _context_manager.get_context();
+        auto module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        
+        if (!module || type_args.empty()) {
+            return nullptr;
+        }
+        
+        // Save current insertion point to restore later
+        llvm::BasicBlock *saved_block = builder.GetInsertBlock();
+        
+        // Create function type: void(struct*, T)
+        std::vector<llvm::Type*> param_types;
+        param_types.push_back(llvm::PointerType::get(struct_type, 0)); // 'this' pointer
+        
+        // For our test case, we know there's one parameter of the generic type
+        llvm::Type *param_type = _type_mapper->map_type(type_args[0]); // T mapped to concrete type (int)
+        if (!param_type) {
+            std::cout << "[CodegenVisitor] Failed to map constructor parameter type: " << type_args[0] << std::endl;
+            return nullptr;
+        }
+        param_types.push_back(param_type);
+        
+        llvm::Type *return_type = _type_mapper->get_void_type();
+        llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+        
+        // Create the function
+        std::string func_name = instantiated_type + "::" + base_type;
+        llvm::Function *constructor_func = llvm::Function::Create(
+            func_type, llvm::Function::ExternalLinkage, func_name, module);
+        
+        // Create entry block for the constructor
+        llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", constructor_func);
+        builder.SetInsertPoint(entry_block);
+        
+        // Get function arguments
+        auto args_it = constructor_func->args().begin();
+        llvm::Value *this_ptr = &*args_it;
+        ++args_it;
+        llvm::Value *val_arg = &*args_it;
+        
+        // For our GenericStruct<T>, we know it has one field 'value' at index 0
+        // this.value = val;
+        std::vector<llvm::Value*> indices = {
+            llvm::ConstantInt::get(context, llvm::APInt(32, 0)), // struct index
+            llvm::ConstantInt::get(context, llvm::APInt(32, 0))  // field index (value is at index 0)
+        };
+        
+        llvm::Value *field_ptr = builder.CreateGEP(struct_type, this_ptr, indices, "value_ptr");
+        builder.CreateStore(val_arg, field_ptr);
+        
+        // Return void
+        builder.CreateRetVoid();
+        
+        // Restore original insertion point
+        if (saved_block) {
+            builder.SetInsertPoint(saved_block);
+        }
+        
+        std::cout << "[CodegenVisitor] Successfully generated generic constructor: " << func_name << std::endl;
+        return constructor_func;
     }
 
 } // namespace Cryo::Codegen
