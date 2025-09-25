@@ -161,6 +161,36 @@ namespace Cryo::Codegen
         llvm::Type *map_generic_type(Cryo::Type *generic_type,
                                      const std::vector<Cryo::Type *> &type_args);
 
+        /**
+         * @brief Map generic type instantiation from string
+         * @param type_name String like "GenericStruct<int>"
+         * @return Instantiated LLVM type
+         */
+        llvm::Type *map_generic_instantiation(const std::string &type_name);
+
+        /**
+         * @brief Create generic struct instantiation
+         * @param base_name Base generic type name
+         * @param type_args Type arguments
+         * @param instantiated_name Full instantiated name
+         * @return Instantiated LLVM struct type
+         */
+        llvm::Type *create_generic_struct_instantiation(const std::string &base_name,
+                                                       const std::vector<std::string> &type_args,
+                                                       const std::string &instantiated_name);
+
+        /**
+         * @brief Register field metadata for generic instantiation
+         * @param type_name Instantiated type name
+         * @param field_name Field name
+         * @param field_index Field index
+         * @param field_type LLVM field type
+         */
+        void register_generic_field_metadata(const std::string &type_name,
+                                            const std::string &field_name,
+                                            int field_index,
+                                            llvm::Type *field_type);
+
         //===================================================================
         // Pointer and Reference Types
         //===================================================================

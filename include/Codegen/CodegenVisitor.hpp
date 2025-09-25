@@ -249,6 +249,12 @@ namespace Cryo::Codegen
         llvm::Function *generate_method_declaration(Cryo::StructMethodNode *method, llvm::Type *struct_type);
         bool generate_function_body(Cryo::FunctionDeclarationNode *node, llvm::Function *function);
 
+        // Generic type generation
+        llvm::Function *generate_generic_constructor(const std::string &instantiated_type,
+                                                     const std::string &base_type,
+                                                     const std::vector<std::string> &type_args,
+                                                     llvm::Type *struct_type);
+
         // Type generation
         llvm::Type *generate_struct_type(Cryo::StructDeclarationNode *node);
         llvm::Type *generate_class_type(Cryo::ClassDeclarationNode *node);
