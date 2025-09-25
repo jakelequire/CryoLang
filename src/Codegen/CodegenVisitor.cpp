@@ -117,6 +117,9 @@ namespace Cryo::Codegen
             std::string var_name = node.name();
             std::string type_annotation = node.type_annotation();
 
+            std::cout << "[DEBUG] Variable Declaration: name='" << var_name 
+                      << "', type_annotation='" << type_annotation << "'" << std::endl;
+
             if (type_annotation.empty() || type_annotation == "auto")
             {
                 report_error("Variable declaration requires explicit type: " + var_name);
@@ -181,6 +184,28 @@ namespace Cryo::Codegen
                             }
                         }
                     }
+                }
+                // Handle pointer types: int* should store element type "int*"
+                else if (type_annotation.back() == '*')
+                {
+                    std::cout << "[CodegenVisitor] Pointer variable '" << var_name << "' type '" << type_annotation << "'" << std::endl;
+                    
+                    // For pointer variables, the element type is the full pointer type
+                    // (what's stored in the alloca is the pointer value itself)
+                    element_type = llvm_type; // llvm_type is already the pointer type (int*)
+                    
+                    std::cout << "[CodegenVisitor] Pointer element type set to full pointer type" << std::endl;
+                }
+                // Handle reference types: &int should store element type "&int" (reference as pointer)
+                else if (type_annotation.front() == '&')
+                {
+                    std::cout << "[CodegenVisitor] Reference variable '" << var_name << "' type '" << type_annotation << "'" << std::endl;
+                    
+                    // For reference variables, the element type is the full reference type
+                    // (what's stored in the alloca is the reference value, implemented as pointer)
+                    element_type = llvm_type; // llvm_type is already the pointer type (int*)
+                    
+                    std::cout << "[CodegenVisitor] Reference element type set to full reference type (as pointer)" << std::endl;
                 }
                 else if (llvm_type->isArrayTy())
                 {
@@ -754,6 +779,7 @@ namespace Cryo::Codegen
                 {
                     // Get the proper element type for the alloca
                     llvm::Type *element_type = _value_context->get_alloca_type(identifier);
+                    
                     llvm::Value *loaded_value = create_load(var_alloca, element_type, identifier + ".load");
                     set_current_value(loaded_value);
                     register_value(&node, loaded_value);
@@ -1928,6 +1954,44 @@ namespace Cryo::Codegen
                     // The result of assignment is the assigned value
                     return right_val;
                 }
+                // Handle assignment to dereferenced pointer: *ptr = value
+                else if (auto *left_unary = dynamic_cast<Cryo::UnaryExpressionNode *>(node->left()))
+                {
+                    if (left_unary->operator_token().kind() == TokenKind::TK_STAR)
+                    {
+                        // This is a dereference assignment: *ptr = value
+                        // First get the pointer value
+                        left_unary->operand()->accept(*this);
+                        llvm::Value *ptr_val = get_current_value();
+
+                        if (!ptr_val)
+                        {
+                            report_error("Failed to generate pointer operand for dereference assignment");
+                            return nullptr;
+                        }
+
+                        // Generate right operand
+                        node->right()->accept(*this);
+                        llvm::Value *right_val = get_current_value();
+
+                        if (!right_val)
+                        {
+                            report_error("Failed to generate right operand of assignment");
+                            return nullptr;
+                        }
+
+                        // Store the right side value to the dereferenced pointer
+                        create_store(right_val, ptr_val);
+
+                        // The result of assignment is the assigned value
+                        return right_val;
+                    }
+                    else
+                    {
+                        report_error("Invalid left-hand side in assignment expression");
+                        return nullptr;
+                    }
+                }
                 else
                 {
                     report_error("Invalid left-hand side in assignment expression");
@@ -2297,11 +2361,77 @@ namespace Cryo::Codegen
                 return builder.CreateNot(boolValue, "not");
             }
         }
+        else if (operator_str == "&")
+        {
+            // Address-of operator: get the address of a variable
+            if (auto identifierNode = dynamic_cast<Cryo::IdentifierNode *>(operand))
+            {
+                std::string varName = identifierNode->name();
+                auto varAlloca = _value_context->get_alloca(varName);
+                if (!varAlloca)
+                {
+                    std::cerr << "[ERROR] Undefined variable in address-of operation: " << varName << std::endl;
+                    return nullptr;
+                }
+                
+                // Return the alloca (address) directly for address-of operator
+                return varAlloca;
+            }
+            else
+            {
+                std::cerr << "[ERROR] Address-of operator (&) can only be applied to variables" << std::endl;
+                return nullptr;
+            }
+        }
+        else if (operator_str == "*")
+        {
+            // Dereference operator: load value from pointer/reference
+            if (!operandValue->getType()->isPointerTy())
+            {
+                std::cerr << "[ERROR] Dereference operator (*) can only be applied to pointer types" << std::endl;
+                return nullptr;
+            }
+            
+            // Try to determine the element type from the variable context
+            llvm::Type *elementType = nullptr;
+            
+            // If this is a direct variable dereference (*ptr), get the pointee type
+            if (auto *identNode = dynamic_cast<Cryo::IdentifierNode *>(node->operand()))
+            {
+                std::string varName = identNode->name();
+                llvm::Type *storedType = _value_context->get_alloca_type(varName);
+                
+                if (storedType && storedType->isPointerTy())
+                {
+                    // For pointer variables, we need to determine what type they point to
+                    // For now, we'll assume common types based on variable naming or context
+                    // This is a temporary solution until we have better type tracking
+                    
+                    // For now, assume int* pointers point to i32
+                    // TODO: Improve this with proper type information storage
+                    elementType = llvm::Type::getInt32Ty(_context_manager.get_context());
+                }
+                else
+                {
+                    // Fallback to the stored type itself
+                    elementType = storedType;
+                }
+            }
+            
+            // Fallback to common types if we can't determine the element type
+            if (!elementType)
+            {
+                // For now, assume i32 as the most common case - this should be improved with proper type tracking
+                elementType = llvm::Type::getInt32Ty(_context_manager.get_context());
+            }
+                
+            return builder.CreateLoad(elementType, operandValue, "deref");
+        }
 
         std::cerr << "[ERROR] Unsupported unary operator: " << operator_str << std::endl;
         return nullptr;
     }
-    llvm::Value *CodegenVisitor::generate_function_call(Cryo::CallExpressionNode *node)
+    llvm::Value *Cryo::Codegen::CodegenVisitor::generate_function_call(Cryo::CallExpressionNode *node)
     {
         if (!node)
             return nullptr;
@@ -2399,7 +2529,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(function, args);
     }
 
-    std::string CodegenVisitor::extract_function_name_from_member_access(MemberAccessNode *node)
+    std::string Cryo::Codegen::CodegenVisitor::extract_function_name_from_member_access(Cryo::MemberAccessNode *node)
     {
         if (!node)
             return "";
@@ -2409,7 +2539,7 @@ namespace Cryo::Codegen
         return node->member();
     }
 
-    std::string CodegenVisitor::map_cryo_to_c_function(const std::string &cryo_name)
+    std::string Cryo::Codegen::CodegenVisitor::map_cryo_to_c_function(const std::string &cryo_name)
     {
         // TODO: This should be replaced with a proper symbol table lookup
         // that gets the C function name from the symbol's metadata
@@ -2417,7 +2547,7 @@ namespace Cryo::Codegen
         return cryo_name;
     }
 
-    llvm::Function *CodegenVisitor::create_runtime_function_declaration(const std::string &c_name, CallExpressionNode *call_node)
+    llvm::Function *Cryo::Codegen::CodegenVisitor::create_runtime_function_declaration(const std::string &c_name, Cryo::CallExpressionNode *call_node)
     {
         // Handle scoped function names like "Std::Runtime::print_int"
         std::string symbol_name = c_name;
@@ -2496,8 +2626,8 @@ namespace Cryo::Codegen
 
         return function;
     }
-    llvm::Value *CodegenVisitor::generate_array_access(Cryo::ArrayAccessNode *node) { return nullptr; }
-    llvm::Value *CodegenVisitor::generate_member_access(Cryo::MemberAccessNode *node) { return nullptr; }
+    llvm::Value *Cryo::Codegen::CodegenVisitor::generate_array_access(Cryo::ArrayAccessNode *node) { return nullptr; }
+    llvm::Value *Cryo::Codegen::CodegenVisitor::generate_member_access(Cryo::MemberAccessNode *node) { return nullptr; }
     void CodegenVisitor::generate_if_statement(Cryo::IfStatementNode *node)
     {
         if (!node)
