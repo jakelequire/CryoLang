@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <optional>
 
 namespace Cryo::Codegen
 {
@@ -255,6 +256,60 @@ namespace Cryo::Codegen
         void clear_cache();
 
         //===================================================================
+        // Field Metadata Management
+        //===================================================================
+
+        /**
+         * @brief Structure to hold field information
+         */
+        struct FieldInfo {
+            llvm::Type* struct_type;
+            int field_index;
+            llvm::Type* field_type;
+            std::string field_name;
+        };
+
+        /**
+         * @brief Register field metadata for a struct/class type
+         * @param type_name Name of the struct/class type
+         * @param field_name Name of the field
+         * @param field_index Index of the field in the struct
+         * @param field_type LLVM type of the field
+         */
+        void register_field_metadata(const std::string& type_name, const std::string& field_name, 
+                                    int field_index, llvm::Type* field_type);
+
+        /**
+         * @brief Get field information for a given type and field name
+         * @param llvm_type LLVM type to search for
+         * @param field_name Name of the field
+         * @return Optional field information
+         */
+        std::optional<FieldInfo> get_field_info(llvm::Type* llvm_type, const std::string& field_name);
+
+        /**
+         * @brief Get field index by name for a registered type
+         * @param type_name Name of the type
+         * @param field_name Name of the field
+         * @return Field index or -1 if not found
+         */
+        int get_field_index(const std::string& type_name, const std::string& field_name);
+
+        /**
+         * @brief Register all fields from a struct declaration
+         * @param struct_decl Struct declaration node
+         * @param llvm_struct_type The corresponding LLVM struct type
+         */
+        void register_struct_fields(Cryo::StructDeclarationNode* struct_decl, llvm::StructType* llvm_struct_type);
+
+        /**
+         * @brief Register all fields from a class declaration
+         * @param class_decl Class declaration node
+         * @param llvm_class_type The corresponding LLVM struct type
+         */
+        void register_class_fields(Cryo::ClassDeclarationNode* class_decl, llvm::StructType* llvm_class_type);
+
+        //===================================================================
         // Error Handling
         //===================================================================
 
@@ -281,6 +336,10 @@ namespace Cryo::Codegen
 
         // Struct type cache for forward declarations
         std::unordered_map<std::string, llvm::StructType *> _struct_cache;
+
+        // Field metadata storage
+        std::unordered_map<std::string, std::unordered_map<std::string, FieldInfo>> _field_metadata;
+        std::unordered_map<llvm::Type*, std::string> _llvm_type_to_name_map;
 
         // Error state
         bool _has_errors;

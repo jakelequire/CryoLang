@@ -336,7 +336,51 @@ namespace Cryo::Codegen
         // Register in main type cache
         register_type(struct_name, struct_type);
 
+        // Register field metadata
+        register_struct_fields(struct_decl, struct_type);
+
         return struct_type;
+    }
+
+    llvm::StructType *TypeMapper::map_class_type(Cryo::ClassDeclarationNode *class_decl)
+    {
+        if (!class_decl)
+        {
+            report_error("Cannot map null class declaration");
+            return nullptr;
+        }
+
+        const std::string &class_name = class_decl->name();
+
+        // Check if already in cache
+        auto cache_it = _struct_cache.find(class_name);
+        if (cache_it != _struct_cache.end())
+        {
+            return cache_it->second;
+        }
+
+        // Create opaque struct first for forward declarations
+        auto &llvm_context = _context_manager.get_context();
+        llvm::StructType *class_type = llvm::StructType::create(llvm_context, class_name);
+        _struct_cache[class_name] = class_type;
+
+        // Generate field types (classes are represented as structs in LLVM)
+        std::vector<llvm::Type *> field_types = generate_class_fields(class_decl);
+        if (has_errors())
+        {
+            return nullptr;
+        }
+
+        // Set the class body
+        class_type->setBody(field_types);
+
+        // Register in main type cache
+        register_type(class_name, class_type);
+
+        // Register field metadata
+        register_class_fields(class_decl, class_type);
+
+        return class_type;
     }
 
     llvm::PointerType *TypeMapper::map_pointer_type(Cryo::Type *pointee_type)
@@ -748,6 +792,107 @@ namespace Cryo::Codegen
         }
 
         return mangled;
+    }
+
+    //===================================================================
+    // Field Metadata Management Implementation
+    //===================================================================
+
+    void TypeMapper::register_field_metadata(const std::string& type_name, const std::string& field_name, 
+                                            int field_index, llvm::Type* field_type)
+    {
+        FieldInfo info;
+        info.field_index = field_index;
+        info.field_type = field_type;
+        info.field_name = field_name;
+        info.struct_type = lookup_type(type_name);
+        
+        _field_metadata[type_name][field_name] = info;
+    }
+
+    std::optional<TypeMapper::FieldInfo> TypeMapper::get_field_info(llvm::Type* llvm_type, const std::string& field_name)
+    {
+        // First, try to find the type name from the LLVM type
+        auto type_name_it = _llvm_type_to_name_map.find(llvm_type);
+        if (type_name_it != _llvm_type_to_name_map.end()) {
+            const std::string& type_name = type_name_it->second;
+            auto type_it = _field_metadata.find(type_name);
+            if (type_it != _field_metadata.end()) {
+                auto field_it = type_it->second.find(field_name);
+                if (field_it != type_it->second.end()) {
+                    return field_it->second;
+                }
+            }
+        }
+
+        // Fallback: search through all registered types
+        for (const auto& [type_name, fields] : _field_metadata) {
+            llvm::Type* registered_type = lookup_type(type_name);
+            if (registered_type == llvm_type) {
+                auto field_it = fields.find(field_name);
+                if (field_it != fields.end()) {
+                    return field_it->second;
+                }
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    int TypeMapper::get_field_index(const std::string& type_name, const std::string& field_name)
+    {
+        auto type_it = _field_metadata.find(type_name);
+        if (type_it != _field_metadata.end()) {
+            auto field_it = type_it->second.find(field_name);
+            if (field_it != type_it->second.end()) {
+                return field_it->second.field_index;
+            }
+        }
+        return -1;
+    }
+
+    void TypeMapper::register_struct_fields(Cryo::StructDeclarationNode* struct_decl, llvm::StructType* llvm_struct_type)
+    {
+        if (!struct_decl || !llvm_struct_type) return;
+
+        const std::string& type_name = struct_decl->name();
+        
+        // Store the mapping from LLVM type to name for quick lookups
+        _llvm_type_to_name_map[llvm_struct_type] = type_name;
+
+        // Register each field
+        int field_index = 0;
+        for (const auto& field : struct_decl->fields()) {
+            if (field) {
+                llvm::Type* field_llvm_type = map_type(field->type_annotation());
+                if (field_llvm_type) {
+                    register_field_metadata(type_name, field->name(), field_index, field_llvm_type);
+                }
+                field_index++;
+            }
+        }
+    }
+
+    void TypeMapper::register_class_fields(Cryo::ClassDeclarationNode* class_decl, llvm::StructType* llvm_class_type)
+    {
+        if (!class_decl || !llvm_class_type) return;
+
+        const std::string& type_name = class_decl->name();
+        
+        // Store the mapping from LLVM type to name for quick lookups
+        _llvm_type_to_name_map[llvm_class_type] = type_name;
+
+        // Register each field
+        int field_index = 0;
+        for (const auto& field : class_decl->fields()) {
+            if (field) {
+                llvm::Type* field_llvm_type = map_type(field->type_annotation());
+                if (field_llvm_type) {
+                    register_field_metadata(type_name, field->name(), field_index, field_llvm_type);
+                }
+                field_index++;
+            }
+        }
     }
 
 } // namespace Cryo::Codegen
