@@ -1492,7 +1492,58 @@ namespace Cryo
         SourceLocation call_location = _current_token.location();
         consume(TokenKind::TK_L_PAREN, "Expected '(' to start function call");
 
-        // Create call expression with the callee (function name/expression)
+        // Check if this could be a non-generic struct literal
+        if (_current_token.is(TokenKind::TK_L_BRACE))
+        {
+            // Check if expr is an identifier (potential struct name)
+            if (auto identifier = dynamic_cast<IdentifierNode *>(expr.get()))
+            {
+                // This looks like a struct literal: StructName({field: value})
+                advance(); // consume '{'
+
+                std::string struct_name = identifier->name();
+                auto struct_literal = _builder.create_struct_literal(call_location, struct_name);
+
+                // Parse field initializers
+                if (!_current_token.is(TokenKind::TK_R_BRACE))
+                {
+                    do
+                    {
+                        // Parse field name
+                        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                        {
+                            error("Expected field name in struct literal");
+                            return nullptr;
+                        }
+
+                        std::string field_name = std::string(_current_token.text());
+                        advance(); // consume field name
+
+                        consume(TokenKind::TK_COLON, "Expected ':' after field name");
+
+                        // Parse field value
+                        auto field_value = parse_expression();
+                        if (!field_value)
+                        {
+                            error("Expected expression for field value");
+                            return nullptr;
+                        }
+
+                        // Create field initializer
+                        auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                        struct_literal->add_field_initializer(std::move(field_init));
+
+                    } while (match(TokenKind::TK_COMMA));
+                }
+
+                consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
+                consume(TokenKind::TK_R_PAREN, "Expected ')' after struct literal");
+
+                return struct_literal;
+            }
+        }
+
+        // Regular function call - create call expression with the callee (function name/expression)
         auto call_expr = _builder.create_call_expression(call_location, std::move(expr));
 
         // Parse arguments if any
