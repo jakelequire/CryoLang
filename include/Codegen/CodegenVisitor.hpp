@@ -254,6 +254,10 @@ namespace Cryo::Codegen
                                                      const std::string &base_type,
                                                      const std::vector<std::string> &type_args,
                                                      llvm::Type *struct_type);
+        void generate_generic_methods(const std::string &instantiated_type,
+                                      const std::string &base_type,
+                                      const std::vector<std::string> &type_args,
+                                      llvm::Type *struct_type);
 
         // Type generation
         llvm::Type *generate_struct_type(Cryo::StructDeclarationNode *node);

@@ -1405,6 +1405,9 @@ namespace Cryo::Codegen
                         _functions[constructor_name] = generated_constructor;
                         std::cout << "[CodegenVisitor] Generated generic constructor: " << constructor_name << std::endl;
                         
+                        // Also generate all generic methods for this instantiation
+                        generate_generic_methods(full_type_name, base_type_name, node.generic_args(), struct_type);
+                        
                         // Now call the generated constructor
                         std::vector<llvm::Value*> args;
                         args.push_back(struct_alloca); // 'this' pointer
@@ -3184,6 +3187,14 @@ namespace Cryo::Codegen
                         std::string method_name = type_name + "::" + member_access->member();
                         auto method_it = _functions.find(method_name);
                         
+                        // If not found and this is a generic type, also try the base type
+                        if (method_it == _functions.end() && type_name.find('<') != std::string::npos) {
+                            // Extract base type name for generic instantiation lookup fallback
+                            std::string base_name = type_name.substr(0, type_name.find('<'));
+                            std::string fallback_method_name = base_name + "::" + member_access->member();
+                            method_it = _functions.find(fallback_method_name);
+                        }
+                        
                         if (method_it != _functions.end()) {
                             llvm::Function* method_func = method_it->second;
                             
@@ -3204,6 +3215,8 @@ namespace Cryo::Codegen
                             
                             // Call the method
                             return builder.CreateCall(method_func, args);
+                        } else {
+                            std::cout << "[CodegenVisitor] Method not found: " << method_name << " for type: " << type_name << std::endl;
                         }
                     }
                 }
@@ -4033,6 +4046,98 @@ namespace Cryo::Codegen
         
         std::cout << "[CodegenVisitor] Successfully generated generic constructor: " << func_name << std::endl;
         return constructor_func;
+    }
+
+    void CodegenVisitor::generate_generic_methods(const std::string &instantiated_type,
+                                                   const std::string &base_type,
+                                                   const std::vector<std::string> &type_args,
+                                                   llvm::Type *struct_type)
+    {
+        std::cout << "[CodegenVisitor] Generating generic methods for " << instantiated_type << std::endl;
+        
+        auto &context = _context_manager.get_context();
+        auto module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        
+        if (!module || type_args.empty()) {
+            std::cout << "[CodegenVisitor] Cannot generate generic methods - missing module or type args" << std::endl;
+            return;
+        }
+        
+        // For GenericStruct, we need to generate the get_value() method
+        if (base_type == "GenericStruct" && type_args.size() == 1) {
+            // Generate get_value() method: T get_value(this*)
+            std::string method_name = instantiated_type + "::get_value";
+            
+            // Check if method already exists
+            if (_functions.find(method_name) != _functions.end()) {
+                std::cout << "[CodegenVisitor] Method " << method_name << " already exists, skipping" << std::endl;
+                return;
+            }
+            
+            llvm::Type *return_type = _type_mapper->map_type(type_args[0]);
+            if (!return_type) {
+                std::cout << "[CodegenVisitor] Failed to map return type: " << type_args[0] << std::endl;
+                return;
+            }
+            
+            // Create function type: T(struct*)
+            std::vector<llvm::Type*> param_types;
+            param_types.push_back(llvm::PointerType::get(struct_type, 0)); // 'this' pointer
+            
+            llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+            
+            // Create function
+            llvm::Function *method_func = llvm::Function::Create(
+                func_type, 
+                llvm::Function::ExternalLinkage, 
+                method_name, 
+                module);
+            
+            if (!method_func) {
+                std::cout << "[CodegenVisitor] Failed to create method function" << std::endl;
+                return;
+            }
+            
+            // Set parameter names
+            auto arg_iter = method_func->arg_begin();
+            arg_iter->setName("this");
+            
+            // Save current insertion point
+            llvm::BasicBlock *saved_block = builder.GetInsertBlock();
+            
+            // Create entry block
+            llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", method_func);
+            builder.SetInsertPoint(entry_block);
+            
+            // Generate method body - return this->value
+            llvm::Value *this_ptr = &(*arg_iter);
+            
+            // Get pointer to the 'value' field (index 0)
+            llvm::Value *field_ptr = builder.CreateStructGEP(struct_type, this_ptr, 0, "value_ptr");
+            
+            // Load the value and return it
+            llvm::Value *field_value = builder.CreateLoad(return_type, field_ptr, "value_val");
+            builder.CreateRet(field_value);
+            
+            // Register the method
+            _functions[method_name] = method_func;
+            
+            // Also register with simplified name for lookup
+            std::string simple_method_name = base_type + "::get_value";
+            if (_functions.find(simple_method_name) == _functions.end()) {
+                _functions[simple_method_name] = method_func;
+            }
+            
+            std::cout << "[CodegenVisitor] Generated generic method: " << method_name << std::endl;
+            
+            // Restore insertion point
+            if (saved_block) {
+                builder.SetInsertPoint(saved_block);
+            }
+        } else {
+            std::cout << "[CodegenVisitor] Unsupported generic type for method generation: " << base_type << std::endl;
+        }
     }
 
 } // namespace Cryo::Codegen
