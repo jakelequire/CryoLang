@@ -36,6 +36,51 @@ namespace Cryo
         return nullptr; // Symbol not found
     }
 
+    Symbol *SymbolTable::lookup_namespaced_symbol(const std::string &namespace_name, const std::string &symbol_name) const
+    {
+        // First check current scope
+        auto namespace_it = namespaces_.find(namespace_name);
+        if (namespace_it != namespaces_.end())
+        {
+            auto symbol_it = namespace_it->second.find(symbol_name);
+            if (symbol_it != namespace_it->second.end())
+            {
+                return const_cast<Symbol *>(&symbol_it->second);
+            }
+        }
+
+        // Check parent scopes
+        if (parent_scope_)
+        {
+            return parent_scope_->lookup_namespaced_symbol(namespace_name, symbol_name);
+        }
+
+        return nullptr; // Symbol not found
+    }
+
+    void SymbolTable::register_namespace(const std::string &namespace_name, const std::unordered_map<std::string, Symbol> &symbols)
+    {
+        namespaces_[namespace_name] = symbols;
+        std::cout << "[DEBUG] Registered namespace '" << namespace_name << "' with " << symbols.size() << " symbols" << std::endl;
+    }
+
+    bool SymbolTable::has_namespace(const std::string &namespace_name) const
+    {
+        auto it = namespaces_.find(namespace_name);
+        if (it != namespaces_.end())
+        {
+            return true;
+        }
+
+        // Check parent scopes
+        if (parent_scope_)
+        {
+            return parent_scope_->has_namespace(namespace_name);
+        }
+
+        return false;
+    }
+
     std::unique_ptr<SymbolTable> SymbolTable::enter_scope()
     {
         // Create new child scope with this as parent
@@ -56,6 +101,8 @@ namespace Cryo
             return "Variable";
         case SymbolKind::Function:
             return "Function";
+        case SymbolKind::Intrinsic:
+            return "Intrinsic";
         case SymbolKind::Type:
             return "Type";
         default:

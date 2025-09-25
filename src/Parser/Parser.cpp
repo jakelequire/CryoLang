@@ -392,6 +392,12 @@ namespace Cryo
             return parse_variable_declaration();
         }
 
+        // Import declarations
+        if (_current_token.is(TokenKind::TK_KW_IMPORT))
+        {
+            return parse_import_declaration();
+        }
+
         // Type declarations - struct, class, type alias, enum
         if (_current_token.is(TokenKind::TK_KW_TYPE))
         {
@@ -437,6 +443,12 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_KW_EXTERN))
         {
             return parse_extern_block();
+        }
+
+        // Intrinsic function declarations
+        if (_current_token.is(TokenKind::TK_KW_INTRINSIC))
+        {
+            return parse_intrinsic_declaration();
         }
 
         // Function declarations
@@ -640,6 +652,146 @@ namespace Cryo
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after extern function declaration");
 
         return func_decl;
+    }
+
+    std::unique_ptr<IntrinsicDeclarationNode> Parser::parse_intrinsic_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        // Parse 'intrinsic' keyword
+        consume(TokenKind::TK_KW_INTRINSIC, "Expected 'intrinsic'");
+
+        // Parse 'function' keyword
+        consume(TokenKind::TK_KW_FUNCTION, "Expected 'function' after 'intrinsic'");
+
+        // Parse function name
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
+        std::string func_name = std::string(name_token.text());
+
+        // Parse parameter list
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
+
+        std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+        if (!_current_token.is(TokenKind::TK_R_PAREN))
+        {
+            params = parse_parameter_list();
+        }
+
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
+
+        // Parse return type
+        Type *return_type = _context.types().get_void_type();
+        if (_current_token.is(TokenKind::TK_ARROW))
+        {
+            advance(); // consume '->'
+            return_type = parse_type_annotation();
+        }
+
+        // Create intrinsic declaration
+        auto intrinsic_decl = std::make_unique<IntrinsicDeclarationNode>(start_loc, func_name, return_type->to_string());
+
+        // Add parameters to intrinsic
+        for (auto &param : params)
+        {
+            intrinsic_decl->add_parameter(std::move(param));
+        }
+
+        // Parse optional implementation body for compiler hints
+        if (_current_token.is(TokenKind::TK_L_BRACE))
+        {
+            auto body = parse_block_statement();
+            intrinsic_decl->set_body(std::unique_ptr<BlockStatementNode>(
+                dynamic_cast<BlockStatementNode *>(body.release())));
+        }
+        else
+        {
+            // No body, just end with semicolon
+            consume(TokenKind::TK_SEMICOLON, "Expected ';' after intrinsic function declaration");
+        }
+
+        return intrinsic_decl;
+    }
+
+    std::unique_ptr<ImportDeclarationNode> Parser::parse_import_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        // Parse 'import' keyword
+        consume(TokenKind::TK_KW_IMPORT, "Expected 'import'");
+
+        // Parse module path - can be string literal (relative) or angle brackets (stdlib)
+        std::string module_path;
+        ImportDeclarationNode::ImportType import_type;
+
+        if (_current_token.is(TokenKind::TK_STRING_LITERAL))
+        {
+            // String literal import for relative files (e.g., import "./relative/path.cryo")
+            module_path = std::string(_current_token.text());
+            // Remove quotes
+            if (module_path.size() >= 2 && module_path.front() == '"' && module_path.back() == '"')
+            {
+                module_path = module_path.substr(1, module_path.size() - 2);
+            }
+
+            import_type = ImportDeclarationNode::ImportType::Relative;
+            advance(); // consume string literal
+        }
+        else if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            // Angle bracket import for standard library (e.g., import <core/intrinsics>)
+            advance(); // consume '<'
+
+            // Build the path from identifiers and forward slashes
+            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+            {
+                throw ParseError("Expected module path after '<' in import statement", _current_token.location());
+            }
+
+            module_path = std::string(_current_token.text());
+            advance(); // consume first identifier
+
+            // Handle path segments separated by '/'
+            while (_current_token.is(TokenKind::TK_SLASH))
+            {
+                advance(); // consume '/'
+                Token ident = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '/' in import path");
+                module_path += "/" + std::string(ident.text());
+            }
+
+            consume(TokenKind::TK_R_ANGLE, "Expected '>' to close standard library import");
+
+            import_type = ImportDeclarationNode::ImportType::Absolute;
+        }
+        else
+        {
+            throw ParseError("Expected import path: use \"./relative/path.cryo\" for relative imports or <core/module> for standard library", _current_token.location());
+        }
+
+        // Parse optional 'as' alias
+        std::string alias;
+        bool has_alias = false;
+        if (_current_token.is(TokenKind::TK_KW_AS))
+        {
+            advance(); // consume 'as'
+            Token alias_token = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after 'as'");
+            alias = std::string(alias_token.text());
+            has_alias = true;
+        }
+
+        // Parse optional ';' or newline
+        if (_current_token.is(TokenKind::TK_SEMICOLON))
+        {
+            advance(); // consume ';'
+        }
+
+        if (has_alias)
+        {
+            return std::make_unique<ImportDeclarationNode>(start_loc, module_path, alias, import_type);
+        }
+        else
+        {
+            return std::make_unique<ImportDeclarationNode>(start_loc, module_path, import_type);
+        }
     }
 
     std::unique_ptr<ReturnStatementNode> Parser::parse_return_statement()

@@ -165,6 +165,17 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    // IntrinsicDeclarationNode visitor implementation
+    void IntrinsicDeclarationNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    void ImportDeclarationNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     void DeclarationStatementNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);

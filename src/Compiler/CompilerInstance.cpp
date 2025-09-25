@@ -257,6 +257,12 @@ namespace Cryo
 
         try
         {
+            // Phase 0: Symbol table population (must happen before type checking)
+            populate_symbol_table(_ast_root.get());
+
+            // Load only newly added intrinsic symbols into type checker
+            _type_checker->load_intrinsic_symbols(*_symbol_table);
+
             // Phase 1: Type checking
             _type_checker->check_program(*_ast_root);
 
@@ -298,10 +304,7 @@ namespace Cryo
                 return false;
             }
 
-            // Phase 2: Basic symbol table population (for legacy compatibility)
-            populate_symbol_table(_ast_root.get());
-
-            // Phase 3: Future semantic analysis phases would go here
+            // Phase 2: Future semantic analysis phases would go here
             // - Control flow analysis
             // - Dead code elimination
             // - etc.
@@ -571,6 +574,64 @@ namespace Cryo
             if (func_decl->body())
             {
                 populate_symbol_table_with_scope(func_decl->body(), current_scope, func_decl->name());
+            }
+        }
+        // Handle intrinsic function declarations
+        else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(node))
+        {
+            // Create function type from return type and parameters
+            std::vector<Type *> param_types;
+            for (const auto &param : intrinsic_decl->parameters())
+            {
+                // Parse parameter type from string annotation
+                Type *param_type = _ast_context->types().parse_type_from_string(param->type_annotation());
+                param_types.push_back(param_type);
+            }
+
+            // Parse return type
+            Type *return_type = _ast_context->types().parse_type_from_string(intrinsic_decl->return_type_annotation());
+
+            // Create function type
+            Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
+
+            // Add intrinsic function to current (global) scope with Intrinsic symbol kind
+            current_scope->declare_symbol(intrinsic_decl->name(), SymbolKind::Intrinsic,
+                                          intrinsic_decl->location(), function_type, scope_name);
+
+            std::cout << "[CompilerInstance] Registered intrinsic function '" << intrinsic_decl->name() << "' in symbol table" << std::endl;
+        }
+        // Handle import declarations
+        else if (auto import_decl = dynamic_cast<ImportDeclarationNode *>(node))
+        {
+            std::cout << "[CompilerInstance] Processing import: " << import_decl->path() << std::endl;
+
+            // Create ModuleLoader instance
+            ModuleLoader loader(*current_scope);
+            loader.set_stdlib_root("./stdlib");
+            loader.set_current_file("./test/"); // TODO: Get actual current file directory
+
+            // Load the import
+            auto result = loader.load_import(*import_decl);
+
+            if (result.success)
+            {
+                // Register the namespace and symbols
+                std::string namespace_name = import_decl->has_alias() ? import_decl->alias() : result.module_name;
+
+                if (!result.symbol_map.empty())
+                {
+                    current_scope->register_namespace(namespace_name, result.symbol_map);
+                    std::cout << "[CompilerInstance] Registered namespace '" << namespace_name << "' with "
+                              << result.symbol_map.size() << " symbols" << std::endl;
+                }
+                else
+                {
+                    std::cout << "[CompilerInstance] Warning: Import succeeded but no symbols found in " << import_decl->path() << std::endl;
+                }
+            }
+            else
+            {
+                std::cout << "[CompilerInstance] Failed to load import '" << import_decl->path() << "': " << result.error_message << std::endl;
             }
         }
         // Handle struct declarations

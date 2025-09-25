@@ -88,6 +88,7 @@ namespace Cryo
         {"from", TokenKind::TK_KW_FROM},
         {"as", TokenKind::TK_KW_AS},
         {"implement", TokenKind::TK_KW_IMPLEMENT},
+        {"intrinsic", TokenKind::TK_KW_INTRINSIC},
 
         // Type System
         {"void", TokenKind::TK_KW_VOID},
