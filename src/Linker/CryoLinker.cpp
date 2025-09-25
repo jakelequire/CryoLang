@@ -26,7 +26,7 @@ namespace Cryo::Linker
     {
 // Set default target triple based on current platform
 #if defined(_WIN32) || defined(_WIN64)
-        _target_triple = "x86_64-pc-windows-msvc";
+        _target_triple = "x86_64-w64-windows-gnu";  // Use MinGW instead of MSVC
 #elif defined(__APPLE__)
         _target_triple = "x86_64-apple-macosx";
 #else
@@ -291,7 +291,7 @@ namespace Cryo::Linker
         llvm::InitializeAllAsmPrinters();
 
         std::string error;
-        auto target_triple = llvm::sys::getDefaultTargetTriple();
+        auto target_triple = _target_triple;  // Use our configured target triple
         module->setTargetTriple(target_triple);
 
         auto target = llvm::TargetRegistry::lookupTarget(target_triple, error);
@@ -487,11 +487,14 @@ namespace Cryo::Linker
     {
         // Build the linker command
         std::vector<std::string> full_command;
-        full_command.push_back("clang"); // Use clang as the linker driver
+#if defined(_WIN32) || defined(_WIN64)
+        full_command.push_back("C:/msys64/mingw64/bin/clang++"); // Use MinGW clang++ on Windows
+#else
+        full_command.push_back("clang++"); // Use system clang++ on other platforms
+#endif
 
         // Add PIE-related flags to fix position-independent executable issues
         full_command.push_back("-fPIE");
-        full_command.push_back("-pie");
 
         // Add all the linker arguments
         for (const auto &arg : args)
