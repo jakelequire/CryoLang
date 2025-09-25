@@ -12,6 +12,7 @@
 #include "Linker/CryoLinker.hpp"
 #include "Utils/file.hpp"
 #include "Utils/RuntimeHeaderParser.hpp"
+#include "Utils/ModuleLoader.hpp"
 #include <memory>
 #include <string>
 #include <vector>

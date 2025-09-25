@@ -530,18 +530,36 @@ namespace Cryo
 
         std::cout << "Loading builtin symbols into TypeChecker..." << std::endl;
         std::cout << "Main symbol table has " << main_symbol_table.get_symbols().size() << " symbols" << std::endl;
-        
+
         // Copy all built-in function symbols from main symbol table
         int copied_count = 0;
         for (const auto &[name, symbol] : main_symbol_table.get_symbols())
         {
-            if (symbol.kind == SymbolKind::Function && symbol.data_type != nullptr)
+            if ((symbol.kind == SymbolKind::Function || symbol.kind == SymbolKind::Intrinsic) && symbol.data_type != nullptr)
             {
                 _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
                 copied_count++;
             }
         }
         std::cout << "Copied " << copied_count << " builtin functions to TypeChecker symbol table" << std::endl;
+    }
+
+    void TypeChecker::load_intrinsic_symbols(const SymbolTable &main_symbol_table)
+    {
+        std::cout << "Loading intrinsic symbols into TypeChecker..." << std::endl;
+
+        // Copy only intrinsic symbols from main symbol table
+        int copied_count = 0;
+        for (const auto &[name, symbol] : main_symbol_table.get_symbols())
+        {
+            if (symbol.kind == SymbolKind::Intrinsic && symbol.data_type != nullptr)
+            {
+                _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
+                copied_count++;
+                std::cout << "Loaded intrinsic: " << name << std::endl;
+            }
+        }
+        std::cout << "Copied " << copied_count << " intrinsic symbols to TypeChecker symbol table" << std::endl;
     }
 
     void TypeChecker::check_program(ProgramNode &program)
@@ -1424,13 +1442,42 @@ namespace Cryo
         const std::string &scope_name = node.scope_name();
         const std::string &member_name = node.member_name();
 
-        // First, try to look up the member name in main symbol table and check if it has the correct scope
+        // Try namespace lookup first using our new namespace support
+        if (_main_symbol_table)
+        {
+            Symbol *symbol = _main_symbol_table->lookup_namespaced_symbol(scope_name, member_name);
+            if (symbol)
+            {
+                // Found in namespace - this is what we want for imports like CryoTest::test_import_function
+                if (symbol->data_type != nullptr)
+                {
+                    node.set_type(symbol->data_type->to_string());
+                    std::cout << "[DEBUG] Resolved namespace symbol: " << scope_name << "::" << member_name
+                              << " with type: " << symbol->data_type->to_string() << std::endl;
+                }
+                else
+                {
+                    // For symbols without type information, use a generic type based on symbol kind
+                    std::string type_name = "unknown";
+                    if (symbol->kind == SymbolKind::Function)
+                    {
+                        type_name = "function"; // Or we could try to infer from the AST
+                    }
+                    node.set_type(type_name);
+                    std::cout << "[DEBUG] Resolved namespace symbol: " << scope_name << "::" << member_name
+                              << " with generic type: " << type_name << std::endl;
+                }
+                return;
+            }
+        }
+
+        // Fallback: try to look up the member name in main symbol table and check if it has the correct scope
         if (_main_symbol_table)
         {
             Symbol *symbol = _main_symbol_table->lookup_symbol(member_name);
             if (symbol && symbol->scope == scope_name)
             {
-                // This is a namespace function call like Std::Runtime::cryo_print_int
+                // This is a scope-qualified function call like Std::Runtime::cryo_print_int
                 node.set_type(symbol->data_type->to_string());
                 return;
             }
@@ -1874,12 +1921,13 @@ namespace Cryo
         {
             // Process constructor parameters and body manually to avoid registering
             // the constructor function with the same name as the struct/class type
-            
+
             const std::string &func_name = node.name();
 
             // Parse return type from node annotation (constructors have void return typically)
-            const std::string &return_type_str = node.return_type_annotation().empty() 
-                ? "void" : node.return_type_annotation();
+            const std::string &return_type_str = node.return_type_annotation().empty()
+                                                     ? "void"
+                                                     : node.return_type_annotation();
             Type *return_type = _type_context.parse_type_from_string(return_type_str);
 
             if (!return_type)
@@ -1952,7 +2000,7 @@ namespace Cryo
             std::string return_type_str = node.return_type_annotation();
             if (return_type_str.empty() && is_constructor)
             {
-                return_type_str = "void";  // Constructors typically return void
+                return_type_str = "void"; // Constructors typically return void
             }
             Type *return_type = _type_context.parse_type_from_string(return_type_str);
 

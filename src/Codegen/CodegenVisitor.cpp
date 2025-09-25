@@ -1,8 +1,10 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "AST/ASTNode.hpp"
 #include "Lexer/lexer.hpp"
+#include "Utils/ModuleLoader.hpp"
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/InlineAsm.h>
 #include <iostream>
 
 namespace Cryo::Codegen
@@ -106,6 +108,156 @@ namespace Cryo::Codegen
         catch (const std::exception &e)
         {
             report_error("Exception in function declaration: " + std::string(e.what()), &node);
+        }
+    }
+
+    void CodegenVisitor::visit(Cryo::IntrinsicDeclarationNode &node)
+    {
+        try
+        {
+            // For intrinsics, we don't generate LLVM function declarations
+            // Instead, we register them in the symbol table for later intrinsic call handling
+            std::cout << "[DEBUG] Registering intrinsic function: " << node.name() << std::endl;
+
+            // Create a function type for the intrinsic (for type checking purposes)
+            std::vector<llvm::Type *> param_types;
+            for (const auto &param : node.parameters())
+            {
+                llvm::Type *param_type = _type_mapper->map_type(param->type_annotation());
+                if (!param_type)
+                {
+                    report_error("Unknown parameter type in intrinsic: " + param->type_annotation());
+                    return;
+                }
+                param_types.push_back(param_type);
+            }
+
+            llvm::Type *return_type = _type_mapper->map_type(node.return_type_annotation());
+            if (!return_type)
+            {
+                report_error("Unknown return type in intrinsic: " + node.return_type_annotation());
+                return;
+            }
+
+            // Create function type for type checking
+            llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+
+            // Mark this as an intrinsic in our intrinsics map
+            _intrinsics[node.name()] = func_type;
+
+            std::cout << "[DEBUG] Intrinsic '" << node.name() << "' registered successfully" << std::endl;
+        }
+        catch (const std::exception &e)
+        {
+            report_error("Exception in intrinsic declaration: " + std::string(e.what()), &node);
+        }
+    }
+
+    void CodegenVisitor::visit(Cryo::ImportDeclarationNode &node)
+    {
+        try
+        {
+            std::cout << "[DEBUG] Processing import declaration: " << node.path();
+
+            if (node.has_alias())
+            {
+                std::cout << " as " << node.alias();
+            }
+
+            std::cout << " (type: ";
+            if (node.import_type() == ImportDeclarationNode::ImportType::Relative)
+            {
+                std::cout << "relative";
+            }
+            else if (node.import_type() == ImportDeclarationNode::ImportType::Absolute)
+            {
+                std::cout << "absolute";
+            }
+            std::cout << ")" << std::endl;
+
+            // Create a ModuleLoader instance for this import
+            ModuleLoader loader(_symbol_table);
+
+            // Set stdlib root to default location
+            loader.set_stdlib_root("./stdlib");
+
+            // Set current file directory (for relative imports)
+            // TODO: This should be passed from the compilation context
+            loader.set_current_file("./test/");
+
+            // Load the import
+            auto result = loader.load_import(node);
+
+            if (result.success)
+            {
+                std::cout << "[INFO] Successfully loaded import '" << node.path() << "'" << std::endl;
+                std::cout << "[INFO] Found " << result.exported_symbols.size() << " exported symbols: ";
+
+                for (size_t i = 0; i < result.exported_symbols.size(); ++i)
+                {
+                    if (i > 0)
+                        std::cout << ", ";
+                    std::cout << result.exported_symbols[i];
+                }
+                std::cout << std::endl;
+
+                // Register the symbols in the namespace
+                std::string namespace_name = node.has_alias() ? node.alias() : result.module_name;
+
+                if (!result.symbol_map.empty())
+                {
+                    // Register the namespace and symbols in the main symbol table
+                    _symbol_table.register_namespace(namespace_name, result.symbol_map);
+
+                    std::cout << "[INFO] Registered namespace '" << namespace_name << "' with "
+                              << result.symbol_map.size() << " symbols in main symbol table" << std::endl;
+
+                    for (const auto &[symbol_name, symbol] : result.symbol_map)
+                    {
+                        std::cout << "[INFO] - " << symbol_name << " ("
+                                  << (symbol.kind == SymbolKind::Function ? "function" : "other") << ")" << std::endl;
+                    }
+                }
+                else
+                {
+                    // Fallback for when symbol_map is empty but we have exported_symbols
+                    // Create symbols with basic information
+                    std::unordered_map<std::string, Symbol> symbol_map;
+                    for (const auto &symbol_name : result.exported_symbols)
+                    {
+                        // Create a basic function symbol - we'll assume functions for now
+                        Symbol symbol(symbol_name, SymbolKind::Function, SourceLocation(), nullptr, namespace_name);
+                        symbol_map[symbol_name] = symbol;
+                        std::cout << "[INFO] Created basic symbol: " << symbol_name << std::endl;
+                    }
+
+                    if (!symbol_map.empty())
+                    {
+                        _symbol_table.register_namespace(namespace_name, symbol_map);
+                        std::cout << "[INFO] Registered basic namespace '" << namespace_name << "' with "
+                                  << symbol_map.size() << " symbols" << std::endl;
+                    }
+                }
+
+                // If there's an alias, handle namespace mapping
+                if (node.has_alias())
+                {
+                    std::cout << "[INFO] Setting up namespace alias: " << node.alias() << std::endl;
+                    // TODO: Implement namespace aliasing
+                }
+
+                std::cout << "[DEBUG] Import processing completed successfully" << std::endl;
+            }
+            else
+            {
+                std::cout << "[ERROR] Failed to load import '" << node.path() << "': "
+                          << result.error_message << std::endl;
+                report_error("Import failed: " + result.error_message, &node);
+            }
+        }
+        catch (const std::exception &e)
+        {
+            report_error("Exception in import declaration: " + std::string(e.what()), &node);
         }
     }
 
@@ -3404,6 +3556,12 @@ namespace Cryo::Codegen
         {
             // Handle simple function name
             function_name = identifier->name();
+
+            // Check if this is an intrinsic call
+            if (_intrinsics.find(function_name) != _intrinsics.end())
+            {
+                return generate_intrinsic_call(node, function_name);
+            }
         }
         else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
         {
@@ -4710,6 +4868,104 @@ namespace Cryo::Codegen
         {
             std::cout << "[CodegenVisitor] Unsupported generic type for method generation: " << base_type << std::endl;
         }
+    }
+
+    llvm::Value *CodegenVisitor::generate_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name)
+    {
+        std::cout << "[CodegenVisitor] Generating intrinsic call: " << intrinsic_name << std::endl;
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Generate arguments
+        std::vector<llvm::Value *> args;
+        for (const auto &arg : node->arguments())
+        {
+            arg->accept(*this);
+            llvm::Value *arg_value = get_current_value();
+            if (!arg_value)
+            {
+                report_error("Failed to generate argument for intrinsic: " + intrinsic_name);
+                return nullptr;
+            }
+            args.push_back(arg_value);
+        }
+
+        // Handle specific intrinsics
+        if (intrinsic_name == "__syscall_write__")
+        {
+            return generate_syscall_write(args);
+        }
+        // Add more intrinsics as needed
+        else
+        {
+            report_error("Unknown intrinsic: " + intrinsic_name);
+            return nullptr;
+        }
+    }
+
+    llvm::Value *CodegenVisitor::generate_syscall_write(const std::vector<llvm::Value *> &args)
+    {
+        std::cout << "[CodegenVisitor] Generating syscall_write intrinsic" << std::endl;
+
+        if (args.size() != 3)
+        {
+            report_error("syscall_write requires exactly 3 arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // On Linux x86_64, write syscall number is 1
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
+
+        // Convert arguments to appropriate types
+        llvm::Value *fd = args[0];
+        llvm::Value *buf = args[1];
+        llvm::Value *len = args[2];
+
+        // Ensure fd is i64
+        if (fd->getType()->isIntegerTy(32))
+        {
+            fd = builder.CreateSExt(fd, llvm::Type::getInt64Ty(context), "fd.ext");
+        }
+
+        // Ensure buf is a pointer (i8*)
+        if (!buf->getType()->isPointerTy())
+        {
+            report_error("syscall_write buffer argument must be a pointer");
+            return nullptr;
+        }
+
+        // Ensure len is i64
+        if (len->getType()->isIntegerTy(32))
+        {
+            len = builder.CreateSExt(len, llvm::Type::getInt64Ty(context), "len.ext");
+        }
+
+        // Create inline assembly for syscall
+        llvm::FunctionType *syscall_type = llvm::FunctionType::get(
+            llvm::Type::getInt64Ty(context),
+            {llvm::Type::getInt64Ty(context),    // rax (syscall number)
+             llvm::Type::getInt64Ty(context),    // rdi (fd)
+             llvm::PointerType::get(context, 0), // rsi (buf) - generic pointer
+             llvm::Type::getInt64Ty(context)},   // rdx (len)
+            false);
+
+        llvm::InlineAsm *syscall_asm = llvm::InlineAsm::get(
+            syscall_type,
+            "syscall",                    // Assembly instruction
+            "={rax},0,{rdi},{rsi},{rdx}", // Constraints
+            true,                         // Has side effects
+            false                         // No align stack
+        );
+
+        // Call the inline assembly
+        llvm::Value *result = builder.CreateCall(syscall_asm, {syscall_num, fd, buf, len}, "syscall.result");
+
+        std::cout << "[CodegenVisitor] Generated syscall_write successfully" << std::endl;
+        return result;
     }
 
 } // namespace Cryo::Codegen

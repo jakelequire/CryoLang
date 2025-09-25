@@ -6,6 +6,7 @@
 #include "Codegen/LLVMContext.hpp"
 #include "Codegen/ValueContext.hpp"
 #include "Codegen/TypeMapper.hpp"
+#include "Utils/ModuleLoader.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>
@@ -75,6 +76,8 @@ namespace Cryo::Codegen
         void visit(Cryo::ProgramNode &node) override;
         void visit(Cryo::DeclarationNode &node) override;
         void visit(Cryo::FunctionDeclarationNode &node) override;
+        void visit(Cryo::IntrinsicDeclarationNode &node) override;
+        void visit(Cryo::ImportDeclarationNode &node) override;
         void visit(Cryo::VariableDeclarationNode &node) override;
         void visit(Cryo::StructDeclarationNode &node) override;
         void visit(Cryo::ClassDeclarationNode &node) override;
@@ -222,6 +225,7 @@ namespace Cryo::Codegen
         // Generated values mapping
         std::unordered_map<Cryo::ASTNode *, llvm::Value *> _node_values;
         std::unordered_map<std::string, llvm::Function *> _functions;
+        std::unordered_map<std::string, llvm::FunctionType *> _intrinsics;
         std::unordered_map<std::string, llvm::Type *> _types;
         std::unordered_map<std::string, llvm::GlobalVariable *> _globals;
         std::unordered_map<std::string, llvm::Type *> _global_types;   // Track global variable element types
@@ -289,6 +293,10 @@ namespace Cryo::Codegen
         std::string extract_function_name_from_member_access(Cryo::MemberAccessNode *node);
         std::string map_cryo_to_c_function(const std::string &cryo_name);
         llvm::Function *create_runtime_function_declaration(const std::string &c_name, Cryo::CallExpressionNode *call_node);
+
+        // Intrinsic call generation
+        llvm::Value *generate_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name);
+        llvm::Value *generate_syscall_write(const std::vector<llvm::Value *> &args);
 
         // Control flow generation
         void generate_if_statement(Cryo::IfStatementNode *node);

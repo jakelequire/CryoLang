@@ -16,7 +16,7 @@ namespace Cryo
     class MatchArmNode;
     class PatternNode;
     class EnumPatternNode;
-    
+
     // Forward declarations for switch statements
     class SwitchStatementNode;
     class CaseStatementNode;
@@ -59,6 +59,8 @@ namespace Cryo
         // Concrete declaration types
         VariableDeclaration,
         FunctionDeclaration,
+        IntrinsicDeclaration,
+        ImportDeclaration,
         StructDeclaration,
         ClassDeclaration,
         EnumDeclaration,
@@ -489,6 +491,120 @@ namespace Cryo
                 os << std::string(indent + 2, ' ') << "Body:" << std::endl;
                 _body->print(os, indent + 4);
             }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Intrinsic function declaration
+    class IntrinsicDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        std::string _return_type_annotation = "void";
+        std::vector<std::unique_ptr<VariableDeclarationNode>> _parameters;
+        std::unique_ptr<BlockStatementNode> _body; // Optional implementation for compiler hints
+
+    public:
+        IntrinsicDeclarationNode(SourceLocation loc, std::string name,
+                                 std::string return_type = "void")
+            : DeclarationNode(NodeKind::IntrinsicDeclaration, loc),
+              _name(std::move(name)), _return_type_annotation(std::move(return_type)) {}
+
+        const std::string &name() const { return _name; }
+        const std::string &return_type_annotation() const { return _return_type_annotation; }
+        const std::vector<std::unique_ptr<VariableDeclarationNode>> &parameters() const { return _parameters; }
+        BlockStatementNode *body() const { return _body.get(); }
+        size_t parameter_count() const { return _parameters.size(); }
+
+        void add_parameter(std::unique_ptr<VariableDeclarationNode> param)
+        {
+            _parameters.push_back(std::move(param));
+        }
+
+        void set_body(std::unique_ptr<BlockStatementNode> body)
+        {
+            _body = std::move(body);
+        }
+
+        void set_return_type(const std::string &return_type)
+        {
+            _return_type_annotation = return_type;
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "IntrinsicDecl: " << _name << "(";
+            for (size_t i = 0; i < _parameters.size(); ++i)
+            {
+                if (i > 0)
+                    os << ", ";
+                if (_parameters[i])
+                    os << _parameters[i]->type_annotation() << " " << _parameters[i]->name();
+            }
+            os << ") -> " << _return_type_annotation << std::endl;
+
+            if (!_parameters.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Parameters:" << std::endl;
+                for (const auto &param : _parameters)
+                {
+                    if (param)
+                        param->print(os, indent + 4);
+                }
+            }
+
+            if (_body)
+            {
+                os << std::string(indent + 2, ' ') << "Implementation Hint:" << std::endl;
+                _body->print(os, indent + 4);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Import declaration node for module importing
+    class ImportDeclarationNode : public DeclarationNode
+    {
+    public:
+        enum class ImportType
+        {
+            Relative, // "./path" or "../path" for relative files
+            Absolute  // <path> for standard library (stdlib/ prefix assumed)
+        };
+
+    private:
+        std::string _path;       // The import path (file path or module name)
+        std::string _alias;      // Optional alias (for "as" keyword)
+        ImportType _import_type; // Type of import
+        bool _has_alias;         // Whether an alias was specified
+
+    public:
+        ImportDeclarationNode(SourceLocation loc, std::string path, ImportType type)
+            : DeclarationNode(NodeKind::ImportDeclaration, loc),
+              _path(std::move(path)), _import_type(type), _has_alias(false) {}
+
+        ImportDeclarationNode(SourceLocation loc, std::string path, std::string alias, ImportType type)
+            : DeclarationNode(NodeKind::ImportDeclaration, loc),
+              _path(std::move(path)), _alias(std::move(alias)), _import_type(type), _has_alias(true) {}
+
+        const std::string &path() const { return _path; }
+        const std::string &alias() const { return _alias; }
+        ImportType import_type() const { return _import_type; }
+        bool has_alias() const { return _has_alias; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "ImportDecl: ";
+            if (_import_type == ImportType::Relative)
+                os << "\"" << _path << "\"";
+            else if (_import_type == ImportType::Absolute)
+                os << "<" << _path << ">";
+
+            if (_has_alias)
+                os << " as " << _alias;
+            os << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;
@@ -1553,12 +1669,12 @@ namespace Cryo
     class CaseStatementNode : public StatementNode
     {
     private:
-        std::unique_ptr<ExpressionNode> _value;        // Value to match (nullptr for default case)
+        std::unique_ptr<ExpressionNode> _value;                  // Value to match (nullptr for default case)
         std::vector<std::unique_ptr<StatementNode>> _statements; // Statements in this case
 
     public:
         CaseStatementNode(SourceLocation loc, std::unique_ptr<ExpressionNode> value,
-                         std::vector<std::unique_ptr<StatementNode>> statements)
+                          std::vector<std::unique_ptr<StatementNode>> statements)
             : StatementNode(NodeKind::CaseStatement, loc), _value(std::move(value)),
               _statements(std::move(statements)) {}
 
@@ -1568,22 +1684,27 @@ namespace Cryo
               _statements(std::move(statements)) {}
 
         ExpressionNode *value() const { return _value.get(); }
-        const std::vector<std::unique_ptr<StatementNode>>& statements() const { return _statements; }
+        const std::vector<std::unique_ptr<StatementNode>> &statements() const { return _statements; }
         bool is_default() const { return _value == nullptr; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            if (is_default()) {
+            if (is_default())
+            {
                 os << std::string(indent, ' ') << "Default:" << std::endl;
-            } else {
+            }
+            else
+            {
                 os << std::string(indent, ' ') << "Case:" << std::endl;
-                if (_value) {
+                if (_value)
+                {
                     os << std::string(indent + 2, ' ') << "Value:" << std::endl;
                     _value->print(os, indent + 4);
                 }
             }
             os << std::string(indent + 2, ' ') << "Statements:" << std::endl;
-            for (const auto& stmt : _statements) {
+            for (const auto &stmt : _statements)
+            {
                 stmt->print(os, indent + 4);
             }
         }
@@ -1600,22 +1721,24 @@ namespace Cryo
 
     public:
         SwitchStatementNode(SourceLocation loc, std::unique_ptr<ExpressionNode> expression,
-                           std::vector<std::unique_ptr<CaseStatementNode>> cases)
+                            std::vector<std::unique_ptr<CaseStatementNode>> cases)
             : StatementNode(NodeKind::SwitchStatement, loc), _expression(std::move(expression)),
               _cases(std::move(cases)) {}
 
         ExpressionNode *expression() const { return _expression.get(); }
-        const std::vector<std::unique_ptr<CaseStatementNode>>& cases() const { return _cases; }
+        const std::vector<std::unique_ptr<CaseStatementNode>> &cases() const { return _cases; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "Switch:" << std::endl;
-            if (_expression) {
+            if (_expression)
+            {
                 os << std::string(indent + 2, ' ') << "Expression:" << std::endl;
                 _expression->print(os, indent + 4);
             }
             os << std::string(indent + 2, ' ') << "Cases:" << std::endl;
-            for (const auto& case_stmt : _cases) {
+            for (const auto &case_stmt : _cases)
+            {
                 case_stmt->print(os, indent + 4);
             }
         }

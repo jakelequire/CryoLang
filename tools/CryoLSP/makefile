@@ -51,7 +51,8 @@ LSP_LIBS = \
 	$(MAIN_OBJ_DIR)/Lexer/lexer.o \
 	$(MAIN_OBJ_DIR)/Parser/Parser.o \
 	$(MAIN_OBJ_DIR)/Utils/file.o \
-	$(MAIN_OBJ_DIR)/Utils/RuntimeHeaderParser.o
+	$(MAIN_OBJ_DIR)/Utils/RuntimeHeaderParser.o \
+	$(MAIN_OBJ_DIR)/Utils/ModuleLoader.o
 
 # OS-specific socket libraries
 ifeq ($(OS), Windows_NT)

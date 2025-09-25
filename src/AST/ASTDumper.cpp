@@ -452,6 +452,86 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(IntrinsicDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "IntrinsicDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        // Build and display function signature
+        _output << " ";
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "'(";
+
+        // Add parameter types
+        const auto &params = node.parameters();
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            if (i > 0)
+                _output << ", ";
+            _output << params[i]->type_annotation();
+        }
+
+        _output << ") -> " << node.return_type_annotation() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+
+        // Dump parameters
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            bool is_last = (i == params.size() - 1);
+            dump_child(params[i].get(), is_last);
+        }
+    }
+
+    void ASTDumper::visit(ImportDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ImportDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+
+        // Show import type
+        _output << "'";
+        if (node.import_type() == ImportDeclarationNode::ImportType::Relative)
+        {
+            _output << "\"" << node.path() << "\"";
+        }
+        else if (node.import_type() == ImportDeclarationNode::ImportType::Absolute)
+        {
+            _output << "<" << node.path() << ">";
+        }
+
+        if (node.has_alias())
+        {
+            _output << " as " << node.alias();
+        }
+
+        _output << "'";
+
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+    }
+
     void ASTDumper::visit(CallExpressionNode &node)
     {
         print_prefix();

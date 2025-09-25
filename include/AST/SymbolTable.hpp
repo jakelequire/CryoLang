@@ -13,6 +13,7 @@ namespace Cryo
     {
         Variable,
         Function,
+        Intrinsic,
         Type
     };
 
@@ -36,6 +37,7 @@ namespace Cryo
     {
     private:
         std::unordered_map<std::string, Symbol> symbols_;
+        std::unordered_map<std::string, std::unordered_map<std::string, Symbol>> namespaces_; // namespace_name -> symbols
         std::unique_ptr<SymbolTable> parent_scope_;
         TypeContext *type_context_; // Add TypeContext for creating function types
 
@@ -46,6 +48,11 @@ namespace Cryo
         // Symbol management
         bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type = nullptr, const std::string &scope = "Global");
         Symbol *lookup_symbol(const std::string &name) const;
+        Symbol *lookup_namespaced_symbol(const std::string &namespace_name, const std::string &symbol_name) const;
+
+        // Namespace management for imports
+        void register_namespace(const std::string &namespace_name, const std::unordered_map<std::string, Symbol> &symbols);
+        bool has_namespace(const std::string &namespace_name) const;
 
         // Access symbols for copying to other symbol tables
         const std::unordered_map<std::string, Symbol> &get_symbols() const { return symbols_; }
