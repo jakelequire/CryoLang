@@ -196,6 +196,13 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Check struct cache for registered struct types
+        auto struct_it = _struct_cache.find(type_name);
+        if (struct_it != _struct_cache.end())
+        {
+            return struct_it->second;
+        }
+
         // Handle generic type instantiation: "GenericStruct<int>" -> instantiated struct type
         size_t angle_pos = type_name.find('<');
         if (angle_pos != std::string::npos)
