@@ -154,6 +154,10 @@ lsp: $(MAIN_BIN)
 	@echo "Building CryoLSP..."
 	@$(MAKE) -C tools/CryoLSP
 
+compiler: $(MAIN_BIN)
+	@echo "Building Cryo Compiler..."
+	@$(MAKE) -C .
+
 # Timed build target
 .PHONY: timed-build
 timed-build:

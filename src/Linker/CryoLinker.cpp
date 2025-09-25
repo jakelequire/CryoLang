@@ -243,7 +243,11 @@ namespace Cryo::Linker
 
         if (!found_runtime)
         {
-            report_error("Could not locate CryoLang runtime library (libcryoruntime.a)");
+            report_error("Could not locate CryoLang runtime library (libcryoruntime.a), Attempted paths:\n");
+            for (const auto &path : runtime_paths)
+            {
+                report_error("  " + path + "\n");
+            }
             return false;
         }
 
@@ -638,8 +642,10 @@ namespace Cryo::Linker
         paths.push_back("/usr/local/lib");
         paths.push_back("/usr/lib");
 
+
 #if defined(_WIN32) || defined(_WIN64)
-        paths.push_back("C:\\Program Files\\CryoLang\\lib");
+        paths.push_back("C:\\Programming\\apps\\CryoLang\\runtime\\build");
+        paths.push_back("C:\\Programming\\apps\\CryoLang\\bin");
 #endif
 
         return paths;
