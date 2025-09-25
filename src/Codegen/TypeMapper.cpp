@@ -165,7 +165,7 @@ namespace Cryo::Codegen
             {
                 base_type.pop_back();
             }
-            
+
             llvm::Type *pointee_type = map_type(base_type);
             if (pointee_type)
             {
@@ -185,7 +185,7 @@ namespace Cryo::Codegen
             {
                 base_type.erase(0, 1);
             }
-            
+
             llvm::Type *referent_type = map_type(base_type);
             if (referent_type)
             {
@@ -806,39 +806,46 @@ namespace Cryo::Codegen
     // Field Metadata Management Implementation
     //===================================================================
 
-    void TypeMapper::register_field_metadata(const std::string& type_name, const std::string& field_name, 
-                                            int field_index, llvm::Type* field_type)
+    void TypeMapper::register_field_metadata(const std::string &type_name, const std::string &field_name,
+                                             int field_index, llvm::Type *field_type)
     {
+        std::cout << "[TypeMapper] Registering field metadata: type=" << type_name << ", field=" << field_name << ", index=" << field_index << "\n";
         FieldInfo info;
         info.field_index = field_index;
         info.field_type = field_type;
         info.field_name = field_name;
         info.struct_type = lookup_type(type_name);
-        
+
         _field_metadata[type_name][field_name] = info;
     }
 
-    std::optional<TypeMapper::FieldInfo> TypeMapper::get_field_info(llvm::Type* llvm_type, const std::string& field_name)
+    std::optional<TypeMapper::FieldInfo> TypeMapper::get_field_info(llvm::Type *llvm_type, const std::string &field_name)
     {
         // First, try to find the type name from the LLVM type
         auto type_name_it = _llvm_type_to_name_map.find(llvm_type);
-        if (type_name_it != _llvm_type_to_name_map.end()) {
-            const std::string& type_name = type_name_it->second;
+        if (type_name_it != _llvm_type_to_name_map.end())
+        {
+            const std::string &type_name = type_name_it->second;
             auto type_it = _field_metadata.find(type_name);
-            if (type_it != _field_metadata.end()) {
+            if (type_it != _field_metadata.end())
+            {
                 auto field_it = type_it->second.find(field_name);
-                if (field_it != type_it->second.end()) {
+                if (field_it != type_it->second.end())
+                {
                     return field_it->second;
                 }
             }
         }
 
         // Fallback: search through all registered types
-        for (const auto& [type_name, fields] : _field_metadata) {
-            llvm::Type* registered_type = lookup_type(type_name);
-            if (registered_type == llvm_type) {
+        for (const auto &[type_name, fields] : _field_metadata)
+        {
+            llvm::Type *registered_type = lookup_type(type_name);
+            if (registered_type == llvm_type)
+            {
                 auto field_it = fields.find(field_name);
-                if (field_it != fields.end()) {
+                if (field_it != fields.end())
+                {
                     return field_it->second;
                 }
             }
@@ -847,33 +854,49 @@ namespace Cryo::Codegen
         return std::nullopt;
     }
 
-    int TypeMapper::get_field_index(const std::string& type_name, const std::string& field_name)
+    int TypeMapper::get_field_index(const std::string &type_name, const std::string &field_name)
     {
+        std::cout << "[TypeMapper] Looking up field: type=" << type_name << ", field=" << field_name << "\n";
         auto type_it = _field_metadata.find(type_name);
-        if (type_it != _field_metadata.end()) {
+        if (type_it != _field_metadata.end())
+        {
             auto field_it = type_it->second.find(field_name);
-            if (field_it != type_it->second.end()) {
+            if (field_it != type_it->second.end())
+            {
+                std::cout << "[TypeMapper] Found field index: " << field_it->second.field_index << "\n";
                 return field_it->second.field_index;
             }
+            else
+            {
+                std::cout << "[TypeMapper] Field not found in type\n";
+            }
+        }
+        else
+        {
+            std::cout << "[TypeMapper] Type not found in field metadata\n";
         }
         return -1;
     }
 
-    void TypeMapper::register_struct_fields(Cryo::StructDeclarationNode* struct_decl, llvm::StructType* llvm_struct_type)
+    void TypeMapper::register_struct_fields(Cryo::StructDeclarationNode *struct_decl, llvm::StructType *llvm_struct_type)
     {
-        if (!struct_decl || !llvm_struct_type) return;
+        if (!struct_decl || !llvm_struct_type)
+            return;
 
-        const std::string& type_name = struct_decl->name();
-        
+        const std::string &type_name = struct_decl->name();
+
         // Store the mapping from LLVM type to name for quick lookups
         _llvm_type_to_name_map[llvm_struct_type] = type_name;
 
         // Register each field
         int field_index = 0;
-        for (const auto& field : struct_decl->fields()) {
-            if (field) {
-                llvm::Type* field_llvm_type = map_type(field->type_annotation());
-                if (field_llvm_type) {
+        for (const auto &field : struct_decl->fields())
+        {
+            if (field)
+            {
+                llvm::Type *field_llvm_type = map_type(field->type_annotation());
+                if (field_llvm_type)
+                {
                     register_field_metadata(type_name, field->name(), field_index, field_llvm_type);
                 }
                 field_index++;
@@ -881,21 +904,25 @@ namespace Cryo::Codegen
         }
     }
 
-    void TypeMapper::register_class_fields(Cryo::ClassDeclarationNode* class_decl, llvm::StructType* llvm_class_type)
+    void TypeMapper::register_class_fields(Cryo::ClassDeclarationNode *class_decl, llvm::StructType *llvm_class_type)
     {
-        if (!class_decl || !llvm_class_type) return;
+        if (!class_decl || !llvm_class_type)
+            return;
 
-        const std::string& type_name = class_decl->name();
-        
+        const std::string &type_name = class_decl->name();
+
         // Store the mapping from LLVM type to name for quick lookups
         _llvm_type_to_name_map[llvm_class_type] = type_name;
 
         // Register each field
         int field_index = 0;
-        for (const auto& field : class_decl->fields()) {
-            if (field) {
-                llvm::Type* field_llvm_type = map_type(field->type_annotation());
-                if (field_llvm_type) {
+        for (const auto &field : class_decl->fields())
+        {
+            if (field)
+            {
+                llvm::Type *field_llvm_type = map_type(field->type_annotation());
+                if (field_llvm_type)
+                {
                     register_field_metadata(type_name, field->name(), field_index, field_llvm_type);
                 }
                 field_index++;
@@ -909,7 +936,7 @@ namespace Cryo::Codegen
 
     llvm::Type *TypeMapper::map_generic_instantiation(const std::string &type_name)
     {
-        // Parse generic type instantiation: "GenericStruct<int>" 
+        // Parse generic type instantiation: "GenericStruct<int>"
         size_t angle_pos = type_name.find('<');
         if (angle_pos == std::string::npos)
         {
@@ -917,7 +944,7 @@ namespace Cryo::Codegen
         }
 
         std::string base_name = type_name.substr(0, angle_pos);
-        
+
         // Extract type arguments between < and >
         size_t close_angle = type_name.find('>', angle_pos);
         if (close_angle == std::string::npos)
@@ -927,7 +954,7 @@ namespace Cryo::Codegen
         }
 
         std::string args_str = type_name.substr(angle_pos + 1, close_angle - angle_pos - 1);
-        
+
         // Parse type arguments (simplified - assumes single type argument for now)
         std::vector<std::string> type_args;
         std::stringstream ss(args_str);
@@ -950,7 +977,8 @@ namespace Cryo::Codegen
         std::string instantiated_name = base_name + "<";
         for (size_t i = 0; i < type_args.size(); ++i)
         {
-            if (i > 0) instantiated_name += ",";
+            if (i > 0)
+                instantiated_name += ",";
             instantiated_name += type_args[i];
         }
         instantiated_name += ">";
@@ -967,15 +995,15 @@ namespace Cryo::Codegen
         return create_generic_struct_instantiation(base_name, type_args, instantiated_name);
     }
 
-    llvm::Type *TypeMapper::create_generic_struct_instantiation(const std::string &base_name, 
-                                                               const std::vector<std::string> &type_args,
-                                                               const std::string &instantiated_name)
+    llvm::Type *TypeMapper::create_generic_struct_instantiation(const std::string &base_name,
+                                                                const std::vector<std::string> &type_args,
+                                                                const std::string &instantiated_name)
     {
         // This is a simplified implementation - in a full compiler, you'd need to:
         // 1. Look up the generic struct template in a registry
         // 2. Substitute type parameters with actual types
         // 3. Create the instantiated struct type
-        
+
         // For now, create a simple struct that matches our test case
         if (base_name == "GenericStruct" && type_args.size() == 1)
         {
@@ -989,16 +1017,45 @@ namespace Cryo::Codegen
 
             // Create LLVM struct type with the concrete type
             auto &context = _context_manager.get_context();
-            std::vector<llvm::Type *> field_types = { value_type };
-            
+            std::vector<llvm::Type *> field_types = {value_type};
+
             llvm::StructType *instantiated_type = llvm::StructType::create(context, field_types, instantiated_name);
-            
+
             // Register the instantiated type
             register_type(instantiated_name, instantiated_type);
-            
+
             // Register field metadata for the instantiated type
             register_generic_field_metadata(instantiated_name, "value", 0, value_type);
-            
+
+            return instantiated_type;
+        }
+
+        if (base_name == "Pair" && type_args.size() == 2)
+        {
+            // Map both type arguments
+            llvm::Type *first_type = map_type(type_args[0]);
+            llvm::Type *second_type = map_type(type_args[1]);
+            if (!first_type || !second_type)
+            {
+                report_error("Failed to map generic type arguments for Pair");
+                return nullptr;
+            }
+
+            // Create LLVM struct type with both fields
+            auto &context = _context_manager.get_context();
+            std::vector<llvm::Type *> field_types = {first_type, second_type};
+
+            llvm::StructType *instantiated_type = llvm::StructType::create(context, field_types, instantiated_name);
+
+            // Register the instantiated type
+            register_type(instantiated_name, instantiated_type);
+            std::cout << "[TypeMapper] Registered Pair generic type: " << instantiated_name << "\n";
+
+            // Register field metadata for the instantiated type
+            register_generic_field_metadata(instantiated_name, "first", 0, first_type);
+            register_generic_field_metadata(instantiated_name, "second", 1, second_type);
+            std::cout << "[TypeMapper] Registered Pair fields: first, second for type: " << instantiated_name << "\n";
+
             return instantiated_type;
         }
 
@@ -1006,9 +1063,9 @@ namespace Cryo::Codegen
         return nullptr;
     }
 
-    void TypeMapper::register_generic_field_metadata(const std::string &type_name, 
-                                                     const std::string &field_name, 
-                                                     int field_index, 
+    void TypeMapper::register_generic_field_metadata(const std::string &type_name,
+                                                     const std::string &field_name,
+                                                     int field_index,
                                                      llvm::Type *field_type)
     {
         register_field_metadata(type_name, field_name, field_index, field_type);

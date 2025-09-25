@@ -505,6 +505,42 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(StructLiteralNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "StructLiteral";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " '" << node.struct_type();
+
+        // Print generic arguments if any
+        if (!node.generic_args().empty())
+        {
+            _output << "<";
+            for (size_t i = 0; i < node.generic_args().size(); ++i)
+            {
+                if (i > 0)
+                    _output << ", ";
+                _output << node.generic_args()[i];
+            }
+            _output << ">";
+        }
+
+        _output << "'" << std::endl;
+
+        // Dump field initializers
+        const auto &field_inits = node.field_initializers();
+        for (size_t i = 0; i < field_inits.size(); ++i)
+        {
+            bool is_last = (i == field_inits.size() - 1);
+            if (field_inits[i] && field_inits[i]->value())
+            {
+                dump_child(field_inits[i]->value(), is_last);
+            }
+        }
+    }
+
     void ASTDumper::visit(ArrayLiteralNode &node)
     {
         print_prefix();

@@ -32,6 +32,7 @@ namespace Cryo
         TernaryExpression,
         CallExpression,
         NewExpression,
+        StructLiteral,
         ArrayLiteral,
         ArrayAccess,
         MemberAccess,
@@ -970,7 +971,7 @@ namespace Cryo
     class ExternBlockNode : public DeclarationNode
     {
     private:
-        std::string _linkage_type;  // "C" or other linkage types
+        std::string _linkage_type; // "C" or other linkage types
         std::vector<std::unique_ptr<FunctionDeclarationNode>> _function_declarations;
 
     public:
@@ -1089,6 +1090,80 @@ namespace Cryo
                         arg->print(os, indent + 4);
                 }
             }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Field initializer for struct literals
+    class FieldInitializerNode
+    {
+    private:
+        std::string _field_name;
+        std::unique_ptr<ExpressionNode> _value;
+
+    public:
+        FieldInitializerNode(std::string field_name, std::unique_ptr<ExpressionNode> value)
+            : _field_name(std::move(field_name)), _value(std::move(value)) {}
+
+        const std::string &field_name() const { return _field_name; }
+        ExpressionNode *value() const { return _value.get(); }
+
+        void print(std::ostream &os, int indent = 0) const
+        {
+            os << std::string(indent, ' ') << "Field: " << _field_name << " = ";
+            if (_value)
+                _value->print(os, 0);
+            os << std::endl;
+        }
+    };
+
+    // Struct literal ({field: value, ...})
+    class StructLiteralNode : public ExpressionNode
+    {
+    private:
+        std::string _struct_type;
+        std::vector<std::string> _generic_args; // For generic types
+        std::vector<std::unique_ptr<FieldInitializerNode>> _field_initializers;
+
+    public:
+        StructLiteralNode(SourceLocation loc, std::string struct_type)
+            : ExpressionNode(NodeKind::StructLiteral, loc), _struct_type(std::move(struct_type)) {}
+
+        const std::string &struct_type() const { return _struct_type; }
+        const std::vector<std::string> &generic_args() const { return _generic_args; }
+        const std::vector<std::unique_ptr<FieldInitializerNode>> &field_initializers() const { return _field_initializers; }
+
+        void add_generic_arg(const std::string &type) { _generic_args.push_back(type); }
+
+        void add_field_initializer(std::unique_ptr<FieldInitializerNode> initializer)
+        {
+            _field_initializers.push_back(std::move(initializer));
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "StructLiteral: " << _struct_type;
+            if (!_generic_args.empty())
+            {
+                os << "<";
+                for (size_t i = 0; i < _generic_args.size(); ++i)
+                {
+                    if (i > 0)
+                        os << ", ";
+                    os << _generic_args[i];
+                }
+                os << ">";
+            }
+            os << " {" << std::endl;
+
+            for (const auto &init : _field_initializers)
+            {
+                if (init)
+                    init->print(os, indent + 2);
+            }
+
+            os << std::string(indent, ' ') << "}" << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;
