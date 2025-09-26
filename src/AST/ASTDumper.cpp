@@ -1171,6 +1171,49 @@ namespace Cryo
         _output << std::endl;
     }
 
+    void ASTDumper::visit(TraitDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "TraitDeclaration";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        // Display generic parameters if any
+        if (!node.generic_parameters().empty())
+        {
+            _output << "<";
+            const auto &params = node.generic_parameters();
+            for (size_t i = 0; i < params.size(); ++i)
+            {
+                if (i > 0)
+                    _output << ", ";
+                if (_use_colors)
+                    _output << Colors::TYPE;
+                _output << params[i];
+                if (_use_colors)
+                    _output << Colors::RESET;
+            }
+            _output << ">";
+        }
+
+        _output << std::endl;
+
+        // Dump trait methods
+        const auto &methods = node.methods();
+        for (size_t i = 0; i < methods.size(); ++i)
+        {
+            dump_child(methods[i].get(), i == methods.size() - 1);
+        }
+    }
+
     void ASTDumper::visit(EnumDeclarationNode &node)
     {
         print_prefix();

@@ -167,6 +167,9 @@ namespace Cryo::CLI::Commands
             {
                 std::cout << "\nSymbol Table:" << std::endl;
                 compiler->dump_symbol_table();
+                
+                std::cout << "\nType Table:" << std::endl;
+                compiler->dump_type_table();
             }
 
             if (args.get_flag("types"))

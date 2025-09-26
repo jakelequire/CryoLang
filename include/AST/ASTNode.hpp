@@ -64,6 +64,7 @@ namespace Cryo
         StructDeclaration,
         ClassDeclaration,
         EnumDeclaration,
+        TraitDeclaration,
         TypeAliasDeclaration,
         ImplementationBlock,
         ExternBlock,
@@ -907,27 +908,96 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
-    // Type alias declaration (type Foo = Bar)
+    // Trait declaration
+    class TraitDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        std::vector<std::unique_ptr<GenericParameterNode>> _generic_parameters;
+        std::vector<std::unique_ptr<FunctionDeclarationNode>> _methods;
+
+    public:
+        TraitDeclarationNode(SourceLocation loc, std::string name)
+            : DeclarationNode(NodeKind::TraitDeclaration, loc), _name(std::move(name)) {}
+
+        const std::string &name() const { return _name; }
+        const std::vector<std::unique_ptr<GenericParameterNode>> &generic_parameters() const { return _generic_parameters; }
+        const std::vector<std::unique_ptr<FunctionDeclarationNode>> &methods() const { return _methods; }
+
+        void add_generic_parameter(std::unique_ptr<GenericParameterNode> param)
+        {
+            _generic_parameters.push_back(std::move(param));
+        }
+
+        void add_method(std::unique_ptr<FunctionDeclarationNode> method)
+        {
+            _methods.push_back(std::move(method));
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "TraitDecl: " << _name;
+            if (!_generic_parameters.empty())
+            {
+                os << "<";
+                for (size_t i = 0; i < _generic_parameters.size(); ++i)
+                {
+                    if (i > 0)
+                        os << ", ";
+                    os << _generic_parameters[i]->name();
+                }
+                os << ">";
+            }
+            os << std::endl;
+
+            if (!_methods.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Methods:" << std::endl;
+                for (const auto &method : _methods)
+                {
+                    if (method)
+                        method->print(os, indent + 4);
+                }
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Type alias declaration (type Foo = Bar, type Ptr<T> = T*)
     class TypeAliasDeclarationNode : public DeclarationNode
     {
     private:
         std::string _alias_name;
         std::string _target_type;
+        std::vector<std::string> _generic_params; // Generic parameters like <T, U>
 
     public:
-        TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name, std::string target_type)
+        TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name, std::string target_type, std::vector<std::string> generic_params = {})
             : DeclarationNode(NodeKind::TypeAliasDeclaration, loc),
-              _alias_name(std::move(alias_name)), _target_type(std::move(target_type)) {}
+              _alias_name(std::move(alias_name)), _target_type(std::move(target_type)), _generic_params(std::move(generic_params)) {}
 
         const std::string &alias_name() const { return _alias_name; }
         const std::string &target_type() const { return _target_type; }
+        const std::vector<std::string> &generic_params() const { return _generic_params; }
+        bool is_generic() const { return !_generic_params.empty(); }
 
         void set_type(const std::string &type) { _target_type = type; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "TypeAlias: " << _alias_name
-               << " = " << _target_type << std::endl;
+            os << std::string(indent, ' ') << "TypeAlias: " << _alias_name;
+            if (!_generic_params.empty()) 
+            {
+                os << "<";
+                for (size_t i = 0; i < _generic_params.size(); ++i) 
+                {
+                    if (i > 0) os << ", ";
+                    os << _generic_params[i];
+                }
+                os << ">";
+            }
+            os << " = " << _target_type << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;

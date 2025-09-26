@@ -211,6 +211,12 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    // TraitDeclarationNode visitor implementation
+    void TraitDeclarationNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     // TypeAliasDeclarationNode visitor implementation
     void TypeAliasDeclarationNode::accept(ASTVisitor &visitor)
     {

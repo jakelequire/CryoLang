@@ -248,6 +248,9 @@ namespace Cryo
         bool is_integral_type(Type *type);
         bool is_boolean_context_valid(Type *type);
 
+        // Enum validation helpers
+        void validate_enum_variant(EnumVariantNode &node, const std::vector<std::string> &generic_param_names);
+
         std::string format_type_error(const std::string &context, Type *expected, Type *actual);
     };
 

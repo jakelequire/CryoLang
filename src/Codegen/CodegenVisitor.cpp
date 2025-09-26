@@ -6,6 +6,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/InlineAsm.h>
 #include <iostream>
+#include <set>
 
 namespace Cryo::Codegen
 {
@@ -713,6 +714,13 @@ namespace Cryo::Codegen
         register_value(&node, nullptr);
     }
 
+    void CodegenVisitor::visit(Cryo::TraitDeclarationNode &node)
+    {
+        // Traits are purely compile-time constructs, no runtime codegen needed
+        std::cout << "[CodegenVisitor] Skipping trait declaration for codegen: " << node.name() << std::endl;
+        register_value(&node, nullptr);
+    }
+
     void CodegenVisitor::visit(Cryo::GenericParameterNode &node)
     {
         // TODO: Implement generic parameter generation
@@ -794,11 +802,19 @@ namespace Cryo::Codegen
 
         std::string target_type_name = node.target_type();
 
+        // Check if this is a primitive type first
+        llvm::Type *primitive_type = _type_mapper->map_type(target_type_name);
+        if (primitive_type && is_primitive_type(target_type_name))
+        {
+            std::cout << "[CodegenVisitor] Skipping implementation block for primitive type: " << target_type_name << std::endl;
+            return; // Skip implementation blocks for primitive types
+        }
+
         // Look up the struct type
         auto struct_type_it = _types.find(target_type_name);
         if (struct_type_it == _types.end())
         {
-            report_error("Unknown struct type in implementation block: " + target_type_name, &node);
+            report_error("Unknown struct type in implementation block: " + target_type_name + " (node kind: " + std::to_string(static_cast<int>(node.kind())) + ")", &node);
             return;
         }
 
@@ -4927,6 +4943,20 @@ namespace Cryo::Codegen
         }
 
         return result;
+    }
+
+    bool CodegenVisitor::is_primitive_type(const std::string &type_name)
+    {
+        // Check if this is a primitive type that should not have implementation blocks
+        static const std::set<std::string> primitive_types = {
+            "i8", "i16", "i32", "i64", "int",
+            "u8", "u16", "u32", "u64", "uint", 
+            "f32", "f64", "float", "double",
+            "bool", "boolean", "char", "string", "void",
+            "ptr", "const_ptr"
+        };
+        
+        return primitive_types.find(type_name) != primitive_types.end();
     }
 
 } // namespace Cryo::Codegen

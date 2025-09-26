@@ -1680,14 +1680,57 @@ namespace Cryo
             return;
         }
 
-        // Visit target type to ensure it's valid
+        // Handle generic type aliases differently
+        if (node.is_generic())
+        {
+            // For now, create a type alias that represents the generic template
+            // In a full implementation, we'd need proper template system with type parameter substitution
+            std::cout << "[DEBUG] Generic type alias: " << alias_name << "<";
+            const auto& params = node.generic_params();
+            for (size_t i = 0; i < params.size(); ++i) {
+                if (i > 0) std::cout << ", ";
+                std::cout << params[i];
+            }
+            std::cout << "> = " << node.target_type() << std::endl;
+
+            // Create a generic type alias - we'll use the full signature as the alias name for now
+            std::string full_signature = alias_name + "<";
+            for (size_t i = 0; i < params.size(); ++i) {
+                if (i > 0) full_signature += ", ";
+                full_signature += params[i];
+            }
+            full_signature += ">";
+            
+            // Create a type alias that shows the generic nature
+            Type *target_type = _type_context.parse_type_from_string(node.target_type());
+            if (!target_type) {
+                target_type = _type_context.get_unknown_type();
+            }
+            
+            Type *generic_alias = _type_context.create_type_alias(full_signature, target_type);
+            _symbol_table->declare_symbol(alias_name, generic_alias, node.location(), false);
+            return;
+        }
+
         std::string target_type_str = node.target_type();
+        
+        // Handle forward declarations (empty target type)
+        if (target_type_str.empty())
+        {
+            // Forward declaration - create TypeAlias with unknown target for now
+            Type *forward_alias = _type_context.create_type_alias(alias_name, _type_context.get_unknown_type());
+            _symbol_table->declare_symbol(alias_name, forward_alias, node.location(), false);
+            return;
+        }
+
+        // Visit target type to ensure it's valid
         Type *target_type = _type_context.parse_type_from_string(target_type_str);
 
         if (target_type && target_type->kind() != TypeKind::Unknown)
         {
-            // Register type alias in symbol table
-            _symbol_table->declare_symbol(alias_name, target_type, node.location(), false);
+            // Create TypeAlias wrapping the target type
+            Type *alias_type = _type_context.create_type_alias(alias_name, target_type);
+            _symbol_table->declare_symbol(alias_name, alias_type, node.location(), false);
         }
         else
         {
@@ -1707,6 +1750,16 @@ namespace Cryo
             return;
         }
 
+        // Collect generic parameter names for validation
+        std::vector<std::string> generic_param_names;
+        for (const auto &param : node.generic_parameters())
+        {
+            if (param)
+            {
+                generic_param_names.push_back(param->name());
+            }
+        }
+
         // Collect variant information
         std::vector<std::string> variant_names;
         bool is_simple_enum = node.is_simple_enum();
@@ -1716,7 +1769,8 @@ namespace Cryo
             if (variant)
             {
                 variant_names.push_back(variant->name());
-                variant->accept(*this);
+                // Pass generic parameters to variant validation
+                validate_enum_variant(*variant, generic_param_names);
             }
         }
 
@@ -1750,10 +1804,20 @@ namespace Cryo
                     std::vector<Type *> param_types;
                     for (const auto &type_str : variant->associated_types())
                     {
-                        Type *param_type = _type_context.parse_type_from_string(type_str);
-                        if (param_type)
+                        // Check if this is a generic parameter
+                        if (std::find(generic_param_names.begin(), generic_param_names.end(), type_str) != generic_param_names.end())
                         {
-                            param_types.push_back(param_type);
+                            // It's a generic parameter - create a generic type placeholder
+                            Type *generic_type = _type_context.get_generic_type(type_str);
+                            param_types.push_back(generic_type);
+                        }
+                        else
+                        {
+                            Type *param_type = _type_context.parse_type_from_string(type_str);
+                            if (param_type)
+                            {
+                                param_types.push_back(param_type);
+                            }
                         }
                     }
 
@@ -1768,12 +1832,26 @@ namespace Cryo
 
     void TypeChecker::visit(EnumVariantNode &node)
     {
-        // Individual variant processing - validation is mostly done in EnumDeclarationNode
+        // Individual variant processing - validation is now done in EnumDeclarationNode
+        // This method is kept for compatibility but actual validation happens in validate_enum_variant
+    }
+
+    void TypeChecker::validate_enum_variant(EnumVariantNode &node, const std::vector<std::string> &generic_param_names)
+    {
+        // Individual variant processing - validation with generic parameter context
         if (!node.is_simple_variant())
         {
             // Validate associated types for complex variants
             for (const auto &type_str : node.associated_types())
             {
+                // Check if this is a generic parameter first
+                if (std::find(generic_param_names.begin(), generic_param_names.end(), type_str) != generic_param_names.end())
+                {
+                    // It's a valid generic parameter - no further validation needed
+                    continue;
+                }
+
+                // Otherwise, validate as a concrete type
                 Type *type = _type_context.parse_type_from_string(type_str);
                 if (!type || type->kind() == TypeKind::Unknown)
                 {
@@ -1792,19 +1870,29 @@ namespace Cryo
 
         if (!target_type_name.empty())
         {
-            // Look up the target type in symbol table
-            target_type = lookup_variable_type(target_type_name);
+            // Handle generic types like "Option<T>" by extracting the base type name
+            std::string base_type_name = target_type_name;
+            size_t generic_start = target_type_name.find('<');
+            if (generic_start != std::string::npos)
+            {
+                base_type_name = target_type_name.substr(0, generic_start);
+            }
+
+            // Look up the base type in symbol table
+            target_type = lookup_variable_type(base_type_name);
             if (!target_type)
             {
-                report_undefined_symbol(node.location(), target_type_name);
+                report_undefined_symbol(node.location(), base_type_name);
                 return;
             }
 
-            // Verify it's a struct or class type
-            if (target_type->kind() != TypeKind::Struct && target_type->kind() != TypeKind::Class)
+            // Verify it's a struct, class, or enum type
+            if (target_type->kind() != TypeKind::Struct && 
+                target_type->kind() != TypeKind::Class && 
+                target_type->kind() != TypeKind::Enum)
             {
                 report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                             "Implementation block can only be applied to struct or class types");
+                             "Implementation block can only be applied to struct, class, or enum types");
                 return;
             }
         }

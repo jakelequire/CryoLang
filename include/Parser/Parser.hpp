@@ -86,6 +86,7 @@ namespace Cryo
         std::unique_ptr<ImportDeclarationNode> parse_import_declaration();
         std::unique_ptr<StructDeclarationNode> parse_struct_declaration();
         std::unique_ptr<ClassDeclarationNode> parse_class_declaration();
+        std::unique_ptr<TraitDeclarationNode> parse_trait_declaration();
         std::unique_ptr<EnumDeclarationNode> parse_enum_declaration();
         std::unique_ptr<TypeAliasDeclarationNode> parse_type_alias_declaration();
         std::unique_ptr<ImplementationBlockNode> parse_implementation_block();

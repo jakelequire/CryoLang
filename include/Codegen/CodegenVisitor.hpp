@@ -85,6 +85,7 @@ namespace Cryo::Codegen
         void visit(Cryo::EnumDeclarationNode &node) override;
         void visit(Cryo::EnumVariantNode &node) override;
         void visit(Cryo::TypeAliasDeclarationNode &node) override;
+        void visit(Cryo::TraitDeclarationNode &node) override;
         void visit(Cryo::ImplementationBlockNode &node) override;
         void visit(Cryo::ExternBlockNode &node) override;
         void visit(Cryo::GenericParameterNode &node) override;
@@ -336,6 +337,7 @@ namespace Cryo::Codegen
         llvm::Type *get_llvm_type(Cryo::Type *cryo_type);
         llvm::Value *cast_value(llvm::Value *value, llvm::Type *target_type);
         bool is_lvalue(Cryo::ExpressionNode *expr);
+        bool is_primitive_type(const std::string &type_name);
 
         // Error reporting
         void report_error(const std::string &message);

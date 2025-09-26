@@ -493,6 +493,15 @@ namespace Cryo
         return result;
     }
 
+    Type *TypeContext::create_type_alias(const std::string &alias_name, Type *target_type)
+    {
+        auto alias_type = std::make_unique<TypeAlias>(alias_name, target_type);
+        Type *result = alias_type.get();
+        _complex_types.push_back(std::move(alias_type));
+        
+        return result;
+    }
+
     std::string TypeContext::normalize_generic_type_string(const std::string &type_str)
     {
         std::string result = type_str;
@@ -546,6 +555,18 @@ namespace Cryo
             return get_f64_type();
         if (normalized_type_str == "float")
             return get_default_float_type();
+        if (normalized_type_str == "double")
+            return get_f64_type(); // double is alias for f64
+
+        // Unsigned integer types
+        if (normalized_type_str == "uint8" || normalized_type_str == "unsigned i8")
+            return get_i8_type(); // For now, treat unsigned as same type
+        if (normalized_type_str == "uint16" || normalized_type_str == "unsigned i16")
+            return get_i16_type();
+        if (normalized_type_str == "uint32" || normalized_type_str == "unsigned i32")
+            return get_i32_type();
+        if (normalized_type_str == "uint64" || normalized_type_str == "unsigned i64")
+            return get_i64_type();
 
         // Array types (basic parsing for "type[]")
         if (normalized_type_str.length() > 2 && normalized_type_str.substr(normalized_type_str.length() - 2) == "[]")

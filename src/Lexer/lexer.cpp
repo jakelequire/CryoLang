@@ -149,7 +149,6 @@ namespace Cryo
         {"nil", TokenKind::TK_KW_NIL},
         {"none", TokenKind::TK_KW_NONE},
         {"some", TokenKind::TK_KW_SOME},
-        {"self", TokenKind::TK_KW_SELF},
         {"super", TokenKind::TK_KW_SUPER},
         {"this", TokenKind::TK_KW_THIS},
 
