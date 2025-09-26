@@ -82,6 +82,7 @@ namespace Cryo
         std::unique_ptr<VariableDeclarationNode> parse_variable_declaration();
         std::unique_ptr<FunctionDeclarationNode> parse_function_declaration();
         std::unique_ptr<FunctionDeclarationNode> parse_extern_function_declaration();
+        void parse_where_clause(FunctionDeclarationNode* func_decl);
         std::unique_ptr<IntrinsicDeclarationNode> parse_intrinsic_declaration();
         std::unique_ptr<ImportDeclarationNode> parse_import_declaration();
         std::unique_ptr<StructDeclarationNode> parse_struct_declaration();
@@ -133,7 +134,7 @@ namespace Cryo
         std::unique_ptr<LiteralNode> parse_boolean_literal();
         std::unique_ptr<LiteralNode> parse_character_literal();
         std::unique_ptr<LiteralNode> parse_null_literal();
-        std::unique_ptr<IdentifierNode> parse_identifier();
+        std::unique_ptr<ExpressionNode> parse_identifier();
 
         // Array literal parsing
         std::unique_ptr<ExpressionNode> parse_array_literal();

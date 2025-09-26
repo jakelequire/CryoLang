@@ -566,9 +566,13 @@ namespace Cryo
             // Create function type
             Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
 
-            // Add function to current (global) scope with proper Type
+            // Build enhanced signature including generic parameters
+            std::string enhanced_signature = build_function_signature(func_decl);
+
+            // Add function to current (global) scope with enhanced display for generics
             current_scope->declare_symbol(func_decl->name(), SymbolKind::Function,
-                                          func_decl->location(), function_type, scope_name);
+                                          func_decl->location(), function_type, scope_name, 
+                                          func_decl->generic_parameters().empty() ? "" : enhanced_signature);
 
             // Recurse into function body with function name as new scope
             if (func_decl->body())
@@ -686,7 +690,23 @@ namespace Cryo
         if (!func_decl)
             return "unknown";
 
-        std::string signature = "(";
+        std::string signature;
+
+        // Add generic parameters if present
+        const auto &generic_params = func_decl->generic_parameters();
+        if (!generic_params.empty())
+        {
+            signature += "<";
+            for (size_t i = 0; i < generic_params.size(); ++i)
+            {
+                if (i > 0)
+                    signature += ", ";
+                signature += generic_params[i]->name();
+            }
+            signature += ">";
+        }
+
+        signature += "(";
 
         // Add parameter types
         const auto &params = func_decl->parameters();
