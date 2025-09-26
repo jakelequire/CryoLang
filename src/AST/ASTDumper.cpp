@@ -591,6 +591,16 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(SizeofExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "SizeofExpr";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " '" << node.type_name() << "'" << std::endl;
+    }
+
     void ASTDumper::visit(StructLiteralNode &node)
     {
         print_prefix();
@@ -1202,6 +1212,34 @@ namespace Cryo
                     _output << Colors::RESET;
             }
             _output << ">";
+        }
+
+        // Display base traits if any
+        if (!node.base_traits().empty())
+        {
+            _output << " : ";
+            const auto &base_traits = node.base_traits();
+            for (size_t i = 0; i < base_traits.size(); ++i)
+            {
+                if (i > 0)
+                    _output << ", ";
+                if (_use_colors)
+                    _output << Colors::TYPE;
+                _output << base_traits[i].name;
+                if (!base_traits[i].type_parameters.empty())
+                {
+                    _output << "<";
+                    for (size_t j = 0; j < base_traits[i].type_parameters.size(); ++j)
+                    {
+                        if (j > 0)
+                            _output << ", ";
+                        _output << base_traits[i].type_parameters[j];
+                    }
+                    _output << ">";
+                }
+                if (_use_colors)
+                    _output << Colors::RESET;
+            }
         }
 
         _output << std::endl;

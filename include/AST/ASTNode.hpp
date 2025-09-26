@@ -36,6 +36,7 @@ namespace Cryo
         TernaryExpression,
         CallExpression,
         NewExpression,
+        SizeofExpression,
         StructLiteral,
         ArrayLiteral,
         ArrayAccess,
@@ -908,6 +909,15 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
+    // Structure to represent a base trait in inheritance
+    struct BaseTraitInfo {
+        std::string name;
+        std::vector<std::string> type_parameters;
+        
+        BaseTraitInfo(std::string trait_name, std::vector<std::string> params = {})
+            : name(std::move(trait_name)), type_parameters(std::move(params)) {}
+    };
+
     // Trait declaration
     class TraitDeclarationNode : public DeclarationNode
     {
@@ -915,6 +925,7 @@ namespace Cryo
         std::string _name;
         std::vector<std::unique_ptr<GenericParameterNode>> _generic_parameters;
         std::vector<std::unique_ptr<FunctionDeclarationNode>> _methods;
+        std::vector<BaseTraitInfo> _base_traits; // Base traits this trait inherits from
 
     public:
         TraitDeclarationNode(SourceLocation loc, std::string name)
@@ -923,6 +934,7 @@ namespace Cryo
         const std::string &name() const { return _name; }
         const std::vector<std::unique_ptr<GenericParameterNode>> &generic_parameters() const { return _generic_parameters; }
         const std::vector<std::unique_ptr<FunctionDeclarationNode>> &methods() const { return _methods; }
+        const std::vector<BaseTraitInfo> &base_traits() const { return _base_traits; }
 
         void add_generic_parameter(std::unique_ptr<GenericParameterNode> param)
         {
@@ -932,6 +944,11 @@ namespace Cryo
         void add_method(std::unique_ptr<FunctionDeclarationNode> method)
         {
             _methods.push_back(std::move(method));
+        }
+
+        void add_base_trait(BaseTraitInfo base_trait)
+        {
+            _base_traits.push_back(std::move(base_trait));
         }
 
         void print(std::ostream &os, int indent = 0) const override
@@ -948,6 +965,30 @@ namespace Cryo
                 }
                 os << ">";
             }
+            
+            // Display base traits
+            if (!_base_traits.empty())
+            {
+                os << " : ";
+                for (size_t i = 0; i < _base_traits.size(); ++i)
+                {
+                    if (i > 0)
+                        os << ", ";
+                    os << _base_traits[i].name;
+                    if (!_base_traits[i].type_parameters.empty())
+                    {
+                        os << "<";
+                        for (size_t j = 0; j < _base_traits[i].type_parameters.size(); ++j)
+                        {
+                            if (j > 0)
+                                os << ", ";
+                            os << _base_traits[i].type_parameters[j];
+                        }
+                        os << ">";
+                    }
+                }
+            }
+            
             os << std::endl;
 
             if (!_methods.empty())
@@ -1282,6 +1323,28 @@ namespace Cryo
                         arg->print(os, indent + 4);
                 }
             }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    //===----------------------------------------------------------------------===//
+    // SizeofExpressionNode
+    //===----------------------------------------------------------------------===//
+    class SizeofExpressionNode : public ExpressionNode
+    {
+    private:
+        std::string _type_name;
+
+    public:
+        SizeofExpressionNode(SourceLocation loc, std::string type_name)
+            : ExpressionNode(NodeKind::SizeofExpression, loc), _type_name(std::move(type_name)) {}
+
+        const std::string &type_name() const { return _type_name; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "SizeofExpression: " << _type_name << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;

@@ -13,6 +13,11 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void SizeofExpressionNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     void StructLiteralNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);

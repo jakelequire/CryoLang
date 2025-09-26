@@ -1731,6 +1731,90 @@ namespace Cryo::Codegen
         set_current_value(struct_value);
     }
 
+    void CodegenVisitor::visit(Cryo::SizeofExpressionNode &node)
+    {
+        std::cout << "[CodegenVisitor] Generating sizeof expression" << std::endl;
+
+        auto &context = _context_manager.get_context();
+        auto module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+
+        if (!module)
+        {
+            report_error("No module available for sizeof expression", &node);
+            return;
+        }
+
+        std::string type_name = node.type_name();
+        llvm::Value *size_value = nullptr;
+
+        // Handle primitive types with known sizes
+        if (type_name == "u8" || type_name == "i8" || type_name == "char")
+        {
+            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
+        }
+        else if (type_name == "u16" || type_name == "i16")
+        {
+            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2);
+        }
+        else if (type_name == "u32" || type_name == "i32" || type_name == "int")
+        {
+            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 4);
+        }
+        else if (type_name == "u64" || type_name == "i64")
+        {
+            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8);
+        }
+        else if (type_name == "f32")
+        {
+            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 4);
+        }
+        else if (type_name == "f64" || type_name == "float")
+        {
+            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8);
+        }
+        else if (type_name == "bool")
+        {
+            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
+        }
+        else if (type_name == "string")
+        {
+            // String is a pointer (8 bytes on 64-bit systems)
+            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8);
+        }
+        else
+        {
+            // Handle user-defined types
+            llvm::Type *llvm_type = _type_mapper->lookup_type(type_name);
+            if (!llvm_type)
+            {
+                // Try the old lookup method as fallback
+                auto type_it = _types.find(type_name);
+                if (type_it != _types.end())
+                {
+                    llvm_type = type_it->second;
+                }
+            }
+            
+            if (llvm_type)
+            {
+                // Calculate size using LLVM's data layout
+                const llvm::DataLayout &data_layout = module->getDataLayout();
+                uint64_t type_size = data_layout.getTypeAllocSize(llvm_type);
+                size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), type_size);
+            }
+            else
+            {
+                report_error("Unknown type in sizeof expression: " + type_name, &node);
+                // Return 0 as fallback
+                size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+            }
+        }
+
+        register_value(&node, size_value);
+        set_current_value(size_value);
+    }
+
     void CodegenVisitor::visit(Cryo::StructLiteralNode &node)
     {
         std::cout << "[CodegenVisitor] Generating struct literal" << std::endl;

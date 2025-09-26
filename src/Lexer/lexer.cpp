@@ -151,6 +151,7 @@ namespace Cryo
         {"some", TokenKind::TK_KW_SOME},
         {"super", TokenKind::TK_KW_SUPER},
         {"this", TokenKind::TK_KW_THIS},
+        {"This", TokenKind::TK_KW_THIS_TYPE},
 
         // Operators as Keywords
         {"in", TokenKind::TK_KW_IN},

@@ -20,6 +20,7 @@ namespace Cryo
     class ImportDeclarationNode;
     class CallExpressionNode;
     class NewExpressionNode;
+    class SizeofExpressionNode;
     class StructLiteralNode;
     class ArrayLiteralNode;
     class ArrayAccessNode;
@@ -73,6 +74,7 @@ namespace Cryo
         virtual void visit(ImportDeclarationNode &node) = 0;
         virtual void visit(CallExpressionNode &node) = 0;
         virtual void visit(NewExpressionNode &node) = 0;
+        virtual void visit(SizeofExpressionNode &node) = 0;
         virtual void visit(StructLiteralNode &node) = 0;
         virtual void visit(ArrayLiteralNode &node) = 0;
         virtual void visit(ArrayAccessNode &node) = 0;
@@ -125,6 +127,7 @@ namespace Cryo
         void visit(ImportDeclarationNode &node) override {}
         void visit(CallExpressionNode &node) override {}
         void visit(NewExpressionNode &node) override {}
+        void visit(SizeofExpressionNode &node) override {}
         void visit(StructLiteralNode &node) override {}
         void visit(ArrayLiteralNode &node) override {}
         void visit(ArrayAccessNode &node) override {}

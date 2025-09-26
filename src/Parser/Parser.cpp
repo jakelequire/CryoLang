@@ -191,12 +191,52 @@ namespace Cryo
             advance();
         }
 
-        // Handle reference types (&type)
+        // Handle reference types (&type, &mut type)
         if (_current_token.is(TokenKind::TK_AMP))
         {
             advance();                            // consume '&'
+            
+            // Check for 'mut' after '&'
+            std::string ref_prefix = "&";
+            if (_current_token.is(TokenKind::TK_KW_MUT))
+            {
+                ref_prefix += "mut ";
+                advance(); // consume 'mut'
+            }
+            
             std::string base_type = parse_type(); // recursive call
-            return type_prefix + "&" + base_type;
+            return type_prefix + ref_prefix + base_type;
+        }
+
+        // Handle tuple types (type1, type2, ...)
+        if (_current_token.is(TokenKind::TK_L_PAREN))
+        {
+            std::string tuple_type = "(";
+            advance(); // consume '('
+            
+            // Parse tuple element types
+            if (!_current_token.is(TokenKind::TK_R_PAREN))
+            {
+                do
+                {
+                    std::string element_type = parse_type();
+                    tuple_type += element_type;
+
+                    if (_current_token.is(TokenKind::TK_COMMA))
+                    {
+                        tuple_type += ", ";
+                        advance(); // consume ','
+                    }
+                    else
+                    {
+                        break;
+                    }
+                } while (true);
+            }
+            
+            consume(TokenKind::TK_R_PAREN, "Expected ')' after tuple types");
+            tuple_type += ")";
+            return type_prefix + tuple_type;
         }
 
         if (!is_type_token())
@@ -209,6 +249,22 @@ namespace Cryo
         advance();
 
         std::string base_type = type_prefix + std::string(type_token.text());
+
+        // Handle scope resolution (e.g., This::Error, T::Output)
+        if (_current_token.is(TokenKind::TK_COLONCOLON))
+        {
+            advance(); // consume '::'
+            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+            {
+                error("Expected identifier after '::'");
+                return base_type;
+            }
+            
+            std::string member_name = std::string(_current_token.text());
+            advance();
+            
+            base_type += "::" + member_name;
+        }
 
         // Handle generic instantiation (e.g., SimpleGeneric<int>)
         if (_current_token.is(TokenKind::TK_L_ANGLE))
@@ -257,11 +313,22 @@ namespace Cryo
 
     Type *Parser::parse_type_annotation()
     {
-        // Handle reference types (&type)
+        // Handle reference types (&type, &mut type)
         if (_current_token.is(TokenKind::TK_AMP))
         {
-            advance();                                 // consume '&'
+            advance(); // consume '&'
+            
+            // Check for 'mut' after '&'
+            bool is_mutable = false;
+            if (_current_token.is(TokenKind::TK_KW_MUT))
+            {
+                is_mutable = true;
+                advance(); // consume 'mut'
+            }
+            
             Type *base_type = parse_type_annotation(); // recursive call
+            
+            // For now, create reference type (could be enhanced later for mut references)
             return _context.types().create_reference_type(base_type);
         }
 
@@ -276,8 +343,32 @@ namespace Cryo
 
         Type *base_type;
 
+        // Handle 'This' keyword for trait-scoped types
+        if (type_token.is(TokenKind::TK_KW_THIS_TYPE))
+        {
+            std::string type_name = "This";
+            
+            // Check for scope resolution (This::Error)
+            if (_current_token.is(TokenKind::TK_COLONCOLON))
+            {
+                advance(); // consume '::'
+                if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                {
+                    error("Expected identifier after 'This::'");
+                    return _context.types().get_unknown_type();
+                }
+                
+                std::string member_name = std::string(_current_token.text());
+                advance();
+                
+                type_name += "::" + member_name;
+            }
+            
+            // For now, create as a generic type (trait associated type)
+            base_type = _context.types().get_generic_type(type_name);
+        }
         // Handle identifiers (could be generic parameters or user-defined types)
-        if (type_token.is(TokenKind::TK_IDENTIFIER))
+        else if (type_token.is(TokenKind::TK_IDENTIFIER))
         {
             std::string type_name = std::string(type_token.text());
 
@@ -1332,6 +1423,12 @@ namespace Cryo
             return parse_new_expression();
         }
 
+        // Sizeof expressions
+        if (_current_token.is(TokenKind::TK_KW_SIZEOF))
+        {
+            return parse_sizeof_expression();
+        }
+
         error("Expected expression");
         return nullptr;
     }
@@ -1401,6 +1498,7 @@ namespace Cryo
                _current_token.is(TokenKind::TK_KW_CHAR) ||
                _current_token.is(TokenKind::TK_KW_STRING) ||
                _current_token.is(TokenKind::TK_KW_VOID) ||
+               _current_token.is(TokenKind::TK_KW_THIS_TYPE) || // Support for 'This'
                _current_token.is(TokenKind::TK_IDENTIFIER); // For user-defined types
     }
 
@@ -1979,6 +2077,28 @@ namespace Cryo
         }
     }
 
+    std::unique_ptr<ExpressionNode> Parser::parse_sizeof_expression()
+    {
+        SourceLocation sizeof_location = _current_token.location();
+        consume(TokenKind::TK_KW_SIZEOF, "Expected 'sizeof' keyword");
+
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after 'sizeof'");
+
+        // Parse type name
+        if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
+        {
+            error("Expected type name in sizeof expression");
+            return nullptr;
+        }
+
+        std::string type_name = std::string(_current_token.text());
+        advance(); // consume type name
+
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after type name");
+
+        return _builder.create_sizeof_expression(sizeof_location, type_name);
+    }
+
     std::unique_ptr<ExpressionNode> Parser::parse_member_access(std::unique_ptr<ExpressionNode> expr)
     {
         SourceLocation access_location = _current_token.location();
@@ -2203,6 +2323,58 @@ namespace Cryo
             }
         }
 
+        // Parse optional trait inheritance (: BaseTrait<T>)
+        if (_current_token.is(TokenKind::TK_COLON))
+        {
+            advance(); // consume ':'
+            
+            do {
+                // Parse base trait name
+                Token base_trait_name = consume(TokenKind::TK_IDENTIFIER, "Expected base trait name");
+                std::string base_name = std::string(base_trait_name.text());
+                
+                std::vector<std::string> type_params;
+                
+                // Parse optional generic parameters for base trait
+                if (_current_token.is(TokenKind::TK_L_ANGLE))
+                {
+                    advance(); // consume '<'
+                    
+                    if (!_current_token.is(TokenKind::TK_R_ANGLE))
+                    {
+                        do {
+                            Token type_param = consume(TokenKind::TK_IDENTIFIER, "Expected type parameter");
+                            type_params.push_back(std::string(type_param.text()));
+                            
+                            if (_current_token.is(TokenKind::TK_COMMA))
+                            {
+                                advance(); // consume ','
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        } while (!is_at_end());
+                    }
+                    
+                    consume(TokenKind::TK_R_ANGLE, "Expected '>' after base trait type parameters");
+                }
+                
+                // Add base trait to the declaration
+                trait_decl->add_base_trait(BaseTraitInfo(base_name, type_params));
+                
+                // Check for multiple inheritance (comma-separated base traits)
+                if (_current_token.is(TokenKind::TK_COMMA))
+                {
+                    advance(); // consume ','
+                }
+                else
+                {
+                    break;
+                }
+            } while (!is_at_end());
+        }
+
         consume(TokenKind::TK_L_BRACE, "Expected '{' after trait declaration");
 
         // Parse trait methods (only signatures, no implementations)
@@ -2211,10 +2383,11 @@ namespace Cryo
             try
             {
                 // Parse method signature
-                if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                if (_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is(TokenKind::TK_KW_FROM))
                 {
-                    Token method_name_token = consume(TokenKind::TK_IDENTIFIER, "Expected method name");
+                    Token method_name_token = _current_token;
                     std::string method_name = std::string(method_name_token.text());
+                    advance(); // consume method name token
 
                     consume(TokenKind::TK_L_PAREN, "Expected '(' after method name");
 
