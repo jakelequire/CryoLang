@@ -497,6 +497,27 @@ namespace Cryo
         }
     };
 
+    // Type alias (user-defined aliases for existing types)
+    class TypeAlias : public Type
+    {
+    private:
+        Type *_target_type; // The actual type this alias refers to
+
+    public:
+        TypeAlias(const std::string &alias_name, Type *target_type)
+            : Type(TypeKind::TypeAlias, alias_name), _target_type(target_type) {}
+
+        bool is_primitive() const override { return _target_type ? _target_type->is_primitive() : false; }
+        bool is_value_type() const override { return _target_type ? _target_type->is_value_type() : false; }
+        bool is_reference_type() const override { return _target_type ? _target_type->is_reference_type() : false; }
+        size_t size_bytes() const override { return _target_type ? _target_type->size_bytes() : 0; }
+        size_t alignment() const override { return _target_type ? _target_type->alignment() : 1; }
+        std::string to_string() const override { return _name; } // Return alias name, not target
+
+        Type *target_type() const { return _target_type; }
+        void set_target_type(Type *target) { _target_type = target; } // For forward declarations
+    };
+
     // Type factory and context for managing types
     class TypeContext
     {
@@ -562,6 +583,9 @@ namespace Cryo
         Type *get_class_type(const std::string &name);
         Type *get_enum_type(const std::string &name, std::vector<std::string> variants = {}, bool is_simple = true);
         Type *get_generic_type(const std::string &name);
+        
+        // Create type aliases
+        Type *create_type_alias(const std::string &alias_name, Type *target_type);
 
         // Type parsing utilities
         std::string normalize_generic_type_string(const std::string &type_str);

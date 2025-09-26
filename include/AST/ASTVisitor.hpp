@@ -40,6 +40,7 @@ namespace Cryo
     class DeclarationStatementNode;
     class StructDeclarationNode;
     class ClassDeclarationNode;
+    class TraitDeclarationNode;
     class EnumDeclarationNode;
     class EnumVariantNode;
     class TypeAliasDeclarationNode;
@@ -92,6 +93,7 @@ namespace Cryo
         virtual void visit(DeclarationStatementNode &node) = 0;
         virtual void visit(StructDeclarationNode &node) = 0;
         virtual void visit(ClassDeclarationNode &node) = 0;
+        virtual void visit(TraitDeclarationNode &node) = 0;
         virtual void visit(EnumDeclarationNode &node) = 0;
         virtual void visit(EnumVariantNode &node) = 0;
         virtual void visit(TypeAliasDeclarationNode &node) = 0;
@@ -143,6 +145,7 @@ namespace Cryo
         void visit(DeclarationStatementNode &node) override {}
         void visit(StructDeclarationNode &node) override {}
         void visit(ClassDeclarationNode &node) override {}
+        void visit(TraitDeclarationNode &node) override {}
         void visit(EnumDeclarationNode &node) override {}
         void visit(EnumVariantNode &node) override {}
         void visit(TypeAliasDeclarationNode &node) override {}

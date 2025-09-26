@@ -176,12 +176,27 @@ namespace Cryo
     // Type parsing
     std::string Parser::parse_type()
     {
+        std::string type_prefix = "";
+        
+        // Handle type modifiers: const, unsigned
+        if (_current_token.is(TokenKind::TK_KW_CONST))
+        {
+            type_prefix += "const ";
+            advance();
+        }
+        
+        if (_current_token.is(TokenKind::TK_KW_UNSIGNED))
+        {
+            type_prefix += "unsigned ";
+            advance();
+        }
+
         // Handle reference types (&type)
         if (_current_token.is(TokenKind::TK_AMP))
         {
             advance();                            // consume '&'
             std::string base_type = parse_type(); // recursive call
-            return "&" + base_type;
+            return type_prefix + "&" + base_type;
         }
 
         if (!is_type_token())
@@ -193,7 +208,7 @@ namespace Cryo
         Token type_token = _current_token;
         advance();
 
-        std::string base_type = std::string(type_token.text());
+        std::string base_type = type_prefix + std::string(type_token.text());
 
         // Handle generic instantiation (e.g., SimpleGeneric<int>)
         if (_current_token.is(TokenKind::TK_L_ANGLE))
@@ -431,6 +446,12 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_KW_CLASS))
         {
             return parse_class_declaration();
+        }
+
+        // Trait declaration
+        if (_current_token.is(TokenKind::TK_KW_TRAIT))
+        {
+            return parse_trait_declaration();
         }
 
         // Implementation block
@@ -1598,8 +1619,34 @@ namespace Cryo
 
         consume(TokenKind::TK_FATARROW, "Expected '=>' after pattern");
 
-        // Parse the body (should be a block statement)
-        auto body = parse_block_statement();
+        // Parse the body - can be either a block statement or a single expression
+        std::unique_ptr<StatementNode> body;
+        
+        if (_current_token.is(TokenKind::TK_L_BRACE))
+        {
+            // Block statement: { ... }
+            body = parse_block_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_RETURN))
+        {
+            // Special handling for return statements in match arms - no semicolon expected
+            SourceLocation return_loc = _current_token.location();
+            consume(TokenKind::TK_KW_RETURN, "Expected 'return'");
+            
+            std::unique_ptr<ExpressionNode> expr = nullptr;
+            if (!_current_token.is(TokenKind::TK_COMMA) && !_current_token.is(TokenKind::TK_R_BRACE))
+            {
+                expr = parse_expression();
+            }
+            
+            body = _builder.create_return_statement(return_loc, std::move(expr));
+        }
+        else
+        {
+            // Expression statement
+            auto expr = parse_expression();
+            body = std::make_unique<ExpressionStatementNode>(start_loc, std::move(expr));
+        }
 
         // Expect comma after match arm (optional for last arm)
         if (_current_token.is(TokenKind::TK_COMMA))
@@ -2135,14 +2182,184 @@ namespace Cryo
         return class_decl;
     }
 
+    std::unique_ptr<TraitDeclarationNode> Parser::parse_trait_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+
+        consume(TokenKind::TK_KW_TRAIT, "Expected 'trait'");
+
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected trait name");
+        std::string trait_name = std::string(name_token.text());
+
+        auto trait_decl = _builder.create_trait_declaration(start_loc, trait_name);
+
+        // Parse optional generic parameters
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            auto generics = parse_generic_parameters();
+            for (auto &generic : generics)
+            {
+                trait_decl->add_generic_parameter(std::move(generic));
+            }
+        }
+
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after trait declaration");
+
+        // Parse trait methods (only signatures, no implementations)
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            try
+            {
+                // Parse method signature
+                if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                {
+                    Token method_name_token = consume(TokenKind::TK_IDENTIFIER, "Expected method name");
+                    std::string method_name = std::string(method_name_token.text());
+
+                    consume(TokenKind::TK_L_PAREN, "Expected '(' after method name");
+
+                    // Parse parameters
+                    std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+                    if (!_current_token.is(TokenKind::TK_R_PAREN))
+                    {
+                        do
+                        {
+                            auto param = parse_parameter();
+                            params.push_back(std::move(param));
+
+                            if (_current_token.is(TokenKind::TK_COMMA))
+                            {
+                                advance(); // consume comma
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        } while (!is_at_end());
+                    }
+
+                    consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
+
+                    // Parse return type
+                    std::string return_type = "void";
+                    if (_current_token.is(TokenKind::TK_ARROW))
+                    {
+                        advance(); // consume '->'
+                        return_type = parse_type();
+                    }
+
+                    consume(TokenKind::TK_SEMICOLON, "Expected ';' after trait method signature");
+
+                    // Create a function declaration (trait methods are just signatures)
+                    auto method_decl = _builder.create_function_declaration(
+                        _current_token.location(), method_name, return_type, true); // traits are public
+                    
+                    // Add parameters to the function declaration
+                    for (auto &param : params)
+                    {
+                        method_decl->add_parameter(std::move(param));
+                    }
+                    
+                    trait_decl->add_method(std::move(method_decl));
+                }
+                else
+                {
+                    error("Expected method signature in trait");
+                    synchronize();
+                }
+            }
+            catch (const ParseError &e)
+            {
+                _errors.push_back(e);
+                synchronize();
+            }
+        }
+
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after trait body");
+        return trait_decl;
+    }
+
     std::unique_ptr<TypeAliasDeclarationNode> Parser::parse_type_alias_declaration()
     {
         SourceLocation start_loc = _current_token.location();
 
         consume(TokenKind::TK_KW_TYPE, "Expected 'type'");
 
-        Token alias_token = consume(TokenKind::TK_IDENTIFIER, "Expected type alias name");
-        std::string alias_name = std::string(alias_token.text());
+        // Handle both identifiers and reserved keywords as type names
+        std::string alias_name;
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            alias_name = std::string(_current_token.text());
+            advance();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_INT) ||
+                 _current_token.is(TokenKind::TK_KW_FLOAT) ||
+                 _current_token.is(TokenKind::TK_KW_DOUBLE) ||
+                 _current_token.is(TokenKind::TK_KW_STRING) ||
+                 _current_token.is(TokenKind::TK_KW_BOOLEAN) ||
+                 _current_token.is(TokenKind::TK_KW_I8) ||
+                 _current_token.is(TokenKind::TK_KW_I16) ||
+                 _current_token.is(TokenKind::TK_KW_I32) ||
+                 _current_token.is(TokenKind::TK_KW_I64) ||
+                 _current_token.is(TokenKind::TK_KW_F32) ||
+                 _current_token.is(TokenKind::TK_KW_F64))
+        {
+            // Allow reserved keywords as type alias names
+            alias_name = std::string(_current_token.text());
+            advance();
+        }
+        else
+        {
+            error("Expected type alias name");
+            return nullptr;
+        }
+
+        // Parse optional generic parameters <T, U, V>
+        std::vector<std::string> generic_params;
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            advance(); // consume '<'
+            
+            do {
+                if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                {
+                    error("Expected generic parameter name");
+                    return nullptr;
+                }
+                
+                generic_params.push_back(std::string(_current_token.text()));
+                advance();
+                
+                if (_current_token.is(TokenKind::TK_COMMA))
+                {
+                    advance(); // consume ','
+                }
+                else if (_current_token.is(TokenKind::TK_R_ANGLE))
+                {
+                    break;
+                }
+                else
+                {
+                    error("Expected ',' or '>' in generic parameter list");
+                    return nullptr;
+                }
+            } while (true);
+            
+            consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic parameters");
+        }
+
+        // Check if this is a forward declaration (type i8;) or alias (type int = i64;)
+        if (_current_token.is(TokenKind::TK_SEMICOLON))
+        {
+            // Forward declaration - for now, generic forward declarations are not supported
+            if (!generic_params.empty())
+            {
+                error("Generic forward declarations are not yet supported");
+                return nullptr;
+            }
+            advance(); // consume semicolon
+            return _builder.create_type_alias_declaration(start_loc, alias_name, ""); // Empty target for forward decl
+        }
 
         consume(TokenKind::TK_EQUAL, "Expected '=' in type alias");
 
@@ -2151,7 +2368,7 @@ namespace Cryo
 
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after type alias");
 
-        return _builder.create_type_alias_declaration(start_loc, alias_name, target_type);
+        return _builder.create_type_alias_declaration(start_loc, alias_name, target_type, generic_params);
     }
 
     std::unique_ptr<EnumDeclarationNode> Parser::parse_enum_declaration()
@@ -2255,14 +2472,50 @@ namespace Cryo
 
         consume(TokenKind::TK_KW_IMPLEMENT, "Expected 'implement'");
 
-        // Optional 'struct' keyword for backward compatibility
+        // Optional 'struct' or 'enum' keyword for different target types
+        bool is_enum_impl = false;
         if (_current_token.is(TokenKind::TK_KW_STRUCT))
         {
             advance(); // consume 'struct'
         }
+        else if (_current_token.is(TokenKind::TK_KW_ENUM))
+        {
+            advance(); // consume 'enum'
+            is_enum_impl = true;
+        }
 
         Token target_token = consume(TokenKind::TK_IDENTIFIER, "Expected target type name");
         std::string target_type = std::string(target_token.text());
+
+        // Handle generic parameters for the target type (e.g., implement enum Option<T>)
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            target_type += "<";
+            advance(); // consume '<'
+            
+            // Parse generic arguments
+            do
+            {
+                if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                {
+                    target_type += std::string(_current_token.text());
+                    advance();
+                }
+                
+                if (_current_token.is(TokenKind::TK_COMMA))
+                {
+                    target_type += ",";
+                    advance();
+                }
+                else
+                {
+                    break;
+                }
+            } while (!is_at_end() && !_current_token.is(TokenKind::TK_R_ANGLE));
+            
+            consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic parameters");
+            target_type += ">";
+        }
 
         auto impl_block = _builder.create_implementation_block(start_loc, target_type);
 

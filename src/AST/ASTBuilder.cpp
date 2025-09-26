@@ -196,9 +196,14 @@ namespace Cryo
         return std::make_unique<ClassDeclarationNode>(loc, std::move(name));
     }
 
-    std::unique_ptr<TypeAliasDeclarationNode> ASTBuilder::create_type_alias_declaration(SourceLocation loc, std::string alias_name, std::string target_type)
+    std::unique_ptr<TraitDeclarationNode> ASTBuilder::create_trait_declaration(SourceLocation loc, std::string name)
     {
-        return std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), std::move(target_type));
+        return std::make_unique<TraitDeclarationNode>(loc, std::move(name));
+    }
+
+    std::unique_ptr<TypeAliasDeclarationNode> ASTBuilder::create_type_alias_declaration(SourceLocation loc, std::string alias_name, std::string target_type, std::vector<std::string> generic_params)
+    {
+        return std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), std::move(target_type), std::move(generic_params));
     }
 
     std::unique_ptr<EnumDeclarationNode> ASTBuilder::create_enum_declaration(SourceLocation loc, std::string name)

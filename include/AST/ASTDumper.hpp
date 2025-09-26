@@ -101,6 +101,7 @@ namespace Cryo
         void visit(EnumDeclarationNode &node) override;
         void visit(EnumVariantNode &node) override;
         void visit(TypeAliasDeclarationNode &node) override;
+        void visit(TraitDeclarationNode &node) override;
         void visit(ScopeResolutionNode &node) override;
         void visit(ImplementationBlockNode &node) override;
         void visit(ExternBlockNode &node) override;
