@@ -739,6 +739,22 @@ namespace Cryo
         return result;
     }
 
+    Type *TypeContext::get_trait_type(const std::string &name)
+    {
+        auto it = _trait_types.find(name);
+        if (it != _trait_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Create new trait type
+        auto trait_type = std::make_unique<TraitType>(name);
+        Type *result = trait_type.get();
+        _trait_types[name] = std::move(trait_type);
+
+        return result;
+    }
+
     Type *TypeContext::get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple)
     {
         auto it = _enum_types.find(name);
@@ -768,5 +784,44 @@ namespace Cryo
         Type *type_ptr = generic_type.get();
         _generic_types[name] = std::move(generic_type);
         return type_ptr;
+    }
+
+    //===----------------------------------------------------------------------===//
+    // StructType Size Calculation
+    //===----------------------------------------------------------------------===//
+    
+    size_t StructType::size_bytes() const
+    {
+        if (_cached_size)
+        {
+            return *_cached_size;
+        }
+
+        // For now, return a placeholder size based on typical struct overhead
+        // TODO: This should calculate actual size based on fields when field info is available
+        // For structs with unknown field layout, we use a reasonable default
+        size_t estimated_size = 8; // Base struct size
+        
+        _cached_size = estimated_size;
+        return estimated_size;
+    }
+
+    //===----------------------------------------------------------------------===//
+    // ClassType Size Calculation  
+    //===----------------------------------------------------------------------===//
+    
+    size_t ClassType::size_bytes() const
+    {
+        if (_cached_size)
+        {
+            return *_cached_size;
+        }
+
+        // Classes are typically stored as pointers/references
+        // The actual object size would include vtable pointer + fields
+        size_t estimated_size = sizeof(void*) * 2; // vtable + typical field overhead
+        
+        _cached_size = estimated_size;
+        return estimated_size;
     }
 }

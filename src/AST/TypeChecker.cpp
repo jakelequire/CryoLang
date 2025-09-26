@@ -138,13 +138,13 @@ namespace Cryo
         const std::string MAGENTA = "\033[35m";
         const std::string RED = "\033[31m";
 
-        os << BOLD << CYAN << "\n+======================================================================================+" << RESET << std::endl;
-        os << BOLD << CYAN << "|                                    Type Table                                        |" << RESET << std::endl;
-        os << BOLD << CYAN << "+======================================================================================+" << RESET << std::endl;
+        os << BOLD << CYAN << "\n+=====================================================================================================+" << RESET << std::endl;
+        os << BOLD << CYAN << "|                                            Type Table                                               |" << RESET << std::endl;
+        os << BOLD << CYAN << "+=====================================================================================================+" << RESET << std::endl;
 
         if (_symbols.empty() && !_parent_scope)
         {
-            os << "|  " << YELLOW << "No types found" << RESET << "                                                                       |" << std::endl;
+            os << "|  " << YELLOW << "No types found" << RESET << "                                                                        |" << std::endl;
             os << BOLD << CYAN << "+======================================================================================+" << RESET << std::endl;
             return;
         }
@@ -161,19 +161,19 @@ namespace Cryo
         os << "|  Total symbols: " << BOLD << GREEN << total_symbols << RESET;
         // Pad to align right side of box
         std::string count_str = std::to_string(total_symbols);
-        for (int i = count_str.length(); i < 65; i++)
+        for (int i = count_str.length(); i < 84; i++)
         {
             os << " ";
         }
         os << "|" << std::endl;
-        os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+----------+" << RESET << std::endl;
-        os << BOLD << CYAN << "|    TypeOf     |      Symbol      |           Type Signature            | Flags  | Location |" << RESET << std::endl;
-        os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+----------+" << RESET << std::endl;
+        os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+--------+----------+" << RESET << std::endl;
+        os << BOLD << CYAN << "|    TypeOf     |      Symbol      |           Type Signature            | Flags  |  Size  | Location |" << RESET << std::endl;
+        os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+--------+----------+" << RESET << std::endl;
 
         // Print symbols from current and parent scopes
         print_type_symbols(os, 0);
 
-        os << BOLD << CYAN << "+======================================================================================+" << RESET << std::endl;
+        os << BOLD << CYAN << "+=====================================================================================================+" << RESET << std::endl;
     }
 
     void TypedSymbolTable::print_type_symbols(std::ostream &os, int scope_level) const
@@ -193,16 +193,17 @@ namespace Cryo
         {
             std::string type_category = determine_type_category(symbol.type);
 
-            // Only include: Struct, Class, Enum declarations, and Alias types
+            // Only include: Struct, Class, Trait, Enum declarations, and Alias types
             // Exclude: Functions, Primitives (enum variants), Arrays, Pointers, etc.
             if (type_category != "Struct" && type_category != "Class" &&
-                type_category != "Enum" && type_category != "Alias")
+                type_category != "Trait" && type_category != "Enum" && type_category != "Alias")
             {
                 continue; // Skip everything else
             }
 
             std::string type_signature = symbol.type ? symbol.type->to_string() : "unknown";
             std::string flags = determine_flags(symbol);
+            std::string size = format_type_size(symbol.type);
             std::string location = std::to_string(symbol.declaration_location.line()) +
                                    ":" + std::to_string(symbol.declaration_location.column());
 
@@ -211,6 +212,10 @@ namespace Cryo
             if (type_category == "Struct" || type_category == "Class")
             {
                 colored_category = MAGENTA + type_category + RESET;
+            }
+            else if (type_category == "Trait")
+            {
+                colored_category = "\033[38;5;208m" + type_category + RESET; // Orange color
             }
             else if (type_category == "Function")
             {
@@ -229,10 +234,20 @@ namespace Cryo
                 colored_category = BLUE + type_category + RESET;
             }
 
+            // Check if this type will have detailed information
+            bool will_have_details = symbol.type && (symbol.type->kind() == TypeKind::Struct || symbol.type->kind() == TypeKind::Class);
+
+            // Print top border if this type will have detailed information
+            if (will_have_details)
+            {
+                os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+--------+----------+" << RESET << std::endl;
+            }
+
             os << "| " << format_field_colored(colored_category, type_category, 13)
                << " | " << format_field(name, 16)
                << " | " << format_field(type_signature, 35)
                << " | " << format_field(flags, 6)
+               << " | " << format_field(size, 6)
                << " | " << format_field(location, 8)
                << " |" << std::endl;
 
@@ -258,6 +273,8 @@ namespace Cryo
             return "Struct";
         case TypeKind::Class:
             return "Class";
+        case TypeKind::Trait:
+            return "Trait";
         case TypeKind::Function:
             return "Function";
         case TypeKind::Enum:
@@ -310,6 +327,24 @@ namespace Cryo
         return flags.empty() ? "N/A" : flags;
     }
 
+    std::string TypedSymbolTable::format_type_size(Type *type) const
+    {
+        if (!type)
+            return "N/A";
+
+        size_t size = type->size_bytes();
+        if (size == 0)
+            return "0";
+        
+        // Format size with unit
+        if (size < 1024)
+            return std::to_string(size) + "B";
+        else if (size < 1024 * 1024)
+            return std::to_string(size / 1024) + "KB";
+        else
+            return std::to_string(size / (1024 * 1024)) + "MB";
+    }
+
     void TypedSymbolTable::print_type_details(std::ostream &os, const TypedSymbol &symbol) const
     {
         const std::string RESET = "\033[0m";
@@ -321,9 +356,6 @@ namespace Cryo
         // For complex types like structs and classes, print their details if available
         if (symbol.type && (symbol.type->kind() == TypeKind::Struct || symbol.type->kind() == TypeKind::Class))
         {
-            // Use the same border as the main table header
-            os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+----------+" << RESET << std::endl;
-
             // Properties section - spans across all columns (no right border)
             os << "|   " << YELLOW << "Properties:" << RESET << std::endl;
 
@@ -480,8 +512,8 @@ namespace Cryo
                 os << "|        No methods defined" << std::endl;
             }
 
-            // Bottom border for this type's details
-            os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+----------+" << RESET << std::endl;
+            // Bottom border for this type's details with 6 columns
+            os << BOLD << CYAN << "+---------------+------------------+-------------------------------------+--------+--------+----------+" << RESET << std::endl;
         }
     }
 
@@ -1312,6 +1344,67 @@ namespace Cryo
         // Later we can add proper constructor signature checking
     }
 
+    void TypeChecker::visit(SizeofExpressionNode &node)
+    {
+        // sizeof is a compile-time operator that returns u64
+        // We need to validate that the type exists
+        
+        std::string type_name = node.type_name();
+        
+        // First check if it's a primitive type
+        if (type_name == "u8" || type_name == "i8" || type_name == "char")
+        {
+            node.set_type("u64");
+            return;
+        }
+        else if (type_name == "u16" || type_name == "i16")
+        {
+            node.set_type("u64");
+            return;
+        }
+        else if (type_name == "u32" || type_name == "i32" || type_name == "int")
+        {
+            node.set_type("u64");
+            return;
+        }
+        else if (type_name == "u64" || type_name == "i64")
+        {
+            node.set_type("u64");
+            return;
+        }
+        else if (type_name == "f32" || type_name == "f64" || type_name == "float")
+        {
+            node.set_type("u64");
+            return;
+        }
+        else if (type_name == "bool")
+        {
+            node.set_type("u64");
+            return;
+        }
+        else if (type_name == "string")
+        {
+            node.set_type("u64");
+            return;
+        }
+        
+        // Check if it's a user-defined type in the symbol table
+        TypedSymbol *type_symbol = _symbol_table->lookup_symbol(type_name);
+        
+        if (type_symbol)
+        {
+            // The type exists, sizeof is valid
+            node.set_type("u64");
+        }
+        else
+        {
+            // Type not found - report error and set to unknown
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                         "Undefined type '" + type_name + "' in sizeof expression");
+            node.set_type("u64"); // Still return u64 even on error
+        }
+    }
+
     // Helper function to substitute generic type parameters in a type string
     std::string substitute_generic_type(const std::string &type_str,
                                         const std::string &object_type,
@@ -1667,6 +1760,63 @@ namespace Cryo
         _current_struct_name = previous_struct_name;
 
         node.set_type(class_name);
+    }
+
+    void TypeChecker::visit(TraitDeclarationNode &node)
+    {
+        std::string trait_name = node.name();
+
+        // Check for redefinition
+        if (_symbol_table->lookup_symbol(trait_name))
+        {
+            report_redefined_symbol(node.location(), trait_name);
+            return;
+        }
+
+        // Register trait type in symbol table
+        Type *trait_type = _type_context.get_trait_type(trait_name);
+        _symbol_table->declare_symbol(trait_name, trait_type, node.location(), &node);
+
+        // Enter trait scope for processing methods
+        enter_scope();
+
+        // Process generic parameters if any
+        for (const auto &generic_param : node.generic_parameters())
+        {
+            if (generic_param)
+            {
+                generic_param->accept(*this);
+            }
+        }
+
+        // Process trait inheritance (parent traits)
+        for (const auto &base_trait : node.base_traits())
+        {
+            // Validate that parent trait exists
+            TypedSymbol *parent_symbol = _symbol_table->lookup_symbol(base_trait.name);
+            if (!parent_symbol)
+            {
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), "Undefined parent trait '" + base_trait.name + "'");
+            }
+            else if (parent_symbol->type->kind() != TypeKind::Trait)
+            {
+                report_error(TypeError::ErrorKind::IncompatibleTypes, node.location(), "'" + base_trait.name + "' is not a trait");
+            }
+        }
+
+        // Process trait methods
+        for (const auto &method : node.methods())
+        {
+            if (method)
+            {
+                method->accept(*this);
+            }
+        }
+
+        // Exit trait scope
+        exit_scope();
+
+        // TraitDeclarationNode doesn't have set_type method, so we don't call it
     }
 
     void TypeChecker::visit(TypeAliasDeclarationNode &node)

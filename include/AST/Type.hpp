@@ -33,6 +33,7 @@ namespace Cryo
         Struct,
         Class,
         Interface,
+        Trait,
         Enum,
         Union,
 
@@ -445,12 +446,15 @@ namespace Cryo
     // Struct type (user-defined)
     class StructType : public Type
     {
+    private:
+        mutable std::optional<size_t> _cached_size;
+
     public:
         StructType(const std::string &name) : Type(TypeKind::Struct, name) {}
 
         bool is_primitive() const override { return false; }
         bool is_value_type() const override { return true; }
-        size_t size_bytes() const override { return sizeof(void *); } // Placeholder
+        size_t size_bytes() const override;
         size_t alignment() const override { return sizeof(void *); }
         std::string to_string() const override { return _name; }
     };
@@ -458,13 +462,29 @@ namespace Cryo
     // Class type (user-defined)
     class ClassType : public Type
     {
+    private:
+        mutable std::optional<size_t> _cached_size;
+
     public:
         ClassType(const std::string &name) : Type(TypeKind::Class, name) {}
 
         bool is_primitive() const override { return false; }
         bool is_reference_type() const override { return true; }
-        size_t size_bytes() const override { return sizeof(void *); } // Pointer size
+        size_t size_bytes() const override;
         size_t alignment() const override { return sizeof(void *); }
+        std::string to_string() const override { return _name; }
+    };
+
+    // Trait type (user-defined)
+    class TraitType : public Type
+    {
+    public:
+        TraitType(const std::string &name) : Type(TypeKind::Trait, name) {}
+
+        bool is_primitive() const override { return false; }
+        bool is_reference_type() const override { return false; }
+        size_t size_bytes() const override { return 0; } // Traits have no runtime representation
+        size_t alignment() const override { return 1; }
         std::string to_string() const override { return _name; }
     };
 
@@ -538,6 +558,7 @@ namespace Cryo
         // User-defined type cache
         std::unordered_map<std::string, std::unique_ptr<StructType>> _struct_types;
         std::unordered_map<std::string, std::unique_ptr<ClassType>> _class_types;
+        std::unordered_map<std::string, std::unique_ptr<TraitType>> _trait_types;
         std::unordered_map<std::string, std::unique_ptr<EnumType>> _enum_types;
         std::unordered_map<std::string, std::unique_ptr<Type>> _generic_types;
 
@@ -581,6 +602,7 @@ namespace Cryo
         // Create user-defined types
         Type *get_struct_type(const std::string &name);
         Type *get_class_type(const std::string &name);
+        Type *get_trait_type(const std::string &name);
         Type *get_enum_type(const std::string &name, std::vector<std::string> variants = {}, bool is_simple = true);
         Type *get_generic_type(const std::string &name);
         

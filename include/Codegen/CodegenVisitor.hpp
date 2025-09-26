@@ -125,6 +125,7 @@ namespace Cryo::Codegen
         void visit(Cryo::TernaryExpressionNode &node) override;
         void visit(Cryo::CallExpressionNode &node) override;
         void visit(Cryo::NewExpressionNode &node) override;
+        void visit(Cryo::SizeofExpressionNode &node) override;
         void visit(Cryo::StructLiteralNode &node) override;
         void visit(Cryo::ArrayLiteralNode &node) override;
         void visit(Cryo::ArrayAccessNode &node) override;

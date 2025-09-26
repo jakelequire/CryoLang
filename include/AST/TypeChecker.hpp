@@ -116,6 +116,7 @@ namespace Cryo
         void print_type_symbols(std::ostream &os, int scope_level) const;
         std::string determine_type_category(Type *type) const;
         std::string determine_flags(const TypedSymbol &symbol) const;
+        std::string format_type_size(Type *type) const;
         void print_type_details(std::ostream &os, const TypedSymbol &symbol) const;
         std::string format_field(const std::string &text, int width) const;
         std::string format_field_colored(const std::string &colored_text, const std::string &plain_text, int width) const;
@@ -178,6 +179,7 @@ namespace Cryo
         void visit(FunctionDeclarationNode &node) override;
         void visit(StructDeclarationNode &node) override;
         void visit(ClassDeclarationNode &node) override;
+        void visit(TraitDeclarationNode &node) override;
         void visit(EnumDeclarationNode &node) override;
         void visit(EnumVariantNode &node) override;
         void visit(TypeAliasDeclarationNode &node) override;
@@ -203,6 +205,7 @@ namespace Cryo
         void visit(UnaryExpressionNode &node) override;
         void visit(CallExpressionNode &node) override;
         void visit(NewExpressionNode &node) override;
+        void visit(SizeofExpressionNode &node) override;
         void visit(MemberAccessNode &node) override;
         void visit(ScopeResolutionNode &node) override;
 
