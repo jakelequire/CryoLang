@@ -388,6 +388,7 @@ namespace Cryo
         _string_type = std::make_unique<StringType>();
         _auto_type = std::make_unique<AutoType>();
         _unknown_type = std::make_unique<UnknownType>();
+        _null_type = std::make_unique<NullType>();
     }
 
     Type *TypeContext::get_integer_type(IntegerKind kind, bool is_signed)
@@ -523,6 +524,8 @@ namespace Cryo
             return get_string_type();
         if (normalized_type_str == "auto")
             return get_auto_type();
+        if (normalized_type_str == "null")
+            return get_null_type();
 
         // Integer types
         if (normalized_type_str == "i8")
@@ -640,6 +643,8 @@ namespace Cryo
             return get_default_float_type();
         case TokenKind::TK_KW_AUTO:
             return get_auto_type();
+        case TokenKind::TK_KW_NULL:
+            return get_null_type();
         default:
             return get_unknown_type();
         }

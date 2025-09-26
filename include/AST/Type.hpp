@@ -45,7 +45,8 @@ namespace Cryo
         // Special types
         Auto,    // For type inference
         Unknown, // Error recovery
-        Never    // Bottom type (functions that never return)
+        Never,   // Bottom type (functions that never return)
+        Null     // Null pointer type
     };
 
     // Integer type specifications
@@ -411,6 +412,21 @@ namespace Cryo
         std::string to_string() const override { return "unknown"; }
     };
 
+    // Null type (null pointer literal)
+    class NullType : public Type
+    {
+    public:
+        NullType() : Type(TypeKind::Null, "null") {}
+
+        bool is_nullable() const override { return true; }
+        bool is_assignable_from(const Type &other) const override { return other.is_nullable(); }
+        bool is_convertible_to(const Type &other) const override { return other.is_nullable(); }
+
+        size_t size_bytes() const override { return sizeof(void*); } // Pointer size
+        size_t alignment() const override { return sizeof(void*); }
+        std::string to_string() const override { return "null"; }
+    };
+
     // Generic type parameter
     class GenericType : public Type
     {
@@ -492,6 +508,7 @@ namespace Cryo
         std::unique_ptr<StringType> _string_type;
         std::unique_ptr<AutoType> _auto_type;
         std::unique_ptr<UnknownType> _unknown_type;
+        std::unique_ptr<NullType> _null_type;
 
         // Integer type cache
         std::unordered_map<int, std::unique_ptr<IntegerType>> _integer_types;
@@ -517,6 +534,7 @@ namespace Cryo
         Type *get_string_type() { return _string_type.get(); }
         Type *get_auto_type() { return _auto_type.get(); }
         Type *get_unknown_type() { return _unknown_type.get(); }
+        Type *get_null_type() { return _null_type.get(); }
 
         // Get integer types
         Type *get_integer_type(IntegerKind kind, bool is_signed = true);

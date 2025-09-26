@@ -134,6 +134,10 @@ namespace Cryo::Codegen
             }
             break;
         }
+        case Cryo::TypeKind::Null:
+            // Null is represented as a generic pointer type
+            llvm_type = llvm::PointerType::get(get_void_type(), 0);
+            break;
         default:
             report_error("Unsupported type kind: " + std::to_string(static_cast<int>(cryo_type->kind())));
             return nullptr;

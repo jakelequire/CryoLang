@@ -15,7 +15,13 @@ namespace Cryo::Codegen
 
     CodegenVisitor::CodegenVisitor(LLVMContextManager &context_manager,
                                    Cryo::SymbolTable &symbol_table)
-        : _context_manager(context_manager), _symbol_table(symbol_table), _value_context(std::make_unique<ValueContext>()), _type_mapper(std::make_unique<TypeMapper>(context_manager)), _current_value(nullptr), _has_errors(false)
+        : _context_manager(context_manager), 
+          _symbol_table(symbol_table), 
+          _value_context(std::make_unique<ValueContext>()), 
+          _type_mapper(std::make_unique<TypeMapper>(context_manager)),
+          _intrinsics(std::make_unique<Intrinsics>(context_manager)),
+          _current_value(nullptr), 
+          _has_errors(false)
     {
     }
 
@@ -142,8 +148,8 @@ namespace Cryo::Codegen
             // Create function type for type checking
             llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
 
-            // Mark this as an intrinsic in our intrinsics map
-            _intrinsics[node.name()] = func_type;
+            // Intrinsic functions are now handled by the Intrinsics module
+            // No need to store in a separate map anymore
 
             std::cout << "[DEBUG] Intrinsic '" << node.name() << "' registered successfully" << std::endl;
         }
@@ -1301,6 +1307,12 @@ namespace Cryo::Codegen
             }
 
             literal_value = _context_manager.get_builder().CreateGlobalStringPtr(str_val);
+            break;
+        }
+        case TokenKind::TK_KW_NULL:
+        {
+            // Create null pointer constant
+            literal_value = llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_ctx, 0));
             break;
         }
         default:
@@ -3557,14 +3569,22 @@ namespace Cryo::Codegen
             // Handle simple function name
             function_name = identifier->name();
 
-            // Check if this is an intrinsic call
-            if (_intrinsics.find(function_name) != _intrinsics.end())
+            // Check if this is an intrinsic call (intrinsics start with "__")
+            if (function_name.length() > 4 && function_name.substr(0, 2) == "__" && function_name.substr(function_name.length() - 2) == "__")
             {
                 return generate_intrinsic_call(node, function_name);
             }
         }
         else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
         {
+            // First check if this is an intrinsic call with qualified names
+            std::string member_name = member_access->member();
+            if (member_name.length() > 4 && member_name.substr(0, 2) == "__" && member_name.substr(member_name.length() - 2) == "__")
+            {
+                // This is a qualified intrinsic call like std::Intrinsics::__printf__
+                return generate_intrinsic_call(node, member_name);
+            }
+            
             // Handle member access - could be namespaced calls or struct method calls
             if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
             {
@@ -3651,6 +3671,15 @@ namespace Cryo::Codegen
         else if (auto *scope_resolution = dynamic_cast<ScopeResolutionNode *>(node->callee()))
         {
             // Handle scope resolution like Std::Runtime::print_int
+            std::string member_name = scope_resolution->member_name();
+            
+            // Check if this is an intrinsic call with qualified names
+            if (member_name.length() > 4 && member_name.substr(0, 2) == "__" && member_name.substr(member_name.length() - 2) == "__")
+            {
+                // This is a qualified intrinsic call like std::Intrinsics::__printf__
+                return generate_intrinsic_call(node, member_name);
+            }
+            
             function_name = scope_resolution->scope_name() + "::" + scope_resolution->member_name();
         }
         else
@@ -4872,10 +4901,7 @@ namespace Cryo::Codegen
 
     llvm::Value *CodegenVisitor::generate_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name)
     {
-        std::cout << "[CodegenVisitor] Generating intrinsic call: " << intrinsic_name << std::endl;
-
-        auto &builder = _context_manager.get_builder();
-        auto &context = _context_manager.get_context();
+        std::cout << "[CodegenVisitor] Delegating intrinsic call to Intrinsics module: " << intrinsic_name << std::endl;
 
         // Generate arguments
         std::vector<llvm::Value *> args;
@@ -4891,80 +4917,15 @@ namespace Cryo::Codegen
             args.push_back(arg_value);
         }
 
-        // Handle specific intrinsics
-        if (intrinsic_name == "__syscall_write__")
+        // Delegate to the Intrinsics module
+        llvm::Value* result = _intrinsics->generate_intrinsic_call(node, intrinsic_name, args);
+        
+        if (_intrinsics->has_errors())
         {
-            return generate_syscall_write(args);
-        }
-        // Add more intrinsics as needed
-        else
-        {
-            report_error("Unknown intrinsic: " + intrinsic_name);
-            return nullptr;
-        }
-    }
-
-    llvm::Value *CodegenVisitor::generate_syscall_write(const std::vector<llvm::Value *> &args)
-    {
-        std::cout << "[CodegenVisitor] Generating syscall_write intrinsic" << std::endl;
-
-        if (args.size() != 3)
-        {
-            report_error("syscall_write requires exactly 3 arguments");
+            report_error("Intrinsic generation failed: " + _intrinsics->get_last_error());
             return nullptr;
         }
 
-        auto &builder = _context_manager.get_builder();
-        auto &context = _context_manager.get_context();
-
-        // On Linux x86_64, write syscall number is 1
-        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
-
-        // Convert arguments to appropriate types
-        llvm::Value *fd = args[0];
-        llvm::Value *buf = args[1];
-        llvm::Value *len = args[2];
-
-        // Ensure fd is i64
-        if (fd->getType()->isIntegerTy(32))
-        {
-            fd = builder.CreateSExt(fd, llvm::Type::getInt64Ty(context), "fd.ext");
-        }
-
-        // Ensure buf is a pointer (i8*)
-        if (!buf->getType()->isPointerTy())
-        {
-            report_error("syscall_write buffer argument must be a pointer");
-            return nullptr;
-        }
-
-        // Ensure len is i64
-        if (len->getType()->isIntegerTy(32))
-        {
-            len = builder.CreateSExt(len, llvm::Type::getInt64Ty(context), "len.ext");
-        }
-
-        // Create inline assembly for syscall
-        llvm::FunctionType *syscall_type = llvm::FunctionType::get(
-            llvm::Type::getInt64Ty(context),
-            {llvm::Type::getInt64Ty(context),    // rax (syscall number)
-             llvm::Type::getInt64Ty(context),    // rdi (fd)
-             llvm::PointerType::get(context, 0), // rsi (buf) - generic pointer
-             llvm::Type::getInt64Ty(context)},   // rdx (len)
-            false);
-
-        llvm::InlineAsm *syscall_asm = llvm::InlineAsm::get(
-            syscall_type,
-            "syscall",                    // Assembly instruction
-            "={rax},0,{rdi},{rsi},{rdx}", // Constraints
-            true,                         // Has side effects
-            false                         // No align stack
-        );
-
-        // Call the inline assembly
-        llvm::Value *result = builder.CreateCall(syscall_asm, {syscall_num, fd, buf, len}, "syscall.result");
-
-        std::cout << "[CodegenVisitor] Generated syscall_write successfully" << std::endl;
         return result;
     }
 

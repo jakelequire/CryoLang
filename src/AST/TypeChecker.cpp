@@ -2043,6 +2043,9 @@ namespace Cryo
         case TokenKind::TK_CHAR_CONSTANT:
             return _type_context.get_char_type();
 
+        case TokenKind::TK_KW_NULL:
+            return _type_context.get_null_type(); // We need to implement this
+
         default:
             return _type_context.get_unknown_type();
         }
