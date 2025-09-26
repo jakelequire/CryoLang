@@ -686,6 +686,19 @@ namespace Cryo
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
         std::string func_name = std::string(name_token.text());
 
+        // Create function declaration early so we can add generic parameters
+        auto func_decl = _builder.create_function_declaration(start_loc, func_name, "void", is_public);
+
+        // Parse optional generic parameters
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            auto generics = parse_generic_parameters();
+            for (auto &generic : generics)
+            {
+                func_decl->add_generic_parameter(std::move(generic));
+            }
+        }
+
         // Parse parameter list first to get parameters
         consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
 
@@ -705,8 +718,14 @@ namespace Cryo
             return_type = parse_type_annotation();
         }
 
-        // Create function declaration with type information
-        auto func_decl = _builder.create_function_declaration(start_loc, func_name, return_type->to_string(), is_public);
+        // Update return type in the already created function declaration
+        func_decl->set_return_type(return_type->to_string());
+
+        // Parse optional where clause
+        if (_current_token.is(TokenKind::TK_KW_WHERE))
+        {
+            parse_where_clause(func_decl.get());
+        }
 
         // Add parameters to function
         for (auto &param : params)
@@ -764,6 +783,40 @@ namespace Cryo
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after extern function declaration");
 
         return func_decl;
+    }
+
+    void Parser::parse_where_clause(FunctionDeclarationNode* func_decl)
+    {
+        // Consume 'where' keyword
+        consume(TokenKind::TK_KW_WHERE, "Expected 'where'");
+
+        // Parse trait bounds separated by commas
+        do
+        {
+            // Parse type parameter (e.g., "T")
+            Token type_param_token = consume(TokenKind::TK_IDENTIFIER, "Expected type parameter");
+            std::string type_param = std::string(type_param_token.text());
+
+            // Consume ':' 
+            consume(TokenKind::TK_COLON, "Expected ':' after type parameter");
+
+            // Parse trait name (e.g., "Default")
+            Token trait_token = consume(TokenKind::TK_IDENTIFIER, "Expected trait name");
+            std::string trait_name = std::string(trait_token.text());
+
+            // Add the trait bound to the function
+            func_decl->add_trait_bound(TraitBound(type_param, trait_name, type_param_token.location()));
+
+            // If there's a comma, continue parsing more bounds
+            if (_current_token.is(TokenKind::TK_COMMA))
+            {
+                advance(); // consume comma
+            }
+            else
+            {
+                break;
+            }
+        } while (true);
     }
 
     std::unique_ptr<IntrinsicDeclarationNode> Parser::parse_intrinsic_declaration()
@@ -1471,9 +1524,30 @@ namespace Cryo
         return _builder.create_literal_node(token);
     }
 
-    std::unique_ptr<IdentifierNode> Parser::parse_identifier()
+    std::unique_ptr<ExpressionNode> Parser::parse_identifier()
     {
         Token token = consume(TokenKind::TK_IDENTIFIER, "Expected identifier");
+        std::string base_name = std::string(token.text());
+        SourceLocation base_loc = token.location();
+        
+        // Check for scope resolution (e.g., T::get_default)
+        if (_current_token.is(TokenKind::TK_COLONCOLON))
+        {
+            advance(); // consume '::'
+            
+            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+            {
+                error("Expected identifier after '::'");
+                return _builder.create_identifier_node(token);
+            }
+            
+            Token member_token = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '::'");
+            std::string member_name = std::string(member_token.text());
+            
+            return _builder.create_scope_resolution(base_loc, base_name, member_name);
+        }
+        
+        // Simple identifier without scope resolution
         return _builder.create_identifier_node(token);
     }
 

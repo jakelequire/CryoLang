@@ -159,7 +159,8 @@ namespace Cryo
         {"sizeof", TokenKind::TK_KW_SIZEOF},
         {"new", TokenKind::TK_KW_NEW},
         {"delete", TokenKind::TK_KW_DELETE},
-        {"with", TokenKind::TK_KW_WITH}};
+        {"with", TokenKind::TK_KW_WITH},
+        {"where", TokenKind::TK_KW_WHERE}};   // Where clause for trait bounds
 
     TokenKind Lexer::lookup_keyword(std::string_view text)
     {

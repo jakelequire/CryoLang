@@ -5,7 +5,7 @@
 
 namespace Cryo
 {
-    bool SymbolTable::declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type, const std::string &scope)
+    bool SymbolTable::declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type, const std::string &scope, const std::string &enhanced_display)
     {
         // Check if symbol already exists in current scope
         if (symbols_.find(name) != symbols_.end())
@@ -14,7 +14,7 @@ namespace Cryo
         }
 
         // Add the symbol to current scope
-        symbols_[name] = Symbol{name, kind, loc, data_type, scope};
+        symbols_[name] = Symbol{name, kind, loc, data_type, scope, enhanced_display};
         return true;
     }
 
@@ -187,7 +187,17 @@ namespace Cryo
         for (const auto &[name, symbol] : symbols_)
         {
             std::string kind_str = get_symbol_kind_string(symbol.kind);
-            std::string type_str = symbol.data_type ? symbol.data_type->to_string() : "unknown";
+            // Use enhanced display if available, otherwise use data_type->to_string()
+            std::string type_str;
+            if (!symbol.enhanced_display.empty())
+            {
+                type_str = symbol.enhanced_display;
+            }
+            else
+            {
+                type_str = symbol.data_type ? symbol.data_type->to_string() : "unknown";
+            }
+            
             std::string location = std::to_string(symbol.declaration_location.line()) +
                                    ":" + std::to_string(symbol.declaration_location.column());
 

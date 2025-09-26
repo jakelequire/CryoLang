@@ -440,13 +440,22 @@ namespace Cryo
 
         _output << std::endl;
 
-        // Dump parameters
+        // Dump generic parameters
+        const auto &generics = node.generic_parameters();
+        const auto &parameters = node.parameters();
         bool has_body = node.body() != nullptr;
 
-        for (size_t i = 0; i < params.size(); ++i)
+        for (size_t i = 0; i < generics.size(); ++i)
         {
-            bool is_last = (i == params.size() - 1) && !has_body;
-            dump_child(params[i].get(), is_last);
+            bool is_last = (i == generics.size() - 1) && parameters.empty() && !has_body;
+            dump_child(generics[i].get(), is_last);
+        }
+
+        // Dump parameters
+        for (size_t i = 0; i < parameters.size(); ++i)
+        {
+            bool is_last = (i == parameters.size() - 1) && !has_body;
+            dump_child(parameters[i].get(), is_last);
         }
 
         // Dump body

@@ -16,6 +16,18 @@ namespace Cryo
     class MatchArmNode;
     class PatternNode;
     class EnumPatternNode;
+    class GenericParameterNode;
+
+    // Forward declarations for where clauses
+    struct TraitBound
+    {
+        std::string type_parameter; // e.g., "T"
+        std::string trait_name;     // e.g., "Default"
+        SourceLocation location;
+
+        TraitBound(std::string type_param, std::string trait, SourceLocation loc)
+            : type_parameter(std::move(type_param)), trait_name(std::move(trait)), location(loc) {}
+    };
 
     // Forward declarations for switch statements
     class SwitchStatementNode;
@@ -411,93 +423,6 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
-    // Function declaration
-    class FunctionDeclarationNode : public DeclarationNode
-    {
-    private:
-        std::string _name;
-        std::string _return_type_annotation = "void"; // Return type annotation
-        std::vector<std::unique_ptr<VariableDeclarationNode>> _parameters;
-        std::unique_ptr<BlockStatementNode> _body;
-        bool _is_public = false; // Visibility
-        bool _is_static = false;
-        bool _is_inline = false;
-        bool _is_variadic = false; // Variadic function (...args)
-
-    public:
-        FunctionDeclarationNode(SourceLocation loc, std::string name,
-                                std::string return_type = "void",
-                                bool is_public = false)
-            : DeclarationNode(NodeKind::FunctionDeclaration, loc),
-              _name(std::move(name)), _return_type_annotation(std::move(return_type)),
-              _is_public(is_public) {}
-
-        const std::string &name() const { return _name; }
-        const std::string &return_type_annotation() const { return _return_type_annotation; }
-        const std::vector<std::unique_ptr<VariableDeclarationNode>> &parameters() const { return _parameters; }
-        BlockStatementNode *body() const { return _body.get(); }
-
-        bool is_public() const { return _is_public; }
-        bool is_static() const { return _is_static; }
-        bool is_inline() const { return _is_inline; }
-        bool is_variadic() const { return _is_variadic; }
-        size_t parameter_count() const { return _parameters.size(); }
-
-        void add_parameter(std::unique_ptr<VariableDeclarationNode> param)
-        {
-            _parameters.push_back(std::move(param));
-        }
-
-        void set_body(std::unique_ptr<BlockStatementNode> body)
-        {
-            _body = std::move(body);
-        }
-
-        void set_return_type(const std::string &return_type)
-        {
-            _return_type_annotation = return_type;
-        }
-
-        void set_visibility(bool is_public) { _is_public = is_public; }
-        void set_static(bool is_static) { _is_static = is_static; }
-        void set_inline(bool is_inline) { _is_inline = is_inline; }
-        void set_variadic(bool is_variadic) { _is_variadic = is_variadic; }
-
-        void print(std::ostream &os, int indent = 0) const override
-        {
-            os << std::string(indent, ' ') << "FunctionDecl: "
-               << (_is_public ? "public " : "private ") << _name << "(";
-            for (size_t i = 0; i < _parameters.size(); ++i)
-            {
-                if (i > 0)
-                    os << ", ";
-                if (_parameters[i])
-                    os << _parameters[i]->type_annotation() << " " << _parameters[i]->name();
-            }
-            if (_is_variadic)
-                os << "...";
-            os << ") -> " << _return_type_annotation << std::endl;
-
-            if (!_parameters.empty())
-            {
-                os << std::string(indent + 2, ' ') << "Parameters:" << std::endl;
-                for (const auto &param : _parameters)
-                {
-                    if (param)
-                        param->print(os, indent + 4);
-                }
-            }
-
-            if (_body)
-            {
-                os << std::string(indent + 2, ' ') << "Body:" << std::endl;
-                _body->print(os, indent + 4);
-            }
-        }
-
-        void accept(ASTVisitor &visitor) override;
-    };
-
     // Intrinsic function declaration
     class IntrinsicDeclarationNode : public DeclarationNode
     {
@@ -660,6 +585,107 @@ namespace Cryo
                 }
             }
             os << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Function declaration
+    class FunctionDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        std::string _return_type_annotation = "void"; // Return type annotation
+        std::vector<std::unique_ptr<VariableDeclarationNode>> _parameters;
+        std::vector<std::unique_ptr<GenericParameterNode>> _generic_parameters;
+        std::vector<TraitBound> _trait_bounds; // Where clause trait bounds
+        std::unique_ptr<BlockStatementNode> _body;
+        bool _is_public = false; // Visibility
+        bool _is_static = false;
+        bool _is_inline = false;
+        bool _is_variadic = false; // Variadic function (...args)
+
+    public:
+        FunctionDeclarationNode(SourceLocation loc, std::string name,
+                                std::string return_type = "void",
+                                bool is_public = false)
+            : DeclarationNode(NodeKind::FunctionDeclaration, loc),
+              _name(std::move(name)), _return_type_annotation(std::move(return_type)),
+              _is_public(is_public) {}
+
+        const std::string &name() const { return _name; }
+        const std::string &return_type_annotation() const { return _return_type_annotation; }
+        const std::vector<std::unique_ptr<VariableDeclarationNode>> &parameters() const { return _parameters; }
+        const std::vector<std::unique_ptr<GenericParameterNode>> &generic_parameters() const { return _generic_parameters; }
+        const std::vector<TraitBound> &trait_bounds() const { return _trait_bounds; }
+        BlockStatementNode *body() const { return _body.get(); }
+
+        bool is_public() const { return _is_public; }
+        bool is_static() const { return _is_static; }
+        bool is_inline() const { return _is_inline; }
+        bool is_variadic() const { return _is_variadic; }
+        size_t parameter_count() const { return _parameters.size(); }
+
+        void add_parameter(std::unique_ptr<VariableDeclarationNode> param)
+        {
+            _parameters.push_back(std::move(param));
+        }
+
+        void add_generic_parameter(std::unique_ptr<GenericParameterNode> param)
+        {
+            _generic_parameters.push_back(std::move(param));
+        }
+
+        void add_trait_bound(const TraitBound& bound)
+        {
+            _trait_bounds.push_back(bound);
+        }
+
+        void set_body(std::unique_ptr<BlockStatementNode> body)
+        {
+            _body = std::move(body);
+        }
+
+        void set_return_type(const std::string &return_type)
+        {
+            _return_type_annotation = return_type;
+        }
+
+        void set_visibility(bool is_public) { _is_public = is_public; }
+        void set_static(bool is_static) { _is_static = is_static; }
+        void set_inline(bool is_inline) { _is_inline = is_inline; }
+        void set_variadic(bool is_variadic) { _is_variadic = is_variadic; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "FunctionDecl: "
+               << (_is_public ? "public " : "private ") << _name << "(";
+            for (size_t i = 0; i < _parameters.size(); ++i)
+            {
+                if (i > 0)
+                    os << ", ";
+                if (_parameters[i])
+                    os << _parameters[i]->type_annotation() << " " << _parameters[i]->name();
+            }
+            if (_is_variadic)
+                os << "...";
+            os << ") -> " << _return_type_annotation << std::endl;
+
+            if (!_parameters.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Parameters:" << std::endl;
+                for (const auto &param : _parameters)
+                {
+                    if (param)
+                        param->print(os, indent + 4);
+                }
+            }
+
+            if (_body)
+            {
+                os << std::string(indent + 2, ' ') << "Body:" << std::endl;
+                _body->print(os, indent + 4);
+            }
         }
 
         void accept(ASTVisitor &visitor) override;

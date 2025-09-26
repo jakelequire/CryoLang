@@ -149,6 +149,10 @@ namespace Cryo
         // Struct method tracking - maps struct name -> method name -> return type
         std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _struct_methods;
 
+        // Current function's generic parameters and their trait bounds
+        // Maps generic parameter name -> set of trait names (e.g., "T" -> {"Default", "Clone"})
+        std::unordered_map<std::string, std::vector<std::string>> _current_generic_trait_bounds;
+
         // Reference to main symbol table (for scope resolution lookups)
         const SymbolTable *_main_symbol_table = nullptr;
 

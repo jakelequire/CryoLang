@@ -24,13 +24,14 @@ namespace Cryo
         SourceLocation declaration_location;
         Type *data_type;   // Changed from string to Type*
         std::string scope; // Scope information (e.g., "Global", "main", "test_fn")
+        std::string enhanced_display; // Optional enhanced display string for complex types like generics
 
         // Default constructor
-        Symbol() : name(""), kind(SymbolKind::Variable), declaration_location(SourceLocation()), data_type(nullptr), scope("Global") {}
+        Symbol() : name(""), kind(SymbolKind::Variable), declaration_location(SourceLocation()), data_type(nullptr), scope("Global"), enhanced_display("") {}
 
         // Parameterized constructor
-        Symbol(const std::string &n, SymbolKind k, SourceLocation loc, Type *type = nullptr, const std::string &sc = "Global")
-            : name(n), kind(k), declaration_location(loc), data_type(type), scope(sc) {}
+        Symbol(const std::string &n, SymbolKind k, SourceLocation loc, Type *type = nullptr, const std::string &sc = "Global", const std::string &enhanced = "")
+            : name(n), kind(k), declaration_location(loc), data_type(type), scope(sc), enhanced_display(enhanced) {}
     };
 
     class SymbolTable
@@ -46,7 +47,7 @@ namespace Cryo
             : parent_scope_(std::move(parent)), type_context_(type_context) {}
 
         // Symbol management
-        bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type = nullptr, const std::string &scope = "Global");
+        bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type = nullptr, const std::string &scope = "Global", const std::string &enhanced_display = "");
         Symbol *lookup_symbol(const std::string &name) const;
         Symbol *lookup_namespaced_symbol(const std::string &namespace_name, const std::string &symbol_name) const;
 

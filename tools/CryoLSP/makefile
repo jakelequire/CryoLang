@@ -41,6 +41,7 @@ LSP_LIBS = \
 	$(MAIN_OBJ_DIR)/AST/TypeChecker.o \
 	$(MAIN_OBJ_DIR)/Codegen/CodeGenerator.o \
 	$(MAIN_OBJ_DIR)/Codegen/CodegenVisitor.o \
+	$(MAIN_OBJ_DIR)/Codegen/Intrinsics.o \
 	$(MAIN_OBJ_DIR)/Codegen/LLVMContext.o \
 	$(MAIN_OBJ_DIR)/Codegen/TargetConfig.o \
 	$(MAIN_OBJ_DIR)/Codegen/TypeMapper.o \
