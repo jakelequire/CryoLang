@@ -130,6 +130,7 @@ namespace Cryo
         std::unique_ptr<LiteralNode> parse_string_literal();
         std::unique_ptr<LiteralNode> parse_boolean_literal();
         std::unique_ptr<LiteralNode> parse_character_literal();
+        std::unique_ptr<LiteralNode> parse_null_literal();
         std::unique_ptr<IdentifierNode> parse_identifier();
 
         // Array literal parsing

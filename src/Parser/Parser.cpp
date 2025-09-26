@@ -1028,6 +1028,11 @@ namespace Cryo
             return parse_boolean_literal();
         }
 
+        if (_current_token.is(TokenKind::TK_KW_NULL))
+        {
+            return parse_null_literal();
+        }
+
         // 'this' keyword - temporarily disabled while fixing implementation
         if (_current_token.is(TokenKind::TK_KW_THIS))
         {
@@ -1339,6 +1344,12 @@ namespace Cryo
     std::unique_ptr<LiteralNode> Parser::parse_character_literal()
     {
         Token token = consume(TokenKind::TK_CHAR_CONSTANT, "Expected character");
+        return _builder.create_literal_node(token);
+    }
+
+    std::unique_ptr<LiteralNode> Parser::parse_null_literal()
+    {
+        Token token = consume(TokenKind::TK_KW_NULL, "Expected null");
         return _builder.create_literal_node(token);
     }
 

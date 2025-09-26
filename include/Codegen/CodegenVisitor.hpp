@@ -6,6 +6,7 @@
 #include "Codegen/LLVMContext.hpp"
 #include "Codegen/ValueContext.hpp"
 #include "Codegen/TypeMapper.hpp"
+#include "Codegen/Intrinsics.hpp"
 #include "Utils/ModuleLoader.hpp"
 
 #include <llvm/IR/Value.h>
@@ -213,6 +214,7 @@ namespace Cryo::Codegen
 
         std::unique_ptr<ValueContext> _value_context;
         std::unique_ptr<TypeMapper> _type_mapper;
+        std::unique_ptr<Intrinsics> _intrinsics;
 
         //===================================================================
         // Generation State
@@ -225,7 +227,6 @@ namespace Cryo::Codegen
         // Generated values mapping
         std::unordered_map<Cryo::ASTNode *, llvm::Value *> _node_values;
         std::unordered_map<std::string, llvm::Function *> _functions;
-        std::unordered_map<std::string, llvm::FunctionType *> _intrinsics;
         std::unordered_map<std::string, llvm::Type *> _types;
         std::unordered_map<std::string, llvm::GlobalVariable *> _globals;
         std::unordered_map<std::string, llvm::Type *> _global_types;   // Track global variable element types
@@ -296,7 +297,6 @@ namespace Cryo::Codegen
 
         // Intrinsic call generation
         llvm::Value *generate_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name);
-        llvm::Value *generate_syscall_write(const std::vector<llvm::Value *> &args);
 
         // Control flow generation
         void generate_if_statement(Cryo::IfStatementNode *node);

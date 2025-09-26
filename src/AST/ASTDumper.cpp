@@ -118,6 +118,8 @@ namespace Cryo
         case TokenKind::TK_KW_TRUE:
         case TokenKind::TK_KW_FALSE:
             return "BooleanLiteral";
+        case TokenKind::TK_KW_NULL:
+            return "NullLiteral";
         default:
             return "Literal";
         }
@@ -137,6 +139,8 @@ namespace Cryo
         case TokenKind::TK_KW_TRUE:
         case TokenKind::TK_KW_FALSE:
             return "boolean";
+        case TokenKind::TK_KW_NULL:
+            return "null";
         default:
             return "unknown";
         }
