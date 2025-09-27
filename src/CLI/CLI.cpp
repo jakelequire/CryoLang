@@ -89,6 +89,7 @@ namespace Cryo::CLI
                          flag_name == "ast" || flag_name == "show-ast" ||
                          flag_name == "symbols" || flag_name == "show-symbols" ||
                          flag_name == "ir" || flag_name == "show-ir" ||
+                         flag_name == "emit-llvm" ||
                          flag_name == "help" || flag_name == "h" ||
                          flag_name == "version" || flag_name == "v")
                 {
@@ -271,6 +272,7 @@ namespace Cryo::CLI
         std::cout << "  --ast                               Show AST during compilation\n";
         std::cout << "  --symbols                           Show symbol table during compilation\n";
         std::cout << "  --ir                                Show generated LLVM IR\n";
+        std::cout << "  --emit-llvm                         Emit LLVM bitcode (.bc) file\n";
         std::cout << "  -c, --compile-only                  Compile only, don't link\n";
         std::cout << "  -o, --output <file>                 Output file name\n\n";
 
@@ -357,6 +359,39 @@ namespace Cryo::CLI
             {
                 std::cout << "\nGenerated LLVM IR:" << std::endl;
                 compiler->dump_ir();
+            }
+
+            // Handle --emit-llvm flag to emit bitcode
+            if (args.get_flag("emit-llvm"))
+            {
+                std::string output_path = file_path;
+                
+                // Change extension from .cryo to .bc
+                size_t pos = output_path.find_last_of('.');
+                if (pos != std::string::npos)
+                {
+                    output_path = output_path.substr(0, pos) + ".bc";
+                }
+                else
+                {
+                    output_path += ".bc";
+                }
+                
+                std::cout << "\nEmitting LLVM bitcode to: " << output_path << std::endl;
+                
+                if (compiler->codegen() && compiler->codegen()->emit_llvm_ir(output_path))
+                {
+                    std::cout << "✓ LLVM bitcode emitted successfully: " << output_path << std::endl;
+                }
+                else
+                {
+                    std::cerr << "\n❌ Failed to emit LLVM bitcode" << std::endl;
+                    if (compiler->codegen())
+                    {
+                        std::cerr << "Error: " << compiler->codegen()->get_last_error() << std::endl;
+                    }
+                    return 1;
+                }
             }
 
             // Generate executable if output file is specified and not compile-only mode
