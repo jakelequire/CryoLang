@@ -186,9 +186,9 @@ namespace Cryo
         return std::make_unique<StructFieldNode>(loc, std::move(name), std::move(type_annotation), visibility);
     }
 
-    std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, std::string return_type, Visibility visibility, bool is_constructor)
+    std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, std::string return_type, Visibility visibility, bool is_constructor, bool is_static)
     {
-        return std::make_unique<StructMethodNode>(loc, std::move(name), std::move(return_type), visibility, is_constructor);
+        return std::make_unique<StructMethodNode>(loc, std::move(name), std::move(return_type), visibility, is_constructor, is_static);
     }
 
     std::unique_ptr<StructDeclarationNode> ASTBuilder::create_struct_declaration(SourceLocation loc, std::string name)

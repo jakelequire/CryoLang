@@ -977,6 +977,17 @@ namespace Cryo
         // Add annotations for class methods only
         if (_in_class_context)
         {
+            // Add static annotation first if applicable
+            if (node.is_static())
+            {
+                _output << " ";
+                if (_use_colors)
+                    _output << Colors::BOLD << Colors::ANNOTATION;
+                _output << "@static";
+                if (_use_colors)
+                    _output << Colors::RESET;
+            }
+            
             if (node.is_constructor())
             {
                 _output << " ";

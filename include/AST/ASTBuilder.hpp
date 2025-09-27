@@ -55,7 +55,7 @@ namespace Cryo
         // Struct and Class creation methods
         std::unique_ptr<GenericParameterNode> create_generic_parameter(SourceLocation loc, std::string name);
         std::unique_ptr<StructFieldNode> create_struct_field(SourceLocation loc, std::string name, std::string type_annotation, Visibility visibility = Visibility::Public);
-        std::unique_ptr<StructMethodNode> create_struct_method(SourceLocation loc, std::string name, std::string return_type, Visibility visibility = Visibility::Public, bool is_constructor = false);
+        std::unique_ptr<StructMethodNode> create_struct_method(SourceLocation loc, std::string name, std::string return_type, Visibility visibility = Visibility::Public, bool is_constructor = false, bool is_static = false);
         std::unique_ptr<StructDeclarationNode> create_struct_declaration(SourceLocation loc, std::string name);
         std::unique_ptr<ClassDeclarationNode> create_class_declaration(SourceLocation loc, std::string name);
         std::unique_ptr<TraitDeclarationNode> create_trait_declaration(SourceLocation loc, std::string name);

@@ -50,6 +50,7 @@ namespace Cryo
         bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type = nullptr, const std::string &scope = "Global", const std::string &enhanced_display = "");
         Symbol *lookup_symbol(const std::string &name) const;
         Symbol *lookup_namespaced_symbol(const std::string &namespace_name, const std::string &symbol_name) const;
+        Symbol *lookup_namespaced_symbol_with_context(const std::string &namespace_name, const std::string &symbol_name, const std::string &current_namespace) const;
 
         // Namespace management for imports
         void register_namespace(const std::string &namespace_name, const std::unordered_map<std::string, Symbol> &symbols);

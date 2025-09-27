@@ -353,6 +353,15 @@ namespace Cryo::Codegen
          */
         const std::string &get_last_error() const { return _last_error; }
 
+        /**
+         * @brief Clear error state without clearing type caches
+         */
+        void clear_errors() { 
+            std::cout << "[DEBUG] TypeMapper: Clearing errors (was: " << _has_errors << ")" << std::endl;
+            _has_errors = false; 
+            _last_error.clear(); 
+        }
+
     private:
         //===================================================================
         // Private Implementation

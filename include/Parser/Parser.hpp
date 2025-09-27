@@ -107,8 +107,10 @@ namespace Cryo
         std::unique_ptr<ASTNode> parse_expression_statement();
 
         // Parameter parsing for functions
-        std::vector<std::unique_ptr<VariableDeclarationNode>> parse_parameter_list();
+        std::pair<std::vector<std::unique_ptr<VariableDeclarationNode>>, bool> parse_parameter_list();
         std::unique_ptr<VariableDeclarationNode> parse_parameter();
+        bool peek_variadic_parameter();
+        std::unique_ptr<VariableDeclarationNode> parse_variadic_parameter();
 
         // Expression parsing (precedence climbing)
         std::unique_ptr<ExpressionNode> parse_expression();

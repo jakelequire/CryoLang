@@ -83,6 +83,68 @@ namespace Cryo::Codegen
         else if (intrinsic_name == "__cos__")
             return generate_cos(args);
 
+        // Type conversion intrinsics - Safe widening conversions
+        else if (intrinsic_name == "__i8_to_i16__")
+            return generate_integer_extension(args, 8, 16, true);
+        else if (intrinsic_name == "__i8_to_i32__")
+            return generate_integer_extension(args, 8, 32, true);
+        else if (intrinsic_name == "__i8_to_i64__")
+            return generate_integer_extension(args, 8, 64, true);
+        else if (intrinsic_name == "__i16_to_i32__")
+            return generate_integer_extension(args, 16, 32, true);
+        else if (intrinsic_name == "__i16_to_i64__")
+            return generate_integer_extension(args, 16, 64, true);
+        else if (intrinsic_name == "__i32_to_i64__")
+            return generate_integer_extension(args, 32, 64, true);
+
+        // Unsigned widening conversions
+        else if (intrinsic_name == "__u8_to_u16__")
+            return generate_integer_extension(args, 8, 16, false);
+        else if (intrinsic_name == "__u8_to_u32__")
+            return generate_integer_extension(args, 8, 32, false);
+        else if (intrinsic_name == "__u8_to_u64__")
+            return generate_integer_extension(args, 8, 64, false);
+        else if (intrinsic_name == "__u16_to_u32__")
+            return generate_integer_extension(args, 16, 32, false);
+        else if (intrinsic_name == "__u16_to_u64__")
+            return generate_integer_extension(args, 16, 64, false);
+        else if (intrinsic_name == "__u32_to_u64__")
+            return generate_integer_extension(args, 32, 64, false);
+
+        // Narrowing conversions
+        else if (intrinsic_name == "__i64_to_i32__")
+            return generate_integer_truncation(args, 64, 32);
+        else if (intrinsic_name == "__i64_to_i16__")
+            return generate_integer_truncation(args, 64, 16);
+        else if (intrinsic_name == "__i64_to_i8__")
+            return generate_integer_truncation(args, 64, 8);
+        else if (intrinsic_name == "__i32_to_i16__")
+            return generate_integer_truncation(args, 32, 16);
+        else if (intrinsic_name == "__i32_to_i8__")
+            return generate_integer_truncation(args, 32, 8);
+        else if (intrinsic_name == "__i16_to_i8__")
+            return generate_integer_truncation(args, 16, 8);
+
+        // Cross-signedness conversions
+        else if (intrinsic_name == "__i32_to_u32__")
+            return generate_sign_conversion(args, 32);
+        else if (intrinsic_name == "__u32_to_i32__")
+            return generate_sign_conversion(args, 32);
+        else if (intrinsic_name == "__i64_to_u64__")
+            return generate_sign_conversion(args, 64);
+        else if (intrinsic_name == "__u64_to_i64__")
+            return generate_sign_conversion(args, 64);
+
+        // Safe conversions with overflow checks
+        else if (intrinsic_name == "__try_i64_to_i32__")
+            return generate_checked_conversion(args, 64, 32, true, true);
+        else if (intrinsic_name == "__try_i64_to_u32__")
+            return generate_checked_conversion(args, 64, 32, true, false);
+        else if (intrinsic_name == "__try_u64_to_i32__")
+            return generate_checked_conversion(args, 64, 32, false, true);
+        else if (intrinsic_name == "__try_u32_to_i32__")
+            return generate_checked_conversion(args, 32, 32, false, true);
+
         // Process management
         else if (intrinsic_name == "__getpid__")
             return generate_getpid(args);
@@ -986,6 +1048,139 @@ namespace Cryo::Codegen
         }
 
         return func;
+    }
+
+    // ========================================
+    // Type Conversion Intrinsics
+    // ========================================
+
+    llvm::Value* Intrinsics::generate_integer_extension(const std::vector<llvm::Value*>& args,
+                                                       unsigned source_bits, unsigned target_bits, bool is_signed)
+    {
+        if (args.size() != 1)
+        {
+            report_error("Integer extension requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        llvm::Type* target_type = llvm::Type::getIntNTy(context, target_bits);
+        
+        if (is_signed)
+        {
+            return builder.CreateSExt(args[0], target_type, "sext");
+        }
+        else
+        {
+            return builder.CreateZExt(args[0], target_type, "zext");
+        }
+    }
+
+    llvm::Value* Intrinsics::generate_integer_truncation(const std::vector<llvm::Value*>& args,
+                                                        unsigned source_bits, unsigned target_bits)
+    {
+        if (args.size() != 1)
+        {
+            report_error("Integer truncation requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        llvm::Type* target_type = llvm::Type::getIntNTy(context, target_bits);
+        return builder.CreateTrunc(args[0], target_type, "trunc");
+    }
+
+    llvm::Value* Intrinsics::generate_sign_conversion(const std::vector<llvm::Value*>& args, unsigned bit_width)
+    {
+        if (args.size() != 1)
+        {
+            report_error("Sign conversion requires exactly 1 argument");
+            return nullptr;
+        }
+
+        // For same-width sign conversions, no actual LLVM instruction is needed
+        // LLVM treats integers as bit patterns - the interpretation is contextual
+        return args[0];
+    }
+
+    llvm::Value* Intrinsics::generate_checked_conversion(const std::vector<llvm::Value*>& args,
+                                                        unsigned source_bits, unsigned target_bits,
+                                                        bool source_signed, bool target_signed)
+    {
+        if (args.size() != 1)
+        {
+            report_error("Checked conversion requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        llvm::Value* source_val = args[0];
+        llvm::Type* target_type = llvm::Type::getIntNTy(context, target_bits);
+
+        // Create bounds for overflow checking
+        llvm::Value* min_val = nullptr;
+        llvm::Value* max_val = nullptr;
+
+        if (target_signed)
+        {
+            // For signed target: -2^(n-1) to 2^(n-1)-1
+            int64_t max_signed = (1LL << (target_bits - 1)) - 1;
+            int64_t min_signed = -(1LL << (target_bits - 1));
+            
+            max_val = llvm::ConstantInt::get(source_val->getType(), max_signed, true);
+            min_val = llvm::ConstantInt::get(source_val->getType(), min_signed, true);
+        }
+        else
+        {
+            // For unsigned target: 0 to 2^n-1
+            uint64_t max_unsigned = (target_bits == 64) ? UINT64_MAX : (1ULL << target_bits) - 1;
+            
+            max_val = llvm::ConstantInt::get(source_val->getType(), max_unsigned, false);
+            min_val = llvm::ConstantInt::get(source_val->getType(), 0, false);
+        }
+
+        // Create overflow checks
+        llvm::Value* too_large = builder.CreateICmpSGT(source_val, max_val, "too_large");
+        llvm::Value* too_small = builder.CreateICmpSLT(source_val, min_val, "too_small");
+        llvm::Value* overflow = builder.CreateOr(too_large, too_small, "overflow");
+
+        // Create the actual conversion
+        llvm::Value* converted;
+        if (target_bits < source_bits)
+        {
+            converted = builder.CreateTrunc(source_val, target_type, "trunc_conv");
+        }
+        else if (target_bits > source_bits)
+        {
+            if (source_signed)
+                converted = builder.CreateSExt(source_val, target_type, "sext_conv");
+            else
+                converted = builder.CreateZExt(source_val, target_type, "zext_conv");
+        }
+        else
+        {
+            // Same size - just bitcast
+            converted = source_val;
+        }
+
+        // For checked conversions, we need to return an optional type
+        // This is simplified - in a full implementation you'd create an optional struct
+        // For now, return null on overflow, the converted value otherwise
+        llvm::Type* result_type = llvm::PointerType::get(target_type, 0);
+        llvm::Value* null_ptr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(result_type));
+        
+        // Allocate space for the result
+        llvm::Value* result_ptr = builder.CreateAlloca(target_type, nullptr, "result");
+        builder.CreateStore(converted, result_ptr);
+        
+        // Return null on overflow, pointer to result otherwise
+        return builder.CreateSelect(overflow, null_ptr, result_ptr, "checked_result");
     }
 
 } // namespace Cryo::Codegen

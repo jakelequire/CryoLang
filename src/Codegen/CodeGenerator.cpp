@@ -147,6 +147,14 @@ namespace Cryo::Codegen
         return true;
     }
 
+    void CodeGenerator::set_source_info(const std::string& source_file, const std::string& namespace_context)
+    {
+        if (_visitor)
+        {
+            _visitor->set_source_info(source_file, namespace_context);
+        }
+    }
+
     //===================================================================
     // Factory Functions
     //===================================================================

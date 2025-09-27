@@ -55,6 +55,12 @@ namespace Cryo
     void CompilerInstance::set_namespace_context(const std::string &namespace_name)
     {
         _current_namespace = namespace_name;
+        
+        // Also set the namespace context in the TypeChecker if it exists
+        if (_type_checker)
+        {
+            _type_checker->set_current_namespace(namespace_name);
+        }
     }
 
     bool CompilerInstance::compile_file(const std::string &source_file)
@@ -343,6 +349,9 @@ namespace Cryo
 
         try
         {
+            // Set source file and namespace context before generating IR
+            _codegen->set_source_info(_source_file, _current_namespace);
+            
             bool success = _codegen->generate_ir(_ast_root.get());
 
             if (!success)

@@ -747,15 +747,17 @@ namespace Cryo
     private:
         Visibility _visibility;
         bool _is_constructor;
+        bool _is_static;
 
     public:
         StructMethodNode(SourceLocation loc, std::string name, std::string return_type,
-                         Visibility visibility = Visibility::Public, bool is_constructor = false)
+                         Visibility visibility = Visibility::Public, bool is_constructor = false, bool is_static = false)
             : FunctionDeclarationNode(loc, std::move(name), std::move(return_type)),
-              _visibility(visibility), _is_constructor(is_constructor) {}
+              _visibility(visibility), _is_constructor(is_constructor), _is_static(is_static) {}
 
         Visibility visibility() const { return _visibility; }
         bool is_constructor() const { return _is_constructor; }
+        bool is_static() const { return _is_static; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
@@ -764,6 +766,8 @@ namespace Cryo
                 os << "private ";
             else if (_visibility == Visibility::Protected)
                 os << "protected ";
+            if (_is_static)
+                os << "static ";
             if (_is_constructor)
                 os << "constructor ";
 

@@ -38,7 +38,7 @@ namespace Cryo
 
     Symbol *SymbolTable::lookup_namespaced_symbol(const std::string &namespace_name, const std::string &symbol_name) const
     {
-        // First check current scope
+        // First check current scope for exact match
         auto namespace_it = namespaces_.find(namespace_name);
         if (namespace_it != namespaces_.end())
         {
@@ -49,13 +49,47 @@ namespace Cryo
             }
         }
 
-        // Check parent scopes
+        // Check parent scopes for exact match
         if (parent_scope_)
         {
-            return parent_scope_->lookup_namespaced_symbol(namespace_name, symbol_name);
+            Symbol *result = parent_scope_->lookup_namespaced_symbol(namespace_name, symbol_name);
+            if (result) return result;
         }
 
         return nullptr; // Symbol not found
+    }
+
+    Symbol *SymbolTable::lookup_namespaced_symbol_with_context(const std::string &namespace_name, const std::string &symbol_name, const std::string &current_namespace) const
+    {
+        // First try exact match
+        Symbol *result = lookup_namespaced_symbol(namespace_name, symbol_name);
+        if (result) return result;
+
+        // If in a namespace, try relative resolution
+        if (!current_namespace.empty() && current_namespace != "Global")
+        {
+            // Extract parent namespace(s) 
+            // For "std::IO" we want "std", for "std::Syscall::IO" we want "std::Syscall"
+            size_t last_scope = current_namespace.find_last_of(':');
+            
+            if (last_scope != std::string::npos && last_scope >= 1)
+            {
+                // Extract parent by removing "::component" from end
+                // "std::IO" -> find_last_of(':') = 4, so substr(0, 4-1) = "std"
+                std::string parent_namespace = current_namespace.substr(0, last_scope - 1);
+                
+                // Try parent::namespace_name (e.g., "std" + "::" + "Syscall" = "std::Syscall")
+                std::string qualified_namespace = parent_namespace + "::" + namespace_name;
+                result = lookup_namespaced_symbol(qualified_namespace, symbol_name);
+                
+                std::cout << "[DEBUG] Trying relative resolution: " << qualified_namespace << "::" << symbol_name 
+                          << " (from context " << current_namespace << ")" << std::endl;
+                
+                if (result) return result;
+            }
+        }
+
+        return nullptr; // Symbol not found with context
     }
 
     void SymbolTable::register_namespace(const std::string &namespace_name, const std::unordered_map<std::string, Symbol> &symbols)
