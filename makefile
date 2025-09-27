@@ -168,9 +168,25 @@ timed-build:
 rebuild:
 	@$(PYTHON) $(BUILD_TIMER) --clean
 
+# Standard library compilation
+STDLIB_DIR = ./stdlib
+STDLIB_BUILD_DIR = $(BIN_DIR)stdlib
+STDLIB_LIB = $(STDLIB_BUILD_DIR)/libcryostd.a
+
+# Find all stdlib source files
+ifeq ($(OS), Windows_NT)
+    STDLIB_SRCS := $(shell C:/msys64/usr/bin/find $(STDLIB_DIR) -name "*.cryo" -type f | C:/msys64/usr/bin/grep -v test-cases)
+else
+    STDLIB_SRCS := $(shell find $(STDLIB_DIR) -name "*.cryo" -type f | grep -v test-cases)
+endif
+
+# Generate corresponding bitcode files
+STDLIB_BC_FILES := $(patsubst $(STDLIB_DIR)/%.cryo,$(STDLIB_BUILD_DIR)/%.bc,$(STDLIB_SRCS))
+
 .PHONY: all
 all: 
 	@$(MAKE) timed-build
+	@$(MAKE) stdlib
 	@$(MAKE) tools
 
 run: $(MAIN_BIN)
@@ -183,6 +199,57 @@ build: $(MAIN_BIN)
 clean:
 	@$(PYTHON) ./scripts/clean.py
 	@$(MAKE) -C tools/CryoLSP clean 2>/dev/null || true
+ifeq ($(OS), Windows_NT)
+	@if exist "$(subst /,\,$(STDLIB_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(STDLIB_BUILD_DIR))"
+else
+	@rm -rf $(STDLIB_BUILD_DIR)
+endif
+
+# =================================================================
+# STANDARD LIBRARY COMPILATION
+# =================================================================
+
+.PHONY: stdlib stdlib-clean
+stdlib: $(STDLIB_LIB)
+
+$(STDLIB_BUILD_DIR):
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$@)" mkdir "$(subst /,\,$@)"
+	@if not exist "$(subst /,\,$@)\core" mkdir "$(subst /,\,$@)\core"
+	@if not exist "$(subst /,\,$@)\io" mkdir "$(subst /,\,$@)\io"
+	@if not exist "$(subst /,\,$@)\strings" mkdir "$(subst /,\,$@)\strings"
+	@if not exist "$(subst /,\,$@)\collections" mkdir "$(subst /,\,$@)\collections"
+else
+	@mkdir -p $@
+	@mkdir -p $@/core $@/io $@/strings $@/collections
+endif
+
+# Compile individual stdlib modules to LLVM bitcode
+$(STDLIB_BUILD_DIR)/%.bc: $(STDLIB_DIR)/%.cryo $(MAIN_BIN) | $(STDLIB_BUILD_DIR)
+	@echo "Compiling stdlib module: $<"
+	@$(MAIN_BIN) $< --emit-llvm
+	@mv $(basename $<).bc $@
+
+# Link all stdlib modules into a single library
+$(STDLIB_LIB): $(STDLIB_BC_FILES)
+	@echo "Creating standard library: $(STDLIB_LIB)"
+ifeq ($(OS), Windows_NT)
+	@llvm-link $(STDLIB_BC_FILES) -o $(STDLIB_BUILD_DIR)/cryostd_combined.bc
+	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryostd_combined.bc -o $(STDLIB_BUILD_DIR)/libcryostd.o
+	@lib /OUT:$(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryostd.o
+else
+	@llvm-link $(STDLIB_BC_FILES) -o $(STDLIB_BUILD_DIR)/cryostd_combined.bc
+	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryostd_combined.bc -o $(STDLIB_BUILD_DIR)/libcryostd.o
+	@ar rcs $(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryostd.o
+endif
+	@echo "✅ Standard library created: $(STDLIB_LIB)"
+
+stdlib-clean:
+ifeq ($(OS), Windows_NT)
+	@if exist "$(subst /,\,$(STDLIB_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(STDLIB_BUILD_DIR))"
+else
+	@rm -rf $(STDLIB_BUILD_DIR)
+endif
 
 # Test targets
 .PHONY: test test-quick test-verbose test-category test-file

@@ -4,6 +4,9 @@
 #include "AST/ASTNode.hpp"
 #include <iostream>
 #include <memory>
+#include <system_error>
+
+#include "llvm/Support/raw_ostream.h"
 
 namespace Cryo::Codegen
 {
@@ -152,6 +155,37 @@ namespace Cryo::Codegen
         if (_visitor)
         {
             _visitor->set_source_info(source_file, namespace_context);
+        }
+    }
+
+    bool CodeGenerator::emit_llvm_ir(const std::string& output_path)
+    {
+        if (!_module)
+        {
+            report_error("No LLVM module available for IR emission");
+            return false;
+        }
+
+        try
+        {
+            std::error_code EC;
+            llvm::raw_fd_ostream output_stream(output_path, EC);
+            
+            if (EC)
+            {
+                report_error("Failed to open file for IR emission: " + EC.message());
+                return false;
+            }
+
+            _module->print(output_stream, nullptr);
+            output_stream.close();
+
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            report_error("Failed to emit LLVM IR: " + std::string(e.what()));
+            return false;
         }
     }
 

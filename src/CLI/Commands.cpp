@@ -98,6 +98,7 @@ namespace Cryo::CLI::Commands
         argument(CLIArgument("ast", "Display AST after compilation", false).flag());
         argument(CLIArgument("symbols", "Display symbol table after compilation", false).flag());
         argument(CLIArgument("types", "Display type table after compilation", false).flag());
+        argument(CLIArgument("emit-llvm", "Emit LLVM bitcode (.bc) instead of executable", false).flag());
     }
 
     int CompileCommand::execute(const ParsedArgs &args)
@@ -176,6 +177,39 @@ namespace Cryo::CLI::Commands
             {
                 std::cout << "\nType Table:" << std::endl;
                 compiler->dump_type_table();
+            }
+
+            // Handle --emit-llvm flag to emit bitcode
+            if (args.get_flag("emit-llvm"))
+            {
+                std::string output_path = input_file;
+                
+                // Change extension from .cryo to .bc
+                size_t pos = output_path.find_last_of('.');
+                if (pos != std::string::npos)
+                {
+                    output_path = output_path.substr(0, pos) + ".bc";
+                }
+                else
+                {
+                    output_path += ".bc";
+                }
+                
+                std::cout << "\nEmitting LLVM bitcode to: " << output_path << std::endl;
+                
+                if (compiler->codegen() && compiler->codegen()->emit_llvm_ir(output_path))
+                {
+                    std::cout << "✓ LLVM bitcode emitted successfully: " << output_path << std::endl;
+                }
+                else
+                {
+                    std::cerr << "❌ Failed to emit LLVM bitcode" << std::endl;
+                    if (compiler->codegen())
+                    {
+                        std::cerr << "Error: " << compiler->codegen()->get_last_error() << std::endl;
+                    }
+                    return 1;
+                }
             }
 
             return 0;
