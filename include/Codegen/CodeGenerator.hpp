@@ -139,6 +139,11 @@ namespace Cryo::Codegen
          */
         void set_source_info(const std::string& source_file, const std::string& namespace_context = "");
 
+        /**
+         * @brief Refresh module name to prevent corruption during complex operations
+         */
+        void refresh_module_name();
+
         //===================================================================
         // Component Access (for advanced usage)
         //===================================================================
