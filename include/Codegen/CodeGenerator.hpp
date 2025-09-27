@@ -55,11 +55,13 @@ namespace Cryo::Codegen
          * @param target_config Target-specific compilation settings
          * @param ast_context Reference to the AST context from frontend
          * @param symbol_table Reference to populated symbol table
+         * @param namespace_name Optional namespace name for LLVM module
          */
         CodeGenerator(
             std::unique_ptr<TargetConfig> target_config,
             Cryo::ASTContext &ast_context,
-            Cryo::SymbolTable &symbol_table);
+            Cryo::SymbolTable &symbol_table,
+            const std::string &namespace_name = "");
 
         ~CodeGenerator();
 
@@ -261,11 +263,13 @@ namespace Cryo::Codegen
      * @brief Create a CodeGenerator with default configuration
      * @param ast_context Reference to AST context
      * @param symbol_table Reference to symbol table
+     * @param namespace_name Optional namespace name for LLVM module
      * @return Unique pointer to CodeGenerator instance
      */
     std::unique_ptr<CodeGenerator> create_default_codegen(
         Cryo::ASTContext &ast_context,
-        Cryo::SymbolTable &symbol_table);
+        Cryo::SymbolTable &symbol_table,
+        const std::string &namespace_name = "");
 
     /**
      * @brief Create a CodeGenerator for specific target

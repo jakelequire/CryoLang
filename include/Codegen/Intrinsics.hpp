@@ -52,6 +52,10 @@ namespace Cryo::Codegen
         llvm::Value* generate_syscall_exit(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_syscall_open(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_syscall_close(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_syscall_lseek(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_syscall_unlink(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_syscall_mkdir(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_syscall_rmdir(const std::vector<llvm::Value*>& args);
 
         // String operations intrinsics
         llvm::Value* generate_strlen(const std::vector<llvm::Value*>& args);

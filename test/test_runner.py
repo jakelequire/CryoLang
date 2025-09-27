@@ -116,7 +116,7 @@ class CryoTestFramework:
             
             if result.returncode == 0:
                 # Check for specific success indicators in output
-                if "✓ Compilation successful!" in result.stdout or "Type checking completed successfully" in result.stdout:
+                if "Compilation successful!" in result.stdout or "Type checking completed successfully" in result.stdout:
                     return TestResult.PASS
                 else:
                     test_case.error_message = "Compilation succeeded but missing success indicator"

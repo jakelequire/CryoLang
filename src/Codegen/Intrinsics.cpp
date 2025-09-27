@@ -54,6 +54,14 @@ namespace Cryo::Codegen
             return generate_syscall_open(args);
         else if (intrinsic_name == "__syscall_close__")
             return generate_syscall_close(args);
+        else if (intrinsic_name == "__syscall_lseek__")
+            return generate_syscall_lseek(args);
+        else if (intrinsic_name == "__syscall_unlink__")
+            return generate_syscall_unlink(args);
+        else if (intrinsic_name == "__syscall_mkdir__")
+            return generate_syscall_mkdir(args);
+        else if (intrinsic_name == "__syscall_rmdir__")
+            return generate_syscall_rmdir(args);
 
         // String operations
         else if (intrinsic_name == "__strlen__")
@@ -527,6 +535,70 @@ namespace Cryo::Codegen
 
         // On Linux x86_64, close syscall number is 3
         llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 3);
+
+        return create_syscall(syscall_num, args);
+    }
+
+    llvm::Value* Intrinsics::generate_syscall_lseek(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("__syscall_lseek__ requires exactly 3 arguments (fd, offset, whence)");
+            return nullptr;
+        }
+
+        auto& context = _context_manager.get_context();
+
+        // On Linux x86_64, lseek syscall number is 8
+        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8);
+
+        return create_syscall(syscall_num, args);
+    }
+
+    llvm::Value* Intrinsics::generate_syscall_unlink(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__syscall_unlink__ requires exactly 1 argument (path)");
+            return nullptr;
+        }
+
+        auto& context = _context_manager.get_context();
+
+        // On Linux x86_64, unlink syscall number is 87
+        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 87);
+
+        return create_syscall(syscall_num, args);
+    }
+
+    llvm::Value* Intrinsics::generate_syscall_mkdir(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("__syscall_mkdir__ requires exactly 2 arguments (path, mode)");
+            return nullptr;
+        }
+
+        auto& context = _context_manager.get_context();
+
+        // On Linux x86_64, mkdir syscall number is 83
+        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 83);
+
+        return create_syscall(syscall_num, args);
+    }
+
+    llvm::Value* Intrinsics::generate_syscall_rmdir(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__syscall_rmdir__ requires exactly 1 argument (path)");
+            return nullptr;
+        }
+
+        auto& context = _context_manager.get_context();
+
+        // On Linux x86_64, rmdir syscall number is 84
+        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 84);
 
         return create_syscall(syscall_num, args);
     }
