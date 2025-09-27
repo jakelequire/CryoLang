@@ -70,6 +70,16 @@ namespace Cryo::Codegen
         llvm::Value* generate_sin(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_cos(const std::vector<llvm::Value*>& args);
 
+        // Type conversion intrinsics
+        llvm::Value* generate_integer_extension(const std::vector<llvm::Value*>& args, 
+                                               unsigned source_bits, unsigned target_bits, bool is_signed);
+        llvm::Value* generate_integer_truncation(const std::vector<llvm::Value*>& args,
+                                                unsigned source_bits, unsigned target_bits);
+        llvm::Value* generate_sign_conversion(const std::vector<llvm::Value*>& args, unsigned bit_width);
+        llvm::Value* generate_checked_conversion(const std::vector<llvm::Value*>& args,
+                                                unsigned source_bits, unsigned target_bits,
+                                                bool source_signed, bool target_signed);
+
         // Process management intrinsics
         llvm::Value* generate_getpid(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_fork(const std::vector<llvm::Value*>& args);

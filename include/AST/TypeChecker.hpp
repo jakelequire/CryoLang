@@ -50,6 +50,35 @@ namespace Cryo
         std::string to_string() const;
     };
 
+    // Type checking warning representation
+    struct TypeWarning
+    {
+        enum class WarningKind
+        {
+            PotentialDataLoss,      // Narrowing conversion (i64 → i32)
+            SignConversion,         // Sign change (i32 → u32)
+            UnsafeConversion,       // Mixed sign/size conversion
+            UnusedVariable,
+            ImplicitConversion
+        };
+
+        WarningKind kind;
+        SourceLocation location;
+        std::string message;
+        Type *from_type = nullptr;
+        Type *to_type = nullptr;
+
+        TypeWarning(WarningKind k, SourceLocation loc, const std::string &msg)
+            : kind(k), location(loc), message(msg) {}
+
+        TypeWarning(WarningKind k, SourceLocation loc, const std::string &msg,
+                   Type *from, Type *to)
+            : kind(k), location(loc), message(msg),
+              from_type(from), to_type(to) {}
+
+        std::string to_string() const;
+    };
+
     // Symbol information for type checking
     // Forward declarations for AST nodes
     class StructDeclarationNode;
@@ -129,9 +158,13 @@ namespace Cryo
         TypeContext &_type_context;
         std::unique_ptr<TypedSymbolTable> _symbol_table;
         std::vector<TypeError> _errors;
+        std::vector<TypeWarning> _warnings;
 
         // Current function return type (for return statement checking)
         Type *_current_function_return_type = nullptr;
+
+        // Current namespace context (for relative namespace resolution)
+        std::string _current_namespace;
 
         // Current struct type (for 'this' keyword resolution)
         Type *_current_struct_type = nullptr;
@@ -167,10 +200,17 @@ namespace Cryo
         // Main entry point
         void check_program(ProgramNode &program);
 
-        // Error handling
+        // Set current namespace context (called by compiler)
+        void set_current_namespace(const std::string &namespace_name) { _current_namespace = namespace_name; }
+
+        // Error and warning handling
         const std::vector<TypeError> &errors() const { return _errors; }
         bool has_errors() const { return !_errors.empty(); }
         size_t error_count() const { return _errors.size(); }
+
+        const std::vector<TypeWarning> &warnings() const { return _warnings; }
+        bool has_warnings() const { return !_warnings.empty(); }
+        size_t warning_count() const { return _warnings.size(); }
 
         // Type table access
         void print_type_table(std::ostream &os = std::cout) const { _symbol_table->print_type_table(os); }
@@ -239,6 +279,9 @@ namespace Cryo
 
         // Error reporting
         void report_error(TypeError::ErrorKind kind, SourceLocation loc, const std::string &message);
+        void report_warning(TypeWarning::WarningKind kind, SourceLocation loc, const std::string &message);
+        void report_conversion_warning(TypeWarning::WarningKind kind, SourceLocation loc, 
+                                     const std::string &message, Type *from, Type *to);
         void report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context);
         void report_undefined_symbol(SourceLocation loc, const std::string &symbol_name);
         void report_redefined_symbol(SourceLocation loc, const std::string &symbol_name);

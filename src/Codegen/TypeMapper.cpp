@@ -138,6 +138,11 @@ namespace Cryo::Codegen
             // Null is represented as a generic pointer type
             llvm_type = llvm::PointerType::get(get_void_type(), 0);
             break;
+        case Cryo::TypeKind::Variadic:
+            // Variadic parameters are special and shouldn't be mapped to concrete LLVM types
+            // This should normally be handled by the function signature generation
+            report_error("Variadic type should not be mapped to concrete LLVM type");
+            return nullptr;
         default:
             report_error("Unsupported type kind: " + std::to_string(static_cast<int>(cryo_type->kind())));
             return nullptr;
@@ -387,6 +392,8 @@ namespace Cryo::Codegen
         std::vector<llvm::Type *> field_types = generate_class_fields(class_decl);
         if (has_errors())
         {
+            std::cout << "[DEBUG] TypeMapper: has_errors() = true after generate_class_fields for " << class_name << std::endl;
+            std::cout << "[DEBUG] TypeMapper: Last error: " << _last_error << std::endl;
             return nullptr;
         }
 

@@ -130,6 +130,13 @@ namespace Cryo::Codegen
          */
         void set_code_model(const std::string &model);
 
+        /**
+         * @brief Set source file information for module naming
+         * @param source_file Full path to the source file
+         * @param namespace_context Current namespace context
+         */
+        void set_source_info(const std::string& source_file, const std::string& namespace_context = "");
+
         //===================================================================
         // Component Access (for advanced usage)
         //===================================================================

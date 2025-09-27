@@ -53,6 +53,32 @@ namespace Cryo
         return other.is_assignable_from(*this);
     }
 
+    Type::ConversionSafety Type::get_conversion_safety(const Type& target) const
+    {
+        // Base implementation - most conversions are impossible unless overridden
+        if (equals(target))
+            return ConversionSafety::Safe;
+        
+        // Check if assignable (for basic type promotion)
+        if (target.is_assignable_from(*this))
+            return ConversionSafety::Safe;
+        
+        return ConversionSafety::Impossible;
+    }
+
+    bool Type::allows_implicit_conversion_to(const Type& target) const
+    {
+        return get_conversion_safety(target) == ConversionSafety::Safe;
+    }
+
+    bool Type::allows_explicit_conversion_to(const Type& target) const
+    {
+        ConversionSafety safety = get_conversion_safety(target);
+        return safety == ConversionSafety::Safe || 
+               safety == ConversionSafety::Warning ||
+               safety == ConversionSafety::Unsafe;
+    }
+
     std::string Type::to_string() const
     {
         if (_cached_string.empty())
@@ -143,6 +169,54 @@ namespace Cryo
     size_t IntegerType::alignment() const
     {
         return size_bytes(); // Usually alignment == size for integers
+    }
+
+    Type::ConversionSafety IntegerType::get_conversion_safety(const Type& target) const
+    {
+        // First check base class behavior
+        if (equals(target))
+            return ConversionSafety::Safe;
+
+        // Only handle integer-to-integer conversions here
+        if (target.kind() != TypeKind::Integer)
+        {
+            // Integer to float is generally safe (may lose precision but no overflow)
+            if (target.is_floating_point())
+                return ConversionSafety::Safe;
+            
+            // Use base class for other type conversions
+            return Type::get_conversion_safety(target);
+        }
+
+        const IntegerType& target_int = static_cast<const IntegerType&>(target);
+        
+        // Same type is always safe
+        if (_int_kind == target_int._int_kind && _is_signed == target_int._is_signed)
+            return ConversionSafety::Safe;
+
+        size_t source_size = size_bytes();
+        size_t target_size = target_int.size_bytes();
+        bool source_signed = _is_signed;
+        bool target_signed = target_int._is_signed;
+
+        // Safe widening conversions (same signedness, larger size)
+        if (source_signed == target_signed && target_size > source_size)
+            return ConversionSafety::Safe;
+
+        // Narrowing conversions (potential data loss)
+        if (target_size < source_size)
+            return ConversionSafety::Warning;
+
+        // Sign conversions (same size, different signedness)
+        if (source_signed != target_signed && target_size == source_size)
+            return ConversionSafety::Warning;
+
+        // Mixed sign and size changes are more dangerous
+        if (source_signed != target_signed)
+            return ConversionSafety::Unsafe;
+
+        // Default to requiring explicit conversion
+        return ConversionSafety::Warning;
     }
 
     std::string IntegerType::get_integer_name(IntegerKind kind, bool is_signed)
@@ -389,6 +463,7 @@ namespace Cryo
         _auto_type = std::make_unique<AutoType>();
         _unknown_type = std::make_unique<UnknownType>();
         _null_type = std::make_unique<NullType>();
+        _variadic_type = std::make_unique<VariadicType>();
     }
 
     Type *TypeContext::get_integer_type(IntegerKind kind, bool is_signed)
@@ -535,6 +610,8 @@ namespace Cryo
             return get_auto_type();
         if (normalized_type_str == "null")
             return get_null_type();
+        if (normalized_type_str == "...")
+            return get_variadic_type();
 
         // Integer types
         if (normalized_type_str == "i8")

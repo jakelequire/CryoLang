@@ -47,7 +47,8 @@ namespace Cryo
         Auto,    // For type inference
         Unknown, // Error recovery
         Never,   // Bottom type (functions that never return)
-        Null     // Null pointer type
+        Null,    // Null pointer type
+        Variadic // Variadic parameter type (...)
     };
 
     // Integer type specifications
@@ -122,6 +123,18 @@ namespace Cryo
         virtual bool is_value_type() const { return true; }
         virtual bool is_nullable() const { return false; }
 
+        // Type conversion safety checking
+        enum class ConversionSafety {
+            Safe,           // No warnings, implicit conversion allowed
+            Warning,        // Emit compiler warning, explicit conversion required
+            Unsafe,         // Require explicit cast or try_into()
+            Impossible      // No conversion possible
+        };
+        
+        virtual ConversionSafety get_conversion_safety(const Type& target) const;
+        virtual bool allows_implicit_conversion_to(const Type& target) const;
+        virtual bool allows_explicit_conversion_to(const Type& target) const;
+
         // Size and alignment (for code generation)
         virtual size_t size_bytes() const = 0;
         virtual size_t alignment() const = 0;
@@ -184,6 +197,9 @@ namespace Cryo
         bool is_unsigned() const override { return !_is_signed; }
 
         IntegerKind integer_kind() const { return _int_kind; }
+
+        // Override conversion safety for intelligent integer conversion
+        ConversionSafety get_conversion_safety(const Type& target) const override;
 
         size_t size_bytes() const override;
         size_t alignment() const override;
@@ -428,6 +444,21 @@ namespace Cryo
         std::string to_string() const override { return "null"; }
     };
 
+    // Variadic parameter type (...)
+    class VariadicType : public Type
+    {
+    public:
+        VariadicType() : Type(TypeKind::Variadic, "...") {}
+
+        // Variadic types represent a parameter pack, so they have special handling
+        bool is_assignable_from(const Type &other) const override { return false; } // No direct assignment
+        bool is_convertible_to(const Type &other) const override { return false; } // No direct conversion
+
+        size_t size_bytes() const override { return 0; } // No size as it's not a concrete type
+        size_t alignment() const override { return 1; }
+        std::string to_string() const override { return "..."; }
+    };
+
     // Generic type parameter
     class GenericType : public Type
     {
@@ -550,6 +581,7 @@ namespace Cryo
         std::unique_ptr<AutoType> _auto_type;
         std::unique_ptr<UnknownType> _unknown_type;
         std::unique_ptr<NullType> _null_type;
+        std::unique_ptr<VariadicType> _variadic_type;
 
         // Integer type cache
         std::unordered_map<int, std::unique_ptr<IntegerType>> _integer_types;
@@ -577,6 +609,7 @@ namespace Cryo
         Type *get_auto_type() { return _auto_type.get(); }
         Type *get_unknown_type() { return _unknown_type.get(); }
         Type *get_null_type() { return _null_type.get(); }
+        Type *get_variadic_type() { return _variadic_type.get(); }
 
         // Get integer types
         Type *get_integer_type(IntegerKind kind, bool is_signed = true);

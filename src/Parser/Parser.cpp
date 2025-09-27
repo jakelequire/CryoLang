@@ -703,9 +703,12 @@ namespace Cryo
         consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
 
         std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+        bool is_variadic = false;
         if (!_current_token.is(TokenKind::TK_R_PAREN))
         {
-            params = parse_parameter_list();
+            auto param_result = parse_parameter_list();
+            params = std::move(param_result.first);
+            is_variadic = param_result.second;
         }
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
@@ -726,6 +729,9 @@ namespace Cryo
         {
             parse_where_clause(func_decl.get());
         }
+
+        // Set variadic flag if detected
+        func_decl->set_variadic(is_variadic);
 
         // Add parameters to function
         for (auto &param : params)
@@ -755,9 +761,12 @@ namespace Cryo
         consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
 
         std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+        bool is_variadic = false;
         if (!_current_token.is(TokenKind::TK_R_PAREN))
         {
-            params = parse_parameter_list();
+            auto param_result = parse_parameter_list();
+            params = std::move(param_result.first);
+            is_variadic = param_result.second;
         }
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
@@ -772,6 +781,9 @@ namespace Cryo
 
         // Create function declaration with type information (extern functions are public by default)
         auto func_decl = _builder.create_function_declaration(start_loc, func_name, return_type->to_string(), true);
+
+        // Set variadic flag if detected
+        func_decl->set_variadic(is_variadic);
 
         // Add parameters to function
         for (auto &param : params)
@@ -837,9 +849,12 @@ namespace Cryo
         consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
 
         std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+        bool is_variadic = false;
         if (!_current_token.is(TokenKind::TK_R_PAREN))
         {
-            params = parse_parameter_list();
+            auto param_result = parse_parameter_list();
+            params = std::move(param_result.first);
+            is_variadic = param_result.second;
         }
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
@@ -854,6 +869,9 @@ namespace Cryo
 
         // Create intrinsic declaration
         auto intrinsic_decl = std::make_unique<IntrinsicDeclarationNode>(start_loc, func_name, return_type->to_string());
+
+        // Set variadic flag if detected (though intrinsics might not need this)
+        // intrinsic_decl->set_variadic(is_variadic);  // Commented out unless IntrinsicDeclarationNode supports it
 
         // Add parameters to intrinsic
         for (auto &param : params)
@@ -1913,19 +1931,40 @@ namespace Cryo
         return _builder.create_expression_statement(start_loc, std::move(expr));
     }
 
-    std::vector<std::unique_ptr<VariableDeclarationNode>> Parser::parse_parameter_list()
+    std::pair<std::vector<std::unique_ptr<VariableDeclarationNode>>, bool> Parser::parse_parameter_list()
     {
         std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+        bool is_variadic = false;
 
-        params.push_back(parse_parameter());
+        // Check if the first parameter is variadic
+        if (peek_variadic_parameter())
+        {
+            params.push_back(parse_variadic_parameter());
+            is_variadic = true;
+        }
+        else
+        {
+            params.push_back(parse_parameter());
+        }
 
         while (_current_token.is(TokenKind::TK_COMMA))
         {
             advance(); // consume ','
-            params.push_back(parse_parameter());
+            
+            // Check if next parameter is variadic (ends with ...)
+            if (peek_variadic_parameter())
+            {
+                params.push_back(parse_variadic_parameter());
+                is_variadic = true;
+                break; // Variadic parameter must be last
+            }
+            else
+            {
+                params.push_back(parse_parameter());
+            }
         }
 
-        return params;
+        return std::make_pair(std::move(params), is_variadic);
     }
 
     std::unique_ptr<VariableDeclarationNode> Parser::parse_parameter()
@@ -1940,6 +1979,32 @@ namespace Cryo
 
         // Create parameter as variable declaration (without initializer)
         return _builder.create_variable_declaration(name_token.location(), param_name, param_type->to_string());
+    }
+
+    bool Parser::peek_variadic_parameter()
+    {
+        // Check if we have an identifier followed by ellipsis: "args..."
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            // Look ahead to see if there's an ellipsis after the identifier
+            Token next = peek_next();
+            return next.is(TokenKind::TK_ELLIPSIS);
+        }
+        return false;
+    }
+
+    std::unique_ptr<VariableDeclarationNode> Parser::parse_variadic_parameter()
+    {
+        // Parse parameter name
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected parameter name");
+        std::string param_name = std::string(name_token.text());
+        
+        // Consume the ellipsis
+        consume(TokenKind::TK_ELLIPSIS, "Expected '...' for variadic parameter");
+        
+        // For variadic parameters, we'll use a special type string to indicate it's variadic
+        // The actual type will be handled by the codegen later
+        return _builder.create_variable_declaration(name_token.location(), param_name, "...");
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_call_expression(std::unique_ptr<ExpressionNode> expr)
@@ -2351,7 +2416,23 @@ namespace Cryo
 
                 // Check if it's a method or field
                 Token next = peek_next();
+                
+                bool is_method = false;
+                
+                // Case 1: regular method - identifier followed by (
                 if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
+                {
+                    is_method = true;
+                }
+                // Case 2: static method - static followed by identifier
+                else if (_current_token.is(TokenKind::TK_KW_STATIC) && next.is(TokenKind::TK_IDENTIFIER))
+                {
+                    // For static methods, we assume it's a method if static is followed by identifier
+                    // The method parsing will handle the rest
+                    is_method = true;
+                }
+                
+                if (is_method)
                 {
                     // It's a method
                     auto method = parse_struct_method(class_name, current_visibility);
@@ -2719,8 +2800,9 @@ namespace Cryo
 
         consume(TokenKind::TK_KW_IMPLEMENT, "Expected 'implement'");
 
-        // Optional 'struct' or 'enum' keyword for different target types
+        // Optional 'struct', 'enum', or 'trait' keyword for different target types
         bool is_enum_impl = false;
+        bool is_trait_impl = false;
         if (_current_token.is(TokenKind::TK_KW_STRUCT))
         {
             advance(); // consume 'struct'
@@ -2729,6 +2811,11 @@ namespace Cryo
         {
             advance(); // consume 'enum'
             is_enum_impl = true;
+        }
+        else if (_current_token.is(TokenKind::TK_KW_TRAIT))
+        {
+            advance(); // consume 'trait'
+            is_trait_impl = true;
         }
 
         Token target_token = consume(TokenKind::TK_IDENTIFIER, "Expected target type name");
@@ -2969,6 +3056,14 @@ namespace Cryo
             visibility = parse_visibility_modifier();
         }
 
+        // Check for static keyword
+        bool is_static = false;
+        if (_current_token.is(TokenKind::TK_KW_STATIC))
+        {
+            is_static = true;
+            advance(); // consume 'static'
+        }
+
         // Check for constructor
         bool is_constructor = false;
         if (_current_token.is(TokenKind::TK_KW_CONSTRUCTOR))
@@ -3003,9 +3098,12 @@ namespace Cryo
 
         // Parse parameters
         std::vector<std::unique_ptr<VariableDeclarationNode>> params;
+        bool is_variadic = false;
         if (!_current_token.is(TokenKind::TK_R_PAREN))
         {
-            params = parse_parameter_list();
+            auto param_result = parse_parameter_list();
+            params = std::move(param_result.first);
+            is_variadic = param_result.second;
         }
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
@@ -3022,7 +3120,10 @@ namespace Cryo
             return_type = "void"; // Constructors don't have explicit return types
         }
 
-        auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor);
+        auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_static);
+
+        // Set variadic flag if detected
+        method->set_variadic(is_variadic);
 
         // Add parameters
         for (auto &param : params)

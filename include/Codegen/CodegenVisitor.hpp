@@ -70,6 +70,13 @@ namespace Cryo::Codegen
          */
         llvm::Value *get_generated_value(Cryo::ASTNode *node);
 
+        /**
+         * @brief Set source file information for module naming
+         * @param source_file Full path to the source file
+         * @param namespace_context Current namespace context
+         */
+        void set_source_info(const std::string& source_file, const std::string& namespace_context = "");
+
         //===================================================================
         // AST Visitor Implementation - Declarations
         //===================================================================
@@ -192,19 +199,27 @@ namespace Cryo::Codegen
         };
 
         /**
-         * @brief Loop context for break/continue
+         * @brief Breakable context for break/continue (loops and switch statements)
          */
-        struct LoopContext
+        struct BreakableContext
         {
-            llvm::BasicBlock *condition_block;
-            llvm::BasicBlock *body_block;
-            llvm::BasicBlock *continue_block;
-            llvm::BasicBlock *break_block;
+            enum Type { Loop, Switch };
+            Type context_type;
+            llvm::BasicBlock *condition_block;  // For loops only
+            llvm::BasicBlock *body_block;       // For loops only  
+            llvm::BasicBlock *continue_block;   // For loops only
+            llvm::BasicBlock *break_block;      // For both loops and switches
 
-            LoopContext(llvm::BasicBlock *cond, llvm::BasicBlock *body,
-                        llvm::BasicBlock *cont, llvm::BasicBlock *brk)
-                : condition_block(cond), body_block(body),
+            // Constructor for loops
+            BreakableContext(llvm::BasicBlock *cond, llvm::BasicBlock *body,
+                           llvm::BasicBlock *cont, llvm::BasicBlock *brk)
+                : context_type(Loop), condition_block(cond), body_block(body),
                   continue_block(cont), break_block(brk) {}
+            
+            // Constructor for switch statements
+            BreakableContext(llvm::BasicBlock *brk)
+                : context_type(Switch), condition_block(nullptr), body_block(nullptr),
+                  continue_block(nullptr), break_block(brk) {}
         };
 
         //===================================================================
@@ -224,7 +239,7 @@ namespace Cryo::Codegen
 
         // Current generation context
         std::unique_ptr<FunctionContext> _current_function;
-        std::stack<LoopContext> _loop_stack;
+        std::stack<BreakableContext> _breakable_stack;
 
         // Generated values mapping
         std::unordered_map<Cryo::ASTNode *, llvm::Value *> _node_values;
@@ -249,6 +264,13 @@ namespace Cryo::Codegen
         bool _has_errors;
         std::string _last_error;
         std::vector<std::string> _errors;
+
+        //===================================================================
+        // Source File Context
+        //===================================================================
+
+        std::string _source_file;
+        std::string _namespace_context;
 
         //===================================================================
         // Private Generation Methods
@@ -306,8 +328,8 @@ namespace Cryo::Codegen
         void generate_for_loop(Cryo::ForStatementNode *node);
         void generate_match_statement(Cryo::MatchStatementNode *node);
         void generate_switch_statement(Cryo::SwitchStatementNode *node);
-        void generate_string_switch(Cryo::SwitchStatementNode *node, llvm::Value *switch_value);
-        void generate_integer_switch(Cryo::SwitchStatementNode *node, llvm::Value *switch_value);
+        void generate_string_switch(Cryo::SwitchStatementNode *node, llvm::Value *switch_value, llvm::BasicBlock *end_block);
+        void generate_integer_switch(Cryo::SwitchStatementNode *node, llvm::Value *switch_value, llvm::BasicBlock *end_block);
         void generate_case_statement(Cryo::CaseStatementNode *node, llvm::SwitchInst *switch_inst, llvm::BasicBlock *end_block);
 
         // Match statement helpers
