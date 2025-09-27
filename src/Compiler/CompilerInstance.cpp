@@ -24,8 +24,7 @@ namespace Cryo
         // Create type checker with the AST context's type context
         _type_checker = std::make_unique<TypeChecker>(_ast_context->types());
 
-        // Create codegen after AST context and symbol table
-        _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table);
+        // Note: CodeGenerator will be created after parsing when namespace is known
 
         // Create linker with symbol table reference
         _linker = std::make_unique<Cryo::Linker::CryoLinker>(*_symbol_table);
@@ -239,6 +238,15 @@ namespace Cryo
                 {
                     std::cout << "Parsed namespace: " << _parser->current_namespace() << std::endl;
                 }
+            }
+
+            // Create CodeGenerator now that we have the namespace information
+            std::string namespace_for_module = _current_namespace.empty() ? "cryo_program" : _current_namespace;
+            _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module);
+            
+            if (_debug_mode)
+            {
+                std::cout << "[DEBUG] Created CodeGenerator with module name: '" << namespace_for_module << "'" << std::endl;
             }
 
             return _ast_root != nullptr;

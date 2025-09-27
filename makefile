@@ -173,15 +173,15 @@ STDLIB_DIR = ./stdlib
 STDLIB_BUILD_DIR = $(BIN_DIR)stdlib
 STDLIB_LIB = $(STDLIB_BUILD_DIR)/libcryostd.a
 
-# Find all stdlib source files
+# Find all stdlib source files - using explicit list for Windows
 ifeq ($(OS), Windows_NT)
-    STDLIB_SRCS := $(shell C:/msys64/usr/bin/find $(STDLIB_DIR) -name "*.cryo" -type f | C:/msys64/usr/bin/grep -v test-cases)
+    STDLIB_SRCS := core/types.cryo core/intrinsics.cryo core/syscall.cryo io/stdio.cryo strings/strings.cryo collections/array.cryo
 else
-    STDLIB_SRCS := $(shell find $(STDLIB_DIR) -name "*.cryo" -type f | grep -v test-cases)
+    STDLIB_SRCS := $(shell find $(STDLIB_DIR) -name "*.cryo" -type f | grep -v test-cases | sed 's|$(STDLIB_DIR)/||')
 endif
 
 # Generate corresponding bitcode files
-STDLIB_BC_FILES := $(patsubst $(STDLIB_DIR)/%.cryo,$(STDLIB_BUILD_DIR)/%.bc,$(STDLIB_SRCS))
+STDLIB_BC_FILES := $(patsubst %.cryo,$(STDLIB_BUILD_DIR)/%.bc,$(STDLIB_SRCS))
 
 .PHONY: all
 all: 
@@ -226,9 +226,14 @@ endif
 
 # Compile individual stdlib modules to LLVM bitcode
 $(STDLIB_BUILD_DIR)/%.bc: $(STDLIB_DIR)/%.cryo $(MAIN_BIN) | $(STDLIB_BUILD_DIR)
-	@echo "Compiling stdlib module: $<"
-	@$(MAIN_BIN) $< --emit-llvm
-	@mv $(basename $<).bc $@
+	@echo "Compiling stdlib module: $(STDLIB_DIR)/$*.cryo"
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
+	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm -c -o $(STDLIB_BUILD_DIR)/$*.bc
+else
+	@mkdir -p $(dir $@)
+	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm -c -o $(shell pwd)/$@
+endif
 
 # Link all stdlib modules into a single library
 $(STDLIB_LIB): $(STDLIB_BC_FILES)

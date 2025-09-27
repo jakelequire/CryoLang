@@ -343,7 +343,7 @@ namespace Cryo::CLI
 
         if (compiler->compile_file(file_path))
         {
-            std::cout << "\n✓ Compilation successful!" << std::endl;
+            std::cout << "\nCompilation successful!" << std::endl;
 
             // Show outputs based on requested flags
             // Note: AST is already shown before IR generation if --ast flag was used
@@ -364,18 +364,29 @@ namespace Cryo::CLI
             // Handle --emit-llvm flag to emit bitcode
             if (args.get_flag("emit-llvm"))
             {
-                std::string output_path = file_path;
+                std::string output_path = args.output_file();
                 
-                // Change extension from .cryo to .bc
-                size_t pos = output_path.find_last_of('.');
-                if (pos != std::string::npos)
+                // If no -o flag specified, use input file path with .bc extension
+                if (output_path.empty())
                 {
-                    output_path = output_path.substr(0, pos) + ".bc";
+                    output_path = file_path;
+                    // Change extension from .cryo to .bc
+                    size_t pos = output_path.find_last_of('.');
+                    if (pos != std::string::npos)
+                    {
+                        output_path = output_path.substr(0, pos) + ".bc";
+                    }
+                    else
+                    {
+                        output_path += ".bc";
+                    }
                 }
-                else
-                {
-                    output_path += ".bc";
-                }
+                // If -o flag specified, use it as is (assume .bc extension already included or will be added)
+                
+                // Normalize path separators for Windows
+                #ifdef _WIN32
+                std::replace(output_path.begin(), output_path.end(), '/', '\\');
+                #endif
                 
                 std::cout << "\nEmitting LLVM bitcode to: " << output_path << std::endl;
                 
