@@ -80,6 +80,18 @@ def delete_folder():
     else:
         print(f"Directory {folder} does not exist")
 
+def delete_stdlib():
+    """Delete the stdlib build directory"""
+    folder = root_dir / "bin" / "stdlib"
+    
+    if folder.exists():
+        try:
+            shutil.rmtree(folder)
+            print(f"Deleted {folder}")
+        except OSError as e:
+            print(f"Error deleting {folder}: {e}")
+    else:
+        print(f"Directory {folder} does not exist")
 def get_compiler_version():
     """Get compiler version in a cross-platform way"""
     compilers = ["clang", "gcc", "cl"]  # cl is MSVC on Windows
@@ -140,5 +152,6 @@ if __name__ == "__main__":
     object_files = recursive_file_names()
     delete_folder()
     delete_binaries()
+    delete_stdlib()
     create_cleaned_log(object_files)
     print("Cleaned successfully.")

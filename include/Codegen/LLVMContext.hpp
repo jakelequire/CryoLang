@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace Cryo::Codegen
 {
@@ -92,11 +93,6 @@ namespace Cryo::Codegen
         const llvm::LLVMContext& get_context() const { return *_context; }
 
         /**
-         * @brief Get LLVM module
-         */
-        llvm::Module* get_module() const { return _module.get(); }
-
-        /**
          * @brief Get IR builder
          */
         llvm::IRBuilder<>& get_builder() { return *_builder; }
@@ -117,29 +113,87 @@ namespace Cryo::Codegen
         //===================================================================
 
         /**
-         * @brief Create a new module with given name
+         * @brief Create a new module with given name (multi-module support)
          * @param name Module name
-         * @return Pointer to new module
+         * @return Pointer to new module (does not overwrite existing modules)
          */
         llvm::Module* create_module(const std::string& name);
+
+        /**
+         * @brief Get module by name
+         * @param name Module name  
+         * @return Pointer to module or nullptr if not found
+         */
+        llvm::Module* get_module(const std::string& name) const;
+
+        /**
+         * @brief Get active module (current module for IR generation)
+         * @return Pointer to active module
+         */
+        llvm::Module* get_module() const { return _active_module; }
+
+        /**
+         * @brief Set active module for IR generation
+         * @param name Module name to make active
+         * @return true if module exists and was set as active
+         */
+        bool set_active_module(const std::string& name);
+
+        /**
+         * @brief Get main module (the primary compilation target)
+         * @return Pointer to main module or nullptr if not set
+         */
+        llvm::Module* get_main_module() const { return _main_module; }
+
+        /**
+         * @brief Set main module (the primary compilation target)
+         * @param name Module name to set as main
+         * @return true if module exists and was set as main
+         */
+        bool set_main_module(const std::string& name);
+
+        /**
+         * @brief Check if module exists
+         * @param name Module name
+         * @return true if module exists
+         */
+        bool has_module(const std::string& name) const;
+
+        /**
+         * @brief Get list of all module names
+         * @return Vector of module names
+         */
+        std::vector<std::string> get_module_names() const;
+
+        /**
+         * @brief Remove module (careful - this will invalidate pointers)
+         * @param name Module name to remove
+         * @return true if module was removed
+         */
+        bool remove_module(const std::string& name);
 
         /**
          * @brief Set module metadata (source file, compile flags, etc.)
          * @param source_file Original source file path
          * @param compile_flags Compilation flags used
+         * @param module_name Specific module name (defaults to active module)
          */
-        void set_module_metadata(const std::string& source_file, const std::string& compile_flags);
+        void set_module_metadata(const std::string& source_file, const std::string& compile_flags, 
+                                const std::string& module_name = "");
 
         /**
          * @brief Verify module integrity
+         * @param module_name Specific module name (defaults to active module)
          * @return true if module is valid
          */
-        bool verify_module() const;
+        bool verify_module(const std::string& module_name = "") const;
 
         /**
          * @brief Print module IR to stream
+         * @param os Output stream
+         * @param module_name Specific module name (defaults to active module)
          */
-        void print_module(std::ostream& os) const;
+        void print_module(std::ostream& os, const std::string& module_name = "") const;
 
         //===================================================================
         // Target Information
@@ -201,13 +255,19 @@ namespace Cryo::Codegen
 
         // LLVM Core Components
         std::unique_ptr<llvm::LLVMContext> _context;
-        std::unique_ptr<llvm::Module> _module;
         std::unique_ptr<llvm::IRBuilder<>> _builder;
         std::unique_ptr<llvm::TargetMachine> _target_machine;
         std::unique_ptr<llvm::DIBuilder> _debug_builder;
 
+        // Multi-Module Management
+        std::unordered_map<std::string, std::unique_ptr<llvm::Module>> _modules;
+        llvm::Module* _active_module;  // Current module for IR generation
+        llvm::Module* _main_module;    // Primary compilation target module
+        std::string _active_module_name;
+        std::string _main_module_name;
+
         // Configuration
-        std::string _module_name;
+        std::string _module_name;      // Default/initial module name
         std::string _target_triple;
         std::string _cpu_target;
         std::string _target_features;
