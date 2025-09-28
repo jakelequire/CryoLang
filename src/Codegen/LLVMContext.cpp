@@ -16,6 +16,10 @@ namespace Cryo::Codegen
 
     LLVMContextManager::LLVMContextManager(const std::string& module_name)
         : _module_name(module_name)
+        , _active_module(nullptr)
+        , _main_module(nullptr)
+        , _active_module_name("")
+        , _main_module_name("")
         , _target_triple("")
         , _cpu_target("generic")
         , _target_features("")
@@ -57,9 +61,10 @@ namespace Cryo::Codegen
                 _target_triple = detect_native_target_triple();
             }
 
-            // Create module
-            _module = std::make_unique<llvm::Module>(_module_name, *_context);
-            _module->setTargetTriple(_target_triple);
+            // Create initial module (if module name was provided)
+            if (!_module_name.empty()) {
+                create_module(_module_name);
+            }
 
             // Create target machine
             if (!create_target_machine()) {
@@ -80,8 +85,11 @@ namespace Cryo::Codegen
     {
         _target_triple = triple;
         
-        if (_module) {
-            _module->setTargetTriple(triple);
+        // Update all existing modules with new target triple
+        for (auto& [name, module] : _modules) {
+            if (module) {
+                module->setTargetTriple(triple);
+            }
         }
 
         // Recreate target machine with new triple
@@ -135,9 +143,11 @@ namespace Cryo::Codegen
             return false;
         }
 
-        // Configure module with target machine data layout
-        if (_module) {
-            _module->setDataLayout(_target_machine->createDataLayout());
+        // Configure all modules with target machine data layout
+        for (auto& [name, module] : _modules) {
+            if (module) {
+                module->setDataLayout(_target_machine->createDataLayout());
+            }
         }
 
         _target_machine_created = true;
@@ -150,8 +160,8 @@ namespace Cryo::Codegen
 
     llvm::DIBuilder* LLVMContextManager::get_debug_builder()
     {
-        if (!_debug_builder && _module) {
-            _debug_builder = std::make_unique<llvm::DIBuilder>(*_module);
+        if (!_debug_builder && _active_module) {
+            _debug_builder = std::make_unique<llvm::DIBuilder>(*_active_module);
         }
         return _debug_builder.get();
     }
@@ -162,52 +172,147 @@ namespace Cryo::Codegen
 
     llvm::Module* LLVMContextManager::create_module(const std::string& name)
     {
-        _module = std::make_unique<llvm::Module>(name, *_context);
-        _module->setTargetTriple(_target_triple);
-        
-        if (_target_machine) {
-            _module->setDataLayout(_target_machine->createDataLayout());
+        // Check if module already exists
+        if (_modules.find(name) != _modules.end()) {
+            std::cout << "[DEBUG] Module '" << name << "' already exists, returning existing module" << std::endl;
+            return _modules[name].get();
         }
 
-        return _module.get();
+        // Create new module
+        auto module = std::make_unique<llvm::Module>(name, *_context);
+        module->setTargetTriple(_target_triple);
+        
+        if (_target_machine) {
+            module->setDataLayout(_target_machine->createDataLayout());
+        }
+
+        // Store the module and get pointer before moving
+        llvm::Module* module_ptr = module.get();
+        _modules[name] = std::move(module);
+
+        // Set as active module
+        _active_module = module_ptr;
+        _active_module_name = name;
+
+        // Set as main module if this is the first module or has same name as constructor parameter
+        if (_main_module == nullptr || name == _module_name) {
+            _main_module = module_ptr;
+            _main_module_name = name;
+            std::cout << "[DEBUG] Set module '" << name << "' as main module" << std::endl;
+        }
+
+        std::cout << "[DEBUG] Created and activated module: " << name << std::endl;
+        return module_ptr;
+    }
+
+    llvm::Module* LLVMContextManager::get_module(const std::string& name) const
+    {
+        auto it = _modules.find(name);
+        return (it != _modules.end()) ? it->second.get() : nullptr;
+    }
+
+    bool LLVMContextManager::set_active_module(const std::string& name)
+    {
+        auto it = _modules.find(name);
+        if (it != _modules.end()) {
+            _active_module = it->second.get();
+            _active_module_name = name;
+            std::cout << "[DEBUG] Switched active module to: " << name << std::endl;
+            return true;
+        }
+        std::cout << "[DEBUG] Cannot switch to module '" << name << "' - does not exist" << std::endl;
+        return false;
+    }
+
+    bool LLVMContextManager::set_main_module(const std::string& name)
+    {
+        auto it = _modules.find(name);
+        if (it != _modules.end()) {
+            _main_module = it->second.get();
+            _main_module_name = name;
+            std::cout << "[DEBUG] Set main module to: " << name << std::endl;
+            return true;
+        }
+        return false;
+    }
+
+    bool LLVMContextManager::has_module(const std::string& name) const
+    {
+        return _modules.find(name) != _modules.end();
+    }
+
+    std::vector<std::string> LLVMContextManager::get_module_names() const
+    {
+        std::vector<std::string> names;
+        names.reserve(_modules.size());
+        for (const auto& pair : _modules) {
+            names.push_back(pair.first);
+        }
+        return names;
+    }
+
+    bool LLVMContextManager::remove_module(const std::string& name)
+    {
+        auto it = _modules.find(name);
+        if (it != _modules.end()) {
+            // Update active/main pointers if they point to the module being removed
+            if (_active_module == it->second.get()) {
+                _active_module = nullptr;
+                _active_module_name.clear();
+            }
+            if (_main_module == it->second.get()) {
+                _main_module = nullptr;
+                _main_module_name.clear();
+            }
+            
+            _modules.erase(it);
+            return true;
+        }
+        return false;
     }
 
     void LLVMContextManager::set_module_metadata(const std::string& source_file, 
-                                                 const std::string& compile_flags)
+                                                 const std::string& compile_flags,
+                                                 const std::string& module_name)
     {
-        if (!_module) {
+        llvm::Module* target_module = module_name.empty() ? _active_module : get_module(module_name);
+        if (!target_module) {
             return;
         }
 
         // Set source file metadata
-        _module->setSourceFileName(source_file);
+        target_module->setSourceFileName(source_file);
 
         // Add compile flags as module flag
         if (!compile_flags.empty()) {
-            _module->addModuleFlag(llvm::Module::Warning, "compile_flags", 
+            target_module->addModuleFlag(llvm::Module::Warning, "compile_flags", 
                                   llvm::MDString::get(*_context, compile_flags));
         }
     }
 
-    bool LLVMContextManager::verify_module() const
+    bool LLVMContextManager::verify_module(const std::string& module_name) const
     {
-        if (!_module) {
+        llvm::Module* target_module = module_name.empty() ? _active_module : get_module(module_name);
+        if (!target_module) {
             return false;
         }
 
-        return !llvm::verifyModule(*_module, &llvm::errs());
+        return !llvm::verifyModule(*target_module, &llvm::errs());
     }
 
-    void LLVMContextManager::print_module(std::ostream& os) const
+    void LLVMContextManager::print_module(std::ostream& os, const std::string& module_name) const
     {
-        if (_module) {
-            llvm::raw_ostream* llvm_os = nullptr;
-            // Create a raw_ostream wrapper for std::ostream
-            std::string str;
-            llvm::raw_string_ostream string_stream(str);
-            _module->print(string_stream, nullptr);
-            os << string_stream.str();
+        llvm::Module* target_module = module_name.empty() ? _active_module : get_module(module_name);
+        if (!target_module) {
+            os << "; No module available for printing" << std::endl;
+            return;
         }
+
+        // Create a raw_ostream wrapper for std::ostream
+        std::string str;
+        llvm::raw_string_ostream string_stream(str);
+        target_module->print(string_stream, nullptr);
+        os << string_stream.str();
     }
 
     //===================================================================

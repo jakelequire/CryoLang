@@ -116,18 +116,30 @@ namespace Cryo::Codegen
             module->setSourceFileName(_source_file);
         }
 
+        std::cout << "[DEBUG] Processing main program with " << node.statements().size() << " statements" << std::endl;
+
         // Generate all top-level statements
-        for (auto &stmt : node.statements())
+        for (size_t i = 0; i < node.statements().size(); ++i)
         {
+            auto &stmt = node.statements()[i];
             if (stmt)
             {
+                std::cout << "[DEBUG] Processing statement " << (i + 1) << "/" << node.statements().size() << std::endl;
                 stmt->accept(*this);
+                std::cout << "[DEBUG] Completed statement " << (i + 1) << std::endl;
+            }
+            else
+            {
+                std::cout << "[DEBUG] Skipping null statement " << (i + 1) << std::endl;
             }
         }
+        
+        std::cout << "[DEBUG] Completed processing main program" << std::endl;
     }
 
     void CodegenVisitor::visit(Cryo::FunctionDeclarationNode &node)
     {
+        std::cout << "[DEBUG] Visiting FunctionDeclarationNode: " << node.name() << std::endl;
         try
         {
             // Skip generic functions for now - they require specialized template instantiation
@@ -154,17 +166,23 @@ namespace Cryo::Codegen
             // Generate function body if present
             if (node.body())
             {
+                std::cout << "[DEBUG] Generating function body for: " << node.name() << std::endl;
                 bool body_success = generate_function_body(&node, function);
                 if (!body_success)
                 {
                     report_error("Failed to generate function body: " + node.name());
                 }
             }
+            else
+            {
+                std::cout << "[DEBUG] No function body to generate for: " << node.name() << std::endl;
+            }
         }
         catch (const std::exception &e)
         {
             report_error("Exception in function declaration: " + std::string(e.what()), &node);
         }
+        std::cout << "[DEBUG] Completed FunctionDeclarationNode: " << node.name() << std::endl;
     }
 
     void CodegenVisitor::visit(Cryo::IntrinsicDeclarationNode &node)
@@ -250,7 +268,23 @@ namespace Cryo::Codegen
                         std::cout << "[INFO] Set namespace context for import: '" << _namespace_context << "'" << std::endl;
                     }
                     
+                    // MULTI-MODULE FIX: Store the main module name before processing import
+                    std::string main_module_name = _context_manager.get_main_module() ? 
+                        _context_manager.get_main_module()->getName().str() : "";
+                    
+                    std::cout << "[DEBUG] Processing import with main module: " << main_module_name << std::endl;
+                    
+                    // Process the import AST (this will create its own module)
                     result.ast->accept(*this);
+                    
+                    // MULTI-MODULE FIX: Switch back to main module after import processing
+                    if (!main_module_name.empty()) {
+                        if (!_context_manager.set_active_module(main_module_name)) {
+                            std::cout << "[ERROR] Failed to switch back to main module: " << main_module_name << std::endl;
+                        } else {
+                            std::cout << "[DEBUG] Successfully switched back to main module: " << main_module_name << std::endl;
+                        }
+                    }
                     
                     // Restore previous namespace context
                     _namespace_context = old_namespace_context;
