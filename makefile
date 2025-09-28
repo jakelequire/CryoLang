@@ -252,7 +252,7 @@ $(STDLIB_LIB): $(STDLIB_BC_FILES)
 	@llvm-link $(STDLIB_BC_FILES) -o $(STDLIB_BUILD_DIR)/cryo_combined.bc
 	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o
 	@llvm-ar rcs $(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryo.o
-	@echo "✅ Standard library created: $(STDLIB_LIB)"
+	@echo "Standard library created Successfully: $(STDLIB_LIB)"
 
 stdlib-clean:
 ifeq ($(OS), Windows_NT)

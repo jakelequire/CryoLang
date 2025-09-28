@@ -641,13 +641,11 @@ namespace Cryo::Linker
 
         // Add common runtime library paths
         paths.push_back("./bin");
-        paths.push_back("./runtime/build"); // Fixed relative path
         paths.push_back("/usr/local/lib");
         paths.push_back("/usr/lib");
 
 
 #if defined(_WIN32) || defined(_WIN64)
-        paths.push_back("C:\\Programming\\apps\\CryoLang\\runtime\\build");
         paths.push_back("C:\\Programming\\apps\\CryoLang\\bin");
 #endif
 

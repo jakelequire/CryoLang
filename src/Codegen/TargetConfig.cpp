@@ -248,9 +248,7 @@ namespace Cryo::Codegen
             _system_lib_paths.push_back("/usr/local/lib");
         }
 
-        // Add current directory and runtime relative paths
-        _runtime_paths.insert(_runtime_paths.begin(), "./runtime/build");
-        _runtime_paths.insert(_runtime_paths.begin(), "../runtime/build");
+        // Runtime paths are no longer needed - using stdlib instead
     }
 
     void TargetConfig::parse_target_triple() const
