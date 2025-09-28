@@ -257,27 +257,65 @@ namespace Cryo::Codegen
             // Refresh module name before emission
             refresh_module_name();
             
+            // Generate binary bytecode (.bc) file
             std::error_code EC;
-            llvm::raw_fd_ostream output_stream(output_path, EC, llvm::sys::fs::OF_None);
+            llvm::raw_fd_ostream bc_output_stream(output_path, EC, llvm::sys::fs::OF_None);
             
             if (EC)
             {
-                report_error("Failed to open file for IR emission: " + EC.message());
+                report_error("Failed to open file for bytecode emission: " + EC.message());
                 return false;
             }
 
-            // Use WriteBitcodeToFile instead of module->print() - more robust
-            llvm::WriteBitcodeToFile(*target_module, output_stream);
+            // Write binary bytecode
+            llvm::WriteBitcodeToFile(*target_module, bc_output_stream);
             
-            output_stream.flush();
+            bc_output_stream.flush();
             
-            if (output_stream.has_error())
+            if (bc_output_stream.has_error())
             {
-                report_error("Error during IR write");
+                report_error("Error during bytecode write");
                 return false;
             }
             
-            output_stream.close();
+            bc_output_stream.close();
+
+            // Generate human-readable LLVM IR (.ll) file
+            std::string ll_output_path = output_path;
+            
+            // Replace .bc extension with .ll
+            size_t pos = ll_output_path.find_last_of('.');
+            if (pos != std::string::npos && ll_output_path.substr(pos) == ".bc")
+            {
+                ll_output_path = ll_output_path.substr(0, pos) + ".ll";
+            }
+            else
+            {
+                // If no .bc extension found, just append .ll
+                ll_output_path += ".ll";
+            }
+
+            std::error_code ll_EC;
+            llvm::raw_fd_ostream ll_output_stream(ll_output_path, ll_EC, llvm::sys::fs::OF_None);
+            
+            if (ll_EC)
+            {
+                report_error("Failed to open file for LLVM IR emission: " + ll_EC.message());
+                return false;
+            }
+
+            // Write human-readable LLVM IR
+            target_module->print(ll_output_stream, nullptr);
+            
+            ll_output_stream.flush();
+            
+            if (ll_output_stream.has_error())
+            {
+                report_error("Error during LLVM IR write");
+                return false;
+            }
+            
+            ll_output_stream.close();
 
             return true;
         }
