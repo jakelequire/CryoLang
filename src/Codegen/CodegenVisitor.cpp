@@ -3487,6 +3487,29 @@ namespace Cryo::Codegen
             case TokenKind::TK_PLUS:
                 if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
                 {
+                    // Handle integer type coercion for different bit widths
+                    llvm::Type *left_type = left_val->getType();
+                    llvm::Type *right_type = right_val->getType();
+                    
+                    if (left_type != right_type)
+                    {
+                        // Get bit widths
+                        unsigned left_bits = left_type->getIntegerBitWidth();
+                        unsigned right_bits = right_type->getIntegerBitWidth();
+                        
+                        // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
+                        if (left_bits > right_bits)
+                        {
+                            // Truncate left operand to match right operand's type
+                            left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
+                        }
+                        else if (right_bits > left_bits)
+                        {
+                            // Truncate right operand to match left operand's type  
+                            right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
+                        }
+                    }
+                    
                     result = builder.CreateAdd(left_val, right_val, "add.tmp");
                 }
                 else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
