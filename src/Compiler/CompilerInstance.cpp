@@ -7,7 +7,7 @@
 namespace Cryo
 {
     CompilerInstance::CompilerInstance()
-        : _debug_mode(false), _show_ast_before_ir(false)
+        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false)
     {
         initialize_components();
     }
@@ -244,6 +244,16 @@ namespace Cryo
             std::string namespace_for_module = _current_namespace.empty() ? "cryo_program" : _current_namespace;
             _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module);
             
+            // Configure stdlib compilation mode if enabled
+            if (_stdlib_compilation_mode)
+            {
+                _codegen->set_stdlib_compilation_mode(true);
+                if (_debug_mode)
+                {
+                    std::cout << "[DEBUG] Enabled stdlib compilation mode in CodeGenerator" << std::endl;
+                }
+            }
+            
             if (_debug_mode)
             {
                 std::cout << "[DEBUG] Created CodeGenerator with module name: '" << namespace_for_module << "'" << std::endl;
@@ -401,6 +411,29 @@ namespace Cryo
 
         try
         {
+            // Configure linker with libcryo if stdlib linking is enabled
+            if (_stdlib_linking_enabled)
+            {
+                // Add libcryo.a to the linker
+                std::string libcryo_path = "./bin/stdlib/libcryo.a";
+                if (std::filesystem::exists(libcryo_path))
+                {
+                    _linker->add_object_file(libcryo_path);
+                    if (_debug_mode)
+                    {
+                        std::cout << "[DEBUG] Added libcryo.a for standard library linking: " << libcryo_path << std::endl;
+                    }
+                }
+                else
+                {
+                    std::cerr << "Warning: libcryo.a not found at " << libcryo_path << ", stdlib functions may not link properly" << std::endl;
+                }
+            }
+            else if (_debug_mode)
+            {
+                std::cout << "[DEBUG] Standard library linking disabled by --no-std flag" << std::endl;
+            }
+
             // Get generated module and link
             llvm::Module *module = _codegen->get_module();
             if (!module)
@@ -740,89 +773,15 @@ namespace Cryo
 
     void CompilerInstance::initialize_standard_library()
     {
-        // Parse runtime.cryo file to load extern function declarations
-        std::string runtime_cryo_path = "./runtime/runtime.cryo";
-
-        // Check if runtime.cryo exists in the current directory
-        if (!std::filesystem::exists(runtime_cryo_path))
-        {
-            std::cerr << "runtime.cryo not found, falling back to empty standard library" << std::endl;
-            return;
-        }
-
-        try
-        {
-            // Read the runtime.cryo file
-            std::ifstream file(runtime_cryo_path);
-            if (!file.is_open())
-            {
-                std::cerr << "Could not open runtime file: " << runtime_cryo_path << std::endl;
-                return;
-            }
-
-            std::string content((std::istreambuf_iterator<char>(file)),
-                                std::istreambuf_iterator<char>());
-            file.close();
-
-            // Create a File object for the Lexer using the factory function
-            auto file_obj = make_file_from_string("./runtime/runtime.cryo", content);
-
-            // Create lexer and parser
-            auto lexer = std::make_unique<Lexer>(std::move(file_obj));
-            Parser parser(std::move(lexer), *_ast_context);
-
-            auto program = parser.parse_program();
-            if (!program)
-            {
-                std::cerr << "Failed to parse runtime file: " << runtime_cryo_path << std::endl;
-                return;
-            }
-
-            // Process extern blocks in the runtime file
-            for (const auto &node : program->statements())
-            {
-                if (auto extern_block = dynamic_cast<ExternBlockNode *>(node.get()))
-                {
-                    // Process each function declaration in the extern block
-                    for (const auto &func_decl : extern_block->function_declarations())
-                    {
-                        if (auto func = dynamic_cast<FunctionDeclarationNode *>(func_decl.get()))
-                        {
-                            // Build function signature
-                            std::string signature = "(" + func->return_type_annotation() + ")";
-                            if (!func->parameters().empty())
-                            {
-                                signature = "(";
-                                for (size_t i = 0; i < func->parameters().size(); ++i)
-                                {
-                                    if (i > 0)
-                                        signature += ", ";
-                                    signature += func->parameters()[i]->type_annotation();
-                                }
-                                signature += ") -> " + func->return_type_annotation();
-                            }
-                            else
-                            {
-                                signature = "() -> " + func->return_type_annotation();
-                            }
-
-                            // Register the function in the symbol table with runtime namespace scope
-                            std::string runtime_namespace = "Std::Runtime"; // Use the same namespace as in runtime.cryo
-                            _symbol_table->declare_builtin_function(func->name(), signature, _ast_context->types(), runtime_namespace);
-                        }
-                    }
-                }
-            }
-
-            std::cout << "Standard library initialized from runtime.cryo" << std::endl;
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Error parsing runtime.cryo: " << e.what() << std::endl;
-        }
-    }
-
-    std::unique_ptr<CompilerInstance> create_compiler_instance()
+        // Initialize standard library from built-in intrinsics
+        // The actual stdlib modules will be loaded dynamically through imports
+        // The libcryo.a linking happens during final linking phase
+        
+        // Note: We don't pre-load stdlib symbols here anymore since they're loaded on-demand
+        // through the import system. This allows for better modularity and avoids duplicate definitions.
+        
+        std::cout << "Standard library initialized from libcryo" << std::endl;
+    }    std::unique_ptr<CompilerInstance> create_compiler_instance()
     {
         return std::make_unique<CompilerInstance>();
     }
