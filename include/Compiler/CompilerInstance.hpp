@@ -44,6 +44,8 @@ namespace Cryo
         std::vector<std::string> _include_paths;
         bool _debug_mode;
         bool _show_ast_before_ir;
+        bool _stdlib_linking_enabled; // Control whether to link libcryo.a by default
+        bool _stdlib_compilation_mode; // Control whether to generate full implementations for stdlib compilation
         std::string _current_namespace; // Current namespace context
 
         // Results
@@ -82,6 +84,14 @@ namespace Cryo
         TypeChecker *type_checker() const { return _type_checker.get(); }
         Cryo::Codegen::CodeGenerator *codegen() const { return _codegen.get(); }
         Cryo::Linker::CryoLinker *linker() const { return _linker.get(); }
+
+        // Standard library linking control
+        void set_stdlib_linking(bool enable) { _stdlib_linking_enabled = enable; }
+        bool stdlib_linking_enabled() const { return _stdlib_linking_enabled; }
+
+        // Standard library compilation mode (generates full implementations)
+        void set_stdlib_compilation_mode(bool enable) { _stdlib_compilation_mode = enable; }
+        bool stdlib_compilation_mode() const { return _stdlib_compilation_mode; }
 
         // Namespace context
         void set_namespace_context(const std::string &namespace_name);

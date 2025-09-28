@@ -91,7 +91,8 @@ namespace Cryo::CLI
                          flag_name == "ir" || flag_name == "show-ir" ||
                          flag_name == "emit-llvm" ||
                          flag_name == "help" || flag_name == "h" ||
-                         flag_name == "version" || flag_name == "v")
+                         flag_name == "version" || flag_name == "v" ||
+                         flag_name == "no-std" || flag_name == "stdlib-mode")
                 {
                     args.set_flag(flag_name, true);
                 }
@@ -339,6 +340,20 @@ namespace Cryo::CLI
         if (args.show_ast())
         {
             compiler->set_show_ast_before_ir(true);
+        }
+
+        // Set stdlib linking flag (disabled if --no-std is present)
+        if (args.get_flag("no-std"))
+        {
+            compiler->set_stdlib_linking(false);
+            std::cout << "[INFO] Standard library linking disabled by --no-std flag" << std::endl;
+        }
+
+        // Set stdlib compilation mode (generates full implementations for imports)
+        if (args.get_flag("stdlib-mode"))
+        {
+            compiler->set_stdlib_compilation_mode(true);
+            std::cout << "[INFO] Standard library compilation mode enabled" << std::endl;
         }
 
         if (compiler->compile_file(file_path))

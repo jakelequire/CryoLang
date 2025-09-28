@@ -77,6 +77,11 @@ namespace Cryo::Codegen
          */
         void set_source_info(const std::string& source_file, const std::string& namespace_context = "");
 
+        /**
+         * @brief Set stdlib compilation mode (generates full implementations for imports)
+         */
+        void set_stdlib_compilation_mode(bool enable) { _stdlib_compilation_mode = enable; }
+
         //===================================================================
         // AST Visitor Implementation - Declarations
         //===================================================================
@@ -252,6 +257,9 @@ namespace Cryo::Codegen
 
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
+
+        // Control flags
+        bool _stdlib_compilation_mode; // Generate full implementations for imports in stdlib mode
 
         // Loop context for break/continue
         llvm::BasicBlock *_current_loop_exit = nullptr;

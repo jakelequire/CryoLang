@@ -23,7 +23,7 @@ namespace Cryo::Codegen
         ASTContext &ast_context,
         SymbolTable &symbol_table,
         const std::string &namespace_name) : _ast_context(ast_context), _symbol_table(symbol_table),
-                                     _has_errors(false), _debug_enabled(false), _optimization_level(2),
+                                     _has_errors(false), _debug_enabled(false), _stdlib_compilation_mode(false), _optimization_level(2),
                                      _functions_generated(0), _types_generated(0), _globals_generated(0),
                                      _module_name(namespace_name.empty() ? "cryo_program" : namespace_name)
     {
@@ -68,6 +68,12 @@ namespace Cryo::Codegen
                 _visitor = std::make_unique<CodegenVisitor>(
                     *_context_manager,
                     _symbol_table);
+                    
+                // Apply stdlib compilation mode to the newly created visitor
+                if (_stdlib_compilation_mode)
+                {
+                    _visitor->set_stdlib_compilation_mode(true);
+                }
             }
 
             // Generate IR by visiting the AST
@@ -162,6 +168,15 @@ namespace Cryo::Codegen
         if (_visitor)
         {
             _visitor->set_source_info(source_file, namespace_context);
+        }
+    }
+
+    void CodeGenerator::set_stdlib_compilation_mode(bool enable)
+    {
+        _stdlib_compilation_mode = enable;
+        if (_visitor)
+        {
+            _visitor->set_stdlib_compilation_mode(enable);
         }
     }
 

@@ -146,6 +146,12 @@ namespace Cryo::Codegen
         llvm::Module* get_main_module() const { return _main_module; }
 
         /**
+         * @brief Get main module name
+         * @return Main module name or empty string if not set
+         */
+        const std::string& get_main_module_name() const { return _main_module_name; }
+
+        /**
          * @brief Set main module (the primary compilation target)
          * @param name Module name to set as main
          * @return true if module exists and was set as main

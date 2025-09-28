@@ -171,7 +171,7 @@ rebuild:
 # Standard library compilation
 STDLIB_DIR = ./stdlib
 STDLIB_BUILD_DIR = $(BIN_DIR)stdlib
-STDLIB_LIB = $(STDLIB_BUILD_DIR)/libcryostd.a
+STDLIB_LIB = $(STDLIB_BUILD_DIR)/libcryo.a
 
 # Find all stdlib source files - using dynamic discovery for both Windows and Linux
 ifeq ($(OS), Windows_NT)
@@ -231,7 +231,7 @@ $(STDLIB_BUILD_DIR)/%.bc: $(STDLIB_DIR)/%.cryo $(MAIN_BIN) | $(STDLIB_BUILD_DIR)
 ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
 	@echo "[STDLIB] Generating IR and dumping to console for $(STDLIB_DIR)/$*.cryo"
-	@.\bin\cryo.exe $(STDLIB_DIR)/$*.cryo --emit-llvm -c -o $(STDLIB_BUILD_DIR)/$*.bc || ( \
+	@.\bin\cryo.exe $(STDLIB_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/$*.bc || ( \
 		echo "[STDLIB] Compilation failed, creating stub file..." && \
 		echo "; Compilation failed for $*.cryo" > $(STDLIB_BUILD_DIR)/$*.bc && \
 		echo "; Stub file created to satisfy build system" >> $(STDLIB_BUILD_DIR)/$*.bc \
@@ -239,7 +239,7 @@ ifeq ($(OS), Windows_NT)
 else
 	@mkdir -p $(dir $@)
 	@echo "[STDLIB] Generating IR and dumping to console for $(STDLIB_DIR)/$*.cryo"
-	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm -c -o $(shell pwd)/$@ || ( \
+	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(shell pwd)/$@ || ( \
 		echo "[STDLIB] Compilation failed, creating stub file..." && \
 		echo "; Compilation failed for $*.cryo" > $@ && \
 		echo "; Stub file created to satisfy build system" >> $@ \
@@ -249,15 +249,9 @@ endif
 # Link all stdlib modules into a single library
 $(STDLIB_LIB): $(STDLIB_BC_FILES)
 	@echo "Creating standard library: $(STDLIB_LIB)"
-ifeq ($(OS), Windows_NT)
-	@llvm-link $(STDLIB_BC_FILES) -o $(STDLIB_BUILD_DIR)/cryostd_combined.bc
-	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryostd_combined.bc -o $(STDLIB_BUILD_DIR)/libcryostd.o
-	@lib /OUT:$(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryostd.o
-else
-	@llvm-link $(STDLIB_BC_FILES) -o $(STDLIB_BUILD_DIR)/cryostd_combined.bc
-	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryostd_combined.bc -o $(STDLIB_BUILD_DIR)/libcryostd.o
-	@ar rcs $(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryostd.o
-endif
+	@llvm-link $(STDLIB_BC_FILES) -o $(STDLIB_BUILD_DIR)/cryo_combined.bc
+	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o
+	@llvm-ar rcs $(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryo.o
 	@echo "✅ Standard library created: $(STDLIB_LIB)"
 
 stdlib-clean:

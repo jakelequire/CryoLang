@@ -23,7 +23,8 @@ namespace Cryo::Codegen
           _type_mapper(std::make_unique<TypeMapper>(context_manager)),
           _intrinsics(std::make_unique<Intrinsics>(context_manager)),
           _current_value(nullptr), 
-          _has_errors(false)
+          _has_errors(false),
+          _stdlib_compilation_mode(false)
     {
     }
 
@@ -74,35 +75,57 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::ProgramNode &node)
     {
-        // Create module name prioritizing namespace context
+        std::cout << "[DEBUG] CodegenVisitor::visit(ProgramNode) - stdlib_compilation_mode: " << (_stdlib_compilation_mode ? "true" : "false") << std::endl;
+        
+        // In stdlib compilation mode, use the existing main module instead of creating a new one
+        llvm::Module* module = nullptr;
         std::string module_name = "cryo_program"; // fallback default
         
-        // First, try to use namespace context if available
-        if (!_namespace_context.empty())
+        if (_stdlib_compilation_mode)
         {
-            module_name = _namespace_context;
+            // In stdlib mode, use the existing main module
+            module = _context_manager.get_main_module();
+            if (module)
+            {
+                module_name = _context_manager.get_main_module_name();
+                std::cout << "[INFO] Using existing main module for stdlib compilation: '" << module_name << "'" << std::endl;
+            }
+            else
+            {
+                std::cout << "[WARNING] No main module found in stdlib mode, creating fallback" << std::endl;
+            }
         }
-        // Otherwise, try to construct from source file
-        else if (!_source_file.empty())
+        
+        if (!module)
         {
-            // Extract just the filename without path and extension
-            std::filesystem::path file_path(_source_file);
-            std::string filename = file_path.stem().string(); // filename without extension
-            module_name = filename;
-        }
+            // Create module name prioritizing namespace context
+            // First, try to use namespace context if available
+            if (!_namespace_context.empty())
+            {
+                module_name = _namespace_context;
+            }
+            // Otherwise, try to construct from source file
+            else if (!_source_file.empty())
+            {
+                // Extract just the filename without path and extension
+                std::filesystem::path file_path(_source_file);
+                std::string filename = file_path.stem().string(); // filename without extension
+                module_name = filename;
+            }
 
-        std::cout << "[INFO] Creating LLVM module: '" << module_name << "'" << std::endl;
-        if (!_source_file.empty())
-        {
-            std::cout << "[INFO] Source file: '" << _source_file << "'" << std::endl;
-        }
-        if (!_namespace_context.empty())
-        {
-            std::cout << "[INFO] Namespace context: '" << _namespace_context << "'" << std::endl;
-        }
+            std::cout << "[INFO] Creating LLVM module: '" << module_name << "'" << std::endl;
+            if (!_source_file.empty())
+            {
+                std::cout << "[INFO] Source file: '" << _source_file << "'" << std::endl;
+            }
+            if (!_namespace_context.empty())
+            {
+                std::cout << "[INFO] Namespace context: '" << _namespace_context << "'" << std::endl;
+            }
 
-        // Create the main module for this program
-        auto module = _context_manager.create_module(module_name);
+            // Create the main module for this program
+            module = _context_manager.create_module(module_name);
+        }
 
         if (!module)
         {
@@ -159,8 +182,17 @@ namespace Cryo::Codegen
                 return;
             }
 
-            // Register the function
-            _functions[node.name()] = function;
+            // Register the function in symbol table with multiple lookup keys
+            _functions[node.name()] = function;  // Simple name lookup
+            
+            // Also register with namespace-qualified name if we're in a namespace
+            if (!_namespace_context.empty())
+            {
+                std::string qualified_name = _namespace_context + "::" + node.name();
+                _functions[qualified_name] = function;
+                std::cout << "[DEBUG] Registered function with qualified name: " << qualified_name << std::endl;
+            }
+            
             register_value(&node, function);
 
             // Generate function body if present
@@ -255,39 +287,25 @@ namespace Cryo::Codegen
                 // Generate code for the imported module's AST to ensure static methods are available
                 if (result.ast)
                 {
-                    std::cout << "[INFO] Generating code for imported module: " << node.path() << std::endl;
-                    
-                    // Clear any previous type mapping errors before processing this module
-                    _type_mapper->clear_errors();
-                    
-                    // Set namespace context for proper qualified naming
-                    std::string old_namespace_context = _namespace_context;
-                    if (!result.module_name.empty())
+                    if (_stdlib_compilation_mode)
                     {
-                        _namespace_context = result.module_name;
-                        std::cout << "[INFO] Set namespace context for import: '" << _namespace_context << "'" << std::endl;
+                        std::cout << "[INFO] Skipping full codegen for imported module in stdlib mode: " << node.path() << " (avoiding symbol duplication in stdlib compilation)" << std::endl;
+                        
+                        // NOTE: In stdlib compilation mode, we should NOT generate full implementations
+                        // for imported modules to avoid symbol duplication. Each module should only
+                        // generate its own implementations when compiled directly.
+                        // We only need the symbol information for type checking and forward declarations,
+                        // which is already handled by the symbol registration below.
                     }
-                    
-                    // MULTI-MODULE FIX: Store the main module name before processing import
-                    std::string main_module_name = _context_manager.get_main_module() ? 
-                        _context_manager.get_main_module()->getName().str() : "";
-                    
-                    std::cout << "[DEBUG] Processing import with main module: " << main_module_name << std::endl;
-                    
-                    // Process the import AST (this will create its own module)
-                    result.ast->accept(*this);
-                    
-                    // MULTI-MODULE FIX: Switch back to main module after import processing
-                    if (!main_module_name.empty()) {
-                        if (!_context_manager.set_active_module(main_module_name)) {
-                            std::cout << "[ERROR] Failed to switch back to main module: " << main_module_name << std::endl;
-                        } else {
-                            std::cout << "[DEBUG] Successfully switched back to main module: " << main_module_name << std::endl;
-                        }
+                    else
+                    {
+                        std::cout << "[INFO] Skipping full codegen for imported module: " << node.path() << " (avoiding symbol duplication)" << std::endl;
+                        
+                        // NOTE: We skip full codegen for imported modules to avoid symbol duplication.
+                        // The imported module will be compiled separately and linked later.
+                        // We only need the symbol information for type checking and forward declarations,
+                        // which is already handled by the symbol registration below.
                     }
-                    
-                    // Restore previous namespace context
-                    _namespace_context = old_namespace_context;
                 }
 
                 // Register the symbols in the namespace
@@ -2736,9 +2754,14 @@ namespace Cryo::Codegen
             llvm::FunctionType *func_type = llvm::FunctionType::get(
                 return_type, param_types, is_variadic);
 
+            // Use simple function name in IR - namespace resolution handled by symbol table
+            std::string function_name = node->name();
+            std::cout << "[DEBUG] Function name generation - using simple IR name: " << function_name 
+                      << " (namespace: '" << _namespace_context << "')" << std::endl;
+
             // Create function
             llvm::Function *function = llvm::Function::Create(
-                func_type, llvm::Function::ExternalLinkage, node->name(), *module);
+                func_type, llvm::Function::ExternalLinkage, function_name, *module);
 
             // Set parameter names
             auto param_it = param_names.begin();
@@ -4036,6 +4059,29 @@ namespace Cryo::Codegen
             }
         }
 
+        // First, check if this is a function we know about in our symbol table
+        auto func_it = _functions.find(function_name);
+        if (func_it != _functions.end())
+        {
+            llvm::Function *known_function = func_it->second;
+            std::cout << "[DEBUG] Found function in symbol table: " << function_name << " -> " << known_function->getName().str() << std::endl;
+            
+            // Generate arguments for the function call
+            std::vector<llvm::Value *> args;
+            for (const auto &arg : node->arguments())
+            {
+                arg->accept(*this);
+                llvm::Value *arg_value = get_generated_value(arg.get());
+                if (arg_value)
+                {
+                    args.push_back(arg_value);
+                }
+            }
+
+            // Call the function
+            return builder.CreateCall(known_function, args);
+        }
+
         // Map Cryo function names to C runtime function names
         std::string c_function_name = map_cryo_to_c_function(function_name);
 
@@ -4281,6 +4327,12 @@ namespace Cryo::Codegen
         if (c_name.find("Std::Runtime::") == 0) {
             // Extract the function name after "Std::Runtime::"
             c_runtime_name = c_name.substr(14); // Length of "Std::Runtime::"
+        } else if (c_name.find("std::") == 0) {
+            // For stdlib functions like std::IO::printf, extract just the function name
+            size_t last_colon = c_name.find_last_of(':');
+            if (last_colon != std::string::npos && last_colon + 1 < c_name.length()) {
+                c_runtime_name = c_name.substr(last_colon + 1);
+            }
         }
         
         llvm::Function* forward_decl = llvm::Function::Create(

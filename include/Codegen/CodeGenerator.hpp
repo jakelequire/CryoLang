@@ -140,6 +140,11 @@ namespace Cryo::Codegen
         void set_source_info(const std::string& source_file, const std::string& namespace_context = "");
 
         /**
+         * @brief Set stdlib compilation mode (generates full implementations for imports)
+         */
+        void set_stdlib_compilation_mode(bool enable);
+
+        /**
          * @brief Refresh module name to prevent corruption during complex operations
          */
         void refresh_module_name();
@@ -217,6 +222,7 @@ namespace Cryo::Codegen
         std::string _module_name;
         std::string _last_error;
         bool _debug_enabled;
+        bool _stdlib_compilation_mode;
         int _optimization_level;
         bool _has_errors;
 
