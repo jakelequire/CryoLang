@@ -447,8 +447,13 @@ namespace Cryo
 
             if (!success)
             {
+                std::string linker_error = _linker->get_last_error();
+                std::cerr << "[DEBUG] Linker error string length: " << linker_error.length() << std::endl;
+                std::cerr << "[DEBUG] Linker error content: '" << linker_error << "'" << std::endl;
+                std::cerr << "[DEBUG] Full error message will be: 'Linking failed: " << linker_error << "'" << std::endl;
+                
                 _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
-                                                  "Linking failed: " + _linker->get_last_error(),
+                                                  "Linking failed: " + linker_error,
                                                   SourceRange{}, _source_file);
             }
 

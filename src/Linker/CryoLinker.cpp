@@ -213,12 +213,19 @@ namespace Cryo::Linker
 
     bool CryoLinker::generate_executable(llvm::Module *module, const std::string &output_path)
     {
+        std::cerr << "[DEBUG] CryoLinker::generate_executable called with output_path: " << output_path << std::endl;
+        
         // Step 1: Generate object file from LLVM IR
         std::string temp_obj = output_path + ".o";
+        std::cerr << "[DEBUG] Generating object file: " << temp_obj << std::endl;
+        
         if (!generate_object_file(module, temp_obj))
         {
+            std::cerr << "[DEBUG] generate_object_file failed!" << std::endl;
             return false;
         }
+        
+        std::cerr << "[DEBUG] Object file generated successfully" << std::endl;
 
         // Step 2: Use system linker to create executable with runtime
         std::vector<std::string> linker_args;
@@ -226,29 +233,33 @@ namespace Cryo::Linker
         // Add the generated object file
         linker_args.push_back(temp_obj);
 
-        // Add runtime libraries
-        bool found_runtime = false;
-        auto runtime_paths = get_default_runtime_paths();
-        for (const auto &path : runtime_paths)
+        // Add all object files that were added via add_object_file (including libcryo.a)
+        for (const auto &obj_file : _object_files)
         {
-            if (runtime_library_exists(path, "cryoruntime"))
-            {
-                // Use static linking for the runtime library
-                std::string static_lib_path = path + "/libcryoruntime.a";
-                linker_args.push_back(static_lib_path);
-                found_runtime = true;
-                break;
-            }
+            linker_args.push_back(obj_file);
+            std::cerr << "[DEBUG] Added object file: " << obj_file << std::endl;
         }
 
-        if (!found_runtime)
+        // Add library paths
+        for (const auto &lib_path : _library_paths)
         {
-            report_error("Could not locate CryoLang runtime library (libcryoruntime.a), Attempted paths:\n");
-            for (const auto &path : runtime_paths)
+            linker_args.push_back("-L" + lib_path);
+            std::cerr << "[DEBUG] Added library path: -L" << lib_path << std::endl;
+        }
+
+        // Add libraries
+        for (const auto &[lib_name, is_static] : _libraries)
+        {
+            if (is_static)
             {
-                report_error("  " + path + "\n");
+                linker_args.push_back("-Wl,-Bstatic");
             }
-            return false;
+            linker_args.push_back("-l" + lib_name);
+            if (is_static)
+            {
+                linker_args.push_back("-Wl,-Bdynamic");
+            }
+            std::cerr << "[DEBUG] Added library: -l" << lib_name << (is_static ? " (static)" : " (dynamic)") << std::endl;
         }
 
         // Add standard libraries
@@ -259,8 +270,15 @@ namespace Cryo::Linker
         linker_args.push_back("-o");
         linker_args.push_back(output_path);
 
+        std::cerr << "[DEBUG] About to call execute_linker_command with " << linker_args.size() << " args" << std::endl;
+        for (size_t i = 0; i < linker_args.size(); ++i) {
+            std::cerr << "[DEBUG] linker_args[" << i << "] = '" << linker_args[i] << "'" << std::endl;
+        }
+
         // Execute system linker
         bool success = execute_linker_command(linker_args);
+        
+        std::cerr << "[DEBUG] execute_linker_command returned: " << (success ? "true" : "false") << std::endl;
 
         // Clean up temp object file
         std::filesystem::remove(temp_obj);
@@ -489,12 +507,13 @@ namespace Cryo::Linker
         std::vector<std::string> full_command;
 #if defined(_WIN32) || defined(_WIN64)
         full_command.push_back("C:/msys64/mingw64/bin/clang++"); // Use MinGW clang++ on Windows
+        // Skip PIE flags on Windows as they can cause runtime issues with MinGW
 #else
         full_command.push_back("clang++"); // Use system clang++ on other platforms
-#endif
-
         // Add PIE-related flags to fix position-independent executable issues
         full_command.push_back("-fPIE");
+        full_command.push_back("-pie");
+#endif
 
         // Add all the linker arguments
         for (const auto &arg : args)
@@ -515,12 +534,57 @@ namespace Cryo::Linker
             cmd += " \"" + full_command[i] + "\"";
         }
 
-        // Execute the command
-        int result = std::system(cmd.c_str());
+        // Log the command for debugging
+        std::cerr << "[DEBUG] Executing linker command: " << cmd << std::endl;
+
+        // On Windows, redirect stderr to capture error output
+#if defined(_WIN32) || defined(_WIN64)
+        std::string cmd_with_redirect = cmd + " 2>&1";
+        FILE* pipe = _popen(cmd_with_redirect.c_str(), "r");
+        if (!pipe) {
+            report_error("Failed to execute linker command: " + cmd);
+            return false;
+        }
+
+        std::string output;
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+        }
+
+        int result = _pclose(pipe);
+#else
+        // For Unix-like systems, use popen to capture output
+        std::string cmd_with_redirect = cmd + " 2>&1";
+        FILE* pipe = popen(cmd_with_redirect.c_str(), "r");
+        if (!pipe) {
+            report_error("Failed to execute linker command: " + cmd);
+            return false;
+        }
+
+        std::string output;
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+        }
+
+        int result = pclose(pipe);
+#endif
+
         if (result != 0)
         {
-            report_error("System linker failed with exit code " + std::to_string(result));
+            std::string error_msg = "System linker failed with exit code " + std::to_string(result);
+            error_msg += "\nLinker command: " + cmd;
+            if (!output.empty()) {
+                error_msg += "\nLinker output:\n" + output;
+            }
+            report_error(error_msg);
             return false;
+        }
+
+        // If there was output but success, log it as info
+        if (!output.empty()) {
+            std::cerr << "[INFO] Linker output: " << output << std::endl;
         }
 
         return true;
