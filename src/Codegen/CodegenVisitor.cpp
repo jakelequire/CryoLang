@@ -1480,6 +1480,9 @@ namespace Cryo::Codegen
                 str_val = str_val.substr(1, str_val.length() - 2);
             }
 
+            // Process escape sequences
+            str_val = process_escape_sequences(str_val);
+
             literal_value = _context_manager.get_builder().CreateGlobalStringPtr(str_val);
             break;
         }
@@ -2649,6 +2652,67 @@ namespace Cryo::Codegen
     // Error Handling
     //===================================================================
 
+    std::string CodegenVisitor::process_escape_sequences(const std::string &str)
+    {
+        std::string result;
+        result.reserve(str.length());
+
+        for (size_t i = 0; i < str.length(); ++i)
+        {
+            if (str[i] == '\\' && i + 1 < str.length())
+            {
+                char next = str[i + 1];
+                switch (next)
+                {
+                case 'n':
+                    result += '\n';
+                    break;
+                case 't':
+                    result += '\t';
+                    break;
+                case 'r':
+                    result += '\r';
+                    break;
+                case '\\':
+                    result += '\\';
+                    break;
+                case '\'':
+                    result += '\'';
+                    break;
+                case '\"':
+                    result += '\"';
+                    break;
+                case '0':
+                    result += '\0';
+                    break;
+                case 'a':
+                    result += '\a';
+                    break;
+                case 'b':
+                    result += '\b';
+                    break;
+                case 'f':
+                    result += '\f';
+                    break;
+                case 'v':
+                    result += '\v';
+                    break;
+                default:
+                    // If unknown escape sequence, just include the character as-is
+                    result += next;
+                    break;
+                }
+                ++i; // Skip the next character since we processed it
+            }
+            else
+            {
+                result += str[i];
+            }
+        }
+
+        return result;
+    }
+
     void CodegenVisitor::clear_errors()
     {
         _has_errors = false;
@@ -3438,6 +3502,24 @@ namespace Cryo::Codegen
                     }
                     result = builder.CreateFAdd(left_val, right_val, "fadd.tmp");
                 }
+                // Handle string concatenation (string + string, string + char, char + string)
+                else if (left_val->getType()->isPointerTy() && right_val->getType()->isPointerTy())
+                {
+                    // This is string + string concatenation
+                    result = generate_string_concatenation(left_val, right_val);
+                }
+                else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy() && 
+                         right_val->getType()->getIntegerBitWidth() == 8)
+                {
+                    // This is string + char concatenation
+                    result = generate_string_char_concatenation(left_val, right_val);
+                }
+                else if (left_val->getType()->isIntegerTy() && left_val->getType()->getIntegerBitWidth() == 8 &&
+                         right_val->getType()->isPointerTy())
+                {
+                    // This is char + string concatenation
+                    result = generate_char_string_concatenation(left_val, right_val);
+                }
                 break;
 
             case TokenKind::TK_MINUS:
@@ -3713,6 +3795,207 @@ namespace Cryo::Codegen
             return nullptr;
         }
     }
+
+    llvm::Value *CodegenVisitor::generate_string_concatenation(llvm::Value *left_str, llvm::Value *right_str)
+    {
+        if (!left_str || !right_str)
+            return nullptr;
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Get or create strlen function
+        llvm::FunctionType *strlen_type = llvm::FunctionType::get(
+            llvm::Type::getInt64Ty(context), 
+            {llvm::PointerType::get(context, 0)}, 
+            false
+        );
+        llvm::Function *strlen_func = _context_manager.get_module()->getFunction("strlen");
+        if (!strlen_func) {
+            strlen_func = llvm::Function::Create(strlen_type, llvm::Function::ExternalLinkage, "strlen", _context_manager.get_module());
+        }
+
+        // Get or create malloc function
+        llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+            llvm::PointerType::get(context, 0), 
+            {llvm::Type::getInt64Ty(context)}, 
+            false
+        );
+        llvm::Function *malloc_func = _context_manager.get_module()->getFunction("malloc");
+        if (!malloc_func) {
+            malloc_func = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", _context_manager.get_module());
+        }
+
+        // Get or create strcpy function  
+        llvm::FunctionType *strcpy_type = llvm::FunctionType::get(
+            llvm::PointerType::get(context, 0), 
+            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)}, 
+            false
+        );
+        llvm::Function *strcpy_func = _context_manager.get_module()->getFunction("strcpy");
+        if (!strcpy_func) {
+            strcpy_func = llvm::Function::Create(strcpy_type, llvm::Function::ExternalLinkage, "strcpy", _context_manager.get_module());
+        }
+
+        // Get or create strcat function
+        llvm::FunctionType *strcat_type = llvm::FunctionType::get(
+            llvm::PointerType::get(context, 0), 
+            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)}, 
+            false
+        );
+        llvm::Function *strcat_func = _context_manager.get_module()->getFunction("strcat");
+        if (!strcat_func) {
+            strcat_func = llvm::Function::Create(strcat_type, llvm::Function::ExternalLinkage, "strcat", _context_manager.get_module());
+        }
+
+        // Calculate lengths of both strings
+        llvm::Value *len1 = builder.CreateCall(strlen_func, {left_str}, "len1");
+        llvm::Value *len2 = builder.CreateCall(strlen_func, {right_str}, "len2");
+
+        // Calculate total length (len1 + len2 + 1 for null terminator)
+        llvm::Value *total_len = builder.CreateAdd(len1, len2, "total_len_temp");
+        llvm::Value *total_len_with_null = builder.CreateAdd(total_len, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1), "total_len");
+
+        // Allocate memory for result string
+        llvm::Value *result_str = builder.CreateCall(malloc_func, {total_len_with_null}, "result_str");
+
+        // Copy first string to result
+        builder.CreateCall(strcpy_func, {result_str, left_str});
+
+        // Concatenate second string to result
+        builder.CreateCall(strcat_func, {result_str, right_str});
+
+        return result_str;
+    }
+
+    llvm::Value *CodegenVisitor::generate_string_char_concatenation(llvm::Value *str_val, llvm::Value *char_val)
+    {
+        if (!str_val || !char_val)
+            return nullptr;
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Get or create strlen function
+        llvm::FunctionType *strlen_type = llvm::FunctionType::get(
+            llvm::Type::getInt64Ty(context), 
+            {llvm::PointerType::get(context, 0)}, 
+            false
+        );
+        llvm::Function *strlen_func = _context_manager.get_module()->getFunction("strlen");
+        if (!strlen_func) {
+            strlen_func = llvm::Function::Create(strlen_type, llvm::Function::ExternalLinkage, "strlen", _context_manager.get_module());
+        }
+
+        // Get or create malloc function
+        llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+            llvm::PointerType::get(context, 0), 
+            {llvm::Type::getInt64Ty(context)}, 
+            false
+        );
+        llvm::Function *malloc_func = _context_manager.get_module()->getFunction("malloc");
+        if (!malloc_func) {
+            malloc_func = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", _context_manager.get_module());
+        }
+
+        // Get or create strcpy function  
+        llvm::FunctionType *strcpy_type = llvm::FunctionType::get(
+            llvm::PointerType::get(context, 0), 
+            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)}, 
+            false
+        );
+        llvm::Function *strcpy_func = _context_manager.get_module()->getFunction("strcpy");
+        if (!strcpy_func) {
+            strcpy_func = llvm::Function::Create(strcpy_type, llvm::Function::ExternalLinkage, "strcpy", _context_manager.get_module());
+        }
+
+        // Calculate length of string
+        llvm::Value *str_len = builder.CreateCall(strlen_func, {str_val}, "str_len");
+
+        // Calculate total length (str_len + 1 char + 1 null terminator)
+        llvm::Value *total_len = builder.CreateAdd(str_len, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2), "total_len");
+
+        // Allocate memory for result string
+        llvm::Value *result_str = builder.CreateCall(malloc_func, {total_len}, "result_str");
+
+        // Copy string to result
+        builder.CreateCall(strcpy_func, {result_str, str_val});
+
+        // Get pointer to end of string (str_len position)
+        llvm::Value *end_ptr = builder.CreateGEP(llvm::Type::getInt8Ty(context), result_str, {str_len}, "end_ptr");
+
+        // Store the character at the end
+        builder.CreateStore(char_val, end_ptr);
+
+        // Store null terminator after the character
+        llvm::Value *null_ptr = builder.CreateGEP(llvm::Type::getInt8Ty(context), end_ptr, {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1)}, "null_ptr");
+        builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0), null_ptr);
+
+        return result_str;
+    }
+
+    llvm::Value *CodegenVisitor::generate_char_string_concatenation(llvm::Value *char_val, llvm::Value *str_val)
+    {
+        if (!char_val || !str_val)
+            return nullptr;
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Get or create strlen function
+        llvm::FunctionType *strlen_type = llvm::FunctionType::get(
+            llvm::Type::getInt64Ty(context), 
+            {llvm::PointerType::get(context, 0)}, 
+            false
+        );
+        llvm::Function *strlen_func = _context_manager.get_module()->getFunction("strlen");
+        if (!strlen_func) {
+            strlen_func = llvm::Function::Create(strlen_type, llvm::Function::ExternalLinkage, "strlen", _context_manager.get_module());
+        }
+
+        // Get or create malloc function
+        llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+            llvm::PointerType::get(context, 0), 
+            {llvm::Type::getInt64Ty(context)}, 
+            false
+        );
+        llvm::Function *malloc_func = _context_manager.get_module()->getFunction("malloc");
+        if (!malloc_func) {
+            malloc_func = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", _context_manager.get_module());
+        }
+
+        // Get or create strcpy function  
+        llvm::FunctionType *strcpy_type = llvm::FunctionType::get(
+            llvm::PointerType::get(context, 0), 
+            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)}, 
+            false
+        );
+        llvm::Function *strcpy_func = _context_manager.get_module()->getFunction("strcpy");
+        if (!strcpy_func) {
+            strcpy_func = llvm::Function::Create(strcpy_type, llvm::Function::ExternalLinkage, "strcpy", _context_manager.get_module());
+        }
+
+        // Calculate length of string
+        llvm::Value *str_len = builder.CreateCall(strlen_func, {str_val}, "str_len");
+
+        // Calculate total length (1 char + str_len + 1 null terminator)
+        llvm::Value *total_len = builder.CreateAdd(str_len, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2), "total_len");
+
+        // Allocate memory for result string
+        llvm::Value *result_str = builder.CreateCall(malloc_func, {total_len}, "result_str");
+
+        // Store the character at the beginning
+        builder.CreateStore(char_val, result_str);
+
+        // Get pointer to position after the character
+        llvm::Value *after_char_ptr = builder.CreateGEP(llvm::Type::getInt8Ty(context), result_str, {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1)}, "after_char_ptr");
+
+        // Copy string after the character
+        builder.CreateCall(strcpy_func, {after_char_ptr, str_val});
+
+        return result_str;
+    }
+
     llvm::Value *CodegenVisitor::generate_unary_operation(Cryo::UnaryExpressionNode *node)
     {
         if (!node)

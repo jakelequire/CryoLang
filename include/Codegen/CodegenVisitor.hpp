@@ -322,6 +322,11 @@ namespace Cryo::Codegen
         llvm::Value *generate_array_access(Cryo::ArrayAccessNode *node);
         llvm::Value *generate_member_access(Cryo::MemberAccessNode *node);
 
+        // String concatenation helpers
+        llvm::Value *generate_string_concatenation(llvm::Value *left_str, llvm::Value *right_str);
+        llvm::Value *generate_string_char_concatenation(llvm::Value *str_val, llvm::Value *char_val);
+        llvm::Value *generate_char_string_concatenation(llvm::Value *char_val, llvm::Value *str_val);
+
         // Function call helpers
         std::string extract_function_name_from_member_access(Cryo::MemberAccessNode *node);
         std::string map_cryo_to_c_function(const std::string &cryo_name);
@@ -369,6 +374,7 @@ namespace Cryo::Codegen
         llvm::Value *cast_value(llvm::Value *value, llvm::Type *target_type);
         bool is_lvalue(Cryo::ExpressionNode *expr);
         bool is_primitive_type(const std::string &type_name);
+        std::string process_escape_sequences(const std::string &str);
 
         // Error reporting
         void report_error(const std::string &message);
