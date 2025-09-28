@@ -1078,6 +1078,16 @@ namespace Cryo
                         {
                             result_type = left_type; // string + string = string
                         }
+                        // Handle string + char concatenation for + operator
+                        else if (op == TokenKind::TK_PLUS && left_type->name() == "string" && right_type->name() == "char")
+                        {
+                            result_type = left_type; // string + char = string
+                        }
+                        // Handle char + string concatenation for + operator
+                        else if (op == TokenKind::TK_PLUS && left_type->name() == "char" && right_type->name() == "string")
+                        {
+                            result_type = right_type; // char + string = string
+                        }
                         // Handle numeric arithmetic
                         else if (left_type == right_type &&
                                  (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float"))
