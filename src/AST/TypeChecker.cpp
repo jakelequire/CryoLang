@@ -1089,10 +1089,29 @@ namespace Cryo
                             result_type = right_type; // char + string = string
                         }
                         // Handle numeric arithmetic
-                        else if (left_type == right_type &&
-                                 (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float"))
+                        else if (left_type->is_numeric() && right_type->is_numeric())
                         {
-                            result_type = left_type;
+                            // Mixed float/int arithmetic
+                            if (left_type->kind() == TypeKind::Float && right_type->is_integral())
+                            {
+                                result_type = left_type; // float + int = float
+                            }
+                            else if (left_type->is_integral() && right_type->kind() == TypeKind::Float)
+                            {
+                                result_type = right_type; // int + float = float
+                            }
+                            // Same type numeric operations
+                            else if (left_type == right_type &&
+                                     (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float"))
+                            {
+                                result_type = left_type;
+                            }
+                            else
+                            {
+                                report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                             "Type mismatch in arithmetic operation: " +
+                                                 left_type->name() + " and " + right_type->name());
+                            }
                         }
                         else
                         {
@@ -2534,6 +2553,37 @@ namespace Cryo
                 case Type::ConversionSafety::Impossible:
                     // Fall through to return false
                     break;
+            }
+        }
+        
+        // Check for float-to-int and int-to-float conversions
+        if (!is_assignable && 
+            ((lhs_type->is_integral() && rhs_type->kind() == TypeKind::Float) ||
+             (lhs_type->kind() == TypeKind::Float && rhs_type->is_integral())))
+        {
+            // Allow float-to-int and int-to-float conversions with warnings
+            if (lhs_type->is_integral() && rhs_type->kind() == TypeKind::Float)
+            {
+                // float to int - may lose precision
+                report_conversion_warning(
+                    TypeWarning::WarningKind::PotentialDataLoss, loc,
+                    "Converting float to int may lose precision and fractional part",
+                    rhs_type, lhs_type
+                );
+                return true;
+            }
+            else if (lhs_type->kind() == TypeKind::Float && rhs_type->is_integral())
+            {
+                // int to float - generally safe but may lose precision for very large integers
+                if (rhs_type->size_bytes() > 4) // int64 to float32 could lose precision
+                {
+                    report_conversion_warning(
+                        TypeWarning::WarningKind::PotentialDataLoss, loc,
+                        "Converting large integer to float may lose precision",
+                        rhs_type, lhs_type
+                    );
+                }
+                return true;
             }
         }
 

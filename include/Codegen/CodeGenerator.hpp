@@ -61,7 +61,8 @@ namespace Cryo::Codegen
             std::unique_ptr<TargetConfig> target_config,
             Cryo::ASTContext &ast_context,
             Cryo::SymbolTable &symbol_table,
-            const std::string &namespace_name = "");
+            const std::string &namespace_name = "",
+            Cryo::DiagnosticManager* gdm = nullptr);
 
         ~CodeGenerator();
 
@@ -217,6 +218,7 @@ namespace Cryo::Codegen
         // Frontend context references
         Cryo::ASTContext &_ast_context;
         Cryo::SymbolTable &_symbol_table;
+        Cryo::DiagnosticManager* _gdm;
 
         // Compilation state
         std::string _module_name;
@@ -281,6 +283,20 @@ namespace Cryo::Codegen
         Cryo::ASTContext &ast_context,
         Cryo::SymbolTable &symbol_table,
         const std::string &namespace_name = "");
+
+    /**
+     * @brief Create a default CodeGenerator with GDM support
+     * @param ast_context Reference to AST context
+     * @param symbol_table Reference to symbol table  
+     * @param namespace_name Module namespace name
+     * @param gdm Diagnostic manager for error reporting
+     * @return Unique pointer to CodeGenerator instance
+     */
+    std::unique_ptr<CodeGenerator> create_default_codegen(
+        Cryo::ASTContext &ast_context,
+        Cryo::SymbolTable &symbol_table,
+        const std::string &namespace_name,
+        Cryo::DiagnosticManager* gdm);
 
     /**
      * @brief Create a CodeGenerator for specific target

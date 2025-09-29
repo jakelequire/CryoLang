@@ -142,8 +142,9 @@ namespace Cryo
             // Phase 5: Semantic analysis (including symbol table population)
             if (!analyze())
             {
+                std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
                 _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
-                                                  "Analysis failed", SourceRange{}, file_path);
+                                                  "Analysis failed in namespace '" + namespace_name + "'", SourceRange{}, file_path);
                 return false;
             }
 
@@ -242,7 +243,7 @@ namespace Cryo
 
             // Create CodeGenerator now that we have the namespace information
             std::string namespace_for_module = _current_namespace.empty() ? "cryo_program" : _current_namespace;
-            _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module);
+            _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module, _diagnostic_manager.get());
             
             // Configure stdlib compilation mode if enabled
             if (_stdlib_compilation_mode)

@@ -11,6 +11,7 @@
 namespace Cryo
 {
     class CallExpressionNode;
+    class DiagnosticManager;  // Forward declaration
 }
 
 namespace Cryo::Codegen
@@ -26,7 +27,7 @@ namespace Cryo::Codegen
     class Intrinsics
     {
     public:
-        explicit Intrinsics(LLVMContextManager& context_manager);
+        explicit Intrinsics(LLVMContextManager& context_manager, Cryo::DiagnosticManager* gdm = nullptr);
         ~Intrinsics() = default;
 
         // Main entry point for intrinsic call generation
@@ -68,6 +69,10 @@ namespace Cryo::Codegen
         llvm::Value* generate_sprintf(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_fprintf(const std::vector<llvm::Value*>& args);
 
+        // String conversion intrinsics
+        llvm::Value* generate_float32_to_string(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_float64_to_string(const std::vector<llvm::Value*>& args);
+
         // Math operations intrinsics
         llvm::Value* generate_sqrt(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_pow(const std::vector<llvm::Value*>& args);
@@ -95,11 +100,14 @@ namespace Cryo::Codegen
 
     private:
         LLVMContextManager& _context_manager;
+        Cryo::DiagnosticManager* _gdm;
         bool _has_errors;
         std::string _last_error;
 
         // Helper methods
         void report_error(const std::string& message);
+        void report_unimplemented_intrinsic(const std::string& intrinsic_name, 
+                                           Cryo::CallExpressionNode* node = nullptr);
         llvm::Value* create_syscall(llvm::Value* syscall_num, 
                                   const std::vector<llvm::Value*>& args);
         llvm::Value* ensure_type(llvm::Value* value, llvm::Type* target_type, 
