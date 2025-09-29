@@ -55,9 +55,9 @@ namespace Cryo
     {
         enum class WarningKind
         {
-            PotentialDataLoss,      // Narrowing conversion (i64 → i32)
-            SignConversion,         // Sign change (i32 → u32)
-            UnsafeConversion,       // Mixed sign/size conversion
+            PotentialDataLoss, // Narrowing conversion (i64 → i32)
+            SignConversion,    // Sign change (i32 → u32)
+            UnsafeConversion,  // Mixed sign/size conversion
             UnusedVariable,
             ImplicitConversion
         };
@@ -72,7 +72,7 @@ namespace Cryo
             : kind(k), location(loc), message(msg) {}
 
         TypeWarning(WarningKind k, SourceLocation loc, const std::string &msg,
-                   Type *from, Type *to)
+                    Type *from, Type *to)
             : kind(k), location(loc), message(msg),
               from_type(from), to_type(to) {}
 
@@ -280,8 +280,8 @@ namespace Cryo
         // Error reporting
         void report_error(TypeError::ErrorKind kind, SourceLocation loc, const std::string &message);
         void report_warning(TypeWarning::WarningKind kind, SourceLocation loc, const std::string &message);
-        void report_conversion_warning(TypeWarning::WarningKind kind, SourceLocation loc, 
-                                     const std::string &message, Type *from, Type *to);
+        void report_conversion_warning(TypeWarning::WarningKind kind, SourceLocation loc,
+                                       const std::string &message, Type *from, Type *to);
         void report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context);
         void report_undefined_symbol(SourceLocation loc, const std::string &symbol_name);
         void report_redefined_symbol(SourceLocation loc, const std::string &symbol_name);
@@ -297,6 +297,7 @@ namespace Cryo
         bool is_comparable_type(Type *type);
         bool is_integral_type(Type *type);
         bool is_boolean_context_valid(Type *type);
+        bool is_primitive_integer_type(const std::string &type_name);
 
         // Enum validation helpers
         void validate_enum_variant(EnumVariantNode &node, const std::vector<std::string> &generic_param_names);

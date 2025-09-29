@@ -17,13 +17,13 @@ namespace Cryo::Codegen
 
     CodegenVisitor::CodegenVisitor(LLVMContextManager &context_manager,
                                    Cryo::SymbolTable &symbol_table,
-                                   Cryo::DiagnosticManager* gdm)
-        : _context_manager(context_manager), 
-          _symbol_table(symbol_table), 
-          _value_context(std::make_unique<ValueContext>()), 
+                                   Cryo::DiagnosticManager *gdm)
+        : _context_manager(context_manager),
+          _symbol_table(symbol_table),
+          _value_context(std::make_unique<ValueContext>()),
           _type_mapper(std::make_unique<TypeMapper>(context_manager)),
           _intrinsics(std::make_unique<Intrinsics>(context_manager, gdm)),
-          _current_value(nullptr), 
+          _current_value(nullptr),
           _has_errors(false),
           _stdlib_compilation_mode(false)
     {
@@ -64,7 +64,7 @@ namespace Cryo::Codegen
         return (it != _node_values.end()) ? it->second : nullptr;
     }
 
-    void CodegenVisitor::set_source_info(const std::string& source_file, const std::string& namespace_context)
+    void CodegenVisitor::set_source_info(const std::string &source_file, const std::string &namespace_context)
     {
         _source_file = source_file;
         _namespace_context = namespace_context;
@@ -77,11 +77,11 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::ProgramNode &node)
     {
         std::cout << "[DEBUG] CodegenVisitor::visit(ProgramNode) - stdlib_compilation_mode: " << (_stdlib_compilation_mode ? "true" : "false") << std::endl;
-        
+
         // In stdlib compilation mode, use the existing main module instead of creating a new one
-        llvm::Module* module = nullptr;
+        llvm::Module *module = nullptr;
         std::string module_name = "cryo_program"; // fallback default
-        
+
         if (_stdlib_compilation_mode)
         {
             // In stdlib mode, use the existing main module
@@ -96,7 +96,7 @@ namespace Cryo::Codegen
                 std::cout << "[WARNING] No main module found in stdlib mode, creating fallback" << std::endl;
             }
         }
-        
+
         if (!module)
         {
             // Create module name prioritizing namespace context
@@ -157,16 +157,16 @@ namespace Cryo::Codegen
                 std::cout << "[DEBUG] Skipping null statement " << (i + 1) << std::endl;
             }
         }
-        
+
         std::cout << "[DEBUG] Completed processing main program" << std::endl;
     }
 
     void CodegenVisitor::visit(Cryo::FunctionDeclarationNode &node)
     {
         std::cout << "[DEBUG] Visiting FunctionDeclarationNode: " << node.name() << std::endl;
-        
+
         // Check if this is a StructMethodNode that was already processed as a primitive method
-        if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode*>(&node))
+        if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(&node))
         {
             // Check if this method was already processed by looking for the generated function
             std::string potential_scoped_name = current_primitive_type + "::" + node.name();
@@ -178,13 +178,13 @@ namespace Cryo::Codegen
                 return;
             }
         }
-        
+
         try
         {
             // Skip generic functions for now - they require specialized template instantiation
             if (!node.generic_parameters().empty())
             {
-                std::cout << "[DEBUG] Skipping generic function declaration: " << node.name() << " (has " 
+                std::cout << "[DEBUG] Skipping generic function declaration: " << node.name() << " (has "
                           << node.generic_parameters().size() << " generic parameters)" << std::endl;
                 register_value(&node, nullptr);
                 return;
@@ -199,8 +199,8 @@ namespace Cryo::Codegen
             }
 
             // Register the function in symbol table with multiple lookup keys
-            _functions[node.name()] = function;  // Simple name lookup
-            
+            _functions[node.name()] = function; // Simple name lookup
+
             // Also register with namespace-qualified name if we're in a namespace
             if (!_namespace_context.empty())
             {
@@ -208,7 +208,7 @@ namespace Cryo::Codegen
                 _functions[qualified_name] = function;
                 std::cout << "[DEBUG] Registered function with qualified name: " << qualified_name << std::endl;
             }
-            
+
             register_value(&node, function);
 
             // Generate function body if present
@@ -240,10 +240,10 @@ namespace Cryo::Codegen
             // For memory efficiency, we'll register intrinsics on-demand rather than pre-allocating
             // LLVM function types for all 123 intrinsic functions at once
             std::cout << "[DEBUG] Deferring intrinsic registration: " << node.name() << std::endl;
-            
+
             // Simply store the intrinsic name for later on-demand registration
             // This prevents memory exhaustion from creating 123 LLVM function types upfront
-            
+
             std::cout << "[DEBUG] Intrinsic '" << node.name() << "' deferred successfully" << std::endl;
         }
         catch (const std::exception &e)
@@ -306,7 +306,7 @@ namespace Cryo::Codegen
                     if (_stdlib_compilation_mode)
                     {
                         std::cout << "[INFO] Skipping full codegen for imported module in stdlib mode: " << node.path() << " (avoiding symbol duplication in stdlib compilation)" << std::endl;
-                        
+
                         // NOTE: In stdlib compilation mode, we should NOT generate full implementations
                         // for imported modules to avoid symbol duplication. Each module should only
                         // generate its own implementations when compiled directly.
@@ -316,7 +316,7 @@ namespace Cryo::Codegen
                     else
                     {
                         std::cout << "[INFO] Skipping full codegen for imported module: " << node.path() << " (avoiding symbol duplication)" << std::endl;
-                        
+
                         // NOTE: We skip full codegen for imported modules to avoid symbol duplication.
                         // The imported module will be compiled separately and linked later.
                         // We only need the symbol information for type checking and forward declarations,
@@ -390,7 +390,8 @@ namespace Cryo::Codegen
         {
             // Debug: Check ValueContext state at the very beginning
             std::cout << "[DEBUG] VarDecl start: this=" << this << ", _value_context=" << _value_context.get() << std::endl;
-            if (!_value_context) {
+            if (!_value_context)
+            {
                 std::cerr << "[ERROR] _value_context is null in visit(VariableDeclarationNode)!" << std::endl;
                 return;
             }
@@ -637,7 +638,7 @@ namespace Cryo::Codegen
 
                 std::string method_name = method->name();
                 std::string qualified_name;
-                
+
                 // Include full namespace in qualified name for proper symbol lookup
                 if (!_namespace_context.empty())
                 {
@@ -647,12 +648,12 @@ namespace Cryo::Codegen
                 {
                     qualified_name = class_name + "::" + method_name;
                 }
-                
+
                 std::cout << "[CodegenVisitor] Full qualified method name: " << qualified_name << std::endl;
 
                 // Build parameter types - static methods don't need 'this' parameter
                 std::vector<llvm::Type *> param_types;
-                
+
                 bool is_static = method->is_static();
                 if (!is_static)
                 {
@@ -701,7 +702,7 @@ namespace Cryo::Codegen
 
                 // Set parameter names
                 auto arg_it = func->arg_begin();
-                
+
                 if (!is_static)
                 {
                     arg_it->setName("this");
@@ -806,7 +807,7 @@ namespace Cryo::Codegen
         // Skip generic enums for now - they require specialized template instantiation
         if (!node.generic_parameters().empty())
         {
-            std::cout << "[DEBUG] Skipping generic enum declaration: " << node.name() << " (has " 
+            std::cout << "[DEBUG] Skipping generic enum declaration: " << node.name() << " (has "
                       << node.generic_parameters().size() << " generic parameters)" << std::endl;
             register_value(&node, nullptr);
             return;
@@ -895,12 +896,15 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::StructMethodNode &node)
     {
         std::cout << "[CodegenVisitor] Generating struct method: " << node.name() << std::endl;
-        
+
         // Check if we're in a primitive implementation block context
-        if (current_primitive_type.empty()) {
+        if (current_primitive_type.empty())
+        {
             // Regular struct method - delegate to parent visitor
-            visit(static_cast<FunctionDeclarationNode&>(node));
-        } else {
+            visit(static_cast<FunctionDeclarationNode &>(node));
+        }
+        else
+        {
             // Primitive method - needs special handling for 'this' parameter
             generate_primitive_method(&node, current_primitive_type);
         }
@@ -980,17 +984,17 @@ namespace Cryo::Codegen
 
         // Check if this is a primitive type first
         llvm::Type *primitive_type = _type_mapper->map_type(target_type_name);
-        std::cout << "[DEBUG] Implementation block for: " << target_type_name 
-                  << ", mapped type: " << (primitive_type ? "valid" : "null") 
+        std::cout << "[DEBUG] Implementation block for: " << target_type_name
+                  << ", mapped type: " << (primitive_type ? "valid" : "null")
                   << ", is_primitive: " << (is_primitive_type(target_type_name) ? "yes" : "no") << std::endl;
-        
+
         if (primitive_type && is_primitive_type(target_type_name))
         {
             std::cout << "[CodegenVisitor] Generating implementation block for primitive type: " << target_type_name << std::endl;
-            
+
             // Set primitive type context for method generation
             current_primitive_type = target_type_name;
-            
+
             // Generate all method implementations for primitive type
             for (const auto &method : node.method_implementations())
             {
@@ -1001,7 +1005,7 @@ namespace Cryo::Codegen
                     visit(*method);
                 }
             }
-            
+
             // Clear primitive type context
             current_primitive_type.clear();
             return; // We've handled the primitive implementation
@@ -1213,7 +1217,8 @@ namespace Cryo::Codegen
                 llvm::Value *return_value = get_current_value();
 
                 std::cout << "[DEBUG] Return statement: return_value = " << (return_value ? "valid" : "NULL") << std::endl;
-                if (return_value) {
+                if (return_value)
+                {
                     std::cout << "[DEBUG] Return value type: " << return_value->getType()->getTypeID() << std::endl;
                 }
 
@@ -1404,7 +1409,7 @@ namespace Cryo::Codegen
         llvm::Function *function = builder.GetInsertBlock()->getParent();
         llvm::BasicBlock *unreachableBlock = llvm::BasicBlock::Create(_context_manager.get_context(), "after.break", function);
         builder.SetInsertPoint(unreachableBlock);
-        
+
         // Add unreachable terminator since this code should never be reached
         builder.CreateUnreachable();
 
@@ -1424,7 +1429,7 @@ namespace Cryo::Codegen
 
         // Get the current breakable context
         const auto &breakable_context = _breakable_stack.top();
-        
+
         // Continue is only valid in loop contexts, not switch contexts
         if (breakable_context.context_type != BreakableContext::Loop)
         {
@@ -1441,7 +1446,7 @@ namespace Cryo::Codegen
         llvm::Function *function = builder.GetInsertBlock()->getParent();
         llvm::BasicBlock *unreachableBlock = llvm::BasicBlock::Create(_context_manager.get_context(), "after.continue", function);
         builder.SetInsertPoint(unreachableBlock);
-        
+
         // Add unreachable terminator since this code should never be reached
         builder.CreateUnreachable();
 
@@ -2018,7 +2023,7 @@ namespace Cryo::Codegen
                     llvm_type = type_it->second;
                 }
             }
-            
+
             if (llvm_type)
             {
                 // Calculate size using LLVM's data layout
@@ -2855,7 +2860,7 @@ namespace Cryo::Codegen
                 if (param)
                 {
                     std::string param_type_annotation = param->type_annotation();
-                    
+
                     // Check if this is a variadic parameter
                     if (param_type_annotation == "...")
                     {
@@ -2863,7 +2868,7 @@ namespace Cryo::Codegen
                         // Skip variadic parameters in LLVM function signature
                         continue;
                     }
-                    
+
                     llvm::Type *param_type = _type_mapper->map_type(param_type_annotation);
                     if (!param_type)
                     {
@@ -2882,7 +2887,7 @@ namespace Cryo::Codegen
 
             // Use simple function name in IR - namespace resolution handled by symbol table
             std::string function_name = node->name();
-            std::cout << "[DEBUG] Function name generation - using simple IR name: " << function_name 
+            std::cout << "[DEBUG] Function name generation - using simple IR name: " << function_name
                       << " (namespace: '" << _namespace_context << "')" << std::endl;
 
             // Create function
@@ -2969,7 +2974,8 @@ namespace Cryo::Codegen
 
             // Debug ValueContext before entering scope
             std::cout << "[DEBUG] Before enter_scope: this=" << this << ", _value_context=" << _value_context.get() << std::endl;
-            if (!_value_context) {
+            if (!_value_context)
+            {
                 std::cerr << "[ERROR] _value_context is null before enter_scope!" << std::endl;
                 return false;
             }
@@ -3092,30 +3098,32 @@ namespace Cryo::Codegen
         }
     }
 
-    void CodegenVisitor::generate_primitive_method(Cryo::StructMethodNode *node, const std::string& primitive_type_name)
+    void CodegenVisitor::generate_primitive_method(Cryo::StructMethodNode *node, const std::string &primitive_type_name)
     {
-        if (!node) return;
-        
+        if (!node)
+            return;
+
         std::cout << "[CodegenVisitor] Generating primitive method: " << primitive_type_name << "::" << node->name() << std::endl;
-        
+
         // Debug: Check _value_context at the very start
         std::cout << "[DEBUG] At method start, _value_context=" << _value_context.get() << std::endl;
-        if (!_value_context) {
+        if (!_value_context)
+        {
             std::cerr << "[ERROR] _value_context is null at method start!" << std::endl;
             report_error("Value context is null at method start", node);
             return;
         }
-        
+
         auto module = _context_manager.get_module();
         auto &builder = _context_manager.get_builder();
         auto &llvm_context = _context_manager.get_context();
-        
+
         if (!module)
         {
             report_error("No module available for primitive method generation");
             return;
         }
-        
+
         // Get primitive type for 'this' parameter
         llvm::Type *primitive_type = _type_mapper->map_type(primitive_type_name);
         if (!primitive_type)
@@ -3123,13 +3131,13 @@ namespace Cryo::Codegen
             report_error("Cannot map primitive type: " + primitive_type_name);
             return;
         }
-        
+
         // Create function signature with 'this' parameter
-        std::vector<llvm::Type*> param_types;
-        
+        std::vector<llvm::Type *> param_types;
+
         // Add 'this' parameter (pointer to primitive type)
         param_types.push_back(llvm::PointerType::getUnqual(primitive_type));
-        
+
         // Add regular parameters
         for (const auto &param : node->parameters())
         {
@@ -3142,7 +3150,7 @@ namespace Cryo::Codegen
                 }
             }
         }
-        
+
         // Map return type
         llvm::Type *return_type = nullptr;
         if (!node->return_type_annotation().empty() && node->return_type_annotation() != "void")
@@ -3153,24 +3161,23 @@ namespace Cryo::Codegen
         {
             return_type = llvm::Type::getVoidTy(llvm_context);
         }
-        
+
         // Create function type
         llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
-        
+
         // Create function with scoped name
         std::string func_name = primitive_type_name + "::" + node->name();
         llvm::Function *func = llvm::Function::Create(
-            func_type, 
+            func_type,
             llvm::Function::ExternalLinkage,
             func_name,
-            module
-        );
-        
+            module);
+
         // Set parameter names
         auto arg_it = func->arg_begin();
         arg_it->setName("this");
         ++arg_it;
-        
+
         for (const auto &param : node->parameters())
         {
             if (param && arg_it != func->arg_end())
@@ -3179,38 +3186,39 @@ namespace Cryo::Codegen
                 ++arg_it;
             }
         }
-        
+
         // Generate function body
         llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(llvm_context, "entry", func);
         builder.SetInsertPoint(entry_block);
-        
+
         // Set up function context for body generation
         _current_function = std::make_unique<FunctionContext>(func, node);
         _current_function->entry_block = entry_block;
-        
+
         // Create allocas for parameters and set up symbol table
         arg_it = func->arg_begin();
-        
+
         // Handle 'this' parameter
         llvm::AllocaInst *this_alloca = create_entry_block_alloca(func, llvm::PointerType::getUnqual(primitive_type), "this");
         if (this_alloca)
         {
             builder.CreateStore(&*arg_it, this_alloca);
-            
+
             // Debug: Check if _value_context is valid
-            if (!_value_context) {
+            if (!_value_context)
+            {
                 std::cerr << "[ERROR] _value_context is null in generate_primitive_method!" << std::endl;
                 report_error("Value context is null", node);
                 return;
             }
-            
+
             std::cout << "[DEBUG] Setting 'this' value in context, _value_context=" << _value_context.get() << std::endl;
-            
+
             // Add to value context so it can be resolved in the function body
             _value_context->set_value("this", this_alloca, this_alloca, llvm::PointerType::getUnqual(primitive_type));
         }
         ++arg_it;
-        
+
         // Handle regular parameters
         for (const auto &param : node->parameters())
         {
@@ -3229,13 +3237,13 @@ namespace Cryo::Codegen
                 ++arg_it;
             }
         }
-        
+
         // Generate function body
         if (node->body())
         {
             node->body()->accept(*this);
         }
-        
+
         // Ensure proper termination
         if (!builder.GetInsertBlock()->getTerminator())
         {
@@ -3249,7 +3257,7 @@ namespace Cryo::Codegen
                 builder.CreateRet(llvm::Constant::getNullValue(return_type));
             }
         }
-        
+
         // Clean up
         _current_function.reset();
         register_value(node, func);
@@ -3723,13 +3731,13 @@ namespace Cryo::Codegen
                     // Handle integer type coercion for different bit widths
                     llvm::Type *left_type = left_val->getType();
                     llvm::Type *right_type = right_val->getType();
-                    
+
                     if (left_type != right_type)
                     {
                         // Get bit widths
                         unsigned left_bits = left_type->getIntegerBitWidth();
                         unsigned right_bits = right_type->getIntegerBitWidth();
-                        
+
                         // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
                         if (left_bits > right_bits)
                         {
@@ -3738,11 +3746,11 @@ namespace Cryo::Codegen
                         }
                         else if (right_bits > left_bits)
                         {
-                            // Truncate right operand to match left operand's type  
+                            // Truncate right operand to match left operand's type
                             right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
                         }
                     }
-                    
+
                     result = builder.CreateAdd(left_val, right_val, "add.tmp");
                 }
                 else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
@@ -3764,7 +3772,7 @@ namespace Cryo::Codegen
                     // This is string + string concatenation
                     result = generate_string_concatenation(left_val, right_val);
                 }
-                else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy() && 
+                else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy() &&
                          right_val->getType()->getIntegerBitWidth() == 8)
                 {
                     // This is string + char concatenation
@@ -3784,13 +3792,13 @@ namespace Cryo::Codegen
                     // Handle integer type coercion for different bit widths
                     llvm::Type *left_type = left_val->getType();
                     llvm::Type *right_type = right_val->getType();
-                    
+
                     if (left_type != right_type)
                     {
                         // Get bit widths
                         unsigned left_bits = left_type->getIntegerBitWidth();
                         unsigned right_bits = right_type->getIntegerBitWidth();
-                        
+
                         // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
                         if (left_bits > right_bits)
                         {
@@ -3799,11 +3807,11 @@ namespace Cryo::Codegen
                         }
                         else if (right_bits > left_bits)
                         {
-                            // Truncate right operand to match left operand's type  
+                            // Truncate right operand to match left operand's type
                             right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
                         }
                     }
-                    
+
                     result = builder.CreateSub(left_val, right_val, "sub.tmp");
                 }
                 else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
@@ -3826,13 +3834,13 @@ namespace Cryo::Codegen
                     // Handle integer type coercion for different bit widths
                     llvm::Type *left_type = left_val->getType();
                     llvm::Type *right_type = right_val->getType();
-                    
+
                     if (left_type != right_type)
                     {
                         // Get bit widths
                         unsigned left_bits = left_type->getIntegerBitWidth();
                         unsigned right_bits = right_type->getIntegerBitWidth();
-                        
+
                         // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
                         if (left_bits > right_bits)
                         {
@@ -3841,11 +3849,11 @@ namespace Cryo::Codegen
                         }
                         else if (right_bits > left_bits)
                         {
-                            // Truncate right operand to match left operand's type  
+                            // Truncate right operand to match left operand's type
                             right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
                         }
                     }
-                    
+
                     result = builder.CreateMul(left_val, right_val, "mul.tmp");
                 }
                 else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
@@ -3868,13 +3876,13 @@ namespace Cryo::Codegen
                     // Handle integer type coercion for different bit widths
                     llvm::Type *left_type = left_val->getType();
                     llvm::Type *right_type = right_val->getType();
-                    
+
                     if (left_type != right_type)
                     {
                         // Get bit widths
                         unsigned left_bits = left_type->getIntegerBitWidth();
                         unsigned right_bits = right_type->getIntegerBitWidth();
-                        
+
                         // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
                         if (left_bits > right_bits)
                         {
@@ -3883,11 +3891,11 @@ namespace Cryo::Codegen
                         }
                         else if (right_bits > left_bits)
                         {
-                            // Truncate right operand to match left operand's type  
+                            // Truncate right operand to match left operand's type
                             right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
                         }
                     }
-                    
+
                     result = builder.CreateSDiv(left_val, right_val, "div.tmp");
                 }
                 else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
@@ -3919,9 +3927,10 @@ namespace Cryo::Codegen
                     if (left_val->getType() != right_val->getType())
                     {
                         // Convert to the larger type
-                        llvm::Type* target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth() 
-                                                 ? left_val->getType() : right_val->getType();
-                        
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
                         if (left_val->getType() != target_type)
                             left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
                         if (right_val->getType() != target_type)
@@ -3950,9 +3959,10 @@ namespace Cryo::Codegen
                     if (left_val->getType() != right_val->getType())
                     {
                         // Convert to the larger type
-                        llvm::Type* target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth() 
-                                                 ? left_val->getType() : right_val->getType();
-                        
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
                         if (left_val->getType() != target_type)
                             left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
                         if (right_val->getType() != target_type)
@@ -3981,9 +3991,10 @@ namespace Cryo::Codegen
                     if (left_val->getType() != right_val->getType())
                     {
                         // Convert to the larger type
-                        llvm::Type* target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth() 
-                                                 ? left_val->getType() : right_val->getType();
-                        
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
                         if (left_val->getType() != target_type)
                             left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
                         if (right_val->getType() != target_type)
@@ -4012,9 +4023,10 @@ namespace Cryo::Codegen
                     if (left_val->getType() != right_val->getType())
                     {
                         // Convert to the larger type
-                        llvm::Type* target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth() 
-                                                 ? left_val->getType() : right_val->getType();
-                        
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
                         if (left_val->getType() != target_type)
                             left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
                         if (right_val->getType() != target_type)
@@ -4043,9 +4055,10 @@ namespace Cryo::Codegen
                     if (left_val->getType() != right_val->getType())
                     {
                         // Convert to the larger type
-                        llvm::Type* target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth() 
-                                                 ? left_val->getType() : right_val->getType();
-                        
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
                         if (left_val->getType() != target_type)
                             left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
                         if (right_val->getType() != target_type)
@@ -4074,9 +4087,10 @@ namespace Cryo::Codegen
                     if (left_val->getType() != right_val->getType())
                     {
                         // Convert to the larger type
-                        llvm::Type* target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth() 
-                                                 ? left_val->getType() : right_val->getType();
-                        
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
                         if (left_val->getType() != target_type)
                             left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
                         if (right_val->getType() != target_type)
@@ -4131,45 +4145,45 @@ namespace Cryo::Codegen
 
         // Get or create strlen function
         llvm::FunctionType *strlen_type = llvm::FunctionType::get(
-            llvm::Type::getInt64Ty(context), 
-            {llvm::PointerType::get(context, 0)}, 
-            false
-        );
+            llvm::Type::getInt64Ty(context),
+            {llvm::PointerType::get(context, 0)},
+            false);
         llvm::Function *strlen_func = _context_manager.get_module()->getFunction("strlen");
-        if (!strlen_func) {
+        if (!strlen_func)
+        {
             strlen_func = llvm::Function::Create(strlen_type, llvm::Function::ExternalLinkage, "strlen", _context_manager.get_module());
         }
 
         // Get or create malloc function
         llvm::FunctionType *malloc_type = llvm::FunctionType::get(
-            llvm::PointerType::get(context, 0), 
-            {llvm::Type::getInt64Ty(context)}, 
-            false
-        );
+            llvm::PointerType::get(context, 0),
+            {llvm::Type::getInt64Ty(context)},
+            false);
         llvm::Function *malloc_func = _context_manager.get_module()->getFunction("malloc");
-        if (!malloc_func) {
+        if (!malloc_func)
+        {
             malloc_func = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", _context_manager.get_module());
         }
 
-        // Get or create strcpy function  
+        // Get or create strcpy function
         llvm::FunctionType *strcpy_type = llvm::FunctionType::get(
-            llvm::PointerType::get(context, 0), 
-            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)}, 
-            false
-        );
+            llvm::PointerType::get(context, 0),
+            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)},
+            false);
         llvm::Function *strcpy_func = _context_manager.get_module()->getFunction("strcpy");
-        if (!strcpy_func) {
+        if (!strcpy_func)
+        {
             strcpy_func = llvm::Function::Create(strcpy_type, llvm::Function::ExternalLinkage, "strcpy", _context_manager.get_module());
         }
 
         // Get or create strcat function
         llvm::FunctionType *strcat_type = llvm::FunctionType::get(
-            llvm::PointerType::get(context, 0), 
-            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)}, 
-            false
-        );
+            llvm::PointerType::get(context, 0),
+            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)},
+            false);
         llvm::Function *strcat_func = _context_manager.get_module()->getFunction("strcat");
-        if (!strcat_func) {
+        if (!strcat_func)
+        {
             strcat_func = llvm::Function::Create(strcat_type, llvm::Function::ExternalLinkage, "strcat", _context_manager.get_module());
         }
 
@@ -4203,34 +4217,34 @@ namespace Cryo::Codegen
 
         // Get or create strlen function
         llvm::FunctionType *strlen_type = llvm::FunctionType::get(
-            llvm::Type::getInt64Ty(context), 
-            {llvm::PointerType::get(context, 0)}, 
-            false
-        );
+            llvm::Type::getInt64Ty(context),
+            {llvm::PointerType::get(context, 0)},
+            false);
         llvm::Function *strlen_func = _context_manager.get_module()->getFunction("strlen");
-        if (!strlen_func) {
+        if (!strlen_func)
+        {
             strlen_func = llvm::Function::Create(strlen_type, llvm::Function::ExternalLinkage, "strlen", _context_manager.get_module());
         }
 
         // Get or create malloc function
         llvm::FunctionType *malloc_type = llvm::FunctionType::get(
-            llvm::PointerType::get(context, 0), 
-            {llvm::Type::getInt64Ty(context)}, 
-            false
-        );
+            llvm::PointerType::get(context, 0),
+            {llvm::Type::getInt64Ty(context)},
+            false);
         llvm::Function *malloc_func = _context_manager.get_module()->getFunction("malloc");
-        if (!malloc_func) {
+        if (!malloc_func)
+        {
             malloc_func = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", _context_manager.get_module());
         }
 
-        // Get or create strcpy function  
+        // Get or create strcpy function
         llvm::FunctionType *strcpy_type = llvm::FunctionType::get(
-            llvm::PointerType::get(context, 0), 
-            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)}, 
-            false
-        );
+            llvm::PointerType::get(context, 0),
+            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)},
+            false);
         llvm::Function *strcpy_func = _context_manager.get_module()->getFunction("strcpy");
-        if (!strcpy_func) {
+        if (!strcpy_func)
+        {
             strcpy_func = llvm::Function::Create(strcpy_type, llvm::Function::ExternalLinkage, "strcpy", _context_manager.get_module());
         }
 
@@ -4269,34 +4283,34 @@ namespace Cryo::Codegen
 
         // Get or create strlen function
         llvm::FunctionType *strlen_type = llvm::FunctionType::get(
-            llvm::Type::getInt64Ty(context), 
-            {llvm::PointerType::get(context, 0)}, 
-            false
-        );
+            llvm::Type::getInt64Ty(context),
+            {llvm::PointerType::get(context, 0)},
+            false);
         llvm::Function *strlen_func = _context_manager.get_module()->getFunction("strlen");
-        if (!strlen_func) {
+        if (!strlen_func)
+        {
             strlen_func = llvm::Function::Create(strlen_type, llvm::Function::ExternalLinkage, "strlen", _context_manager.get_module());
         }
 
         // Get or create malloc function
         llvm::FunctionType *malloc_type = llvm::FunctionType::get(
-            llvm::PointerType::get(context, 0), 
-            {llvm::Type::getInt64Ty(context)}, 
-            false
-        );
+            llvm::PointerType::get(context, 0),
+            {llvm::Type::getInt64Ty(context)},
+            false);
         llvm::Function *malloc_func = _context_manager.get_module()->getFunction("malloc");
-        if (!malloc_func) {
+        if (!malloc_func)
+        {
             malloc_func = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", _context_manager.get_module());
         }
 
-        // Get or create strcpy function  
+        // Get or create strcpy function
         llvm::FunctionType *strcpy_type = llvm::FunctionType::get(
-            llvm::PointerType::get(context, 0), 
-            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)}, 
-            false
-        );
+            llvm::PointerType::get(context, 0),
+            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0)},
+            false);
         llvm::Function *strcpy_func = _context_manager.get_module()->getFunction("strcpy");
-        if (!strcpy_func) {
+        if (!strcpy_func)
+        {
             strcpy_func = llvm::Function::Create(strcpy_type, llvm::Function::ExternalLinkage, "strcpy", _context_manager.get_module());
         }
 
@@ -4523,6 +4537,12 @@ namespace Cryo::Codegen
             // Handle simple function name
             function_name = identifier->name();
 
+            // Check if this is a primitive type constructor (e.g., i64, i32, etc.)
+            if (is_primitive_integer_constructor(function_name))
+            {
+                return generate_primitive_constructor_call(node, function_name);
+            }
+
             // Check if this is an intrinsic call (intrinsics start with "__")
             if (function_name.length() > 4 && function_name.substr(0, 2) == "__" && function_name.substr(function_name.length() - 2) == "__")
             {
@@ -4538,7 +4558,7 @@ namespace Cryo::Codegen
                 // This is a qualified intrinsic call like std::Intrinsics::__printf__
                 return generate_intrinsic_call(node, member_name);
             }
-            
+
             // Handle member access - could be namespaced calls or struct method calls
             if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
             {
@@ -4614,7 +4634,7 @@ namespace Cryo::Codegen
                         else
                         {
                             std::cout << "[CodegenVisitor] Method not found: " << method_name << " for type: " << type_name << std::endl;
-                            
+
                             // For primitive types, use the fully qualified method name instead of just the member name
                             // This allows linking with precompiled primitive methods in libcryo.a
                             if (is_primitive_type(type_name))
@@ -4662,14 +4682,14 @@ namespace Cryo::Codegen
         {
             // Handle scope resolution like Std::Runtime::print_int
             std::string member_name = scope_resolution->member_name();
-            
+
             // Check if this is an intrinsic call with qualified names
             if (member_name.length() > 4 && member_name.substr(0, 2) == "__" && member_name.substr(member_name.length() - 2) == "__")
             {
                 // This is a qualified intrinsic call like std::Intrinsics::__printf__
                 return generate_intrinsic_call(node, member_name);
             }
-            
+
             function_name = scope_resolution->scope_name() + "::" + scope_resolution->member_name();
         }
         else
@@ -4709,7 +4729,7 @@ namespace Cryo::Codegen
         {
             llvm::Function *known_function = func_it->second;
             std::cout << "[DEBUG] Found function in symbol table: " << function_name << " -> " << known_function->getName().str() << std::endl;
-            
+
             // Generate arguments for the function call
             std::vector<llvm::Value *> args;
             for (const auto &arg : node->arguments())
@@ -4732,10 +4752,11 @@ namespace Cryo::Codegen
         // Look up the function in the module using the C runtime name
         // Map Std::Runtime functions to their C runtime equivalents
         std::string lookup_name = c_function_name;
-        if (c_function_name.find("Std::Runtime::") == 0) {
+        if (c_function_name.find("Std::Runtime::") == 0)
+        {
             lookup_name = c_function_name.substr(14); // Extract name after "Std::Runtime::"
         }
-        
+
         llvm::Function *function = module->getFunction(lookup_name);
         if (!function)
         {
@@ -4744,7 +4765,7 @@ namespace Cryo::Codegen
             if (!function)
             {
                 std::cerr << "Failed to create function declaration for: " << c_function_name << std::endl;
-                
+
                 // Dump current IR state before crash
                 std::cerr << "=== CURRENT IR DUMP BEFORE CRASH ===" << std::endl;
                 std::string ir_string;
@@ -4752,21 +4773,21 @@ namespace Cryo::Codegen
                 module->print(stream, nullptr);
                 std::cerr << stream.str() << std::endl;
                 std::cerr << "=== END IR DUMP ===" << std::endl;
-                
+
                 return nullptr;
             }
         }
 
         // Generate arguments
         std::vector<llvm::Value *> args;
-        
+
         // For primitive method calls (like string::length), we need to add the 'this' pointer as the first argument
         if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
         {
             if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
             {
                 std::string object_name = object_identifier->name();
-                
+
                 // Check if this is a primitive type method call
                 auto type_it = _variable_types.find(object_name);
                 if (type_it != _variable_types.end() && is_primitive_type(type_it->second))
@@ -4816,7 +4837,7 @@ namespace Cryo::Codegen
                 }
             }
         }
-        
+
         // Add regular arguments
         for (const auto &arg : node->arguments())
         {
@@ -4839,7 +4860,7 @@ namespace Cryo::Codegen
                 std::cout << "[DEBUG] Expected args: " << function->getFunctionType()->getNumParams() << ", provided: " << args.size() << std::endl;
             }
         }
-        llvm::Value* call_result = builder.CreateCall(function, args);
+        llvm::Value *call_result = builder.CreateCall(function, args);
         return call_result;
     }
 
@@ -4879,18 +4900,111 @@ namespace Cryo::Codegen
         // Look up the function in the symbol table
         Symbol *symbol = nullptr;
 
+        // Debug: show what symbols are available
+        std::cout << "[DEBUG] Symbol table lookup for: '" << c_name << "'" << std::endl;
+        std::cout << "[DEBUG] Scope context: '" << scope_name << "', Member: '" << symbol_name << "'" << std::endl;
+
         // First try to find by the full name
         symbol = _symbol_table.lookup_symbol(c_name);
+        std::cout << "[DEBUG] Symbol lookup for '" << c_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
 
         // If not found, try to find by the member name
         if (!symbol)
         {
             symbol = _symbol_table.lookup_symbol(symbol_name);
+            std::cout << "[DEBUG] Symbol lookup for member name '" << symbol_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
 
             // Verify the scope matches if we found a symbol
             if (symbol && symbol->scope != scope_name)
             {
+                std::cout << "[DEBUG] Symbol found but scope mismatch: '" << symbol->scope << "' != '" << scope_name << "'" << std::endl;
                 symbol = nullptr; // Wrong scope, keep looking
+            }
+        }
+
+        // Try namespaced lookup
+        if (!symbol)
+        {
+            std::cout << "[DEBUG] Trying namespaced lookup..." << std::endl;
+            symbol = _symbol_table.lookup_namespaced_symbol(scope_name, symbol_name);
+            std::cout << "[DEBUG] Namespaced lookup for '" << scope_name << "::" << symbol_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
+        }
+
+        // Debug symbol properties if found
+        if (symbol)
+        {
+            std::cout << "[DEBUG] Symbol found! Kind: " << (int)symbol->kind << " (Function=" << (int)SymbolKind::Function << ")" << std::endl;
+            std::cout << "[DEBUG] Symbol data_type: " << (symbol->data_type ? "NOT NULL" : "NULL") << std::endl;
+            if (symbol->data_type)
+            {
+                std::cout << "[DEBUG] Symbol data_type name: " << symbol->data_type->name() << std::endl;
+                FunctionType *func_type = dynamic_cast<FunctionType *>(symbol->data_type);
+                std::cout << "[DEBUG] Dynamic cast to FunctionType: " << (func_type ? "SUCCESS" : "FAILED") << std::endl;
+            }
+        }
+
+        // If we found a function symbol, use its actual type information
+        if (symbol && symbol->kind == SymbolKind::Function && symbol->data_type)
+        {
+            std::cout << "[DEBUG] Found function symbol, checking data_type..." << std::endl;
+            FunctionType *func_type = dynamic_cast<FunctionType *>(symbol->data_type);
+            if (func_type)
+            {
+                std::cout << "[DEBUG] Using symbol table function type for: " << c_name << std::endl;
+
+                // Convert Cryo types to LLVM types
+                std::vector<llvm::Type *> param_types;
+                for (const auto &param_type : func_type->parameter_types())
+                {
+                    llvm::Type *llvm_param_type = get_llvm_type(param_type.get());
+                    if (llvm_param_type)
+                    {
+                        param_types.push_back(llvm_param_type);
+                    }
+                    else
+                    {
+                        std::cerr << "[WARNING] Failed to convert parameter type, using i32 as fallback" << std::endl;
+                        param_types.push_back(llvm::Type::getInt32Ty(_context_manager.get_context()));
+                    }
+                }
+
+                llvm::Type *return_type = get_llvm_type(func_type->return_type().get());
+                if (!return_type)
+                {
+                    std::cerr << "[WARNING] Failed to convert return type, using i64 as fallback" << std::endl;
+                    return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
+                }
+
+                // Create function type and declaration using actual types
+                llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(return_type, param_types, false);
+
+                // Map the Cryo function name to the C runtime function name
+                std::string c_runtime_name = c_name;
+                if (c_name.find("Std::Runtime::") == 0)
+                {
+                    c_runtime_name = c_name.substr(14);
+                }
+                else if (c_name.find("std::") == 0)
+                {
+                    size_t last_colon = c_name.find_last_of(':');
+                    if (last_colon != std::string::npos && last_colon + 1 < c_name.length())
+                    {
+                        c_runtime_name = c_name.substr(last_colon + 1);
+                    }
+                }
+
+                llvm::Function *forward_decl = llvm::Function::Create(
+                    llvm_func_type,
+                    llvm::Function::ExternalLinkage,
+                    c_runtime_name,
+                    _context_manager.get_module());
+
+                if (forward_decl)
+                {
+                    _functions[c_name] = forward_decl;
+                    std::cout << "[DEBUG] Successfully created forward declaration using symbol table for: " << c_name << std::endl;
+                    return forward_decl;
+                }
             }
         }
 
@@ -4901,9 +5015,9 @@ namespace Cryo::Codegen
             if (functions_it != _functions.end())
             {
                 std::cout << "[CodegenVisitor] Found pre-generated function: " << c_name << std::endl;
-                llvm::Function* found_func = functions_it->second;
+                llvm::Function *found_func = functions_it->second;
                 std::cout << "[DEBUG] Function name at find time: " << (found_func ? found_func->getName().str() : "NULL") << std::endl;
-                
+
                 // Check if the function has a valid name and parent
                 if (found_func && found_func->getParent())
                 {
@@ -4927,11 +5041,11 @@ namespace Cryo::Codegen
                     _functions.erase(c_name);
                 }
             }
-            
+
             // Try resolving with namespace variations
             std::vector<std::string> search_variations;
             search_variations.push_back(c_name); // Original name
-            
+
             // If we have a namespace context, try variations
             if (!_namespace_context.empty())
             {
@@ -4946,7 +5060,7 @@ namespace Cryo::Codegen
                 {
                     current_root_ns = _namespace_context;
                 }
-                
+
                 // Check if the function name starts with the same root namespace
                 if (c_name.find(current_root_ns + "::") != 0)
                 {
@@ -4956,23 +5070,23 @@ namespace Cryo::Codegen
                     search_variations.push_back(_namespace_context + "::" + c_name);
                 }
             }
-            
+
             // If no namespace context or we're looking for something not in current namespace,
             // try common prefixes (especially std:: for standard library)
             if (c_name.find("::") != std::string::npos && c_name.find("std::") != 0)
             {
                 search_variations.push_back("std::" + c_name);
             }
-            
+
             // Try all variations
-            for (const std::string& search_name : search_variations)
+            for (const std::string &search_name : search_variations)
             {
                 functions_it = _functions.find(search_name);
                 if (functions_it != _functions.end())
                 {
-                    llvm::Function* found_func = functions_it->second;
+                    llvm::Function *found_func = functions_it->second;
                     std::cout << "[CodegenVisitor] Found function in _functions map: " << search_name << " (searched for: " << c_name << ")" << std::endl;
-                    
+
                     // Check if function is valid (not orphaned)
                     if (found_func && found_func->getParent())
                     {
@@ -4990,20 +5104,21 @@ namespace Cryo::Codegen
                 }
             }
         }
-        
+
         // If we reach here, the function wasn't found anywhere
         // Create a forward declaration based on the call site
         std::cout << "[DEBUG] Creating forward declaration for: " << c_name << std::endl;
         std::cout << "[DEBUG] Current namespace context: " << _namespace_context << std::endl;
-        
-        if (!call_node) {
+
+        if (!call_node)
+        {
             std::cerr << "[ERROR] Cannot create forward declaration without call node" << std::endl;
             return nullptr;
         }
-        
+
         // Infer parameter types from call arguments
-        std::vector<llvm::Type*> param_types;
-        
+        std::vector<llvm::Type *> param_types;
+
         // Check if this is a primitive method call that needs a 'this' pointer
         bool is_primitive_method_call = false;
         if (auto *member_access = dynamic_cast<MemberAccessNode *>(call_node->callee()))
@@ -5021,57 +5136,64 @@ namespace Cryo::Codegen
                 }
             }
         }
-        
+
         if (!call_node->arguments().empty())
         {
-            for (const auto& arg : call_node->arguments())
+            for (const auto &arg : call_node->arguments())
             {
                 // Generate the argument to determine its type
                 arg->accept(*this);
-                llvm::Value* arg_val = get_current_value();
-                if (arg_val) {
+                llvm::Value *arg_val = get_current_value();
+                if (arg_val)
+                {
                     param_types.push_back(arg_val->getType());
-                } else {
+                }
+                else
+                {
                     std::cerr << "[WARNING] Failed to determine argument type, using i32 as fallback" << std::endl;
                     param_types.push_back(llvm::Type::getInt32Ty(_context_manager.get_context()));
                 }
             }
         }
-        
+
         // Use a reasonable default return type (most system calls return int/i32)
-        llvm::Type* return_type = llvm::Type::getInt64Ty(_context_manager.get_context()); // i64 for most syscalls
-        
+        llvm::Type *return_type = llvm::Type::getInt64Ty(_context_manager.get_context()); // i64 for most syscalls
+
         // Create function type and declaration
-        llvm::FunctionType* func_type = llvm::FunctionType::get(return_type, param_types, false);
-        
+        llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+
         // Map the Cryo function name to the C runtime function name
         std::string c_runtime_name = c_name;
-        if (c_name.find("Std::Runtime::") == 0) {
+        if (c_name.find("Std::Runtime::") == 0)
+        {
             // Extract the function name after "Std::Runtime::"
             c_runtime_name = c_name.substr(14); // Length of "Std::Runtime::"
-        } else if (c_name.find("std::") == 0) {
+        }
+        else if (c_name.find("std::") == 0)
+        {
             // For stdlib functions like std::IO::printf, extract just the function name
             size_t last_colon = c_name.find_last_of(':');
-            if (last_colon != std::string::npos && last_colon + 1 < c_name.length()) {
+            if (last_colon != std::string::npos && last_colon + 1 < c_name.length())
+            {
                 c_runtime_name = c_name.substr(last_colon + 1);
             }
         }
-        
-        llvm::Function* forward_decl = llvm::Function::Create(
+
+        llvm::Function *forward_decl = llvm::Function::Create(
             func_type,
             llvm::Function::ExternalLinkage,
-            c_runtime_name,  // Use the C runtime function name instead of the full Cryo name
-            _context_manager.get_module()
-        );
-        
-        if (!forward_decl) {
+            c_runtime_name, // Use the C runtime function name instead of the full Cryo name
+            _context_manager.get_module());
+
+        if (!forward_decl)
+        {
             std::cerr << "[ERROR] Failed to create forward declaration for: " << c_name << std::endl;
             return nullptr;
         }
-        
+
         // Store the forward declaration for future use
         _functions[c_name] = forward_decl;
-        
+
         std::cout << "[DEBUG] Successfully created forward declaration for: " << c_name << std::endl;
         return forward_decl;
     }
@@ -5324,7 +5446,7 @@ namespace Cryo::Codegen
 
         // Create the end block that will be used for break statements
         llvm::BasicBlock *end_block = llvm::BasicBlock::Create(context, "switch.end", function);
-        
+
         // Create switch context for break statements
         BreakableContext switch_ctx(end_block);
         _breakable_stack.push(switch_ctx);
@@ -5353,10 +5475,10 @@ namespace Cryo::Codegen
             // Handle integer switch using LLVM switch instruction
             generate_integer_switch(node, switch_value, end_block);
         }
-        
+
         // Restore previous breakable context
         _breakable_stack.pop();
-        
+
         // Set insertion point to after the switch
         builder.SetInsertPoint(end_block);
     }
@@ -5887,14 +6009,14 @@ namespace Cryo::Codegen
         try
         {
             auto &builder = _context_manager.get_builder();
-            
+
             // Get the target type from the pointer
             llvm::Type *target_type = ptr->getType();
             if (target_type->isPointerTy())
             {
                 target_type = value->getType(); /* Use value type for compatibility */
             }
-            
+
             // Check if we need type conversion
             llvm::Type *value_type = value->getType();
             if (value_type != target_type)
@@ -5914,7 +6036,7 @@ namespace Cryo::Codegen
                 {
                     unsigned value_bits = value_type->getIntegerBitWidth();
                     unsigned target_bits = target_type->getIntegerBitWidth();
-                    
+
                     if (value_bits > target_bits)
                     {
                         value = builder.CreateTrunc(value, target_type, "trunc");
@@ -5925,7 +6047,7 @@ namespace Cryo::Codegen
                     }
                 }
             }
-            
+
             builder.CreateStore(value, ptr);
         }
         catch (const std::exception &e)
@@ -5940,7 +6062,8 @@ namespace Cryo::Codegen
         try
         {
             std::cout << "[DEBUG] enter_scope: this=" << this << ", _value_context=" << _value_context.get() << std::endl;
-            if (!_value_context) {
+            if (!_value_context)
+            {
                 std::cerr << "[ERROR] _value_context is null in enter_scope!" << std::endl;
                 return;
             }
@@ -5986,7 +6109,17 @@ namespace Cryo::Codegen
         return dummy;
     }
     llvm::BasicBlock *CodegenVisitor::create_basic_block(const std::string &name, llvm::Function *function) { return nullptr; }
-    llvm::Type *CodegenVisitor::get_llvm_type(Cryo::Type *cryo_type) { return nullptr; }
+    llvm::Type *CodegenVisitor::get_llvm_type(Cryo::Type *cryo_type)
+    {
+        if (!cryo_type)
+        {
+            return nullptr;
+        }
+
+        // Convert Type object to string and use TypeMapper
+        std::string type_string = cryo_type->to_string();
+        return _type_mapper->map_type(type_string);
+    }
     llvm::Value *CodegenVisitor::cast_value(llvm::Value *value, llvm::Type *target_type) { return nullptr; }
     bool CodegenVisitor::is_lvalue(Cryo::ExpressionNode *expr) { return false; }
 
@@ -6192,8 +6325,8 @@ namespace Cryo::Codegen
         }
 
         // Delegate to the Intrinsics module
-        llvm::Value* result = _intrinsics->generate_intrinsic_call(node, intrinsic_name, args);
-        
+        llvm::Value *result = _intrinsics->generate_intrinsic_call(node, intrinsic_name, args);
+
         if (_intrinsics->has_errors())
         {
             report_error("Intrinsic generation failed: " + _intrinsics->get_last_error());
@@ -6208,13 +6341,111 @@ namespace Cryo::Codegen
         // Check if this is a primitive type that should not have implementation blocks
         static const std::set<std::string> primitive_types = {
             "i8", "i16", "i32", "i64", "int",
-            "u8", "u16", "u32", "u64", "uint", 
+            "u8", "u16", "u32", "u64", "uint",
             "f32", "f64", "float", "double",
             "bool", "boolean", "char", "string", "void",
-            "ptr", "const_ptr"
-        };
-        
+            "ptr", "const_ptr"};
+
         return primitive_types.find(type_name) != primitive_types.end();
+    }
+
+    bool CodegenVisitor::is_primitive_integer_constructor(const std::string &function_name) const
+    {
+        static const std::unordered_set<std::string> integer_types = {
+            "i8", "i16", "i32", "i64", "int",
+            "u8", "u16", "u32", "u64", "uint"};
+
+        return integer_types.find(function_name) != integer_types.end();
+    }
+
+    llvm::Value *CodegenVisitor::generate_primitive_constructor_call(CallExpressionNode *node, const std::string &target_type)
+    {
+        if (!node || node->arguments().empty())
+        {
+            report_error("Primitive constructor requires exactly one argument", node);
+            return nullptr;
+        }
+
+        if (node->arguments().size() != 1)
+        {
+            report_error("Primitive constructor requires exactly one argument", node);
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+
+        // Visit the argument to get its value
+        node->arguments()[0]->accept(*this);
+        llvm::Value *source_value = get_current_value();
+
+        if (!source_value)
+        {
+            report_error("Failed to generate value for primitive constructor argument", node);
+            return nullptr;
+        }
+
+        // Get LLVM types for source and target
+        llvm::Type *source_type = source_value->getType();
+        llvm::Type *target_llvm_type = _type_mapper->map_type(target_type);
+
+        if (!target_llvm_type)
+        {
+            report_error("Failed to map target type for primitive constructor: " + target_type, node);
+            return nullptr;
+        }
+
+        // Generate appropriate cast instruction
+        return generate_integer_cast(source_value, source_type, target_llvm_type, target_type);
+    }
+
+    llvm::Value *CodegenVisitor::generate_integer_cast(llvm::Value *source_value, llvm::Type *source_type,
+                                                       llvm::Type *target_type, const std::string &target_type_name)
+    {
+        auto &builder = _context_manager.get_builder();
+
+        // If types are the same, no cast needed
+        if (source_type == target_type)
+        {
+            return source_value;
+        }
+
+        // Both should be integer types
+        if (!source_type->isIntegerTy() || !target_type->isIntegerTy())
+        {
+            std::cerr << "Error: Primitive constructor only supports integer types" << std::endl;
+            return nullptr;
+        }
+
+        unsigned source_bits = source_type->getIntegerBitWidth();
+        unsigned target_bits = target_type->getIntegerBitWidth();
+
+        // Determine if target type is signed
+        bool target_is_signed = (target_type_name == "i8" || target_type_name == "i16" ||
+                                 target_type_name == "i32" || target_type_name == "i64" ||
+                                 target_type_name == "int");
+
+        if (source_bits == target_bits)
+        {
+            // Same size, just bitcast
+            return builder.CreateBitCast(source_value, target_type);
+        }
+        else if (source_bits < target_bits)
+        {
+            // Widening conversion
+            if (target_is_signed)
+            {
+                return builder.CreateSExt(source_value, target_type); // Sign extend
+            }
+            else
+            {
+                return builder.CreateZExt(source_value, target_type); // Zero extend
+            }
+        }
+        else
+        {
+            // Narrowing conversion
+            return builder.CreateTrunc(source_value, target_type);
+        }
     }
 
 } // namespace Cryo::Codegen

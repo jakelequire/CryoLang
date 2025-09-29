@@ -3,6 +3,7 @@
 #include "Lexer/lexer.hpp"
 #include <sstream>
 #include <algorithm>
+#include <unordered_set>
 
 namespace Cryo
 {
@@ -350,7 +351,7 @@ namespace Cryo
         size_t size = type->size_bytes();
         if (size == 0)
             return "0";
-        
+
         // Format size with unit
         if (size < 1024)
             return std::to_string(size) + "B";
@@ -1007,6 +1008,16 @@ namespace Cryo
             return;
         }
 
+        // Special handling for primitive type constructors
+        if (is_primitive_integer_type(name))
+        {
+            // Primitive type constructors are functions that take one argument and return the target type
+            // e.g., i64 is a function (T) -> i64 where T is any integer type
+            std::string function_type = "(any) -> " + name;
+            node.set_type(function_type);
+            return;
+        }
+
         TypedSymbol *symbol = _symbol_table->lookup_symbol(name);
         if (!symbol)
         {
@@ -1401,9 +1412,9 @@ namespace Cryo
     {
         // sizeof is a compile-time operator that returns u64
         // We need to validate that the type exists
-        
+
         std::string type_name = node.type_name();
-        
+
         // First check if it's a primitive type
         if (type_name == "u8" || type_name == "i8" || type_name == "char")
         {
@@ -1440,10 +1451,10 @@ namespace Cryo
             node.set_type("u64");
             return;
         }
-        
+
         // Check if it's a user-defined type in the symbol table
         TypedSymbol *type_symbol = _symbol_table->lookup_symbol(type_name);
-        
+
         if (type_symbol)
         {
             // The type exists, sizeof is valid
@@ -1544,7 +1555,7 @@ namespace Cryo
                                   lookup_type == "f32" || lookup_type == "f64" || lookup_type == "double" ||
                                   lookup_type == "boolean" || lookup_type == "bool" || lookup_type == "char" ||
                                   lookup_type == "void");
-                                  
+
         if (!struct_type && !is_primitive_type)
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
@@ -1552,9 +1563,9 @@ namespace Cryo
             node.set_type("unknown");
             return;
         }
-        
+
         // For non-primitive types, verify it's a struct/class/generic type
-        if (struct_type && !is_primitive_type && 
+        if (struct_type && !is_primitive_type &&
             struct_type->kind() != TypeKind::Struct &&
             struct_type->kind() != TypeKind::Class &&
             struct_type->kind() != TypeKind::Generic)
@@ -1601,38 +1612,47 @@ namespace Cryo
         {
             // First, try to find if we have the primitive type methods imported from stdlib
             // Check if we have core::Types imported (which would contain primitive implementations)
-            if (_main_symbol_table) 
+            if (_main_symbol_table)
             {
                 // Look through all registered namespaces for potential primitive method implementations
                 std::string primitive_method_name = lookup_type + "::" + member_name;
-                
+
                 // Also try checking if the method exists as a global function (for compatibility)
                 auto symbol = _main_symbol_table->lookup_symbol(member_name);
-                if (symbol && symbol->kind == SymbolKind::Function) 
+                if (symbol && symbol->kind == SymbolKind::Function)
                 {
                     // Found a function with the right name - assume it's the primitive method
                     // For primitive methods, we'll set appropriate return types
-                    if (member_name == "length") {
+                    if (member_name == "length")
+                    {
                         node.set_type("u64");
                         return;
-                    } else if (member_name == "char_at") {
+                    }
+                    else if (member_name == "char_at")
+                    {
                         node.set_type("char");
                         return;
-                    } else {
+                    }
+                    else
+                    {
                         node.set_type("unknown"); // Fallback for other methods
                         return;
                     }
                 }
-                
+
                 // If we have imported core/types (which contains primitive implementations),
                 // assume primitive methods are available
-                if (_main_symbol_table->has_namespace("std::core::Types") && lookup_type == "string") {
+                if (_main_symbol_table->has_namespace("std::core::Types") && lookup_type == "string")
+                {
                     // We have core/types imported and this is a string method call
                     // Assume common primitive methods are available
-                    if (member_name == "length") {
+                    if (member_name == "length")
+                    {
                         node.set_type("u64");
                         return;
-                    } else if (member_name == "char_at") {
+                    }
+                    else if (member_name == "char_at")
+                    {
                         node.set_type("char");
                         return;
                     }
@@ -1662,7 +1682,7 @@ namespace Cryo
                 {
                     node.set_type(symbol->data_type->to_string());
                     std::cout << "[DEBUG] Resolved namespace symbol: " << scope_name << "::" << member_name
-                              << " with type: " << symbol->data_type->to_string() 
+                              << " with type: " << symbol->data_type->to_string()
                               << " (context: " << _current_namespace << ")" << std::endl;
                 }
                 else
@@ -1675,7 +1695,7 @@ namespace Cryo
                     }
                     node.set_type(type_name);
                     std::cout << "[DEBUG] Resolved namespace symbol: " << scope_name << "::" << member_name
-                              << " with generic type: " << type_name 
+                              << " with generic type: " << type_name
                               << " (context: " << _current_namespace << ")" << std::endl;
                 }
                 return;
@@ -1688,9 +1708,9 @@ namespace Cryo
             {
                 // Split "Syscall::IO" into namespace="Syscall" and class_name="IO"
                 std::string namespace_part = scope_name.substr(0, last_scope - 1); // "Syscall"
-                std::string class_name = scope_name.substr(last_scope + 1); // "IO"
+                std::string class_name = scope_name.substr(last_scope + 1);        // "IO"
 
-                std::cout << "[DEBUG] Trying multi-level resolution: namespace='" << namespace_part 
+                std::cout << "[DEBUG] Trying multi-level resolution: namespace='" << namespace_part
                           << "', class='" << class_name << "', method='" << member_name << "'" << std::endl;
 
                 // Look up the class in the namespace (with context)
@@ -1698,34 +1718,34 @@ namespace Cryo
                 if (class_symbol && class_symbol->kind == SymbolKind::Type)
                 {
                     std::cout << "[DEBUG] Found class " << class_name << " in namespace " << namespace_part << std::endl;
-                    
+
                     // Now look for the method within the class
                     // For static methods, we assume they exist and have appropriate types
                     if (member_name == "write" && class_name == "IO")
                     {
                         node.set_type("i64"); // write returns i64
-                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name 
+                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
                                   << " -> i64" << std::endl;
                         return;
                     }
-                    else if (member_name == "read" && class_name == "IO") 
+                    else if (member_name == "read" && class_name == "IO")
                     {
                         node.set_type("i64"); // read returns i64
-                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name 
+                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
                                   << " -> i64" << std::endl;
                         return;
                     }
                     else if (member_name == "open" && class_name == "IO")
                     {
                         node.set_type("int"); // open returns int
-                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name 
+                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
                                   << " -> int" << std::endl;
                         return;
                     }
                     else if (member_name == "close" && class_name == "IO")
                     {
                         node.set_type("int"); // close returns int
-                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name 
+                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
                                   << " -> int" << std::endl;
                         return;
                     }
@@ -1733,7 +1753,7 @@ namespace Cryo
                     {
                         // Generic static method - assume it exists
                         node.set_type("unknown");
-                        std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name 
+                        std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
                                   << " -> unknown" << std::endl;
                         return;
                     }
@@ -1763,11 +1783,11 @@ namespace Cryo
         {
             // scope_name is a generic type parameter with trait bounds
             const std::vector<std::string> &trait_names = trait_bounds_it->second;
-            
+
             // For now, assume the static method exists if the trait bound is present
             // TODO: In a complete implementation, we would look up the trait definition
             // and verify that the member_name method exists in one of the bound traits
-            
+
             // For static methods like get_default(), infer the return type as the generic parameter
             if (member_name == "get_default")
             {
@@ -1776,13 +1796,15 @@ namespace Cryo
                           << " -> " << scope_name << std::endl;
                 return;
             }
-            
+
             // For other static methods, use unknown type for now
             node.set_type("unknown");
             std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
                       << " -> unknown (trait bounds: ";
-            for (size_t i = 0; i < trait_names.size(); ++i) {
-                if (i > 0) std::cout << ", ";
+            for (size_t i = 0; i < trait_names.size(); ++i)
+            {
+                if (i > 0)
+                    std::cout << ", ";
                 std::cout << trait_names[i];
             }
             std::cout << ")" << std::endl;
@@ -2049,34 +2071,39 @@ namespace Cryo
             // For now, create a type alias that represents the generic template
             // In a full implementation, we'd need proper template system with type parameter substitution
             std::cout << "[DEBUG] Generic type alias: " << alias_name << "<";
-            const auto& params = node.generic_params();
-            for (size_t i = 0; i < params.size(); ++i) {
-                if (i > 0) std::cout << ", ";
+            const auto &params = node.generic_params();
+            for (size_t i = 0; i < params.size(); ++i)
+            {
+                if (i > 0)
+                    std::cout << ", ";
                 std::cout << params[i];
             }
             std::cout << "> = " << node.target_type() << std::endl;
 
             // Create a generic type alias - we'll use the full signature as the alias name for now
             std::string full_signature = alias_name + "<";
-            for (size_t i = 0; i < params.size(); ++i) {
-                if (i > 0) full_signature += ", ";
+            for (size_t i = 0; i < params.size(); ++i)
+            {
+                if (i > 0)
+                    full_signature += ", ";
                 full_signature += params[i];
             }
             full_signature += ">";
-            
+
             // Create a type alias that shows the generic nature
             Type *target_type = _type_context.parse_type_from_string(node.target_type());
-            if (!target_type) {
+            if (!target_type)
+            {
                 target_type = _type_context.get_unknown_type();
             }
-            
+
             Type *generic_alias = _type_context.create_type_alias(full_signature, target_type);
             _symbol_table->declare_symbol(alias_name, generic_alias, node.location(), false);
             return;
         }
 
         std::string target_type_str = node.target_type();
-        
+
         // Handle forward declarations (empty target type)
         if (target_type_str.empty())
         {
@@ -2266,8 +2293,8 @@ namespace Cryo
                 }
 
                 // Verify it's a struct, class, enum, or trait type
-                if (target_type->kind() != TypeKind::Struct && 
-                    target_type->kind() != TypeKind::Class && 
+                if (target_type->kind() != TypeKind::Struct &&
+                    target_type->kind() != TypeKind::Class &&
                     target_type->kind() != TypeKind::Enum &&
                     target_type->kind() != TypeKind::Trait)
                 {
@@ -2581,63 +2608,60 @@ namespace Cryo
         // If direct assignment is not allowed, check for explicit conversions with warnings
         if (!is_assignable && lhs_type->is_integral() && rhs_type->is_integral())
         {
-            auto lhs_int = static_cast<IntegerType*>(lhs_type);
-            auto rhs_int = static_cast<IntegerType*>(rhs_type);
-            
+            auto lhs_int = static_cast<IntegerType *>(lhs_type);
+            auto rhs_int = static_cast<IntegerType *>(rhs_type);
+
             Type::ConversionSafety safety = rhs_int->get_conversion_safety(*lhs_int);
-            
+
             switch (safety)
             {
-                case Type::ConversionSafety::Safe:
-                    // This should have been caught by is_assignable_from, but allow anyway
-                    return true;
-                    
-                case Type::ConversionSafety::Warning:
+            case Type::ConversionSafety::Safe:
+                // This should have been caught by is_assignable_from, but allow anyway
+                return true;
+
+            case Type::ConversionSafety::Warning:
+            {
+                // Emit warning but allow the conversion
+                size_t lhs_size = lhs_type->size_bytes();
+                size_t rhs_size = rhs_type->size_bytes();
+                bool lhs_signed = lhs_type->is_signed();
+                bool rhs_signed = rhs_type->is_signed();
+
+                if (lhs_size < rhs_size)
                 {
-                    // Emit warning but allow the conversion
-                    size_t lhs_size = lhs_type->size_bytes();
-                    size_t rhs_size = rhs_type->size_bytes();
-                    bool lhs_signed = lhs_type->is_signed();
-                    bool rhs_signed = rhs_type->is_signed();
-                    
-                    if (lhs_size < rhs_size)
-                    {
-                        // Narrowing conversion
-                        report_conversion_warning(
-                            TypeWarning::WarningKind::PotentialDataLoss, loc,
-                            "Narrowing conversion may lose data",
-                            rhs_type, lhs_type
-                        );
-                    }
-                    else if (lhs_signed != rhs_signed)
-                    {
-                        // Sign conversion
-                        report_conversion_warning(
-                            TypeWarning::WarningKind::SignConversion, loc,
-                            "Converting between signed and unsigned integers",
-                            rhs_type, lhs_type
-                        );
-                    }
-                    return true; // Allow with warning
-                }
-                
-                case Type::ConversionSafety::Unsafe:
-                    // Mixed sign and size changes - emit warning but still allow
+                    // Narrowing conversion
                     report_conversion_warning(
-                        TypeWarning::WarningKind::UnsafeConversion, loc,
-                        "Unsafe conversion: mixed sign and size change",
-                        rhs_type, lhs_type
-                    );
-                    return true; // Allow with warning
-                    
-                case Type::ConversionSafety::Impossible:
-                    // Fall through to return false
-                    break;
+                        TypeWarning::WarningKind::PotentialDataLoss, loc,
+                        "Narrowing conversion may lose data",
+                        rhs_type, lhs_type);
+                }
+                else if (lhs_signed != rhs_signed)
+                {
+                    // Sign conversion
+                    report_conversion_warning(
+                        TypeWarning::WarningKind::SignConversion, loc,
+                        "Converting between signed and unsigned integers",
+                        rhs_type, lhs_type);
+                }
+                return true; // Allow with warning
+            }
+
+            case Type::ConversionSafety::Unsafe:
+                // Mixed sign and size changes - emit warning but still allow
+                report_conversion_warning(
+                    TypeWarning::WarningKind::UnsafeConversion, loc,
+                    "Unsafe conversion: mixed sign and size change",
+                    rhs_type, lhs_type);
+                return true; // Allow with warning
+
+            case Type::ConversionSafety::Impossible:
+                // Fall through to return false
+                break;
             }
         }
-        
+
         // Check for float-to-int and int-to-float conversions
-        if (!is_assignable && 
+        if (!is_assignable &&
             ((lhs_type->is_integral() && rhs_type->kind() == TypeKind::Float) ||
              (lhs_type->kind() == TypeKind::Float && rhs_type->is_integral())))
         {
@@ -2648,8 +2672,7 @@ namespace Cryo
                 report_conversion_warning(
                     TypeWarning::WarningKind::PotentialDataLoss, loc,
                     "Converting float to int may lose precision and fractional part",
-                    rhs_type, lhs_type
-                );
+                    rhs_type, lhs_type);
                 return true;
             }
             else if (lhs_type->kind() == TypeKind::Float && rhs_type->is_integral())
@@ -2660,8 +2683,7 @@ namespace Cryo
                     report_conversion_warning(
                         TypeWarning::WarningKind::PotentialDataLoss, loc,
                         "Converting large integer to float may lose precision",
-                        rhs_type, lhs_type
-                    );
+                        rhs_type, lhs_type);
                 }
                 return true;
             }
@@ -2762,8 +2784,8 @@ namespace Cryo
         _warnings.emplace_back(kind, loc, message);
     }
 
-    void TypeChecker::report_conversion_warning(TypeWarning::WarningKind kind, SourceLocation loc, 
-                                               const std::string &message, Type *from, Type *to)
+    void TypeChecker::report_conversion_warning(TypeWarning::WarningKind kind, SourceLocation loc,
+                                                const std::string &message, Type *from, Type *to)
     {
         _warnings.emplace_back(kind, loc, message, from, to);
     }
@@ -2942,5 +2964,14 @@ namespace Cryo
                 _symbol_table->declare_symbol(var_name, var_type, node.location(), false);
             }
         }
+    }
+
+    bool TypeChecker::is_primitive_integer_type(const std::string &type_name)
+    {
+        static const std::unordered_set<std::string> integer_types = {
+            "i8", "i16", "i32", "i64", "int",
+            "u8", "u16", "u32", "u64", "uint"};
+
+        return integer_types.find(type_name) != integer_types.end();
     }
 }

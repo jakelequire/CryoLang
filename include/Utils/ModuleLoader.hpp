@@ -106,6 +106,14 @@ namespace Cryo
         std::unordered_map<std::string, Symbol> create_symbol_map(const ProgramNode &ast, const std::string &module_name);
 
         /**
+         * @brief Create a FunctionType from a FunctionDeclarationNode
+         * @param func_decl The function declaration node
+         * @param type_context TypeContext for creating type objects
+         * @return FunctionType object or nullptr if creation fails
+         */
+        Type *create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context);
+
+        /**
          * @brief Check if we have a circular import dependency
          * @param module_path The module path being loaded
          * @return True if circular dependency detected

@@ -51,13 +51,13 @@ namespace Cryo::Codegen
         CodegenVisitor(
             LLVMContextManager &context_manager,
             Cryo::SymbolTable &symbol_table,
-            Cryo::DiagnosticManager* gdm = nullptr);
+            Cryo::DiagnosticManager *gdm = nullptr);
 
         // Prevent copying and moving to avoid unique_ptr issues
-        CodegenVisitor(const CodegenVisitor&) = delete;
-        CodegenVisitor& operator=(const CodegenVisitor&) = delete;
-        CodegenVisitor(CodegenVisitor&&) = delete;
-        CodegenVisitor& operator=(CodegenVisitor&&) = delete;
+        CodegenVisitor(const CodegenVisitor &) = delete;
+        CodegenVisitor &operator=(const CodegenVisitor &) = delete;
+        CodegenVisitor(CodegenVisitor &&) = delete;
+        CodegenVisitor &operator=(CodegenVisitor &&) = delete;
 
         ~CodegenVisitor() = default;
 
@@ -84,7 +84,7 @@ namespace Cryo::Codegen
          * @param source_file Full path to the source file
          * @param namespace_context Current namespace context
          */
-        void set_source_info(const std::string& source_file, const std::string& namespace_context = "");
+        void set_source_info(const std::string &source_file, const std::string &namespace_context = "");
 
         /**
          * @brief Set stdlib compilation mode (generates full implementations for imports)
@@ -217,19 +217,23 @@ namespace Cryo::Codegen
          */
         struct BreakableContext
         {
-            enum Type { Loop, Switch };
+            enum Type
+            {
+                Loop,
+                Switch
+            };
             Type context_type;
-            llvm::BasicBlock *condition_block;  // For loops only
-            llvm::BasicBlock *body_block;       // For loops only  
-            llvm::BasicBlock *continue_block;   // For loops only
-            llvm::BasicBlock *break_block;      // For both loops and switches
+            llvm::BasicBlock *condition_block; // For loops only
+            llvm::BasicBlock *body_block;      // For loops only
+            llvm::BasicBlock *continue_block;  // For loops only
+            llvm::BasicBlock *break_block;     // For both loops and switches
 
             // Constructor for loops
             BreakableContext(llvm::BasicBlock *cond, llvm::BasicBlock *body,
-                           llvm::BasicBlock *cont, llvm::BasicBlock *brk)
+                             llvm::BasicBlock *cont, llvm::BasicBlock *brk)
                 : context_type(Loop), condition_block(cond), body_block(body),
                   continue_block(cont), break_block(brk) {}
-            
+
             // Constructor for switch statements
             BreakableContext(llvm::BasicBlock *brk)
                 : context_type(Switch), condition_block(nullptr), body_block(nullptr),
@@ -269,10 +273,10 @@ namespace Cryo::Codegen
 
         // Control flags
         bool _stdlib_compilation_mode; // Generate full implementations for imports in stdlib mode
-        
+
         // Primitive type context for method generation
-        std::string current_primitive_type; // Track current primitive type being implemented
-        std::set<Cryo::StructMethodNode*> processed_primitive_methods; // Track already processed primitive methods
+        std::string current_primitive_type;                             // Track current primitive type being implemented
+        std::set<Cryo::StructMethodNode *> processed_primitive_methods; // Track already processed primitive methods
 
         // Loop context for break/continue
         llvm::BasicBlock *_current_loop_exit = nullptr;
@@ -301,7 +305,7 @@ namespace Cryo::Codegen
         llvm::Function *generate_function_declaration(Cryo::FunctionDeclarationNode *node);
         llvm::Function *generate_method_declaration(Cryo::StructMethodNode *method, llvm::Type *struct_type);
         bool generate_function_body(Cryo::FunctionDeclarationNode *node, llvm::Function *function);
-        void generate_primitive_method(Cryo::StructMethodNode *node, const std::string& primitive_type_name);
+        void generate_primitive_method(Cryo::StructMethodNode *node, const std::string &primitive_type_name);
 
         // Generic type generation
         llvm::Function *generate_generic_constructor(const std::string &instantiated_type,
@@ -335,6 +339,12 @@ namespace Cryo::Codegen
         llvm::Value *generate_function_call(Cryo::CallExpressionNode *node);
         llvm::Value *generate_array_access(Cryo::ArrayAccessNode *node);
         llvm::Value *generate_member_access(Cryo::MemberAccessNode *node);
+
+        // Primitive constructor helpers
+        bool is_primitive_integer_constructor(const std::string &function_name) const;
+        llvm::Value *generate_primitive_constructor_call(CallExpressionNode *node, const std::string &target_type);
+        llvm::Value *generate_integer_cast(llvm::Value *source_value, llvm::Type *source_type,
+                                           llvm::Type *target_type, const std::string &target_type_name);
 
         // String concatenation helpers
         llvm::Value *generate_string_concatenation(llvm::Value *left_str, llvm::Value *right_str);
