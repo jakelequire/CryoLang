@@ -300,29 +300,20 @@ namespace Cryo::Codegen
                 }
                 std::cout << std::endl;
 
-                // Generate code for the imported module's AST to ensure static methods are available
-                if (result.ast)
+                // Skip full codegen for imported modules to avoid symbol duplication
+                if (_stdlib_compilation_mode)
                 {
-                    if (_stdlib_compilation_mode)
-                    {
-                        std::cout << "[INFO] Skipping full codegen for imported module in stdlib mode: " << node.path() << " (avoiding symbol duplication in stdlib compilation)" << std::endl;
-
-                        // NOTE: In stdlib compilation mode, we should NOT generate full implementations
-                        // for imported modules to avoid symbol duplication. Each module should only
-                        // generate its own implementations when compiled directly.
-                        // We only need the symbol information for type checking and forward declarations,
-                        // which is already handled by the symbol registration below.
-                    }
-                    else
-                    {
-                        std::cout << "[INFO] Skipping full codegen for imported module: " << node.path() << " (avoiding symbol duplication)" << std::endl;
-
-                        // NOTE: We skip full codegen for imported modules to avoid symbol duplication.
-                        // The imported module will be compiled separately and linked later.
-                        // We only need the symbol information for type checking and forward declarations,
-                        // which is already handled by the symbol registration below.
-                    }
+                    std::cout << "[INFO] Skipping full codegen for imported module in stdlib mode: " << node.path() << " (avoiding symbol duplication in stdlib compilation)" << std::endl;
                 }
+                else
+                {
+                    std::cout << "[INFO] Skipping full codegen for imported module: " << node.path() << " (avoiding symbol duplication)" << std::endl;
+                }
+
+                // NOTE: We skip full codegen for imported modules to avoid symbol duplication.
+                // The imported module will be compiled separately and linked later.
+                // We only need the symbol information for type checking and forward declarations,
+                // which is handled by the symbol registration below.
 
                 // Register the symbols in the namespace
                 std::string namespace_name = node.has_alias() ? node.alias() : result.module_name;
@@ -4532,10 +4523,12 @@ namespace Cryo::Codegen
 
         // Get the function name from the callee
         std::string function_name;
+        std::string resolved_function_name; // Will be set after namespace alias resolution
         if (auto *identifier = dynamic_cast<IdentifierNode *>(node->callee()))
         {
             // Handle simple function name
             function_name = identifier->name();
+            resolved_function_name = function_name;
 
             // Check if this is a primitive type constructor (e.g., i64, i32, etc.)
             if (is_primitive_integer_constructor(function_name))
@@ -4640,12 +4633,14 @@ namespace Cryo::Codegen
                             if (is_primitive_type(type_name))
                             {
                                 std::cout << "[CodegenVisitor] Using qualified name for primitive method: " << method_name << std::endl;
-                                function_name = method_name; // Use string::length instead of just length
+                                function_name = method_name;          // Use string::length instead of just length
+                                resolved_function_name = method_name; // Also update the resolved name
                             }
                             else
                             {
                                 // Fall back to unqualified name for non-primitive types
                                 function_name = extract_function_name_from_member_access(member_access);
+                                resolved_function_name = function_name; // Update resolved name
                             }
                         }
                     }
@@ -4664,17 +4659,20 @@ namespace Cryo::Codegen
                         std::string method_name = "string::" + member_access->member();
                         std::cout << "[CodegenVisitor] String literal method call: " << method_name << std::endl;
                         function_name = method_name;
+                        resolved_function_name = method_name;
                     }
                     else
                     {
                         // Handle other literal types as needed
                         function_name = extract_function_name_from_member_access(member_access);
+                        resolved_function_name = function_name;
                     }
                 }
                 else
                 {
                     // Fall back to handling namespaced calls like Std::Runtime::print_int
                     function_name = extract_function_name_from_member_access(member_access);
+                    resolved_function_name = function_name;
                 }
             }
         }
@@ -4691,6 +4689,7 @@ namespace Cryo::Codegen
             }
 
             function_name = scope_resolution->scope_name() + "::" + scope_resolution->member_name();
+            resolved_function_name = function_name;
         }
         else
         {
@@ -4723,12 +4722,39 @@ namespace Cryo::Codegen
             }
         }
 
+        // Check for namespace alias resolution first
+        resolved_function_name = function_name;
+
+        // Check if this is a namespace-qualified call (contains "::")
+        size_t scope_pos = function_name.find("::");
+        if (scope_pos != std::string::npos)
+        {
+            std::string namespace_part = function_name.substr(0, scope_pos);
+            std::string function_part = function_name.substr(scope_pos + 2);
+
+            std::cout << "[DEBUG] Checking namespace alias for: " << namespace_part << "::" << function_part << std::endl;
+
+            // Check if the namespace part is an alias in our symbol table
+            if (_symbol_table.has_namespace(namespace_part))
+            {
+                // Look up the symbol in the aliased namespace
+                Symbol *symbol = _symbol_table.lookup_namespaced_symbol(namespace_part, function_part);
+                if (symbol && symbol->kind == SymbolKind::Function)
+                {
+                    // For namespace aliases, use just the function name for linking
+                    resolved_function_name = function_part;
+                    std::cout << "[DEBUG] Resolved namespace alias " << namespace_part << "::" << function_part
+                              << " to function: " << resolved_function_name << std::endl;
+                }
+            }
+        }
+
         // First, check if this is a function we know about in our symbol table
-        auto func_it = _functions.find(function_name);
+        auto func_it = _functions.find(resolved_function_name);
         if (func_it != _functions.end())
         {
             llvm::Function *known_function = func_it->second;
-            std::cout << "[DEBUG] Found function in symbol table: " << function_name << " -> " << known_function->getName().str() << std::endl;
+            std::cout << "[DEBUG] Found function in symbol table: " << resolved_function_name << " -> " << known_function->getName().str() << std::endl;
 
             // Generate arguments for the function call
             std::vector<llvm::Value *> args;
@@ -4747,7 +4773,7 @@ namespace Cryo::Codegen
         }
 
         // Map Cryo function names to C runtime function names
-        std::string c_function_name = map_cryo_to_c_function(function_name);
+        std::string c_function_name = map_cryo_to_c_function(resolved_function_name);
 
         // Look up the function in the module using the C runtime name
         // Map Std::Runtime functions to their C runtime equivalents
@@ -4764,7 +4790,8 @@ namespace Cryo::Codegen
             function = create_runtime_function_declaration(c_function_name, node);
             if (!function)
             {
-                std::cerr << "Failed to create function declaration for: " << c_function_name << std::endl;
+                std::cerr << "Failed to create function declaration for: " << c_function_name
+                          << " (resolved from: " << function_name << ")" << std::endl;
 
                 // Dump current IR state before crash
                 std::cerr << "=== CURRENT IR DUMP BEFORE CRASH ===" << std::endl;

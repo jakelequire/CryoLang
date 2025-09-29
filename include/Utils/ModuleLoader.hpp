@@ -23,19 +23,12 @@ namespace Cryo
     public:
         struct ImportResult
         {
-            bool success;
+            bool success = false;
             std::string error_message;
-            std::string module_name; // Name of the module/namespace
-            std::unique_ptr<ProgramNode> ast;
-            std::vector<std::string> exported_symbols;          // Legacy list of symbol names
-            std::unordered_map<std::string, Symbol> symbol_map; // Full symbol information
-
-            // Make it movable but not copyable
-            ImportResult() = default;
-            ImportResult(const ImportResult &) = delete;
-            ImportResult &operator=(const ImportResult &) = delete;
-            ImportResult(ImportResult &&) = default;
-            ImportResult &operator=(ImportResult &&) = default;
+            std::string module_name;
+            std::unordered_map<std::string, Symbol> symbol_map;
+            std::vector<std::string> exported_symbols;
+            std::string namespace_alias; // For single specific imports treated as namespace aliases
         };
 
     private:
@@ -112,6 +105,14 @@ namespace Cryo
          * @return FunctionType object or nullptr if creation fails
          */
         Type *create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context);
+
+        /**
+         * @brief Filter import result to only include specific symbols
+         * @param result The import result to filter
+         * @param specific_imports List of specific symbols to include
+         * @return Filtered import result with only the requested symbols
+         */
+        ImportResult filter_specific_imports(ImportResult result, const std::vector<std::string> &specific_imports);
 
         /**
          * @brief Check if we have a circular import dependency
