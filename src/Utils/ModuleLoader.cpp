@@ -36,6 +36,21 @@ namespace Cryo
         std::cout << "[DEBUG] ModuleLoader: Loading import '" << import_path
                   << "' -> '" << resolved_path << "'" << std::endl;
 
+        // Check for specific vs wildcard import
+        if (import_node.is_specific_import())
+        {
+            std::cout << "[DEBUG] ModuleLoader: Processing specific import with symbols: ";
+            for (const auto &symbol : import_node.specific_imports())
+            {
+                std::cout << symbol << " ";
+            }
+            std::cout << std::endl;
+        }
+        else
+        {
+            std::cout << "[DEBUG] ModuleLoader: Processing wildcard import" << std::endl;
+        }
+
         // Check if already loaded
         auto cached = _loaded_modules.find(resolved_path);
         if (cached != _loaded_modules.end())
@@ -60,10 +75,44 @@ namespace Cryo
         ImportResult result = load_module_from_file(resolved_path, import_path);
         _loading_modules.erase(resolved_path);
 
+        // Handle specific imports - distinguish between namespace aliases and symbol imports
+        if (import_node.is_specific_import() && result.success)
+        {
+            // If we have exactly one specific import, treat it as a namespace alias
+            // Otherwise, treat it as symbol imports
+            if (import_node.specific_imports().size() == 1)
+            {
+                std::cout << "[DEBUG] ModuleLoader: Treating single specific import as namespace alias: "
+                          << import_node.specific_imports()[0] << std::endl;
+                // For namespace alias, we keep all symbols but set the alias
+                result.namespace_alias = import_node.specific_imports()[0];
+            }
+            else
+            {
+                std::cout << "[DEBUG] ModuleLoader: Treating multiple specific imports as symbol imports" << std::endl;
+                result = filter_specific_imports(std::move(result), import_node.specific_imports());
+            }
+        }
+
         // Cache the result (move it)
         _loaded_modules[resolved_path] = std::move(result);
         // We need to create a new result since the original was moved
-        return load_module_from_file(resolved_path, import_path);
+        ImportResult final_result = load_module_from_file(resolved_path, import_path);
+
+        // Apply filtering again for the final result if needed
+        if (import_node.is_specific_import() && final_result.success)
+        {
+            if (import_node.specific_imports().size() == 1)
+            {
+                final_result.namespace_alias = import_node.specific_imports()[0];
+            }
+            else
+            {
+                final_result = filter_specific_imports(std::move(final_result), import_node.specific_imports());
+            }
+        }
+
+        return final_result;
     }
 
     std::string ModuleLoader::resolve_import_path(const std::string &import_path, ImportDeclarationNode::ImportType import_type)
@@ -166,7 +215,6 @@ namespace Cryo
                       << " symbols" << std::endl;
 
             result.success = true;
-            result.ast = std::move(ast);
             return result;
         }
         catch (const std::exception &e)
@@ -232,16 +280,9 @@ namespace Cryo
             {
                 if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
                 {
-                    Type *function_type = nullptr;
-
-                    if (type_context)
-                    {
-                        // Create proper FunctionType from the declaration
-                        function_type = create_function_type_from_declaration(func_decl, type_context);
-                    }
-
-                    // Create function symbol with proper type information
-                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_decl->location(), function_type, module_name);
+                    // Create function symbol with nullptr type for now to avoid memory issues
+                    // The proper type will be resolved when the symbol is actually used
+                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_decl->location(), nullptr, module_name);
                     symbol_map[func_decl->name()] = symbol;
                 }
                 else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(decl))
@@ -334,6 +375,47 @@ namespace Cryo
 
         // Create FunctionType
         return type_context->create_function_type(return_type, parameter_types);
+    }
+
+    ModuleLoader::ImportResult ModuleLoader::filter_specific_imports(ImportResult result, const std::vector<std::string> &specific_imports)
+    {
+        std::cout << "[DEBUG] ModuleLoader: Filtering imports for specific symbols" << std::endl;
+
+        if (!result.success)
+        {
+            return result;
+        }
+
+        // Create filtered symbol map and exported symbols list
+        std::unordered_map<std::string, Symbol> filtered_symbol_map;
+        std::vector<std::string> filtered_exported_symbols;
+
+        for (const std::string &import_name : specific_imports)
+        {
+            // Check if the symbol exists in the module
+            auto symbol_it = result.symbol_map.find(import_name);
+            if (symbol_it != result.symbol_map.end())
+            {
+                filtered_symbol_map[import_name] = symbol_it->second;
+                filtered_exported_symbols.push_back(import_name);
+                std::cout << "[DEBUG] ModuleLoader: Found and included symbol: " << import_name << std::endl;
+            }
+            else
+            {
+                // Symbol not found - this should be a compilation error
+                result.success = false;
+                result.error_message = "Symbol '" + import_name + "' not found in module '" + result.module_name + "'";
+                std::cout << "[DEBUG] ModuleLoader: Error - Symbol not found: " << import_name << std::endl;
+                return result;
+            }
+        }
+
+        // Update the result with filtered symbols
+        result.symbol_map = std::move(filtered_symbol_map);
+        result.exported_symbols = std::move(filtered_exported_symbols);
+
+        std::cout << "[DEBUG] ModuleLoader: Filtered to " << result.symbol_map.size() << " symbols" << std::endl;
+        return result;
     }
 
     std::string ModuleLoader::get_parent_directory(const std::string &file_path)

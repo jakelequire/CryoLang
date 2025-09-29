@@ -501,29 +501,57 @@ namespace Cryo
             Absolute  // <path> for standard library (stdlib/ prefix assumed)
         };
 
+        enum class ImportStyle
+        {
+            WildcardImport,    // import <core/types>; or import * from <core/types>;
+            SpecificImport     // import IO from <io/stdio>;
+        };
+
     private:
-        std::string _path;       // The import path (file path or module name)
-        std::string _alias;      // Optional alias (for "as" keyword)
-        ImportType _import_type; // Type of import
-        bool _has_alias;         // Whether an alias was specified
+        std::string _path;              // The import path (file path or module name)
+        std::string _alias;             // Optional alias (for "as" keyword)
+        std::vector<std::string> _specific_imports; // Specific symbols to import (for "import X from")
+        ImportType _import_type;        // Type of import
+        ImportStyle _import_style;      // Style of import (wildcard vs specific)
+        bool _has_alias;                // Whether an alias was specified
 
     public:
         ImportDeclarationNode(SourceLocation loc, std::string path, ImportType type)
             : DeclarationNode(NodeKind::ImportDeclaration, loc),
-              _path(std::move(path)), _import_type(type), _has_alias(false) {}
+              _path(std::move(path)), _import_type(type), _import_style(ImportStyle::WildcardImport), _has_alias(false) {}
 
         ImportDeclarationNode(SourceLocation loc, std::string path, std::string alias, ImportType type)
             : DeclarationNode(NodeKind::ImportDeclaration, loc),
-              _path(std::move(path)), _alias(std::move(alias)), _import_type(type), _has_alias(true) {}
+              _path(std::move(path)), _alias(std::move(alias)), _import_type(type), _import_style(ImportStyle::WildcardImport), _has_alias(true) {}
+
+        // Constructor for specific imports (import X from <path>)
+        ImportDeclarationNode(SourceLocation loc, std::vector<std::string> specific_imports, std::string path, ImportType type)
+            : DeclarationNode(NodeKind::ImportDeclaration, loc),
+              _path(std::move(path)), _specific_imports(std::move(specific_imports)), _import_type(type), _import_style(ImportStyle::SpecificImport), _has_alias(false) {}
 
         const std::string &path() const { return _path; }
         const std::string &alias() const { return _alias; }
+        const std::vector<std::string> &specific_imports() const { return _specific_imports; }
         ImportType import_type() const { return _import_type; }
+        ImportStyle import_style() const { return _import_style; }
         bool has_alias() const { return _has_alias; }
+        bool is_specific_import() const { return _import_style == ImportStyle::SpecificImport; }
+        bool is_wildcard_import() const { return _import_style == ImportStyle::WildcardImport; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "ImportDecl: ";
+            
+            if (_import_style == ImportStyle::SpecificImport)
+            {
+                for (size_t i = 0; i < _specific_imports.size(); ++i)
+                {
+                    if (i > 0) os << ", ";
+                    os << _specific_imports[i];
+                }
+                os << " from ";
+            }
+            
             if (_import_type == ImportType::Relative)
                 os << "\"" << _path << "\"";
             else if (_import_type == ImportType::Absolute)

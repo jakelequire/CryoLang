@@ -902,10 +902,72 @@ namespace Cryo
         // Parse 'import' keyword
         consume(TokenKind::TK_KW_IMPORT, "Expected 'import'");
 
-        // Parse module path - can be string literal (relative) or angle brackets (stdlib)
-        std::string module_path;
-        ImportDeclarationNode::ImportType import_type;
+        // Check for different import patterns:
+        // 1. import * from <path>;            (wildcard with explicit from)
+        // 2. import IO from <path>;           (specific import with from)
+        // 3. import IO, Function from <path>; (multiple specific imports)  
+        // 4. import <path>;                   (traditional wildcard)
+        // 5. import <path> as alias;          (traditional with alias)
 
+        std::vector<std::string> specific_imports;
+        std::string module_path;
+        std::string alias;
+        ImportDeclarationNode::ImportType import_type;
+        bool has_alias = false;
+        bool using_from_syntax = false;
+
+        // Check if we have a wildcard (*) or specific imports before 'from'
+        if (_current_token.is(TokenKind::TK_STAR))
+        {
+            // import * from <path>;
+            advance(); // consume '*'
+            
+            if (!_current_token.is(TokenKind::TK_KW_FROM))
+            {
+                throw ParseError("Expected 'from' after '*' in import statement", _current_token.location());
+            }
+            
+            advance(); // consume 'from'
+            using_from_syntax = true;
+            // This is still a wildcard import, just with explicit 'from' syntax
+        }
+        else if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            // Could be: import IO from <path>; or import IO, Function from <path>; or import <path>;
+            // We need to look ahead to see if there's a 'from' keyword
+            
+            // Parse the first identifier
+            std::string first_identifier = std::string(_current_token.text());
+            advance(); // consume identifier
+            
+            // Check if we have a comma (multiple imports) or 'from' (specific import) or something else (traditional import path)
+            if (_current_token.is(TokenKind::TK_COMMA) || _current_token.is(TokenKind::TK_KW_FROM))
+            {
+                // This is specific import syntax: import IO from <path>; or import IO, Function from <path>;
+                specific_imports.push_back(first_identifier);
+                
+                // Parse additional imports if comma-separated
+                while (_current_token.is(TokenKind::TK_COMMA))
+                {
+                    advance(); // consume ','
+                    Token import_name = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after ',' in import list");
+                    specific_imports.push_back(std::string(import_name.text()));
+                }
+                
+                // Now we should have 'from'
+                consume(TokenKind::TK_KW_FROM, "Expected 'from' after import list");
+                using_from_syntax = true;
+            }
+            else
+            {
+                // This might be traditional import syntax where the identifier is part of the path
+                // We need to backtrack and parse this as a traditional import path
+                // For now, let's handle this as an error since identifiers without <> or "" are ambiguous
+                throw ParseError("Ambiguous import syntax. Use 'import <path>' for stdlib or 'import \"path\"' for relative imports, or 'import Symbol from <path>' for specific imports", _current_token.location());
+            }
+        }
+
+        // Now parse the module path (required for all import types)
         if (_current_token.is(TokenKind::TK_STRING_LITERAL))
         {
             // String literal import for relative files (e.g., import "./relative/path.cryo")
@@ -950,10 +1012,8 @@ namespace Cryo
             throw ParseError("Expected import path: use \"./relative/path.cryo\" for relative imports or <core/module> for standard library", _current_token.location());
         }
 
-        // Parse optional 'as' alias
-        std::string alias;
-        bool has_alias = false;
-        if (_current_token.is(TokenKind::TK_KW_AS))
+        // Parse optional 'as' alias (only for traditional wildcard imports)
+        if (_current_token.is(TokenKind::TK_KW_AS) && !using_from_syntax)
         {
             advance(); // consume 'as'
             Token alias_token = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after 'as'");
@@ -967,12 +1027,20 @@ namespace Cryo
             advance(); // consume ';'
         }
 
-        if (has_alias)
+        // Create the appropriate import node based on the syntax used
+        if (!specific_imports.empty())
         {
+            // Specific import: import IO from <path>;
+            return std::make_unique<ImportDeclarationNode>(start_loc, std::move(specific_imports), module_path, import_type);
+        }
+        else if (has_alias)
+        {
+            // Traditional import with alias: import <path> as alias;
             return std::make_unique<ImportDeclarationNode>(start_loc, module_path, alias, import_type);
         }
         else
         {
+            // Wildcard import: import <path>; or import * from <path>;
             return std::make_unique<ImportDeclarationNode>(start_loc, module_path, import_type);
         }
     }

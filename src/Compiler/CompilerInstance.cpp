@@ -675,18 +675,47 @@ namespace Cryo
 
             if (result.success)
             {
-                // Register the namespace and symbols
-                std::string namespace_name = import_decl->has_alias() ? import_decl->alias() : result.module_name;
-
-                if (!result.symbol_map.empty())
+                if (import_decl->is_specific_import())
                 {
-                    current_scope->register_namespace(namespace_name, result.symbol_map);
-                    std::cout << "[CompilerInstance] Registered namespace '" << namespace_name << "' with "
-                              << result.symbol_map.size() << " symbols" << std::endl;
+                    // Check if this is a namespace alias (single specific import) or symbol imports (multiple)
+                    if (!result.namespace_alias.empty())
+                    {
+                        // Single specific import treated as namespace alias
+                        std::cout << "[CompilerInstance] Processing namespace alias '" << result.namespace_alias 
+                                  << "' for module '" << result.module_name << "' with " << result.symbol_map.size() << " symbols" << std::endl;
+                        
+                        current_scope->register_namespace(result.namespace_alias, result.symbol_map);
+                        std::cout << "[CompilerInstance] Registered namespace alias '" << result.namespace_alias << "' with "
+                                  << result.symbol_map.size() << " symbols" << std::endl;
+                    }
+                    else
+                    {
+                        // Multiple specific imports - add symbols directly to current scope
+                        std::cout << "[CompilerInstance] Processing specific symbol imports with " << result.symbol_map.size() << " symbols" << std::endl;
+                        
+                        for (const auto &[symbol_name, symbol] : result.symbol_map)
+                        {
+                            // Register each symbol directly in the current scope
+                            current_scope->declare_symbol(symbol_name, symbol.kind, symbol.declaration_location, symbol.data_type, scope_name);
+                            std::cout << "[CompilerInstance] Registered specific symbol: " << symbol_name << std::endl;
+                        }
+                    }
                 }
                 else
                 {
-                    std::cout << "[CompilerInstance] Warning: Import succeeded but no symbols found in " << import_decl->path() << std::endl;
+                    // For wildcard imports, register the namespace and symbols
+                    std::string namespace_name = import_decl->has_alias() ? import_decl->alias() : result.module_name;
+
+                    if (!result.symbol_map.empty())
+                    {
+                        current_scope->register_namespace(namespace_name, result.symbol_map);
+                        std::cout << "[CompilerInstance] Registered namespace '" << namespace_name << "' with "
+                                  << result.symbol_map.size() << " symbols" << std::endl;
+                    }
+                    else
+                    {
+                        std::cout << "[CompilerInstance] Warning: Import succeeded but no symbols found in " << import_decl->path() << std::endl;
+                    }
                 }
             }
             else
