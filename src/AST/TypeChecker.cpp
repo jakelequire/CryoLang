@@ -1537,9 +1537,27 @@ namespace Cryo
 
         // Look up the type by name to get struct/class information
         Type *struct_type = lookup_variable_type(lookup_type);
-        if (!struct_type || (struct_type->kind() != TypeKind::Struct &&
-                             struct_type->kind() != TypeKind::Class &&
-                             struct_type->kind() != TypeKind::Generic))
+        bool is_primitive_type = (lookup_type == "string" || lookup_type == "int" || lookup_type == "i8" ||
+                                  lookup_type == "i16" || lookup_type == "i32" || lookup_type == "i64" ||
+                                  lookup_type == "uint" || lookup_type == "u8" || lookup_type == "u16" ||
+                                  lookup_type == "u32" || lookup_type == "u64" || lookup_type == "float" ||
+                                  lookup_type == "f32" || lookup_type == "f64" || lookup_type == "double" ||
+                                  lookup_type == "boolean" || lookup_type == "bool" || lookup_type == "char" ||
+                                  lookup_type == "void");
+                                  
+        if (!struct_type && !is_primitive_type)
+        {
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                         "Cannot access member of non-struct/class type: " + object_type);
+            node.set_type("unknown");
+            return;
+        }
+        
+        // For non-primitive types, verify it's a struct/class/generic type
+        if (struct_type && !is_primitive_type && 
+            struct_type->kind() != TypeKind::Struct &&
+            struct_type->kind() != TypeKind::Class &&
+            struct_type->kind() != TypeKind::Generic)
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
                          "Cannot access member of non-struct/class type: " + object_type);
@@ -1574,6 +1592,51 @@ namespace Cryo
                 std::string resolved_type = substitute_generic_type(method_return_type, object_type, lookup_type);
                 node.set_type(resolved_type);
                 return;
+            }
+        }
+
+        // For primitive types, also check if there are functions available in global scope
+        // that might be primitive method implementations from imported modules
+        if (is_primitive_type)
+        {
+            // First, try to find if we have the primitive type methods imported from stdlib
+            // Check if we have core::Types imported (which would contain primitive implementations)
+            if (_main_symbol_table) 
+            {
+                // Look through all registered namespaces for potential primitive method implementations
+                std::string primitive_method_name = lookup_type + "::" + member_name;
+                
+                // Also try checking if the method exists as a global function (for compatibility)
+                auto symbol = _main_symbol_table->lookup_symbol(member_name);
+                if (symbol && symbol->kind == SymbolKind::Function) 
+                {
+                    // Found a function with the right name - assume it's the primitive method
+                    // For primitive methods, we'll set appropriate return types
+                    if (member_name == "length") {
+                        node.set_type("u64");
+                        return;
+                    } else if (member_name == "char_at") {
+                        node.set_type("char");
+                        return;
+                    } else {
+                        node.set_type("unknown"); // Fallback for other methods
+                        return;
+                    }
+                }
+                
+                // If we have imported core/types (which contains primitive implementations),
+                // assume primitive methods are available
+                if (_main_symbol_table->has_namespace("std::core::Types") && lookup_type == "string") {
+                    // We have core/types imported and this is a string method call
+                    // Assume common primitive methods are available
+                    if (member_name == "length") {
+                        node.set_type("u64");
+                        return;
+                    } else if (member_name == "char_at") {
+                        node.set_type("char");
+                        return;
+                    }
+                }
             }
         }
 
@@ -2167,6 +2230,7 @@ namespace Cryo
         // Get target type name as string
         std::string target_type_name = node.target_type();
         Type *target_type = nullptr;
+        bool is_primitive_type = false;
 
         if (!target_type_name.empty())
         {
@@ -2178,23 +2242,39 @@ namespace Cryo
                 base_type_name = target_type_name.substr(0, generic_start);
             }
 
-            // Look up the base type in symbol table
-            target_type = lookup_variable_type(base_type_name);
-            if (!target_type)
+            // Check if it's a primitive type first
+            if (base_type_name == "string" || base_type_name == "int" || base_type_name == "i8" ||
+                base_type_name == "i16" || base_type_name == "i32" || base_type_name == "i64" ||
+                base_type_name == "uint" || base_type_name == "u8" || base_type_name == "u16" ||
+                base_type_name == "u32" || base_type_name == "u64" || base_type_name == "float" ||
+                base_type_name == "f32" || base_type_name == "f64" || base_type_name == "double" ||
+                base_type_name == "boolean" || base_type_name == "bool" || base_type_name == "char" ||
+                base_type_name == "void")
             {
-                report_undefined_symbol(node.location(), base_type_name);
-                return;
+                is_primitive_type = true;
+                // Create a primitive type using type context
+                target_type = _type_context.parse_type_from_string(base_type_name);
             }
-
-            // Verify it's a struct, class, enum, or trait type
-            if (target_type->kind() != TypeKind::Struct && 
-                target_type->kind() != TypeKind::Class && 
-                target_type->kind() != TypeKind::Enum &&
-                target_type->kind() != TypeKind::Trait)
+            else
             {
-                report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                             "Implementation block can only be applied to struct, class, enum, or trait types");
-                return;
+                // Look up the base type in symbol table
+                target_type = lookup_variable_type(base_type_name);
+                if (!target_type)
+                {
+                    report_undefined_symbol(node.location(), base_type_name);
+                    return;
+                }
+
+                // Verify it's a struct, class, enum, or trait type
+                if (target_type->kind() != TypeKind::Struct && 
+                    target_type->kind() != TypeKind::Class && 
+                    target_type->kind() != TypeKind::Enum &&
+                    target_type->kind() != TypeKind::Trait)
+                {
+                    report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                                 "Implementation block can only be applied to struct, class, enum, or trait types");
+                    return;
+                }
             }
         }
 

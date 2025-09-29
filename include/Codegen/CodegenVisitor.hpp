@@ -13,6 +13,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/BasicBlock.h>
 #include <memory>
+#include <set>
 #include <stack>
 #include <unordered_map>
 
@@ -51,6 +52,12 @@ namespace Cryo::Codegen
             LLVMContextManager &context_manager,
             Cryo::SymbolTable &symbol_table,
             Cryo::DiagnosticManager* gdm = nullptr);
+
+        // Prevent copying and moving to avoid unique_ptr issues
+        CodegenVisitor(const CodegenVisitor&) = delete;
+        CodegenVisitor& operator=(const CodegenVisitor&) = delete;
+        CodegenVisitor(CodegenVisitor&&) = delete;
+        CodegenVisitor& operator=(CodegenVisitor&&) = delete;
 
         ~CodegenVisitor() = default;
 
@@ -262,6 +269,10 @@ namespace Cryo::Codegen
 
         // Control flags
         bool _stdlib_compilation_mode; // Generate full implementations for imports in stdlib mode
+        
+        // Primitive type context for method generation
+        std::string current_primitive_type; // Track current primitive type being implemented
+        std::set<Cryo::StructMethodNode*> processed_primitive_methods; // Track already processed primitive methods
 
         // Loop context for break/continue
         llvm::BasicBlock *_current_loop_exit = nullptr;
@@ -290,6 +301,7 @@ namespace Cryo::Codegen
         llvm::Function *generate_function_declaration(Cryo::FunctionDeclarationNode *node);
         llvm::Function *generate_method_declaration(Cryo::StructMethodNode *method, llvm::Type *struct_type);
         bool generate_function_body(Cryo::FunctionDeclarationNode *node, llvm::Function *function);
+        void generate_primitive_method(Cryo::StructMethodNode *node, const std::string& primitive_type_name);
 
         // Generic type generation
         llvm::Function *generate_generic_constructor(const std::string &instantiated_type,
