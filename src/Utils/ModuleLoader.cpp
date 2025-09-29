@@ -3,6 +3,7 @@
 #include "Lexer/lexer.hpp"
 #include "Utils/file.hpp"
 #include "AST/ASTContext.hpp"
+#include "AST/Type.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -221,6 +222,9 @@ namespace Cryo
     {
         std::unordered_map<std::string, Symbol> symbol_map;
 
+        // Get TypeContext for creating proper type objects
+        TypeContext *type_context = _symbol_table.get_type_context();
+
         // Process all top-level declarations
         for (const auto &statement : ast.statements())
         {
@@ -228,8 +232,16 @@ namespace Cryo
             {
                 if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
                 {
-                    // Create function symbol
-                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_decl->location(), nullptr, module_name);
+                    Type *function_type = nullptr;
+
+                    if (type_context)
+                    {
+                        // Create proper FunctionType from the declaration
+                        function_type = create_function_type_from_declaration(func_decl, type_context);
+                    }
+
+                    // Create function symbol with proper type information
+                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_decl->location(), function_type, module_name);
                     symbol_map[func_decl->name()] = symbol;
                 }
                 else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(decl))
@@ -271,6 +283,57 @@ namespace Cryo
     bool ModuleLoader::has_circular_dependency(const std::string &module_path)
     {
         return _loading_modules.find(module_path) != _loading_modules.end();
+    }
+
+    Type *ModuleLoader::create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context)
+    {
+        if (!func_decl || !type_context)
+        {
+            return nullptr;
+        }
+
+        // Get return type
+        Type *return_type = nullptr;
+        const std::string &return_type_str = func_decl->return_type_annotation();
+        if (!return_type_str.empty() && return_type_str != "void")
+        {
+            return_type = type_context->parse_type_from_string(return_type_str);
+        }
+        else
+        {
+            // Default to void for functions without explicit return type or explicit void
+            return_type = type_context->get_void_type();
+        }
+
+        // Get parameter types
+        std::vector<Type *> parameter_types;
+        for (const auto &param : func_decl->parameters())
+        {
+            const std::string &param_type_str = param->type_annotation();
+            if (!param_type_str.empty())
+            {
+                Type *param_type = type_context->parse_type_from_string(param_type_str);
+                if (param_type)
+                {
+                    parameter_types.push_back(param_type);
+                }
+                else
+                {
+                    std::cerr << "Warning: Failed to parse parameter type '" << param_type_str
+                              << "' for function '" << func_decl->name() << "'" << std::endl;
+                    return nullptr;
+                }
+            }
+            else
+            {
+                std::cerr << "Warning: Parameter '" << param->name()
+                          << "' in function '" << func_decl->name() << "' has no type annotation" << std::endl;
+                return nullptr;
+            }
+        }
+
+        // Create FunctionType
+        return type_context->create_function_type(return_type, parameter_types);
     }
 
     std::string ModuleLoader::get_parent_directory(const std::string &file_path)

@@ -22,8 +22,8 @@ namespace Cryo
         std::string name;
         SymbolKind kind;
         SourceLocation declaration_location;
-        Type *data_type;   // Changed from string to Type*
-        std::string scope; // Scope information (e.g., "Global", "main", "test_fn")
+        Type *data_type;              // Changed from string to Type*
+        std::string scope;            // Scope information (e.g., "Global", "main", "test_fn")
         std::string enhanced_display; // Optional enhanced display string for complex types like generics
 
         // Default constructor
@@ -66,6 +66,7 @@ namespace Cryo
 
         // Type context management
         void set_type_context(TypeContext *type_context) { type_context_ = type_context; }
+        TypeContext *get_type_context() const { return type_context_; }
 
         // Scope management
         std::unique_ptr<SymbolTable> enter_scope();

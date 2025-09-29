@@ -82,7 +82,7 @@ namespace Cryo
         std::unique_ptr<VariableDeclarationNode> parse_variable_declaration();
         std::unique_ptr<FunctionDeclarationNode> parse_function_declaration();
         std::unique_ptr<FunctionDeclarationNode> parse_extern_function_declaration();
-        void parse_where_clause(FunctionDeclarationNode* func_decl);
+        void parse_where_clause(FunctionDeclarationNode *func_decl);
         std::unique_ptr<IntrinsicDeclarationNode> parse_intrinsic_declaration();
         std::unique_ptr<ImportDeclarationNode> parse_import_declaration();
         std::unique_ptr<StructDeclarationNode> parse_struct_declaration();
@@ -154,6 +154,7 @@ namespace Cryo
         // Utility methods
         bool is_type_token() const;
         bool is_primitive_type_token() const;
+        bool is_integer_primitive_type_token() const;
         bool is_visibility_modifier() const;
         bool is_variable_modifier() const; // const, mut
         int get_operator_precedence(TokenKind kind) const;
