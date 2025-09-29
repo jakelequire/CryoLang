@@ -1594,6 +1594,28 @@ namespace Cryo
                _current_token.is(TokenKind::TK_IDENTIFIER); // For user-defined types
     }
 
+    bool Parser::is_primitive_type_token() const
+    {
+        return _current_token.is(TokenKind::TK_KW_I8) ||
+               _current_token.is(TokenKind::TK_KW_I16) ||
+               _current_token.is(TokenKind::TK_KW_I32) ||
+               _current_token.is(TokenKind::TK_KW_I64) ||
+               _current_token.is(TokenKind::TK_KW_INT) ||
+               _current_token.is(TokenKind::TK_KW_UINT) ||
+               _current_token.is(TokenKind::TK_KW_UINT8) ||
+               _current_token.is(TokenKind::TK_KW_UINT16) ||
+               _current_token.is(TokenKind::TK_KW_UINT32) ||
+               _current_token.is(TokenKind::TK_KW_UINT64) ||
+               _current_token.is(TokenKind::TK_KW_FLOAT) ||
+               _current_token.is(TokenKind::TK_KW_F32) ||
+               _current_token.is(TokenKind::TK_KW_F64) ||
+               _current_token.is(TokenKind::TK_KW_DOUBLE) ||
+               _current_token.is(TokenKind::TK_KW_BOOLEAN) ||
+               _current_token.is(TokenKind::TK_KW_CHAR) ||
+               _current_token.is(TokenKind::TK_KW_STRING) ||
+               _current_token.is(TokenKind::TK_KW_VOID);
+    }
+
     bool Parser::is_visibility_modifier() const
     {
         return _current_token.is(TokenKind::TK_KW_PUBLIC) ||
@@ -2803,6 +2825,8 @@ namespace Cryo
         // Optional 'struct', 'enum', or 'trait' keyword for different target types
         bool is_enum_impl = false;
         bool is_trait_impl = false;
+        bool is_primitive_impl = false;
+        
         if (_current_token.is(TokenKind::TK_KW_STRUCT))
         {
             advance(); // consume 'struct'
@@ -2817,8 +2841,23 @@ namespace Cryo
             advance(); // consume 'trait'
             is_trait_impl = true;
         }
+        else if (is_primitive_type_token())
+        {
+            // Handle primitive types like 'string', 'int', etc.
+            is_primitive_impl = true;
+        }
 
-        Token target_token = consume(TokenKind::TK_IDENTIFIER, "Expected target type name");
+        Token target_token;
+        if (is_primitive_impl)
+        {
+            // For primitive types, the current token is the type itself
+            target_token = _current_token;
+            advance();
+        }
+        else
+        {
+            target_token = consume(TokenKind::TK_IDENTIFIER, "Expected target type name");
+        }
         std::string target_type = std::string(target_token.text());
 
         // Handle generic parameters for the target type (e.g., implement enum Option<T>)

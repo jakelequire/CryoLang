@@ -153,6 +153,7 @@ namespace Cryo
 
         // Utility methods
         bool is_type_token() const;
+        bool is_primitive_type_token() const;
         bool is_visibility_modifier() const;
         bool is_variable_modifier() const; // const, mut
         int get_operator_precedence(TokenKind kind) const;

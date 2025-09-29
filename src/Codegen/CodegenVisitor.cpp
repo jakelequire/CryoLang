@@ -164,6 +164,21 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::FunctionDeclarationNode &node)
     {
         std::cout << "[DEBUG] Visiting FunctionDeclarationNode: " << node.name() << std::endl;
+        
+        // Check if this is a StructMethodNode that was already processed as a primitive method
+        if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode*>(&node))
+        {
+            // Check if this method was already processed by looking for the generated function
+            std::string potential_scoped_name = current_primitive_type + "::" + node.name();
+            auto module = _context_manager.get_module();
+            if (module && module->getFunction(potential_scoped_name))
+            {
+                std::cout << "[DEBUG] Skipping already processed primitive method: " << potential_scoped_name << std::endl;
+                register_value(&node, nullptr);
+                return;
+            }
+        }
+        
         try
         {
             // Skip generic functions for now - they require specialized template instantiation
@@ -373,6 +388,13 @@ namespace Cryo::Codegen
     {
         try
         {
+            // Debug: Check ValueContext state at the very beginning
+            std::cout << "[DEBUG] VarDecl start: this=" << this << ", _value_context=" << _value_context.get() << std::endl;
+            if (!_value_context) {
+                std::cerr << "[ERROR] _value_context is null in visit(VariableDeclarationNode)!" << std::endl;
+                return;
+            }
+
             // Get the variable name and type
             std::string var_name = node.name();
             std::string type_annotation = node.type_annotation();
@@ -872,7 +894,16 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::StructMethodNode &node)
     {
-        // TODO: Implement struct method generation
+        std::cout << "[CodegenVisitor] Generating struct method: " << node.name() << std::endl;
+        
+        // Check if we're in a primitive implementation block context
+        if (current_primitive_type.empty()) {
+            // Regular struct method - delegate to parent visitor
+            visit(static_cast<FunctionDeclarationNode&>(node));
+        } else {
+            // Primitive method - needs special handling for 'this' parameter
+            generate_primitive_method(&node, current_primitive_type);
+        }
         register_value(&node, nullptr);
     }
 
@@ -949,10 +980,31 @@ namespace Cryo::Codegen
 
         // Check if this is a primitive type first
         llvm::Type *primitive_type = _type_mapper->map_type(target_type_name);
+        std::cout << "[DEBUG] Implementation block for: " << target_type_name 
+                  << ", mapped type: " << (primitive_type ? "valid" : "null") 
+                  << ", is_primitive: " << (is_primitive_type(target_type_name) ? "yes" : "no") << std::endl;
+        
         if (primitive_type && is_primitive_type(target_type_name))
         {
-            std::cout << "[CodegenVisitor] Skipping implementation block for primitive type: " << target_type_name << std::endl;
-            return; // Skip implementation blocks for primitive types
+            std::cout << "[CodegenVisitor] Generating implementation block for primitive type: " << target_type_name << std::endl;
+            
+            // Set primitive type context for method generation
+            current_primitive_type = target_type_name;
+            
+            // Generate all method implementations for primitive type
+            for (const auto &method : node.method_implementations())
+            {
+                if (method)
+                {
+                    // For primitive methods, we need to generate them as regular functions
+                    // but with a special naming scheme that includes the primitive type
+                    visit(*method);
+                }
+            }
+            
+            // Clear primitive type context
+            current_primitive_type.clear();
+            return; // We've handled the primitive implementation
         }
 
         // Look up the struct type
@@ -2906,6 +2958,13 @@ namespace Cryo::Codegen
             // Set insertion point to entry block
             _context_manager.get_builder().SetInsertPoint(entry_block);
 
+            // Debug ValueContext before entering scope
+            std::cout << "[DEBUG] Before enter_scope: this=" << this << ", _value_context=" << _value_context.get() << std::endl;
+            if (!_value_context) {
+                std::cerr << "[ERROR] _value_context is null before enter_scope!" << std::endl;
+                return false;
+            }
+
             // Enter function scope BEFORE registering parameters
             enter_scope(entry_block);
 
@@ -3023,6 +3082,170 @@ namespace Cryo::Codegen
             return false;
         }
     }
+
+    void CodegenVisitor::generate_primitive_method(Cryo::StructMethodNode *node, const std::string& primitive_type_name)
+    {
+        if (!node) return;
+        
+        std::cout << "[CodegenVisitor] Generating primitive method: " << primitive_type_name << "::" << node->name() << std::endl;
+        
+        // Debug: Check _value_context at the very start
+        std::cout << "[DEBUG] At method start, _value_context=" << _value_context.get() << std::endl;
+        if (!_value_context) {
+            std::cerr << "[ERROR] _value_context is null at method start!" << std::endl;
+            report_error("Value context is null at method start", node);
+            return;
+        }
+        
+        auto module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        auto &llvm_context = _context_manager.get_context();
+        
+        if (!module)
+        {
+            report_error("No module available for primitive method generation");
+            return;
+        }
+        
+        // Get primitive type for 'this' parameter
+        llvm::Type *primitive_type = _type_mapper->map_type(primitive_type_name);
+        if (!primitive_type)
+        {
+            report_error("Cannot map primitive type: " + primitive_type_name);
+            return;
+        }
+        
+        // Create function signature with 'this' parameter
+        std::vector<llvm::Type*> param_types;
+        
+        // Add 'this' parameter (pointer to primitive type)
+        param_types.push_back(llvm::PointerType::getUnqual(primitive_type));
+        
+        // Add regular parameters
+        for (const auto &param : node->parameters())
+        {
+            if (param)
+            {
+                llvm::Type *param_type = _type_mapper->map_type(param->type_annotation());
+                if (param_type)
+                {
+                    param_types.push_back(param_type);
+                }
+            }
+        }
+        
+        // Map return type
+        llvm::Type *return_type = nullptr;
+        if (!node->return_type_annotation().empty() && node->return_type_annotation() != "void")
+        {
+            return_type = _type_mapper->map_type(node->return_type_annotation());
+        }
+        if (!return_type)
+        {
+            return_type = llvm::Type::getVoidTy(llvm_context);
+        }
+        
+        // Create function type
+        llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+        
+        // Create function with scoped name
+        std::string func_name = primitive_type_name + "::" + node->name();
+        llvm::Function *func = llvm::Function::Create(
+            func_type, 
+            llvm::Function::ExternalLinkage,
+            func_name,
+            module
+        );
+        
+        // Set parameter names
+        auto arg_it = func->arg_begin();
+        arg_it->setName("this");
+        ++arg_it;
+        
+        for (const auto &param : node->parameters())
+        {
+            if (param && arg_it != func->arg_end())
+            {
+                arg_it->setName(param->name());
+                ++arg_it;
+            }
+        }
+        
+        // Generate function body
+        llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(llvm_context, "entry", func);
+        builder.SetInsertPoint(entry_block);
+        
+        // Set up function context for body generation
+        _current_function = std::make_unique<FunctionContext>(func, node);
+        _current_function->entry_block = entry_block;
+        
+        // Create allocas for parameters and set up symbol table
+        arg_it = func->arg_begin();
+        
+        // Handle 'this' parameter
+        llvm::AllocaInst *this_alloca = create_entry_block_alloca(func, llvm::PointerType::getUnqual(primitive_type), "this");
+        if (this_alloca)
+        {
+            builder.CreateStore(&*arg_it, this_alloca);
+            
+            // Debug: Check if _value_context is valid
+            if (!_value_context) {
+                std::cerr << "[ERROR] _value_context is null in generate_primitive_method!" << std::endl;
+                report_error("Value context is null", node);
+                return;
+            }
+            
+            std::cout << "[DEBUG] Setting 'this' value in context, _value_context=" << _value_context.get() << std::endl;
+            
+            // Add to value context so it can be resolved in the function body
+            _value_context->set_value("this", this_alloca, this_alloca, llvm::PointerType::getUnqual(primitive_type));
+        }
+        ++arg_it;
+        
+        // Handle regular parameters
+        for (const auto &param : node->parameters())
+        {
+            if (param && arg_it != func->arg_end())
+            {
+                llvm::Type *param_type = _type_mapper->map_type(param->type_annotation());
+                if (param_type)
+                {
+                    llvm::AllocaInst *alloca = create_entry_block_alloca(func, param_type, param->name());
+                    if (alloca)
+                    {
+                        builder.CreateStore(&*arg_it, alloca);
+                        _value_context->set_value(param->name(), alloca, alloca, param_type);
+                    }
+                }
+                ++arg_it;
+            }
+        }
+        
+        // Generate function body
+        if (node->body())
+        {
+            node->body()->accept(*this);
+        }
+        
+        // Ensure proper termination
+        if (!builder.GetInsertBlock()->getTerminator())
+        {
+            if (return_type->isVoidTy())
+            {
+                builder.CreateRetVoid();
+            }
+            else
+            {
+                // Return default value for non-void functions
+                builder.CreateRet(llvm::Constant::getNullValue(return_type));
+            }
+        }
+        
+        // Clean up
+        _current_function.reset();
+        register_value(node, func);
+    }
+
     llvm::Type *CodegenVisitor::generate_struct_type(Cryo::StructDeclarationNode *node) { return nullptr; }
     llvm::Type *CodegenVisitor::generate_class_type(Cryo::ClassDeclarationNode *node)
     {
@@ -4382,13 +4605,28 @@ namespace Cryo::Codegen
                         else
                         {
                             std::cout << "[CodegenVisitor] Method not found: " << method_name << " for type: " << type_name << std::endl;
+                            
+                            // For primitive types, use the fully qualified method name instead of just the member name
+                            // This allows linking with precompiled primitive methods in libcryo.a
+                            if (is_primitive_type(type_name))
+                            {
+                                std::cout << "[CodegenVisitor] Using qualified name for primitive method: " << method_name << std::endl;
+                                function_name = method_name; // Use string::length instead of just length
+                            }
+                            else
+                            {
+                                // Fall back to unqualified name for non-primitive types
+                                function_name = extract_function_name_from_member_access(member_access);
+                            }
                         }
                     }
                 }
             }
-
-            // Fall back to handling namespaced calls like Std::Runtime::print_int
-            function_name = extract_function_name_from_member_access(member_access);
+            else
+            {
+                // Fall back to handling namespaced calls like Std::Runtime::print_int
+                function_name = extract_function_name_from_member_access(member_access);
+            }
         }
         else if (auto *scope_resolution = dynamic_cast<ScopeResolutionNode *>(node->callee()))
         {
@@ -4491,6 +4729,41 @@ namespace Cryo::Codegen
 
         // Generate arguments
         std::vector<llvm::Value *> args;
+        
+        // For primitive method calls (like string::length), we need to add the 'this' pointer as the first argument
+        if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
+        {
+            if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
+            {
+                std::string object_name = object_identifier->name();
+                
+                // Check if this is a primitive type method call
+                auto type_it = _variable_types.find(object_name);
+                if (type_it != _variable_types.end() && is_primitive_type(type_it->second))
+                {
+                    // This is a primitive method call - add the object as 'this' pointer
+                    llvm::Value *object_value = _value_context->get_value(object_name);
+                    if (object_value)
+                    {
+                        // If it's an alloca (stack variable), load the value first
+                        if (llvm::isa<llvm::AllocaInst>(object_value))
+                        {
+                            llvm::Type *element_type = _value_context->get_alloca_type(object_name);
+                            llvm::Value *loaded_value = create_load(object_value, element_type, object_name + ".load");
+                            args.push_back(loaded_value); // Load the actual value for primitive methods
+                            std::cout << "[CodegenVisitor] Added loaded 'this' value for primitive method: " << function_name << std::endl;
+                        }
+                        else
+                        {
+                            args.push_back(object_value); // Direct value (like function parameters)
+                            std::cout << "[CodegenVisitor] Added direct 'this' value for primitive method: " << function_name << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Add regular arguments
         for (const auto &arg : node->arguments())
         {
             arg->accept(*this);
@@ -4676,6 +4949,25 @@ namespace Cryo::Codegen
         
         // Infer parameter types from call arguments
         std::vector<llvm::Type*> param_types;
+        
+        // Check if this is a primitive method call that needs a 'this' pointer
+        bool is_primitive_method_call = false;
+        if (auto *member_access = dynamic_cast<MemberAccessNode *>(call_node->callee()))
+        {
+            if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
+            {
+                std::string object_name = object_identifier->name();
+                auto type_it = _variable_types.find(object_name);
+                if (type_it != _variable_types.end() && is_primitive_type(type_it->second))
+                {
+                    is_primitive_method_call = true;
+                    // Add 'this' pointer parameter (string pointer for string methods)
+                    param_types.push_back(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(_context_manager.get_context())));
+                    std::cout << "[DEBUG] Added 'this' pointer parameter to forward declaration for primitive method: " << c_name << std::endl;
+                }
+            }
+        }
+        
         if (!call_node->arguments().empty())
         {
             for (const auto& arg : call_node->arguments())
@@ -5593,6 +5885,11 @@ namespace Cryo::Codegen
     {
         try
         {
+            std::cout << "[DEBUG] enter_scope: this=" << this << ", _value_context=" << _value_context.get() << std::endl;
+            if (!_value_context) {
+                std::cerr << "[ERROR] _value_context is null in enter_scope!" << std::endl;
+                return;
+            }
             _value_context->enter_scope("scope");
 
             if (_current_function)
