@@ -1198,7 +1198,41 @@ namespace Cryo
 
         if (_current_token.is(TokenKind::TK_STRING_LITERAL))
         {
-            return parse_string_literal();
+            std::unique_ptr<ExpressionNode> expr = parse_string_literal();
+            
+            // Handle postfix expressions on string literals (like "hello".length())
+            while (true)
+            {
+                if (_current_token.is(TokenKind::TK_L_PAREN))
+                {
+                    // Function call
+                    expr = parse_call_expression(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_L_SQUARE))
+                {
+                    // Array access
+                    expr = parse_array_access(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_PERIOD))
+                {
+                    // Member access
+                    expr = parse_member_access(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_PLUSPLUS) || _current_token.is(TokenKind::TK_MINUSMINUS))
+                {
+                    // Postfix increment/decrement
+                    Token op = _current_token;
+                    advance();
+                    expr = _builder.create_unary_expression(op, std::move(expr));
+                }
+                else
+                {
+                    // No more postfix operations
+                    break;
+                }
+            }
+            
+            return expr;
         }
 
         if (_current_token.is(TokenKind::TK_CHAR_CONSTANT))
