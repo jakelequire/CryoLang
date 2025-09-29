@@ -596,6 +596,9 @@ namespace Cryo
 
     void CompilerInstance::populate_symbol_table(ASTNode *node)
     {
+        // Inject auto-imports before processing user imports
+        inject_auto_imports(_symbol_table.get(), "Global");
+        
         populate_symbol_table_with_scope(node, _symbol_table.get(), "Global");
     }
 
@@ -816,7 +819,64 @@ namespace Cryo
         // through the import system. This allows for better modularity and avoids duplicate definitions.
         
         std::cout << "Standard library initialized from libcryo" << std::endl;
-    }    std::unique_ptr<CompilerInstance> create_compiler_instance()
+    }
+
+    void CompilerInstance::inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name)
+    {
+        // Skip auto-import if we're in stdlib compilation mode to avoid circular dependencies
+        if (_stdlib_compilation_mode)
+        {
+            std::cout << "[CompilerInstance] Skipping auto-imports in stdlib compilation mode" << std::endl;
+            return;
+        }
+
+        // Skip auto-import if we're compiling the core/types module itself
+        if (_source_file.find("core/types.cryo") != std::string::npos || 
+            _source_file.find("stdlib/core/types.cryo") != std::string::npos)
+        {
+            std::cout << "[CompilerInstance] Skipping auto-imports when compiling core/types module" << std::endl;
+            return;
+        }
+
+        std::cout << "[CompilerInstance] Injecting auto-import: core/types" << std::endl;
+
+        // Create ModuleLoader instance
+        ModuleLoader loader(*current_scope);
+        loader.set_stdlib_root("./stdlib");
+        loader.set_current_file("./"); // Use current directory as base
+
+        // Create a synthetic ImportDeclarationNode for core/types
+        // This simulates: import <core/types>;
+        auto core_types_import = std::make_unique<ImportDeclarationNode>(
+            SourceLocation(0, 0),                        // synthetic location
+            "core/types",                                // path
+            ImportDeclarationNode::ImportType::Absolute  // absolute import (stdlib)
+        );
+
+        // Load the import
+        auto result = loader.load_import(*core_types_import);
+
+        if (result.success)
+        {
+            // Register the namespace and symbols (wildcard import behavior)
+            if (!result.symbol_map.empty())
+            {
+                current_scope->register_namespace(result.module_name, result.symbol_map);
+                std::cout << "[CompilerInstance] Auto-imported core/types: registered namespace '" << result.module_name 
+                          << "' with " << result.symbol_map.size() << " symbols" << std::endl;
+            }
+            else
+            {
+                std::cout << "[CompilerInstance] Warning: Auto-import succeeded but no symbols found in core/types" << std::endl;
+            }
+        }
+        else
+        {
+            std::cout << "[CompilerInstance] Warning: Failed to auto-import core/types: " << result.error_message << std::endl;
+        }
+    }
+    
+    std::unique_ptr<CompilerInstance> create_compiler_instance()
     {
         return std::make_unique<CompilerInstance>();
     }
