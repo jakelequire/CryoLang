@@ -1212,20 +1212,28 @@ namespace Cryo::Codegen
                 node.expression()->accept(*this);
                 llvm::Value *return_value = get_current_value();
 
+                std::cout << "[DEBUG] Return statement: return_value = " << (return_value ? "valid" : "NULL") << std::endl;
+                if (return_value) {
+                    std::cout << "[DEBUG] Return value type: " << return_value->getType()->getTypeID() << std::endl;
+                }
+
                 if (!return_value)
                 {
+                    std::cout << "[DEBUG] Return value is NULL - creating default value" << std::endl;
                     report_error("Failed to generate return value");
                     return;
                 }
 
                 if (_current_function && _current_function->return_value_alloca)
                 {
+                    std::cout << "[DEBUG] Using structured return pattern" << std::endl;
                     // Store return value and jump to return block
                     create_store(return_value, _current_function->return_value_alloca);
                     builder.CreateBr(_current_function->return_block);
                 }
                 else
                 {
+                    std::cout << "[DEBUG] Using direct return" << std::endl;
                     // Direct return
                     builder.CreateRet(return_value);
                 }
@@ -1442,6 +1450,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::LiteralNode &node)
     {
+        std::cout << "[DEBUG] Visiting LiteralNode, kind: " << static_cast<int>(node.literal_kind()) << ", value: " << node.value() << std::endl;
         auto &llvm_ctx = _context_manager.get_context();
         llvm::Value *literal_value = nullptr;
 
@@ -4624,8 +4633,29 @@ namespace Cryo::Codegen
             }
             else
             {
-                // Fall back to handling namespaced calls like Std::Runtime::print_int
-                function_name = extract_function_name_from_member_access(member_access);
+                // Check if the object is a literal that needs primitive method handling
+                if (auto *literal_node = dynamic_cast<LiteralNode *>(member_access->object()))
+                {
+                    std::cout << "[DEBUG] Found literal node in member access, kind: " << static_cast<int>(literal_node->literal_kind()) << std::endl;
+                    // Check if this is a string literal method call
+                    if (literal_node->literal_kind() == TokenKind::TK_STRING_LITERAL)
+                    {
+                        // This is a string literal method call like "hello".length()
+                        std::string method_name = "string::" + member_access->member();
+                        std::cout << "[CodegenVisitor] String literal method call: " << method_name << std::endl;
+                        function_name = method_name;
+                    }
+                    else
+                    {
+                        // Handle other literal types as needed
+                        function_name = extract_function_name_from_member_access(member_access);
+                    }
+                }
+                else
+                {
+                    // Fall back to handling namespaced calls like Std::Runtime::print_int
+                    function_name = extract_function_name_from_member_access(member_access);
+                }
             }
         }
         else if (auto *scope_resolution = dynamic_cast<ScopeResolutionNode *>(node->callee()))
@@ -4758,6 +4788,30 @@ namespace Cryo::Codegen
                             args.push_back(object_value); // Direct value (like function parameters)
                             std::cout << "[CodegenVisitor] Added direct 'this' value for primitive method: " << function_name << std::endl;
                         }
+                    }
+                }
+            }
+            else if (auto *literal_node = dynamic_cast<LiteralNode *>(member_access->object()))
+            {
+                std::cout << "[DEBUG] In argument generation - found literal node, kind: " << static_cast<int>(literal_node->literal_kind()) << std::endl;
+                // Handle literal method calls like "hello".length()
+                if (literal_node->literal_kind() == TokenKind::TK_STRING_LITERAL)
+                {
+                    std::cout << "[CodegenVisitor] Processing string literal method call" << std::endl;
+                    std::cout << "[DEBUG] About to call accept on literal node with value: " << literal_node->value() << std::endl;
+                    // Generate the string literal value and add it as 'this' pointer
+                    literal_node->accept(*this);
+                    std::cout << "[DEBUG] Finished calling accept on literal node" << std::endl;
+                    llvm::Value *literal_value = get_generated_value(literal_node);
+                    std::cout << "[DEBUG] String literal value: " << (literal_value ? "valid" : "NULL") << std::endl;
+                    if (literal_value)
+                    {
+                        args.push_back(literal_value);
+                        std::cout << "[CodegenVisitor] Added string literal as 'this' value for primitive method: " << function_name << std::endl;
+                    }
+                    else
+                    {
+                        std::cout << "[ERROR] Failed to generate string literal value" << std::endl;
                     }
                 }
             }
