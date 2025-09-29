@@ -1227,7 +1227,7 @@ namespace Cryo
                     _output << ", ";
                 if (_use_colors)
                     _output << Colors::TYPE;
-                _output << params[i];
+                _output << params[i]->name();
                 if (_use_colors)
                     _output << Colors::RESET;
             }

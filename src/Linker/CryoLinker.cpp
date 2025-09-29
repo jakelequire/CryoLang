@@ -26,7 +26,7 @@ namespace Cryo::Linker
     {
 // Set default target triple based on current platform
 #if defined(_WIN32) || defined(_WIN64)
-        _target_triple = "x86_64-w64-windows-gnu";  // Use MinGW instead of MSVC
+        _target_triple = "x86_64-w64-windows-gnu"; // Use MinGW instead of MSVC
 #elif defined(__APPLE__)
         _target_triple = "x86_64-apple-macosx";
 #else
@@ -214,17 +214,17 @@ namespace Cryo::Linker
     bool CryoLinker::generate_executable(llvm::Module *module, const std::string &output_path)
     {
         std::cerr << "[DEBUG] CryoLinker::generate_executable called with output_path: " << output_path << std::endl;
-        
+
         // Step 1: Generate object file from LLVM IR
         std::string temp_obj = output_path + ".o";
         std::cerr << "[DEBUG] Generating object file: " << temp_obj << std::endl;
-        
+
         if (!generate_object_file(module, temp_obj))
         {
             std::cerr << "[DEBUG] generate_object_file failed!" << std::endl;
             return false;
         }
-        
+
         std::cerr << "[DEBUG] Object file generated successfully" << std::endl;
 
         // Step 2: Use system linker to create executable with runtime
@@ -271,13 +271,14 @@ namespace Cryo::Linker
         linker_args.push_back(output_path);
 
         std::cerr << "[DEBUG] About to call execute_linker_command with " << linker_args.size() << " args" << std::endl;
-        for (size_t i = 0; i < linker_args.size(); ++i) {
+        for (size_t i = 0; i < linker_args.size(); ++i)
+        {
             std::cerr << "[DEBUG] linker_args[" << i << "] = '" << linker_args[i] << "'" << std::endl;
         }
 
         // Execute system linker
         bool success = execute_linker_command(linker_args);
-        
+
         std::cerr << "[DEBUG] execute_linker_command returned: " << (success ? "true" : "false") << std::endl;
 
         // Clean up temp object file
@@ -309,7 +310,7 @@ namespace Cryo::Linker
         llvm::InitializeAllAsmPrinters();
 
         std::string error;
-        auto target_triple = _target_triple;  // Use our configured target triple
+        auto target_triple = _target_triple; // Use our configured target triple
         module->setTargetTriple(target_triple);
 
         auto target = llvm::TargetRegistry::lookupTarget(target_triple, error);
@@ -507,12 +508,11 @@ namespace Cryo::Linker
         std::vector<std::string> full_command;
 #if defined(_WIN32) || defined(_WIN64)
         full_command.push_back("C:/msys64/mingw64/bin/clang++"); // Use MinGW clang++ on Windows
-        // Skip PIE flags on Windows as they can cause runtime issues with MinGW
+                                                                 // Skip PIE flags on Windows as they can cause runtime issues with MinGW
 #else
         full_command.push_back("clang++"); // Use system clang++ on other platforms
-        // Add PIE-related flags to fix position-independent executable issues
+        // Add PIE-related flags now that libcryo.a is compiled with -fPIC
         full_command.push_back("-fPIE");
-        full_command.push_back("-pie");
 #endif
 
         // Add all the linker arguments
@@ -540,15 +540,17 @@ namespace Cryo::Linker
         // On Windows, redirect stderr to capture error output
 #if defined(_WIN32) || defined(_WIN64)
         std::string cmd_with_redirect = cmd + " 2>&1";
-        FILE* pipe = _popen(cmd_with_redirect.c_str(), "r");
-        if (!pipe) {
+        FILE *pipe = _popen(cmd_with_redirect.c_str(), "r");
+        if (!pipe)
+        {
             report_error("Failed to execute linker command: " + cmd);
             return false;
         }
 
         std::string output;
         char buffer[256];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+        {
             output += buffer;
         }
 
@@ -556,15 +558,17 @@ namespace Cryo::Linker
 #else
         // For Unix-like systems, use popen to capture output
         std::string cmd_with_redirect = cmd + " 2>&1";
-        FILE* pipe = popen(cmd_with_redirect.c_str(), "r");
-        if (!pipe) {
+        FILE *pipe = popen(cmd_with_redirect.c_str(), "r");
+        if (!pipe)
+        {
             report_error("Failed to execute linker command: " + cmd);
             return false;
         }
 
         std::string output;
         char buffer[256];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+        {
             output += buffer;
         }
 
@@ -575,7 +579,8 @@ namespace Cryo::Linker
         {
             std::string error_msg = "System linker failed with exit code " + std::to_string(result);
             error_msg += "\nLinker command: " + cmd;
-            if (!output.empty()) {
+            if (!output.empty())
+            {
                 error_msg += "\nLinker output:\n" + output;
             }
             report_error(error_msg);
@@ -583,7 +588,8 @@ namespace Cryo::Linker
         }
 
         // If there was output but success, log it as info
-        if (!output.empty()) {
+        if (!output.empty())
+        {
             std::cerr << "[INFO] Linker output: " << output << std::endl;
         }
 
@@ -707,7 +713,6 @@ namespace Cryo::Linker
         paths.push_back("./bin");
         paths.push_back("/usr/local/lib");
         paths.push_back("/usr/lib");
-
 
 #if defined(_WIN32) || defined(_WIN64)
         paths.push_back("C:\\Programming\\apps\\CryoLang\\bin");

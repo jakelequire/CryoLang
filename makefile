@@ -250,7 +250,11 @@ endif
 $(STDLIB_LIB): $(STDLIB_BC_FILES)
 	@echo "Creating standard library: $(STDLIB_LIB)"
 	@llvm-link $(STDLIB_BC_FILES) -o $(STDLIB_BUILD_DIR)/cryo_combined.bc
+ifeq ($(OS), Windows_NT)
 	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o
+else
+	@llc -filetype=obj -relocation-model=pic $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o
+endif
 	@llvm-ar rcs $(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryo.o
 	@echo "Standard library created Successfully: $(STDLIB_LIB)"
 
