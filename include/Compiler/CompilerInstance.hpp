@@ -44,8 +44,8 @@ namespace Cryo
         std::vector<std::string> _include_paths;
         bool _debug_mode;
         bool _show_ast_before_ir;
-        bool _stdlib_linking_enabled; // Control whether to link libcryo.a by default
-        bool _stdlib_compilation_mode; // Control whether to generate full implementations for stdlib compilation
+        bool _stdlib_linking_enabled;   // Control whether to link libcryo.a by default
+        bool _stdlib_compilation_mode;  // Control whether to generate full implementations for stdlib compilation
         std::string _current_namespace; // Current namespace context
 
         // Results
