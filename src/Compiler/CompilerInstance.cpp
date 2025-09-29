@@ -54,7 +54,7 @@ namespace Cryo
     void CompilerInstance::set_namespace_context(const std::string &namespace_name)
     {
         _current_namespace = namespace_name;
-        
+
         // Also set the namespace context in the TypeChecker if it exists
         if (_type_checker)
         {
@@ -244,7 +244,7 @@ namespace Cryo
             // Create CodeGenerator now that we have the namespace information
             std::string namespace_for_module = _current_namespace.empty() ? "cryo_program" : _current_namespace;
             _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module, _diagnostic_manager.get());
-            
+
             // Configure stdlib compilation mode if enabled
             if (_stdlib_compilation_mode)
             {
@@ -254,7 +254,7 @@ namespace Cryo
                     std::cout << "[DEBUG] Enabled stdlib compilation mode in CodeGenerator" << std::endl;
                 }
             }
-            
+
             if (_debug_mode)
             {
                 std::cout << "[DEBUG] Created CodeGenerator with module name: '" << namespace_for_module << "'" << std::endl;
@@ -370,7 +370,7 @@ namespace Cryo
         {
             // Set source file and namespace context before generating IR
             _codegen->set_source_info(_source_file, _current_namespace);
-            
+
             bool success = _codegen->generate_ir(_ast_root.get());
 
             if (!success)
@@ -452,7 +452,7 @@ namespace Cryo
                 std::cerr << "[DEBUG] Linker error string length: " << linker_error.length() << std::endl;
                 std::cerr << "[DEBUG] Linker error content: '" << linker_error << "'" << std::endl;
                 std::cerr << "[DEBUG] Full error message will be: 'Linking failed: " << linker_error << "'" << std::endl;
-                
+
                 _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
                                                   "Linking failed: " + linker_error,
                                                   SourceRange{}, _source_file);
@@ -598,7 +598,7 @@ namespace Cryo
     {
         // Inject auto-imports before processing user imports
         inject_auto_imports(_symbol_table.get(), "Global");
-        
+
         populate_symbol_table_with_scope(node, _symbol_table.get(), "Global");
     }
 
@@ -630,7 +630,7 @@ namespace Cryo
 
             // Add function to current (global) scope with enhanced display for generics
             current_scope->declare_symbol(func_decl->name(), SymbolKind::Function,
-                                          func_decl->location(), function_type, scope_name, 
+                                          func_decl->location(), function_type, scope_name,
                                           func_decl->generic_parameters().empty() ? "" : enhanced_signature);
 
             // Recurse into function body with function name as new scope
@@ -684,9 +684,9 @@ namespace Cryo
                     if (!result.namespace_alias.empty())
                     {
                         // Single specific import treated as namespace alias
-                        std::cout << "[CompilerInstance] Processing namespace alias '" << result.namespace_alias 
+                        std::cout << "[CompilerInstance] Processing namespace alias '" << result.namespace_alias
                                   << "' for module '" << result.module_name << "' with " << result.symbol_map.size() << " symbols" << std::endl;
-                        
+
                         current_scope->register_namespace(result.namespace_alias, result.symbol_map);
                         std::cout << "[CompilerInstance] Registered namespace alias '" << result.namespace_alias << "' with "
                                   << result.symbol_map.size() << " symbols" << std::endl;
@@ -695,7 +695,7 @@ namespace Cryo
                     {
                         // Multiple specific imports - add symbols directly to current scope
                         std::cout << "[CompilerInstance] Processing specific symbol imports with " << result.symbol_map.size() << " symbols" << std::endl;
-                        
+
                         for (const auto &[symbol_name, symbol] : result.symbol_map)
                         {
                             // Register each symbol directly in the current scope
@@ -814,10 +814,10 @@ namespace Cryo
         // Initialize standard library from built-in intrinsics
         // The actual stdlib modules will be loaded dynamically through imports
         // The libcryo.a linking happens during final linking phase
-        
+
         // Note: We don't pre-load stdlib symbols here anymore since they're loaded on-demand
         // through the import system. This allows for better modularity and avoids duplicate definitions.
-        
+
         std::cout << "Standard library initialized from libcryo" << std::endl;
     }
 
@@ -831,7 +831,7 @@ namespace Cryo
         }
 
         // Skip auto-import if we're compiling the core/types module itself
-        if (_source_file.find("core/types.cryo") != std::string::npos || 
+        if (_source_file.find("core/types.cryo") != std::string::npos ||
             _source_file.find("stdlib/core/types.cryo") != std::string::npos)
         {
             std::cout << "[CompilerInstance] Skipping auto-imports when compiling core/types module" << std::endl;
@@ -848,9 +848,9 @@ namespace Cryo
         // Create a synthetic ImportDeclarationNode for core/types
         // This simulates: import <core/types>;
         auto core_types_import = std::make_unique<ImportDeclarationNode>(
-            SourceLocation(0, 0),                        // synthetic location
-            "core/types",                                // path
-            ImportDeclarationNode::ImportType::Absolute  // absolute import (stdlib)
+            SourceLocation(0, 0),                       // synthetic location
+            "core/types",                               // path
+            ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
         );
 
         // Load the import
@@ -862,7 +862,7 @@ namespace Cryo
             if (!result.symbol_map.empty())
             {
                 current_scope->register_namespace(result.module_name, result.symbol_map);
-                std::cout << "[CompilerInstance] Auto-imported core/types: registered namespace '" << result.module_name 
+                std::cout << "[CompilerInstance] Auto-imported core/types: registered namespace '" << result.module_name
                           << "' with " << result.symbol_map.size() << " symbols" << std::endl;
             }
             else
@@ -875,7 +875,7 @@ namespace Cryo
             std::cout << "[CompilerInstance] Warning: Failed to auto-import core/types: " << result.error_message << std::endl;
         }
     }
-    
+
     std::unique_ptr<CompilerInstance> create_compiler_instance()
     {
         return std::make_unique<CompilerInstance>();
