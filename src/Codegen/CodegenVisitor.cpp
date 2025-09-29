@@ -16,12 +16,13 @@ namespace Cryo::Codegen
     //===================================================================
 
     CodegenVisitor::CodegenVisitor(LLVMContextManager &context_manager,
-                                   Cryo::SymbolTable &symbol_table)
+                                   Cryo::SymbolTable &symbol_table,
+                                   Cryo::DiagnosticManager* gdm)
         : _context_manager(context_manager), 
           _symbol_table(symbol_table), 
           _value_context(std::make_unique<ValueContext>()), 
           _type_mapper(std::make_unique<TypeMapper>(context_manager)),
-          _intrinsics(std::make_unique<Intrinsics>(context_manager)),
+          _intrinsics(std::make_unique<Intrinsics>(context_manager, gdm)),
           _current_value(nullptr), 
           _has_errors(false),
           _stdlib_compilation_mode(false)
@@ -3548,6 +3549,29 @@ namespace Cryo::Codegen
             case TokenKind::TK_MINUS:
                 if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
                 {
+                    // Handle integer type coercion for different bit widths
+                    llvm::Type *left_type = left_val->getType();
+                    llvm::Type *right_type = right_val->getType();
+                    
+                    if (left_type != right_type)
+                    {
+                        // Get bit widths
+                        unsigned left_bits = left_type->getIntegerBitWidth();
+                        unsigned right_bits = right_type->getIntegerBitWidth();
+                        
+                        // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
+                        if (left_bits > right_bits)
+                        {
+                            // Truncate left operand to match right operand's type
+                            left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
+                        }
+                        else if (right_bits > left_bits)
+                        {
+                            // Truncate right operand to match left operand's type  
+                            right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
+                        }
+                    }
+                    
                     result = builder.CreateSub(left_val, right_val, "sub.tmp");
                 }
                 else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
@@ -3567,6 +3591,29 @@ namespace Cryo::Codegen
             case TokenKind::TK_STAR: // Multiplication
                 if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
                 {
+                    // Handle integer type coercion for different bit widths
+                    llvm::Type *left_type = left_val->getType();
+                    llvm::Type *right_type = right_val->getType();
+                    
+                    if (left_type != right_type)
+                    {
+                        // Get bit widths
+                        unsigned left_bits = left_type->getIntegerBitWidth();
+                        unsigned right_bits = right_type->getIntegerBitWidth();
+                        
+                        // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
+                        if (left_bits > right_bits)
+                        {
+                            // Truncate left operand to match right operand's type
+                            left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
+                        }
+                        else if (right_bits > left_bits)
+                        {
+                            // Truncate right operand to match left operand's type  
+                            right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
+                        }
+                    }
+                    
                     result = builder.CreateMul(left_val, right_val, "mul.tmp");
                 }
                 else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
@@ -3586,6 +3633,29 @@ namespace Cryo::Codegen
             case TokenKind::TK_SLASH: // Division
                 if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
                 {
+                    // Handle integer type coercion for different bit widths
+                    llvm::Type *left_type = left_val->getType();
+                    llvm::Type *right_type = right_val->getType();
+                    
+                    if (left_type != right_type)
+                    {
+                        // Get bit widths
+                        unsigned left_bits = left_type->getIntegerBitWidth();
+                        unsigned right_bits = right_type->getIntegerBitWidth();
+                        
+                        // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
+                        if (left_bits > right_bits)
+                        {
+                            // Truncate left operand to match right operand's type
+                            left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
+                        }
+                        else if (right_bits > left_bits)
+                        {
+                            // Truncate right operand to match left operand's type  
+                            right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
+                        }
+                    }
+                    
                     result = builder.CreateSDiv(left_val, right_val, "div.tmp");
                 }
                 else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
@@ -5471,6 +5541,45 @@ namespace Cryo::Codegen
         try
         {
             auto &builder = _context_manager.get_builder();
+            
+            // Get the target type from the pointer
+            llvm::Type *target_type = ptr->getType();
+            if (target_type->isPointerTy())
+            {
+                target_type = value->getType(); /* Use value type for compatibility */
+            }
+            
+            // Check if we need type conversion
+            llvm::Type *value_type = value->getType();
+            if (value_type != target_type)
+            {
+                // Handle float-to-int conversion
+                if (value_type->isFloatingPointTy() && target_type->isIntegerTy())
+                {
+                    value = builder.CreateFPToSI(value, target_type, "float2int");
+                }
+                // Handle int-to-float conversion
+                else if (value_type->isIntegerTy() && target_type->isFloatingPointTy())
+                {
+                    value = builder.CreateSIToFP(value, target_type, "int2float");
+                }
+                // Handle integer size conversion
+                else if (value_type->isIntegerTy() && target_type->isIntegerTy())
+                {
+                    unsigned value_bits = value_type->getIntegerBitWidth();
+                    unsigned target_bits = target_type->getIntegerBitWidth();
+                    
+                    if (value_bits > target_bits)
+                    {
+                        value = builder.CreateTrunc(value, target_type, "trunc");
+                    }
+                    else if (value_bits < target_bits)
+                    {
+                        value = builder.CreateSExt(value, target_type, "sext");
+                    }
+                }
+            }
+            
             builder.CreateStore(value, ptr);
         }
         catch (const std::exception &e)

@@ -45,10 +45,12 @@ namespace Cryo::Codegen
          * @brief Construct codegen visitor
          * @param context_manager LLVM context manager
          * @param symbol_table Symbol table from frontend
+         * @param gdm Optional diagnostic manager for reporting errors
          */
         CodegenVisitor(
             LLVMContextManager &context_manager,
-            Cryo::SymbolTable &symbol_table);
+            Cryo::SymbolTable &symbol_table,
+            Cryo::DiagnosticManager* gdm = nullptr);
 
         ~CodegenVisitor() = default;
 

@@ -1,6 +1,7 @@
 #include "Codegen/Intrinsics.hpp"
 #include "Codegen/LLVMContext.hpp"
 #include "AST/ASTNode.hpp"
+#include "GDM/GDM.hpp"
 
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Constants.h>
@@ -12,8 +13,8 @@
 
 namespace Cryo::Codegen
 {
-    Intrinsics::Intrinsics(LLVMContextManager& context_manager)
-        : _context_manager(context_manager), _has_errors(false)
+    Intrinsics::Intrinsics(LLVMContextManager& context_manager, Cryo::DiagnosticManager* gdm)
+        : _context_manager(context_manager), _gdm(gdm), _has_errors(false)
     {
     }
 
@@ -80,6 +81,12 @@ namespace Cryo::Codegen
             return generate_sprintf(args);
         else if (intrinsic_name == "__fprintf__")
             return generate_fprintf(args);
+
+        // String conversion operations
+        else if (intrinsic_name == "__float32_to_string__")
+            return generate_float32_to_string(args);
+        else if (intrinsic_name == "__float64_to_string__")
+            return generate_float64_to_string(args);
 
         // Math operations
         else if (intrinsic_name == "__sqrt__")
@@ -161,7 +168,7 @@ namespace Cryo::Codegen
 
         else
         {
-            report_error("Unknown intrinsic: " + intrinsic_name);
+            report_unimplemented_intrinsic(intrinsic_name, node);
             return nullptr;
         }
     }
@@ -834,6 +841,124 @@ namespace Cryo::Codegen
     }
 
     // ========================================
+    // String Conversion Intrinsics
+    // ========================================
+
+    llvm::Value* Intrinsics::generate_float32_to_string(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__float32_to_string__ requires exactly 1 argument (f32_value)");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+        llvm::Module* module = _context_manager.get_module();
+
+        // Check that argument is a float32 type
+        llvm::Value* float_arg = args[0];
+        if (!float_arg->getType()->isFloatTy())
+        {
+            report_error("__float32_to_string__ argument must be a f32 type");
+            return nullptr;
+        }
+
+        // Allocate buffer for the string (enough for most float representations)
+        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Constant* buffer_size = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 64);
+        
+        // Create malloc call for buffer
+        llvm::Function* malloc_func = get_or_create_libc_function("malloc", 
+            llvm::FunctionType::get(char_ptr_type, {llvm::Type::getInt64Ty(context)}, false));
+        
+        llvm::Value* buffer_size_64 = builder.CreateZExt(buffer_size, llvm::Type::getInt64Ty(context));
+        llvm::Value* buffer = builder.CreateCall(malloc_func, {buffer_size_64}, "float32_str_buffer");
+
+        // Create sprintf call: sprintf(buffer, "%.6f", float_value)
+        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType* sprintf_type = llvm::FunctionType::get(
+            int_type, {char_ptr_type, char_ptr_type}, true); // variadic
+
+        llvm::Function* sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
+
+        // Create format string "%.6f" as a global constant
+        std::string format_str = "%.6f";
+        llvm::Constant* format_const = llvm::ConstantDataArray::getString(context, format_str, true);
+        llvm::GlobalVariable* format_global = new llvm::GlobalVariable(
+            *module, format_const->getType(), true, llvm::GlobalValue::PrivateLinkage,
+            format_const, "float32_format_str");
+        
+        // Get pointer to the format string
+        llvm::Value* format_ptr = builder.CreatePointerCast(format_global, char_ptr_type);
+
+        // Convert float32 to double (sprintf %f expects double)
+        llvm::Value* double_arg = builder.CreateFPExt(float_arg, llvm::Type::getDoubleTy(context), "f32_to_double");
+
+        // Call sprintf(buffer, "%.6f", double_value)
+        builder.CreateCall(sprintf_func, {buffer, format_ptr, double_arg}, "sprintf.f32.result");
+
+        // Return the buffer (which is now a null-terminated string)
+        return buffer;
+    }
+
+    llvm::Value* Intrinsics::generate_float64_to_string(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__float64_to_string__ requires exactly 1 argument (f64_value)");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+        llvm::Module* module = _context_manager.get_module();
+
+        // Check that argument is a float64 type
+        llvm::Value* float_arg = args[0];
+        if (!float_arg->getType()->isDoubleTy())
+        {
+            report_error("__float64_to_string__ argument must be a f64 type");
+            return nullptr;
+        }
+
+        // Allocate buffer for the string (enough for most float representations)
+        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Constant* buffer_size = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 64);
+        
+        // Create malloc call for buffer
+        llvm::Function* malloc_func = get_or_create_libc_function("malloc", 
+            llvm::FunctionType::get(char_ptr_type, {llvm::Type::getInt64Ty(context)}, false));
+        
+        llvm::Value* buffer_size_64 = builder.CreateZExt(buffer_size, llvm::Type::getInt64Ty(context));
+        llvm::Value* buffer = builder.CreateCall(malloc_func, {buffer_size_64}, "float64_str_buffer");
+
+        // Create sprintf call: sprintf(buffer, "%.6f", double_value)
+        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType* sprintf_type = llvm::FunctionType::get(
+            int_type, {char_ptr_type, char_ptr_type}, true); // variadic
+
+        llvm::Function* sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
+
+        // Create format string "%.15g" for better double precision
+        std::string format_str = "%.15g";
+        llvm::Constant* format_const = llvm::ConstantDataArray::getString(context, format_str, true);
+        llvm::GlobalVariable* format_global = new llvm::GlobalVariable(
+            *module, format_const->getType(), true, llvm::GlobalValue::PrivateLinkage,
+            format_const, "float64_format_str");
+        
+        // Get pointer to the format string
+        llvm::Value* format_ptr = builder.CreatePointerCast(format_global, char_ptr_type);
+
+        // double is already the right type for sprintf %g
+        // Call sprintf(buffer, "%.15g", double_value)
+        builder.CreateCall(sprintf_func, {buffer, format_ptr, float_arg}, "sprintf.f64.result");
+
+        // Return the buffer (which is now a null-terminated string)
+        return buffer;
+    }
+
+    // ========================================
     // Math Operations Intrinsics
     // ========================================
 
@@ -970,6 +1095,41 @@ namespace Cryo::Codegen
         _has_errors = true;
         _last_error = message;
         std::cerr << "[Intrinsics] Error: " << message << std::endl;
+    }
+
+    void Intrinsics::report_unimplemented_intrinsic(const std::string& intrinsic_name, Cryo::CallExpressionNode* node)
+    {
+        _has_errors = true;
+        _last_error = "Unimplemented intrinsic: " + intrinsic_name;
+        
+        // Report to GDM if available
+        if (_gdm)
+        {
+            std::string message = "Intrinsic function '" + intrinsic_name + "' is called but not implemented";
+            
+            // Try to get source location if node is available
+            if (node && node->location().line() > 0)
+            {
+                // Convert from lexer SourceLocation to GDM SourceRange
+                const auto& loc = node->location();
+                Cryo::SourceRange range(loc);  // Use explicit constructor
+                
+                _gdm->report_error(Cryo::DiagnosticID::UnimplementedIntrinsic, 
+                                 Cryo::DiagnosticCategory::CodeGen,
+                                 range, "<source_file>", message);
+            }
+            else
+            {
+                // Fallback: report without location
+                Cryo::SourceRange dummy_range;  // Default constructed range
+                _gdm->report_error(Cryo::DiagnosticID::UnimplementedIntrinsic,
+                                 Cryo::DiagnosticCategory::CodeGen,
+                                 message, dummy_range, "<unknown>");
+            }
+        }
+        
+        // Still output to stderr as backup
+        std::cerr << "[Intrinsics] Error: " << _last_error << std::endl;
     }
 
     void Intrinsics::clear_errors()

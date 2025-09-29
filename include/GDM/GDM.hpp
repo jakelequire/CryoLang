@@ -72,6 +72,9 @@ namespace Cryo
         FileReadError,
         OutOfMemory,
 
+        // CodeGen diagnostics
+        UnimplementedIntrinsic,
+
         // Generic
         Unknown
     };

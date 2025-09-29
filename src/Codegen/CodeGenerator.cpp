@@ -22,7 +22,8 @@ namespace Cryo::Codegen
         std::unique_ptr<TargetConfig> target_config,
         ASTContext &ast_context,
         SymbolTable &symbol_table,
-        const std::string &namespace_name) : _ast_context(ast_context), _symbol_table(symbol_table),
+        const std::string &namespace_name,
+        Cryo::DiagnosticManager* gdm) : _ast_context(ast_context), _symbol_table(symbol_table), _gdm(gdm),
                                      _has_errors(false), _debug_enabled(false), _stdlib_compilation_mode(false), _optimization_level(2),
                                      _functions_generated(0), _types_generated(0), _globals_generated(0),
                                      _module_name(namespace_name.empty() ? "cryo_program" : namespace_name)
@@ -67,7 +68,8 @@ namespace Cryo::Codegen
             {
                 _visitor = std::make_unique<CodegenVisitor>(
                     *_context_manager,
-                    _symbol_table);
+                    _symbol_table,
+                    _gdm);
                     
                 // Apply stdlib compilation mode to the newly created visitor
                 if (_stdlib_compilation_mode)
@@ -345,7 +347,16 @@ namespace Cryo::Codegen
         // Create a default target config
         auto target_config = std::make_unique<TargetConfig>();
 
-        return std::make_unique<CodeGenerator>(std::move(target_config), ast_context, symbol_table, namespace_name);
+        return std::make_unique<CodeGenerator>(std::move(target_config), ast_context, symbol_table, namespace_name, nullptr);
+    }
+
+    std::unique_ptr<CodeGenerator> create_default_codegen(ASTContext &ast_context, SymbolTable &symbol_table, 
+                                                        const std::string &namespace_name, DiagnosticManager* gdm)
+    {
+        // Create a default target config
+        auto target_config = std::make_unique<TargetConfig>();
+
+        return std::make_unique<CodeGenerator>(std::move(target_config), ast_context, symbol_table, namespace_name, gdm);
     }
 
 } // namespace Cryo::Codegen
