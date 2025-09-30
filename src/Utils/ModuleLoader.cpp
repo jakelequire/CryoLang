@@ -56,9 +56,30 @@ namespace Cryo
         if (cached != _loaded_modules.end())
         {
             std::cout << "[DEBUG] ModuleLoader: Using cached module" << std::endl;
-            // Since we can't copy, we need to return a reference or handle this differently
-            // For now, let's just reload it
-            std::cout << "[DEBUG] ModuleLoader: Reloading cached module (copy issue)" << std::endl;
+            
+            // Create a copy of the cached result to return
+            ImportResult cached_result;
+            cached_result.success = cached->second.success;
+            cached_result.error_message = cached->second.error_message;
+            cached_result.module_name = cached->second.module_name;
+            cached_result.namespace_alias = cached->second.namespace_alias;
+            cached_result.symbol_map = cached->second.symbol_map;
+            cached_result.exported_symbols = cached->second.exported_symbols;
+            
+            // Apply filtering for specific imports if needed
+            if (import_node.is_specific_import() && cached_result.success)
+            {
+                if (import_node.specific_imports().size() == 1)
+                {
+                    cached_result.namespace_alias = import_node.specific_imports()[0];
+                }
+                else
+                {
+                    cached_result = filter_specific_imports(std::move(cached_result), import_node.specific_imports());
+                }
+            }
+            
+            return cached_result;
         }
 
         // Check for circular dependency
@@ -94,25 +115,19 @@ namespace Cryo
             }
         }
 
-        // Cache the result (move it)
-        _loaded_modules[resolved_path] = std::move(result);
-        // We need to create a new result since the original was moved
-        ImportResult final_result = load_module_from_file(resolved_path, import_path);
+        // Create a copy for caching before returning
+        ImportResult cache_copy;
+        cache_copy.success = result.success;
+        cache_copy.error_message = result.error_message;
+        cache_copy.module_name = result.module_name;
+        cache_copy.namespace_alias = result.namespace_alias;
+        cache_copy.symbol_map = result.symbol_map; // This should copy the map
+        cache_copy.exported_symbols = result.exported_symbols;
+        
+        // Cache the copy
+        _loaded_modules[resolved_path] = std::move(cache_copy);
 
-        // Apply filtering again for the final result if needed
-        if (import_node.is_specific_import() && final_result.success)
-        {
-            if (import_node.specific_imports().size() == 1)
-            {
-                final_result.namespace_alias = import_node.specific_imports()[0];
-            }
-            else
-            {
-                final_result = filter_specific_imports(std::move(final_result), import_node.specific_imports());
-            }
-        }
-
-        return final_result;
+        return result;
     }
 
     std::string ModuleLoader::resolve_import_path(const std::string &import_path, ImportDeclarationNode::ImportType import_type)

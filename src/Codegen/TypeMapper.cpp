@@ -138,6 +138,76 @@ namespace Cryo::Codegen
             // Null is represented as a generic pointer type
             llvm_type = llvm::PointerType::get(get_void_type(), 0);
             break;
+        case Cryo::TypeKind::Parameterized:
+        {
+            // Handle parameterized types (generics)
+            auto parameterized_type = static_cast<Cryo::ParameterizedType *>(cryo_type);
+            
+            if (parameterized_type->base_name() == "Array")
+            {
+                // For Array<T>, create a struct with data pointer and size
+                auto type_args = parameterized_type->type_parameters();
+                if (!type_args.empty())
+                {
+                    llvm::Type *element_type = map_type(type_args[0].get());
+                    if (element_type)
+                    {
+                        std::vector<llvm::Type *> fields = {
+                            llvm::PointerType::get(element_type, 0), // data pointer
+                            get_integer_type(64)                     // size (u64)
+                        };
+                        llvm_type = llvm::StructType::create(_context_manager.get_context(), fields, 
+                                                           parameterized_type->get_instantiated_name());
+                    }
+                }
+            }
+            else if (parameterized_type->base_name() == "Option")
+            {
+                // For Option<T>, create a tagged union
+                auto type_args = parameterized_type->type_parameters();
+                if (!type_args.empty())
+                {
+                    llvm::Type *value_type = map_type(type_args[0].get());
+                    if (value_type)
+                    {
+                        std::vector<llvm::Type *> fields = {
+                            get_boolean_type(),  // has_value flag
+                            value_type          // value
+                        };
+                        llvm_type = llvm::StructType::create(_context_manager.get_context(), fields,
+                                                           parameterized_type->get_instantiated_name());
+                    }
+                }
+            }
+            else if (parameterized_type->base_name() == "Result")
+            {
+                // For Result<T,E>, create a tagged union with value/error
+                auto type_args = parameterized_type->type_parameters();
+                if (type_args.size() >= 2)
+                {
+                    llvm::Type *value_type = map_type(type_args[0].get());
+                    llvm::Type *error_type = map_type(type_args[1].get());
+                    if (value_type && error_type)
+                    {
+                        // For simplicity, create a union using a large enough byte array
+                        // This is a simplified approach - in a production compiler you'd want
+                        // more sophisticated union handling
+                        std::vector<llvm::Type *> fields = {
+                            get_boolean_type(),                         // is_ok flag
+                            llvm::ArrayType::get(get_char_type(), 64)   // union data (64 bytes should be enough for most types)
+                        };
+                        llvm_type = llvm::StructType::create(_context_manager.get_context(), fields,
+                                                           parameterized_type->get_instantiated_name());
+                    }
+                }
+            }
+            else
+            {
+                report_error("Unsupported parameterized type: " + parameterized_type->base_name());
+                return nullptr;
+            }
+            break;
+        }
         case Cryo::TypeKind::Variadic:
             // Variadic parameters are special and shouldn't be mapped to concrete LLVM types
             // This should normally be handled by the function signature generation

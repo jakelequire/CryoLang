@@ -901,4 +901,273 @@ namespace Cryo
         _cached_size = estimated_size;
         return estimated_size;
     }
+
+    //===----------------------------------------------------------------------===//
+    // ParameterizedType Implementation
+    //===----------------------------------------------------------------------===//
+    
+    std::string ParameterizedType::get_instantiated_name() const
+    {
+        if (_cached_instantiated_name.empty())
+        {
+            if (is_template())
+            {
+                // For templates like Array<T>, return the template name
+                _cached_instantiated_name = _base_name + "<";
+                for (size_t i = 0; i < _param_names.size(); ++i)
+                {
+                    if (i > 0) _cached_instantiated_name += ", ";
+                    _cached_instantiated_name += _param_names[i];
+                }
+                _cached_instantiated_name += ">";
+            }
+            else if (is_instantiation())
+            {
+                // For instantiations like Array<int>, return the concrete name
+                _cached_instantiated_name = _base_name + "<";
+                for (size_t i = 0; i < _type_params.size(); ++i)
+                {
+                    if (i > 0) _cached_instantiated_name += ", ";
+                    _cached_instantiated_name += _type_params[i]->to_string();
+                }
+                _cached_instantiated_name += ">";
+            }
+            else
+            {
+                _cached_instantiated_name = _base_name;
+            }
+        }
+        return _cached_instantiated_name;
+    }
+
+    std::shared_ptr<ParameterizedType> ParameterizedType::instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const
+    {
+        if (!is_template())
+        {
+            // Already instantiated or not a template
+            return nullptr;
+        }
+        
+        if (concrete_types.size() != _param_names.size())
+        {
+            // Mismatched parameter count
+            return nullptr;
+        }
+
+        auto instantiation = std::make_shared<ParameterizedType>(_base_name, concrete_types);
+        return instantiation;
+    }
+
+    bool ParameterizedType::is_assignable_from(const Type &other) const
+    {
+        if (other.kind() != TypeKind::Parameterized)
+            return false;
+
+        const ParameterizedType &other_param = static_cast<const ParameterizedType&>(other);
+        
+        // Must have same base name
+        if (_base_name != other_param._base_name)
+            return false;
+
+        // If both are instantiations, check type parameter compatibility
+        if (is_instantiation() && other_param.is_instantiation())
+        {
+            if (_type_params.size() != other_param._type_params.size())
+                return false;
+            
+            for (size_t i = 0; i < _type_params.size(); ++i)
+            {
+                if (!_type_params[i]->is_assignable_from(*other_param._type_params[i]))
+                    return false;
+            }
+            return true;
+        }
+
+        // Templates are compatible with any instantiation of the same base
+        return true;
+    }
+
+    bool ParameterizedType::is_convertible_to(const Type &other) const
+    {
+        return other.is_assignable_from(*this);
+    }
+
+    size_t ParameterizedType::size_bytes() const
+    {
+        if (is_template())
+        {
+            // Templates have no concrete size until instantiated
+            return 0;
+        }
+
+        // For instantiations, calculate size based on the concrete type structure
+        // This is a simplified implementation - in practice you'd need to know
+        // the actual struct layout for each parameterized type
+        if (_base_name == "Array")
+        {
+            // Array<T> has: T* elements, u64 length, u64 capacity
+            return sizeof(void*) + sizeof(uint64_t) + sizeof(uint64_t);
+        }
+        else if (_base_name == "Option")
+        {
+            // Option<T> might be implemented as: bool has_value, T value
+            if (!_type_params.empty())
+            {
+                return sizeof(bool) + _type_params[0]->size_bytes();
+            }
+        }
+        
+        // Default fallback
+        return sizeof(void*);
+    }
+
+    size_t ParameterizedType::alignment() const
+    {
+        if (is_template())
+            return 1;
+        
+        // For instantiated types, use the largest alignment of contained types
+        size_t max_align = sizeof(void*); // Default pointer alignment
+        
+        for (const auto &param : _type_params)
+        {
+            max_align = std::max(max_align, param->alignment());
+        }
+        
+        return max_align;
+    }
+
+    std::string ParameterizedType::to_string() const
+    {
+        return get_instantiated_name();
+    }
+
+    //===----------------------------------------------------------------------===//
+    // TypeRegistry Implementation
+    //===----------------------------------------------------------------------===//
+    
+    void TypeRegistry::register_template(const std::string &base_name, 
+                                         const std::vector<std::string> &param_names)
+    {
+        auto template_type = std::make_shared<ParameterizedType>(base_name, param_names);
+        _templates[base_name] = template_type;
+    }
+
+    ParameterizedType *TypeRegistry::get_template(const std::string &base_name)
+    {
+        auto it = _templates.find(base_name);
+        return (it != _templates.end()) ? it->second.get() : nullptr;
+    }
+
+    ParameterizedType *TypeRegistry::instantiate(const std::string &base_name,
+                                                 const std::vector<Type*> &concrete_types)
+    {
+        // Get the template
+        auto template_type = get_template(base_name);
+        if (!template_type)
+            return nullptr;
+
+        // Create instantiation name
+        std::string inst_name = base_name + "<";
+        for (size_t i = 0; i < concrete_types.size(); ++i)
+        {
+            if (i > 0) inst_name += ", ";
+            inst_name += concrete_types[i]->to_string();
+        }
+        inst_name += ">";
+
+        // Check if already instantiated
+        auto existing = _instantiations.find(inst_name);
+        if (existing != _instantiations.end())
+        {
+            return existing->second.get();
+        }
+
+        // Create new instantiation
+        std::vector<std::shared_ptr<Type>> shared_types;
+        for (auto *type : concrete_types)
+        {
+            // This is a simplification - in practice you'd need proper shared_ptr management
+            shared_types.push_back(std::shared_ptr<Type>(type, [](Type*){})); // Non-owning shared_ptr
+        }
+
+        auto instantiation = template_type->instantiate(shared_types);
+        if (instantiation)
+        {
+            _instantiations[inst_name] = instantiation;
+            return instantiation.get();
+        }
+
+        return nullptr;
+    }
+
+    ParameterizedType *TypeRegistry::parse_and_instantiate(const std::string &type_string)
+    {
+        auto [base_name, param_strs] = parse_generic_syntax(type_string);
+        
+        if (param_strs.empty() || !has_template(base_name))
+            return nullptr;
+
+        // Convert parameter strings to types
+        std::vector<Type*> concrete_types;
+        for (const auto &param_str : param_strs)
+        {
+            // This is simplified - you'd need proper type parsing here
+            Type *param_type = _type_context->parse_type_from_string(param_str);
+            if (!param_type)
+                return nullptr;
+            concrete_types.push_back(param_type);
+        }
+
+        return instantiate(base_name, concrete_types);
+    }
+
+    ParameterizedType *TypeRegistry::get_instantiation(const std::string &instantiated_name)
+    {
+        auto it = _instantiations.find(instantiated_name);
+        return (it != _instantiations.end()) ? it->second.get() : nullptr;
+    }
+
+    bool TypeRegistry::has_template(const std::string &base_name) const
+    {
+        return _templates.find(base_name) != _templates.end();
+    }
+
+    std::pair<std::string, std::vector<std::string>> TypeRegistry::parse_generic_syntax(const std::string &type_string)
+    {
+        std::string base_name = type_string;
+        std::vector<std::string> param_strs;
+
+        size_t angle_pos = type_string.find('<');
+        if (angle_pos == std::string::npos)
+        {
+            return {base_name, param_strs};
+        }
+
+        base_name = type_string.substr(0, angle_pos);
+        
+        size_t close_angle = type_string.find('>', angle_pos);
+        if (close_angle == std::string::npos)
+        {
+            return {base_name, param_strs}; // Malformed
+        }
+
+        std::string params_str = type_string.substr(angle_pos + 1, close_angle - angle_pos - 1);
+        
+        // Simple parameter parsing (splits on commas)
+        std::stringstream ss(params_str);
+        std::string param;
+        while (std::getline(ss, param, ','))
+        {
+            // Trim whitespace
+            param.erase(0, param.find_first_not_of(" \t"));
+            param.erase(param.find_last_not_of(" \t") + 1);
+            if (!param.empty())
+            {
+                param_strs.push_back(param);
+            }
+        }
+
+        return {base_name, param_strs};
+    }
 }

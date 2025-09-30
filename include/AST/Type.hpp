@@ -39,6 +39,7 @@ namespace Cryo
 
         // Advanced types
         Generic,
+        Parameterized, // For types like Array<T>, Option<T>
         Optional,
         Tuple,
         TypeAlias,
@@ -474,6 +475,52 @@ namespace Cryo
         std::string to_string() const override { return name(); }
     };
 
+    // Parameterized type (e.g., Array<T>, Option<T>)
+    class ParameterizedType : public Type
+    {
+    private:
+        std::string _base_name;                           // "Array", "Option", etc.
+        std::vector<std::shared_ptr<Type>> _type_params;  // [T, U, ...]
+        std::vector<std::string> _param_names;           // ["T", "U", ...] for template params
+        mutable std::string _cached_instantiated_name;   // "Array<int>", "Option<string>"
+        
+    public:
+        ParameterizedType(const std::string &base_name, 
+                         const std::vector<std::string> &param_names)
+            : Type(TypeKind::Parameterized, base_name), 
+              _base_name(base_name), _param_names(param_names) {}
+
+        ParameterizedType(const std::string &base_name,
+                         const std::vector<std::shared_ptr<Type>> &type_params)
+            : Type(TypeKind::Parameterized, base_name),
+              _base_name(base_name), _type_params(type_params) {}
+
+        // Accessors
+        const std::string &base_name() const { return _base_name; }
+        const std::vector<std::shared_ptr<Type>> &type_parameters() const { return _type_params; }
+        const std::vector<std::string> &parameter_names() const { return _param_names; }
+        size_t parameter_count() const { return std::max(_type_params.size(), _param_names.size()); }
+
+        // Check if this is a template (has parameter names) vs instantiation (has concrete types)
+        bool is_template() const { return !_param_names.empty() && _type_params.empty(); }
+        bool is_instantiation() const { return !_type_params.empty(); }
+
+        // Get instantiated name like "Array<int>"
+        std::string get_instantiated_name() const;
+
+        // Create an instantiation of this parameterized type
+        std::shared_ptr<ParameterizedType> instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const;
+
+        // Type compatibility - only compatible with other parameterized types with same base
+        bool is_assignable_from(const Type &other) const override;
+        bool is_convertible_to(const Type &other) const override;
+
+        // Size is only known for instantiated types
+        size_t size_bytes() const override;
+        size_t alignment() const override;
+        std::string to_string() const override;
+    };
+
     // Struct type (user-defined)
     class StructType : public Type
     {
@@ -639,6 +686,12 @@ namespace Cryo
         Type *get_enum_type(const std::string &name, std::vector<std::string> variants = {}, bool is_simple = true);
         Type *get_generic_type(const std::string &name);
         
+        // Parameterized types
+        ParameterizedType *create_parameterized_type(const std::string &base_name, 
+                                                    const std::vector<std::string> &param_names);
+        ParameterizedType *instantiate_parameterized_type(const std::string &base_name,
+                                                          const std::vector<Type*> &concrete_types);
+        
         // Create type aliases
         Type *create_type_alias(const std::string &alias_name, Type *target_type);
 
@@ -650,5 +703,45 @@ namespace Cryo
         // Type compatibility and conversion
         bool are_types_compatible(Type *lhs, Type *rhs);
         Type *get_common_type(Type *lhs, Type *rhs);
+    };
+
+    // Type Registry for managing parameterized types and instantiations
+    class TypeRegistry
+    {
+    private:
+        // Template definitions: "Array" -> ParameterizedType with param names ["T"]
+        std::unordered_map<std::string, std::shared_ptr<ParameterizedType>> _templates;
+        
+        // Instantiations: "Array<int>" -> concrete ParameterizedType with [IntType]
+        std::unordered_map<std::string, std::shared_ptr<ParameterizedType>> _instantiations;
+        
+        // Type context for creating concrete types
+        TypeContext *_type_context;
+
+    public:
+        TypeRegistry(TypeContext *context) : _type_context(context) {}
+
+        // Register a parameterized type template (e.g., Array<T>)
+        void register_template(const std::string &base_name, 
+                              const std::vector<std::string> &param_names);
+
+        // Get a template by base name
+        ParameterizedType *get_template(const std::string &base_name);
+
+        // Create an instantiation (Array<int>) from template (Array<T>)
+        ParameterizedType *instantiate(const std::string &base_name,
+                                      const std::vector<Type*> &concrete_types);
+
+        // Parse type string like "Array<int>" and return instantiation
+        ParameterizedType *parse_and_instantiate(const std::string &type_string);
+
+        // Get existing instantiation if it exists
+        ParameterizedType *get_instantiation(const std::string &instantiated_name);
+
+        // Check if a base name has a registered template
+        bool has_template(const std::string &base_name) const;
+
+        // Utility to parse generic type syntax: "Array<int, string>" -> ("Array", ["int", "string"])
+        std::pair<std::string, std::vector<std::string>> parse_generic_syntax(const std::string &type_string);
     };
 }
