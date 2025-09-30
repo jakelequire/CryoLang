@@ -1422,7 +1422,7 @@ namespace Cryo
 
                         consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic arguments");
 
-                        // Check if this is followed by parentheses (constructor call)
+                        // Check if this is followed by parentheses (constructor call) or scope resolution
                         if (_current_token.is(TokenKind::TK_L_PAREN))
                         {
                             // Parse the constructor call with arguments
@@ -1510,10 +1510,26 @@ namespace Cryo
                                 expr = std::move(new_expr);
                             }
                         }
+                        else if (_current_token.is(TokenKind::TK_COLONCOLON))
+                        {
+                            // Generic type with scope resolution: Option<T>::None
+                            // Create a generic type identifier that can be used in scope resolution
+                            std::string generic_type_name = type_name + "<";
+                            for (size_t i = 0; i < generic_args.size(); ++i)
+                            {
+                                if (i > 0) generic_type_name += ",";
+                                generic_type_name += generic_args[i];
+                            }
+                            generic_type_name += ">";
+                            
+                            // Create identifier with generic type name for scope resolution
+                            Token generic_token(TokenKind::TK_IDENTIFIER, generic_type_name, type_location);
+                            expr = _builder.create_identifier_node(generic_token);
+                        }
                         else
                         {
-                            // Not a constructor call, this is an error for now
-                            error("Generic type expressions are only supported for constructor calls");
+                            // Not a constructor call or scope resolution, this is an error for now
+                            error("Generic type expressions must be followed by constructor call '()' or scope resolution '::'");
                             return nullptr;
                         }
                     }

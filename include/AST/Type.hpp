@@ -608,6 +608,9 @@ namespace Cryo
         bool is_primitive() const override { return _target_type ? _target_type->is_primitive() : false; }
         bool is_value_type() const override { return _target_type ? _target_type->is_value_type() : false; }
         bool is_reference_type() const override { return _target_type ? _target_type->is_reference_type() : false; }
+        bool is_nullable() const override { return _target_type ? _target_type->is_nullable() : false; }
+        bool is_assignable_from(const Type &other) const override { return _target_type ? _target_type->is_assignable_from(other) : false; }
+        bool is_convertible_to(const Type &other) const override { return _target_type ? _target_type->is_convertible_to(other) : false; }
         size_t size_bytes() const override { return _target_type ? _target_type->size_bytes() : 0; }
         size_t alignment() const override { return _target_type ? _target_type->alignment() : 1; }
         std::string to_string() const override { return _name; } // Return alias name, not target
@@ -665,6 +668,12 @@ namespace Cryo
         Type *get_i32_type() { return get_integer_type(IntegerKind::I32); }
         Type *get_i64_type() { return get_integer_type(IntegerKind::I64); }
         Type *get_int_type() { return get_integer_type(IntegerKind::Int); }
+        
+        // Get unsigned integer types
+        Type *get_u8_type() { return get_integer_type(IntegerKind::U8, false); }
+        Type *get_u16_type() { return get_integer_type(IntegerKind::U16, false); }
+        Type *get_u32_type() { return get_integer_type(IntegerKind::U32, false); }
+        Type *get_u64_type() { return get_integer_type(IntegerKind::U64, false); }
 
         // Get float types
         Type *get_float_type(FloatKind kind);

@@ -2,6 +2,7 @@
 #include "Lexer/lexer.hpp" // For TokenKind enum
 #include <sstream>
 #include <algorithm>
+#include <iostream>
 
 namespace Cryo
 {
@@ -26,6 +27,10 @@ namespace Cryo
 
         // Auto type needs special handling
         if (_kind == TypeKind::Auto)
+            return true;
+
+        // Nullable types can accept null
+        if (other._kind == TypeKind::Null && is_nullable())
             return true;
 
         // Numeric promotions
@@ -636,14 +641,14 @@ namespace Cryo
             return get_f64_type(); // double is alias for f64
 
         // Unsigned integer types
-        if (normalized_type_str == "uint8" || normalized_type_str == "unsigned i8")
-            return get_i8_type(); // For now, treat unsigned as same type
-        if (normalized_type_str == "uint16" || normalized_type_str == "unsigned i16")
-            return get_i16_type();
-        if (normalized_type_str == "uint32" || normalized_type_str == "unsigned i32")
-            return get_i32_type();
-        if (normalized_type_str == "uint64" || normalized_type_str == "unsigned i64")
-            return get_i64_type();
+        if (normalized_type_str == "u8" || normalized_type_str == "uint8" || normalized_type_str == "unsigned i8")
+            return get_u8_type();
+        if (normalized_type_str == "u16" || normalized_type_str == "uint16" || normalized_type_str == "unsigned i16")
+            return get_u16_type();
+        if (normalized_type_str == "u32" || normalized_type_str == "uint32" || normalized_type_str == "unsigned i32")
+            return get_u32_type();
+        if (normalized_type_str == "u64" || normalized_type_str == "uint64" || normalized_type_str == "unsigned i64")
+            return get_u64_type();
 
         // Array types (basic parsing for "type[]")
         if (normalized_type_str.length() > 2 && normalized_type_str.substr(normalized_type_str.length() - 2) == "[]")
@@ -678,19 +683,42 @@ namespace Cryo
             }
         }
 
+        // Check for generic instantiation syntax FIRST (before struct types)
+        size_t angle_pos = normalized_type_str.find('<');
+        if (angle_pos != std::string::npos && normalized_type_str.back() == '>')
+        {
+            std::string base_name = normalized_type_str.substr(0, angle_pos);
+            std::string params_str = normalized_type_str.substr(angle_pos + 1, normalized_type_str.length() - angle_pos - 2);
+            
+            // Handle known generic type aliases
+            if (base_name == "ptr")
+            {
+                // ptr<T> = T* - create a pointer type to T
+                Type *pointee_type = parse_type_from_string(params_str);
+                if (pointee_type)
+                {
+                    return create_pointer_type(pointee_type);
+                }
+            }
+            else if (base_name == "const_ptr")
+            {
+                // const_ptr<T> = const T* - for now, treat same as ptr<T>
+                Type *pointee_type = parse_type_from_string(params_str);
+                if (pointee_type)
+                {
+                    return create_pointer_type(pointee_type);
+                }
+            }
+            
+            // This looks like a generic instantiation - create struct type for it
+            return get_struct_type(normalized_type_str);
+        }
+
         // Check for user-defined struct types (including generic instantiation)
         auto struct_it = _struct_types.find(normalized_type_str);
         if (struct_it != _struct_types.end())
         {
             return struct_it->second.get();
-        }
-        
-        // Check for generic instantiation syntax (e.g., "SimpleGeneric<int>")
-        size_t angle_pos = normalized_type_str.find('<');
-        if (angle_pos != std::string::npos && normalized_type_str.back() == '>')
-        {
-            // This looks like a generic instantiation - create struct type for it
-            return get_struct_type(normalized_type_str);
         }
 
         // Check for user-defined class types
@@ -960,6 +988,12 @@ namespace Cryo
 
     bool ParameterizedType::is_assignable_from(const Type &other) const
     {
+        // Special case: pointer types (ptr<T>) can accept null
+        if (other.kind() == TypeKind::Null && (_base_name == "ptr" || _base_name == "const_ptr"))
+        {
+            return true;
+        }
+
         if (other.kind() != TypeKind::Parameterized)
             return false;
 
