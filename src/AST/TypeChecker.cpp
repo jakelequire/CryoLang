@@ -569,6 +569,12 @@ namespace Cryo
         : _type_context(type_ctx)
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
+        _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
+        
+        // Register common generic types
+        register_generic_type("Array", {"T"});
+        register_generic_type("Option", {"T"});
+        register_generic_type("Result", {"T", "E"});
     }
 
     void TypeChecker::load_builtin_symbols(const SymbolTable &main_symbol_table)
@@ -608,6 +614,16 @@ namespace Cryo
             }
         }
         std::cout << "Copied " << copied_count << " intrinsic symbols to TypeChecker symbol table" << std::endl;
+    }
+
+    void TypeChecker::register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names)
+    {
+        _type_registry->register_template(base_name, param_names);
+    }
+
+    ParameterizedType *TypeChecker::resolve_generic_type(const std::string &type_string)
+    {
+        return _type_registry->parse_and_instantiate(type_string);
     }
 
     void TypeChecker::check_program(ProgramNode &program)
@@ -1377,18 +1393,42 @@ namespace Cryo
         // Handle generic types
         if (!node.generic_args().empty())
         {
-            type_name += "<";
+            // Build the full generic type string for TypeRegistry resolution
+            std::string full_type_name = node.type_name() + "<";
             for (size_t i = 0; i < node.generic_args().size(); ++i)
             {
                 if (i > 0)
-                    type_name += ", ";
-                type_name += node.generic_args()[i];
+                    full_type_name += ", ";
+                full_type_name += node.generic_args()[i];
             }
-            type_name += ">";
+            full_type_name += ">";
+            
+            // Use TypeRegistry to resolve generic type instantiation
+            auto resolved_type = resolve_generic_type(full_type_name);
+            if (resolved_type)
+            {
+                // Successfully resolved generic type - use its name
+                type_name = resolved_type->get_instantiated_name();
+                node.set_type(type_name);
+                return;
+            }
+            else
+            {
+                // Fallback to manual type name construction
+                type_name = full_type_name;
+            }
         }
 
         // Look for the type definition in the symbol table
-        TypedSymbol *type_symbol = _symbol_table->lookup_symbol(node.type_name());
+        // First try the full instantiated name (e.g., "Array<int>")
+        TypedSymbol *type_symbol = _symbol_table->lookup_symbol(type_name);
+        
+        // If not found and this is a generic type, try to find the base template
+        if (!type_symbol && !node.generic_args().empty())
+        {
+            // Try to find the generic template (e.g., "Array" for "Array<int>")
+            type_symbol = _symbol_table->lookup_symbol(node.type_name());
+        }
 
         if (type_symbol)
         {

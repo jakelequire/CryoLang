@@ -157,6 +157,7 @@ namespace Cryo
     private:
         TypeContext &_type_context;
         std::unique_ptr<TypedSymbolTable> _symbol_table;
+        std::unique_ptr<TypeRegistry> _type_registry;
         std::vector<TypeError> _errors;
         std::vector<TypeWarning> _warnings;
 
@@ -196,6 +197,10 @@ namespace Cryo
         // Load built-in functions from main SymbolTable
         void load_builtin_symbols(const SymbolTable &main_symbol_table);
         void load_intrinsic_symbols(const SymbolTable &main_symbol_table);
+
+        // Generic type management
+        void register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names);
+        ParameterizedType *resolve_generic_type(const std::string &type_string);
 
         // Main entry point
         void check_program(ProgramNode &program);
