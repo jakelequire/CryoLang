@@ -244,7 +244,8 @@ namespace Cryo
                kind == TokenKind::TK_CHAR_CONSTANT ||
                kind == TokenKind::TK_BOOLEAN_LITERAL ||
                kind == TokenKind::TK_KW_TRUE ||
-               kind == TokenKind::TK_KW_FALSE;
+               kind == TokenKind::TK_KW_FALSE ||
+               kind == TokenKind::TK_KW_NULL;
     }
 
     void ASTBuilder::validate_identifier_token(const Token &token) const
