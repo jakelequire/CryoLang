@@ -1129,7 +1129,9 @@ namespace Cryo
                             }
                             // Same type numeric operations
                             else if (left_type == right_type &&
-                                     (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float"))
+                                     (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float" ||
+                                      left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" ||
+                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64"))
                             {
                                 result_type = left_type;
                             }
