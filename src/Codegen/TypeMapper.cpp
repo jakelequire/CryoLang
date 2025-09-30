@@ -42,6 +42,9 @@ namespace Cryo::Codegen
         register_type("f32", get_float_type(32));
         register_type("f64", get_float_type(64));
         register_type("float", get_float_type(32)); // Default float
+
+        // Initialize built-in generic types
+        initialize_builtin_generic_types();
     }
 
     //===================================================================
@@ -142,7 +145,7 @@ namespace Cryo::Codegen
         {
             // Handle parameterized types (generics)
             auto parameterized_type = static_cast<Cryo::ParameterizedType *>(cryo_type);
-            
+
             if (parameterized_type->base_name() == "Array")
             {
                 // For Array<T>, create a struct with data pointer and size
@@ -156,8 +159,8 @@ namespace Cryo::Codegen
                             llvm::PointerType::get(element_type, 0), // data pointer
                             get_integer_type(64)                     // size (u64)
                         };
-                        llvm_type = llvm::StructType::create(_context_manager.get_context(), fields, 
-                                                           parameterized_type->get_instantiated_name());
+                        llvm_type = llvm::StructType::create(_context_manager.get_context(), fields,
+                                                             parameterized_type->get_instantiated_name());
                     }
                 }
             }
@@ -171,11 +174,11 @@ namespace Cryo::Codegen
                     if (value_type)
                     {
                         std::vector<llvm::Type *> fields = {
-                            get_boolean_type(),  // has_value flag
+                            get_boolean_type(), // has_value flag
                             value_type          // value
                         };
                         llvm_type = llvm::StructType::create(_context_manager.get_context(), fields,
-                                                           parameterized_type->get_instantiated_name());
+                                                             parameterized_type->get_instantiated_name());
                     }
                 }
             }
@@ -193,11 +196,11 @@ namespace Cryo::Codegen
                         // This is a simplified approach - in a production compiler you'd want
                         // more sophisticated union handling
                         std::vector<llvm::Type *> fields = {
-                            get_boolean_type(),                         // is_ok flag
-                            llvm::ArrayType::get(get_char_type(), 64)   // union data (64 bytes should be enough for most types)
+                            get_boolean_type(),                       // is_ok flag
+                            llvm::ArrayType::get(get_char_type(), 64) // union data (64 bytes should be enough for most types)
                         };
                         llvm_type = llvm::StructType::create(_context_manager.get_context(), fields,
-                                                           parameterized_type->get_instantiated_name());
+                                                             parameterized_type->get_instantiated_name());
                     }
                 }
             }
@@ -1087,12 +1090,17 @@ namespace Cryo::Codegen
                                                                 const std::vector<std::string> &type_args,
                                                                 const std::string &instantiated_name)
     {
-        // This is a simplified implementation - in a full compiler, you'd need to:
-        // 1. Look up the generic struct template in a registry
-        // 2. Substitute type parameters with actual types
-        // 3. Create the instantiated struct type
+        // Use the new generic type definition system
+        llvm::Type *result = create_generic_type_from_def(base_name, type_args, instantiated_name);
+        if (result)
+        {
+            return result;
+        }
 
-        // For now, create a simple struct that matches our test case
+        // If not found in registry, try legacy fallback for backwards compatibility
+        std::cout << "[TypeMapper] Generic type '" << base_name << "' not found in registry, trying legacy fallback\n";
+
+        // Legacy fallback for GenericStruct (can be removed once all types are registered)
         if (base_name == "GenericStruct" && type_args.size() == 1)
         {
             // Map the type argument
@@ -1115,35 +1123,7 @@ namespace Cryo::Codegen
             // Register field metadata for the instantiated type
             register_generic_field_metadata(instantiated_name, "value", 0, value_type);
 
-            return instantiated_type;
-        }
-
-        if (base_name == "Pair" && type_args.size() == 2)
-        {
-            // Map both type arguments
-            llvm::Type *first_type = map_type(type_args[0]);
-            llvm::Type *second_type = map_type(type_args[1]);
-            if (!first_type || !second_type)
-            {
-                report_error("Failed to map generic type arguments for Pair");
-                return nullptr;
-            }
-
-            // Create LLVM struct type with both fields
-            auto &context = _context_manager.get_context();
-            std::vector<llvm::Type *> field_types = {first_type, second_type};
-
-            llvm::StructType *instantiated_type = llvm::StructType::create(context, field_types, instantiated_name);
-
-            // Register the instantiated type
-            register_type(instantiated_name, instantiated_type);
-            std::cout << "[TypeMapper] Registered Pair generic type: " << instantiated_name << "\n";
-
-            // Register field metadata for the instantiated type
-            register_generic_field_metadata(instantiated_name, "first", 0, first_type);
-            register_generic_field_metadata(instantiated_name, "second", 1, second_type);
-            std::cout << "[TypeMapper] Registered Pair fields: first, second for type: " << instantiated_name << "\n";
-
+            std::cout << "[TypeMapper] Created legacy GenericStruct instantiation: " << instantiated_name << "\n";
             return instantiated_type;
         }
 
@@ -1157,6 +1137,228 @@ namespace Cryo::Codegen
                                                      llvm::Type *field_type)
     {
         register_field_metadata(type_name, field_name, field_index, field_type);
+    }
+
+    //===================================================================
+    // Generic Type Definition System Implementation
+    //===================================================================
+
+    void TypeMapper::register_generic_type_def(const GenericTypeDef &def)
+    {
+        _generic_type_registry[def.base_name] = def;
+        std::cout << "[TypeMapper] Registered generic type definition: " << def.base_name
+                  << " with " << def.num_type_params << " parameters\n";
+    }
+
+    void TypeMapper::initialize_builtin_generic_types()
+    {
+        // Define Array<T> generic type
+        GenericTypeDef array_def;
+        array_def.base_name = "Array";
+        array_def.num_type_params = 1;
+        array_def.description = "Dynamic array with elements, length, and capacity";
+        array_def.fields = {
+            {"elements", "ptr<T>", true}, // T* elements
+            {"length", "u64", false},     // u64 length
+            {"capacity", "u64", false}    // u64 capacity
+        };
+        register_generic_type_def(array_def);
+
+        // Define Pair<T,U> generic type
+        GenericTypeDef pair_def;
+        pair_def.base_name = "Pair";
+        pair_def.num_type_params = 2;
+        pair_def.description = "Pair containing two values of potentially different types";
+        pair_def.fields = {
+            {"first", "T", true}, // T first
+            {"second", "U", true} // U second
+        };
+        register_generic_type_def(pair_def);
+
+        // Define ptr<T> generic type (pointer)
+        GenericTypeDef ptr_def;
+        ptr_def.base_name = "ptr";
+        ptr_def.num_type_params = 1;
+        ptr_def.description = "Pointer to type T";
+        ptr_def.fields = {}; // No fields - this is a primitive pointer type
+        register_generic_type_def(ptr_def);
+
+        // Define const_ptr<T> generic type
+        GenericTypeDef const_ptr_def;
+        const_ptr_def.base_name = "const_ptr";
+        const_ptr_def.num_type_params = 1;
+        const_ptr_def.description = "Const pointer to type T";
+        const_ptr_def.fields = {}; // No fields - this is a primitive pointer type
+        register_generic_type_def(const_ptr_def);
+
+        // Define Option<T> generic type
+        GenericTypeDef option_def;
+        option_def.base_name = "Option";
+        option_def.num_type_params = 1;
+        option_def.description = "Optional value that may contain Some(T) or None";
+        option_def.fields = {
+            {"has_value", "bool", false}, // bool has_value
+            {"value", "T", true}          // T value
+        };
+        register_generic_type_def(option_def);
+
+        // Define Result<T,E> generic type
+        GenericTypeDef result_def;
+        result_def.base_name = "Result";
+        result_def.num_type_params = 2;
+        result_def.description = "Result type that contains either Ok(T) or Err(E)";
+        result_def.fields = {
+            {"is_ok", "bool", false},         // bool is_ok
+            {"data", "union_data<T,E>", true} // Union data (simplified)
+        };
+        register_generic_type_def(result_def);
+
+        std::cout << "[TypeMapper] Initialized " << _generic_type_registry.size()
+                  << " built-in generic type definitions\n";
+    }
+
+    llvm::Type *TypeMapper::create_generic_type_from_def(const std::string &base_name,
+                                                         const std::vector<std::string> &type_args,
+                                                         const std::string &instantiated_name)
+    {
+        // Look up the generic type definition
+        auto def_it = _generic_type_registry.find(base_name);
+        if (def_it == _generic_type_registry.end())
+        {
+            report_error("Unknown generic type: " + base_name);
+            return nullptr;
+        }
+
+        const GenericTypeDef &def = def_it->second;
+
+        // Validate type argument count
+        if (static_cast<int>(type_args.size()) != def.num_type_params)
+        {
+            report_error("Generic type " + base_name + " expects " +
+                         std::to_string(def.num_type_params) + " type arguments, got " +
+                         std::to_string(type_args.size()));
+            return nullptr;
+        }
+
+        // Handle special cases for primitive pointer types
+        if (base_name == "ptr" || base_name == "const_ptr")
+        {
+            llvm::Type *pointee_type = map_type(type_args[0]);
+            if (!pointee_type)
+            {
+                report_error("Failed to map pointee type for " + base_name + ": " + type_args[0]);
+                return nullptr;
+            }
+
+            llvm::Type *pointer_type = llvm::PointerType::get(pointee_type, 0);
+            register_type(instantiated_name, pointer_type);
+            return pointer_type;
+        }
+
+        // Create type parameter mapping (T -> concrete_type, U -> concrete_type2, etc.)
+        std::unordered_map<std::string, std::string> type_params_map;
+        std::vector<std::string> param_names = {"T", "U", "V", "W"}; // Support up to 4 params for now
+        for (int i = 0; i < def.num_type_params && i < static_cast<int>(param_names.size()); ++i)
+        {
+            type_params_map[param_names[i]] = type_args[i];
+        }
+
+        // Resolve field types using the type parameter mapping
+        auto &context = _context_manager.get_context();
+        std::vector<llvm::Type *> field_types;
+
+        for (const auto &field_def : def.fields)
+        {
+            llvm::Type *field_type = resolve_type_expression(field_def.type_expr, type_params_map);
+            if (!field_type)
+            {
+                report_error("Failed to resolve field type '" + field_def.type_expr +
+                             "' for field '" + field_def.name + "' in " + base_name);
+                return nullptr;
+            }
+            field_types.push_back(field_type);
+        }
+
+        // Create the struct type
+        llvm::StructType *instantiated_type = llvm::StructType::create(context, field_types, instantiated_name);
+
+        // Register the instantiated type
+        register_type(instantiated_name, instantiated_type);
+
+        // Register field metadata
+        for (size_t i = 0; i < def.fields.size(); ++i)
+        {
+            register_generic_field_metadata(instantiated_name, def.fields[i].name,
+                                            static_cast<int>(i), field_types[i]);
+        }
+
+        std::cout << "[TypeMapper] Created generic type instantiation: " << instantiated_name
+                  << " with " << field_types.size() << " fields\n";
+
+        return instantiated_type;
+    }
+
+    llvm::Type *TypeMapper::resolve_type_expression(const std::string &type_expr,
+                                                    const std::unordered_map<std::string, std::string> &type_params_map)
+    {
+        // Handle template parameter substitution
+        auto param_it = type_params_map.find(type_expr);
+        if (param_it != type_params_map.end())
+        {
+            // Direct template parameter: T -> int
+            return map_type(param_it->second);
+        }
+
+        // Handle templated expressions like ptr<T>
+        if (type_expr.find('<') != std::string::npos)
+        {
+            size_t angle_pos = type_expr.find('<');
+            size_t close_angle = type_expr.find('>', angle_pos);
+
+            if (close_angle == std::string::npos)
+            {
+                report_error("Malformed type expression: " + type_expr);
+                return nullptr;
+            }
+
+            std::string base_type = type_expr.substr(0, angle_pos);
+            std::string param_expr = type_expr.substr(angle_pos + 1, close_angle - angle_pos - 1);
+
+            // Recursively resolve the parameter
+            llvm::Type *param_type = resolve_type_expression(param_expr, type_params_map);
+            if (!param_type)
+            {
+                return nullptr;
+            }
+
+            // Handle specific template expressions
+            if (base_type == "ptr")
+            {
+                return llvm::PointerType::get(param_type, 0);
+            }
+            else if (base_type == "const_ptr")
+            {
+                return llvm::PointerType::get(param_type, 0); // LLVM doesn't distinguish const at type level
+            }
+            else
+            {
+                // For other generic types, construct the instantiated name and map it
+                std::string instantiated_expr = base_type + "<" + param_expr + ">";
+                return map_type(instantiated_expr);
+            }
+        }
+
+        // Handle special union data type (simplified for Result<T,E>)
+        if (type_expr.find("union_data<") == 0)
+        {
+            // For now, just create a large enough byte array to hold either type
+            // In a production compiler, you'd want proper union support
+            auto &context = _context_manager.get_context();
+            return llvm::ArrayType::get(get_char_type(), 64); // 64 bytes should be enough for most types
+        }
+
+        // Direct type lookup for non-templated types
+        return map_type(type_expr);
     }
 
 } // namespace Cryo::Codegen

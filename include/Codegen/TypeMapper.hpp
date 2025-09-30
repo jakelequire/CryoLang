@@ -176,8 +176,8 @@ namespace Cryo::Codegen
          * @return Instantiated LLVM struct type
          */
         llvm::Type *create_generic_struct_instantiation(const std::string &base_name,
-                                                       const std::vector<std::string> &type_args,
-                                                       const std::string &instantiated_name);
+                                                        const std::vector<std::string> &type_args,
+                                                        const std::string &instantiated_name);
 
         /**
          * @brief Register field metadata for generic instantiation
@@ -187,9 +187,9 @@ namespace Cryo::Codegen
          * @param field_type LLVM field type
          */
         void register_generic_field_metadata(const std::string &type_name,
-                                            const std::string &field_name,
-                                            int field_index,
-                                            llvm::Type *field_type);
+                                             const std::string &field_name,
+                                             int field_index,
+                                             llvm::Type *field_type);
 
         //===================================================================
         // Pointer and Reference Types
@@ -292,10 +292,11 @@ namespace Cryo::Codegen
         /**
          * @brief Structure to hold field information
          */
-        struct FieldInfo {
-            llvm::Type* struct_type;
+        struct FieldInfo
+        {
+            llvm::Type *struct_type;
             int field_index;
-            llvm::Type* field_type;
+            llvm::Type *field_type;
             std::string field_name;
         };
 
@@ -306,8 +307,8 @@ namespace Cryo::Codegen
          * @param field_index Index of the field in the struct
          * @param field_type LLVM type of the field
          */
-        void register_field_metadata(const std::string& type_name, const std::string& field_name, 
-                                    int field_index, llvm::Type* field_type);
+        void register_field_metadata(const std::string &type_name, const std::string &field_name,
+                                     int field_index, llvm::Type *field_type);
 
         /**
          * @brief Get field information for a given type and field name
@@ -315,7 +316,7 @@ namespace Cryo::Codegen
          * @param field_name Name of the field
          * @return Optional field information
          */
-        std::optional<FieldInfo> get_field_info(llvm::Type* llvm_type, const std::string& field_name);
+        std::optional<FieldInfo> get_field_info(llvm::Type *llvm_type, const std::string &field_name);
 
         /**
          * @brief Get field index by name for a registered type
@@ -323,21 +324,21 @@ namespace Cryo::Codegen
          * @param field_name Name of the field
          * @return Field index or -1 if not found
          */
-        int get_field_index(const std::string& type_name, const std::string& field_name);
+        int get_field_index(const std::string &type_name, const std::string &field_name);
 
         /**
          * @brief Register all fields from a struct declaration
          * @param struct_decl Struct declaration node
          * @param llvm_struct_type The corresponding LLVM struct type
          */
-        void register_struct_fields(Cryo::StructDeclarationNode* struct_decl, llvm::StructType* llvm_struct_type);
+        void register_struct_fields(Cryo::StructDeclarationNode *struct_decl, llvm::StructType *llvm_struct_type);
 
         /**
          * @brief Register all fields from a class declaration
          * @param class_decl Class declaration node
          * @param llvm_class_type The corresponding LLVM struct type
          */
-        void register_class_fields(Cryo::ClassDeclarationNode* class_decl, llvm::StructType* llvm_class_type);
+        void register_class_fields(Cryo::ClassDeclarationNode *class_decl, llvm::StructType *llvm_class_type);
 
         //===================================================================
         // Error Handling
@@ -356,11 +357,68 @@ namespace Cryo::Codegen
         /**
          * @brief Clear error state without clearing type caches
          */
-        void clear_errors() { 
+        void clear_errors()
+        {
             std::cout << "[DEBUG] TypeMapper: Clearing errors (was: " << _has_errors << ")" << std::endl;
-            _has_errors = false; 
-            _last_error.clear(); 
+            _has_errors = false;
+            _last_error.clear();
         }
+
+        //===================================================================
+        // Generic Type Definition System
+        //===================================================================
+
+        /**
+         * @brief Definition of a generic type field
+         */
+        struct GenericFieldDef
+        {
+            std::string name;      // Field name (e.g., "elements", "length")
+            std::string type_expr; // Type expression (e.g., "ptr<T>", "u64", "T")
+            bool is_templated;     // Whether this field uses template parameters
+        };
+
+        /**
+         * @brief Definition of a generic type
+         */
+        struct GenericTypeDef
+        {
+            std::string base_name;               // Base name (e.g., "Array", "Pair")
+            int num_type_params;                 // Number of type parameters
+            std::vector<GenericFieldDef> fields; // Field definitions
+            std::string description;             // Optional description
+        };
+
+        /**
+         * @brief Register a generic type definition
+         * @param def Generic type definition
+         */
+        void register_generic_type_def(const GenericTypeDef &def);
+
+        /**
+         * @brief Initialize built-in generic types (Array, Pair, etc.)
+         */
+        void initialize_builtin_generic_types();
+
+        /**
+         * @brief Create generic type instantiation using registered definitions
+         * @param base_name Base generic type name
+         * @param type_args Type argument strings
+         * @param instantiated_name Full instantiated name
+         * @return Instantiated LLVM type
+         */
+        llvm::Type *create_generic_type_from_def(const std::string &base_name,
+                                                 const std::vector<std::string> &type_args,
+                                                 const std::string &instantiated_name);
+
+        /**
+         * @brief Resolve type expression with template substitution
+         * @param type_expr Type expression (e.g., "ptr<T>", "u64")
+         * @param type_params_map Mapping from parameter names to concrete types
+         * @return Resolved LLVM type
+         */
+        llvm::Type *resolve_type_expression(const std::string &type_expr,
+                                            const std::unordered_map<std::string, std::string> &type_params_map);
 
     private:
         //===================================================================
@@ -378,7 +436,10 @@ namespace Cryo::Codegen
 
         // Field metadata storage
         std::unordered_map<std::string, std::unordered_map<std::string, FieldInfo>> _field_metadata;
-        std::unordered_map<llvm::Type*, std::string> _llvm_type_to_name_map;
+        std::unordered_map<llvm::Type *, std::string> _llvm_type_to_name_map;
+
+        // Registry of generic type definitions
+        std::unordered_map<std::string, GenericTypeDef> _generic_type_registry;
 
         // Error state
         bool _has_errors;

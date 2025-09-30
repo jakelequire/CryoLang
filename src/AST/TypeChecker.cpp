@@ -570,7 +570,7 @@ namespace Cryo
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
         _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
-        
+
         // Register common generic types
         register_generic_type("Array", {"T"});
         register_generic_type("Option", {"T"});
@@ -1404,7 +1404,7 @@ namespace Cryo
                 full_type_name += node.generic_args()[i];
             }
             full_type_name += ">";
-            
+
             // Use TypeRegistry to resolve generic type instantiation
             auto resolved_type = resolve_generic_type(full_type_name);
             if (resolved_type)
@@ -1424,7 +1424,7 @@ namespace Cryo
         // Look for the type definition in the symbol table
         // First try the full instantiated name (e.g., "Array<int>")
         TypedSymbol *type_symbol = _symbol_table->lookup_symbol(type_name);
-        
+
         // If not found and this is a generic type, try to find the base template
         if (!type_symbol && !node.generic_args().empty())
         {
@@ -1580,6 +1580,29 @@ namespace Cryo
         // Get the member name
         std::string member_name = node.member();
 
+        // Check if this is an array type (ends with [])
+        bool is_array_type = (object_type.find("[]") != std::string::npos);
+
+        // Handle built-in array properties
+        if (is_array_type)
+        {
+            if (member_name == "length")
+            {
+                node.set_type("u64");
+                return;
+            }
+            else if (member_name == "size")
+            {
+                node.set_type("u64");
+                return;
+            }
+            // For now, only support built-in array properties
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                         "Unknown array property '" + member_name + "' for type '" + object_type + "'");
+            node.set_type("unknown");
+            return;
+        }
+
         // For generic types, extract the base type name for field/method lookup
         std::string lookup_type = object_type;
         size_t generic_pos = object_type.find('<');
@@ -1646,6 +1669,59 @@ namespace Cryo
                 node.set_type(resolved_type);
                 return;
             }
+        }
+
+        // Check for private methods within the same class/struct context
+        // Look in the private method registry
+        std::cout << "[DEBUG] Looking up private method '" << member_name
+                  << "' in lookup_type '" << lookup_type << "'" << std::endl;
+
+        // First check if we're in a class context and the lookup_type matches current class
+        if (!_current_struct_name.empty() && lookup_type == _current_struct_name)
+        {
+            auto private_method_struct_it = _private_struct_methods.find(lookup_type);
+            if (private_method_struct_it != _private_struct_methods.end())
+            {
+                auto private_method_it = private_method_struct_it->second.find(member_name);
+                if (private_method_it != private_method_struct_it->second.end())
+                {
+                    std::cout << "[DEBUG] Found private method '" << member_name << "' in current class '" << lookup_type << "'" << std::endl;
+                    std::string method_return_type = private_method_it->second->to_string();
+                    std::string resolved_type = substitute_generic_type(method_return_type, object_type, lookup_type);
+                    node.set_type(resolved_type);
+                    return;
+                }
+            }
+
+            // If not found in registered methods, check if we're currently processing the class definition
+            // In this case, allow the private method call to proceed
+            std::cout << "[DEBUG] Allowing private method '" << member_name << "' in current class context '" << lookup_type << "'" << std::endl;
+            node.set_type("void"); // Default to void for private methods
+            return;
+        }
+
+        auto private_method_struct_it = _private_struct_methods.find(lookup_type);
+        if (private_method_struct_it != _private_struct_methods.end())
+        {
+            std::cout << "[DEBUG] Found private methods for type '" << lookup_type << "'" << std::endl;
+            auto private_method_it = private_method_struct_it->second.find(member_name);
+            if (private_method_it != private_method_struct_it->second.end())
+            {
+                std::cout << "[DEBUG] Found private method '" << member_name << "'" << std::endl;
+                // Found the private method - substitute generic type parameters if needed
+                std::string method_return_type = private_method_it->second->to_string();
+                std::string resolved_type = substitute_generic_type(method_return_type, object_type, lookup_type);
+                node.set_type(resolved_type);
+                return;
+            }
+            else
+            {
+                std::cout << "[DEBUG] Private method '" << member_name << "' not found in type '" << lookup_type << "'" << std::endl;
+            }
+        }
+        else
+        {
+            std::cout << "[DEBUG] No private methods found for type '" << lookup_type << "'" << std::endl;
         }
 
         // For primitive types, also check if there are functions available in global scope
@@ -1723,9 +1799,7 @@ namespace Cryo
                 if (symbol->data_type != nullptr)
                 {
                     node.set_type(symbol->data_type->to_string());
-                    std::cout << "[DEBUG] Resolved namespace symbol: " << scope_name << "::" << member_name
-                              << " with type: " << symbol->data_type->to_string()
-                              << " (context: " << _current_namespace << ")" << std::endl;
+                    // Resolved namespace symbol
                 }
                 else
                 {
@@ -1736,9 +1810,9 @@ namespace Cryo
                         type_name = "function"; // Or we could try to infer from the AST
                     }
                     node.set_type(type_name);
-                    std::cout << "[DEBUG] Resolved namespace symbol: " << scope_name << "::" << member_name
-                              << " with generic type: " << type_name
-                              << " (context: " << _current_namespace << ")" << std::endl;
+                    // std::cout << "[DEBUG] Resolved namespace symbol: " << scope_name << "::" << member_name
+                    // << " with generic type: " << type_name
+                    // << " (context: " << _current_namespace << ")" << std::endl;
                 }
                 return;
             }
@@ -1752,57 +1826,54 @@ namespace Cryo
                 std::string namespace_part = scope_name.substr(0, last_scope - 1); // "Syscall"
                 std::string class_name = scope_name.substr(last_scope + 1);        // "IO"
 
-                std::cout << "[DEBUG] Trying multi-level resolution: namespace='" << namespace_part
-                          << "', class='" << class_name << "', method='" << member_name << "'" << std::endl;
+                // Trying multi-level resolution
 
                 // Look up the class in the namespace (with context)
                 Symbol *class_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(namespace_part, class_name, _current_namespace);
                 if (class_symbol && class_symbol->kind == SymbolKind::Type)
                 {
-                    std::cout << "[DEBUG] Found class " << class_name << " in namespace " << namespace_part << std::endl;
+                    // Found class in namespace
 
                     // Now look for the method within the class
                     // For static methods, we assume they exist and have appropriate types
                     if (member_name == "write" && class_name == "IO")
                     {
                         node.set_type("i64"); // write returns i64
-                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
-                                  << " -> i64" << std::endl;
+                        // std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
+                        // << " -> i64" << std::endl;
                         return;
                     }
                     else if (member_name == "read" && class_name == "IO")
                     {
                         node.set_type("i64"); // read returns i64
-                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
-                                  << " -> i64" << std::endl;
+                        // Resolved static method IO::read -> i64
                         return;
                     }
                     else if (member_name == "open" && class_name == "IO")
                     {
                         node.set_type("int"); // open returns int
-                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
-                                  << " -> int" << std::endl;
+                        // Resolved static method IO::open -> int
                         return;
                     }
                     else if (member_name == "close" && class_name == "IO")
                     {
                         node.set_type("int"); // close returns int
-                        std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
-                                  << " -> int" << std::endl;
+                        // std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
+                        // << " -> int" << std::endl;
                         return;
                     }
                     else
                     {
                         // Generic static method - assume it exists
                         node.set_type("unknown");
-                        std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
-                                  << " -> unknown" << std::endl;
+                        // std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
+                        // << " -> unknown" << std::endl;
                         return;
                     }
                 }
                 else
                 {
-                    std::cout << "[DEBUG] Class " << class_name << " not found in namespace " << namespace_part << std::endl;
+                    // std::cout << "[DEBUG] Class " << class_name << " not found in namespace " << namespace_part << std::endl;
                 }
             }
         }
@@ -1834,15 +1905,15 @@ namespace Cryo
             if (member_name == "get_default")
             {
                 node.set_type(scope_name); // Return type is T
-                std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
-                          << " -> " << scope_name << std::endl;
+                // std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
+                // << " -> " << scope_name << std::endl;
                 return;
             }
 
             // For other static methods, use unknown type for now
             node.set_type("unknown");
-            std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
-                      << " -> unknown (trait bounds: ";
+            // std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
+            // << " -> unknown (trait bounds: ";
             for (size_t i = 0; i < trait_names.size(); ++i)
             {
                 if (i > 0)
@@ -1854,10 +1925,51 @@ namespace Cryo
         }
 
         // If not found, try the old enum-based approach
+        // For generic types like "Option<T>", extract the base type name
+        std::string base_scope_name = scope_name;
+        size_t generic_start = scope_name.find('<');
+        if (generic_start != std::string::npos)
+        {
+            base_scope_name = scope_name.substr(0, generic_start);
+        }
+
         // Look up the scope type (should be an enum type)
-        TypedSymbol *scope_symbol = _symbol_table->lookup_symbol(scope_name);
+        std::cout << "[DEBUG] Looking up scope symbol '" << base_scope_name << "'" << std::endl;
+
+        // Check if it's a generic type pattern like Option<T>
+        TypedSymbol *scope_symbol = nullptr;
+        if (scope_name.find('<') != std::string::npos)
+        {
+            // For generic types, first try the base name
+            scope_symbol = _symbol_table->lookup_symbol(base_scope_name);
+            if (!scope_symbol && _main_symbol_table)
+            {
+                // Try looking for the generic type in the main symbol table
+                Symbol *main_symbol = _main_symbol_table->lookup_symbol(base_scope_name);
+                if (main_symbol && main_symbol->data_type)
+                {
+                    std::cout << "[DEBUG] Found generic type '" << base_scope_name << "' in main symbol table" << std::endl;
+                    // For enum types, allow the scope resolution to proceed
+                    return; // Found the type, proceed with resolution
+                }
+            }
+
+            // If not found yet, this might be a forward reference within the same module
+            // For common types like Option, Result etc, allow them to be resolved
+            if (!scope_symbol && (base_scope_name == "Option" || base_scope_name == "Result" || base_scope_name == "Array"))
+            {
+                std::cout << "[DEBUG] Allowing forward reference for common generic type '" << base_scope_name << "'" << std::endl;
+                return; // Allow the scope resolution to proceed
+            }
+        }
+        else
+        {
+            scope_symbol = _symbol_table->lookup_symbol(base_scope_name);
+        }
+
         if (!scope_symbol)
         {
+            std::cout << "[DEBUG] Scope symbol '" << base_scope_name << "' not found" << std::endl;
             std::string qualified_name = scope_name + "::" + member_name;
             report_undefined_symbol(node.location(), qualified_name);
             node.set_type(_type_context.get_unknown_type()->to_string());
@@ -1867,7 +1979,7 @@ namespace Cryo
         Type *scope_type = scope_symbol->type;
         if (!scope_type)
         {
-            report_undefined_symbol(node.location(), scope_name);
+            report_undefined_symbol(node.location(), base_scope_name);
             node.set_type(_type_context.get_unknown_type()->to_string());
             return;
         }
@@ -1876,15 +1988,16 @@ namespace Cryo
         if (scope_type->kind() != TypeKind::Enum)
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Scope resolution '::' can only be used with enum types or namespace functions, got: " + scope_name);
+                         "Scope resolution '::' can only be used with enum types or namespace functions, got: " + base_scope_name);
             node.set_type(_type_context.get_unknown_type()->to_string());
             return;
         }
 
-        // For enum scope resolution like Shape::Circle, the type should be Shape
-        // TODO: In a more complete implementation, we would validate that member_name is a valid variant
-        // For now, we'll just set the type to the enum type
-        node.set_type(scope_type->to_string());
+        // For enum scope resolution like Shape::Circle or Option<T>::None,
+        // the type should be the original parameterized type (e.g., "Option<T>")
+        node.set_type(scope_name);
+
+        // Resolved generic enum variant
     }
 
     //===----------------------------------------------------------------------===//
@@ -2112,7 +2225,7 @@ namespace Cryo
         {
             // For now, create a type alias that represents the generic template
             // In a full implementation, we'd need proper template system with type parameter substitution
-            std::cout << "[DEBUG] Generic type alias: " << alias_name << "<";
+            // std::cout << "[DEBUG] Generic type alias: " << alias_name << "<";
             const auto &params = node.generic_params();
             for (size_t i = 0; i < params.size(); ++i)
             {
@@ -2544,7 +2657,17 @@ namespace Cryo
 
             if (return_type)
             {
-                _struct_methods[_current_struct_name][method_name] = return_type;
+                // Register in appropriate registry based on visibility
+                if (node.visibility() == Visibility::Private)
+                {
+                    std::cout << "[DEBUG] Registering private method '" << method_name
+                              << "' for struct '" << _current_struct_name << "'" << std::endl;
+                    _private_struct_methods[_current_struct_name][method_name] = return_type;
+                }
+                else
+                {
+                    _struct_methods[_current_struct_name][method_name] = return_type;
+                }
             }
         }
     }
