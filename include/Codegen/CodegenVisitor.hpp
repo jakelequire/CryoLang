@@ -335,6 +335,12 @@ namespace Cryo::Codegen
         llvm::Type *generate_class_type(Cryo::ClassDeclarationNode *node);
         llvm::Type *generate_enum_type(Cryo::EnumDeclarationNode *node);
 
+        // Array method generation helper
+        void generate_array_methods(const std::string &class_name, llvm::Type *class_type);
+
+        // Type name conversion helper
+        std::string generate_monomorphized_type_name(const std::string &parameterized_type);
+
         // Enum generation helpers
         void generate_simple_enum_constants(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type);
         void generate_complex_enum_constructors(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type);

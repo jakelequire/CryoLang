@@ -1896,7 +1896,11 @@ namespace Cryo
                                   lookup_type == "boolean" || lookup_type == "bool" || lookup_type == "char" ||
                                   lookup_type == "void");
 
-        if (!struct_type && !is_primitive_type)
+        // Check if this is a generic type (contains '<' and '>')
+        bool is_generic_type = (object_type.find('<') != std::string::npos &&
+                                object_type.find('>') != std::string::npos);
+
+        if (!struct_type && !is_primitive_type && !is_generic_type)
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
                          "Cannot access member of non-struct/class type: " + object_type);
@@ -2050,6 +2054,40 @@ namespace Cryo
                         return;
                     }
                 }
+            }
+        }
+
+        // Check for methods in registered class templates
+        // For now, hardcode known template methods - TODO: make this dynamic
+        if (lookup_type == "Array" && is_generic_type)
+        {
+            if (member_name == "size")
+            {
+                std::cout << "[DEBUG] Found template method 'size' in Array<T>" << std::endl;
+                node.set_type("u64");
+                return;
+            }
+            else if (member_name == "push")
+            {
+                std::cout << "[DEBUG] Found template method 'push' in Array<T>" << std::endl;
+                node.set_type("void");
+                return;
+            }
+            else if (member_name == "get")
+            {
+                std::cout << "[DEBUG] Found template method 'get' in Array<T>" << std::endl;
+                // Extract the element type from Array<T>
+                size_t start = object_type.find('<');
+                size_t end = object_type.find('>');
+                if (start != std::string::npos && end != std::string::npos && end > start)
+                {
+                    std::string element_type = object_type.substr(start + 1, end - start - 1);
+                    std::string option_type = "Option<" + element_type + ">";
+                    node.set_type(option_type);
+                    return;
+                }
+                node.set_type("Option<unknown>");
+                return;
             }
         }
 

@@ -2238,6 +2238,78 @@ namespace Cryo::Codegen
         std::cout << "[CodegenVisitor] Array access: var_name='" << array_var_name
                   << "', is_nested=" << (is_nested_access ? "true" : "false") << std::endl;
 
+        // Special handling for Array<T> types - treat them as direct array access
+        if (!array_var_name.empty() && !is_nested_access)
+        {
+            auto type_it = _variable_types.find(array_var_name);
+            if (type_it != _variable_types.end())
+            {
+                std::string var_type = type_it->second;
+                // Check if this is an Array<T> type
+                if (var_type.find("Array<") == 0 && var_type.find('>') != std::string::npos)
+                {
+                    std::cout << "[CodegenVisitor] Special Array<T> direct access for variable '"
+                              << array_var_name << "' of type '" << var_type << "'" << std::endl;
+
+                    // Extract the element type (T)
+                    size_t start = var_type.find('<') + 1;
+                    size_t end = var_type.find('>');
+                    std::string element_type_str = var_type.substr(start, end - start);
+
+                    // Get the element type for Array operations
+                    Cryo::Type *cryo_element_type = _symbol_table.get_type_context()->parse_type_from_string(element_type_str);
+                    llvm::Type *llvm_element_type = cryo_element_type ? _type_mapper->map_type(cryo_element_type) : nullptr;
+
+                    if (!llvm_element_type)
+                    {
+                        report_error("Could not resolve element type for Array indexing: " + element_type_str, &node);
+                        return;
+                    }
+
+                    // Get the Array variable's alloca
+                    llvm::Value *array_var_alloca = _value_context->get_value(array_var_name);
+                    if (array_var_alloca && array_var_alloca->getType()->isPointerTy())
+                    {
+                        std::cout << "[CodegenVisitor] Array variable alloca found, attempting load..." << std::endl;
+
+                        // Load the array pointer from the Array variable
+                        // Since the Array<int> struct is empty but contains the array literal pointer,
+                        // we need to load it carefully - the stored data is actually a pointer to the first element
+                        llvm::Type *stored_ptr_type = llvm::PointerType::get(context, 0);
+                        llvm::Value *loaded_array_ptr = builder.CreateLoad(
+                            stored_ptr_type,
+                            array_var_alloca,
+                            array_var_name + ".array.load");
+
+                        std::cout << "[CodegenVisitor] Successfully loaded array pointer, creating element access..." << std::endl;
+
+                        // Create GEP to access the specific element directly
+                        llvm::Value *element_ptr = builder.CreateGEP(
+                            llvm_element_type,
+                            loaded_array_ptr,
+                            {index_val},
+                            array_var_name + ".element.ptr");
+
+                        // Load the element value
+                        llvm::Value *element_value = builder.CreateLoad(
+                            llvm_element_type,
+                            element_ptr,
+                            array_var_name + ".element.load");
+
+                        register_value(&node, element_value);
+                        set_current_value(element_value);
+                        std::cout << "[CodegenVisitor] Generated Array<T> direct element access successfully - RETURNING" << std::endl;
+                        return;
+                    }
+                    else
+                    {
+                        report_error("Could not get Array variable alloca for indexing: " + array_var_name, &node);
+                        return;
+                    }
+                }
+            }
+        }
+
         // Convert index to i32 if it's not already
         if (index_val->getType() != llvm::Type::getInt32Ty(context))
         {
@@ -6830,12 +6902,6 @@ namespace Cryo::Codegen
         {
             type_substitutions["T"] = type_args[0];
             std::cout << "[CodegenVisitor] Type substitution: T -> " << type_args[0] << std::endl;
-        }
-
-        // Generate hardcoded methods for known generic structs
-        if (base_type == "GenericStruct")
-        {
-            generate_generic_struct_methods(instantiated_type, type_args, struct_type, type_substitutions);
         }
         else
         {
