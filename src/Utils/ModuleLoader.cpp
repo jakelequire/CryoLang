@@ -56,7 +56,7 @@ namespace Cryo
         if (cached != _loaded_modules.end())
         {
             std::cout << "[DEBUG] ModuleLoader: Using cached module" << std::endl;
-            
+
             // Create a copy of the cached result to return
             ImportResult cached_result;
             cached_result.success = cached->second.success;
@@ -65,7 +65,7 @@ namespace Cryo
             cached_result.namespace_alias = cached->second.namespace_alias;
             cached_result.symbol_map = cached->second.symbol_map;
             cached_result.exported_symbols = cached->second.exported_symbols;
-            
+
             // Apply filtering for specific imports if needed
             if (import_node.is_specific_import() && cached_result.success)
             {
@@ -78,7 +78,7 @@ namespace Cryo
                     cached_result = filter_specific_imports(std::move(cached_result), import_node.specific_imports());
                 }
             }
-            
+
             return cached_result;
         }
 
@@ -123,7 +123,7 @@ namespace Cryo
         cache_copy.namespace_alias = result.namespace_alias;
         cache_copy.symbol_map = result.symbol_map; // This should copy the map
         cache_copy.exported_symbols = result.exported_symbols;
-        
+
         // Cache the copy
         _loaded_modules[resolved_path] = std::move(cache_copy);
 
@@ -222,7 +222,7 @@ namespace Cryo
             // Do ALL processing on the original AST and keep it alive
             // 1. Register generic templates from the original AST
             register_templates_from_ast(*ast, result.module_name);
-            
+
             // 2. Extract symbols from the original AST
             result.exported_symbols = extract_exported_symbols(*ast);
             std::cout << "[DEBUG] ModuleLoader: Found " << result.exported_symbols.size() << " exported symbols" << std::endl;
@@ -462,10 +462,10 @@ namespace Cryo
                     if (!class_decl->generic_parameters().empty())
                     {
                         _template_registry.register_class_template(
-                            class_decl->name(),   // base_name
-                            class_decl,           // template_node
-                            module_name,          // module_namespace
-                            "imported_module"     // source_file (placeholder)
+                            class_decl->name(), // base_name
+                            class_decl,         // template_node
+                            module_name,        // module_namespace
+                            "imported_module"   // source_file (placeholder)
                         );
                         std::cout << "[DEBUG] ModuleLoader: Registered generic class template: "
                                   << class_decl->name() << " from module: " << module_name << std::endl;
@@ -476,9 +476,9 @@ namespace Cryo
                     // Register generic enum templates
                     if (!enum_decl->generic_parameters().empty())
                     {
-                        std::cout << "[DEBUG] ModuleLoader: Before registration - enum " << enum_decl->name() 
+                        std::cout << "[DEBUG] ModuleLoader: Before registration - enum " << enum_decl->name()
                                   << " has " << enum_decl->generic_parameters().size() << " generic parameters" << std::endl;
-                        
+
                         // Debug first parameter
                         if (!enum_decl->generic_parameters().empty())
                         {
@@ -489,12 +489,12 @@ namespace Cryo
                                 std::cout << "[DEBUG] ModuleLoader: First parameter name: " << first_param->name() << std::endl;
                             }
                         }
-                        
+
                         _template_registry.register_enum_template(
-                            enum_decl->name(),    // base_name
-                            enum_decl,            // template_node
-                            module_name,          // module_namespace
-                            "imported_module"     // source_file (placeholder)
+                            enum_decl->name(), // base_name
+                            enum_decl,         // template_node
+                            module_name,       // module_namespace
+                            "imported_module"  // source_file (placeholder)
                         );
                         std::cout << "[DEBUG] ModuleLoader: Registered generic enum template: "
                                   << enum_decl->name() << " from module: " << module_name << std::endl;
@@ -506,10 +506,10 @@ namespace Cryo
                     if (!struct_decl->generic_parameters().empty())
                     {
                         _template_registry.register_struct_template(
-                            struct_decl->name(),  // base_name
-                            struct_decl,          // template_node
-                            module_name,          // module_namespace
-                            "imported_module"     // source_file (placeholder)
+                            struct_decl->name(), // base_name
+                            struct_decl,         // template_node
+                            module_name,         // module_namespace
+                            "imported_module"    // source_file (placeholder)
                         );
                         std::cout << "[DEBUG] ModuleLoader: Registered generic struct template: "
                                   << struct_decl->name() << " from module: " << module_name << std::endl;
@@ -521,13 +521,28 @@ namespace Cryo
                     if (!func_decl->generic_parameters().empty())
                     {
                         _template_registry.register_function_template(
-                            func_decl->name(),    // base_name
-                            func_decl,            // template_node
-                            module_name,          // module_namespace
-                            "imported_module"     // source_file (placeholder)
+                            func_decl->name(), // base_name
+                            func_decl,         // template_node
+                            module_name,       // module_namespace
+                            "imported_module"  // source_file (placeholder)
                         );
                         std::cout << "[DEBUG] ModuleLoader: Registered generic function template: "
                                   << func_decl->name() << " from module: " << module_name << std::endl;
+                    }
+                }
+                else if (auto trait_decl = dynamic_cast<TraitDeclarationNode *>(decl))
+                {
+                    // Register generic trait templates
+                    if (!trait_decl->generic_parameters().empty())
+                    {
+                        _template_registry.register_trait_template(
+                            trait_decl->name(), // base_name
+                            trait_decl,         // template_node
+                            module_name,        // module_namespace
+                            "imported_module"   // source_file (placeholder)
+                        );
+                        std::cout << "[DEBUG] ModuleLoader: Registered generic trait template: "
+                                  << trait_decl->name() << " from module: " << module_name << std::endl;
                     }
                 }
             }

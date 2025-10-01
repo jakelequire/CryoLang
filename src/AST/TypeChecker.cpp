@@ -656,6 +656,7 @@ namespace Cryo
 
         std::string current_arg;
         int bracket_depth = 0;
+        int paren_depth = 0; // Track parentheses depth for tuple types
 
         for (size_t i = 0; i < args_str.length(); ++i)
         {
@@ -671,7 +672,17 @@ namespace Cryo
                 bracket_depth--;
                 current_arg += c;
             }
-            else if (c == ',' && bracket_depth == 0)
+            else if (c == '(')
+            {
+                paren_depth++;
+                current_arg += c;
+            }
+            else if (c == ')')
+            {
+                paren_depth--;
+                current_arg += c;
+            }
+            else if (c == ',' && bracket_depth == 0 && paren_depth == 0)
             {
                 // Found a top-level comma - this separates arguments
                 std::string trimmed_arg = current_arg;
@@ -733,20 +744,38 @@ namespace Cryo
             return _type_context.get_generic_type(type_string);
         }
 
-        // Check for parameterized types like ptr<T>, Option<T>
-        if (type_string.find('<') != std::string::npos)
+        // Check for tuple types first (before checking for generic syntax)
+        if (type_string.front() == '(' && type_string.back() == ')')
         {
-            std::cout << "[DEBUG] TypeChecker: Found generic type syntax in '" << type_string << "'" << std::endl;
+            std::cout << "[DEBUG] TypeChecker: '" << type_string << "' is a tuple type, deferring to type context" << std::endl;
+            // Tuple types should be handled by the main type context, not as generic instantiations
+            return _type_context.parse_type_from_string(type_string);
+        }
+
+        // Check for reference types (&Type<T>) - strip the & for template lookup
+        std::string clean_type_string = type_string;
+        bool is_reference = false;
+        if (type_string.front() == '&')
+        {
+            clean_type_string = type_string.substr(1);
+            is_reference = true;
+            std::cout << "[DEBUG] TypeChecker: Stripped reference prefix, checking template for: '" << clean_type_string << "'" << std::endl;
+        }
+
+        // Check for parameterized types like ptr<T>, Option<T>, Iterator<T>
+        if (clean_type_string.find('<') != std::string::npos)
+        {
+            std::cout << "[DEBUG] TypeChecker: Found generic type syntax in '" << clean_type_string << "'" << std::endl;
 
             // Parse the base type and type arguments
-            size_t open_bracket = type_string.find('<');
-            size_t close_bracket = type_string.find('>', open_bracket);
+            size_t open_bracket = clean_type_string.find('<');
+            size_t close_bracket = clean_type_string.find('>', open_bracket);
 
             if (close_bracket != std::string::npos)
             {
-                std::string base_type = type_string.substr(0, open_bracket);
-                std::string type_args_str = type_string.substr(open_bracket + 1,
-                                                               close_bracket - open_bracket - 1);
+                std::string base_type = clean_type_string.substr(0, open_bracket);
+                std::string type_args_str = clean_type_string.substr(open_bracket + 1,
+                                                                     close_bracket - open_bracket - 1);
 
                 std::cout << "[DEBUG] TypeChecker: base_type='" << base_type << "', type_args='" << type_args_str << "'" << std::endl;
 
@@ -769,7 +798,7 @@ namespace Cryo
                     // This prevents tracking during template definition parsing
                     std::vector<std::string> concrete_types = parse_template_arguments(type_args_str);
 
-                    std::cout << "[DEBUG] TypeChecker: Tracking concrete instantiation: " << type_string
+                    std::cout << "[DEBUG] TypeChecker: Tracking concrete instantiation: " << clean_type_string
                               << " (base: " << base_type << ", args: " << type_args_str << ")" << std::endl;
                     std::cout << "[DEBUG] TypeChecker: Parsed " << concrete_types.size() << " concrete types:";
                     for (const auto &type : concrete_types)
@@ -778,7 +807,8 @@ namespace Cryo
                     }
                     std::cout << std::endl;
 
-                    track_instantiation(base_type, concrete_types, type_string, SourceLocation{});
+                    // Track the base template (without &), but record the clean type name for instantiation
+                    track_instantiation(base_type, concrete_types, clean_type_string, SourceLocation{});
                 }
             }
         }
