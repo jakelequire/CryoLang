@@ -265,6 +265,9 @@ else
 	@rm -rf $(STDLIB_BUILD_DIR)
 endif
 
+stdlib-types:
+	@.\bin\cryo.exe $(STDLIB_DIR)/core/types.cryo --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/core/types.bc
+
 # Test targets
 .PHONY: test test-quick test-verbose test-category test-file
 test: $(MAIN_BIN)

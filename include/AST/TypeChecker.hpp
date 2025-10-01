@@ -3,10 +3,12 @@
 #include "AST/ASTNode.hpp"
 #include "AST/ASTVisitor.hpp"
 #include "AST/ASTContext.hpp"
+#include "AST/GenericInstantiation.hpp"
 #include "Lexer/lexer.hpp"
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Cryo
 {
@@ -190,6 +192,39 @@ namespace Cryo
         // Maps generic parameter name -> set of trait names (e.g., "T" -> {"Default", "Clone"})
         std::unordered_map<std::string, std::vector<std::string>> _current_generic_trait_bounds;
 
+        // Generic context management
+        struct GenericContext {
+            std::string type_name;                    // Name of the generic type (e.g., "Array", "Option")
+            std::unordered_set<std::string> parameters; // Set of generic parameters (e.g., {"T"})
+            bool is_template_definition = true;       // true for template definitions, false for instantiations
+            SourceLocation location;                  // Location where this generic context started
+            
+            GenericContext(const std::string& name, const std::vector<std::string>& params, SourceLocation loc)
+                : type_name(name), parameters(params.begin(), params.end()), location(loc) {}
+        };
+        
+        std::vector<GenericContext> _generic_context_stack; // Stack of nested generic contexts
+        std::vector<GenericInstantiation> _required_instantiations; // Track all generic instantiations needed
+        
+        // Generic context management methods
+        void enter_generic_context(const std::string& type_name, 
+                                 const std::vector<std::string>& parameters, 
+                                 SourceLocation location);
+        void exit_generic_context();
+        bool is_in_generic_context() const;
+        bool is_generic_parameter(const std::string& name) const;
+        std::string get_current_generic_type() const;
+        const std::vector<std::string> get_current_generic_parameters() const;
+
+        // Enhanced type resolution that considers generic context
+        Type* resolve_type_with_generic_context(const std::string& type_string);
+
+        // Generic instantiation tracking methods
+        void track_instantiation(const std::string& base_name, 
+                                const std::vector<std::string>& concrete_types, 
+                                const std::string& instantiated_name, 
+                                SourceLocation location);
+
         // Reference to main symbol table (for scope resolution lookups)
         const SymbolTable *_main_symbol_table = nullptr;
 
@@ -204,6 +239,9 @@ namespace Cryo
         // Generic type management
         void register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names);
         ParameterizedType *resolve_generic_type(const std::string &type_string);
+
+        // Generic instantiation tracking - public access for monomorphization
+        const std::vector<GenericInstantiation>& get_required_instantiations() const;
 
         // Main entry point
         void check_program(ProgramNode &program);

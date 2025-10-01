@@ -577,6 +577,141 @@ namespace Cryo
         register_generic_type("Result", {"T", "E"});
     }
 
+    //===----------------------------------------------------------------------===//
+    // Generic Context Management
+    //===----------------------------------------------------------------------===//
+
+    void TypeChecker::enter_generic_context(const std::string& type_name, 
+                                           const std::vector<std::string>& parameters, 
+                                           SourceLocation location)
+    {
+        std::cout << "[DEBUG] TypeChecker: Entering generic context for '" << type_name 
+                  << "' with parameters: ";
+        for (size_t i = 0; i < parameters.size(); ++i) {
+            std::cout << parameters[i];
+            if (i < parameters.size() - 1) std::cout << ", ";
+        }
+        std::cout << std::endl;
+
+        _generic_context_stack.emplace_back(type_name, parameters, location);
+    }
+
+    void TypeChecker::exit_generic_context()
+    {
+        if (!_generic_context_stack.empty()) {
+            const auto& context = _generic_context_stack.back();
+            std::cout << "[DEBUG] TypeChecker: Exiting generic context for '" 
+                      << context.type_name << "'" << std::endl;
+            _generic_context_stack.pop_back();
+        }
+    }
+
+    bool TypeChecker::is_in_generic_context() const
+    {
+        return !_generic_context_stack.empty();
+    }
+
+    bool TypeChecker::is_generic_parameter(const std::string& name) const
+    {
+        for (const auto& context : _generic_context_stack) {
+            if (context.parameters.find(name) != context.parameters.end()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string TypeChecker::get_current_generic_type() const
+    {
+        if (_generic_context_stack.empty()) {
+            return "";
+        }
+        return _generic_context_stack.back().type_name;
+    }
+
+    const std::vector<std::string> TypeChecker::get_current_generic_parameters() const
+    {
+        if (_generic_context_stack.empty()) {
+            return {};
+        }
+        
+        const auto& context = _generic_context_stack.back();
+        return std::vector<std::string>(context.parameters.begin(), context.parameters.end());
+    }
+
+    Type* TypeChecker::resolve_type_with_generic_context(const std::string& type_string)
+    {
+        // First check if this is a generic parameter
+        if (is_generic_parameter(type_string)) {
+            std::cout << "[DEBUG] TypeChecker: '" << type_string 
+                      << "' is a generic parameter, creating generic type" << std::endl;
+            return _type_context.get_generic_type(type_string);
+        }
+
+        // Check for parameterized types like ptr<T>, Option<T>
+        if (type_string.find('<') != std::string::npos) {
+            // Parse the base type and type arguments
+            size_t open_bracket = type_string.find('<');
+            size_t close_bracket = type_string.find('>', open_bracket);
+            
+            if (close_bracket != std::string::npos) {
+                std::string base_type = type_string.substr(0, open_bracket);
+                std::string type_args_str = type_string.substr(open_bracket + 1, 
+                                                              close_bracket - open_bracket - 1);
+                
+                // Check if any type arguments are generic parameters
+                bool has_generic_args = is_generic_parameter(type_args_str);
+                
+                if (has_generic_args) {
+                    std::cout << "[DEBUG] TypeChecker: '" << type_string 
+                              << "' contains generic parameters, deferring resolution" << std::endl;
+                    // For template definitions with generic parameters, we don't create concrete types yet
+                    return _type_context.get_generic_type(type_string);
+                } else if (!is_in_generic_context()) {
+                    // Only track concrete instantiations when we're NOT defining a generic type
+                    // This prevents tracking during template definition parsing
+                    std::vector<std::string> concrete_types;
+                    concrete_types.push_back(type_args_str); // For now, handle single argument types
+                    
+                    std::cout << "[DEBUG] TypeChecker: Tracking concrete instantiation: " << type_string 
+                              << " (base: " << base_type << ", args: " << type_args_str << ")" << std::endl;
+                    
+                    track_instantiation(base_type, concrete_types, type_string, SourceLocation{});
+                }
+            }
+        }
+
+        // Fall back to normal type parsing
+        return _type_context.parse_type_from_string(type_string);
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Generic Instantiation Tracking
+    //===----------------------------------------------------------------------===//
+
+    void TypeChecker::track_instantiation(const std::string& base_name, 
+                                         const std::vector<std::string>& concrete_types, 
+                                         const std::string& instantiated_name, 
+                                         SourceLocation location)
+    {
+        // Check if we already have this instantiation
+        for (const auto& inst : _required_instantiations) {
+            if (inst.instantiated_name == instantiated_name) {
+                return; // Already tracked
+            }
+        }
+
+        std::cout << "[DEBUG] TypeChecker: Tracking instantiation '" << instantiated_name 
+                  << "' (base: " << base_name << ")" << std::endl;
+        
+        _required_instantiations.emplace_back(base_name, concrete_types, instantiated_name, location);
+    }
+
+    const std::vector<GenericInstantiation>& TypeChecker::get_required_instantiations() const
+    {
+        return _required_instantiations;
+    }
+
     void TypeChecker::load_builtin_symbols(const SymbolTable &main_symbol_table)
     {
         // Store reference to main symbol table for scope lookups
@@ -674,7 +809,7 @@ namespace Cryo
         // Parse type annotation from node
         if (!node.type_annotation().empty() && node.type_annotation() != "auto")
         {
-            declared_type = _type_context.parse_type_from_string(node.type_annotation());
+            declared_type = resolve_type_with_generic_context(node.type_annotation());
         }
 
         if (node.initializer())
@@ -730,7 +865,7 @@ namespace Cryo
 
         // Parse return type from node annotation
         const std::string &return_type_str = node.return_type_annotation();
-        Type *return_type = _type_context.parse_type_from_string(return_type_str);
+        Type *return_type = resolve_type_with_generic_context(return_type_str);
 
         if (!return_type)
         {
@@ -746,7 +881,7 @@ namespace Cryo
             if (param)
             {
                 const std::string &param_type_str = param->type_annotation();
-                Type *param_type = _type_context.parse_type_from_string(param_type_str);
+                Type *param_type = resolve_type_with_generic_context(param_type_str);
                 if (!param_type)
                 {
                     report_error(TypeError::ErrorKind::InvalidOperation, param->location(),
@@ -1412,12 +1547,18 @@ namespace Cryo
                 // Successfully resolved generic type - use its name
                 type_name = resolved_type->get_instantiated_name();
                 node.set_type(type_name);
+                
+                // Track this instantiation for monomorphization
+                track_instantiation(node.type_name(), node.generic_args(), full_type_name, node.location());
                 return;
             }
             else
             {
                 // Fallback to manual type name construction
                 type_name = full_type_name;
+                
+                // Still track the instantiation even if TypeRegistry couldn't resolve it
+                track_instantiation(node.type_name(), node.generic_args(), full_type_name, node.location());
             }
         }
 
@@ -2079,6 +2220,26 @@ namespace Cryo
             return;
         }
 
+        // Handle generic parameters
+        std::vector<std::string> generic_param_names;
+        for (const auto &generic_param : node.generic_parameters())
+        {
+            if (generic_param)
+            {
+                generic_param_names.push_back(generic_param->name());
+            }
+        }
+
+        // Track if we entered a generic context
+        bool entered_generic_context = false;
+
+        // Enter generic context if this is a generic class
+        if (!generic_param_names.empty())
+        {
+            enter_generic_context(class_name, generic_param_names, node.location());
+            entered_generic_context = true;
+        }
+
         // Register class type in symbol table FIRST, before processing fields
         // This allows fields to reference this class type or other class/struct types
         Type *class_type = _type_context.get_class_type(class_name);
@@ -2148,6 +2309,12 @@ namespace Cryo
         // Restore previous struct type and struct name
         _current_struct_type = previous_struct_type;
         _current_struct_name = previous_struct_name;
+
+        // Exit generic context if we entered one
+        if (entered_generic_context)
+        {
+            exit_generic_context();
+        }
 
         node.set_type(class_name);
     }

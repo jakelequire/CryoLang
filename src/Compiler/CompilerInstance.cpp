@@ -24,6 +24,12 @@ namespace Cryo
         // Create type checker with the AST context's type context
         _type_checker = std::make_unique<TypeChecker>(_ast_context->types());
 
+        // Create monomorphization pass
+        _monomorphization_pass = std::make_unique<MonomorphizationPass>();
+
+        // Create template registry
+        _template_registry = std::make_unique<TemplateRegistry>();
+
         // Note: CodeGenerator will be created after parsing when namespace is known
 
         // Create linker with symbol table reference
@@ -273,6 +279,8 @@ namespace Cryo
 
     bool CompilerInstance::analyze()
     {
+        std::cout << "[CompilerInstance] Starting analysis phase..." << std::endl;
+        
         if (!_ast_root)
         {
             _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
@@ -282,16 +290,19 @@ namespace Cryo
 
         try
         {
+            std::cout << "[CompilerInstance] Phase 0: Symbol table population..." << std::endl;
             // Phase 0: Symbol table population (must happen before type checking)
             populate_symbol_table(_ast_root.get());
 
+            std::cout << "[CompilerInstance] Loading intrinsic symbols into type checker..." << std::endl;
             // Load only newly added intrinsic symbols into type checker
             _type_checker->load_intrinsic_symbols(*_symbol_table);
 
+            std::cout << "[CompilerInstance] Phase 1: Type checking..." << std::endl;
             // Phase 1: Type checking
             _type_checker->check_program(*_ast_root);
 
-            // Check if type checking found errors
+            std::cout << "[CompilerInstance] Checking for type errors..." << std::endl;
             if (_type_checker->has_errors())
             {
                 // Convert type errors to diagnostic manager errors
@@ -329,7 +340,37 @@ namespace Cryo
                 return false;
             }
 
-            // Phase 2: Future semantic analysis phases would go here
+            // Phase 2: Monomorphization - Generate specialized versions of generic types
+            if (_debug_mode)
+            {
+                std::cout << "Starting monomorphization pass..." << std::endl;
+            }
+
+            const auto& required_instantiations = _type_checker->get_required_instantiations();
+            if (!required_instantiations.empty())
+            {
+                bool monomorphization_success = _monomorphization_pass->monomorphize(*_ast_root, required_instantiations, *_template_registry);
+                if (!monomorphization_success)
+                {
+                    _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
+                                                      "Monomorphization failed", SourceRange{}, _source_file);
+                    return false;
+                }
+
+                if (_debug_mode)
+                {
+                    std::cout << "Monomorphization completed successfully." << std::endl;
+                }
+            }
+            else
+            {
+                if (_debug_mode)
+                {
+                    std::cout << "No generic instantiations required, skipping monomorphization." << std::endl;
+                }
+            }
+
+            // Phase 3: Future semantic analysis phases would go here
             // - Control flow analysis
             // - Dead code elimination
             // - etc.
@@ -633,6 +674,19 @@ namespace Cryo
                                           func_decl->location(), function_type, scope_name,
                                           func_decl->generic_parameters().empty() ? "" : enhanced_signature);
 
+            // Register generic function templates if this function has generic parameters
+            if (!func_decl->generic_parameters().empty())
+            {
+                std::cout << "[CompilerInstance] Registering local generic function template: " << func_decl->name() << std::endl;
+                _template_registry->register_function_template(
+                    func_decl->name(),
+                    func_decl,
+                    "Main",  // Use "Main" as the module name for local templates
+                    "" // No source file path for main file templates
+                );
+                std::cout << "[CompilerInstance] Registered local generic function template: " << func_decl->name() << std::endl;
+            }
+
             // Recurse into function body with function name as new scope
             if (func_decl->body())
             {
@@ -669,7 +723,7 @@ namespace Cryo
             std::cout << "[CompilerInstance] Processing import: " << import_decl->path() << std::endl;
 
             // Create ModuleLoader instance
-            ModuleLoader loader(*current_scope);
+            ModuleLoader loader(*current_scope, *_template_registry);
             loader.set_stdlib_root("./stdlib");
             loader.set_current_file("./test/"); // TODO: Get actual current file directory
 
@@ -735,6 +789,42 @@ namespace Cryo
             // Add struct to symbol table as a Type symbol
             current_scope->declare_symbol(struct_decl->name(), SymbolKind::Type,
                                           struct_decl->location(), struct_type, scope_name);
+
+            // Register generic struct templates if this struct has generic parameters
+            if (!struct_decl->generic_parameters().empty())
+            {
+                std::cout << "[CompilerInstance] Registering local generic struct template: " << struct_decl->name() << std::endl;
+                _template_registry->register_struct_template(
+                    struct_decl->name(),
+                    struct_decl,
+                    "Main",  // Use "Main" as the module name for local templates
+                    "" // No source file path for main file templates
+                );
+                std::cout << "[CompilerInstance] Registered local generic struct template: " << struct_decl->name() << std::endl;
+            }
+        }
+        // Handle enum declarations
+        else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(node))
+        {
+            // Get or create enum type
+            Type *enum_type = _ast_context->types().get_enum_type(enum_decl->name());
+
+            // Add enum to symbol table as a Type symbol
+            current_scope->declare_symbol(enum_decl->name(), SymbolKind::Type,
+                                          enum_decl->location(), enum_type, scope_name);
+
+            // Register generic enum templates if this enum has generic parameters
+            if (!enum_decl->generic_parameters().empty())
+            {
+                std::cout << "[CompilerInstance] Registering local generic enum template: " << enum_decl->name() << std::endl;
+                _template_registry->register_enum_template(
+                    enum_decl->name(),
+                    enum_decl,
+                    "Main",  // Use "Main" as the module name for local templates
+                    "" // No source file path for main file templates
+                );
+                std::cout << "[CompilerInstance] Registered local generic enum template: " << enum_decl->name() << std::endl;
+            }
         }
         // Handle variable declarations
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
@@ -841,7 +931,7 @@ namespace Cryo
         std::cout << "[CompilerInstance] Injecting auto-import: core/types" << std::endl;
 
         // Create ModuleLoader instance
-        ModuleLoader loader(*current_scope);
+        ModuleLoader loader(*current_scope, *_template_registry);
         loader.set_stdlib_root("./stdlib");
         loader.set_current_file("./"); // Use current directory as base
 
