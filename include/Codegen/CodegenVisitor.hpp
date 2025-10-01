@@ -7,6 +7,7 @@
 #include "Codegen/ValueContext.hpp"
 #include "Codegen/TypeMapper.hpp"
 #include "Codegen/Intrinsics.hpp"
+#include "Codegen/FunctionRegistry.hpp"
 #include "Utils/ModuleLoader.hpp"
 
 #include <llvm/IR/Value.h>
@@ -250,6 +251,7 @@ namespace Cryo::Codegen
         std::unique_ptr<ValueContext> _value_context;
         std::unique_ptr<TypeMapper> _type_mapper;
         std::unique_ptr<Intrinsics> _intrinsics;
+        std::unique_ptr<FunctionRegistry> _function_registry;
 
         //===================================================================
         // Generation State
@@ -316,6 +318,17 @@ namespace Cryo::Codegen
                                       const std::string &base_type,
                                       const std::vector<std::string> &type_args,
                                       llvm::Type *struct_type);
+        void generate_generic_struct_methods(const std::string &instantiated_type,
+                                             const std::vector<std::string> &type_args,
+                                             llvm::Type *struct_type,
+                                             const std::unordered_map<std::string, std::string> &type_substitutions);
+        void generate_get_value_method(const std::string &instantiated_type,
+                                       const std::vector<std::string> &type_args,
+                                       llvm::Type *struct_type,
+                                       const std::unordered_map<std::string, std::string> &type_substitutions);
+        void generate_get_value_method_body(llvm::Function *method,
+                                            llvm::Type *struct_type,
+                                            const std::unordered_map<std::string, std::string> &type_substitutions);
 
         // Type generation
         llvm::Type *generate_struct_type(Cryo::StructDeclarationNode *node);

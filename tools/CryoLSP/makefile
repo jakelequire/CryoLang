@@ -36,11 +36,14 @@ LSP_LIBS = \
 	$(MAIN_OBJ_DIR)/AST/ASTContext.o \
 	$(MAIN_OBJ_DIR)/AST/ASTDumper.o \
 	$(MAIN_OBJ_DIR)/AST/ASTNode.o \
+	$(MAIN_OBJ_DIR)/AST/MonomorphizationPass.o \
 	$(MAIN_OBJ_DIR)/AST/SymbolTable.o \
+	$(MAIN_OBJ_DIR)/AST/TemplateRegistry.o \
 	$(MAIN_OBJ_DIR)/AST/Type.o \
 	$(MAIN_OBJ_DIR)/AST/TypeChecker.o \
 	$(MAIN_OBJ_DIR)/Codegen/CodeGenerator.o \
 	$(MAIN_OBJ_DIR)/Codegen/CodegenVisitor.o \
+	$(MAIN_OBJ_DIR)/Codegen/FunctionRegistry.o \
 	$(MAIN_OBJ_DIR)/Codegen/Intrinsics.o \
 	$(MAIN_OBJ_DIR)/Codegen/LLVMContext.o \
 	$(MAIN_OBJ_DIR)/Codegen/TargetConfig.o \

@@ -402,8 +402,164 @@ namespace Cryo::Codegen
         }
         else
         {
-            // Check if this is a parameterized enum that should use enhanced type system
-            if (_type_context && struct_name.find('<') != std::string::npos && struct_name.find('>') != std::string::npos)
+            // Check if this is a parameterized type that should map to a monomorphized version
+            if (struct_name.find('<') != std::string::npos && struct_name.find('>') != std::string::npos)
+            {
+                // Extract base name and type arguments to create monomorphized name
+                size_t angle_pos = struct_name.find('<');
+                std::string base_name = struct_name.substr(0, angle_pos);
+
+                size_t close_angle = struct_name.find('>', angle_pos);
+                if (close_angle != std::string::npos)
+                {
+                    std::string type_args_str = struct_name.substr(angle_pos + 1, close_angle - angle_pos - 1);
+
+                    // Create monomorphized name by replacing <T> with _T
+                    std::string monomorphized_name = base_name;
+                    std::stringstream ss(type_args_str);
+                    std::string arg;
+                    while (std::getline(ss, arg, ','))
+                    {
+                        // Trim whitespace
+                        arg.erase(0, arg.find_first_not_of(" \t"));
+                        arg.erase(arg.find_last_not_of(" \t") + 1);
+                        if (!arg.empty())
+                        {
+                            monomorphized_name += "_" + arg;
+                        }
+                    }
+
+                    std::cout << "[TypeMapper] Trying monomorphized name: " << monomorphized_name << " for parameterized type: " << struct_name << std::endl;
+
+                    // Check if the monomorphized version exists
+                    auto mono_it = _struct_ast_nodes.find(monomorphized_name);
+                    if (mono_it != _struct_ast_nodes.end())
+                    {
+                        std::cout << "[TypeMapper] Found monomorphized struct: " << monomorphized_name << std::endl;
+                        auto struct_node = mono_it->second;
+
+                        for (const auto &field : struct_node->fields())
+                        {
+                            if (field)
+                            {
+                                std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << field->type_annotation() << std::endl;
+
+                                // Map field type using TypeContext
+                                if (_type_context)
+                                {
+                                    auto field_cryo_type = _type_context->parse_type_from_string(field->type_annotation());
+                                    if (field_cryo_type)
+                                    {
+                                        llvm::Type *field_llvm_type = map_type(field_cryo_type);
+                                        if (field_llvm_type)
+                                        {
+                                            field_types.push_back(field_llvm_type);
+                                            std::cout << "[TypeMapper] Mapped field '" << field->name() << "' to LLVM type" << std::endl;
+                                        }
+                                        else
+                                        {
+                                            std::cerr << "[TypeMapper] Failed to map field type: " << field->type_annotation() << std::endl;
+                                            field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                        }
+                                    }
+                                    else
+                                    {
+                                        std::cerr << "[TypeMapper] Failed to parse field type: " << field->type_annotation() << std::endl;
+                                        field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                    }
+                                }
+                                else
+                                {
+                                    std::cerr << "[TypeMapper] No TypeContext available for field type mapping" << std::endl;
+                                    field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        std::cout << "[TypeMapper] Monomorphized struct not found: " << monomorphized_name << ", trying base template" << std::endl;
+
+                        // If monomorphized version not found, try to use the base template to create it
+                        auto base_it = _struct_ast_nodes.find(base_name);
+                        if (base_it != _struct_ast_nodes.end())
+                        {
+                            std::cout << "[TypeMapper] Found base template: " << base_name << ", creating fields with substituted types" << std::endl;
+                            auto base_struct = base_it->second;
+
+                            // Parse the type arguments for substitution
+                            std::vector<std::string> type_args;
+                            std::stringstream ss(type_args_str);
+                            std::string arg;
+                            while (std::getline(ss, arg, ','))
+                            {
+                                // Trim whitespace
+                                arg.erase(0, arg.find_first_not_of(" \t"));
+                                arg.erase(arg.find_last_not_of(" \t") + 1);
+                                if (!arg.empty())
+                                {
+                                    type_args.push_back(arg);
+                                }
+                            }
+
+                            // Create fields by substituting generic type parameters
+                            for (const auto &field : base_struct->fields())
+                            {
+                                if (field)
+                                {
+                                    std::string field_type = field->type_annotation();
+
+                                    // Simple substitution - replace T with the first type argument
+                                    if (field_type == "T" && !type_args.empty())
+                                    {
+                                        field_type = type_args[0];
+                                    }
+                                    // Add more substitution rules as needed for U, V, etc.
+
+                                    std::cout << "[TypeMapper] Processing substituted field: " << field->name() << " : " << field_type << std::endl;
+
+                                    // Map field type using TypeContext
+                                    if (_type_context)
+                                    {
+                                        auto field_cryo_type = _type_context->parse_type_from_string(field_type);
+                                        if (field_cryo_type)
+                                        {
+                                            llvm::Type *field_llvm_type = map_type(field_cryo_type);
+                                            if (field_llvm_type)
+                                            {
+                                                field_types.push_back(field_llvm_type);
+                                                std::cout << "[TypeMapper] Mapped substituted field '" << field->name() << "' to LLVM type" << std::endl;
+                                            }
+                                            else
+                                            {
+                                                std::cerr << "[TypeMapper] Failed to map substituted field type: " << field_type << std::endl;
+                                                field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                            }
+                                        }
+                                        else
+                                        {
+                                            std::cerr << "[TypeMapper] Failed to parse substituted field type: " << field_type << std::endl;
+                                            field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                        }
+                                    }
+                                    else
+                                    {
+                                        std::cerr << "[TypeMapper] No TypeContext available for substituted field type mapping" << std::endl;
+                                        field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            std::cout << "[TypeMapper] Base template not found: " << base_name << ", falling back to enhanced enum system" << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // If monomorphized version not found, check if this is a parameterized enum that should use enhanced type system
+            if (field_types.empty() && _type_context && struct_name.find('<') != std::string::npos && struct_name.find('>') != std::string::npos)
             {
                 // Extract base name and type arguments for parameterized types
                 size_t angle_pos = struct_name.find('<');
@@ -471,6 +627,10 @@ namespace Cryo::Codegen
         llvm_struct->setBody(field_types);
 
         std::cout << "[TypeMapper] Created struct type '" << struct_name << "' with " << field_types.size() << " fields" << std::endl;
+
+        // Cache the created type for future lookups
+        register_type(struct_name, llvm_struct);
+
         return llvm_struct;
     }
 
@@ -563,6 +723,10 @@ namespace Cryo::Codegen
         llvm_class->setBody(field_types);
 
         std::cout << "[TypeMapper] Created class type '" << class_name << "' with " << field_types.size() << " fields" << std::endl;
+
+        // Cache the created type for future lookups
+        register_type(class_name, llvm_class);
+
         return llvm_class;
     }
 
@@ -880,10 +1044,63 @@ namespace Cryo::Codegen
         return llvm::StructType::create(llvm_context, name);
     }
 
+    // Helper function to convert generic type names to instantiated names
+    // e.g., "Pair<int,string>" -> "Pair_int_string"
+    std::string TypeMapper::convert_generic_to_instantiated_name(const std::string &type_name)
+    {
+        // Check if this is a generic type (contains < and >)
+        size_t start = type_name.find('<');
+        if (start == std::string::npos)
+        {
+            return type_name; // Not a generic type
+        }
+
+        size_t end = type_name.rfind('>');
+        if (end == std::string::npos || end <= start)
+        {
+            return type_name; // Malformed generic type
+        }
+
+        // Extract base name and type parameters
+        std::string base_name = type_name.substr(0, start);
+        std::string type_params = type_name.substr(start + 1, end - start - 1);
+
+        // Parse type parameters (simple comma-separated parsing)
+        std::vector<std::string> concrete_types;
+        std::istringstream iss(type_params);
+        std::string param;
+        while (std::getline(iss, param, ','))
+        {
+            // Trim whitespace
+            param.erase(0, param.find_first_not_of(" \t"));
+            param.erase(param.find_last_not_of(" \t") + 1);
+            concrete_types.push_back(param);
+        }
+
+        // Generate mangled name using the same convention as MonomorphizationPass
+        std::ostringstream mangled;
+        mangled << base_name;
+        for (const auto &type : concrete_types)
+        {
+            mangled << "_" << type;
+        }
+
+        return mangled.str();
+    }
+
     int TypeMapper::get_field_index(const std::string &type_name, const std::string &field_name)
     {
+        // Convert generic type name to instantiated name if needed
+        std::string lookup_name = convert_generic_to_instantiated_name(type_name);
+
+        std::cout << "[TypeMapper] Looking up field '" << field_name << "' in type '" << type_name << "'" << std::endl;
+        if (lookup_name != type_name)
+        {
+            std::cout << "[TypeMapper] Converted generic type '" << type_name << "' to instantiated name '" << lookup_name << "'" << std::endl;
+        }
+
         // Check if we have AST information for this type
-        auto class_it = _class_ast_nodes.find(type_name);
+        auto class_it = _class_ast_nodes.find(lookup_name);
         if (class_it != _class_ast_nodes.end())
         {
             auto class_node = class_it->second;
@@ -893,13 +1110,13 @@ namespace Cryo::Codegen
             {
                 if (fields[i] && fields[i]->name() == field_name)
                 {
-                    std::cout << "[TypeMapper] Found field '" << field_name << "' at index " << i << " in class '" << type_name << "'" << std::endl;
+                    std::cout << "[TypeMapper] Found field '" << field_name << "' at index " << i << " in class '" << lookup_name << "'" << std::endl;
                     return static_cast<int>(i);
                 }
             }
         }
 
-        auto struct_it = _struct_ast_nodes.find(type_name);
+        auto struct_it = _struct_ast_nodes.find(lookup_name);
         if (struct_it != _struct_ast_nodes.end())
         {
             auto struct_node = struct_it->second;
@@ -909,13 +1126,13 @@ namespace Cryo::Codegen
             {
                 if (fields[i] && fields[i]->name() == field_name)
                 {
-                    std::cout << "[TypeMapper] Found field '" << field_name << "' at index " << i << " in struct '" << type_name << "'" << std::endl;
+                    std::cout << "[TypeMapper] Found field '" << field_name << "' at index " << i << " in struct '" << lookup_name << "'" << std::endl;
                     return static_cast<int>(i);
                 }
             }
         }
 
-        std::cerr << "[TypeMapper] Field '" << field_name << "' not found in type '" << type_name << "'" << std::endl;
+        std::cerr << "[TypeMapper] Field '" << field_name << "' not found in type '" << type_name << "' (lookup name: '" << lookup_name << "')" << std::endl;
         return -1; // Field not found
     }
 
