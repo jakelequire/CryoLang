@@ -865,7 +865,8 @@ namespace Cryo
         Type *get_struct_type(const std::string &name);
         Type *get_class_type(const std::string &name);
         Type *get_trait_type(const std::string &name);
-        Type *get_enum_type(const std::string &name, std::vector<std::string> variants = {}, bool is_simple = true);
+        Type *get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple);
+        Type *lookup_enum_type(const std::string &name); // Lookup existing enum type only
         Type *get_generic_type(const std::string &name);
 
         // Parameterized types

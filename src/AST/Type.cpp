@@ -890,18 +890,42 @@ namespace Cryo
 
     Type *TypeContext::get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple)
     {
+        std::cout << "[DEBUG] TypeContext::get_enum_type called with name=" << name 
+                  << " is_simple=" << is_simple << std::endl;
+        std::cout << "[DEBUG] Call stack trace (simplified): TypeContext::get_enum_type" << std::endl;
+        
         auto it = _enum_types.find(name);
         if (it != _enum_types.end())
         {
+            std::cout << "[DEBUG] Found existing enum type for " << name 
+                      << " existing is_simple=" << it->second->is_simple_enum() << std::endl;
             return it->second.get();
         }
 
         // Create new enum type
+        std::cout << "[DEBUG] Creating new EnumType with is_simple=" << is_simple << std::endl;
         auto enum_type = std::make_unique<EnumType>(name, std::move(variants), is_simple);
+        std::cout << "[DEBUG] Created EnumType, result is_simple_enum()=" << enum_type->is_simple_enum() << std::endl;
         Type *result = enum_type.get();
         _enum_types[name] = std::move(enum_type);
 
         return result;
+    }
+
+    Type *TypeContext::lookup_enum_type(const std::string &name)
+    {
+        std::cout << "[DEBUG] TypeContext::lookup_enum_type called with name=" << name << std::endl;
+        
+        auto it = _enum_types.find(name);
+        if (it != _enum_types.end())
+        {
+            std::cout << "[DEBUG] Found existing enum type for " << name 
+                      << " is_simple=" << it->second->is_simple_enum() << std::endl;
+            return it->second.get();
+        }
+        
+        std::cout << "[DEBUG] No existing enum type found for " << name << std::endl;
+        return nullptr;
     }
 
     Type *TypeContext::get_generic_type(const std::string &name)

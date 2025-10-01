@@ -806,12 +806,10 @@ namespace Cryo
         // Handle enum declarations
         else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(node))
         {
-            // Get or create enum type
-            Type *enum_type = _ast_context->types().get_enum_type(enum_decl->name());
-
-            // Add enum to symbol table as a Type symbol
+            // Don't create the enum type here - let the TypeChecker handle it properly
+            // Just add a placeholder in the symbol table for now
             current_scope->declare_symbol(enum_decl->name(), SymbolKind::Type,
-                                          enum_decl->location(), enum_type, scope_name);
+                                          enum_decl->location(), nullptr, scope_name);
 
             // Register generic enum templates if this enum has generic parameters
             if (!enum_decl->generic_parameters().empty())

@@ -216,6 +216,9 @@ namespace Cryo
         std::string get_current_generic_type() const;
         const std::vector<std::string> get_current_generic_parameters() const;
 
+        // Helper method to parse comma-separated template arguments
+        std::vector<std::string> parse_template_arguments(const std::string& args_str);
+
         // Enhanced type resolution that considers generic context
         Type* resolve_type_with_generic_context(const std::string& type_string);
 
