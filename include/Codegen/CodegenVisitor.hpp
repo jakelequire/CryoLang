@@ -333,6 +333,15 @@ namespace Cryo::Codegen
                                                   int discriminant);
         void register_enum_variant(const std::string &enum_name, const std::string &variant_name, llvm::Value *value);
 
+        // Parameterized enum helpers
+        void ensure_parameterized_enum_constructors(const std::string &instantiated_name,
+                                                    const std::string &base_name,
+                                                    const std::vector<std::string> &type_args);
+        void generate_parameterized_enum_variant_constructor(const std::string &instantiated_name,
+                                                             const std::string &variant_name,
+                                                             const std::vector<std::string> &type_args,
+                                                             llvm::Type *enum_type);
+
         // Expression generation helpers
         llvm::Value *generate_binary_operation(Cryo::BinaryExpressionNode *node);
         llvm::Value *generate_unary_operation(Cryo::UnaryExpressionNode *node);

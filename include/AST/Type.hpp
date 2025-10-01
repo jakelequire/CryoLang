@@ -11,6 +11,8 @@ namespace Cryo
     // Forward declarations
     class Type;
     class TypeContext;
+    class EnumType;
+    class ParameterizedType;
 
     // Type system enums and constants
     enum class TypeKind
@@ -125,16 +127,17 @@ namespace Cryo
         virtual bool is_nullable() const { return false; }
 
         // Type conversion safety checking
-        enum class ConversionSafety {
-            Safe,           // No warnings, implicit conversion allowed
-            Warning,        // Emit compiler warning, explicit conversion required
-            Unsafe,         // Require explicit cast or try_into()
-            Impossible      // No conversion possible
+        enum class ConversionSafety
+        {
+            Safe,      // No warnings, implicit conversion allowed
+            Warning,   // Emit compiler warning, explicit conversion required
+            Unsafe,    // Require explicit cast or try_into()
+            Impossible // No conversion possible
         };
-        
-        virtual ConversionSafety get_conversion_safety(const Type& target) const;
-        virtual bool allows_implicit_conversion_to(const Type& target) const;
-        virtual bool allows_explicit_conversion_to(const Type& target) const;
+
+        virtual ConversionSafety get_conversion_safety(const Type &target) const;
+        virtual bool allows_implicit_conversion_to(const Type &target) const;
+        virtual bool allows_explicit_conversion_to(const Type &target) const;
 
         // Size and alignment (for code generation)
         virtual size_t size_bytes() const = 0;
@@ -200,7 +203,7 @@ namespace Cryo
         IntegerKind integer_kind() const { return _int_kind; }
 
         // Override conversion safety for intelligent integer conversion
-        ConversionSafety get_conversion_safety(const Type& target) const override;
+        ConversionSafety get_conversion_safety(const Type &target) const override;
 
         size_t size_bytes() const override;
         size_t alignment() const override;
@@ -440,8 +443,8 @@ namespace Cryo
         bool is_assignable_from(const Type &other) const override { return other.is_nullable(); }
         bool is_convertible_to(const Type &other) const override { return other.is_nullable(); }
 
-        size_t size_bytes() const override { return sizeof(void*); } // Pointer size
-        size_t alignment() const override { return sizeof(void*); }
+        size_t size_bytes() const override { return sizeof(void *); } // Pointer size
+        size_t alignment() const override { return sizeof(void *); }
         std::string to_string() const override { return "null"; }
     };
 
@@ -453,7 +456,7 @@ namespace Cryo
 
         // Variadic types represent a parameter pack, so they have special handling
         bool is_assignable_from(const Type &other) const override { return false; } // No direct assignment
-        bool is_convertible_to(const Type &other) const override { return false; } // No direct conversion
+        bool is_convertible_to(const Type &other) const override { return false; }  // No direct conversion
 
         size_t size_bytes() const override { return 0; } // No size as it's not a concrete type
         size_t alignment() const override { return 1; }
@@ -479,19 +482,20 @@ namespace Cryo
     class ParameterizedType : public Type
     {
     private:
-        std::string _base_name;                           // "Array", "Option", etc.
-        std::vector<std::shared_ptr<Type>> _type_params;  // [T, U, ...]
+        std::string _base_name;                          // "Array", "Option", etc.
+        std::vector<std::shared_ptr<Type>> _type_params; // [T, U, ...]
         std::vector<std::string> _param_names;           // ["T", "U", ...] for template params
         mutable std::string _cached_instantiated_name;   // "Array<int>", "Option<string>"
-        
+        std::shared_ptr<EnumType> _base_enum_type;       // If this is an enum parameterization
+
     public:
-        ParameterizedType(const std::string &base_name, 
-                         const std::vector<std::string> &param_names)
-            : Type(TypeKind::Parameterized, base_name), 
+        ParameterizedType(const std::string &base_name,
+                          const std::vector<std::string> &param_names)
+            : Type(TypeKind::Parameterized, base_name),
               _base_name(base_name), _param_names(param_names) {}
 
         ParameterizedType(const std::string &base_name,
-                         const std::vector<std::shared_ptr<Type>> &type_params)
+                          const std::vector<std::shared_ptr<Type>> &type_params)
             : Type(TypeKind::Parameterized, base_name),
               _base_name(base_name), _type_params(type_params) {}
 
@@ -504,6 +508,36 @@ namespace Cryo
         // Check if this is a template (has parameter names) vs instantiation (has concrete types)
         bool is_template() const { return !_param_names.empty() && _type_params.empty(); }
         bool is_instantiation() const { return !_type_params.empty(); }
+
+        // Enum-specific methods
+        void set_base_enum_type(std::shared_ptr<EnumType> enum_type) { _base_enum_type = enum_type; }
+        std::shared_ptr<EnumType> get_base_enum_type() const { return _base_enum_type; }
+        bool is_enum_instantiation() const { return _base_enum_type != nullptr; }
+
+        // Layout information for enum instantiations
+        struct FieldLayout
+        {
+            std::string name;
+            std::shared_ptr<Type> type;
+            size_t offset;
+            size_t size;
+        };
+
+        // Get field layout for instantiated enum types
+        std::vector<FieldLayout> get_enum_field_layout() const;
+
+        // Query specific layout patterns
+        bool is_optional_like() const;
+        bool is_result_like() const;
+
+        // Get discriminant information for enum types
+        bool has_discriminant() const;
+        size_t get_discriminant_size() const;
+        size_t get_discriminant_offset() const { return 0; } // Usually at offset 0
+
+        // Get data field information
+        std::vector<std::shared_ptr<Type>> get_data_field_types() const;
+        size_t get_data_offset() const; // Offset where data starts after discriminant
 
         // Get instantiated name like "Array<int>"
         std::string get_instantiated_name() const;
@@ -566,33 +600,168 @@ namespace Cryo
         std::string to_string() const override { return _name; }
     };
 
+    // Enum variant metadata for complex enums
+    struct EnumVariant
+    {
+        std::string name;
+        std::vector<std::shared_ptr<Type>> field_types; // Types of the fields in this variant
+        std::vector<std::string> field_names;           // Names of the fields (optional)
+        bool has_data = false;                          // Whether this variant carries data
+
+        EnumVariant(const std::string &variant_name)
+            : name(variant_name), has_data(false) {}
+
+        EnumVariant(const std::string &variant_name,
+                    const std::vector<std::shared_ptr<Type>> &types,
+                    const std::vector<std::string> &names = {})
+            : name(variant_name), field_types(types), field_names(names), has_data(!types.empty()) {}
+    };
+
+    // Enum layout specification for parameterized enums
+    struct EnumLayout
+    {
+        bool uses_tag = true;                                       // Whether enum uses discriminant tag
+        size_t tag_size = sizeof(int);                              // Size of discriminant tag
+        std::vector<std::shared_ptr<Type>> common_fields;           // Fields present in all variants
+        std::unordered_map<std::string, size_t> variant_data_sizes; // Max data size per variant
+        size_t total_size = 0;                                      // Total enum size
+        size_t alignment = sizeof(void *);                          // Enum alignment
+
+        // Layout patterns for common enum types
+        enum class LayoutPattern
+        {
+            SimpleEnum,   // C-style enum (just discriminant)
+            TaggedUnion,  // Rust-style enum (tag + union)
+            OptionalType, // Option<T> pattern (bool + T)
+            ResultType,   // Result<T,E> pattern (bool + union)
+            Custom        // User-defined layout
+        };
+        LayoutPattern pattern = LayoutPattern::Custom;
+    };
+
     // Enum type (user-defined)
     class EnumType : public Type
     {
     private:
-        std::vector<std::string> _variants;
-        bool _is_simple_enum; // true for C-style, false for Rust-style
+        std::vector<std::string> _variants;         // Simple variant names (legacy)
+        std::vector<EnumVariant> _variant_metadata; // Rich variant information
+        bool _is_simple_enum;                       // true for C-style, false for Rust-style
+        bool _is_parameterized;                     // true if this enum takes type parameters
+        std::vector<std::string> _type_parameters;  // Parameter names like ["T", "E"]
+        std::unique_ptr<EnumLayout> _layout;        // Layout specification
 
     public:
+        // Legacy constructor for simple enums
         EnumType(const std::string &name, std::vector<std::string> variants, bool is_simple = true)
-            : Type(TypeKind::Enum, name), _variants(std::move(variants)), _is_simple_enum(is_simple) {}
+            : Type(TypeKind::Enum, name), _variants(std::move(variants)), _is_simple_enum(is_simple),
+              _is_parameterized(false), _layout(std::make_unique<EnumLayout>())
+        {
+            _layout->pattern = is_simple ? EnumLayout::LayoutPattern::SimpleEnum : EnumLayout::LayoutPattern::TaggedUnion;
+        }
+
+        // Enhanced constructor for complex/parameterized enums
+        EnumType(const std::string &name,
+                 std::vector<EnumVariant> variants,
+                 const std::vector<std::string> &type_params = {},
+                 std::unique_ptr<EnumLayout> layout = nullptr)
+            : Type(TypeKind::Enum, name), _variant_metadata(std::move(variants)),
+              _is_simple_enum(false), _is_parameterized(!type_params.empty()),
+              _type_parameters(type_params), _layout(std::move(layout))
+        {
+            if (!_layout)
+            {
+                _layout = std::make_unique<EnumLayout>();
+                _layout->pattern = _is_parameterized ? EnumLayout::LayoutPattern::Custom : EnumLayout::LayoutPattern::TaggedUnion;
+            }
+
+            // Build simple variant names for compatibility
+            for (const auto &variant : _variant_metadata)
+            {
+                _variants.push_back(variant.name);
+            }
+        }
 
         bool is_primitive() const override { return _is_simple_enum; }
         bool is_value_type() const override { return true; }
+        bool is_parameterized() const { return _is_parameterized; }
+
         size_t size_bytes() const override
         {
-            return _is_simple_enum ? sizeof(int) : sizeof(void *); // Simple enums are ints, complex ones are tagged unions
+            if (_layout && _layout->total_size > 0)
+            {
+                return _layout->total_size;
+            }
+            return _is_simple_enum ? sizeof(int) : sizeof(void *);
         }
-        size_t alignment() const override { return _is_simple_enum ? sizeof(int) : sizeof(void *); }
+
+        size_t alignment() const override
+        {
+            if (_layout)
+            {
+                return _layout->alignment;
+            }
+            return _is_simple_enum ? sizeof(int) : sizeof(void *);
+        }
+
         std::string to_string() const override { return _name; }
 
+        // Legacy interface
         const std::vector<std::string> &variants() const { return _variants; }
         bool is_simple_enum() const { return _is_simple_enum; }
-
         bool has_variant(const std::string &variant_name) const
         {
             return std::find(_variants.begin(), _variants.end(), variant_name) != _variants.end();
         }
+
+        // Enhanced interface
+        const std::vector<EnumVariant> &get_variant_metadata() const { return _variant_metadata; }
+        const std::vector<std::string> &get_type_parameters() const { return _type_parameters; }
+        const EnumLayout *get_layout() const { return _layout.get(); }
+
+        // Variant query methods
+        const EnumVariant *get_variant_info(const std::string &variant_name) const
+        {
+            auto it = std::find_if(_variant_metadata.begin(), _variant_metadata.end(),
+                                   [&variant_name](const EnumVariant &v)
+                                   { return v.name == variant_name; });
+            return it != _variant_metadata.end() ? &(*it) : nullptr;
+        }
+
+        bool variant_has_data(const std::string &variant_name) const
+        {
+            const auto *variant = get_variant_info(variant_name);
+            return variant && variant->has_data;
+        }
+
+        std::vector<std::shared_ptr<Type>> get_variant_field_types(const std::string &variant_name) const
+        {
+            const auto *variant = get_variant_info(variant_name);
+            return variant ? variant->field_types : std::vector<std::shared_ptr<Type>>{};
+        }
+
+        // Layout pattern queries
+        bool is_optional_pattern() const
+        {
+            return _layout && _layout->pattern == EnumLayout::LayoutPattern::OptionalType;
+        }
+
+        bool is_result_pattern() const
+        {
+            return _layout && _layout->pattern == EnumLayout::LayoutPattern::ResultType;
+        }
+
+        bool uses_discriminant_tag() const
+        {
+            return _layout && _layout->uses_tag;
+        }
+
+        size_t get_discriminant_size() const
+        {
+            return _layout ? _layout->tag_size : sizeof(int);
+        }
+
+        // Create layout information for parameterized enum instantiation
+        std::unique_ptr<EnumLayout> create_instantiated_layout(const std::vector<std::shared_ptr<Type>> &concrete_types) const;
     };
 
     // Type alias (user-defined aliases for existing types)
@@ -647,6 +816,10 @@ namespace Cryo
         // Complex type cache
         std::vector<std::unique_ptr<Type>> _complex_types;
 
+        // Parameterized enum registry
+        std::unordered_map<std::string, std::shared_ptr<EnumType>> _parameterized_enum_templates;
+        std::unordered_map<std::string, std::unique_ptr<EnumLayout>> _enum_layout_templates;
+
     public:
         TypeContext();
         ~TypeContext() = default;
@@ -668,7 +841,7 @@ namespace Cryo
         Type *get_i32_type() { return get_integer_type(IntegerKind::I32); }
         Type *get_i64_type() { return get_integer_type(IntegerKind::I64); }
         Type *get_int_type() { return get_integer_type(IntegerKind::Int); }
-        
+
         // Get unsigned integer types
         Type *get_u8_type() { return get_integer_type(IntegerKind::U8, false); }
         Type *get_u16_type() { return get_integer_type(IntegerKind::U16, false); }
@@ -694,15 +867,35 @@ namespace Cryo
         Type *get_trait_type(const std::string &name);
         Type *get_enum_type(const std::string &name, std::vector<std::string> variants = {}, bool is_simple = true);
         Type *get_generic_type(const std::string &name);
-        
+
         // Parameterized types
-        ParameterizedType *create_parameterized_type(const std::string &base_name, 
-                                                    const std::vector<std::string> &param_names);
+        ParameterizedType *create_parameterized_type(const std::string &base_name,
+                                                     const std::vector<std::string> &param_names);
         ParameterizedType *instantiate_parameterized_type(const std::string &base_name,
-                                                          const std::vector<Type*> &concrete_types);
-        
+                                                          const std::vector<Type *> &concrete_types);
+
         // Create type aliases
         Type *create_type_alias(const std::string &alias_name, Type *target_type);
+
+        // Enum metadata registry
+        void register_parameterized_enum(const std::string &base_name,
+                                         const std::vector<std::string> &type_params,
+                                         std::unique_ptr<EnumLayout> layout_template);
+
+        std::shared_ptr<EnumType> get_parameterized_enum_template(const std::string &base_name);
+
+        std::shared_ptr<ParameterizedType> instantiate_parameterized_enum(
+            const std::string &base_name,
+            const std::vector<Type *> &concrete_types);
+
+        // Query enum layout patterns without hard-coding names
+        bool is_optional_pattern_enum(const std::string &base_name) const;
+        bool is_result_pattern_enum(const std::string &base_name) const;
+
+        // Get enum field layout generically
+        std::vector<std::shared_ptr<Type>> get_enum_field_types(
+            const std::string &base_name,
+            const std::vector<Type *> &concrete_types) const;
 
         // Type parsing utilities
         std::string normalize_generic_type_string(const std::string &type_str);
@@ -712,6 +905,10 @@ namespace Cryo
         // Type compatibility and conversion
         bool are_types_compatible(Type *lhs, Type *rhs);
         Type *get_common_type(Type *lhs, Type *rhs);
+
+    private:
+        // Helper to register built-in parameterized enums
+        void register_builtin_parameterized_enums();
     };
 
     // Type Registry for managing parameterized types and instantiations
@@ -720,10 +917,10 @@ namespace Cryo
     private:
         // Template definitions: "Array" -> ParameterizedType with param names ["T"]
         std::unordered_map<std::string, std::shared_ptr<ParameterizedType>> _templates;
-        
+
         // Instantiations: "Array<int>" -> concrete ParameterizedType with [IntType]
         std::unordered_map<std::string, std::shared_ptr<ParameterizedType>> _instantiations;
-        
+
         // Type context for creating concrete types
         TypeContext *_type_context;
 
@@ -731,15 +928,15 @@ namespace Cryo
         TypeRegistry(TypeContext *context) : _type_context(context) {}
 
         // Register a parameterized type template (e.g., Array<T>)
-        void register_template(const std::string &base_name, 
-                              const std::vector<std::string> &param_names);
+        void register_template(const std::string &base_name,
+                               const std::vector<std::string> &param_names);
 
         // Get a template by base name
         ParameterizedType *get_template(const std::string &base_name);
 
         // Create an instantiation (Array<int>) from template (Array<T>)
         ParameterizedType *instantiate(const std::string &base_name,
-                                      const std::vector<Type*> &concrete_types);
+                                       const std::vector<Type *> &concrete_types);
 
         // Parse type string like "Array<int>" and return instantiation
         ParameterizedType *parse_and_instantiate(const std::string &type_string);
