@@ -303,6 +303,13 @@ namespace Cryo::Codegen
         std::optional<FieldInfo> get_field_info(llvm::Type *llvm_type, const std::string &field_name);
 
         /**
+         * @brief Convert generic type name to instantiated name
+         * @param type_name Name of the generic type (e.g., "Pair<int,string>")
+         * @return Instantiated name (e.g., "Pair_int_string") or original name if not generic
+         */
+        std::string convert_generic_to_instantiated_name(const std::string &type_name);
+
+        /**
          * @brief Get field index by name for a registered type
          * @param type_name Name of the type
          * @param field_name Name of the field

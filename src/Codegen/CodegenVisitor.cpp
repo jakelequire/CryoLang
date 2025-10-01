@@ -25,6 +25,7 @@ namespace Cryo::Codegen
           _value_context(std::make_unique<ValueContext>()),
           _type_mapper(std::make_unique<TypeMapper>(context_manager, symbol_table.get_type_context())),
           _intrinsics(std::make_unique<Intrinsics>(context_manager, gdm)),
+          _function_registry(std::make_unique<FunctionRegistry>(symbol_table, *symbol_table.get_type_context())),
           _current_value(nullptr),
           _has_errors(false),
           _stdlib_compilation_mode(false)
@@ -144,12 +145,40 @@ namespace Cryo::Codegen
 
         std::cout << "[DEBUG] Processing main program with " << node.statements().size() << " statements" << std::endl;
 
-        // Generate all top-level statements
+        // Two-pass processing to ensure struct declarations are processed before usage
+        // Pass 1: Process all struct and class declarations first
+        std::cout << "[DEBUG] Pass 1: Processing struct and class declarations" << std::endl;
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
             if (stmt)
             {
+                // Check if this is a struct or class declaration
+                if (stmt->kind() == NodeKind::StructDeclaration ||
+                    stmt->kind() == NodeKind::ClassDeclaration)
+                {
+                    std::cout << "[DEBUG] Processing struct/class declaration " << (i + 1) << "/" << node.statements().size() << std::endl;
+                    stmt->accept(*this);
+                    std::cout << "[DEBUG] Completed struct/class declaration " << (i + 1) << std::endl;
+                }
+            }
+        }
+
+        // Pass 2: Process all other statements
+        std::cout << "[DEBUG] Pass 2: Processing other statements" << std::endl;
+        for (size_t i = 0; i < node.statements().size(); ++i)
+        {
+            auto &stmt = node.statements()[i];
+            if (stmt)
+            {
+                // Skip struct and class declarations (already processed)
+                if (stmt->kind() == NodeKind::StructDeclaration ||
+                    stmt->kind() == NodeKind::ClassDeclaration)
+                {
+                    std::cout << "[DEBUG] Skipping already processed struct/class declaration " << (i + 1) << std::endl;
+                    continue;
+                }
+
                 std::cout << "[DEBUG] Processing statement " << (i + 1) << "/" << node.statements().size() << std::endl;
                 stmt->accept(*this);
                 std::cout << "[DEBUG] Completed statement " << (i + 1) << std::endl;
@@ -500,7 +529,7 @@ namespace Cryo::Codegen
         // Check if this is a generic class template
         if (!node.generic_parameters().empty())
         {
-            std::cout << "[DEBUG] Skipping code generation for generic class template: " << node.name() 
+            std::cout << "[DEBUG] Skipping code generation for generic class template: " << node.name()
                       << " (has " << node.generic_parameters().size() << " generic parameters)" << std::endl;
             std::cout << "[DEBUG] Generic classes like " << node.name() << "<T> will be handled when instantiated with concrete types" << std::endl;
             return;
@@ -734,18 +763,18 @@ namespace Cryo::Codegen
         std::cout << "[DEBUG] Processing enum: " << node.name() << std::endl;
         std::cout << "[DEBUG] Enum has " << node.variants().size() << " variants" << std::endl;
         std::cout << "[DEBUG] node.is_simple_enum() = " << node.is_simple_enum() << std::endl;
-        
+
         // Check each variant
         for (const auto &variant : node.variants())
         {
-            std::cout << "[DEBUG] Variant: " << variant->name() 
+            std::cout << "[DEBUG] Variant: " << variant->name()
                       << " has " << variant->associated_types().size() << " associated types"
                       << " is_simple_variant: " << variant->is_simple_variant() << std::endl;
         }
 
         Cryo::EnumType *cryo_enum_type = static_cast<Cryo::EnumType *>(
             _symbol_table.get_type_context()->get_enum_type(node.name(), std::move(variant_names), node.is_simple_enum()));
-        
+
         std::cout << "[DEBUG] Created EnumType, is_simple_enum(): " << cryo_enum_type->is_simple_enum() << std::endl;
         llvm::Type *enum_type = _type_mapper->map_enum_type(cryo_enum_type);
         if (!enum_type)
@@ -1808,7 +1837,7 @@ namespace Cryo::Codegen
                     if (arg)
                     {
                         arg->accept(*this);
-                        llvm::Value *arg_value = get_generated_value(arg.get());
+                        llvm::Value *arg_value = get_current_value();
                         if (arg_value)
                         {
                             args.push_back(arg_value);
@@ -1854,7 +1883,7 @@ namespace Cryo::Codegen
                             if (arg)
                             {
                                 arg->accept(*this);
-                                llvm::Value *arg_value = get_generated_value(arg.get());
+                                llvm::Value *arg_value = get_current_value();
                                 if (arg_value)
                                 {
                                     args.push_back(arg_value);
@@ -4589,7 +4618,7 @@ namespace Cryo::Codegen
                                 if (arg)
                                 {
                                     arg->accept(*this);
-                                    llvm::Value *arg_value = get_generated_value(arg.get());
+                                    llvm::Value *arg_value = get_current_value();
                                     if (arg_value)
                                     {
                                         args.push_back(arg_value);
@@ -4726,7 +4755,7 @@ namespace Cryo::Codegen
             }
         }
 
-        // Check if this is an enum constructor call first  
+        // Check if this is an enum constructor call first
         if (_enum_variants.find(function_name) != _enum_variants.end())
         {
             // This is an enum constructor call
@@ -4748,8 +4777,8 @@ namespace Cryo::Codegen
                 // Verify the argument count matches the function signature
                 if (args.size() != llvm_function->arg_size())
                 {
-                    std::cout << "[ERROR] Argument count mismatch for " << function_name 
-                              << ": expected " << llvm_function->arg_size() 
+                    std::cout << "[ERROR] Argument count mismatch for " << function_name
+                              << ": expected " << llvm_function->arg_size()
                               << ", got " << args.size() << std::endl;
                     return nullptr;
                 }
@@ -4799,7 +4828,7 @@ namespace Cryo::Codegen
             for (const auto &arg : node->arguments())
             {
                 arg->accept(*this);
-                llvm::Value *arg_value = get_generated_value(arg.get());
+                llvm::Value *arg_value = get_current_value();
                 if (arg_value)
                 {
                     args.push_back(arg_value);
@@ -4814,12 +4843,9 @@ namespace Cryo::Codegen
         std::string c_function_name = map_cryo_to_c_function(resolved_function_name);
 
         // Look up the function in the module using the C runtime name
-        // Map Std::Runtime functions to their C runtime equivalents
-        std::string lookup_name = c_function_name;
-        if (c_function_name.find("Std::Runtime::") == 0)
-        {
-            lookup_name = c_function_name.substr(14); // Extract name after "Std::Runtime::"
-        }
+        // Use FunctionRegistry to get the runtime function name
+        FunctionMetadata metadata = _function_registry->get_function_metadata(c_function_name, _namespace_context);
+        std::string lookup_name = metadata.runtime_name.empty() ? c_function_name : metadata.runtime_name;
 
         llvm::Function *function = module->getFunction(lookup_name);
         if (!function)
@@ -4904,29 +4930,195 @@ namespace Cryo::Codegen
         }
 
         // Add regular arguments
-        for (const auto &arg : node->arguments())
+        for (size_t i = 0; i < node->arguments().size(); ++i)
         {
+            const auto &arg = node->arguments()[i];
+            std::cout << "[DEBUG] Processing argument " << i << " of " << node->arguments().size() << std::endl;
+
             arg->accept(*this);
-            llvm::Value *arg_value = get_generated_value(arg.get());
+            llvm::Value *arg_value = get_current_value();
+
+            std::cout << "[DEBUG] Argument " << i << " value: " << (arg_value ? "valid" : "NULL") << std::endl;
+
             if (arg_value)
             {
-                args.push_back(arg_value);
+                // Additional safety check - ensure the value has a valid type
+                if (arg_value->getType())
+                {
+                    args.push_back(arg_value);
+                    std::cout << "[DEBUG] Successfully added argument " << i << " to call" << std::endl;
+                }
+                else
+                {
+                    std::cout << "[ERROR] Argument " << i << " has NULL type, skipping" << std::endl;
+                    return nullptr;
+                }
+            }
+            else
+            {
+                std::cout << "[ERROR] Failed to generate argument " << i << " for function call: " << function_name << std::endl;
+                return nullptr;
             }
         }
 
         // Create the function call
         std::cout << "[DEBUG] About to create call. Function pointer: " << (function ? "valid" : "NULL") << std::endl;
-        if (function)
+        if (!function)
         {
-            std::cout << "[DEBUG] Function name: " << function->getName().str() << std::endl;
-            std::cout << "[DEBUG] Function type: " << (function->getFunctionType() ? "valid" : "NULL") << std::endl;
-            if (function->getFunctionType())
+            std::cout << "[ERROR] Function pointer is NULL, cannot create call" << std::endl;
+            return nullptr;
+        }
+
+        std::cout << "[DEBUG] Function name: " << function->getName().str() << std::endl;
+        std::cout << "[DEBUG] Function type: " << (function->getFunctionType() ? "valid" : "NULL") << std::endl;
+
+        if (!function->getFunctionType())
+        {
+            std::cout << "[ERROR] Function type is NULL, cannot create call" << std::endl;
+            return nullptr;
+        }
+
+        std::cout << "[DEBUG] Expected args: " << function->getFunctionType()->getNumParams() << ", provided: " << args.size() << std::endl;
+
+        // Validate all arguments before creating the call
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            if (!args[i])
             {
-                std::cout << "[DEBUG] Expected args: " << function->getFunctionType()->getNumParams() << ", provided: " << args.size() << std::endl;
+                std::cout << "[ERROR] Argument " << i << " is NULL, cannot create call" << std::endl;
+                return nullptr;
+            }
+            if (!args[i]->getType())
+            {
+                std::cout << "[ERROR] Argument " << i << " has NULL type, cannot create call" << std::endl;
+                return nullptr;
             }
         }
-        llvm::Value *call_result = builder.CreateCall(function, args);
-        return call_result;
+
+        std::cout << "[DEBUG] All arguments validated, creating call..." << std::endl;
+
+        // Add extensive debugging before CreateCall
+        std::cout << "[DEBUG] Builder basic block: " << (builder.GetInsertBlock() ? "valid" : "NULL") << std::endl;
+        if (builder.GetInsertBlock())
+        {
+            std::cout << "[DEBUG] Basic block parent: " << (builder.GetInsertBlock()->getParent() ? "valid" : "NULL") << std::endl;
+        }
+
+        std::cout << "[DEBUG] Function details:" << std::endl;
+        std::cout << "[DEBUG]   Function name: " << function->getName().str() << std::endl;
+        std::cout << "[DEBUG]   Function address: " << function << std::endl;
+        std::cout << "[DEBUG]   Function type address: " << function->getFunctionType() << std::endl;
+        std::cout << "[DEBUG]   Function linkage: " << function->getLinkage() << std::endl;
+
+        std::cout << "[DEBUG] Arguments details:" << std::endl;
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            std::cout << "[DEBUG]   Arg " << i << ": address=" << args[i] << ", type=" << args[i]->getType() << std::endl;
+            if (args[i]->getType())
+            {
+                args[i]->getType()->print(llvm::errs());
+                std::cout << std::endl;
+            }
+        }
+
+        std::cout << "[DEBUG] About to call CreateCall with " << args.size() << " arguments..." << std::endl;
+
+        // Add even more detailed debugging before CreateCall
+        try
+        {
+            std::cout << "[DEBUG] Verifying function before CreateCall..." << std::endl;
+
+            // Check if function is valid
+            if (!function)
+            {
+                std::cout << "[ERROR] Function is null!" << std::endl;
+                return nullptr;
+            }
+
+            // Check function type
+            llvm::FunctionType *funcType = function->getFunctionType();
+            if (!funcType)
+            {
+                std::cout << "[ERROR] Function type is null!" << std::endl;
+                return nullptr;
+            }
+
+            std::cout << "[DEBUG] Function type params: " << funcType->getNumParams() << std::endl;
+            std::cout << "[DEBUG] Function is vararg: " << funcType->isVarArg() << std::endl;
+
+            // Verify module compatibility
+            llvm::Module *funcModule = function->getParent();
+            llvm::Module *currentModule = builder.GetInsertBlock()->getModule();
+            std::cout << "[DEBUG] Function module: " << (funcModule ? funcModule->getName().str() : "NULL") << std::endl;
+            std::cout << "[DEBUG] Current module: " << (currentModule ? currentModule->getName().str() : "NULL") << std::endl;
+
+            if (funcModule != currentModule)
+            {
+                std::cout << "[WARNING] Cross-module function call detected!" << std::endl;
+            }
+
+            // Detailed argument verification
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                std::cout << "[DEBUG] Arg " << i << " verification:" << std::endl;
+                if (!args[i])
+                {
+                    std::cout << "[ERROR]   Argument is null!" << std::endl;
+                    return nullptr;
+                }
+
+                llvm::Type *argType = args[i]->getType();
+                if (!argType)
+                {
+                    std::cout << "[ERROR]   Argument type is null!" << std::endl;
+                    return nullptr;
+                }
+
+                std::cout << "[DEBUG]   Argument value: " << args[i] << std::endl;
+                std::cout << "[DEBUG]   Argument type: " << argType << std::endl;
+
+                if (i < funcType->getNumParams())
+                {
+                    llvm::Type *expectedType = funcType->getParamType(i);
+                    std::cout << "[DEBUG]   Expected type: " << expectedType << std::endl;
+                    std::cout << "[DEBUG]   Types match: " << (argType == expectedType ? "YES" : "NO") << std::endl;
+                }
+            }
+
+            std::cout << "[DEBUG] All pre-CreateCall checks passed, creating call..." << std::endl;
+            llvm::Value *call_result = builder.CreateCall(function, args);
+            std::cout << "[DEBUG] CreateCall completed successfully!" << std::endl;
+
+            // Add debugging for the result
+            if (!call_result)
+            {
+                std::cout << "[ERROR] CreateCall returned NULL!" << std::endl;
+                return nullptr;
+            }
+
+            std::cout << "[DEBUG] Call result: " << call_result << std::endl;
+            std::cout << "[DEBUG] Call result type: " << call_result->getType() << std::endl;
+
+            if (call_result->getType())
+            {
+                std::cout << "[DEBUG] Result type verified, printing..." << std::endl;
+                call_result->getType()->print(llvm::errs());
+                std::cout << std::endl;
+            }
+
+            std::cout << "[DEBUG] About to return call_result..." << std::endl;
+            return call_result;
+        }
+        catch (const std::exception &e)
+        {
+            std::cout << "[ERROR] Exception during CreateCall: " << e.what() << std::endl;
+            return nullptr;
+        }
+        catch (...)
+        {
+            std::cout << "[ERROR] Unknown exception during CreateCall!" << std::endl;
+            return nullptr;
+        }
     }
 
     std::string Cryo::Codegen::CodegenVisitor::extract_function_name_from_member_access(Cryo::MemberAccessNode *node)
@@ -5043,20 +5235,9 @@ namespace Cryo::Codegen
                 // Create function type and declaration using actual types
                 llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(return_type, param_types, false);
 
-                // Map the Cryo function name to the C runtime function name
-                std::string c_runtime_name = c_name;
-                if (c_name.find("Std::Runtime::") == 0)
-                {
-                    c_runtime_name = c_name.substr(14);
-                }
-                else if (c_name.find("std::") == 0)
-                {
-                    size_t last_colon = c_name.find_last_of(':');
-                    if (last_colon != std::string::npos && last_colon + 1 < c_name.length())
-                    {
-                        c_runtime_name = c_name.substr(last_colon + 1);
-                    }
-                }
+                // Use FunctionRegistry to get the runtime function name
+                FunctionMetadata metadata_local = _function_registry->get_function_metadata(c_name, _namespace_context);
+                std::string c_runtime_name = metadata_local.runtime_name.empty() ? c_name : metadata_local.runtime_name;
 
                 llvm::Function *forward_decl = llvm::Function::Create(
                     llvm_func_type,
@@ -5221,28 +5402,51 @@ namespace Cryo::Codegen
             }
         }
 
-        // Use a reasonable default return type (most system calls return int/i32)
-        llvm::Type *return_type = llvm::Type::getInt64Ty(_context_manager.get_context()); // i64 for most syscalls
+        // Use FunctionRegistry to infer return type based on function metadata
+        llvm::Type *return_type = _function_registry->get_function_return_type(c_name, _context_manager.get_context(), _namespace_context);
+
+        std::cout << "[DEBUG] FunctionRegistry return type for '" << c_name << "': " << return_type << std::endl;
+        if (return_type)
+        {
+            return_type->print(llvm::errs());
+            std::cout << std::endl;
+        }
+
+        // TEMPORARY FIX: Override return type for known cross-module functions
+        if (c_name == "std::String::_strlen")
+        {
+            std::cout << "[DEBUG] Overriding return type for std::String::_strlen to u64" << std::endl;
+            return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
+        }
+        else if (c_name == "std::Syscall::IO::write")
+        {
+            std::cout << "[DEBUG] Overriding return type for std::Syscall::IO::write to i64" << std::endl;
+            return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
+        }
+        else if (c_name == "std::String::_int_to_string")
+        {
+            std::cout << "[DEBUG] Overriding return type for std::String::_int_to_string to string" << std::endl;
+            return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
+        }
+        else if (c_name == "std::String::_float_to_string")
+        {
+            std::cout << "[DEBUG] Overriding return type for std::String::_float_to_string to string" << std::endl;
+            return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
+        }
+        else if (c_name == "std::String::from_char")
+        {
+            std::cout << "[DEBUG] Overriding return type for std::String::from_char to string" << std::endl;
+            return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
+        }
 
         // Create function type and declaration
         llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
 
-        // Map the Cryo function name to the C runtime function name
-        std::string c_runtime_name = c_name;
-        if (c_name.find("Std::Runtime::") == 0)
-        {
-            // Extract the function name after "Std::Runtime::"
-            c_runtime_name = c_name.substr(14); // Length of "Std::Runtime::"
-        }
-        else if (c_name.find("std::") == 0)
-        {
-            // For stdlib functions like std::IO::printf, extract just the function name
-            size_t last_colon = c_name.find_last_of(':');
-            if (last_colon != std::string::npos && last_colon + 1 < c_name.length())
-            {
-                c_runtime_name = c_name.substr(last_colon + 1);
-            }
-        }
+        // Use FunctionRegistry to get the runtime function name
+        FunctionMetadata metadata = _function_registry->get_function_metadata(c_name, _namespace_context);
+        std::string c_runtime_name = metadata.runtime_name.empty() ? c_name : metadata.runtime_name;
+
+        std::cout << "[DEBUG] FunctionRegistry provided runtime name for '" << c_name << "': '" << c_runtime_name << "'" << std::endl;
 
         llvm::Function *forward_decl = llvm::Function::Create(
             func_type,
@@ -5697,6 +5901,19 @@ namespace Cryo::Codegen
         auto &context = _context_manager.get_context();
         llvm::Function *function = builder.GetInsertBlock()->getParent();
 
+        // Check if switch_value is an enum and extract discriminant if needed
+        llvm::Value *actual_switch_value = switch_value;
+        if (switch_value->getType()->isStructTy())
+        {
+            // This might be an enum - try to extract the discriminant
+            llvm::Value *discriminant = extract_enum_discriminant(switch_value);
+            if (discriminant)
+            {
+                actual_switch_value = discriminant;
+                std::cout << "[CodegenVisitor] DEBUG: Extracted enum discriminant for switch" << std::endl;
+            }
+        }
+
         // Create basic blocks (end_block is already created by caller)
         llvm::BasicBlock *default_block = nullptr;
 
@@ -5717,7 +5934,7 @@ namespace Cryo::Codegen
         }
 
         // Create the switch instruction
-        llvm::SwitchInst *switch_inst = builder.CreateSwitch(switch_value, default_block, node->cases().size());
+        llvm::SwitchInst *switch_inst = builder.CreateSwitch(actual_switch_value, default_block, node->cases().size());
 
         // Generate code for each case
         for (size_t i = 0; i < node->cases().size(); ++i)
@@ -5827,17 +6044,17 @@ namespace Cryo::Codegen
             // It's a pointer to an enum struct - load the discriminant field
             // For tagged union: { i32 discriminant, [N x i8] payload }
             // We need to access the first field (discriminant)
-            
+
             // Try to get the pointed-to type first to understand what we're dealing with
             std::cout << "[CodegenVisitor] DEBUG: enum_value type: " << enum_value->getType() << std::endl;
-            
+
             // For now, let's use a simpler approach - load the first 32 bits as discriminant
             // Cast to a byte pointer and load as i32
             llvm::Value *i8_ptr = builder.CreateBitCast(
-                enum_value, 
+                enum_value,
                 llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0),
                 "enum_i8_ptr");
-            
+
             llvm::Value *i32_ptr = builder.CreateBitCast(
                 i8_ptr,
                 llvm::PointerType::get(llvm::Type::getInt32Ty(context), 0),
@@ -5854,30 +6071,32 @@ namespace Cryo::Codegen
         else
         {
             std::cout << "[CodegenVisitor] DEBUG: Processing enum struct value" << std::endl;
-            
+
             // Debug: Print the actual LLVM type
             std::string type_str;
             llvm::raw_string_ostream os(type_str);
             enum_value->getType()->print(os);
             std::cout << "[CodegenVisitor] DEBUG: enum_value LLVM type: " << os.str() << std::endl;
-            
+
             // Check if it's actually a struct type
-            if (!enum_value->getType()->isStructTy()) {
+            if (!enum_value->getType()->isStructTy())
+            {
                 std::cout << "[CodegenVisitor] ERROR: Expected struct type but got something else!" << std::endl;
                 return nullptr;
             }
-            
+
             llvm::StructType *struct_type = llvm::cast<llvm::StructType>(enum_value->getType());
             std::cout << "[CodegenVisitor] DEBUG: Struct has " << struct_type->getNumElements() << " elements" << std::endl;
-            
+
             // Check if this is an empty struct (indicates enum wasn't properly constructed)
-            if (struct_type->getNumElements() == 0) {
+            if (struct_type->getNumElements() == 0)
+            {
                 std::cout << "[CodegenVisitor] ERROR: Empty struct - enum type not properly constructed!" << std::endl;
                 std::cout << "[CodegenVisitor] ERROR: Expected tagged union with discriminant field" << std::endl;
                 // Return a default discriminant value to prevent crash
                 return llvm::ConstantInt::get(llvm::Type::getInt32Ty(_context_manager.get_context()), 0);
             }
-            
+
             // It's a struct value - extract the discriminant directly
             llvm::Value *discriminant = builder.CreateExtractValue(
                 enum_value,
@@ -5963,7 +6182,7 @@ namespace Cryo::Codegen
         // Check if the enum type is properly constructed
         llvm::Type *enum_type = enum_value->getType();
         bool is_empty_enum = false;
-        
+
         // For modern LLVM with opaque pointers, we need to be careful about type checking
         if (enum_type->isPointerTy())
         {
@@ -5981,7 +6200,7 @@ namespace Cryo::Codegen
                 is_empty_enum = true;
             }
         }
-        
+
         if (is_empty_enum)
         {
             std::cout << "[CodegenVisitor] Skipping pattern binding extraction for empty enum" << std::endl;
@@ -6005,13 +6224,13 @@ namespace Cryo::Codegen
             // It's a pointer to an enum struct - get payload field pointer
             // For tagged union: { i32 discriminant, [N x i8] payload }
             // The payload starts after the discriminant (4 bytes for i32)
-            
+
             // Cast to i8* and offset by the size of the discriminant
             llvm::Value *enum_i8_ptr = builder.CreateBitCast(
-                enum_value, 
+                enum_value,
                 llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0),
                 "enum_i8_ptr");
-                
+
             llvm::Value *offset = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 4); // sizeof(i32)
             llvm::Value *payload_ptr = builder.CreateInBoundsGEP(
                 llvm::Type::getInt8Ty(context),
@@ -6393,7 +6612,7 @@ namespace Cryo::Codegen
             if (!type_args.empty())
             {
                 std::string type_arg = type_args[0];
-                
+
                 // Convert the type argument string to an LLVM type
                 llvm::Type *param_type = nullptr;
                 if (type_arg == "i32" || type_arg == "int")
@@ -6421,7 +6640,7 @@ namespace Cryo::Codegen
                     // Try to look up as a registered type
                     param_type = _type_mapper->lookup_type(type_arg);
                 }
-                
+
                 if (param_type)
                 {
                     param_types.push_back(param_type);
@@ -6589,89 +6808,188 @@ namespace Cryo::Codegen
             return;
         }
 
-        // For GenericStruct, we need to generate the get_value() method
-        if (base_type == "GenericStruct" && type_args.size() == 1)
+        // Find the original template struct in the TypeMapper
+        // TypeMapper stores struct AST nodes registered during struct declaration processing
+        StructDeclarationNode *template_struct = nullptr;
+
+        // For now, we'll look up the template struct from the TypeMapper's internal storage
+        // This is a bit of a hack, but we need access to the stored AST nodes
+        // TODO: Add a proper method to TypeMapper to get struct templates
+
+        // Since we can't directly access TypeMapper's private _struct_ast_nodes,
+        // we'll implement a simpler approach: use the base type name to find
+        // the template and generate basic method stubs
+
+        std::cout << "[CodegenVisitor] Looking for template struct: " << base_type << std::endl;
+
+        // Create type substitution map
+        std::unordered_map<std::string, std::string> type_substitutions;
+
+        // For now, create a simple substitution map assuming T -> first type arg
+        if (!type_args.empty())
         {
-            // Generate get_value() method: T get_value(this*)
-            std::string method_name = instantiated_type + "::get_value";
+            type_substitutions["T"] = type_args[0];
+            std::cout << "[CodegenVisitor] Type substitution: T -> " << type_args[0] << std::endl;
+        }
 
-            // Check if method already exists
-            if (_functions.find(method_name) != _functions.end())
-            {
-                std::cout << "[CodegenVisitor] Method " << method_name << " already exists, skipping" << std::endl;
-                return;
-            }
-
-            Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(type_args[0]);
-            llvm::Type *return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
-            if (!return_type)
-            {
-                std::cout << "[CodegenVisitor] Failed to map return type: " << type_args[0] << std::endl;
-                return;
-            }
-
-            // Create function type: T(struct*)
-            std::vector<llvm::Type *> param_types;
-            param_types.push_back(llvm::PointerType::get(struct_type, 0)); // 'this' pointer
-
-            llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
-
-            // Create function
-            llvm::Function *method_func = llvm::Function::Create(
-                func_type,
-                llvm::Function::ExternalLinkage,
-                method_name,
-                module);
-
-            if (!method_func)
-            {
-                std::cout << "[CodegenVisitor] Failed to create method function" << std::endl;
-                return;
-            }
-
-            // Set parameter names
-            auto arg_iter = method_func->arg_begin();
-            arg_iter->setName("this");
-
-            // Save current insertion point
-            llvm::BasicBlock *saved_block = builder.GetInsertBlock();
-
-            // Create entry block
-            llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", method_func);
-            builder.SetInsertPoint(entry_block);
-
-            // Generate method body - return this->value
-            llvm::Value *this_ptr = &(*arg_iter);
-
-            // Get pointer to the 'value' field (index 0)
-            llvm::Value *field_ptr = builder.CreateStructGEP(struct_type, this_ptr, 0, "value_ptr");
-
-            // Load the value and return it
-            llvm::Value *field_value = builder.CreateLoad(return_type, field_ptr, "value_val");
-            builder.CreateRet(field_value);
-
-            // Register the method
-            _functions[method_name] = method_func;
-
-            // Also register with simplified name for lookup
-            std::string simple_method_name = base_type + "::get_value";
-            if (_functions.find(simple_method_name) == _functions.end())
-            {
-                _functions[simple_method_name] = method_func;
-            }
-
-            std::cout << "[CodegenVisitor] Generated generic method: " << method_name << std::endl;
-
-            // Restore insertion point
-            if (saved_block)
-            {
-                builder.SetInsertPoint(saved_block);
-            }
+        // Generate hardcoded methods for known generic structs
+        if (base_type == "GenericStruct")
+        {
+            generate_generic_struct_methods(instantiated_type, type_args, struct_type, type_substitutions);
         }
         else
         {
-            std::cout << "[CodegenVisitor] Unsupported generic type for method generation: " << base_type << std::endl;
+            std::cout << "[CodegenVisitor] Generic method generation not implemented for: " << base_type << std::endl;
         }
+    }
+
+    void CodegenVisitor::generate_generic_struct_methods(const std::string &instantiated_type,
+                                                         const std::vector<std::string> &type_args,
+                                                         llvm::Type *struct_type,
+                                                         const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        std::cout << "[CodegenVisitor] Generating GenericStruct methods for " << instantiated_type << std::endl;
+
+        auto &context = _context_manager.get_context();
+        auto module = _context_manager.get_module();
+
+        // Generate get_value() method
+        generate_get_value_method(instantiated_type, type_args, struct_type, type_substitutions);
+    }
+
+    void CodegenVisitor::generate_get_value_method(const std::string &instantiated_type,
+                                                   const std::vector<std::string> &type_args,
+                                                   llvm::Type *struct_type,
+                                                   const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        std::cout << "[CodegenVisitor] Generating get_value method for " << instantiated_type << std::endl;
+
+        auto &context = _context_manager.get_context();
+        auto module = _context_manager.get_module();
+
+        if (type_args.empty())
+        {
+            std::cout << "[CodegenVisitor] No type arguments for get_value method" << std::endl;
+            return;
+        }
+
+        // Create specialized method name
+        std::string method_name = instantiated_type + "::get_value";
+
+        // Check if this method is already generated
+        if (_functions.find(method_name) != _functions.end())
+        {
+            std::cout << "[CodegenVisitor] Method already exists: " << method_name << std::endl;
+            return;
+        }
+
+        // Determine return type based on the first type argument
+        std::string return_type = type_args[0];
+        llvm::Type *llvm_return_type = nullptr;
+
+        if (return_type == "int")
+        {
+            llvm_return_type = llvm::Type::getInt32Ty(context);
+        }
+        else if (return_type == "float")
+        {
+            llvm_return_type = llvm::Type::getFloatTy(context);
+        }
+        else if (return_type == "string")
+        {
+            llvm_return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        }
+        else
+        {
+            std::cout << "[CodegenVisitor] Unknown return type: " << return_type << ", defaulting to i32" << std::endl;
+            llvm_return_type = llvm::Type::getInt32Ty(context);
+        }
+
+        // Create parameter types (this pointer)
+        std::vector<llvm::Type *> param_types;
+        param_types.push_back(llvm::PointerType::get(struct_type, 0)); // 'this' pointer
+
+        // Create function type
+        llvm::FunctionType *func_type = llvm::FunctionType::get(llvm_return_type, param_types, false);
+
+        // Create the function
+        llvm::Function *method = llvm::Function::Create(
+            func_type, llvm::Function::ExternalLinkage, method_name, module);
+
+        // Set parameter names
+        auto args = method->arg_begin();
+        args->setName("this");
+
+        std::cout << "[CodegenVisitor] Created get_value method: " << method_name
+                  << " with return type: " << return_type << std::endl;
+
+        // Generate method body
+        generate_get_value_method_body(method, struct_type, type_substitutions);
+
+        // Register the method
+        _functions[method_name] = method;
+        std::cout << "[CodegenVisitor] Registered get_value method: " << method_name << std::endl;
+    }
+
+    void CodegenVisitor::generate_get_value_method_body(llvm::Function *method,
+                                                        llvm::Type *struct_type,
+                                                        const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        std::cout << "[CodegenVisitor] Generating get_value method body" << std::endl;
+
+        auto &context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+
+        // Save the current insert point to restore later
+        llvm::BasicBlock *saved_insert_block = builder.GetInsertBlock();
+
+        // Create entry basic block for the method
+        llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", method);
+        builder.SetInsertPoint(entry_block);
+
+        // Get the 'this' pointer (first parameter)
+        auto args = method->arg_begin();
+        llvm::Value *this_ptr = &*args;
+
+        // The get_value() method should return this.value
+        // For GenericStruct<T>, the 'value' field is at index 0
+        std::vector<llvm::Value *> indices = {
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0), // struct index
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0)  // field index (value is first field)
+        };
+
+        // Get pointer to the 'value' field
+        llvm::Value *value_ptr = builder.CreateGEP(struct_type, this_ptr, indices, "value_ptr");
+
+        // Load the value
+        // Determine the field type based on struct type
+        llvm::Type *field_type = nullptr;
+        if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(struct_type))
+        {
+            if (struct_llvm_type->getNumElements() > 0)
+            {
+                field_type = struct_llvm_type->getElementType(0);
+            }
+        }
+
+        if (!field_type)
+        {
+            std::cout << "[CodegenVisitor] Could not determine field type, using i32" << std::endl;
+            field_type = llvm::Type::getInt32Ty(context);
+        }
+
+        llvm::Value *value = builder.CreateLoad(field_type, value_ptr, "value");
+
+        // Return the loaded value
+        builder.CreateRet(value);
+
+        // Restore the original insert point
+        if (saved_insert_block)
+        {
+            builder.SetInsertPoint(saved_insert_block);
+        }
+
+        std::cout << "[CodegenVisitor] Generated get_value method body successfully" << std::endl;
     }
 
     llvm::Value *CodegenVisitor::generate_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name)
