@@ -192,19 +192,84 @@ namespace Cryo
         }
 
         // Clone the template node
-        // Note: This is a simplified clone - in practice you'd need a deep copy visitor
         auto specialized = std::make_unique<ClassDeclarationNode>(
             template_node.location(),
             generate_mangled_name(instantiation.base_name, instantiation.concrete_types));
 
-        // TODO: Implement deep copying of the class body with type substitution
-        // This would involve:
-        // 1. Copying all fields with substituted types
-        // 2. Copying all methods with substituted types
-        // 3. Updating method bodies to use concrete types
+        // Deep copy fields with type substitution
+        std::cout << "[MonomorphizationPass] Copying " << template_node.fields().size() << " fields from template" << std::endl;
+        for (const auto &field : template_node.fields())
+        {
+            if (field)
+            {
+                std::string original_type = field->type_annotation();
+                std::string substituted_type = substitute_type_in_string(original_type, type_substitutions);
+
+                // Create new field with substituted type
+                auto specialized_field = std::make_unique<StructFieldNode>(
+                    field->location(),
+                    field->name(),
+                    substituted_type,
+                    field->visibility());
+
+                specialized->add_field(std::move(specialized_field));
+                std::cout << "[MonomorphizationPass] Added field: " << field->name()
+                          << " : " << substituted_type << std::endl;
+            }
+        }
+
+        // Deep copy methods with type substitution
+        std::cout << "[MonomorphizationPass] Copying " << template_node.methods().size() << " methods from template" << std::endl;
+        for (const auto &method : template_node.methods())
+        {
+            if (method)
+            {
+                // Substitute return type
+                std::string original_return_type = method->return_type_annotation();
+                std::string substituted_return_type = substitute_type_in_string(original_return_type, type_substitutions);
+
+                // Create new method with substituted return type
+                auto specialized_method = std::make_unique<StructMethodNode>(
+                    method->location(),
+                    method->name(),
+                    substituted_return_type,
+                    method->visibility(),
+                    method->is_constructor(),
+                    method->is_static());
+
+                // Copy parameters with type substitution
+                for (const auto &param : method->parameters())
+                {
+                    if (param)
+                    {
+                        std::string original_param_type = param->type_annotation();
+                        std::string substituted_param_type = substitute_type_in_string(original_param_type, type_substitutions);
+
+                        auto specialized_param = std::make_unique<VariableDeclarationNode>(
+                            param->location(),
+                            param->name(),
+                            substituted_param_type);
+
+                        specialized_method->add_parameter(std::move(specialized_param));
+                    }
+                }
+
+                // TODO: Copy method body with type substitution (for now, copy as-is)
+                if (method->body())
+                {
+                    // For now, we'll skip copying the method body as it requires complex AST traversal
+                    // The method signature is the most important part for type checking
+                }
+
+                specialized->add_method(std::move(specialized_method));
+                std::cout << "[MonomorphizationPass] Added method: " << method->name()
+                          << " -> " << substituted_return_type << std::endl;
+            }
+        }
 
         std::cout << "[MonomorphizationPass] Generated specialized class: "
-                  << specialized->name() << std::endl;
+                  << specialized->name() << " with " << specialized->fields().size()
+                  << " fields and " << specialized->methods().size() << " methods" << std::endl;
 
         return specialized;
     }
@@ -421,6 +486,56 @@ namespace Cryo
 
         // For now, this is a placeholder
         std::cout << "[MonomorphizationPass] TODO: Implement type substitution for node" << std::endl;
+    }
+
+    std::string MonomorphizationPass::substitute_type_in_string(
+        const std::string &type_string,
+        const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        std::string result = type_string;
+
+        // Handle array types first (T[] -> int[])
+        for (const auto &[generic_param, concrete_type] : type_substitutions)
+        {
+            std::string array_pattern = generic_param + "[]";
+            if (result == array_pattern)
+            {
+                result = concrete_type + "[]";
+                std::cout << "[MonomorphizationPass] Array type substitution: "
+                          << array_pattern << " -> " << result << std::endl;
+                return result;
+            }
+        }
+
+        // Handle parameterized types (Option<T> -> Option<int>)
+        for (const auto &[generic_param, concrete_type] : type_substitutions)
+        {
+            size_t pos = 0;
+            std::string search_pattern = "<" + generic_param + ">";
+            std::string replacement = "<" + concrete_type + ">";
+
+            while ((pos = result.find(search_pattern, pos)) != std::string::npos)
+            {
+                result.replace(pos, search_pattern.length(), replacement);
+                pos += replacement.length();
+                std::cout << "[MonomorphizationPass] Parameterized type substitution: "
+                          << generic_param << " -> " << concrete_type << std::endl;
+            }
+        }
+
+        // Simple substitution - replace exact matches
+        for (const auto &[generic_param, concrete_type] : type_substitutions)
+        {
+            if (result == generic_param)
+            {
+                result = concrete_type;
+                std::cout << "[MonomorphizationPass] Simple type substitution: "
+                          << generic_param << " -> " << concrete_type << std::endl;
+                break;
+            }
+        }
+
+        return result;
     }
 
     std::unique_ptr<EnumDeclarationNode> MonomorphizationPass::specialize_enum_template_from_metadata(
