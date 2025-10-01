@@ -4647,6 +4647,29 @@ namespace Cryo::Codegen
                     if (type_it != _variable_types.end())
                     {
                         type_name = type_it->second;
+
+                        // Map parameterized types to monomorphized types for method lookup
+                        // e.g., Array<int> -> Array_int
+                        if (type_name.find('<') != std::string::npos && type_name.find('>') != std::string::npos)
+                        {
+                            // Extract base type and arguments
+                            size_t angle_start = type_name.find('<');
+                            size_t angle_end = type_name.find('>');
+                            if (angle_start != std::string::npos && angle_end != std::string::npos && angle_end > angle_start)
+                            {
+                                std::string base_type = type_name.substr(0, angle_start);
+                                std::string type_args = type_name.substr(angle_start + 1, angle_end - angle_start - 1);
+
+                                // Generate monomorphized name: Array<int> -> Array_int
+                                std::string monomorphized_name = base_type + "_" + type_args;
+
+                                std::cout << "[CodegenVisitor] Mapping parameterized type '" << type_name
+                                          << "' to monomorphized type '" << monomorphized_name
+                                          << "' for method lookup" << std::endl;
+
+                                type_name = monomorphized_name;
+                            }
+                        }
                     }
                     else
                     {

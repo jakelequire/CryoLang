@@ -338,6 +338,64 @@ namespace Cryo::Codegen
 
         // Check if we already have this struct type in cache
         std::string struct_name = struct_type->name();
+
+        // Special case: if this looks like a parameterized type (e.g., Array<int>),
+        // check if the monomorphized class (e.g., Array_int) is registered
+        if (struct_name.find('<') != std::string::npos && struct_name.find('>') != std::string::npos)
+        {
+            // Extract base name and type arguments for parameterized types
+            size_t angle_pos = struct_name.find('<');
+            std::string base_name = struct_name.substr(0, angle_pos);
+
+            size_t close_angle = struct_name.find('>', angle_pos);
+            if (close_angle != std::string::npos)
+            {
+                std::string type_args_str = struct_name.substr(angle_pos + 1, close_angle - angle_pos - 1);
+
+                // Generate the monomorphized name (e.g., Array<int> -> Array_int)
+                std::string monomorphized_name = base_name;
+                std::stringstream ss(type_args_str);
+                std::string arg;
+                while (std::getline(ss, arg, ','))
+                {
+                    // Trim whitespace
+                    arg.erase(0, arg.find_first_not_of(" \t"));
+                    arg.erase(arg.find_last_not_of(" \t") + 1);
+                    if (!arg.empty())
+                    {
+                        monomorphized_name += "_" + arg;
+                    }
+                }
+
+                // Check if the monomorphized version exists as a class
+                auto class_it = _class_ast_nodes.find(monomorphized_name);
+                if (class_it != _class_ast_nodes.end())
+                {
+                    std::cout << "[TypeMapper] Redirecting parameterized struct '" << struct_name
+                              << "' to monomorphized class '" << monomorphized_name << "'" << std::endl;
+
+                    // Create a ClassType and delegate to map_class_type
+                    auto class_type = std::make_unique<Cryo::ClassType>(monomorphized_name);
+                    return map_class_type(class_type.get());
+                }
+            }
+        }
+
+        // Also check if this looks like a monomorphized class (e.g., Array_int)
+        if (struct_name.find('_') != std::string::npos)
+        {
+            auto class_it = _class_ast_nodes.find(struct_name);
+            if (class_it != _class_ast_nodes.end())
+            {
+                std::cout << "[TypeMapper] Redirecting monomorphized struct '" << struct_name
+                          << "' to class handling" << std::endl;
+
+                // Create a ClassType and delegate to map_class_type
+                auto class_type = std::make_unique<Cryo::ClassType>(struct_name);
+                return map_class_type(class_type.get());
+            }
+        }
+
         auto it = _struct_cache.find(struct_name);
         if (it != _struct_cache.end())
         {
