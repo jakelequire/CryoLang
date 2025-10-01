@@ -124,6 +124,14 @@ namespace Cryo
                 success = false;
                 continue;
             }
+            else if (template_info->trait_template)
+            {
+                std::cout << "[MonomorphizationPass] Trait template found: "
+                          << instantiation.base_name << " - traits don't require concrete specialization" << std::endl;
+                // Traits don't generate concrete instances, they're used for type checking
+                // Skip this instantiation as it doesn't need monomorphization
+                continue;
+            }
             else
             {
                 std::cerr << "[MonomorphizationPass] ERROR: Template info contains no valid template: "

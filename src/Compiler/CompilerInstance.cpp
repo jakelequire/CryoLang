@@ -7,7 +7,7 @@
 namespace Cryo
 {
     CompilerInstance::CompilerInstance()
-        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false)
+        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _current_namespace("")
     {
         initialize_components();
     }
@@ -29,6 +29,9 @@ namespace Cryo
 
         // Create template registry
         _template_registry = std::make_unique<TemplateRegistry>();
+
+        // Create module loader - needs to be created after symbol table and template registry
+        _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry);
 
         // Note: CodeGenerator will be created after parsing when namespace is known
 
@@ -280,7 +283,7 @@ namespace Cryo
     bool CompilerInstance::analyze()
     {
         std::cout << "[CompilerInstance] Starting analysis phase..." << std::endl;
-        
+
         if (!_ast_root)
         {
             _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
@@ -346,7 +349,7 @@ namespace Cryo
                 std::cout << "Starting monomorphization pass..." << std::endl;
             }
 
-            const auto& required_instantiations = _type_checker->get_required_instantiations();
+            const auto &required_instantiations = _type_checker->get_required_instantiations();
             if (!required_instantiations.empty())
             {
                 bool monomorphization_success = _monomorphization_pass->monomorphize(*_ast_root, required_instantiations, *_template_registry);
@@ -681,8 +684,8 @@ namespace Cryo
                 _template_registry->register_function_template(
                     func_decl->name(),
                     func_decl,
-                    "Main",  // Use "Main" as the module name for local templates
-                    "" // No source file path for main file templates
+                    "Main", // Use "Main" as the module name for local templates
+                    ""      // No source file path for main file templates
                 );
                 std::cout << "[CompilerInstance] Registered local generic function template: " << func_decl->name() << std::endl;
             }
@@ -722,13 +725,12 @@ namespace Cryo
         {
             std::cout << "[CompilerInstance] Processing import: " << import_decl->path() << std::endl;
 
-            // Create ModuleLoader instance
-            ModuleLoader loader(*current_scope, *_template_registry);
-            loader.set_stdlib_root("./stdlib");
-            loader.set_current_file("./test/"); // TODO: Get actual current file directory
+            // Use the member ModuleLoader instance
+            _module_loader->set_stdlib_root("./stdlib");
+            _module_loader->set_current_file(_source_file);
 
             // Load the import
-            auto result = loader.load_import(*import_decl);
+            auto result = _module_loader->load_import(*import_decl);
 
             if (result.success)
             {
@@ -797,8 +799,8 @@ namespace Cryo
                 _template_registry->register_struct_template(
                     struct_decl->name(),
                     struct_decl,
-                    "Main",  // Use "Main" as the module name for local templates
-                    "" // No source file path for main file templates
+                    "Main", // Use "Main" as the module name for local templates
+                    ""      // No source file path for main file templates
                 );
                 std::cout << "[CompilerInstance] Registered local generic struct template: " << struct_decl->name() << std::endl;
             }
@@ -818,10 +820,30 @@ namespace Cryo
                 _template_registry->register_enum_template(
                     enum_decl->name(),
                     enum_decl,
-                    "Main",  // Use "Main" as the module name for local templates
-                    "" // No source file path for main file templates
+                    "Main", // Use "Main" as the module name for local templates
+                    ""      // No source file path for main file templates
                 );
                 std::cout << "[CompilerInstance] Registered local generic enum template: " << enum_decl->name() << std::endl;
+            }
+        }
+        // Handle trait declarations
+        else if (auto trait_decl = dynamic_cast<TraitDeclarationNode *>(node))
+        {
+            // Add trait to symbol table as a type
+            current_scope->declare_symbol(trait_decl->name(), SymbolKind::Type,
+                                          trait_decl->location(), nullptr, scope_name);
+
+            // Register generic trait templates if this trait has generic parameters
+            if (!trait_decl->generic_parameters().empty())
+            {
+                std::cout << "[CompilerInstance] Registering local generic trait template: " << trait_decl->name() << std::endl;
+                _template_registry->register_trait_template(
+                    trait_decl->name(),
+                    trait_decl,
+                    "Main", // Use "Main" as the module name for local templates
+                    ""      // No source file path for main file templates
+                );
+                std::cout << "[CompilerInstance] Registered local generic trait template: " << trait_decl->name() << std::endl;
             }
         }
         // Handle variable declarations
@@ -928,10 +950,9 @@ namespace Cryo
 
         std::cout << "[CompilerInstance] Injecting auto-import: core/types" << std::endl;
 
-        // Create ModuleLoader instance
-        ModuleLoader loader(*current_scope, *_template_registry);
-        loader.set_stdlib_root("./stdlib");
-        loader.set_current_file("./"); // Use current directory as base
+        // Use the member ModuleLoader instance
+        _module_loader->set_stdlib_root("./stdlib");
+        _module_loader->set_current_file(_source_file);
 
         // Create a synthetic ImportDeclarationNode for core/types
         // This simulates: import <core/types>;
@@ -942,7 +963,7 @@ namespace Cryo
         );
 
         // Load the import
-        auto result = loader.load_import(*core_types_import);
+        auto result = _module_loader->load_import(*core_types_import);
 
         if (result.success)
         {

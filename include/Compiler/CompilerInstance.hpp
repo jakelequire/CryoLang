@@ -31,17 +31,21 @@ namespace Cryo
     class CompilerInstance
     {
     private:
-        // Core components
+        // Core components (order matters for destruction!)
         std::unique_ptr<Lexer> _lexer;
         std::unique_ptr<Parser> _parser;
         std::unique_ptr<ASTContext> _ast_context;
         std::unique_ptr<SymbolTable> _symbol_table;
         std::unique_ptr<DiagnosticManager> _diagnostic_manager;
+        // TypeChecker must come AFTER ASTContext since it holds a reference to ast_context->types()
         std::unique_ptr<TypeChecker> _type_checker;
         std::unique_ptr<MonomorphizationPass> _monomorphization_pass;
         std::unique_ptr<TemplateRegistry> _template_registry;
         std::unique_ptr<Cryo::Codegen::CodeGenerator> _codegen;
         std::unique_ptr<Cryo::Linker::CryoLinker> _linker;
+        // ModuleLoader must be declared AFTER the objects it references (symbol_table, template_registry)
+        // This ensures proper destruction order (ModuleLoader destroyed first)
+        std::unique_ptr<ModuleLoader> _module_loader;
 
         // Compilation state
         std::string _source_file;
