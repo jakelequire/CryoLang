@@ -8,6 +8,7 @@
 #include <iostream>
 #include <set>
 #include <filesystem>
+#include <sstream>
 
 namespace Cryo::Codegen
 {
@@ -21,7 +22,7 @@ namespace Cryo::Codegen
         : _context_manager(context_manager),
           _symbol_table(symbol_table),
           _value_context(std::make_unique<ValueContext>()),
-          _type_mapper(std::make_unique<TypeMapper>(context_manager)),
+          _type_mapper(std::make_unique<TypeMapper>(context_manager, symbol_table.get_type_context())),
           _intrinsics(std::make_unique<Intrinsics>(context_manager, gdm)),
           _current_value(nullptr),
           _has_errors(false),
@@ -401,7 +402,13 @@ namespace Cryo::Codegen
             }
 
             // Map to LLVM type using type annotation
-            llvm::Type *llvm_type = _type_mapper->map_type(type_annotation);
+            Cryo::Type *cryo_type = _symbol_table.get_type_context()->parse_type_from_string(type_annotation);
+            if (!cryo_type)
+            {
+                report_error("Failed to parse type annotation: " + type_annotation);
+                return;
+            }
+            llvm::Type *llvm_type = _type_mapper->map_type(cryo_type);
             if (!llvm_type)
             {
                 report_error("Failed to map type for variable: " + var_name + " (type: " + type_annotation + ")");
@@ -444,7 +451,11 @@ namespace Cryo::Codegen
                             std::string element_type_name = type_annotation.substr(0, matching_bracket_pos);
                             std::cout << "[CodegenVisitor] Variable '" << var_name << "' type '" << type_annotation
                                       << "' -> element_type_name = '" << element_type_name << "'" << std::endl;
-                            element_type = _type_mapper->map_type(element_type_name);
+                            Cryo::Type *cryo_element_type = _symbol_table.get_type_context()->parse_type_from_string(element_type_name);
+                            if (cryo_element_type)
+                            {
+                                element_type = _type_mapper->map_type(cryo_element_type);
+                            }
                             if (!element_type)
                             {
                                 std::cout << "[CodegenVisitor] Warning: Could not map element type '" << element_type_name << "', using full array type" << std::endl;
@@ -555,6 +566,9 @@ namespace Cryo::Codegen
     {
         std::cout << "[CodegenVisitor] Generating struct declaration: " << node.name() << std::endl;
 
+        // Register AST node with TypeMapper for field metadata
+        _type_mapper->register_struct_ast_node(&node);
+
         // Check if this is a generic struct
         if (!node.generic_parameters().empty())
         {
@@ -577,7 +591,8 @@ namespace Cryo::Codegen
         }
 
         // Use TypeMapper to create the struct type and register fields automatically
-        llvm::StructType *struct_type = _type_mapper->map_struct_type(&node);
+        Cryo::StructType *cryo_struct_type = static_cast<Cryo::StructType *>(_symbol_table.get_type_context()->get_struct_type(node.name()));
+        llvm::Type *struct_type = _type_mapper->map_struct_type(cryo_struct_type);
 
         if (!struct_type)
         {
@@ -596,11 +611,15 @@ namespace Cryo::Codegen
     {
         std::cout << "[CodegenVisitor] Visiting ClassDeclarationNode: " << node.name() << std::endl;
 
+        // Register AST node with TypeMapper for field metadata
+        _type_mapper->register_class_ast_node(&node);
+
         // Clear any previous type mapping errors before processing this class
         _type_mapper->clear_errors();
 
         // Generate LLVM type for the class
-        llvm::Type *class_type = _type_mapper->map_class_type(&node);
+        Cryo::ClassType *cryo_class_type = static_cast<Cryo::ClassType *>(_symbol_table.get_type_context()->get_class_type(node.name()));
+        llvm::Type *class_type = _type_mapper->map_class_type(cryo_class_type);
         if (!class_type)
         {
             std::cerr << "[CodegenVisitor] Failed to map class type for " << node.name() << std::endl;
@@ -657,7 +676,8 @@ namespace Cryo::Codegen
                     if (param)
                     {
                         std::string param_type_str = param->type_annotation();
-                        llvm::Type *param_type = _type_mapper->map_type(param_type_str);
+                        Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_str);
+                        llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
                         if (param_type)
                         {
                             param_types.push_back(param_type);
@@ -674,7 +694,8 @@ namespace Cryo::Codegen
                 llvm::Type *return_type = llvm::Type::getVoidTy(context);
                 if (!method->return_type_annotation().empty() && method->return_type_annotation() != "void")
                 {
-                    llvm::Type *mapped_return_type = _type_mapper->map_type(method->return_type_annotation());
+                    Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(method->return_type_annotation());
+                    llvm::Type *mapped_return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
                     if (mapped_return_type)
                     {
                         return_type = mapped_return_type;
@@ -751,7 +772,8 @@ namespace Cryo::Codegen
                         {
                             std::string param_name = param->name();
                             std::string param_type_str = param->type_annotation();
-                            llvm::Type *param_type = _type_mapper->map_type(param_type_str);
+                            Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_str);
+                            llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
 
                             if (param_type)
                             {
@@ -795,17 +817,28 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::EnumDeclarationNode &node)
     {
-        // Skip generic enums for now - they require specialized template instantiation
+        // Skip generic enums for now - they should be handled as ParameterizedType instances
+        // when actually instantiated, not as generic templates
         if (!node.generic_parameters().empty())
         {
             std::cout << "[DEBUG] Skipping generic enum declaration: " << node.name() << " (has "
                       << node.generic_parameters().size() << " generic parameters)" << std::endl;
+            std::cout << "[DEBUG] Generic enums like Option<T> will be handled through ParameterizedType system when instantiated" << std::endl;
             register_value(&node, nullptr);
             return;
         }
 
         // Generate LLVM type for the enum
-        llvm::Type *enum_type = _type_mapper->map_enum_type(&node);
+        // Extract variant names from the AST node
+        std::vector<std::string> variant_names;
+        for (const auto &variant : node.variants())
+        {
+            variant_names.push_back(variant->name());
+        }
+
+        Cryo::EnumType *cryo_enum_type = static_cast<Cryo::EnumType *>(
+            _symbol_table.get_type_context()->get_enum_type(node.name(), std::move(variant_names), node.is_simple_enum()));
+        llvm::Type *enum_type = _type_mapper->map_enum_type(cryo_enum_type);
         if (!enum_type)
         {
             report_error("Failed to generate LLVM type for enum: " + node.name());
@@ -974,7 +1007,8 @@ namespace Cryo::Codegen
         }
 
         // Check if this is a primitive type first
-        llvm::Type *primitive_type = _type_mapper->map_type(target_type_name);
+        Cryo::Type *cryo_target_type = _symbol_table.get_type_context()->parse_type_from_string(target_type_name);
+        llvm::Type *primitive_type = cryo_target_type ? _type_mapper->map_type(cryo_target_type) : nullptr;
         std::cout << "[DEBUG] Implementation block for: " << target_type_name
                   << ", mapped type: " << (primitive_type ? "valid" : "null")
                   << ", is_primitive: " << (is_primitive_type(target_type_name) ? "yes" : "no") << std::endl;
@@ -1034,7 +1068,8 @@ namespace Cryo::Codegen
                 if (param)
                 {
                     std::string param_type_str = param->type_annotation();
-                    llvm::Type *param_type = _type_mapper->map_type(param_type_str);
+                    Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_str);
+                    llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
                     if (param_type)
                     {
                         param_types.push_back(param_type);
@@ -1052,7 +1087,8 @@ namespace Cryo::Codegen
             std::string return_type_str = method->return_type_annotation();
             if (!return_type_str.empty() && return_type_str != "void")
             {
-                llvm::Type *mapped_return_type = _type_mapper->map_type(return_type_str);
+                Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(return_type_str);
+                llvm::Type *mapped_return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
                 if (mapped_return_type)
                 {
                     return_type = mapped_return_type;
@@ -1119,7 +1155,8 @@ namespace Cryo::Codegen
                 {
                     std::string param_name = param->name();
                     std::string param_type_str = param->type_annotation();
-                    llvm::Type *param_type = _type_mapper->map_type(param_type_str);
+                    Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_str);
+                    llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
 
                     if (param_type)
                     {
@@ -2828,7 +2865,8 @@ namespace Cryo::Codegen
             std::string return_type_annotation = node->return_type_annotation();
             if (return_type_annotation != "void")
             {
-                return_type = _type_mapper->map_type(return_type_annotation);
+                Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(return_type_annotation);
+                return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
             }
             else
             {
@@ -2860,7 +2898,8 @@ namespace Cryo::Codegen
                         continue;
                     }
 
-                    llvm::Type *param_type = _type_mapper->map_type(param_type_annotation);
+                    Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_annotation);
+                    llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
                     if (!param_type)
                     {
                         report_error("Failed to map parameter type: " + param->name() + " (type: " + param_type_annotation + ")");
@@ -2947,7 +2986,8 @@ namespace Cryo::Codegen
                 builder.SetInsertPoint(entry_block);
 
                 // Map the return type from AST
-                llvm::Type *llvm_return_type = _type_mapper->map_type(return_type_str);
+                Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(return_type_str);
+                llvm::Type *llvm_return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
                 if (llvm_return_type)
                 {
                     _current_function->return_value_alloca = builder.CreateAlloca(
@@ -2985,7 +3025,8 @@ namespace Cryo::Codegen
                     std::string param_type_annotation = var_decl->type_annotation();
 
                     // Map the parameter type from AST
-                    llvm::Type *param_type = _type_mapper->map_type(param_type_annotation);
+                    Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_annotation);
+                    llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
                     if (!param_type)
                     {
                         report_error("Failed to map parameter type: " + param_name + " (" + param_type_annotation + ")");
@@ -3040,7 +3081,8 @@ namespace Cryo::Codegen
                 else
                 {
                     // For non-void functions, create a default return value
-                    llvm::Type *llvm_return_type = _type_mapper->map_type(return_type_str);
+                    Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(return_type_str);
+                    llvm::Type *llvm_return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
                     if (llvm_return_type)
                     {
                         builder.CreateRet(llvm::Constant::getNullValue(llvm_return_type));
@@ -3060,7 +3102,8 @@ namespace Cryo::Codegen
             if (_current_function->return_block && !is_void_function)
             {
                 // Load the return value from the return value alloca and return it
-                llvm::Type *llvm_return_type = _type_mapper->map_type(return_type_str);
+                Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(return_type_str);
+                llvm::Type *llvm_return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
                 if (llvm_return_type && _current_function->return_value_alloca)
                 {
                     builder.SetInsertPoint(_current_function->return_block);
@@ -3116,7 +3159,8 @@ namespace Cryo::Codegen
         }
 
         // Get primitive type for 'this' parameter
-        llvm::Type *primitive_type = _type_mapper->map_type(primitive_type_name);
+        Cryo::Type *cryo_primitive_type = _symbol_table.get_type_context()->parse_type_from_string(primitive_type_name);
+        llvm::Type *primitive_type = cryo_primitive_type ? _type_mapper->map_type(cryo_primitive_type) : nullptr;
         if (!primitive_type)
         {
             report_error("Cannot map primitive type: " + primitive_type_name);
@@ -3134,7 +3178,8 @@ namespace Cryo::Codegen
         {
             if (param)
             {
-                llvm::Type *param_type = _type_mapper->map_type(param->type_annotation());
+                Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param->type_annotation());
+                llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
                 if (param_type)
                 {
                     param_types.push_back(param_type);
@@ -3146,7 +3191,8 @@ namespace Cryo::Codegen
         llvm::Type *return_type = nullptr;
         if (!node->return_type_annotation().empty() && node->return_type_annotation() != "void")
         {
-            return_type = _type_mapper->map_type(node->return_type_annotation());
+            Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(node->return_type_annotation());
+            return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
         }
         if (!return_type)
         {
@@ -3215,7 +3261,8 @@ namespace Cryo::Codegen
         {
             if (param && arg_it != func->arg_end())
             {
-                llvm::Type *param_type = _type_mapper->map_type(param->type_annotation());
+                Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param->type_annotation());
+                llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
                 if (param_type)
                 {
                     llvm::AllocaInst *alloca = create_entry_block_alloca(func, param_type, param->name());
@@ -3257,11 +3304,21 @@ namespace Cryo::Codegen
     llvm::Type *CodegenVisitor::generate_struct_type(Cryo::StructDeclarationNode *node) { return nullptr; }
     llvm::Type *CodegenVisitor::generate_class_type(Cryo::ClassDeclarationNode *node)
     {
-        return _type_mapper->map_class_type(node);
+        Cryo::ClassType *cryo_class_type = static_cast<Cryo::ClassType *>(_symbol_table.get_type_context()->get_class_type(node->name()));
+        return _type_mapper->map_class_type(cryo_class_type);
     }
     llvm::Type *CodegenVisitor::generate_enum_type(Cryo::EnumDeclarationNode *node)
     {
-        return _type_mapper->map_enum_type(node);
+        // Extract variant names from the AST node
+        std::vector<std::string> variant_names;
+        for (const auto &variant : node->variants())
+        {
+            variant_names.push_back(variant->name());
+        }
+
+        Cryo::EnumType *cryo_enum_type = static_cast<Cryo::EnumType *>(
+            _symbol_table.get_type_context()->get_enum_type(node->name(), std::move(variant_names), node->is_simple_enum()));
+        return _type_mapper->map_enum_type(cryo_enum_type);
     }
 
     void CodegenVisitor::generate_simple_enum_constants(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type)
@@ -3360,14 +3417,24 @@ namespace Cryo::Codegen
         auto &llvm_context = _context_manager.get_context();
         auto *module = _context_manager.get_module();
 
-        llvm::Type *enum_type = _type_mapper->lookup_type(enum_decl->name());
+        // Extract variant names for enum type creation
+        std::vector<std::string> variant_names;
+        for (const auto &v : enum_decl->variants())
+        {
+            variant_names.push_back(v->name());
+        }
+
+        Cryo::EnumType *cryo_enum_type = static_cast<Cryo::EnumType *>(
+            _symbol_table.get_type_context()->get_enum_type(enum_decl->name(), variant_names, enum_decl->is_simple_enum()));
+        llvm::Type *enum_type = _type_mapper->map_enum_type(cryo_enum_type);
         std::string constructor_name = enum_decl->name() + "::" + variant->name();
 
         // Build parameter types for associated data
         std::vector<llvm::Type *> param_types;
         for (const auto &type_name : variant->associated_types())
         {
-            llvm::Type *param_type = _type_mapper->map_type(type_name);
+            Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(type_name);
+            llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
             if (param_type)
             {
                 param_types.push_back(param_type);
@@ -4697,7 +4764,60 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Check if this is an enum constructor call first
+        // Check if this is a parameterized enum constructor call that needs generation
+        size_t param_scope_pos = function_name.find("::");
+        if (param_scope_pos != std::string::npos)
+        {
+            std::string type_part = function_name.substr(0, param_scope_pos);
+            std::string variant_part = function_name.substr(param_scope_pos + 2);
+
+            // Check if the type part looks like a parameterized type (contains < and >)
+            if (type_part.find('<') != std::string::npos && type_part.find('>') != std::string::npos)
+            {
+                // Parse the type: "Option<int>" -> base="Option", args=["int"]
+                size_t open_bracket = type_part.find('<');
+                size_t close_bracket = type_part.find('>', open_bracket);
+
+                if (open_bracket != std::string::npos && close_bracket != std::string::npos && close_bracket > open_bracket)
+                {
+                    std::string base_name = type_part.substr(0, open_bracket);
+                    std::string type_args_str = type_part.substr(open_bracket + 1, close_bracket - open_bracket - 1);
+
+                    // Parse type arguments (simple comma-separated for now)
+                    std::vector<std::string> type_args;
+                    std::stringstream ss(type_args_str);
+                    std::string arg;
+                    while (std::getline(ss, arg, ','))
+                    {
+                        // Trim whitespace
+                        arg.erase(0, arg.find_first_not_of(" \t"));
+                        arg.erase(arg.find_last_not_of(" \t") + 1);
+                        if (!arg.empty())
+                        {
+                            type_args.push_back(arg);
+                        }
+                    }
+
+                    if (!type_args.empty())
+                    {
+                        std::cout << "[CodegenVisitor] Detected parameterized enum constructor call: " << function_name << std::endl;
+                        std::cout << "[CodegenVisitor] Base: " << base_name << ", Variant: " << variant_part << ", Args: ";
+                        for (size_t i = 0; i < type_args.size(); ++i)
+                        {
+                            if (i > 0)
+                                std::cout << ", ";
+                            std::cout << type_args[i];
+                        }
+                        std::cout << std::endl;
+
+                        // Ensure constructors are generated for this parameterized enum
+                        ensure_parameterized_enum_constructors(type_part, base_name, type_args);
+                    }
+                }
+            }
+        }
+
+        // Check if this is an enum constructor call first  
         if (_enum_variants.find(function_name) != _enum_variants.end())
         {
             // This is an enum constructor call
@@ -4714,6 +4834,15 @@ namespace Cryo::Codegen
                     {
                         args.push_back(arg_val);
                     }
+                }
+
+                // Verify the argument count matches the function signature
+                if (args.size() != llvm_function->arg_size())
+                {
+                    std::cout << "[ERROR] Argument count mismatch for " << function_name 
+                              << ": expected " << llvm_function->arg_size() 
+                              << ", got " << args.size() << std::endl;
+                    return nullptr;
                 }
 
                 // Call the enum constructor function
@@ -6143,9 +6272,8 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Convert Type object to string and use TypeMapper
-        std::string type_string = cryo_type->to_string();
-        return _type_mapper->map_type(type_string);
+        // Use the new Type-based interface directly
+        return _type_mapper->map_type(cryo_type);
     }
     llvm::Value *CodegenVisitor::cast_value(llvm::Value *value, llvm::Type *target_type) { return nullptr; }
     bool CodegenVisitor::is_lvalue(Cryo::ExpressionNode *expr) { return false; }
@@ -6157,6 +6285,229 @@ namespace Cryo::Codegen
 
         // Also register with just the variant name for unqualified access
         _enum_variants[variant_name] = value;
+    }
+
+    void CodegenVisitor::ensure_parameterized_enum_constructors(const std::string &instantiated_name,
+                                                                const std::string &base_name,
+                                                                const std::vector<std::string> &type_args)
+    {
+        // Check if constructors are already generated for this instantiation
+        std::string first_variant_name = instantiated_name + "::";
+        bool already_generated = false;
+        for (const auto &[variant_key, variant_func] : _enum_variants)
+        {
+            if (variant_key.find(first_variant_name) == 0)
+            {
+                already_generated = true;
+                break;
+            }
+        }
+
+        if (already_generated)
+        {
+            return; // Already generated
+        }
+
+        std::cout << "[CodegenVisitor] Generating variant constructors for parameterized enum: " << instantiated_name << std::endl;
+
+        auto &llvm_context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+
+        if (!module)
+        {
+            report_error("No module available for parameterized enum constructor generation");
+            return;
+        }
+
+        // Get the enum type from TypeMapper - let TypeMapper handle the creation
+        llvm::Type *enum_type = _type_mapper->lookup_type(instantiated_name);
+        if (!enum_type)
+        {
+            // Convert type argument strings to Type* for TypeMapper to process
+            std::vector<std::shared_ptr<Cryo::Type>> type_args_as_types;
+            for (const std::string &type_arg : type_args)
+            {
+                Cryo::Type *arg_type = _symbol_table.get_type_context()->parse_type_from_string(type_arg);
+                if (arg_type)
+                {
+                    type_args_as_types.push_back(std::shared_ptr<Cryo::Type>(arg_type));
+                }
+            }
+
+            // Create a ParameterizedType instance for TypeMapper to process
+            if (!type_args_as_types.empty())
+            {
+                std::unique_ptr<Cryo::ParameterizedType> parameterized_type =
+                    std::make_unique<Cryo::ParameterizedType>(base_name, type_args_as_types);
+
+                // Let TypeMapper handle the creation and registration
+                enum_type = _type_mapper->map_type(parameterized_type.get());
+
+                std::cout << "[CodegenVisitor] TypeMapper processed parameterized enum, got type: "
+                          << (enum_type ? enum_type->getStructName().str() : "null") << std::endl;
+            }
+        }
+
+        if (!enum_type)
+        {
+            report_error("Failed to get enum type for parameterized enum: " + instantiated_name);
+            return;
+        }
+
+        // Get the base enum type from TypeContext to find its variants
+        Cryo::Type *base_enum_type = _symbol_table.get_type_context()->get_enum_type(base_name);
+        Cryo::EnumType *cryo_enum_type = dynamic_cast<Cryo::EnumType *>(base_enum_type);
+
+        if (!cryo_enum_type)
+        {
+            report_error("Could not find base enum type for parameterized enum: " + base_name);
+            return;
+        }
+
+        // Generate constructors for each variant of the base enum
+        const auto &variants = cryo_enum_type->variants();
+        std::cout << "[CodegenVisitor] Base enum " << base_name << " has " << variants.size() << " variants" << std::endl;
+
+        for (const auto &variant_name : variants)
+        {
+            std::cout << "[CodegenVisitor] Processing variant: " << variant_name << std::endl;
+            generate_parameterized_enum_variant_constructor(instantiated_name, variant_name, type_args, enum_type);
+            std::cout << "[CodegenVisitor] Completed variant: " << variant_name << std::endl;
+        }
+    }
+
+    void CodegenVisitor::generate_parameterized_enum_variant_constructor(const std::string &instantiated_name,
+                                                                         const std::string &variant_name,
+                                                                         const std::vector<std::string> &type_args,
+                                                                         llvm::Type *enum_type)
+    {
+        std::cout << "[CodegenVisitor] Starting variant constructor generation for: " << variant_name
+                  << " of " << instantiated_name << std::endl;
+
+        auto &llvm_context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+
+        std::cout << "[CodegenVisitor] Got LLVM context and module" << std::endl;
+
+        std::string constructor_name = instantiated_name + "::" + variant_name;
+
+        // Use enhanced type system to get constructor parameters for this variant
+        std::vector<llvm::Type *> param_types;
+        bool needs_value_param = false;
+
+        // For now, determine parameter needs based on variant name patterns
+        // Some/Ok variants typically need a value parameter, None/Err variants typically don't
+        if (variant_name == "Some" || variant_name == "Ok")
+        {
+            // This variant needs a parameter - use the first type argument
+            if (!type_args.empty())
+            {
+                std::string type_arg = type_args[0];
+                
+                // Convert the type argument string to an LLVM type
+                llvm::Type *param_type = nullptr;
+                if (type_arg == "i32" || type_arg == "int")
+                {
+                    param_type = _type_mapper->get_integer_type(32, true);
+                }
+                else if (type_arg == "i64")
+                {
+                    param_type = _type_mapper->get_integer_type(64, true);
+                }
+                else if (type_arg == "f64" || type_arg == "float")
+                {
+                    param_type = _type_mapper->get_float_type(64);
+                }
+                else if (type_arg == "bool")
+                {
+                    param_type = _type_mapper->get_boolean_type();
+                }
+                else if (type_arg == "str" || type_arg == "string")
+                {
+                    param_type = _type_mapper->get_string_type();
+                }
+                else
+                {
+                    // Try to look up as a registered type
+                    param_type = _type_mapper->lookup_type(type_arg);
+                }
+                
+                if (param_type)
+                {
+                    param_types.push_back(param_type);
+                    needs_value_param = true;
+                }
+            }
+        }
+        // None, Nothing, Err variants don't need parameters        // Create function type
+        llvm::FunctionType *func_type = llvm::FunctionType::get(enum_type, param_types, false);
+        llvm::Function *constructor_func = llvm::Function::Create(
+            func_type, llvm::Function::ExternalLinkage, constructor_name, *module);
+
+        // Set parameter names
+        if (needs_value_param && constructor_func->arg_size() > 0)
+        {
+            constructor_func->arg_begin()->setName("value");
+        }
+
+        // Create function body
+        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_context, "entry", constructor_func);
+
+        // Save current insertion point
+        llvm::BasicBlock *saved_block = builder.GetInsertBlock();
+        builder.SetInsertPoint(entry);
+
+        // Create enum instance
+        llvm::Value *enum_instance = llvm::UndefValue::get(enum_type);
+
+        // Set the discriminant/flag field based on variant
+        if (variant_name == "None" || variant_name == "Nothing")
+        {
+            // Set has_value/is_ok to false
+            llvm::Value *false_value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_context), 0);
+            enum_instance = builder.CreateInsertValue(enum_instance, false_value, {0}, "set_flag");
+        }
+        else if (variant_name == "Some" || variant_name == "Ok")
+        {
+            // Set has_value/is_ok to true and set the value
+            llvm::Value *true_value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_context), 1);
+            enum_instance = builder.CreateInsertValue(enum_instance, true_value, {0}, "set_flag");
+
+            if (needs_value_param && constructor_func->arg_size() > 0)
+            {
+                llvm::Value *value_param = &*constructor_func->arg_begin();
+                enum_instance = builder.CreateInsertValue(enum_instance, value_param, {1}, "set_value");
+            }
+        }
+        else if (variant_name == "Err")
+        {
+            // For Result<T,E>, set is_ok to false and store error in union
+            llvm::Value *false_value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_context), 0);
+            enum_instance = builder.CreateInsertValue(enum_instance, false_value, {0}, "set_flag");
+
+            if (needs_value_param && constructor_func->arg_size() > 0)
+            {
+                // For errors, we'd need to handle the union data properly
+                // This is a simplified version
+                llvm::Value *error_param = &*constructor_func->arg_begin();
+                enum_instance = builder.CreateInsertValue(enum_instance, error_param, {1}, "set_error");
+            }
+        }
+
+        builder.CreateRet(enum_instance);
+
+        // Restore insertion point
+        if (saved_block)
+        {
+            builder.SetInsertPoint(saved_block);
+        }
+
+        // Register the constructor
+        register_enum_variant(instantiated_name, variant_name, constructor_func);
+
+        std::cout << "[CodegenVisitor] Generated parameterized enum constructor: " << constructor_name << std::endl;
     }
 
     llvm::Function *CodegenVisitor::generate_generic_constructor(const std::string &instantiated_type,
@@ -6183,7 +6534,8 @@ namespace Cryo::Codegen
         param_types.push_back(llvm::PointerType::get(struct_type, 0)); // 'this' pointer
 
         // For our test case, we know there's one parameter of the generic type
-        llvm::Type *param_type = _type_mapper->map_type(type_args[0]); // T mapped to concrete type (int)
+        Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(type_args[0]);
+        llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr; // T mapped to concrete type (int)
         if (!param_type)
         {
             std::cout << "[CodegenVisitor] Failed to map constructor parameter type: " << type_args[0] << std::endl;
@@ -6262,7 +6614,8 @@ namespace Cryo::Codegen
                 return;
             }
 
-            llvm::Type *return_type = _type_mapper->map_type(type_args[0]);
+            Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(type_args[0]);
+            llvm::Type *return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
             if (!return_type)
             {
                 std::cout << "[CodegenVisitor] Failed to map return type: " << type_args[0] << std::endl;
@@ -6413,7 +6766,8 @@ namespace Cryo::Codegen
 
         // Get LLVM types for source and target
         llvm::Type *source_type = source_value->getType();
-        llvm::Type *target_llvm_type = _type_mapper->map_type(target_type);
+        Cryo::Type *cryo_target_type = _symbol_table.get_type_context()->parse_type_from_string(target_type);
+        llvm::Type *target_llvm_type = cryo_target_type ? _type_mapper->map_type(cryo_target_type) : nullptr;
 
         if (!target_llvm_type)
         {

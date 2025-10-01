@@ -40,8 +40,9 @@ namespace Cryo::Codegen
         /**
          * @brief Construct type mapper
          * @param context_manager LLVM context manager
+         * @param type_context Cryo type context for type operations
          */
-        explicit TypeMapper(LLVMContextManager &context_manager);
+        explicit TypeMapper(LLVMContextManager &context_manager, Cryo::TypeContext *type_context = nullptr);
 
         ~TypeMapper() = default;
 
@@ -50,18 +51,11 @@ namespace Cryo::Codegen
         //===================================================================
 
         /**
-         * @brief Map CryoLang type to LLVM type
+         * @brief Map CryoLang type to LLVM type (PRIMARY METHOD)
          * @param cryo_type CryoLang type to convert
          * @return Corresponding LLVM type or nullptr if conversion fails
          */
         llvm::Type *map_type(Cryo::Type *cryo_type);
-
-        /**
-         * @brief Map CryoLang type to LLVM type by name
-         * @param type_name String representation of type
-         * @return Corresponding LLVM type or nullptr if not found
-         */
-        llvm::Type *map_type(const std::string &type_name);
 
         /**
          * @brief Map function signature to LLVM function type
@@ -124,90 +118,80 @@ namespace Cryo::Codegen
 
         /**
          * @brief Map array type to LLVM array or vector type
-         * @param element_type Array element type
-         * @param size Array size (0 for dynamic arrays)
-         * @param is_dynamic Whether array is dynamically sized
+         * @param array_type Array type
          * @return LLVM array type or pointer for dynamic arrays
          */
-        llvm::Type *map_array_type(Cryo::Type *element_type, size_t size, bool is_dynamic = false);
+        llvm::Type *map_array_type(Cryo::ArrayType *array_type);
+
+        /**
+         * @brief Map pointer type to LLVM pointer type
+         * @param pointer_type Pointer type
+         * @return LLVM pointer type
+         */
+        llvm::Type *map_pointer_type(Cryo::PointerType *pointer_type);
+
+        /**
+         * @brief Map reference type to LLVM pointer type
+         * @param reference_type Reference type
+         * @return LLVM pointer type
+         */
+        llvm::Type *map_reference_type(Cryo::ReferenceType *reference_type);
+
+        /**
+         * @brief Map parameterized type (generics) to LLVM type
+         * @param parameterized_type Parameterized type
+         * @return LLVM type for instantiated generic
+         */
+        llvm::Type *map_parameterized_type(Cryo::ParameterizedType *parameterized_type);
+
+        /**
+         * @brief Map function type to LLVM function type
+         * @param function_type Function type
+         * @return LLVM function type
+         */
+        llvm::Type *map_function_type(Cryo::FunctionType *function_type);
+
+        /**
+         * @brief Map integer type to LLVM integer type
+         * @param integer_type Integer type
+         * @return LLVM integer type
+         */
+        llvm::Type *map_integer_type(Cryo::IntegerType *integer_type);
+
+        /**
+         * @brief Map float type to LLVM float type
+         * @param float_type Float type
+         * @return LLVM float type
+         */
+        llvm::Type *map_float_type(Cryo::FloatType *float_type);
 
         /**
          * @brief Map struct type to LLVM struct type
-         * @param struct_decl Struct declaration node
+         * @param struct_type Struct type
          * @return LLVM struct type
          */
-        llvm::StructType *map_struct_type(Cryo::StructDeclarationNode *struct_decl);
+        llvm::Type *map_struct_type(Cryo::StructType *struct_type);
 
         /**
-         * @brief Map class type to LLVM struct type (with vtable if needed)
-         * @param class_decl Class declaration node
+         * @brief Map class type to LLVM struct type
+         * @param class_type Class type
          * @return LLVM struct type
          */
-        llvm::StructType *map_class_type(Cryo::ClassDeclarationNode *class_decl);
+        llvm::Type *map_class_type(Cryo::ClassType *class_type);
 
         /**
          * @brief Map enum type to LLVM type
-         * @param enum_decl Enum declaration node
-         * @return LLVM integer or struct type depending on enum style
+         * @param enum_type Enum type
+         * @return LLVM integer or struct type
          */
-        llvm::Type *map_enum_type(Cryo::EnumDeclarationNode *enum_decl);
+        llvm::Type *map_enum_type(Cryo::EnumType *enum_type);
 
         /**
-         * @brief Map generic type instance
-         * @param generic_type Generic type declaration
-         * @param type_args Type arguments for instantiation
-         * @return Instantiated LLVM type
+         * @brief Map optional type to LLVM type
+         * @param optional_type Optional type
+         * @return LLVM type for optional
          */
-        llvm::Type *map_generic_type(Cryo::Type *generic_type,
-                                     const std::vector<Cryo::Type *> &type_args);
-
-        /**
-         * @brief Map generic type instantiation from string
-         * @param type_name String like "GenericStruct<int>"
-         * @return Instantiated LLVM type
-         */
-        llvm::Type *map_generic_instantiation(const std::string &type_name);
-
-        /**
-         * @brief Create generic struct instantiation
-         * @param base_name Base generic type name
-         * @param type_args Type arguments
-         * @param instantiated_name Full instantiated name
-         * @return Instantiated LLVM struct type
-         */
-        llvm::Type *create_generic_struct_instantiation(const std::string &base_name,
-                                                        const std::vector<std::string> &type_args,
-                                                        const std::string &instantiated_name);
-
-        /**
-         * @brief Register field metadata for generic instantiation
-         * @param type_name Instantiated type name
-         * @param field_name Field name
-         * @param field_index Field index
-         * @param field_type LLVM field type
-         */
-        void register_generic_field_metadata(const std::string &type_name,
-                                             const std::string &field_name,
-                                             int field_index,
-                                             llvm::Type *field_type);
-
-        //===================================================================
-        // Pointer and Reference Types
-        //===================================================================
-
-        /**
-         * @brief Map pointer type
-         * @param pointee_type Type being pointed to
-         * @return LLVM pointer type
-         */
-        llvm::PointerType *map_pointer_type(Cryo::Type *pointee_type);
-
-        /**
-         * @brief Map reference type (implemented as pointer in LLVM)
-         * @param referenced_type Type being referenced
-         * @return LLVM pointer type
-         */
-        llvm::PointerType *map_reference_type(Cryo::Type *referenced_type);
+        llvm::Type *map_optional_type(Cryo::OptionalType *optional_type);
 
         //===================================================================
         // Type Information and Utilities
@@ -326,20 +310,6 @@ namespace Cryo::Codegen
          */
         int get_field_index(const std::string &type_name, const std::string &field_name);
 
-        /**
-         * @brief Register all fields from a struct declaration
-         * @param struct_decl Struct declaration node
-         * @param llvm_struct_type The corresponding LLVM struct type
-         */
-        void register_struct_fields(Cryo::StructDeclarationNode *struct_decl, llvm::StructType *llvm_struct_type);
-
-        /**
-         * @brief Register all fields from a class declaration
-         * @param class_decl Class declaration node
-         * @param llvm_class_type The corresponding LLVM struct type
-         */
-        void register_class_fields(Cryo::ClassDeclarationNode *class_decl, llvm::StructType *llvm_class_type);
-
         //===================================================================
         // Error Handling
         //===================================================================
@@ -363,6 +333,22 @@ namespace Cryo::Codegen
             _has_errors = false;
             _last_error.clear();
         }
+
+        //===================================================================
+        // AST Node Integration
+        //===================================================================
+
+        /**
+         * @brief Register AST class declaration node for field metadata
+         * @param class_node Class declaration node containing field information
+         */
+        void register_class_ast_node(Cryo::ClassDeclarationNode *class_node);
+
+        /**
+         * @brief Register AST struct declaration node for field metadata
+         * @param struct_node Struct declaration node containing field information
+         */
+        void register_struct_ast_node(Cryo::StructDeclarationNode *struct_node);
 
         //===================================================================
         // Generic Type Definition System
@@ -426,6 +412,7 @@ namespace Cryo::Codegen
         //===================================================================
 
         LLVMContextManager &_context_manager;
+        Cryo::TypeContext *_type_context;
 
         // Type cache
         std::unordered_map<std::string, llvm::Type *> _type_cache;
@@ -440,6 +427,10 @@ namespace Cryo::Codegen
 
         // Registry of generic type definitions
         std::unordered_map<std::string, GenericTypeDef> _generic_type_registry;
+
+        // AST node storage for field information
+        std::unordered_map<std::string, Cryo::ClassDeclarationNode *> _class_ast_nodes;
+        std::unordered_map<std::string, Cryo::StructDeclarationNode *> _struct_ast_nodes;
 
         // Error state
         bool _has_errors;
