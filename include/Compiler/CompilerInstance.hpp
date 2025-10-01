@@ -7,6 +7,8 @@
 #include "AST/ASTNode.hpp"
 #include "AST/ASTDumper.hpp"
 #include "AST/TypeChecker.hpp"
+#include "AST/MonomorphizationPass.hpp"
+#include "AST/TemplateRegistry.hpp"
 #include "GDM/GDM.hpp"
 #include "Codegen/CodeGenerator.hpp"
 #include "Linker/CryoLinker.hpp"
@@ -36,6 +38,8 @@ namespace Cryo
         std::unique_ptr<SymbolTable> _symbol_table;
         std::unique_ptr<DiagnosticManager> _diagnostic_manager;
         std::unique_ptr<TypeChecker> _type_checker;
+        std::unique_ptr<MonomorphizationPass> _monomorphization_pass;
+        std::unique_ptr<TemplateRegistry> _template_registry;
         std::unique_ptr<Cryo::Codegen::CodeGenerator> _codegen;
         std::unique_ptr<Cryo::Linker::CryoLinker> _linker;
 

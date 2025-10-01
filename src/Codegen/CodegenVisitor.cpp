@@ -1,5 +1,6 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "AST/ASTNode.hpp"
+#include "AST/TemplateRegistry.hpp"
 #include "Lexer/lexer.hpp"
 #include "Utils/ModuleLoader.hpp"
 #include <llvm/IR/Module.h>
@@ -255,125 +256,10 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::ImportDeclarationNode &node)
     {
-        try
-        {
-            std::cout << "[DEBUG] Processing import declaration: " << node.path();
-
-            if (node.has_alias())
-            {
-                std::cout << " as " << node.alias();
-            }
-
-            std::cout << " (type: ";
-            if (node.import_type() == ImportDeclarationNode::ImportType::Relative)
-            {
-                std::cout << "relative";
-            }
-            else if (node.import_type() == ImportDeclarationNode::ImportType::Absolute)
-            {
-                std::cout << "absolute";
-            }
-            std::cout << ")" << std::endl;
-
-            // Create a ModuleLoader instance for this import
-            ModuleLoader loader(_symbol_table);
-
-            // Set stdlib root to default location
-            loader.set_stdlib_root("./stdlib");
-
-            // Set current file directory (for relative imports)
-            // TODO: This should be passed from the compilation context
-            loader.set_current_file("./test/");
-
-            // Load the import
-            auto result = loader.load_import(node);
-
-            if (result.success)
-            {
-                std::cout << "[INFO] Successfully loaded import '" << node.path() << "'" << std::endl;
-                std::cout << "[INFO] Found " << result.exported_symbols.size() << " exported symbols: ";
-
-                for (size_t i = 0; i < result.exported_symbols.size(); ++i)
-                {
-                    if (i > 0)
-                        std::cout << ", ";
-                    std::cout << result.exported_symbols[i];
-                }
-                std::cout << std::endl;
-
-                // Skip full codegen for imported modules to avoid symbol duplication
-                if (_stdlib_compilation_mode)
-                {
-                    std::cout << "[INFO] Skipping full codegen for imported module in stdlib mode: " << node.path() << " (avoiding symbol duplication in stdlib compilation)" << std::endl;
-                }
-                else
-                {
-                    std::cout << "[INFO] Skipping full codegen for imported module: " << node.path() << " (avoiding symbol duplication)" << std::endl;
-                }
-
-                // NOTE: We skip full codegen for imported modules to avoid symbol duplication.
-                // The imported module will be compiled separately and linked later.
-                // We only need the symbol information for type checking and forward declarations,
-                // which is handled by the symbol registration below.
-
-                // Register the symbols in the namespace
-                std::string namespace_name = node.has_alias() ? node.alias() : result.module_name;
-
-                if (!result.symbol_map.empty())
-                {
-                    // Register the namespace and symbols in the main symbol table
-                    _symbol_table.register_namespace(namespace_name, result.symbol_map);
-
-                    std::cout << "[INFO] Registered namespace '" << namespace_name << "' with "
-                              << result.symbol_map.size() << " symbols in main symbol table" << std::endl;
-
-                    for (const auto &[symbol_name, symbol] : result.symbol_map)
-                    {
-                        std::cout << "[INFO] - " << symbol_name << " ("
-                                  << (symbol.kind == SymbolKind::Function ? "function" : "other") << ")" << std::endl;
-                    }
-                }
-                else
-                {
-                    // Fallback for when symbol_map is empty but we have exported_symbols
-                    // Create symbols with basic information
-                    std::unordered_map<std::string, Symbol> symbol_map;
-                    for (const auto &symbol_name : result.exported_symbols)
-                    {
-                        // Create a basic function symbol - we'll assume functions for now
-                        Symbol symbol(symbol_name, SymbolKind::Function, SourceLocation(), nullptr, namespace_name);
-                        symbol_map[symbol_name] = symbol;
-                        std::cout << "[INFO] Created basic symbol: " << symbol_name << std::endl;
-                    }
-
-                    if (!symbol_map.empty())
-                    {
-                        _symbol_table.register_namespace(namespace_name, symbol_map);
-                        std::cout << "[INFO] Registered basic namespace '" << namespace_name << "' with "
-                                  << symbol_map.size() << " symbols" << std::endl;
-                    }
-                }
-
-                // If there's an alias, handle namespace mapping
-                if (node.has_alias())
-                {
-                    std::cout << "[INFO] Setting up namespace alias: " << node.alias() << std::endl;
-                    // TODO: Implement namespace aliasing
-                }
-
-                std::cout << "[DEBUG] Import processing completed successfully" << std::endl;
-            }
-            else
-            {
-                std::cout << "[ERROR] Failed to load import '" << node.path() << "': "
-                          << result.error_message << std::endl;
-                report_error("Import failed: " + result.error_message, &node);
-            }
-        }
-        catch (const std::exception &e)
-        {
-            report_error("Exception in import declaration: " + std::string(e.what()), &node);
-        }
+        // Import declarations should already be processed during the analysis phase
+        // Skip processing during codegen to avoid double-processing and memory issues
+        std::cout << "[DEBUG] Skipping import declaration during codegen: " << node.path() << std::endl;
+        return;
     }
 
     void CodegenVisitor::visit(Cryo::VariableDeclarationNode &node)
@@ -610,6 +496,15 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::ClassDeclarationNode &node)
     {
         std::cout << "[CodegenVisitor] Visiting ClassDeclarationNode: " << node.name() << std::endl;
+
+        // Check if this is a generic class template
+        if (!node.generic_parameters().empty())
+        {
+            std::cout << "[DEBUG] Skipping code generation for generic class template: " << node.name() 
+                      << " (has " << node.generic_parameters().size() << " generic parameters)" << std::endl;
+            std::cout << "[DEBUG] Generic classes like " << node.name() << "<T> will be handled when instantiated with concrete types" << std::endl;
+            return;
+        }
 
         // Register AST node with TypeMapper for field metadata
         _type_mapper->register_class_ast_node(&node);

@@ -8,6 +8,7 @@
 
 #include "AST/ASTNode.hpp"
 #include "AST/SymbolTable.hpp"
+#include "AST/TemplateRegistry.hpp"
 
 namespace Cryo
 {
@@ -37,9 +38,13 @@ namespace Cryo
         std::unordered_map<std::string, ImportResult> _loaded_modules; // Cache of loaded modules
         std::unordered_set<std::string> _loading_modules;              // Track modules currently being loaded (cycle detection)
         SymbolTable &_symbol_table;                                    // Reference to main symbol table
+        TemplateRegistry &_template_registry;                          // Reference to template registry for cross-module templates
+        
+        // Storage for imported ASTs to keep them alive for template registration
+        std::unordered_map<std::string, std::unique_ptr<ProgramNode>> _imported_asts;
 
     public:
-        explicit ModuleLoader(SymbolTable &symbol_table);
+        explicit ModuleLoader(SymbolTable &symbol_table, TemplateRegistry &template_registry);
         ~ModuleLoader() = default;
 
         /**
@@ -97,6 +102,13 @@ namespace Cryo
          * @return Map of symbol names to Symbol objects with full information
          */
         std::unordered_map<std::string, Symbol> create_symbol_map(const ProgramNode &ast, const std::string &module_name);
+
+        /**
+         * @brief Register generic templates from a module's AST into the template registry
+         * @param ast The parsed AST of the module
+         * @param module_name Name of the module/namespace for debugging
+         */
+        void register_templates_from_ast(const ProgramNode &ast, const std::string &module_name);
 
         /**
          * @brief Create a FunctionType from a FunctionDeclarationNode
