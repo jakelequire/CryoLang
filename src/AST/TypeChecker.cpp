@@ -639,6 +639,64 @@ namespace Cryo
         return std::vector<std::string>(context.parameters.begin(), context.parameters.end());
     }
 
+    std::vector<std::string> TypeChecker::parse_template_arguments(const std::string& args_str)
+    {
+        std::vector<std::string> result;
+        if (args_str.empty()) {
+            return result;
+        }
+
+        std::string current_arg;
+        int bracket_depth = 0;
+        
+        for (size_t i = 0; i < args_str.length(); ++i) {
+            char c = args_str[i];
+            
+            if (c == '<') {
+                bracket_depth++;
+                current_arg += c;
+            } else if (c == '>') {
+                bracket_depth--;
+                current_arg += c;
+            } else if (c == ',' && bracket_depth == 0) {
+                // Found a top-level comma - this separates arguments
+                std::string trimmed_arg = current_arg;
+                // Trim whitespace
+                size_t start = trimmed_arg.find_first_not_of(" \t");
+                size_t end = trimmed_arg.find_last_not_of(" \t");
+                if (start != std::string::npos && end != std::string::npos) {
+                    trimmed_arg = trimmed_arg.substr(start, end - start + 1);
+                } else if (start != std::string::npos) {
+                    trimmed_arg = trimmed_arg.substr(start);
+                }
+                
+                if (!trimmed_arg.empty()) {
+                    result.push_back(trimmed_arg);
+                }
+                current_arg.clear();
+            } else {
+                current_arg += c;
+            }
+        }
+        
+        // Add the last argument
+        std::string trimmed_arg = current_arg;
+        // Trim whitespace
+        size_t start = trimmed_arg.find_first_not_of(" \t");
+        size_t end = trimmed_arg.find_last_not_of(" \t");
+        if (start != std::string::npos && end != std::string::npos) {
+            trimmed_arg = trimmed_arg.substr(start, end - start + 1);
+        } else if (start != std::string::npos) {
+            trimmed_arg = trimmed_arg.substr(start);
+        }
+        
+        if (!trimmed_arg.empty()) {
+            result.push_back(trimmed_arg);
+        }
+        
+        return result;
+    }
+
     Type* TypeChecker::resolve_type_with_generic_context(const std::string& type_string)
     {
         // First check if this is a generic parameter
@@ -670,11 +728,15 @@ namespace Cryo
                 } else if (!is_in_generic_context()) {
                     // Only track concrete instantiations when we're NOT defining a generic type
                     // This prevents tracking during template definition parsing
-                    std::vector<std::string> concrete_types;
-                    concrete_types.push_back(type_args_str); // For now, handle single argument types
+                    std::vector<std::string> concrete_types = parse_template_arguments(type_args_str);
                     
                     std::cout << "[DEBUG] TypeChecker: Tracking concrete instantiation: " << type_string 
                               << " (base: " << base_type << ", args: " << type_args_str << ")" << std::endl;
+                    std::cout << "[DEBUG] TypeChecker: Parsed " << concrete_types.size() << " concrete types:";
+                    for (const auto& type : concrete_types) {
+                        std::cout << " '" << type << "'";
+                    }
+                    std::cout << std::endl;
                     
                     track_instantiation(base_type, concrete_types, type_string, SourceLocation{});
                 }

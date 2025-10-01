@@ -731,8 +731,22 @@ namespace Cryo::Codegen
             variant_names.push_back(variant->name());
         }
 
+        std::cout << "[DEBUG] Processing enum: " << node.name() << std::endl;
+        std::cout << "[DEBUG] Enum has " << node.variants().size() << " variants" << std::endl;
+        std::cout << "[DEBUG] node.is_simple_enum() = " << node.is_simple_enum() << std::endl;
+        
+        // Check each variant
+        for (const auto &variant : node.variants())
+        {
+            std::cout << "[DEBUG] Variant: " << variant->name() 
+                      << " has " << variant->associated_types().size() << " associated types"
+                      << " is_simple_variant: " << variant->is_simple_variant() << std::endl;
+        }
+
         Cryo::EnumType *cryo_enum_type = static_cast<Cryo::EnumType *>(
             _symbol_table.get_type_context()->get_enum_type(node.name(), std::move(variant_names), node.is_simple_enum()));
+        
+        std::cout << "[DEBUG] Created EnumType, is_simple_enum(): " << cryo_enum_type->is_simple_enum() << std::endl;
         llvm::Type *enum_type = _type_mapper->map_enum_type(cryo_enum_type);
         if (!enum_type)
         {
@@ -5803,19 +5817,35 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
+        // Debug: Print the type information
+        std::cout << "[CodegenVisitor] DEBUG: enum_value type is pointer: " << enum_value->getType()->isPointerTy() << std::endl;
+        std::cout << "[CodegenVisitor] DEBUG: enum_value type is struct: " << enum_value->getType()->isStructTy() << std::endl;
+
         // Check if enum_value is a pointer or a value
         if (enum_value->getType()->isPointerTy())
         {
             // It's a pointer to an enum struct - load the discriminant field
-            llvm::Value *discriminant_ptr = builder.CreateStructGEP(
-                nullptr, // Let LLVM infer the type
-                enum_value,
-                0,
+            // For tagged union: { i32 discriminant, [N x i8] payload }
+            // We need to access the first field (discriminant)
+            
+            // Try to get the pointed-to type first to understand what we're dealing with
+            std::cout << "[CodegenVisitor] DEBUG: enum_value type: " << enum_value->getType() << std::endl;
+            
+            // For now, let's use a simpler approach - load the first 32 bits as discriminant
+            // Cast to a byte pointer and load as i32
+            llvm::Value *i8_ptr = builder.CreateBitCast(
+                enum_value, 
+                llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0),
+                "enum_i8_ptr");
+            
+            llvm::Value *i32_ptr = builder.CreateBitCast(
+                i8_ptr,
+                llvm::PointerType::get(llvm::Type::getInt32Ty(context), 0),
                 "discriminant_ptr");
 
             llvm::Value *discriminant = builder.CreateLoad(
                 llvm::Type::getInt32Ty(context),
-                discriminant_ptr,
+                i32_ptr,
                 "discriminant");
 
             std::cout << "[CodegenVisitor] Extracted discriminant from enum pointer" << std::endl;
@@ -5823,13 +5853,38 @@ namespace Cryo::Codegen
         }
         else
         {
-            // It's a value - extract the discriminant directly
+            std::cout << "[CodegenVisitor] DEBUG: Processing enum struct value" << std::endl;
+            
+            // Debug: Print the actual LLVM type
+            std::string type_str;
+            llvm::raw_string_ostream os(type_str);
+            enum_value->getType()->print(os);
+            std::cout << "[CodegenVisitor] DEBUG: enum_value LLVM type: " << os.str() << std::endl;
+            
+            // Check if it's actually a struct type
+            if (!enum_value->getType()->isStructTy()) {
+                std::cout << "[CodegenVisitor] ERROR: Expected struct type but got something else!" << std::endl;
+                return nullptr;
+            }
+            
+            llvm::StructType *struct_type = llvm::cast<llvm::StructType>(enum_value->getType());
+            std::cout << "[CodegenVisitor] DEBUG: Struct has " << struct_type->getNumElements() << " elements" << std::endl;
+            
+            // Check if this is an empty struct (indicates enum wasn't properly constructed)
+            if (struct_type->getNumElements() == 0) {
+                std::cout << "[CodegenVisitor] ERROR: Empty struct - enum type not properly constructed!" << std::endl;
+                std::cout << "[CodegenVisitor] ERROR: Expected tagged union with discriminant field" << std::endl;
+                // Return a default discriminant value to prevent crash
+                return llvm::ConstantInt::get(llvm::Type::getInt32Ty(_context_manager.get_context()), 0);
+            }
+            
+            // It's a struct value - extract the discriminant directly
             llvm::Value *discriminant = builder.CreateExtractValue(
                 enum_value,
                 {0},
                 "discriminant");
 
-            std::cout << "[CodegenVisitor] Extracted discriminant from enum value" << std::endl;
+            std::cout << "[CodegenVisitor] Extracted discriminant from enum struct value" << std::endl;
             return discriminant;
         }
     }
@@ -5905,6 +5960,34 @@ namespace Cryo::Codegen
 
         std::cout << "[CodegenVisitor] Extracting pattern bindings for " << pattern->variant_name() << std::endl;
 
+        // Check if the enum type is properly constructed
+        llvm::Type *enum_type = enum_value->getType();
+        bool is_empty_enum = false;
+        
+        // For modern LLVM with opaque pointers, we need to be careful about type checking
+        if (enum_type->isPointerTy())
+        {
+            // We can't directly get the pointed-to type with opaque pointers
+            // Instead, we'll check during the actual operation below
+            std::cout << "[CodegenVisitor] Enum value is pointer type (opaque pointer)" << std::endl;
+        }
+        else if (enum_type->isStructTy())
+        {
+            auto struct_type = llvm::cast<llvm::StructType>(enum_type);
+            if (struct_type->getNumElements() == 0)
+            {
+                std::cout << "[CodegenVisitor] ERROR: Cannot extract pattern bindings - enum type is empty struct!" << std::endl;
+                std::cout << "[CodegenVisitor] Struct name: " << (struct_type->hasName() ? struct_type->getName().str() : "unnamed") << std::endl;
+                is_empty_enum = true;
+            }
+        }
+        
+        if (is_empty_enum)
+        {
+            std::cout << "[CodegenVisitor] Skipping pattern binding extraction for empty enum" << std::endl;
+            return; // Early return to prevent LLVM assertion
+        }
+
         // For now, we'll implement a basic version that extracts parameters
         // TODO: Implement proper payload extraction from tagged union
         const auto &bindings = pattern->bound_variables();
@@ -5920,10 +6003,20 @@ namespace Cryo::Codegen
         if (enum_value->getType()->isPointerTy())
         {
             // It's a pointer to an enum struct - get payload field pointer
-            llvm::Value *payload_ptr = builder.CreateStructGEP(
-                nullptr, // Let LLVM infer the type
-                enum_value,
-                1,
+            // For tagged union: { i32 discriminant, [N x i8] payload }
+            // The payload starts after the discriminant (4 bytes for i32)
+            
+            // Cast to i8* and offset by the size of the discriminant
+            llvm::Value *enum_i8_ptr = builder.CreateBitCast(
+                enum_value, 
+                llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0),
+                "enum_i8_ptr");
+                
+            llvm::Value *offset = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 4); // sizeof(i32)
+            llvm::Value *payload_ptr = builder.CreateInBoundsGEP(
+                llvm::Type::getInt8Ty(context),
+                enum_i8_ptr,
+                offset,
                 "payload_ptr");
             payload_value = payload_ptr;
         }
@@ -6251,7 +6344,7 @@ namespace Cryo::Codegen
         }
 
         // Get the base enum type from TypeContext to find its variants
-        Cryo::Type *base_enum_type = _symbol_table.get_type_context()->get_enum_type(base_name);
+        Cryo::Type *base_enum_type = _symbol_table.get_type_context()->lookup_enum_type(base_name);
         Cryo::EnumType *cryo_enum_type = dynamic_cast<Cryo::EnumType *>(base_enum_type);
 
         if (!cryo_enum_type)
