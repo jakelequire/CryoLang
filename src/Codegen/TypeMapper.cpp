@@ -338,6 +338,7 @@ namespace Cryo::Codegen
 
         // Check if we already have this struct type in cache
         std::string struct_name = struct_type->name();
+        std::cout << "[TypeMapper] map_struct_type called for: " << struct_name << std::endl;
 
         // Special case: if this looks like a parameterized type (e.g., Array<int>),
         // check if the monomorphized class (e.g., Array_int) is registered

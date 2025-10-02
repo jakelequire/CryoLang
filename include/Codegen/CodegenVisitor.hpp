@@ -278,6 +278,7 @@ namespace Cryo::Codegen
 
         // Primitive type context for method generation
         std::string current_primitive_type;                             // Track current primitive type being implemented
+        std::string current_struct_type;                                // Track current struct type being implemented
         std::set<Cryo::StructMethodNode *> processed_primitive_methods; // Track already processed primitive methods
 
         // Loop context for break/continue

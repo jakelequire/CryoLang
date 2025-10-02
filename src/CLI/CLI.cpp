@@ -356,25 +356,35 @@ namespace Cryo::CLI
             std::cout << "[INFO] Standard library compilation mode enabled" << std::endl;
         }
 
-        if (compiler->compile_file(file_path))
+        bool compilation_success = compiler->compile_file(file_path);
+        
+        if (compilation_success)
         {
             std::cout << "\nCompilation successful!" << std::endl;
+        }
+        else
+        {
+            std::cerr << "\n❌ Compilation failed!" << std::endl;
+        }
 
-            // Show outputs based on requested flags
-            // Note: AST is already shown before IR generation if --ast flag was used
+        // Show outputs based on requested flags - regardless of compilation success
+        // This is useful for debugging, especially when IR generation fails
+        
+        if (args.show_symbols() && compilation_success)
+        {
+            std::cout << "\nSymbol Table:" << std::endl;
+            compiler->dump_symbol_table();
+            compiler->dump_type_table();
+        }
 
-            if (args.show_symbols())
-            {
-                std::cout << "\nSymbol Table:" << std::endl;
-                compiler->dump_symbol_table();
-                compiler->dump_type_table();
-            }
+        if (args.show_ir())
+        {
+            std::cout << "\nGenerated LLVM IR:" << std::endl;
+            compiler->dump_ir();
+        }
 
-            if (args.show_ir())
-            {
-                std::cout << "\nGenerated LLVM IR:" << std::endl;
-                compiler->dump_ir();
-            }
+        if (compilation_success)
+        {
 
             // Handle --emit-llvm flag to emit bitcode
             if (args.get_flag("emit-llvm"))
@@ -449,7 +459,6 @@ namespace Cryo::CLI
         }
         else
         {
-            std::cerr << "\n❌ Compilation failed!" << std::endl;
             compiler->print_diagnostics();
             return 1;
         }

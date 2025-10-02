@@ -150,6 +150,39 @@ namespace Cryo
         std::string generate_mangled_name(const std::string &base_name,
                                           const std::vector<std::string> &concrete_types);
 
+        /**
+         * Clone a method body with type substitution applied.
+         *
+         * @param original_body The original method body to clone
+         * @param type_substitutions Map from generic parameter to concrete type
+         * @return Cloned method body with type substitutions applied
+         */
+        std::unique_ptr<BlockStatementNode> clone_method_body_with_substitution(
+            BlockStatementNode *original_body,
+            const std::unordered_map<std::string, std::string> &type_substitutions);
+
+        /**
+         * Clone a statement with type substitution applied.
+         *
+         * @param original_statement The original statement to clone
+         * @param type_substitutions Map from generic parameter to concrete type
+         * @return Cloned statement with type substitutions applied
+         */
+        std::unique_ptr<StatementNode> clone_statement_with_substitution(
+            StatementNode *original_statement,
+            const std::unordered_map<std::string, std::string> &type_substitutions);
+
+        /**
+         * Clone an expression with type substitution applied.
+         *
+         * @param original_expr The original expression to clone
+         * @param type_substitutions Map from generic parameter to concrete type
+         * @return Cloned expression with type substitutions applied
+         */
+        std::unique_ptr<ExpressionNode> clone_expression_with_substitution(
+            ExpressionNode *original_expr,
+            const std::unordered_map<std::string, std::string> &type_substitutions);
+
         // Track generated specializations to avoid duplicates
         std::unordered_map<std::string, ASTNode *> _generated_specializations;
     };
