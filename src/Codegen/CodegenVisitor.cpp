@@ -350,9 +350,52 @@ namespace Cryo::Codegen
             }
 
             // Generate IR based on scope context
-            if (_current_function)
+            bool should_be_global = node.is_global() || !_current_function;
+
+            if (should_be_global)
+            {
+                // Global variable
+                std::cout << "[CodegenVisitor] Creating global variable: " << var_name << std::endl;
+                auto module = _context_manager.get_module();
+                if (!module)
+                {
+                    report_error("No module available for global variable: " + var_name);
+                    return;
+                }
+
+                llvm::Constant *initializer = nullptr;
+                if (node.has_initializer())
+                {
+                    // For now, only handle constant initializers for globals
+                    if (auto literal = dynamic_cast<Cryo::LiteralNode *>(node.initializer()))
+                    {
+                        node.initializer()->accept(*this);
+                        if (auto const_val = llvm::dyn_cast<llvm::Constant>(get_current_value()))
+                        {
+                            initializer = const_val;
+                        }
+                    }
+                }
+
+                if (!initializer)
+                {
+                    // Default zero initializer
+                    initializer = llvm::Constant::getNullValue(llvm_type);
+                }
+
+                auto global_var = new llvm::GlobalVariable(
+                    *module, llvm_type, false,
+                    llvm::GlobalValue::ExternalLinkage,
+                    initializer, var_name);
+
+                _globals[var_name] = global_var;
+                _global_types[var_name] = llvm_type; // Store the type for later access
+                register_value(&node, global_var);
+            }
+            else
             {
                 // Local variable in function
+                std::cout << "[CodegenVisitor] Creating local variable: " << var_name << std::endl;
                 llvm::AllocaInst *alloca = create_entry_block_alloca(
                     _current_function->function, llvm_type, var_name);
 
@@ -552,44 +595,6 @@ namespace Cryo::Codegen
                         }
                     }
                 }
-            }
-            else
-            {
-                // Global variable
-                auto module = _context_manager.get_module();
-                if (!module)
-                {
-                    report_error("No module available for global variable: " + var_name);
-                    return;
-                }
-
-                llvm::Constant *initializer = nullptr;
-                if (node.has_initializer())
-                {
-                    // For now, only handle constant initializers for globals
-                    if (auto literal = dynamic_cast<Cryo::LiteralNode *>(node.initializer()))
-                    {
-                        node.initializer()->accept(*this);
-                        if (auto const_val = llvm::dyn_cast<llvm::Constant>(get_current_value()))
-                        {
-                            initializer = const_val;
-                        }
-                    }
-                }
-
-                if (!initializer)
-                {
-                    // Default zero initializer
-                    initializer = llvm::Constant::getNullValue(llvm_type);
-                }
-
-                auto global_var = new llvm::GlobalVariable(
-                    *module, llvm_type, false,
-                    llvm::GlobalValue::ExternalLinkage,
-                    initializer, var_name);
-
-                _globals[var_name] = global_var;
-                register_value(&node, global_var);
             }
         }
         catch (const std::exception &e)
@@ -4002,7 +4007,28 @@ namespace Cryo::Codegen
                 {
                     // Look up the variable in the current scope
                     std::string var_name = left_identifier->name();
-                    llvm::Value *var_alloca = _value_context->get_alloca(var_name);
+                    llvm::Value *var_alloca = nullptr;
+
+                    // First try local scope
+                    if (_value_context)
+                    {
+                        var_alloca = _value_context->get_alloca(var_name);
+                        if (var_alloca)
+                        {
+                            std::cout << "[CodegenVisitor] Found local variable for assignment: " << var_name << std::endl;
+                        }
+                    }
+
+                    // If not found in local scope, check global variables
+                    if (!var_alloca)
+                    {
+                        auto global_it = _globals.find(var_name);
+                        if (global_it != _globals.end())
+                        {
+                            var_alloca = global_it->second;
+                            std::cout << "[CodegenVisitor] Found global variable for assignment: " << var_name << std::endl;
+                        }
+                    }
 
                     if (!var_alloca)
                     {
