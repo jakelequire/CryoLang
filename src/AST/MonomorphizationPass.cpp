@@ -254,11 +254,19 @@ namespace Cryo
                     }
                 }
 
-                // TODO: Copy method body with type substitution (for now, copy as-is)
+                // Copy method body with type substitution
                 if (method->body())
                 {
-                    // For now, we'll skip copying the method body as it requires complex AST traversal
-                    // The method signature is the most important part for type checking
+                    auto cloned_body = clone_method_body_with_substitution(method->body(), type_substitutions);
+                    if (cloned_body)
+                    {
+                        specialized_method->set_body(std::move(cloned_body));
+                        std::cout << "[MonomorphizationPass] Copied method body for: " << method->name() << std::endl;
+                    }
+                    else
+                    {
+                        std::cout << "[MonomorphizationPass] WARNING: Failed to clone method body for: " << method->name() << std::endl;
+                    }
                 }
 
                 specialized->add_method(std::move(specialized_method));
@@ -313,25 +321,14 @@ namespace Cryo
             if (field)
             {
                 std::string original_type = field->type_annotation();
-                std::string substituted_type = original_type;
-
-                // Perform type substitution
-                for (const auto &[param, concrete] : type_substitutions)
-                {
-                    if (substituted_type == param)
-                    {
-                        substituted_type = concrete;
-                        std::cout << "[MonomorphizationPass] Field '" << field->name()
-                                  << "' type substituted: " << original_type << " -> " << substituted_type << std::endl;
-                        break;
-                    }
-                }
+                std::string substituted_type = substitute_type_in_string(original_type, type_substitutions);
 
                 // Create new field with substituted type
                 auto specialized_field = std::make_unique<StructFieldNode>(
                     field->location(),
                     field->name(),
-                    substituted_type);
+                    substituted_type,
+                    field->visibility());
 
                 specialized->add_field(std::move(specialized_field));
                 std::cout << "[MonomorphizationPass] Added field: " << field->name()
@@ -339,8 +336,72 @@ namespace Cryo
             }
         }
 
+        // Copy methods with type substitution (just like class specialization)
+        std::cout << "[MonomorphizationPass] Copying " << template_node.methods().size() << " methods from template" << std::endl;
+        for (const auto &method : template_node.methods())
+        {
+            if (method)
+            {
+                // Substitute return type
+                std::string original_return_type = method->return_type_annotation();
+                std::string substituted_return_type = substitute_type_in_string(original_return_type, type_substitutions);
+
+                // Create new method with substituted return type
+                auto specialized_method = std::make_unique<StructMethodNode>(
+                    method->location(),
+                    method->name(),
+                    substituted_return_type,
+                    method->visibility(),
+                    method->is_constructor(),
+                    method->is_static());
+
+                // Copy parameters with type substitution
+                for (const auto &param : method->parameters())
+                {
+                    if (param)
+                    {
+                        std::string original_param_type = param->type_annotation();
+                        std::string substituted_param_type = substitute_type_in_string(original_param_type, type_substitutions);
+
+                        auto specialized_param = std::make_unique<VariableDeclarationNode>(
+                            param->location(),
+                            param->name(),
+                            substituted_param_type,
+                            nullptr,
+                            param->is_mutable());
+
+                        specialized_method->add_parameter(std::move(specialized_param));
+                    }
+                }
+
+                // Clone method body with type substitution
+                if (method->body())
+                {
+                    std::cout << "[MonomorphizationPass] Cloning method body with " 
+                              << method->body()->statements().size() << " statements" << std::endl;
+                    auto cloned_body = clone_method_body_with_substitution(method->body(), type_substitutions);
+                    if (cloned_body)
+                    {
+                        specialized_method->set_body(std::move(cloned_body));
+                        std::cout << "[MonomorphizationPass] Successfully cloned method body with " 
+                                  << specialized_method->body()->statements().size() << " statements" << std::endl;
+                        std::cout << "[MonomorphizationPass] Copied method body for: " << method->name() << std::endl;
+                    }
+                    else
+                    {
+                        std::cout << "[MonomorphizationPass] WARNING: Failed to clone method body for: " << method->name() << std::endl;
+                    }
+                }
+
+                specialized->add_method(std::move(specialized_method));
+                std::cout << "[MonomorphizationPass] Added method: " << method->name() 
+                          << " -> " << substituted_return_type << std::endl;
+            }
+        }
+
         std::cout << "[MonomorphizationPass] Generated specialized struct: "
-                  << specialized->name() << " with " << specialized->fields().size() << " fields" << std::endl;
+                  << specialized->name() << " with " << specialized->fields().size() 
+                  << " fields and " << specialized->methods().size() << " methods" << std::endl;
 
         return specialized;
     }
@@ -666,5 +727,319 @@ namespace Cryo
         }
 
         return mangled.str();
+    }
+
+    std::unique_ptr<BlockStatementNode> MonomorphizationPass::clone_method_body_with_substitution(
+        BlockStatementNode *original_body,
+        const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        if (!original_body)
+        {
+            return nullptr;
+        }
+
+        std::cout << "[MonomorphizationPass] Cloning method body with " 
+                  << original_body->statements().size() << " statements" << std::endl;
+
+        // Create a new block statement
+        auto cloned_body = std::make_unique<BlockStatementNode>(original_body->location());
+
+        // Clone each statement in the body
+        for (const auto &statement : original_body->statements())
+        {
+            if (statement)
+            {
+                auto cloned_statement = clone_statement_with_substitution(statement.get(), type_substitutions);
+                if (cloned_statement)
+                {
+                    cloned_body->add_statement(std::move(cloned_statement));
+                }
+                else
+                {
+                    std::cout << "[MonomorphizationPass] WARNING: Failed to clone statement in method body" << std::endl;
+                }
+            }
+        }
+
+        std::cout << "[MonomorphizationPass] Successfully cloned method body with " 
+                  << cloned_body->statements().size() << " statements" << std::endl;
+
+        return cloned_body;
+    }
+
+    std::unique_ptr<StatementNode> MonomorphizationPass::clone_statement_with_substitution(
+        StatementNode *original_statement,
+        const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        if (!original_statement)
+        {
+            return nullptr;
+        }
+
+        // For now, we'll implement a basic cloning that handles the most common statement types
+        // This is a simplified implementation - a full implementation would need a visitor pattern
+
+        switch (original_statement->kind())
+        {
+            case NodeKind::DeclarationStatement:
+            {
+                auto *decl_stmt = static_cast<DeclarationStatementNode *>(original_statement);
+                auto *decl = decl_stmt->declaration();
+                
+                if (decl && decl->kind() == NodeKind::VariableDeclaration)
+                {
+                    auto *var_decl = static_cast<VariableDeclarationNode *>(decl);
+                    
+                    // Apply type substitution to the variable's type annotation
+                    std::string original_type = var_decl->type_annotation();
+                    std::string substituted_type = substitute_type_in_string(original_type, type_substitutions);
+                    
+                    auto cloned_var = std::make_unique<VariableDeclarationNode>(
+                        var_decl->location(),
+                        var_decl->name(),
+                        substituted_type,
+                        nullptr  // Skip initializer cloning for now
+                    );
+                    
+                    // Wrap in DeclarationStatementNode
+                    auto cloned_decl_stmt = std::make_unique<DeclarationStatementNode>(
+                        decl_stmt->location(),
+                        std::move(cloned_var)
+                    );
+                    
+                    return std::move(cloned_decl_stmt);
+                }
+                break;
+            }
+            
+            case NodeKind::ReturnStatement:
+            {
+                auto *return_stmt = static_cast<ReturnStatementNode *>(original_statement);
+                auto cloned_expr = clone_expression_with_substitution(return_stmt->expression(), type_substitutions);
+                auto cloned_return = std::make_unique<ReturnStatementNode>(return_stmt->location(), std::move(cloned_expr));
+                return std::move(cloned_return);
+            }
+            
+            case NodeKind::ExpressionStatement:
+            {
+                auto *expr_stmt = static_cast<ExpressionStatementNode *>(original_statement);
+                if (expr_stmt->expression())
+                {
+                    auto cloned_expr = clone_expression_with_substitution(expr_stmt->expression(), type_substitutions);
+                    if (cloned_expr)
+                    {
+                        auto cloned_stmt = std::make_unique<ExpressionStatementNode>(
+                            expr_stmt->location(),
+                            std::move(cloned_expr)
+                        );
+                        return std::move(cloned_stmt);
+                    }
+                }
+                break;
+            }
+
+            case NodeKind::IfStatement:
+            {
+                auto *if_stmt = static_cast<IfStatementNode *>(original_statement);
+                
+                // Clone condition
+                auto cloned_condition = clone_expression_with_substitution(if_stmt->condition(), type_substitutions);
+                if (!cloned_condition)
+                {
+                    break;
+                }
+                
+                // Clone then statement
+                auto cloned_then = clone_statement_with_substitution(if_stmt->then_statement(), type_substitutions);
+                if (!cloned_then)
+                {
+                    break;
+                }
+                
+                // Clone else statement (if it exists)
+                std::unique_ptr<StatementNode> cloned_else = nullptr;
+                if (if_stmt->else_statement())
+                {
+                    cloned_else = clone_statement_with_substitution(if_stmt->else_statement(), type_substitutions);
+                }
+                
+                return std::make_unique<IfStatementNode>(
+                    if_stmt->location(),
+                    std::move(cloned_condition),
+                    std::move(cloned_then),
+                    std::move(cloned_else)
+                );
+            }
+
+            // Add more statement types as needed
+            default:
+                std::cout << "[MonomorphizationPass] WARNING: Unsupported statement type for cloning: " 
+                          << static_cast<int>(original_statement->kind()) << std::endl;
+                break;
+        }
+
+        return nullptr;
+    }
+
+    std::unique_ptr<ExpressionNode> MonomorphizationPass::clone_expression_with_substitution(
+        ExpressionNode *original_expr,
+        const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        if (!original_expr)
+        {
+            return nullptr;
+        }
+
+        // Implement basic expression cloning - this is a simplified version
+        switch (original_expr->kind())
+        {
+            case NodeKind::Literal:
+            {
+                auto *literal = static_cast<LiteralNode *>(original_expr);
+                return std::make_unique<LiteralNode>(
+                    NodeKind::Literal, 
+                    literal->location(), 
+                    literal->value(), 
+                    literal->literal_kind()
+                );
+            }
+            
+            case NodeKind::Identifier:
+            {
+                auto *identifier = static_cast<IdentifierNode *>(original_expr);
+                return std::make_unique<IdentifierNode>(
+                    NodeKind::Identifier,
+                    identifier->location(), 
+                    identifier->name()
+                );
+            }
+
+            case NodeKind::BinaryExpression:
+            {
+                auto *binary_expr = static_cast<BinaryExpressionNode *>(original_expr);
+                
+                auto cloned_left = clone_expression_with_substitution(binary_expr->left(), type_substitutions);
+                auto cloned_right = clone_expression_with_substitution(binary_expr->right(), type_substitutions);
+                
+                if (cloned_left && cloned_right)
+                {
+                    return std::make_unique<BinaryExpressionNode>(
+                        NodeKind::BinaryExpression,
+                        binary_expr->location(),
+                        binary_expr->operator_token(),
+                        std::move(cloned_left),
+                        std::move(cloned_right)
+                    );
+                }
+                break;
+            }
+
+            case NodeKind::ArrayAccess:
+            {
+                auto *array_access = static_cast<ArrayAccessNode *>(original_expr);
+                
+                auto cloned_array = clone_expression_with_substitution(array_access->array(), type_substitutions);
+                auto cloned_index = clone_expression_with_substitution(array_access->index(), type_substitutions);
+                
+                if (cloned_array && cloned_index)
+                {
+                    return std::make_unique<ArrayAccessNode>(
+                        array_access->location(),
+                        std::move(cloned_array),
+                        std::move(cloned_index)
+                    );
+                }
+                break;
+            }
+
+            case NodeKind::MemberAccess:
+            {
+                auto *member_access = static_cast<MemberAccessNode *>(original_expr);
+                
+                auto cloned_object = clone_expression_with_substitution(member_access->object(), type_substitutions);
+                if (cloned_object)
+                {
+                    return std::make_unique<MemberAccessNode>(
+                        member_access->location(),
+                        std::move(cloned_object),
+                        member_access->member()
+                    );
+                }
+                break;
+            }
+
+            case NodeKind::CallExpression:
+            {
+                auto *call_expr = static_cast<CallExpressionNode *>(original_expr);
+                
+                // Clone the function/method being called
+                auto cloned_function = clone_expression_with_substitution(call_expr->callee(), type_substitutions);
+                if (!cloned_function)
+                {
+                    break;
+                }
+                
+                // Create new call expression
+                auto cloned_call = std::make_unique<CallExpressionNode>(
+                    call_expr->location(),
+                    std::move(cloned_function)
+                );
+                
+                // Clone arguments
+                for (const auto &arg : call_expr->arguments())
+                {
+                    if (arg)
+                    {
+                        auto cloned_arg = clone_expression_with_substitution(arg.get(), type_substitutions);
+                        if (cloned_arg)
+                        {
+                            cloned_call->add_argument(std::move(cloned_arg));
+                        }
+                    }
+                }
+                
+                return std::move(cloned_call);
+            }
+
+            case NodeKind::ScopeResolution:
+            {
+                auto *scope_res = static_cast<ScopeResolutionNode *>(original_expr);
+                
+                // For scope resolution (like Option<T>::None), we need to apply type substitutions
+                std::string scope_name = scope_res->scope_name();
+                std::string member_name = scope_res->member_name();
+                
+                // Apply type substitutions to the scope name
+                for (const auto &substitution : type_substitutions)
+                {
+                    // Replace template parameter in scope name
+                    size_t pos = 0;
+                    while ((pos = scope_name.find(substitution.first, pos)) != std::string::npos)
+                    {
+                        scope_name.replace(pos, substitution.first.length(), substitution.second);
+                        pos += substitution.second.length();
+                    }
+                }
+                
+                return std::make_unique<ScopeResolutionNode>(
+                    scope_res->location(),
+                    scope_name,
+                    member_name
+                );
+            }
+
+            // Add more expression types as needed (simplified for now)
+            default:
+                std::cout << "[MonomorphizationPass] WARNING: Unsupported expression type for cloning: " 
+                          << static_cast<int>(original_expr->kind()) << std::endl;
+                // For unsupported expressions, return a simple identifier as fallback
+                return std::make_unique<IdentifierNode>(
+                    NodeKind::Identifier,
+                    original_expr->location(), 
+                    "UNSUPPORTED_EXPR"
+                );
+        }
+
+        return nullptr;
     }
 }

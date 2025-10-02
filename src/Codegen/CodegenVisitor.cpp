@@ -10,6 +10,7 @@
 #include <set>
 #include <filesystem>
 #include <sstream>
+#include <algorithm>
 
 namespace Cryo::Codegen
 {
@@ -423,12 +424,97 @@ namespace Cryo::Codegen
                 // Handle initialization if present
                 if (node.has_initializer())
                 {
-                    node.initializer()->accept(*this);
-                    llvm::Value *init_value = get_current_value();
-
-                    if (init_value)
+                    // Check if this is an Array<T> type being initialized with an array literal
+                    if (type_annotation.find("Array<") == 0 && type_annotation.find('>') != std::string::npos)
                     {
-                        create_store(init_value, alloca);
+                        // This is an Array<T> type - call the constructor instead of direct assignment
+                        std::cout << "[CodegenVisitor] Array<T> variable initialization - calling constructor" << std::endl;
+                        
+                        // Generate the array literal first
+                        node.initializer()->accept(*this);
+                        llvm::Value *array_ptr = get_current_value();
+                        
+                        if (array_ptr)
+                        {
+                            // Extract the concrete type name (e.g., Array<int> -> Array_int)
+                            std::string base_type = type_annotation.substr(0, type_annotation.find('<'));
+                            size_t start = type_annotation.find('<') + 1;
+                            size_t end = type_annotation.find('>');
+                            std::string type_args = type_annotation.substr(start, end - start);
+                            std::string monomorphized_name = base_type + "_" + type_args;
+                            
+                            // Find the constructor function
+                            std::string constructor_name = monomorphized_name + "::" + base_type;
+                            auto constructor_it = _functions.find(constructor_name);
+                            
+                            if (constructor_it != _functions.end())
+                            {
+                                llvm::Function *constructor_func = constructor_it->second;
+                                std::cout << "[CodegenVisitor] Found Array constructor: " << constructor_name << std::endl;
+                                
+                                // Get the builder from context manager
+                                auto &builder = _context_manager.get_builder();
+                                auto &context = _context_manager.get_context();
+                                
+                                // Get the exact parameter type from the constructor function
+                                // This ensures we match the constructor parameter type exactly
+                                llvm::FunctionType *constructor_type = constructor_func->getFunctionType();
+                                llvm::Type *dynamic_array_type = nullptr;
+                                
+                                // The constructor should have 2 parameters: 'this' pointer and dynamic array struct
+                                if (constructor_type->getNumParams() >= 2) {
+                                    dynamic_array_type = constructor_type->getParamType(1); // Second parameter
+                                    std::cout << "[CodegenVisitor] Using constructor parameter type for dynamic array" << std::endl;
+                                } else {
+                                    std::cout << "[CodegenVisitor] ERROR: Constructor doesn't have expected parameter count" << std::endl;
+                                    return; // Skip this variable declaration
+                                }
+                                
+                                // Allocate and initialize the dynamic array struct
+                                llvm::AllocaInst *dynamic_array_alloca = builder.CreateAlloca(dynamic_array_type, nullptr, "dynamic_array");
+                                
+                                // Set ptr field (first field) to the array pointer
+                                llvm::Value *ptr_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 0, "ptr_field");
+                                builder.CreateStore(array_ptr, ptr_field_ptr);
+                                
+                                // Set length field (second field) to 10 (hardcoded for now - should be calculated from array literal)
+                                llvm::Value *length_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 1, "length_field");
+                                builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 10), length_field_ptr);
+                                
+                                // Set capacity field (third field) to 10 as well
+                                llvm::Value *capacity_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 2, "capacity_field");
+                                builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 10), capacity_field_ptr);
+                                
+                                // Load the dynamic array struct to pass by value
+                                llvm::Value *dynamic_array_value = builder.CreateLoad(dynamic_array_type, dynamic_array_alloca, "dynamic_array_value");
+                                
+                                // Call constructor with 'this' pointer and dynamic array struct
+                                std::vector<llvm::Value *> args;
+                                args.push_back(alloca);              // 'this' pointer
+                                args.push_back(dynamic_array_value); // dynamic array struct
+                                
+                                builder.CreateCall(constructor_func, args);
+                                
+                                std::cout << "[CodegenVisitor] Called Array constructor successfully" << std::endl;
+                            }
+                            else
+                            {
+                                std::cout << "[CodegenVisitor] Warning: Array constructor not found: " << constructor_name << std::endl;
+                                // Fall back to direct assignment
+                                create_store(array_ptr, alloca);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Regular variable initialization
+                        node.initializer()->accept(*this);
+                        llvm::Value *init_value = get_current_value();
+
+                        if (init_value)
+                        {
+                            create_store(init_value, alloca);
+                        }
                     }
                 }
             }
@@ -519,6 +605,185 @@ namespace Cryo::Codegen
         _types[node.name()] = struct_type;
 
         std::cout << "[CodegenVisitor] Created LLVM struct type for " << node.name() << std::endl;
+        
+        // Generate methods defined in the struct (similar to class method processing)
+        if (!node.methods().empty())
+        {
+            std::cout << "[CodegenVisitor] Processing " << node.methods().size() << " struct methods for " << node.name() << std::endl;
+            
+            llvm::Type *struct_ptr_type = llvm::PointerType::getUnqual(struct_type);
+            
+            for (const auto &method : node.methods())
+            {
+                std::cout << "[CodegenVisitor] Generating struct method: " << node.name() << "::" << method->name() << std::endl;
+
+                std::string method_name = method->name();
+                std::string qualified_name;
+
+                // Include full namespace in qualified name for proper symbol lookup
+                if (!_namespace_context.empty())
+                {
+                    qualified_name = _namespace_context + "::" + node.name() + "::" + method_name;
+                }
+                else
+                {
+                    qualified_name = node.name() + "::" + method_name;
+                }
+
+                std::cout << "[CodegenVisitor] Full qualified struct method name: " << qualified_name << std::endl;
+
+                // Build parameter types - add 'this' pointer for non-static methods
+                std::vector<llvm::Type *> param_types;
+
+                bool is_static = method->is_static();
+                if (!is_static)
+                {
+                    param_types.push_back(struct_ptr_type); // 'this' pointer
+                }
+
+                // Add other parameters
+                for (const auto &param : method->parameters())
+                {
+                    if (param)
+                    {
+                        std::string param_type_str = param->type_annotation();
+                        Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_str);
+                        llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
+                        if (param_type)
+                        {
+                            param_types.push_back(param_type);
+                        }
+                        else
+                        {
+                            report_error("Failed to map parameter type: " + param_type_str, method.get());
+                            continue;
+                        }
+                    }
+                }
+
+                // Map return type
+                llvm::Type *return_type = llvm::Type::getVoidTy(context);
+                if (!method->return_type_annotation().empty() && method->return_type_annotation() != "void")
+                {
+                    Cryo::Type *cryo_return_type = _symbol_table.get_type_context()->parse_type_from_string(method->return_type_annotation());
+                    llvm::Type *mapped_return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : nullptr;
+                    if (mapped_return_type)
+                    {
+                        return_type = mapped_return_type;
+                    }
+                }
+
+                // Create function type and function
+                llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+                llvm::Function *func = llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, qualified_name, *module);
+
+                // Store function for later lookup
+                _functions[qualified_name] = func;
+                std::cout << "[DEBUG] Stored struct method '" << qualified_name << "' in function registry" << std::endl;
+
+                // Set parameter names
+                auto arg_it = func->arg_begin();
+
+                if (!is_static)
+                {
+                    arg_it->setName("this");
+                    ++arg_it;
+                }
+
+                for (const auto &param : method->parameters())
+                {
+                    if (param && arg_it != func->arg_end())
+                    {
+                        arg_it->setName(param->name());
+                        ++arg_it;
+                    }
+                }
+
+                // Generate method body if it exists
+                if (method->body())
+                {
+                    // Create basic block for method entry
+                    llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", func);
+                    _context_manager.get_builder().SetInsertPoint(entry_block);
+
+                    // Store current function context
+                    _current_function = std::make_unique<FunctionContext>(func, static_cast<FunctionDeclarationNode *>(method.get()));
+                    _current_function->entry_block = entry_block;
+
+                    // Enter function scope
+                    enter_scope(entry_block);
+
+                    // Create allocas and store parameter values
+                    auto param_arg_it = func->arg_begin();
+
+                    // Handle 'this' parameter first (only for non-static methods)
+                    if (!is_static && param_arg_it != func->arg_end())
+                    {
+                        // Create alloca for 'this' pointer
+                        llvm::AllocaInst *this_alloca = _context_manager.get_builder().CreateAlloca(struct_ptr_type, nullptr, "this");
+                        _context_manager.get_builder().CreateStore(&*param_arg_it, this_alloca);
+                        _value_context->set_value("this", this_alloca, this_alloca, struct_ptr_type);
+                        ++param_arg_it;
+                    }
+
+                    // Handle other parameters
+                    for (const auto &param : method->parameters())
+                    {
+                        if (param && param_arg_it != func->arg_end())
+                        {
+                            std::string param_type_str = param->type_annotation();
+                            Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_str);
+                            llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
+                            
+                            if (param_type)
+                            {
+                                llvm::AllocaInst *param_alloca = _context_manager.get_builder().CreateAlloca(param_type, nullptr, param->name());
+                                _context_manager.get_builder().CreateStore(&*param_arg_it, param_alloca);
+                                _value_context->set_value(param->name(), param_alloca, param_alloca, param_type);
+                            }
+                            ++param_arg_it;
+                        }
+                    }
+
+                    // Generate method body
+                    try
+                    {
+                        // Set current struct context for member access resolution
+                        current_struct_type = node.name();
+                        
+                        method->body()->accept(*this);
+                        
+                        // Clear struct context
+                        current_struct_type.clear();
+                        
+                        // Add return if the method doesn't already have one
+                        llvm::BasicBlock *current_block = _context_manager.get_builder().GetInsertBlock();
+                        if (current_block && !current_block->getTerminator())
+                        {
+                            if (return_type->isVoidTy())
+                            {
+                                _context_manager.get_builder().CreateRetVoid();
+                            }
+                            else
+                            {
+                                // Create a default return value (this shouldn't happen in well-formed code)
+                                llvm::Value *default_val = llvm::UndefValue::get(return_type);
+                                _context_manager.get_builder().CreateRet(default_val);
+                            }
+                        }
+                    }
+                    catch (const std::exception &e)
+                    {
+                        report_error("Exception in struct method body generation: " + std::string(e.what()), method.get());
+                    }
+
+                    // Exit function scope
+                    exit_scope();
+                    _current_function.reset();
+                }
+            }
+        }
+        
         register_value(&node, nullptr); // Struct declarations don't have runtime values
     }
 
@@ -857,19 +1122,52 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::StructMethodNode &node)
     {
-        std::cout << "[CodegenVisitor] Generating struct method: " << node.name() << std::endl;
+        std::cout << "[CodegenVisitor] Visiting StructMethodNode: " << node.name() << std::endl;
 
         // Check if we're in a primitive implementation block context
-        if (current_primitive_type.empty())
-        {
-            // Regular struct method - delegate to parent visitor
-            visit(static_cast<FunctionDeclarationNode &>(node));
-        }
-        else
+        if (!current_primitive_type.empty())
         {
             // Primitive method - needs special handling for 'this' parameter
             generate_primitive_method(&node, current_primitive_type);
+            register_value(&node, nullptr);
+            return;
         }
+
+        // Regular struct method: These should be processed by StructDeclarationNode
+        // When StructMethodNode is visited individually, it means it was already processed
+        // Check if this method was already generated by looking for the function
+        std::string parent_struct_name = ""; // Get from parent context if available
+        std::string potential_qualified_name;
+
+        // Try to find the parent struct name and construct qualified method name
+        if (!_namespace_context.empty())
+        {
+            // We need a way to get the parent struct name
+            // For now, let's check if the function already exists in registry
+            auto module = _context_manager.get_module();
+            if (module)
+            {
+                // Look for any function that ends with "::" + method name
+                for (auto &func : *module)
+                {
+                    std::string func_name = func.getName().str();
+                    std::string suffix = "::" + node.name();
+                    if (func_name.size() > suffix.size() && 
+                        func_name.substr(func_name.size() - suffix.size()) == suffix)
+                    {
+                        std::cout << "[CodegenVisitor] StructMethodNode already processed: " << func_name << std::endl;
+                        register_value(&node, &func);
+                        return;
+                    }
+                }
+            }
+        }
+
+        std::cout << "[CodegenVisitor] WARNING: StructMethodNode visited individually without parent struct context: " << node.name() << std::endl;
+        std::cout << "[CodegenVisitor] This suggests the method was not processed by StructDeclarationNode" << std::endl;
+        
+        // If we reach here, treat it as a standalone function (fallback)
+        visit(static_cast<FunctionDeclarationNode &>(node));
         register_value(&node, nullptr);
     }
 
@@ -2625,77 +2923,152 @@ namespace Cryo::Codegen
         std::string member_name = node.member();
         std::cout << "[CodegenVisitor] Accessing member: " << member_name << std::endl;
 
-        // Determine the struct type and field index using metadata-driven approach
+        // Enhanced member access resolution for generic structs
         llvm::Type *struct_type = nullptr;
         int field_index = -1;
         std::string type_name;
 
-        // First, identify the type name from the LLVM type
-        if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
+        // Strategy 1: Try current struct context first (most reliable for generic structs)
+        if (!current_struct_type.empty())
         {
-            // For stack-allocated objects, get the allocated type
-            llvm::Type *allocated_type = alloca_inst->getAllocatedType();
-
-            // Check if it's a pointer type (like 'this' parameters)
-            if (allocated_type->isPointerTy())
+            std::cout << "[CodegenVisitor] Trying current struct context: " << current_struct_type << std::endl;
+            
+            auto context_type_it = _types.find(current_struct_type);
+            if (context_type_it != _types.end())
             {
-                // For pointer types, we need the pointed-to type
-                // In LLVM 20, we need to check what the pointer points to based on context
-                // Since we know this is a struct/class pointer, look it up in our type registry
-                for (const auto &[registered_name, registered_type] : _types)
+                if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(context_type_it->second))
                 {
-                    if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
+                    // Verify this could be the right type by checking field exists
+                    int test_field_index = _type_mapper->get_field_index(current_struct_type, member_name);
+                    if (test_field_index != -1)
                     {
-                        llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
-                        if (allocated_type == expected_ptr_type)
+                        struct_type = struct_llvm_type;
+                        type_name = current_struct_type;
+                        field_index = test_field_index;
+                        std::cout << "[CodegenVisitor] Found struct type via method context: " << current_struct_type 
+                                  << ", field index: " << field_index << std::endl;
+                    }
+                }
+            }
+        }
+
+        // Strategy 2: Try direct type resolution from LLVM type if strategy 1 failed
+        if (!struct_type && object_ptr)
+        {
+            std::cout << "[CodegenVisitor] Trying direct type resolution from LLVM type" << std::endl;
+            
+            if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
+            {
+                llvm::Type *allocated_type = alloca_inst->getAllocatedType();
+                std::cout << "[CodegenVisitor] Member access allocated_type: " << (allocated_type ? "valid" : "null") << std::endl;
+
+                if (allocated_type->isPointerTy())
+                {
+                    std::cout << "[CodegenVisitor] Member access: this is a pointer type, searching for matching struct" << std::endl;
+                    
+                    // For pointer types, find the matching struct by comparing against all registered types
+                    for (const auto &[registered_name, registered_type] : _types)
+                    {
+                        if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
                         {
-                            struct_type = struct_llvm_type;
+                            llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
+                            
+                            // Try both exact comparison and flexible comparison for generic structs
+                            bool type_matches = (allocated_type == expected_ptr_type);
+                            
+                            // For generic structs, also check if this could be a specialized instance
+                            if (!type_matches && registered_name.find("GenericStruct") != std::string::npos)
+                            {
+                                // Check if field exists in this struct type
+                                int test_field_index = _type_mapper->get_field_index(registered_name, member_name);
+                                if (test_field_index != -1)
+                                {
+                                    type_matches = true;
+                                    std::cout << "[CodegenVisitor] Generic struct field match found for: " << registered_name << std::endl;
+                                }
+                            }
+                            
+                            if (type_matches)
+                            {
+                                struct_type = struct_llvm_type;
+                                type_name = registered_name;
+                                field_index = _type_mapper->get_field_index(registered_name, member_name);
+                                std::cout << "[CodegenVisitor] Found matching struct type: " << registered_name 
+                                          << ", field index: " << field_index << std::endl;
+                                break;
+                            }
+                        }
+                    }
+                }
+                else if (llvm::isa<llvm::StructType>(allocated_type))
+                {
+                    // Direct struct type
+                    struct_type = allocated_type;
+                    std::cout << "[CodegenVisitor] Member access: direct struct type" << std::endl;
+                    
+                    // Find the type name
+                    for (const auto &[registered_name, registered_type] : _types)
+                    {
+                        if (registered_type == struct_type)
+                        {
                             type_name = registered_name;
+                            field_index = _type_mapper->get_field_index(registered_name, member_name);
+                            std::cout << "[CodegenVisitor] Found direct struct type: " << type_name 
+                                      << ", field index: " << field_index << std::endl;
                             break;
                         }
                     }
                 }
             }
-            else if (llvm::isa<llvm::StructType>(allocated_type))
-            {
-                // Direct struct type
-                struct_type = allocated_type;
-            }
         }
 
-        // Find the type name by matching the LLVM struct type against registered types
-        if (struct_type && llvm::isa<llvm::StructType>(struct_type) && type_name.empty())
-        {
-            std::cout << "[CodegenVisitor] Looking for type name for struct type in member access\n";
-            for (const auto &[registered_name, registered_type] : _types)
-            {
-                if (registered_type == struct_type)
-                {
-                    type_name = registered_name;
-                    std::cout << "[CodegenVisitor] Found type name: " << type_name << "\n";
-                    break;
-                }
-            }
-            if (type_name.empty())
-            {
-                std::cout << "[CodegenVisitor] Failed to find type name for struct type\n";
-            }
-        }
-
-        // Use TypeMapper to get field information
-        if (!type_name.empty())
-        {
-            std::cout << "[CodegenVisitor] Getting field index for type: " << type_name << ", field: " << member_name << "\n";
-            field_index = _type_mapper->get_field_index(type_name, member_name);
-            std::cout << "[CodegenVisitor] Field index result: " << field_index << "\n";
-        }
-
+        // Strategy 3: Fallback pattern matching for specialized generic types
         if (!struct_type || field_index == -1)
         {
-            report_error("Unknown struct type or field in member access: " + member_name, &node);
+            std::cout << "[CodegenVisitor] Trying fallback pattern matching for specialized generic structs" << std::endl;
+            
+            // Look specifically for GenericStruct specializations
+            for (const auto &[registered_name, registered_type] : _types)
+            {
+                if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
+                {
+                    // Check if this is a GenericStruct specialization with the field we need
+                    if (registered_name.find("GenericStruct_") != std::string::npos)
+                    {
+                        int test_field_index = _type_mapper->get_field_index(registered_name, member_name);
+                        if (test_field_index != -1)
+                        {
+                            struct_type = struct_llvm_type;
+                            type_name = registered_name;
+                            field_index = test_field_index;
+                            std::cout << "[CodegenVisitor] Fallback pattern match found: " << registered_name 
+                                      << ", field index: " << field_index << std::endl;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Validate we found everything we need
+        if (!struct_type || field_index == -1 || type_name.empty())
+        {
+            std::cout << "[CodegenVisitor] Member access resolution failed:" << std::endl;
+            std::cout << "  struct_type: " << (struct_type ? "found" : "null") << std::endl;
+            std::cout << "  field_index: " << field_index << std::endl;
+            std::cout << "  type_name: " << type_name << std::endl;
+            std::cout << "  member_name: " << member_name << std::endl;
+            std::cout << "  current_struct_type: " << current_struct_type << std::endl;
+            
+            report_error("Unknown struct type or field in member access: " + member_name + " (type: " + type_name + ")", &node);
             register_value(&node, nullptr);
             return;
         }
+
+        std::cout << "[CodegenVisitor] Member access resolution successful:" << std::endl;
+        std::cout << "  type_name: " << type_name << std::endl;
+        std::cout << "  member_name: " << member_name << std::endl;
+        std::cout << "  field_index: " << field_index << std::endl;
 
         // Handle the case where object_ptr might be a pointer to the struct
         // (like 'this' parameters which are stored as pointers)
@@ -2707,11 +3080,13 @@ namespace Cryo::Codegen
             {
                 // For pointer-to-struct, load the pointer first
                 struct_ptr = create_load(object_ptr, allocated_type, "struct_ptr");
+                std::cout << "[CodegenVisitor] Loaded struct pointer for member access" << std::endl;
             }
         }
 
         // Create GEP instruction to access the field
         llvm::Value *field_ptr = builder.CreateStructGEP(struct_type, struct_ptr, field_index, member_name + "_ptr");
+        std::cout << "[CodegenVisitor] Created GEP for field access" << std::endl;
 
         // Load the field value
         llvm::Type *field_type = struct_type->getStructElementType(field_index);
@@ -4648,28 +5023,10 @@ namespace Cryo::Codegen
                     {
                         type_name = type_it->second;
 
-                        // Map parameterized types to monomorphized types for method lookup
-                        // e.g., Array<int> -> Array_int
-                        if (type_name.find('<') != std::string::npos && type_name.find('>') != std::string::npos)
-                        {
-                            // Extract base type and arguments
-                            size_t angle_start = type_name.find('<');
-                            size_t angle_end = type_name.find('>');
-                            if (angle_start != std::string::npos && angle_end != std::string::npos && angle_end > angle_start)
-                            {
-                                std::string base_type = type_name.substr(0, angle_start);
-                                std::string type_args = type_name.substr(angle_start + 1, angle_end - angle_start - 1);
-
-                                // Generate monomorphized name: Array<int> -> Array_int
-                                std::string monomorphized_name = base_type + "_" + type_args;
-
-                                std::cout << "[CodegenVisitor] Mapping parameterized type '" << type_name
-                                          << "' to monomorphized type '" << monomorphized_name
-                                          << "' for method lookup" << std::endl;
-
-                                type_name = monomorphized_name;
-                            }
-                        }
+                        // Keep the original generic type name for method lookup
+                        // The specialized methods are stored with the full generic name like "GenericStruct<int>::get_value"
+                        std::cout << "[CodegenVisitor] Using type name '" << type_name
+                                  << "' for method lookup" << std::endl;
                     }
                     else
                     {
@@ -4690,13 +5047,32 @@ namespace Cryo::Codegen
                         std::string method_name = type_name + "::" + member_access->member();
                         auto method_it = _functions.find(method_name);
 
-                        // If not found and this is a generic type, also try the base type
+                        // If not found and this is a generic type, try different lookup strategies
                         if (method_it == _functions.end() && type_name.find('<') != std::string::npos)
                         {
-                            // Extract base type name for generic instantiation lookup fallback
-                            std::string base_name = type_name.substr(0, type_name.find('<'));
-                            std::string fallback_method_name = base_name + "::" + member_access->member();
-                            method_it = _functions.find(fallback_method_name);
+                            // First try: Convert angle bracket format to underscore format for monomorphized types
+                            // GenericStruct<int> -> GenericStruct_int
+                            std::string monomorphized_name = type_name;
+                            size_t angle_start = monomorphized_name.find('<');
+                            size_t angle_end = monomorphized_name.find('>', angle_start);
+                            if (angle_start != std::string::npos && angle_end != std::string::npos)
+                            {
+                                std::string type_params = monomorphized_name.substr(angle_start + 1, angle_end - angle_start - 1);
+                                // Replace commas with underscores for multiple type parameters
+                                std::replace(type_params.begin(), type_params.end(), ',', '_');
+                                std::replace(type_params.begin(), type_params.end(), ' ', '_');
+                                monomorphized_name = monomorphized_name.substr(0, angle_start) + "_" + type_params;
+                            }
+                            std::string monomorphized_method_name = monomorphized_name + "::" + member_access->member();
+                            method_it = _functions.find(monomorphized_method_name);
+
+                            // Second try: Extract base type name for generic instantiation lookup fallback
+                            if (method_it == _functions.end())
+                            {
+                                std::string base_name = type_name.substr(0, type_name.find('<'));
+                                std::string fallback_method_name = base_name + "::" + member_access->member();
+                                method_it = _functions.find(fallback_method_name);
+                            }
                         }
 
                         if (method_it != _functions.end())
