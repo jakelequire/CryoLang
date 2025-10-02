@@ -425,10 +425,24 @@ namespace Cryo::Codegen
                 if (node.has_initializer())
                 {
                     // Check if this is an Array<T> type being initialized with an array literal
+                    // This is a very special case to handle Array<T> construction
+                    // e.g., `const arr: Array<int> = [1, 2, 3];`
+                    // The constructor should be called with the array literal elements
+                    // 
+                    // This is a very special case and not generalizable to other types
+                    // so we hardcode the check for Array<T> here.
                     if (type_annotation.find("Array<") == 0 && type_annotation.find('>') != std::string::npos)
                     {
                         // This is an Array<T> type - call the constructor instead of direct assignment
                         std::cout << "[CodegenVisitor] Array<T> variable initialization - calling constructor" << std::endl;
+                        
+                        // Get the array literal size before generating it
+                        size_t array_literal_size = 0;
+                        if (auto *array_literal = dynamic_cast<Cryo::ArrayLiteralNode*>(node.initializer()))
+                        {
+                            array_literal_size = array_literal->size();
+                            std::cout << "[CodegenVisitor] Array literal has " << array_literal_size << " elements" << std::endl;
+                        }
                         
                         // Generate the array literal first
                         node.initializer()->accept(*this);
@@ -477,13 +491,13 @@ namespace Cryo::Codegen
                                 llvm::Value *ptr_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 0, "ptr_field");
                                 builder.CreateStore(array_ptr, ptr_field_ptr);
                                 
-                                // Set length field (second field) to 10 (hardcoded for now - should be calculated from array literal)
+                                // Set length field (second field) to the actual array literal size
                                 llvm::Value *length_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 1, "length_field");
-                                builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 10), length_field_ptr);
+                                builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size), length_field_ptr);
                                 
-                                // Set capacity field (third field) to 10 as well
+                                // Set capacity field (third field) to the same value as length initially
                                 llvm::Value *capacity_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 2, "capacity_field");
-                                builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 10), capacity_field_ptr);
+                                builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size), capacity_field_ptr);
                                 
                                 // Load the dynamic array struct to pass by value
                                 llvm::Value *dynamic_array_value = builder.CreateLoad(dynamic_array_type, dynamic_array_alloca, "dynamic_array_value");
@@ -2922,6 +2936,38 @@ namespace Cryo::Codegen
 
         std::string member_name = node.member();
         std::cout << "[CodegenVisitor] Accessing member: " << member_name << std::endl;
+
+        // Check if this is array length access (literal_elements.length)
+        if (member_name == "length" && object_ptr)
+        {
+            std::cout << "[CodegenVisitor] Checking for array length access" << std::endl;
+            
+            // Check if the object is a dynamic array type (T[])
+            if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
+            {
+                llvm::Type *allocated_type = alloca_inst->getAllocatedType();
+                
+                // Check if this is a dynamic array struct (has ptr, length, capacity fields)
+                if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(allocated_type))
+                {
+                    std::string type_name = struct_type->getName().str();
+                    if (type_name.find("dynamic_array") != std::string::npos)
+                    {
+                        std::cout << "[CodegenVisitor] Found dynamic array type for length access: " << type_name << std::endl;
+                        
+                        // Access the length field (field index 1)
+                        llvm::Value *length_field_ptr = builder.CreateStructGEP(struct_type, object_ptr, 1, "length_ptr");
+                        llvm::Type *length_type = struct_type->getStructElementType(1); // u64
+                        llvm::Value *length_value = create_load(length_field_ptr, length_type, "length_val");
+                        
+                        std::cout << "[CodegenVisitor] Successfully generated array length access" << std::endl;
+                        register_value(&node, length_value);
+                        set_current_value(length_value);
+                        return;
+                    }
+                }
+            }
+        }
 
         // Enhanced member access resolution for generic structs
         llvm::Type *struct_type = nullptr;
