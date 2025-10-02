@@ -13,6 +13,7 @@ namespace Cryo
     class TypeContext;
     class EnumType;
     class ParameterizedType;
+    class TemplateRegistry;
 
     // Type system enums and constants
     enum class TypeKind
@@ -820,6 +821,9 @@ namespace Cryo
         std::unordered_map<std::string, std::shared_ptr<EnumType>> _parameterized_enum_templates;
         std::unordered_map<std::string, std::unique_ptr<EnumLayout>> _enum_layout_templates;
 
+        // Global template registry access for AST-based analysis
+        TemplateRegistry *_global_template_registry = nullptr;
+
     public:
         TypeContext();
         ~TypeContext() = default;
@@ -884,6 +888,10 @@ namespace Cryo
                                          std::unique_ptr<EnumLayout> layout_template);
 
         std::shared_ptr<EnumType> get_parameterized_enum_template(const std::string &base_name);
+
+        // Template registry access for AST-based analysis
+        void set_global_template_registry(TemplateRegistry *registry) { _global_template_registry = registry; }
+        TemplateRegistry *get_global_template_registry() const { return _global_template_registry; }
 
         std::shared_ptr<ParameterizedType> instantiate_parameterized_enum(
             const std::string &base_name,
