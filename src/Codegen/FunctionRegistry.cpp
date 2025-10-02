@@ -88,7 +88,7 @@ namespace Cryo::Codegen
                                                            const std::string &resolved_namespace) const
     {
         FunctionMetadata metadata = get_function_metadata(function_name, resolved_namespace);
-        
+
         // Special handling for enum constructors
         if (metadata.category == FunctionCategory::StructFunction)
         {
@@ -97,22 +97,22 @@ namespace Cryo::Codegen
             if (scope_pos != std::string::npos)
             {
                 std::string enum_name = function_name.substr(0, scope_pos);
-                
+
                 // Look up if this is a parameterized enum type
                 // For cases like Result::Ok where we need Result<T,E>
                 // We can't determine the exact instantiation here, so we use a generic struct type
-                
+
                 // Create a simple struct type as placeholder - the actual type will be resolved
                 // when the enum constructor is generated
-                std::vector<llvm::Type*> fields = {
-                    llvm::Type::getInt1Ty(llvm_context),  // discriminant
-                    llvm::PointerType::get(llvm_context, 0)  // value field
+                std::vector<llvm::Type *> fields = {
+                    llvm::Type::getInt1Ty(llvm_context),    // discriminant
+                    llvm::PointerType::get(llvm_context, 0) // value field
                 };
-                
+
                 return llvm::StructType::get(llvm_context, fields);
             }
         }
-        
+
         return category_to_llvm_type(metadata.category, llvm_context);
     }
 
@@ -304,7 +304,7 @@ namespace Cryo::Codegen
         std::string enum_name = function_name.substr(0, scope_pos);
         std::string variant_name = function_name.substr(scope_pos + 2);
 
-        std::cout << "[FunctionRegistry] Checking enum constructor: " << enum_name 
+        std::cout << "[FunctionRegistry] Checking enum constructor: " << enum_name
                   << "::" << variant_name << std::endl;
 
         // Look up the enum type in the type context
@@ -325,10 +325,10 @@ namespace Cryo::Codegen
         // Check if the variant exists in the enum
         const auto &variants = cryo_enum_type->variants();
         bool variant_found = std::find(variants.begin(), variants.end(), variant_name) != variants.end();
-        
+
         if (!variant_found)
         {
-            std::cout << "[FunctionRegistry] Variant " << variant_name 
+            std::cout << "[FunctionRegistry] Variant " << variant_name
                       << " not found in enum " << enum_name << std::endl;
             return metadata; // Variant doesn't exist
         }

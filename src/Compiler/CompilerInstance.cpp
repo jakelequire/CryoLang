@@ -744,6 +744,7 @@ namespace Cryo
                                   << "' for module '" << result.module_name << "' with " << result.symbol_map.size() << " symbols" << std::endl;
 
                         current_scope->register_namespace(result.namespace_alias, result.symbol_map);
+                        _imported_namespaces.push_back(result.namespace_alias); // Track for enhanced resolution
                         std::cout << "[CompilerInstance] Registered namespace alias '" << result.namespace_alias << "' with "
                                   << result.symbol_map.size() << " symbols" << std::endl;
                     }
@@ -768,6 +769,7 @@ namespace Cryo
                     if (!result.symbol_map.empty())
                     {
                         current_scope->register_namespace(namespace_name, result.symbol_map);
+                        _imported_namespaces.push_back(namespace_name); // Track for enhanced resolution
                         std::cout << "[CompilerInstance] Registered namespace '" << namespace_name << "' with "
                                   << result.symbol_map.size() << " symbols" << std::endl;
                     }

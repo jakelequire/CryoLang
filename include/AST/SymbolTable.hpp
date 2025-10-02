@@ -53,6 +53,10 @@ namespace Cryo
         Symbol *lookup_namespaced_symbol_with_context(const std::string &namespace_name, const std::string &symbol_name, const std::string &current_namespace) const;
         Symbol *lookup_symbol_in_any_namespace(const std::string &symbol_name) const;
 
+        // Enhanced import resolution
+        Symbol *lookup_symbol_with_import_resolution(const std::string &symbol_name, const std::vector<std::string> &imported_namespaces) const;
+        Symbol *lookup_qualified_symbol_with_import_shortcuts(const std::string &qualified_name, const std::vector<std::string> &imported_namespaces) const;
+
         // Namespace management for imports
         void register_namespace(const std::string &namespace_name, const std::unordered_map<std::string, Symbol> &symbols);
         bool has_namespace(const std::string &namespace_name) const;

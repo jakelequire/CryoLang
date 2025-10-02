@@ -5299,14 +5299,14 @@ namespace Cryo::Codegen
         {
             std::string base_name = function_name.substr(0, early_scope_pos);
             std::string variant_name = function_name.substr(early_scope_pos + 2);
-            
+
             std::cout << "[CodegenVisitor] Early check: is " << function_name << " a template enum constructor? (base: " << base_name << ", variant: " << variant_name << ")" << std::endl;
-            
+
             // Check if base_name is a known template enum (like Result, Option)
             if (base_name == "Result" || base_name == "Option")
             {
                 std::cout << "[CodegenVisitor] Early detection: template enum constructor " << function_name << std::endl;
-                
+
                 // Try to find an existing instantiation that matches this call
                 std::string matching_instantiation;
                 std::cout << "[CodegenVisitor] Early: Looking for existing instantiations of " << base_name << " in _enum_variants:" << std::endl;
@@ -5320,11 +5320,11 @@ namespace Cryo::Codegen
                         break;
                     }
                 }
-                
+
                 if (!matching_instantiation.empty())
                 {
                     std::cout << "[CodegenVisitor] Early: Found matching instantiation: " << matching_instantiation << std::endl;
-                    
+
                     // Use the instantiated constructor
                     llvm::Value *constructor_func = _enum_variants[matching_instantiation];
                     if (auto *llvm_function = llvm::dyn_cast<llvm::Function>(constructor_func))
@@ -5349,47 +5349,58 @@ namespace Cryo::Codegen
                 else
                 {
                     std::cout << "[CodegenVisitor] Early: No matching instantiation found for " << function_name << std::endl;
-                    
+
                     // Prevent infinite recursion with a generation guard
                     static std::set<std::string> generating;
                     std::string guard_key = base_name + "::" + variant_name;
-                    
-                    if (generating.find(guard_key) != generating.end()) {
+
+                    if (generating.find(guard_key) != generating.end())
+                    {
                         std::cout << "[CodegenVisitor] Early: Already generating " << guard_key << ", avoiding recursion" << std::endl;
-                    } else {
+                    }
+                    else
+                    {
                         std::cout << "[CodegenVisitor] Early: Triggering enum constructor generation!" << std::endl;
                         generating.insert(guard_key);
-                        
+
                         // We need to infer the concrete instantiation from the current context
                         // For now, we'll use the return type of the current function to determine the instantiation
-                        if (_current_function && _current_function->ast_node) {
+                        if (_current_function && _current_function->ast_node)
+                        {
                             std::string return_type_str = _current_function->ast_node->return_type_annotation();
                             std::cout << "[CodegenVisitor] Current function return type: " << return_type_str << std::endl;
-                            
-                            // If the return type looks like a parameterized enum (e.g., "AllocResult<void>"), 
+
+                            // If the return type looks like a parameterized enum (e.g., "AllocResult<void>"),
                             // extract the concrete type arguments and generate constructors
-                            if (return_type_str.find('<') != std::string::npos) {
+                            if (return_type_str.find('<') != std::string::npos)
+                            {
                                 // Parse the return type to get base name and type arguments
                                 size_t open_bracket = return_type_str.find('<');
                                 size_t close_bracket = return_type_str.find('>', open_bracket);
-                                if (open_bracket != std::string::npos && close_bracket != std::string::npos) {
+                                if (open_bracket != std::string::npos && close_bracket != std::string::npos)
+                                {
                                     std::string base_return_type = return_type_str.substr(0, open_bracket);
                                     std::string type_args_str = return_type_str.substr(open_bracket + 1, close_bracket - open_bracket - 1);
-                                    
+
                                     // If the base type matches our enum base (Result), generate constructors
-                                    if (base_return_type == base_name || 
-                                        (base_return_type == "AllocResult" && base_name == "Result")) {
-                                        
+                                    if (base_return_type == base_name ||
+                                        (base_return_type == "AllocResult" && base_name == "Result"))
+                                    {
+
                                         std::vector<std::string> type_args;
                                         // For AllocResult<void>, this should generate Result<void*, AllocError>
-                                        if (base_return_type == "AllocResult" && type_args_str == "void") {
+                                        if (base_return_type == "AllocResult" && type_args_str == "void")
+                                        {
                                             type_args = {"void*", "AllocError"};
                                             ensure_parameterized_enum_constructors("Result<void*, AllocError>", "Result", type_args);
-                                        } else {
+                                        }
+                                        else
+                                        {
                                             // Split type_args_str by comma and generate constructors
                                             std::istringstream iss(type_args_str);
                                             std::string type_arg;
-                                            while (std::getline(iss, type_arg, ',')) {
+                                            while (std::getline(iss, type_arg, ','))
+                                            {
                                                 // Trim whitespace
                                                 type_arg.erase(0, type_arg.find_first_not_of(" \t"));
                                                 type_arg.erase(type_arg.find_last_not_of(" \t") + 1);
@@ -5397,31 +5408,35 @@ namespace Cryo::Codegen
                                             }
                                             ensure_parameterized_enum_constructors(return_type_str, base_name, type_args);
                                         }
-                                        
+
                                         std::cout << "[CodegenVisitor] Generated constructors for " << return_type_str << std::endl;
-                                        
+
                                         // Now try to find the constructor again
                                         std::string instantiated_name = (base_return_type == "AllocResult") ? "Result<void*, AllocError>" : return_type_str;
                                         std::string qualified_variant_name = instantiated_name + "::" + variant_name;
                                         auto variant_it = _enum_variants.find(qualified_variant_name);
-                                        if (variant_it != _enum_variants.end()) {
+                                        if (variant_it != _enum_variants.end())
+                                        {
                                             std::cout << "[CodegenVisitor] Found generated constructor: " << qualified_variant_name << std::endl;
                                             llvm::Function *llvm_function = llvm::dyn_cast<llvm::Function>(variant_it->second);
-                                            if (llvm_function) {
+                                            if (llvm_function)
+                                            {
                                                 // Prepare arguments and call the constructor
                                                 std::vector<llvm::Value *> args;
-                                                for (size_t i = 0; i < node->arguments().size() && i < llvm_function->arg_size(); ++i) {
+                                                for (size_t i = 0; i < node->arguments().size() && i < llvm_function->arg_size(); ++i)
+                                                {
                                                     node->arguments()[i]->accept(*this);
                                                     llvm::Value *arg_val = _node_values[node->arguments()[i].get()];
-                                                    if (arg_val) {
+                                                    if (arg_val)
+                                                    {
                                                         args.push_back(arg_val);
                                                     }
                                                 }
-                                                
+
                                                 // Call the enum constructor function
                                                 llvm::Value *enum_instance = builder.CreateCall(llvm_function, args, "enum_constructor");
                                                 register_value(node, enum_instance);
-                                                generating.erase(guard_key);  // Remove from guard before returning
+                                                generating.erase(guard_key); // Remove from guard before returning
                                                 return enum_instance;
                                             }
                                         }
@@ -5429,10 +5444,10 @@ namespace Cryo::Codegen
                                 }
                             }
                         }
-                        
-                        generating.erase(guard_key);  // Always remove from guard
+
+                        generating.erase(guard_key); // Always remove from guard
                     }
-                    
+
                     std::cout << "[CodegenVisitor] Could not generate constructors, continuing with normal flow" << std::endl;
                 }
             }
@@ -5533,16 +5548,16 @@ namespace Cryo::Codegen
         {
             std::string base_name = function_name.substr(0, template_scope_pos);
             std::string variant_name = function_name.substr(template_scope_pos + 2);
-            
+
             std::cout << "[CodegenVisitor] Checking if " << function_name << " is a template enum constructor (base: " << base_name << ", variant: " << variant_name << ")" << std::endl;
-            
+
             // Check if base_name is a known template enum (like Result, Option)
             // We need to determine the instantiation context from the return type
             // For now, let's check for known template enums
             if (base_name == "Result" || base_name == "Option")
             {
                 std::cout << "[CodegenVisitor] Detected template enum constructor: " << function_name << std::endl;
-                
+
                 // Try to find an existing instantiation that matches this call
                 // Look for any instantiated enum that starts with the base name
                 std::string matching_instantiation;
@@ -5557,11 +5572,11 @@ namespace Cryo::Codegen
                         break;
                     }
                 }
-                
+
                 if (!matching_instantiation.empty())
                 {
                     std::cout << "[CodegenVisitor] Found matching instantiation: " << matching_instantiation << std::endl;
-                    
+
                     // Use the instantiated constructor
                     llvm::Value *constructor_func = _enum_variants[matching_instantiation];
                     if (auto *llvm_function = llvm::dyn_cast<llvm::Function>(constructor_func))
@@ -5990,6 +6005,24 @@ namespace Cryo::Codegen
             std::cout << "[DEBUG] Trying namespaced lookup..." << std::endl;
             symbol = _symbol_table.lookup_namespaced_symbol(scope_name, symbol_name);
             std::cout << "[DEBUG] Namespaced lookup for '" << scope_name << "::" << symbol_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
+        }
+
+        // Try enhanced resolution with import shortcuts
+        if (!symbol)
+        {
+            std::cout << "[DEBUG] Trying enhanced import resolution..." << std::endl;
+            // Get all imported namespaces (for now we'll extract from the symbol table itself)
+            std::vector<std::string> imported_namespaces;
+
+            // For the specific case of "Memory::Box", try expanding to "std::Memory::Box"
+            if (scope_name == "Memory")
+            {
+                imported_namespaces.push_back("std::Memory");
+            }
+            // Add more namespace expansions as needed
+
+            symbol = _symbol_table.lookup_qualified_symbol_with_import_shortcuts(c_name, imported_namespaces);
+            std::cout << "[DEBUG] Enhanced import resolution for '" << c_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
         }
 
         // Debug symbol properties if found
@@ -7342,10 +7375,10 @@ namespace Cryo::Codegen
             {
                 function_return_type = _current_function->ast_node->return_type_annotation();
                 enum_type = _type_mapper->lookup_type(function_return_type);
-                std::cout << "[CodegenVisitor] Using function return type: " << function_return_type 
+                std::cout << "[CodegenVisitor] Using function return type: " << function_return_type
                           << " -> " << (enum_type ? enum_type->getStructName().str() : "null") << std::endl;
             }
-            
+
             if (!enum_type)
             {
                 // Convert type argument strings to Type* for TypeMapper to process
@@ -7401,6 +7434,164 @@ namespace Cryo::Codegen
         }
     }
 
+    // Helper method to determine variant properties from template registry
+    CodegenVisitor::VariantInfo CodegenVisitor::analyze_enum_variant(const std::string &base_enum_name,
+                                                                     const std::string &variant_name,
+                                                                     const std::vector<std::string> &type_args)
+    {
+        VariantInfo info;
+        info.has_associated_data = false;
+        info.is_success_variant = false;
+
+        // Get the actual enum template from the type system
+        std::shared_ptr<Cryo::EnumType> enum_template = _symbol_table.get_type_context()->get_parameterized_enum_template(base_enum_name);
+
+        if (!enum_template)
+        {
+            std::cout << "[CodegenVisitor] Warning: No enum template found for " << base_enum_name << ", using fallback" << std::endl;
+            return info; // Return empty info for unknown enums
+        }
+
+        // Get the actual variant list from the template
+        const auto &variants = enum_template->variants();
+
+        std::cout << "[CodegenVisitor] Analyzing variant '" << variant_name << "' in enum '" << base_enum_name
+                  << "' with " << variants.size() << " total variants" << std::endl;
+
+        // Find the variant index and determine properties
+        int variant_index = -1;
+        for (size_t i = 0; i < variants.size(); ++i)
+        {
+            if (variants[i] == variant_name)
+            {
+                variant_index = static_cast<int>(i);
+                break;
+            }
+        }
+
+        if (variant_index == -1)
+        {
+            std::cout << "[CodegenVisitor] Warning: Variant '" << variant_name << "' not found in enum '" << base_enum_name << "'" << std::endl;
+            return info;
+        }
+
+        // Apply semantic rules based on enum structure and variant position
+        if (variants.size() == 2)
+        {
+            // Two-variant enum: typically first=success, second=failure (Option/Result pattern)
+            info.is_success_variant = (variant_index == 0);
+        }
+        else
+        {
+            // Multi-variant enum: determine success semantics by name patterns
+            std::string lower_name = variant_name;
+            std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+            info.is_success_variant = (lower_name.find("ok") != std::string::npos ||
+                                       lower_name.find("some") != std::string::npos ||
+                                       lower_name.find("success") != std::string::npos);
+        }
+
+        // Try to get the actual AST template to determine variant properties
+        TemplateRegistry *template_registry = _symbol_table.get_type_context()->get_global_template_registry();
+        if (template_registry)
+        {
+            const auto *template_info = template_registry->find_template(base_enum_name);
+            if (template_info && template_info->enum_template)
+            {
+                // Access the real EnumDeclarationNode to get variant information
+                EnumDeclarationNode *enum_decl = template_info->enum_template;
+                const auto &ast_variants = enum_decl->variants();
+
+                std::cout << "[CodegenVisitor] Found AST template for " << base_enum_name
+                          << " with " << ast_variants.size() << " AST variants" << std::endl;
+
+                // Find the matching variant in the AST
+                if (variant_index < static_cast<int>(ast_variants.size()))
+                {
+                    const auto &ast_variant = ast_variants[variant_index];
+
+                    // Use the real AST information
+                    info.has_associated_data = !ast_variant->is_simple_variant();
+
+                    if (info.has_associated_data)
+                    {
+                        // Get the actual associated types from the AST
+                        const auto &variant_types = ast_variant->associated_types();
+
+                        // Get the actual generic parameter names from the enum template
+                        const auto &enum_params = enum_decl->generic_parameters();
+
+                        for (const std::string &variant_type : variant_types)
+                        {
+                            // Check if this is a generic parameter by looking it up in the enum's generic params
+                            bool is_generic_param = false;
+                            size_t param_index = 0;
+
+                            for (size_t i = 0; i < enum_params.size(); ++i)
+                            {
+                                if (enum_params[i]->name() == variant_type)
+                                {
+                                    is_generic_param = true;
+                                    param_index = i;
+                                    break;
+                                }
+                            }
+
+                            if (is_generic_param && param_index < type_args.size())
+                            {
+                                // Resolve generic parameter to concrete type
+                                info.associated_types.push_back(type_args[param_index]);
+                            }
+                            else
+                            {
+                                // Direct type name (non-template)
+                                info.associated_types.push_back(variant_type);
+                            }
+                        }
+                    }
+
+                    std::cout << "[CodegenVisitor] AST-based analysis: variant '" << variant_name
+                              << "' has_data=" << info.has_associated_data
+                              << ", type_count=" << info.associated_types.size() << std::endl;
+
+                    return info; // Return AST-based result
+                }
+            }
+        }
+
+        // Fallback: if AST access fails, use generic position-based analysis
+        std::cout << "[CodegenVisitor] Template registry access failed, using fallback analysis" << std::endl;
+        if (variants.size() == 2)
+        {
+            // For two-variant enums, assume first variant may have data based on type args
+            if (variant_index == 0 && !type_args.empty())
+            {
+                info.has_associated_data = true;
+                info.associated_types.push_back(type_args[0]);
+            }
+            else if (variant_index == 1 && type_args.size() > 1)
+            {
+                info.has_associated_data = true;
+                info.associated_types.push_back(type_args[1]);
+            }
+        }
+        else
+        {
+            // Multi-variant: use position-based mapping with type args
+            if (variant_index < static_cast<int>(type_args.size()))
+            {
+                info.has_associated_data = true;
+                info.associated_types.push_back(type_args[variant_index]);
+            }
+        }
+
+        std::cout << "[CodegenVisitor] Variant analysis: has_data=" << info.has_associated_data
+                  << ", is_success=" << info.is_success_variant
+                  << ", type_count=" << info.associated_types.size() << std::endl;
+
+        return info;
+    }
+
     void CodegenVisitor::generate_parameterized_enum_variant_constructor(const std::string &instantiated_name,
                                                                          const std::string &variant_name,
                                                                          const std::vector<std::string> &type_args,
@@ -7417,95 +7608,34 @@ namespace Cryo::Codegen
 
         std::string constructor_name = instantiated_name + "::" + variant_name;
 
-        // Use enhanced type system to get constructor parameters for this variant
+        // Extract base enum name from instantiated name (e.g., "Result<void*, AllocError>" -> "Result")
+        std::string base_enum_name = instantiated_name;
+        size_t angle_pos = base_enum_name.find('<');
+        if (angle_pos != std::string::npos)
+        {
+            base_enum_name = base_enum_name.substr(0, angle_pos);
+        }
+
+        // Use dynamic variant analysis instead of hardcoded checks
+        VariantInfo variant_info = analyze_enum_variant(base_enum_name, variant_name, type_args);
+
         std::vector<llvm::Type *> param_types;
-        bool needs_value_param = false;
+        bool needs_value_param = variant_info.has_associated_data;
 
-        // Determine parameter needs based on variant name and type arguments
-        if (variant_name == "Some" || variant_name == "Ok")
+        // Resolve parameter types dynamically
+        if (needs_value_param && !variant_info.associated_types.empty())
         {
-            // This variant needs a parameter - use the first type argument (T)
-            if (!type_args.empty())
+            for (const std::string &type_arg : variant_info.associated_types)
             {
-                std::string type_arg = type_args[0];
-
-                // Convert the type argument string to an LLVM type
-                llvm::Type *param_type = nullptr;
-                if (type_arg == "i32" || type_arg == "int")
-                {
-                    param_type = _type_mapper->get_integer_type(32, true);
-                }
-                else if (type_arg == "i64")
-                {
-                    param_type = _type_mapper->get_integer_type(64, true);
-                }
-                else if (type_arg == "f64" || type_arg == "float")
-                {
-                    param_type = _type_mapper->get_float_type(64);
-                }
-                else if (type_arg == "bool")
-                {
-                    param_type = _type_mapper->get_boolean_type();
-                }
-                else if (type_arg == "str" || type_arg == "string")
-                {
-                    param_type = _type_mapper->get_string_type();
-                }
-                else if (type_arg == "void*")
-                {
-                    param_type = llvm::PointerType::get(_type_mapper->get_void_type(), 0);
-                }
-                else
-                {
-                    // Try to look up as a registered type
-                    param_type = _type_mapper->lookup_type(type_arg);
-                }
-
+                llvm::Type *param_type = resolve_type_argument_to_llvm_type(type_arg);
                 if (param_type)
                 {
                     param_types.push_back(param_type);
-                    needs_value_param = true;
                 }
             }
         }
-        else if (variant_name == "Err")
-        {
-            // Err variant needs a parameter - use the second type argument (E)
-            if (type_args.size() > 1)
-            {
-                std::string error_type_arg = type_args[1];
-                
-                // Convert the error type argument string to an LLVM type
-                llvm::Type *param_type = nullptr;
-                if (error_type_arg == "i32" || error_type_arg == "int")
-                {
-                    param_type = _type_mapper->get_integer_type(32, true);
-                }
-                else if (error_type_arg == "i64")
-                {
-                    param_type = _type_mapper->get_integer_type(64, true);
-                }
-                else
-                {
-                    // Try to look up as a registered type (for enum types like AllocError)
-                    param_type = _type_mapper->lookup_type(error_type_arg);
-                    
-                    // If lookup failed and this is for a simple enum error type, use i32
-                    if (!param_type && error_type_arg == "AllocError")
-                    {
-                        param_type = _type_mapper->get_integer_type(32, true);
-                        std::cout << "[CodegenVisitor] Using i32 for AllocError enum parameter" << std::endl;
-                    }
-                }
 
-                if (param_type)
-                {
-                    param_types.push_back(param_type);
-                    needs_value_param = true;
-                }
-            }
-        }
-        // None, Nothing variants don't need parameters        // Create function type
+        // Create function type
         llvm::FunctionType *func_type = llvm::FunctionType::get(enum_type, param_types, false);
         llvm::Function *constructor_func = llvm::Function::Create(
             func_type, llvm::Function::ExternalLinkage, constructor_name, *module);
@@ -7526,55 +7656,34 @@ namespace Cryo::Codegen
         // Create enum instance
         llvm::Value *enum_instance = llvm::UndefValue::get(enum_type);
 
-        // Set the discriminant/flag field based on variant
-        if (variant_name == "None" || variant_name == "Nothing")
-        {
-            // Set has_value/is_ok to false
-            llvm::Value *false_value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_context), 0);
-            enum_instance = builder.CreateInsertValue(enum_instance, false_value, {0}, "set_flag");
-        }
-        else if (variant_name == "Some" || variant_name == "Ok")
-        {
-            // Set has_value/is_ok to true and set the value
-            llvm::Value *true_value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_context), 1);
-            enum_instance = builder.CreateInsertValue(enum_instance, true_value, {0}, "set_flag");
+        // Set the discriminant/flag field based on variant semantics
+        llvm::Value *discriminant_value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_context),
+                                                                 variant_info.is_success_variant ? 1 : 0);
+        enum_instance = builder.CreateInsertValue(enum_instance, discriminant_value, {0}, "set_flag");
 
-            if (needs_value_param && constructor_func->arg_size() > 0)
-            {
-                llvm::Value *value_param = &*constructor_func->arg_begin();
-                enum_instance = builder.CreateInsertValue(enum_instance, value_param, {1}, "set_value");
-            }
-        }
-        else if (variant_name == "Err")
+        // Handle associated data if present
+        if (variant_info.has_associated_data && needs_value_param && constructor_func->arg_size() > 0)
         {
-            // For Result<T,E>, set is_ok to false and store error in union
-            llvm::Value *false_value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_context), 0);
-            enum_instance = builder.CreateInsertValue(enum_instance, false_value, {0}, "set_flag");
+            llvm::Value *value_param = &*constructor_func->arg_begin();
 
-            if (needs_value_param && constructor_func->arg_size() > 0)
+            // Handle type casting for union data field if needed
+            llvm::Type *struct_field_type = enum_type->getStructElementType(1);
+            if (value_param->getType() != struct_field_type)
             {
-                // For errors, we need to handle the union data properly
-                llvm::Value *error_param = &*constructor_func->arg_begin();
-                
-                // If the error parameter is an integer but the struct field is a pointer,
-                // we need to cast it appropriately
-                llvm::Type *struct_field_type = enum_type->getStructElementType(1);
-                if (error_param->getType() != struct_field_type)
+                if (value_param->getType()->isIntegerTy() && struct_field_type->isPointerTy())
                 {
-                    if (error_param->getType()->isIntegerTy() && struct_field_type->isPointerTy())
-                    {
-                        // Cast integer to pointer (for simple enum values)
-                        error_param = builder.CreateIntToPtr(error_param, struct_field_type, "error_as_ptr");
-                    }
-                    else if (error_param->getType()->isPointerTy() && struct_field_type->isIntegerTy())
-                    {
-                        // Cast pointer to integer
-                        error_param = builder.CreatePtrToInt(error_param, struct_field_type, "error_as_int");
-                    }
+                    // Cast integer to pointer (for simple enum values)
+                    value_param = builder.CreateIntToPtr(value_param, struct_field_type, "value_as_ptr");
                 }
-                
-                enum_instance = builder.CreateInsertValue(enum_instance, error_param, {1}, "set_error");
+                else if (value_param->getType()->isPointerTy() && struct_field_type->isIntegerTy())
+                {
+                    // Cast pointer to integer
+                    value_param = builder.CreatePtrToInt(value_param, struct_field_type, "value_as_int");
+                }
             }
+
+            std::string field_name = variant_info.is_success_variant ? "set_value" : "set_error";
+            enum_instance = builder.CreateInsertValue(enum_instance, value_param, {1}, field_name);
         }
 
         builder.CreateRet(enum_instance);
@@ -8001,6 +8110,57 @@ namespace Cryo::Codegen
             // Narrowing conversion
             return builder.CreateTrunc(source_value, target_type);
         }
+    }
+
+    // Helper method to resolve type argument string to LLVM type
+    llvm::Type *CodegenVisitor::resolve_type_argument_to_llvm_type(const std::string &type_arg)
+    {
+        llvm::Type *param_type = nullptr;
+
+        if (type_arg == "i32" || type_arg == "int")
+        {
+            param_type = _type_mapper->get_integer_type(32, true);
+        }
+        else if (type_arg == "i64")
+        {
+            param_type = _type_mapper->get_integer_type(64, true);
+        }
+        else if (type_arg == "f64" || type_arg == "float")
+        {
+            param_type = _type_mapper->get_float_type(64);
+        }
+        else if (type_arg == "bool")
+        {
+            param_type = _type_mapper->get_boolean_type();
+        }
+        else if (type_arg == "str" || type_arg == "string")
+        {
+            param_type = _type_mapper->get_string_type();
+        }
+        else if (type_arg == "void*")
+        {
+            param_type = llvm::PointerType::get(_type_mapper->get_void_type(), 0);
+        }
+        else
+        {
+            // Try to look up as a registered type (for enum types like AllocError)
+            param_type = _type_mapper->lookup_type(type_arg);
+
+            // If lookup failed and this looks like a simple enum, use i32
+            if (!param_type)
+            {
+                // Simple heuristic: if it's a capitalized identifier, assume it's an enum
+                if (!type_arg.empty() && std::isupper(type_arg[0]) &&
+                    type_arg.find('*') == std::string::npos &&
+                    type_arg.find('<') == std::string::npos)
+                {
+                    param_type = _type_mapper->get_integer_type(32, true);
+                    std::cout << "[CodegenVisitor] Using i32 for enum type: " << type_arg << std::endl;
+                }
+            }
+        }
+
+        return param_type;
     }
 
 } // namespace Cryo::Codegen

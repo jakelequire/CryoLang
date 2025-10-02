@@ -362,6 +362,18 @@ namespace Cryo::Codegen
                                                              const std::vector<std::string> &type_args,
                                                              llvm::Type *enum_type);
 
+        // Enum variant analysis helpers
+        struct VariantInfo
+        {
+            bool has_associated_data;
+            std::vector<std::string> associated_types;
+            bool is_success_variant; // true for Ok/Some, false for Err/None
+        };
+        VariantInfo analyze_enum_variant(const std::string &base_enum_name,
+                                         const std::string &variant_name,
+                                         const std::vector<std::string> &type_args);
+        llvm::Type *resolve_type_argument_to_llvm_type(const std::string &type_arg);
+
         // Expression generation helpers
         llvm::Value *generate_binary_operation(Cryo::BinaryExpressionNode *node);
         llvm::Value *generate_unary_operation(Cryo::UnaryExpressionNode *node);

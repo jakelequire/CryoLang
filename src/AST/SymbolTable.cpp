@@ -117,6 +117,70 @@ namespace Cryo
         return nullptr; // Symbol not found in any namespace
     }
 
+    Symbol *SymbolTable::lookup_symbol_with_import_resolution(const std::string &symbol_name, const std::vector<std::string> &imported_namespaces) const
+    {
+        // First try local scope
+        Symbol *result = lookup_symbol(symbol_name);
+        if (result)
+            return result;
+
+        // Then try each imported namespace
+        for (const std::string &namespace_name : imported_namespaces)
+        {
+            result = lookup_namespaced_symbol(namespace_name, symbol_name);
+            if (result)
+            {
+                std::cout << "[DEBUG] Found symbol '" << symbol_name << "' in imported namespace '" << namespace_name << "'" << std::endl;
+                return result;
+            }
+        }
+
+        // Finally fall back to any namespace search
+        return lookup_symbol_in_any_namespace(symbol_name);
+    }
+
+    Symbol *SymbolTable::lookup_qualified_symbol_with_import_shortcuts(const std::string &qualified_name, const std::vector<std::string> &imported_namespaces) const
+    {
+        // First try the full qualified name as-is
+        size_t scope_pos = qualified_name.find("::");
+        if (scope_pos != std::string::npos)
+        {
+            std::string namespace_part = qualified_name.substr(0, scope_pos);
+            std::string symbol_part = qualified_name.substr(scope_pos + 2);
+
+            // Try exact lookup first
+            Symbol *result = lookup_namespaced_symbol(namespace_part, symbol_part);
+            if (result)
+                return result;
+
+            // Try expanding short namespace names with imported namespaces
+            for (const std::string &imported_namespace : imported_namespaces)
+            {
+                // Check if this imported namespace ends with the requested namespace part
+                // e.g., "Memory" matches "std::Memory"
+                if (imported_namespace.length() > namespace_part.length())
+                {
+                    size_t suffix_pos = imported_namespace.length() - namespace_part.length();
+                    if (imported_namespace.substr(suffix_pos) == namespace_part)
+                    {
+                        // Check that it's preceded by "::" or is at the start
+                        if (suffix_pos == 0 || imported_namespace.substr(suffix_pos - 2, 2) == "::")
+                        {
+                            result = lookup_namespaced_symbol(imported_namespace, symbol_part);
+                            if (result)
+                            {
+                                std::cout << "[DEBUG] Expanded '" << qualified_name << "' to '" << imported_namespace << "::" << symbol_part << "'" << std::endl;
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
     void SymbolTable::register_namespace(const std::string &namespace_name, const std::unordered_map<std::string, Symbol> &symbols)
     {
         namespaces_[namespace_name] = symbols;
