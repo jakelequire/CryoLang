@@ -3268,11 +3268,34 @@ namespace Cryo
             advance();
         }
 
+        // Check for destructor
+        bool is_destructor = false;
+        if (_current_token.is(TokenKind::TK_TILDE))
+        {
+            is_destructor = true;
+            advance(); // consume '~'
+        }
+
         Token method_token;
         std::string method_name;
 
+        // For destructors, method name should match the struct/class name
+        if (is_destructor)
+        {
+            if (_current_token.is(TokenKind::TK_IDENTIFIER))
+            {
+                method_token = _current_token;
+                method_name = "~" + std::string(method_token.text());
+                advance();
+            }
+            else
+            {
+                error("Expected class/struct name after '~' in destructor");
+                return nullptr;
+            }
+        }
         // Accept both identifiers and keywords as method names
-        if (_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword())
+        else if (_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword())
         {
             method_token = _current_token;
             method_name = std::string(method_token.text());

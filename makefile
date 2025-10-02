@@ -271,6 +271,9 @@ stdlib-types:
 stdlib-stdio:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/io/stdio.cryo --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/io/stdio.bc
 
+stdlib-memory:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/core/memory.cryo --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/core/memory.bc
+
 # Test targets
 .PHONY: test test-quick test-verbose test-category test-file
 test: $(MAIN_BIN)
