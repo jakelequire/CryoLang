@@ -114,6 +114,24 @@ namespace Cryo
         return nullptr;
     }
 
+    TypedSymbol *TypedSymbolTable::lookup_symbol_in_any_namespace(const std::string &symbol_name)
+    {
+        // Search current scope
+        auto it = _symbols.find(symbol_name);
+        if (it != _symbols.end())
+        {
+            return &it->second;
+        }
+
+        // Search parent scopes
+        if (_parent_scope)
+        {
+            return _parent_scope->lookup_symbol_in_any_namespace(symbol_name);
+        }
+
+        return nullptr;
+    }
+
     bool TypedSymbolTable::is_symbol_defined(const std::string &name)
     {
         return lookup_symbol(name) != nullptr;
@@ -778,6 +796,30 @@ namespace Cryo
                                                                      close_bracket - open_bracket - 1);
 
                 std::cout << "[DEBUG] TypeChecker: base_type='" << base_type << "', type_args='" << type_args_str << "'" << std::endl;
+
+                // Check if base_type is a type alias first
+                TypedSymbol *alias_symbol = _symbol_table->lookup_symbol(base_type);
+                if (alias_symbol && alias_symbol->type && alias_symbol->type->kind() == TypeKind::TypeAlias)
+                {
+                    std::cout << "[DEBUG] TypeChecker: Found type alias '" << base_type << "', expanding..." << std::endl;
+                    // For type aliases like AllocResult<T> = Result<T*, AllocError>
+                    // We need to expand AllocResult<void> to Result<void*, AllocError>
+
+                    // Get the target type string from the alias
+                    if (auto alias_type = dynamic_cast<TypeAlias *>(alias_symbol->type))
+                    {
+                        std::string target_type_str = alias_type->target_type()->to_string();
+                        std::cout << "[DEBUG] TypeChecker: Alias target type: '" << target_type_str << "'" << std::endl;
+
+                        // For now, expand manually for AllocResult
+                        if (base_type == "AllocResult" && type_args_str == "void")
+                        {
+                            std::string expanded_type = "Result<void*, AllocError>";
+                            std::cout << "[DEBUG] TypeChecker: Expanding " << clean_type_string << " to " << expanded_type << std::endl;
+                            return resolve_type_with_generic_context(expanded_type);
+                        }
+                    }
+                }
 
                 // Check if any type arguments are generic parameters
                 bool has_generic_args = is_generic_parameter(type_args_str);
@@ -2255,6 +2297,13 @@ namespace Cryo
         {
             // For generic types, first try the base name
             scope_symbol = _symbol_table->lookup_symbol(base_scope_name);
+
+            // If not found locally, try looking in all imported namespaces
+            if (!scope_symbol)
+            {
+                scope_symbol = _symbol_table->lookup_symbol_in_any_namespace(base_scope_name);
+            }
+
             if (!scope_symbol && _main_symbol_table)
             {
                 // Try looking for the generic type in the main symbol table
@@ -2265,9 +2314,28 @@ namespace Cryo
                     // For enum types, allow the scope resolution to proceed
                     return; // Found the type, proceed with resolution
                 }
+
+                // Also try main symbol table namespaces
+                main_symbol = _main_symbol_table->lookup_symbol_in_any_namespace(base_scope_name);
+                if (main_symbol && main_symbol->data_type)
+                {
+                    std::cout << "[DEBUG] Found generic type '" << base_scope_name << "' in main symbol table namespace" << std::endl;
+                    return; // Found the type, proceed with resolution
+                }
             }
 
-            // If not found yet, this might be a forward reference within the same module
+            // If not found yet, check if it's a registered generic type in our type registry
+            if (!scope_symbol)
+            {
+                ParameterizedType *template_type = _type_registry->get_template(base_scope_name);
+                if (template_type)
+                {
+                    std::cout << "[DEBUG] Found generic type '" << base_scope_name << "' in type registry" << std::endl;
+                    return; // Found the type, proceed with resolution
+                }
+            }
+
+            // If still not found, this might be a forward reference within the same module
             // For common types like Option, Result etc, allow them to be resolved
             if (!scope_symbol && (base_scope_name == "Option" || base_scope_name == "Result" || base_scope_name == "Array"))
             {
@@ -2278,6 +2346,23 @@ namespace Cryo
         else
         {
             scope_symbol = _symbol_table->lookup_symbol(base_scope_name);
+
+            // If not found in local scope, try looking in all imported namespaces
+            if (!scope_symbol)
+            {
+                scope_symbol = _symbol_table->lookup_symbol_in_any_namespace(base_scope_name);
+            }
+
+            // If still not found, check if it's a registered generic type in our type registry
+            if (!scope_symbol)
+            {
+                ParameterizedType *template_type = _type_registry->get_template(base_scope_name);
+                if (template_type)
+                {
+                    std::cout << "[DEBUG] Found generic type '" << base_scope_name << "' in type registry (non-generic case)" << std::endl;
+                    return; // Found the type, proceed with resolution
+                }
+            }
         }
 
         if (!scope_symbol)

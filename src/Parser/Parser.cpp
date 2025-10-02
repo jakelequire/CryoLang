@@ -130,6 +130,33 @@ namespace Cryo
         return Token{}; // Return empty token on error
     }
 
+    Token Parser::consume_right_angle()
+    {
+        // Handle >> token splitting for nested generics like AllocResult<Box<int>>
+        if (_current_token.is(TokenKind::TK_GREATERGREATER))
+        {
+            // We need to split >> into two > tokens
+            // Return the first > and leave the second > in the stream
+            Token first_angle = Token(TokenKind::TK_R_ANGLE, ">", _current_token.location());
+
+            // Replace current token with the second >
+            _current_token = Token(TokenKind::TK_R_ANGLE, ">", _current_token.location());
+
+            return first_angle;
+        }
+        else if (_current_token.is(TokenKind::TK_R_ANGLE))
+        {
+            Token token = _current_token;
+            advance();
+            return token;
+        }
+        else
+        {
+            error("Expected '>' after generic type arguments");
+            return Token{};
+        }
+    }
+
     bool Parser::is_at_end() const
     {
         return _current_token.is_eof();
@@ -396,7 +423,7 @@ namespace Cryo
                     }
                 } while (true);
 
-                consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic type arguments");
+                consume_right_angle(); // Use special handler for nested generics
 
                 // For now, create an instantiated generic type name
                 // TODO: In a more complete implementation, we would create proper instantiated types
@@ -905,7 +932,7 @@ namespace Cryo
         // Check for different import patterns:
         // 1. import * from <path>;            (wildcard with explicit from)
         // 2. import IO from <path>;           (specific import with from)
-        // 3. import IO, Function from <path>; (multiple specific imports)  
+        // 3. import IO, Function from <path>; (multiple specific imports)
         // 4. import <path>;                   (traditional wildcard)
         // 5. import <path> as alias;          (traditional with alias)
 
@@ -921,12 +948,12 @@ namespace Cryo
         {
             // import * from <path>;
             advance(); // consume '*'
-            
+
             if (!_current_token.is(TokenKind::TK_KW_FROM))
             {
                 throw ParseError("Expected 'from' after '*' in import statement", _current_token.location());
             }
-            
+
             advance(); // consume 'from'
             using_from_syntax = true;
             // This is still a wildcard import, just with explicit 'from' syntax
@@ -935,17 +962,17 @@ namespace Cryo
         {
             // Could be: import IO from <path>; or import IO, Function from <path>; or import <path>;
             // We need to look ahead to see if there's a 'from' keyword
-            
+
             // Parse the first identifier
             std::string first_identifier = std::string(_current_token.text());
             advance(); // consume identifier
-            
+
             // Check if we have a comma (multiple imports) or 'from' (specific import) or something else (traditional import path)
             if (_current_token.is(TokenKind::TK_COMMA) || _current_token.is(TokenKind::TK_KW_FROM))
             {
                 // This is specific import syntax: import IO from <path>; or import IO, Function from <path>;
                 specific_imports.push_back(first_identifier);
-                
+
                 // Parse additional imports if comma-separated
                 while (_current_token.is(TokenKind::TK_COMMA))
                 {
@@ -953,7 +980,7 @@ namespace Cryo
                     Token import_name = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after ',' in import list");
                     specific_imports.push_back(std::string(import_name.text()));
                 }
-                
+
                 // Now we should have 'from'
                 consume(TokenKind::TK_KW_FROM, "Expected 'from' after import list");
                 using_from_syntax = true;
@@ -1180,9 +1207,54 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_equality()
     {
-        auto expr = parse_relational();
+        auto expr = parse_bitwise_or();
 
         while (_current_token.is(TokenKind::TK_EQUALEQUAL) || _current_token.is(TokenKind::TK_EXCLAIMEQUAL))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_bitwise_or();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_bitwise_or()
+    {
+        auto expr = parse_bitwise_xor();
+
+        while (_current_token.is(TokenKind::TK_PIPE))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_bitwise_xor();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_bitwise_xor()
+    {
+        auto expr = parse_bitwise_and();
+
+        while (_current_token.is(TokenKind::TK_CARET))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_bitwise_and();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_bitwise_and()
+    {
+        auto expr = parse_relational();
+
+        while (_current_token.is(TokenKind::TK_AMP))
         {
             Token op = _current_token;
             advance();
@@ -1243,6 +1315,7 @@ namespace Cryo
     {
         if (_current_token.is(TokenKind::TK_MINUS) || _current_token.is(TokenKind::TK_EXCLAIM) ||
             _current_token.is(TokenKind::TK_AMP) || _current_token.is(TokenKind::TK_STAR) ||
+            _current_token.is(TokenKind::TK_TILDE) ||
             _current_token.is(TokenKind::TK_PLUSPLUS) || _current_token.is(TokenKind::TK_MINUSMINUS))
         {
             Token op = _current_token;
@@ -1517,11 +1590,12 @@ namespace Cryo
                             std::string generic_type_name = type_name + "<";
                             for (size_t i = 0; i < generic_args.size(); ++i)
                             {
-                                if (i > 0) generic_type_name += ",";
+                                if (i > 0)
+                                    generic_type_name += ",";
                                 generic_type_name += generic_args[i];
                             }
                             generic_type_name += ">";
-                            
+
                             // Create identifier with generic type name for scope resolution
                             Token generic_token(TokenKind::TK_IDENTIFIER, generic_type_name, type_location);
                             expr = _builder.create_identifier_node(generic_token);
@@ -2513,8 +2587,10 @@ namespace Cryo
             {
                 // Check if it's a method (has parentheses) or field (has colon)
                 Token next = peek_next();
-                if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
-                    next.is(TokenKind::TK_L_PAREN))
+                if (((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                     next.is(TokenKind::TK_L_PAREN)) ||
+                    (_current_token.is(TokenKind::TK_TILDE) && next.is(TokenKind::TK_IDENTIFIER)) ||
+                    _current_token.is(TokenKind::TK_KW_CONSTRUCTOR))
                 {
                     // It's a method
                     auto method = parse_struct_method(struct_name);
@@ -2605,6 +2681,16 @@ namespace Cryo
                 {
                     // For static methods, we assume it's a method if static is followed by identifier
                     // The method parsing will handle the rest
+                    is_method = true;
+                }
+                // Case 3: destructor - ~ followed by identifier
+                else if (_current_token.is(TokenKind::TK_TILDE) && next.is(TokenKind::TK_IDENTIFIER))
+                {
+                    is_method = true;
+                }
+                // Case 4: constructor with explicit constructor keyword
+                else if (_current_token.is(TokenKind::TK_KW_CONSTRUCTOR))
+                {
                     is_method = true;
                 }
 

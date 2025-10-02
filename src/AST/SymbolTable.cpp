@@ -53,7 +53,8 @@ namespace Cryo
         if (parent_scope_)
         {
             Symbol *result = parent_scope_->lookup_namespaced_symbol(namespace_name, symbol_name);
-            if (result) return result;
+            if (result)
+                return result;
         }
 
         return nullptr; // Symbol not found
@@ -63,33 +64,57 @@ namespace Cryo
     {
         // First try exact match
         Symbol *result = lookup_namespaced_symbol(namespace_name, symbol_name);
-        if (result) return result;
+        if (result)
+            return result;
 
         // If in a namespace, try relative resolution
         if (!current_namespace.empty() && current_namespace != "Global")
         {
-            // Extract parent namespace(s) 
+            // Extract parent namespace(s)
             // For "std::IO" we want "std", for "std::Syscall::IO" we want "std::Syscall"
             size_t last_scope = current_namespace.find_last_of(':');
-            
+
             if (last_scope != std::string::npos && last_scope >= 1)
             {
                 // Extract parent by removing "::component" from end
                 // "std::IO" -> find_last_of(':') = 4, so substr(0, 4-1) = "std"
                 std::string parent_namespace = current_namespace.substr(0, last_scope - 1);
-                
+
                 // Try parent::namespace_name (e.g., "std" + "::" + "Syscall" = "std::Syscall")
                 std::string qualified_namespace = parent_namespace + "::" + namespace_name;
                 result = lookup_namespaced_symbol(qualified_namespace, symbol_name);
-                
-                std::cout << "[DEBUG] Trying relative resolution: " << qualified_namespace << "::" << symbol_name 
+
+                std::cout << "[DEBUG] Trying relative resolution: " << qualified_namespace << "::" << symbol_name
                           << " (from context " << current_namespace << ")" << std::endl;
-                
-                if (result) return result;
+
+                if (result)
+                    return result;
             }
         }
 
         return nullptr; // Symbol not found with context
+    }
+
+    Symbol *SymbolTable::lookup_symbol_in_any_namespace(const std::string &symbol_name) const
+    {
+        // Search through all registered namespaces
+        for (const auto &[namespace_name, symbols] : namespaces_)
+        {
+            auto symbol_it = symbols.find(symbol_name);
+            if (symbol_it != symbols.end())
+            {
+                std::cout << "[DEBUG] Found symbol '" << symbol_name << "' in namespace '" << namespace_name << "'" << std::endl;
+                return const_cast<Symbol *>(&symbol_it->second);
+            }
+        }
+
+        // Check parent scopes
+        if (parent_scope_)
+        {
+            return parent_scope_->lookup_symbol_in_any_namespace(symbol_name);
+        }
+
+        return nullptr; // Symbol not found in any namespace
     }
 
     void SymbolTable::register_namespace(const std::string &namespace_name, const std::unordered_map<std::string, Symbol> &symbols)
@@ -231,7 +256,7 @@ namespace Cryo
             {
                 type_str = symbol.data_type ? symbol.data_type->to_string() : "unknown";
             }
-            
+
             std::string location = std::to_string(symbol.declaration_location.line()) +
                                    ":" + std::to_string(symbol.declaration_location.column());
 

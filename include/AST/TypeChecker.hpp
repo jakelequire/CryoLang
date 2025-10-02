@@ -127,6 +127,7 @@ namespace Cryo
         bool declare_symbol(const std::string &name, Type *type,
                             SourceLocation loc, ClassDeclarationNode *class_node);
         TypedSymbol *lookup_symbol(const std::string &name);
+        TypedSymbol *lookup_symbol_in_any_namespace(const std::string &symbol_name);
         bool is_symbol_defined(const std::string &name);
 
         // Scope management
@@ -193,40 +194,41 @@ namespace Cryo
         std::unordered_map<std::string, std::vector<std::string>> _current_generic_trait_bounds;
 
         // Generic context management
-        struct GenericContext {
-            std::string type_name;                    // Name of the generic type (e.g., "Array", "Option")
+        struct GenericContext
+        {
+            std::string type_name;                      // Name of the generic type (e.g., "Array", "Option")
             std::unordered_set<std::string> parameters; // Set of generic parameters (e.g., {"T"})
-            bool is_template_definition = true;       // true for template definitions, false for instantiations
-            SourceLocation location;                  // Location where this generic context started
-            
-            GenericContext(const std::string& name, const std::vector<std::string>& params, SourceLocation loc)
+            bool is_template_definition = true;         // true for template definitions, false for instantiations
+            SourceLocation location;                    // Location where this generic context started
+
+            GenericContext(const std::string &name, const std::vector<std::string> &params, SourceLocation loc)
                 : type_name(name), parameters(params.begin(), params.end()), location(loc) {}
         };
-        
-        std::vector<GenericContext> _generic_context_stack; // Stack of nested generic contexts
+
+        std::vector<GenericContext> _generic_context_stack;         // Stack of nested generic contexts
         std::vector<GenericInstantiation> _required_instantiations; // Track all generic instantiations needed
-        
+
         // Generic context management methods
-        void enter_generic_context(const std::string& type_name, 
-                                 const std::vector<std::string>& parameters, 
-                                 SourceLocation location);
+        void enter_generic_context(const std::string &type_name,
+                                   const std::vector<std::string> &parameters,
+                                   SourceLocation location);
         void exit_generic_context();
         bool is_in_generic_context() const;
-        bool is_generic_parameter(const std::string& name) const;
+        bool is_generic_parameter(const std::string &name) const;
         std::string get_current_generic_type() const;
         const std::vector<std::string> get_current_generic_parameters() const;
 
         // Helper method to parse comma-separated template arguments
-        std::vector<std::string> parse_template_arguments(const std::string& args_str);
+        std::vector<std::string> parse_template_arguments(const std::string &args_str);
 
         // Enhanced type resolution that considers generic context
-        Type* resolve_type_with_generic_context(const std::string& type_string);
+        Type *resolve_type_with_generic_context(const std::string &type_string);
 
         // Generic instantiation tracking methods
-        void track_instantiation(const std::string& base_name, 
-                                const std::vector<std::string>& concrete_types, 
-                                const std::string& instantiated_name, 
-                                SourceLocation location);
+        void track_instantiation(const std::string &base_name,
+                                 const std::vector<std::string> &concrete_types,
+                                 const std::string &instantiated_name,
+                                 SourceLocation location);
 
         // Reference to main symbol table (for scope resolution lookups)
         const SymbolTable *_main_symbol_table = nullptr;
@@ -244,7 +246,7 @@ namespace Cryo
         ParameterizedType *resolve_generic_type(const std::string &type_string);
 
         // Generic instantiation tracking - public access for monomorphization
-        const std::vector<GenericInstantiation>& get_required_instantiations() const;
+        const std::vector<GenericInstantiation> &get_required_instantiations() const;
 
         // Main entry point
         void check_program(ProgramNode &program);

@@ -629,9 +629,41 @@ namespace Cryo::Codegen
                 {
                     std::string type_args_str = struct_name.substr(angle_pos + 1, close_angle - angle_pos - 1);
 
-                    // Parse type arguments
+                    // Resolve type alias generically using TypeContext
+                    std::string resolved_struct_name = struct_name;
+                    if (_type_context)
+                    {
+                        resolved_struct_name = _type_context->resolve_parameterized_type_alias(base_name, type_args_str);
+                        if (resolved_struct_name != struct_name)
+                        {
+                            std::cout << "[TypeMapper] Resolved type alias '" << struct_name
+                                      << "' to '" << resolved_struct_name << "'" << std::endl;
+                        }
+                    }
+
+                    // Extract resolved base name and type arguments
+                    std::string resolved_base_name = base_name;
+                    std::string resolved_type_args = type_args_str;
+
+                    if (resolved_struct_name != struct_name)
+                    {
+                        // Parse the resolved type name
+                        size_t resolved_angle_pos = resolved_struct_name.find('<');
+                        if (resolved_angle_pos != std::string::npos)
+                        {
+                            resolved_base_name = resolved_struct_name.substr(0, resolved_angle_pos);
+                            size_t resolved_close_angle = resolved_struct_name.find('>', resolved_angle_pos);
+                            if (resolved_close_angle != std::string::npos)
+                            {
+                                resolved_type_args = resolved_struct_name.substr(resolved_angle_pos + 1,
+                                                                                 resolved_close_angle - resolved_angle_pos - 1);
+                            }
+                        }
+                    }
+
+                    // Parse type arguments using the resolved type string
                     std::vector<Cryo::Type *> type_args;
-                    std::stringstream ss(type_args_str);
+                    std::stringstream ss(resolved_type_args);
                     std::string arg;
                     while (std::getline(ss, arg, ','))
                     {
@@ -650,7 +682,7 @@ namespace Cryo::Codegen
 
                     // Query enhanced enum type system for field layout
                     std::vector<std::shared_ptr<Cryo::Type>> enum_field_types =
-                        _type_context->get_enum_field_types(base_name, type_args);
+                        _type_context->get_enum_field_types(resolved_base_name, type_args);
 
                     if (!enum_field_types.empty())
                     {

@@ -146,9 +146,26 @@ namespace Cryo::Codegen
 
         std::cout << "[DEBUG] Processing main program with " << node.statements().size() << " statements" << std::endl;
 
-        // Two-pass processing to ensure struct declarations are processed before usage
-        // Pass 1: Process all struct and class declarations first
-        std::cout << "[DEBUG] Pass 1: Processing struct and class declarations" << std::endl;
+        // Three-pass processing to ensure proper dependency order
+        // Pass 1: Process all enum declarations first (needed for struct/class methods)
+        std::cout << "[DEBUG] Pass 1: Processing enum declarations" << std::endl;
+        for (size_t i = 0; i < node.statements().size(); ++i)
+        {
+            auto &stmt = node.statements()[i];
+            if (stmt)
+            {
+                // Check if this is an enum declaration
+                if (stmt->kind() == NodeKind::EnumDeclaration)
+                {
+                    std::cout << "[DEBUG] Processing enum declaration " << (i + 1) << "/" << node.statements().size() << std::endl;
+                    stmt->accept(*this);
+                    std::cout << "[DEBUG] Completed enum declaration " << (i + 1) << std::endl;
+                }
+            }
+        }
+
+        // Pass 2: Process all struct and class declarations
+        std::cout << "[DEBUG] Pass 2: Processing struct and class declarations" << std::endl;
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
@@ -165,18 +182,19 @@ namespace Cryo::Codegen
             }
         }
 
-        // Pass 2: Process all other statements
-        std::cout << "[DEBUG] Pass 2: Processing other statements" << std::endl;
+        // Pass 3: Process all other statements
+        std::cout << "[DEBUG] Pass 3: Processing other statements" << std::endl;
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
             if (stmt)
             {
-                // Skip struct and class declarations (already processed)
-                if (stmt->kind() == NodeKind::StructDeclaration ||
+                // Skip enum, struct and class declarations (already processed)
+                if (stmt->kind() == NodeKind::EnumDeclaration ||
+                    stmt->kind() == NodeKind::StructDeclaration ||
                     stmt->kind() == NodeKind::ClassDeclaration)
                 {
-                    std::cout << "[DEBUG] Skipping already processed struct/class declaration " << (i + 1) << std::endl;
+                    std::cout << "[DEBUG] Skipping already processed declaration " << (i + 1) << std::endl;
                     continue;
                 }
 
@@ -428,26 +446,26 @@ namespace Cryo::Codegen
                     // This is a very special case to handle Array<T> construction
                     // e.g., `const arr: Array<int> = [1, 2, 3];`
                     // The constructor should be called with the array literal elements
-                    // 
+                    //
                     // This is a very special case and not generalizable to other types
                     // so we hardcode the check for Array<T> here.
                     if (type_annotation.find("Array<") == 0 && type_annotation.find('>') != std::string::npos)
                     {
                         // This is an Array<T> type - call the constructor instead of direct assignment
                         std::cout << "[CodegenVisitor] Array<T> variable initialization - calling constructor" << std::endl;
-                        
+
                         // Get the array literal size before generating it
                         size_t array_literal_size = 0;
-                        if (auto *array_literal = dynamic_cast<Cryo::ArrayLiteralNode*>(node.initializer()))
+                        if (auto *array_literal = dynamic_cast<Cryo::ArrayLiteralNode *>(node.initializer()))
                         {
                             array_literal_size = array_literal->size();
                             std::cout << "[CodegenVisitor] Array literal has " << array_literal_size << " elements" << std::endl;
                         }
-                        
+
                         // Generate the array literal first
                         node.initializer()->accept(*this);
                         llvm::Value *array_ptr = get_current_value();
-                        
+
                         if (array_ptr)
                         {
                             // Extract the concrete type name (e.g., Array<int> -> Array_int)
@@ -456,59 +474,62 @@ namespace Cryo::Codegen
                             size_t end = type_annotation.find('>');
                             std::string type_args = type_annotation.substr(start, end - start);
                             std::string monomorphized_name = base_type + "_" + type_args;
-                            
+
                             // Find the constructor function
                             std::string constructor_name = monomorphized_name + "::" + base_type;
                             auto constructor_it = _functions.find(constructor_name);
-                            
+
                             if (constructor_it != _functions.end())
                             {
                                 llvm::Function *constructor_func = constructor_it->second;
                                 std::cout << "[CodegenVisitor] Found Array constructor: " << constructor_name << std::endl;
-                                
+
                                 // Get the builder from context manager
                                 auto &builder = _context_manager.get_builder();
                                 auto &context = _context_manager.get_context();
-                                
+
                                 // Get the exact parameter type from the constructor function
                                 // This ensures we match the constructor parameter type exactly
                                 llvm::FunctionType *constructor_type = constructor_func->getFunctionType();
                                 llvm::Type *dynamic_array_type = nullptr;
-                                
+
                                 // The constructor should have 2 parameters: 'this' pointer and dynamic array struct
-                                if (constructor_type->getNumParams() >= 2) {
+                                if (constructor_type->getNumParams() >= 2)
+                                {
                                     dynamic_array_type = constructor_type->getParamType(1); // Second parameter
                                     std::cout << "[CodegenVisitor] Using constructor parameter type for dynamic array" << std::endl;
-                                } else {
+                                }
+                                else
+                                {
                                     std::cout << "[CodegenVisitor] ERROR: Constructor doesn't have expected parameter count" << std::endl;
                                     return; // Skip this variable declaration
                                 }
-                                
+
                                 // Allocate and initialize the dynamic array struct
                                 llvm::AllocaInst *dynamic_array_alloca = builder.CreateAlloca(dynamic_array_type, nullptr, "dynamic_array");
-                                
+
                                 // Set ptr field (first field) to the array pointer
                                 llvm::Value *ptr_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 0, "ptr_field");
                                 builder.CreateStore(array_ptr, ptr_field_ptr);
-                                
+
                                 // Set length field (second field) to the actual array literal size
                                 llvm::Value *length_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 1, "length_field");
                                 builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size), length_field_ptr);
-                                
+
                                 // Set capacity field (third field) to the same value as length initially
                                 llvm::Value *capacity_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 2, "capacity_field");
                                 builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size), capacity_field_ptr);
-                                
+
                                 // Load the dynamic array struct to pass by value
                                 llvm::Value *dynamic_array_value = builder.CreateLoad(dynamic_array_type, dynamic_array_alloca, "dynamic_array_value");
-                                
+
                                 // Call constructor with 'this' pointer and dynamic array struct
                                 std::vector<llvm::Value *> args;
                                 args.push_back(alloca);              // 'this' pointer
                                 args.push_back(dynamic_array_value); // dynamic array struct
-                                
+
                                 builder.CreateCall(constructor_func, args);
-                                
+
                                 std::cout << "[CodegenVisitor] Called Array constructor successfully" << std::endl;
                             }
                             else
@@ -619,14 +640,14 @@ namespace Cryo::Codegen
         _types[node.name()] = struct_type;
 
         std::cout << "[CodegenVisitor] Created LLVM struct type for " << node.name() << std::endl;
-        
+
         // Generate methods defined in the struct (similar to class method processing)
         if (!node.methods().empty())
         {
             std::cout << "[CodegenVisitor] Processing " << node.methods().size() << " struct methods for " << node.name() << std::endl;
-            
+
             llvm::Type *struct_ptr_type = llvm::PointerType::getUnqual(struct_type);
-            
+
             for (const auto &method : node.methods())
             {
                 std::cout << "[CodegenVisitor] Generating struct method: " << node.name() << "::" << method->name() << std::endl;
@@ -748,7 +769,7 @@ namespace Cryo::Codegen
                             std::string param_type_str = param->type_annotation();
                             Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_str);
                             llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
-                            
+
                             if (param_type)
                             {
                                 llvm::AllocaInst *param_alloca = _context_manager.get_builder().CreateAlloca(param_type, nullptr, param->name());
@@ -764,12 +785,12 @@ namespace Cryo::Codegen
                     {
                         // Set current struct context for member access resolution
                         current_struct_type = node.name();
-                        
+
                         method->body()->accept(*this);
-                        
+
                         // Clear struct context
                         current_struct_type.clear();
-                        
+
                         // Add return if the method doesn't already have one
                         llvm::BasicBlock *current_block = _context_manager.get_builder().GetInsertBlock();
                         if (current_block && !current_block->getTerminator())
@@ -797,7 +818,7 @@ namespace Cryo::Codegen
                 }
             }
         }
-        
+
         register_value(&node, nullptr); // Struct declarations don't have runtime values
     }
 
@@ -1166,7 +1187,7 @@ namespace Cryo::Codegen
                 {
                     std::string func_name = func.getName().str();
                     std::string suffix = "::" + node.name();
-                    if (func_name.size() > suffix.size() && 
+                    if (func_name.size() > suffix.size() &&
                         func_name.substr(func_name.size() - suffix.size()) == suffix)
                     {
                         std::cout << "[CodegenVisitor] StructMethodNode already processed: " << func_name << std::endl;
@@ -1179,7 +1200,7 @@ namespace Cryo::Codegen
 
         std::cout << "[CodegenVisitor] WARNING: StructMethodNode visited individually without parent struct context: " << node.name() << std::endl;
         std::cout << "[CodegenVisitor] This suggests the method was not processed by StructDeclarationNode" << std::endl;
-        
+
         // If we reach here, treat it as a standalone function (fallback)
         visit(static_cast<FunctionDeclarationNode &>(node));
         register_value(&node, nullptr);
@@ -2941,12 +2962,12 @@ namespace Cryo::Codegen
         if (member_name == "length" && object_ptr)
         {
             std::cout << "[CodegenVisitor] Checking for array length access" << std::endl;
-            
+
             // Check if the object is a dynamic array type (T[])
             if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
             {
                 llvm::Type *allocated_type = alloca_inst->getAllocatedType();
-                
+
                 // Check if this is a dynamic array struct (has ptr, length, capacity fields)
                 if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(allocated_type))
                 {
@@ -2954,12 +2975,12 @@ namespace Cryo::Codegen
                     if (type_name.find("dynamic_array") != std::string::npos)
                     {
                         std::cout << "[CodegenVisitor] Found dynamic array type for length access: " << type_name << std::endl;
-                        
+
                         // Access the length field (field index 1)
                         llvm::Value *length_field_ptr = builder.CreateStructGEP(struct_type, object_ptr, 1, "length_ptr");
                         llvm::Type *length_type = struct_type->getStructElementType(1); // u64
                         llvm::Value *length_value = create_load(length_field_ptr, length_type, "length_val");
-                        
+
                         std::cout << "[CodegenVisitor] Successfully generated array length access" << std::endl;
                         register_value(&node, length_value);
                         set_current_value(length_value);
@@ -2978,7 +2999,7 @@ namespace Cryo::Codegen
         if (!current_struct_type.empty())
         {
             std::cout << "[CodegenVisitor] Trying current struct context: " << current_struct_type << std::endl;
-            
+
             auto context_type_it = _types.find(current_struct_type);
             if (context_type_it != _types.end())
             {
@@ -2991,7 +3012,7 @@ namespace Cryo::Codegen
                         struct_type = struct_llvm_type;
                         type_name = current_struct_type;
                         field_index = test_field_index;
-                        std::cout << "[CodegenVisitor] Found struct type via method context: " << current_struct_type 
+                        std::cout << "[CodegenVisitor] Found struct type via method context: " << current_struct_type
                                   << ", field index: " << field_index << std::endl;
                     }
                 }
@@ -3002,7 +3023,7 @@ namespace Cryo::Codegen
         if (!struct_type && object_ptr)
         {
             std::cout << "[CodegenVisitor] Trying direct type resolution from LLVM type" << std::endl;
-            
+
             if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
             {
                 llvm::Type *allocated_type = alloca_inst->getAllocatedType();
@@ -3011,17 +3032,17 @@ namespace Cryo::Codegen
                 if (allocated_type->isPointerTy())
                 {
                     std::cout << "[CodegenVisitor] Member access: this is a pointer type, searching for matching struct" << std::endl;
-                    
+
                     // For pointer types, find the matching struct by comparing against all registered types
                     for (const auto &[registered_name, registered_type] : _types)
                     {
                         if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
                         {
                             llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
-                            
+
                             // Try both exact comparison and flexible comparison for generic structs
                             bool type_matches = (allocated_type == expected_ptr_type);
-                            
+
                             // For generic structs, also check if this could be a specialized instance
                             if (!type_matches && registered_name.find("GenericStruct") != std::string::npos)
                             {
@@ -3033,13 +3054,13 @@ namespace Cryo::Codegen
                                     std::cout << "[CodegenVisitor] Generic struct field match found for: " << registered_name << std::endl;
                                 }
                             }
-                            
+
                             if (type_matches)
                             {
                                 struct_type = struct_llvm_type;
                                 type_name = registered_name;
                                 field_index = _type_mapper->get_field_index(registered_name, member_name);
-                                std::cout << "[CodegenVisitor] Found matching struct type: " << registered_name 
+                                std::cout << "[CodegenVisitor] Found matching struct type: " << registered_name
                                           << ", field index: " << field_index << std::endl;
                                 break;
                             }
@@ -3051,7 +3072,7 @@ namespace Cryo::Codegen
                     // Direct struct type
                     struct_type = allocated_type;
                     std::cout << "[CodegenVisitor] Member access: direct struct type" << std::endl;
-                    
+
                     // Find the type name
                     for (const auto &[registered_name, registered_type] : _types)
                     {
@@ -3059,7 +3080,7 @@ namespace Cryo::Codegen
                         {
                             type_name = registered_name;
                             field_index = _type_mapper->get_field_index(registered_name, member_name);
-                            std::cout << "[CodegenVisitor] Found direct struct type: " << type_name 
+                            std::cout << "[CodegenVisitor] Found direct struct type: " << type_name
                                       << ", field index: " << field_index << std::endl;
                             break;
                         }
@@ -3072,7 +3093,7 @@ namespace Cryo::Codegen
         if (!struct_type || field_index == -1)
         {
             std::cout << "[CodegenVisitor] Trying fallback pattern matching for specialized generic structs" << std::endl;
-            
+
             // Look specifically for GenericStruct specializations
             for (const auto &[registered_name, registered_type] : _types)
             {
@@ -3087,7 +3108,7 @@ namespace Cryo::Codegen
                             struct_type = struct_llvm_type;
                             type_name = registered_name;
                             field_index = test_field_index;
-                            std::cout << "[CodegenVisitor] Fallback pattern match found: " << registered_name 
+                            std::cout << "[CodegenVisitor] Fallback pattern match found: " << registered_name
                                       << ", field index: " << field_index << std::endl;
                             break;
                         }
@@ -3105,7 +3126,7 @@ namespace Cryo::Codegen
             std::cout << "  type_name: " << type_name << std::endl;
             std::cout << "  member_name: " << member_name << std::endl;
             std::cout << "  current_struct_type: " << current_struct_type << std::endl;
-            
+
             report_error("Unknown struct type or field in member access: " + member_name + " (type: " + type_name + ")", &node);
             register_value(&node, nullptr);
             return;
@@ -4439,6 +4460,31 @@ namespace Cryo::Codegen
                     }
                     result = builder.CreateFCmpOEQ(left_val, right_val, "feq.tmp");
                 }
+                else if (left_val->getType()->isPointerTy() || right_val->getType()->isPointerTy())
+                {
+                    // Pointer comparison - convert both to the same pointer type if needed
+                    llvm::Type *pointer_type = llvm::PointerType::get(_context_manager.get_context(), 0);
+
+                    if (!left_val->getType()->isPointerTy())
+                    {
+                        // Convert integer to pointer if needed (e.g., null constant)
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateIntToPtr(left_val, pointer_type, "int2ptr");
+                        }
+                    }
+
+                    if (!right_val->getType()->isPointerTy())
+                    {
+                        // Convert integer to pointer if needed (e.g., null constant)
+                        if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateIntToPtr(right_val, pointer_type, "int2ptr");
+                        }
+                    }
+
+                    result = builder.CreateICmpEQ(left_val, right_val, "ptr_eq.tmp");
+                }
                 break;
 
             case TokenKind::TK_EXCLAIMEQUAL:
@@ -4470,6 +4516,31 @@ namespace Cryo::Codegen
                         right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
                     }
                     result = builder.CreateFCmpONE(left_val, right_val, "fne.tmp");
+                }
+                else if (left_val->getType()->isPointerTy() || right_val->getType()->isPointerTy())
+                {
+                    // Pointer comparison - convert both to the same pointer type if needed
+                    llvm::Type *pointer_type = llvm::PointerType::get(_context_manager.get_context(), 0);
+
+                    if (!left_val->getType()->isPointerTy())
+                    {
+                        // Convert integer to pointer if needed (e.g., null constant)
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateIntToPtr(left_val, pointer_type, "int2ptr");
+                        }
+                    }
+
+                    if (!right_val->getType()->isPointerTy())
+                    {
+                        // Convert integer to pointer if needed (e.g., null constant)
+                        if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateIntToPtr(right_val, pointer_type, "int2ptr");
+                        }
+                    }
+
+                    result = builder.CreateICmpNE(left_val, right_val, "ptr_ne.tmp");
                 }
                 break;
 
@@ -5219,6 +5290,154 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        std::cout << "[DEBUG] Processing function call: " << function_name << std::endl;
+
+        // Check if this is a template enum constructor (e.g., Result::Ok) that needs instantiation
+        // This must happen early, before any forward declarations are created
+        size_t early_scope_pos = function_name.find("::");
+        if (early_scope_pos != std::string::npos)
+        {
+            std::string base_name = function_name.substr(0, early_scope_pos);
+            std::string variant_name = function_name.substr(early_scope_pos + 2);
+            
+            std::cout << "[CodegenVisitor] Early check: is " << function_name << " a template enum constructor? (base: " << base_name << ", variant: " << variant_name << ")" << std::endl;
+            
+            // Check if base_name is a known template enum (like Result, Option)
+            if (base_name == "Result" || base_name == "Option")
+            {
+                std::cout << "[CodegenVisitor] Early detection: template enum constructor " << function_name << std::endl;
+                
+                // Try to find an existing instantiation that matches this call
+                std::string matching_instantiation;
+                std::cout << "[CodegenVisitor] Early: Looking for existing instantiations of " << base_name << " in _enum_variants:" << std::endl;
+                for (const auto &[variant_key, variant_func] : _enum_variants)
+                {
+                    std::cout << "[CodegenVisitor] Early:   - Found variant: " << variant_key << std::endl;
+                    // Look for patterns like "Result<void*, AllocError>::Ok"
+                    if (variant_key.find(base_name + "<") == 0 && variant_key.find("::" + variant_name) != std::string::npos)
+                    {
+                        matching_instantiation = variant_key;
+                        break;
+                    }
+                }
+                
+                if (!matching_instantiation.empty())
+                {
+                    std::cout << "[CodegenVisitor] Early: Found matching instantiation: " << matching_instantiation << std::endl;
+                    
+                    // Use the instantiated constructor
+                    llvm::Value *constructor_func = _enum_variants[matching_instantiation];
+                    if (auto *llvm_function = llvm::dyn_cast<llvm::Function>(constructor_func))
+                    {
+                        // Generate arguments for the constructor call
+                        std::vector<llvm::Value *> args;
+                        for (auto &arg : node->arguments())
+                        {
+                            arg->accept(*this);
+                            llvm::Value *arg_val = get_current_value();
+                            if (arg_val)
+                            {
+                                args.push_back(arg_val);
+                            }
+                        }
+
+                        // Call the enum constructor function
+                        llvm::Value *enum_instance = builder.CreateCall(llvm_function, args, "enum_constructor");
+                        return enum_instance;
+                    }
+                }
+                else
+                {
+                    std::cout << "[CodegenVisitor] Early: No matching instantiation found for " << function_name << std::endl;
+                    
+                    // Prevent infinite recursion with a generation guard
+                    static std::set<std::string> generating;
+                    std::string guard_key = base_name + "::" + variant_name;
+                    
+                    if (generating.find(guard_key) != generating.end()) {
+                        std::cout << "[CodegenVisitor] Early: Already generating " << guard_key << ", avoiding recursion" << std::endl;
+                    } else {
+                        std::cout << "[CodegenVisitor] Early: Triggering enum constructor generation!" << std::endl;
+                        generating.insert(guard_key);
+                        
+                        // We need to infer the concrete instantiation from the current context
+                        // For now, we'll use the return type of the current function to determine the instantiation
+                        if (_current_function && _current_function->ast_node) {
+                            std::string return_type_str = _current_function->ast_node->return_type_annotation();
+                            std::cout << "[CodegenVisitor] Current function return type: " << return_type_str << std::endl;
+                            
+                            // If the return type looks like a parameterized enum (e.g., "AllocResult<void>"), 
+                            // extract the concrete type arguments and generate constructors
+                            if (return_type_str.find('<') != std::string::npos) {
+                                // Parse the return type to get base name and type arguments
+                                size_t open_bracket = return_type_str.find('<');
+                                size_t close_bracket = return_type_str.find('>', open_bracket);
+                                if (open_bracket != std::string::npos && close_bracket != std::string::npos) {
+                                    std::string base_return_type = return_type_str.substr(0, open_bracket);
+                                    std::string type_args_str = return_type_str.substr(open_bracket + 1, close_bracket - open_bracket - 1);
+                                    
+                                    // If the base type matches our enum base (Result), generate constructors
+                                    if (base_return_type == base_name || 
+                                        (base_return_type == "AllocResult" && base_name == "Result")) {
+                                        
+                                        std::vector<std::string> type_args;
+                                        // For AllocResult<void>, this should generate Result<void*, AllocError>
+                                        if (base_return_type == "AllocResult" && type_args_str == "void") {
+                                            type_args = {"void*", "AllocError"};
+                                            ensure_parameterized_enum_constructors("Result<void*, AllocError>", "Result", type_args);
+                                        } else {
+                                            // Split type_args_str by comma and generate constructors
+                                            std::istringstream iss(type_args_str);
+                                            std::string type_arg;
+                                            while (std::getline(iss, type_arg, ',')) {
+                                                // Trim whitespace
+                                                type_arg.erase(0, type_arg.find_first_not_of(" \t"));
+                                                type_arg.erase(type_arg.find_last_not_of(" \t") + 1);
+                                                type_args.push_back(type_arg);
+                                            }
+                                            ensure_parameterized_enum_constructors(return_type_str, base_name, type_args);
+                                        }
+                                        
+                                        std::cout << "[CodegenVisitor] Generated constructors for " << return_type_str << std::endl;
+                                        
+                                        // Now try to find the constructor again
+                                        std::string instantiated_name = (base_return_type == "AllocResult") ? "Result<void*, AllocError>" : return_type_str;
+                                        std::string qualified_variant_name = instantiated_name + "::" + variant_name;
+                                        auto variant_it = _enum_variants.find(qualified_variant_name);
+                                        if (variant_it != _enum_variants.end()) {
+                                            std::cout << "[CodegenVisitor] Found generated constructor: " << qualified_variant_name << std::endl;
+                                            llvm::Function *llvm_function = llvm::dyn_cast<llvm::Function>(variant_it->second);
+                                            if (llvm_function) {
+                                                // Prepare arguments and call the constructor
+                                                std::vector<llvm::Value *> args;
+                                                for (size_t i = 0; i < node->arguments().size() && i < llvm_function->arg_size(); ++i) {
+                                                    node->arguments()[i]->accept(*this);
+                                                    llvm::Value *arg_val = _node_values[node->arguments()[i].get()];
+                                                    if (arg_val) {
+                                                        args.push_back(arg_val);
+                                                    }
+                                                }
+                                                
+                                                // Call the enum constructor function
+                                                llvm::Value *enum_instance = builder.CreateCall(llvm_function, args, "enum_constructor");
+                                                register_value(node, enum_instance);
+                                                generating.erase(guard_key);  // Remove from guard before returning
+                                                return enum_instance;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        generating.erase(guard_key);  // Always remove from guard
+                    }
+                    
+                    std::cout << "[CodegenVisitor] Could not generate constructors, continuing with normal flow" << std::endl;
+                }
+            }
+        }
+
         // Check if this is a parameterized enum constructor call that needs generation
         size_t param_scope_pos = function_name.find("::");
         if (param_scope_pos != std::string::npos)
@@ -5303,6 +5522,75 @@ namespace Cryo::Codegen
                 // Call the enum constructor function
                 llvm::Value *enum_instance = builder.CreateCall(llvm_function, args, "enum_constructor");
                 return enum_instance;
+            }
+        }
+
+        std::cout << "[DEBUG] About to check template enum constructor for: " << function_name << std::endl;
+
+        // Check if this is a template enum constructor (e.g., Result::Ok) that needs instantiation
+        size_t template_scope_pos = function_name.find("::");
+        if (template_scope_pos != std::string::npos)
+        {
+            std::string base_name = function_name.substr(0, template_scope_pos);
+            std::string variant_name = function_name.substr(template_scope_pos + 2);
+            
+            std::cout << "[CodegenVisitor] Checking if " << function_name << " is a template enum constructor (base: " << base_name << ", variant: " << variant_name << ")" << std::endl;
+            
+            // Check if base_name is a known template enum (like Result, Option)
+            // We need to determine the instantiation context from the return type
+            // For now, let's check for known template enums
+            if (base_name == "Result" || base_name == "Option")
+            {
+                std::cout << "[CodegenVisitor] Detected template enum constructor: " << function_name << std::endl;
+                
+                // Try to find an existing instantiation that matches this call
+                // Look for any instantiated enum that starts with the base name
+                std::string matching_instantiation;
+                std::cout << "[CodegenVisitor] Looking for existing instantiations of " << base_name << " in _enum_variants:" << std::endl;
+                for (const auto &[variant_key, variant_func] : _enum_variants)
+                {
+                    std::cout << "[CodegenVisitor]   - Found variant: " << variant_key << std::endl;
+                    // Look for patterns like "Result<void*, AllocError>::Ok"
+                    if (variant_key.find(base_name + "<") == 0 && variant_key.find("::" + variant_name) != std::string::npos)
+                    {
+                        matching_instantiation = variant_key;
+                        break;
+                    }
+                }
+                
+                if (!matching_instantiation.empty())
+                {
+                    std::cout << "[CodegenVisitor] Found matching instantiation: " << matching_instantiation << std::endl;
+                    
+                    // Use the instantiated constructor
+                    llvm::Value *constructor_func = _enum_variants[matching_instantiation];
+                    if (auto *llvm_function = llvm::dyn_cast<llvm::Function>(constructor_func))
+                    {
+                        // Generate arguments for the constructor call
+                        std::vector<llvm::Value *> args;
+                        for (auto &arg : node->arguments())
+                        {
+                            arg->accept(*this);
+                            llvm::Value *arg_val = get_current_value();
+                            if (arg_val)
+                            {
+                                args.push_back(arg_val);
+                            }
+                        }
+
+                        // Call the enum constructor function
+                        llvm::Value *enum_instance = builder.CreateCall(llvm_function, args, "enum_constructor");
+                        return enum_instance;
+                    }
+                }
+                else
+                {
+                    std::cout << "[CodegenVisitor] No matching instantiation found for " << function_name << std::endl;
+                }
+            }
+            else
+            {
+                std::cout << "[CodegenVisitor] " << base_name << " is not a known template enum" << std::endl;
             }
         }
 
@@ -7048,28 +7336,41 @@ namespace Cryo::Codegen
         llvm::Type *enum_type = _type_mapper->lookup_type(instantiated_name);
         if (!enum_type)
         {
-            // Convert type argument strings to Type* for TypeMapper to process
-            std::vector<std::shared_ptr<Cryo::Type>> type_args_as_types;
-            for (const std::string &type_arg : type_args)
+            // For cases like AllocResult<void> -> Result<void*, AllocError>, use the actual function return type
+            std::string function_return_type = "";
+            if (_current_function && _current_function->ast_node)
             {
-                Cryo::Type *arg_type = _symbol_table.get_type_context()->parse_type_from_string(type_arg);
-                if (arg_type)
-                {
-                    type_args_as_types.push_back(std::shared_ptr<Cryo::Type>(arg_type));
-                }
+                function_return_type = _current_function->ast_node->return_type_annotation();
+                enum_type = _type_mapper->lookup_type(function_return_type);
+                std::cout << "[CodegenVisitor] Using function return type: " << function_return_type 
+                          << " -> " << (enum_type ? enum_type->getStructName().str() : "null") << std::endl;
             }
-
-            // Create a ParameterizedType instance for TypeMapper to process
-            if (!type_args_as_types.empty())
+            
+            if (!enum_type)
             {
-                std::unique_ptr<Cryo::ParameterizedType> parameterized_type =
-                    std::make_unique<Cryo::ParameterizedType>(base_name, type_args_as_types);
+                // Convert type argument strings to Type* for TypeMapper to process
+                std::vector<std::shared_ptr<Cryo::Type>> type_args_as_types;
+                for (const std::string &type_arg : type_args)
+                {
+                    Cryo::Type *arg_type = _symbol_table.get_type_context()->parse_type_from_string(type_arg);
+                    if (arg_type)
+                    {
+                        type_args_as_types.push_back(std::shared_ptr<Cryo::Type>(arg_type));
+                    }
+                }
 
-                // Let TypeMapper handle the creation and registration
-                enum_type = _type_mapper->map_type(parameterized_type.get());
+                // Create a ParameterizedType instance for TypeMapper to process
+                if (!type_args_as_types.empty())
+                {
+                    std::unique_ptr<Cryo::ParameterizedType> parameterized_type =
+                        std::make_unique<Cryo::ParameterizedType>(base_name, type_args_as_types);
 
-                std::cout << "[CodegenVisitor] TypeMapper processed parameterized enum, got type: "
-                          << (enum_type ? enum_type->getStructName().str() : "null") << std::endl;
+                    // Let TypeMapper handle the creation and registration
+                    enum_type = _type_mapper->map_type(parameterized_type.get());
+
+                    std::cout << "[CodegenVisitor] TypeMapper processed parameterized enum, got type: "
+                              << (enum_type ? enum_type->getStructName().str() : "null") << std::endl;
+                }
             }
         }
 
@@ -7079,18 +7380,17 @@ namespace Cryo::Codegen
             return;
         }
 
-        // Get the base enum type from TypeContext to find its variants
-        Cryo::Type *base_enum_type = _symbol_table.get_type_context()->lookup_enum_type(base_name);
-        Cryo::EnumType *cryo_enum_type = dynamic_cast<Cryo::EnumType *>(base_enum_type);
+        // Get the base enum template from TypeContext to find its variants
+        std::shared_ptr<Cryo::EnumType> enum_template = _symbol_table.get_type_context()->get_parameterized_enum_template(base_name);
 
-        if (!cryo_enum_type)
+        if (!enum_template)
         {
-            report_error("Could not find base enum type for parameterized enum: " + base_name);
+            report_error("Could not find base enum template for parameterized enum: " + base_name);
             return;
         }
 
         // Generate constructors for each variant of the base enum
-        const auto &variants = cryo_enum_type->variants();
+        const auto &variants = enum_template->variants();
         std::cout << "[CodegenVisitor] Base enum " << base_name << " has " << variants.size() << " variants" << std::endl;
 
         for (const auto &variant_name : variants)
@@ -7121,11 +7421,10 @@ namespace Cryo::Codegen
         std::vector<llvm::Type *> param_types;
         bool needs_value_param = false;
 
-        // For now, determine parameter needs based on variant name patterns
-        // Some/Ok variants typically need a value parameter, None/Err variants typically don't
+        // Determine parameter needs based on variant name and type arguments
         if (variant_name == "Some" || variant_name == "Ok")
         {
-            // This variant needs a parameter - use the first type argument
+            // This variant needs a parameter - use the first type argument (T)
             if (!type_args.empty())
             {
                 std::string type_arg = type_args[0];
@@ -7152,6 +7451,10 @@ namespace Cryo::Codegen
                 {
                     param_type = _type_mapper->get_string_type();
                 }
+                else if (type_arg == "void*")
+                {
+                    param_type = llvm::PointerType::get(_type_mapper->get_void_type(), 0);
+                }
                 else
                 {
                     // Try to look up as a registered type
@@ -7165,7 +7468,44 @@ namespace Cryo::Codegen
                 }
             }
         }
-        // None, Nothing, Err variants don't need parameters        // Create function type
+        else if (variant_name == "Err")
+        {
+            // Err variant needs a parameter - use the second type argument (E)
+            if (type_args.size() > 1)
+            {
+                std::string error_type_arg = type_args[1];
+                
+                // Convert the error type argument string to an LLVM type
+                llvm::Type *param_type = nullptr;
+                if (error_type_arg == "i32" || error_type_arg == "int")
+                {
+                    param_type = _type_mapper->get_integer_type(32, true);
+                }
+                else if (error_type_arg == "i64")
+                {
+                    param_type = _type_mapper->get_integer_type(64, true);
+                }
+                else
+                {
+                    // Try to look up as a registered type (for enum types like AllocError)
+                    param_type = _type_mapper->lookup_type(error_type_arg);
+                    
+                    // If lookup failed and this is for a simple enum error type, use i32
+                    if (!param_type && error_type_arg == "AllocError")
+                    {
+                        param_type = _type_mapper->get_integer_type(32, true);
+                        std::cout << "[CodegenVisitor] Using i32 for AllocError enum parameter" << std::endl;
+                    }
+                }
+
+                if (param_type)
+                {
+                    param_types.push_back(param_type);
+                    needs_value_param = true;
+                }
+            }
+        }
+        // None, Nothing variants don't need parameters        // Create function type
         llvm::FunctionType *func_type = llvm::FunctionType::get(enum_type, param_types, false);
         llvm::Function *constructor_func = llvm::Function::Create(
             func_type, llvm::Function::ExternalLinkage, constructor_name, *module);
@@ -7213,9 +7553,26 @@ namespace Cryo::Codegen
 
             if (needs_value_param && constructor_func->arg_size() > 0)
             {
-                // For errors, we'd need to handle the union data properly
-                // This is a simplified version
+                // For errors, we need to handle the union data properly
                 llvm::Value *error_param = &*constructor_func->arg_begin();
+                
+                // If the error parameter is an integer but the struct field is a pointer,
+                // we need to cast it appropriately
+                llvm::Type *struct_field_type = enum_type->getStructElementType(1);
+                if (error_param->getType() != struct_field_type)
+                {
+                    if (error_param->getType()->isIntegerTy() && struct_field_type->isPointerTy())
+                    {
+                        // Cast integer to pointer (for simple enum values)
+                        error_param = builder.CreateIntToPtr(error_param, struct_field_type, "error_as_ptr");
+                    }
+                    else if (error_param->getType()->isPointerTy() && struct_field_type->isIntegerTy())
+                    {
+                        // Cast pointer to integer
+                        error_param = builder.CreatePtrToInt(error_param, struct_field_type, "error_as_int");
+                    }
+                }
+                
                 enum_instance = builder.CreateInsertValue(enum_instance, error_param, {1}, "set_error");
             }
         }
