@@ -183,16 +183,24 @@ namespace Cryo
     {
     private:
         std::string _name;
+        bool _is_global_reference = false; // whether this identifier references a global variable
 
     public:
         IdentifierNode(NodeKind kind, SourceLocation loc, std::string name)
             : ExpressionNode(kind, loc), _name(std::move(name)) {}
 
         const std::string &name() const { return _name; }
+        bool is_global_reference() const { return _is_global_reference; }
+
+        // Scope setters
+        void set_global_reference(bool is_global) { _is_global_reference = is_global; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "Identifier: " << _name << std::endl;
+            os << std::string(indent, ' ') << "Identifier: " << _name;
+            if (_is_global_reference)
+                os << " (global)";
+            os << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;
@@ -382,15 +390,17 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> _initializer;
         bool _is_mutable = false; // const vs mut
         bool _is_auto = false;    // auto type inference
+        bool _is_global = false;  // whether this variable is declared at global scope
 
     public:
         VariableDeclarationNode(SourceLocation loc, std::string name,
                                 std::string type_annotation = "",
                                 std::unique_ptr<ExpressionNode> init = nullptr,
-                                bool is_mutable = false)
+                                bool is_mutable = false,
+                                bool is_global = false)
             : DeclarationNode(NodeKind::VariableDeclaration, loc),
               _name(std::move(name)), _type_annotation(std::move(type_annotation)),
-              _initializer(std::move(init)), _is_mutable(is_mutable)
+              _initializer(std::move(init)), _is_mutable(is_mutable), _is_global(is_global)
         {
             _is_auto = (_type_annotation == "auto" || _type_annotation.empty());
         }
@@ -401,6 +411,7 @@ namespace Cryo
         bool is_mutable() const { return _is_mutable; }
         bool is_auto() const { return _is_auto; }
         bool has_initializer() const { return _initializer != nullptr; }
+        bool is_global() const { return _is_global; }
 
         // Type annotation setters
         void set_type_annotation(const std::string &type)
@@ -409,9 +420,13 @@ namespace Cryo
             _is_auto = (type == "auto");
         }
 
+        // Scope setters
+        void set_global(bool is_global) { _is_global = is_global; }
+
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "VariableDecl: "
+               << (_is_global ? "global " : "")
                << (_is_mutable ? "mut " : "const ") << _name;
             if (!_type_annotation.empty())
                 os << ": " << _type_annotation;
@@ -503,17 +518,17 @@ namespace Cryo
 
         enum class ImportStyle
         {
-            WildcardImport,    // import <core/types>; or import * from <core/types>;
-            SpecificImport     // import IO from <io/stdio>;
+            WildcardImport, // import <core/types>; or import * from <core/types>;
+            SpecificImport  // import IO from <io/stdio>;
         };
 
     private:
-        std::string _path;              // The import path (file path or module name)
-        std::string _alias;             // Optional alias (for "as" keyword)
+        std::string _path;                          // The import path (file path or module name)
+        std::string _alias;                         // Optional alias (for "as" keyword)
         std::vector<std::string> _specific_imports; // Specific symbols to import (for "import X from")
-        ImportType _import_type;        // Type of import
-        ImportStyle _import_style;      // Style of import (wildcard vs specific)
-        bool _has_alias;                // Whether an alias was specified
+        ImportType _import_type;                    // Type of import
+        ImportStyle _import_style;                  // Style of import (wildcard vs specific)
+        bool _has_alias;                            // Whether an alias was specified
 
     public:
         ImportDeclarationNode(SourceLocation loc, std::string path, ImportType type)
@@ -541,17 +556,18 @@ namespace Cryo
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "ImportDecl: ";
-            
+
             if (_import_style == ImportStyle::SpecificImport)
             {
                 for (size_t i = 0; i < _specific_imports.size(); ++i)
                 {
-                    if (i > 0) os << ", ";
+                    if (i > 0)
+                        os << ", ";
                     os << _specific_imports[i];
                 }
                 os << " from ";
             }
-            
+
             if (_import_type == ImportType::Relative)
                 os << "\"" << _path << "\"";
             else if (_import_type == ImportType::Absolute)
@@ -664,7 +680,7 @@ namespace Cryo
             _generic_parameters.push_back(std::move(param));
         }
 
-        void add_trait_bound(const TraitBound& bound)
+        void add_trait_bound(const TraitBound &bound)
         {
             _trait_bounds.push_back(bound);
         }
@@ -780,10 +796,10 @@ namespace Cryo
 
     public:
         StructMethodNode(SourceLocation loc, std::string name, std::string return_type,
-                         Visibility visibility = Visibility::Public, bool is_constructor = false, 
+                         Visibility visibility = Visibility::Public, bool is_constructor = false,
                          bool is_destructor = false, bool is_static = false)
             : FunctionDeclarationNode(loc, std::move(name), std::move(return_type)),
-              _visibility(visibility), _is_constructor(is_constructor), 
+              _visibility(visibility), _is_constructor(is_constructor),
               _is_destructor(is_destructor), _is_static(is_static) {}
 
         Visibility visibility() const { return _visibility; }
@@ -974,10 +990,11 @@ namespace Cryo
     };
 
     // Structure to represent a base trait in inheritance
-    struct BaseTraitInfo {
+    struct BaseTraitInfo
+    {
         std::string name;
         std::vector<std::string> type_parameters;
-        
+
         BaseTraitInfo(std::string trait_name, std::vector<std::string> params = {})
             : name(std::move(trait_name)), type_parameters(std::move(params)) {}
     };
@@ -1029,7 +1046,7 @@ namespace Cryo
                 }
                 os << ">";
             }
-            
+
             // Display base traits
             if (!_base_traits.empty())
             {
@@ -1052,7 +1069,7 @@ namespace Cryo
                     }
                 }
             }
-            
+
             os << std::endl;
 
             if (!_methods.empty())
@@ -1092,12 +1109,13 @@ namespace Cryo
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "TypeAlias: " << _alias_name;
-            if (!_generic_params.empty()) 
+            if (!_generic_params.empty())
             {
                 os << "<";
-                for (size_t i = 0; i < _generic_params.size(); ++i) 
+                for (size_t i = 0; i < _generic_params.size(); ++i)
                 {
-                    if (i > 0) os << ", ";
+                    if (i > 0)
+                        os << ", ";
                     os << _generic_params[i];
                 }
                 os << ">";

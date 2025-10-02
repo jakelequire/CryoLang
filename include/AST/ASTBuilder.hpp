@@ -31,7 +31,8 @@ namespace Cryo
                                                                              std::string name,
                                                                              std::string type_annotation,
                                                                              std::unique_ptr<ExpressionNode> init = nullptr,
-                                                                             bool is_mutable = false);
+                                                                             bool is_mutable = false,
+                                                                             bool is_global = false);
         std::unique_ptr<FunctionDeclarationNode> create_function_declaration(SourceLocation loc,
                                                                              std::string name,
                                                                              std::string return_type,

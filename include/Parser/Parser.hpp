@@ -38,6 +38,7 @@ namespace Cryo
         // Context tracking
         bool _in_implementation_block = false;
         std::string _current_namespace = "Global"; // Current namespace context
+        int _scope_depth = 0;                      // Track nesting depth (0 = global scope)
 
     public:
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
@@ -52,6 +53,15 @@ namespace Cryo
 
         // Namespace access
         const std::string &current_namespace() const { return _current_namespace; }
+
+        // Scope tracking
+        bool is_global_scope() const { return _scope_depth == 0; }
+        void enter_scope() { _scope_depth++; }
+        void exit_scope()
+        {
+            if (_scope_depth > 0)
+                _scope_depth--;
+        }
 
     private:
         // Diagnostic reporting

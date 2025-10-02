@@ -87,9 +87,10 @@ namespace Cryo
                                                                                      std::string name,
                                                                                      std::string type_annotation,
                                                                                      std::unique_ptr<ExpressionNode> init,
-                                                                                     bool is_mutable)
+                                                                                     bool is_mutable,
+                                                                                     bool is_global)
     {
-        return std::make_unique<VariableDeclarationNode>(loc, std::move(name), std::move(type_annotation), std::move(init), is_mutable);
+        return std::make_unique<VariableDeclarationNode>(loc, std::move(name), std::move(type_annotation), std::move(init), is_mutable, is_global);
     }
 
     std::unique_ptr<FunctionDeclarationNode> ASTBuilder::create_function_declaration(SourceLocation loc,

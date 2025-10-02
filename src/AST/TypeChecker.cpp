@@ -1039,6 +1039,18 @@ namespace Cryo
     {
         const std::string &func_name = node.name();
 
+        // Handle generic functions - enter generic context if needed
+        bool is_generic_function = !node.generic_parameters().empty();
+        if (is_generic_function)
+        {
+            std::vector<std::string> generic_param_names;
+            for (const auto &generic_param : node.generic_parameters())
+            {
+                generic_param_names.push_back(generic_param->name());
+            }
+            enter_generic_context(func_name, generic_param_names, node.location());
+        }
+
         // Parse return type from node annotation
         const std::string &return_type_str = node.return_type_annotation();
         Type *return_type = resolve_type_with_generic_context(return_type_str);
@@ -1110,6 +1122,12 @@ namespace Cryo
         _in_function = false;
         _current_generic_trait_bounds.clear();
         exit_scope();
+
+        // Exit generic context if it was a generic function
+        if (is_generic_function)
+        {
+            exit_generic_context();
+        }
     }
 
     //===----------------------------------------------------------------------===//
@@ -1807,6 +1825,14 @@ namespace Cryo
         }
         else if (type_name == "string")
         {
+            node.set_type("u64");
+            return;
+        }
+
+        // Check if we're in a generic context and this is a generic parameter
+        if (is_in_generic_context() && is_generic_parameter(type_name))
+        {
+            // This is a valid generic parameter - sizeof is valid
             node.set_type("u64");
             return;
         }

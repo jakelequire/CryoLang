@@ -685,7 +685,10 @@ namespace Cryo
 
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after variable declaration");
 
-        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, var_type->to_string(), std::move(initializer), is_mutable);
+        // Determine if this is a global variable based on current scope
+        bool is_global = is_global_scope();
+
+        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, var_type->to_string(), std::move(initializer), is_mutable, is_global);
 
         return var_decl;
     }
@@ -1093,6 +1096,9 @@ namespace Cryo
         SourceLocation start_loc = _current_token.location();
         consume(TokenKind::TK_L_BRACE, "Expected '{'");
 
+        // Enter new scope for this block
+        enter_scope();
+
         auto block = _builder.create_block_statement(start_loc);
 
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
@@ -1126,6 +1132,10 @@ namespace Cryo
         }
 
         consume(TokenKind::TK_R_BRACE, "Expected '}'");
+
+        // Exit scope after parsing the block
+        exit_scope();
+
         return block;
     }
 
