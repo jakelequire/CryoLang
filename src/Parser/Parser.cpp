@@ -3339,7 +3339,7 @@ namespace Cryo
             return_type = "void"; // Constructors don't have explicit return types
         }
 
-        auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_static);
+        auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static);
 
         // Set variadic flag if detected
         method->set_variadic(is_variadic);
