@@ -41,6 +41,14 @@ namespace Cryo::Codegen
             return metadata;
         }
 
+        // Try enum constructor classification before namespace-based classification
+        metadata = classify_enum_constructor(function_name, resolved_namespace);
+        if (metadata.category != FunctionCategory::Unknown)
+        {
+            _metadata_cache[cache_key] = metadata;
+            return metadata;
+        }
+
         // Then try namespace-based classification
         metadata = classify_from_namespace(function_name, resolved_namespace);
         if (metadata.category != FunctionCategory::Unknown)
@@ -80,6 +88,31 @@ namespace Cryo::Codegen
                                                            const std::string &resolved_namespace) const
     {
         FunctionMetadata metadata = get_function_metadata(function_name, resolved_namespace);
+        
+        // Special handling for enum constructors
+        if (metadata.category == FunctionCategory::StructFunction)
+        {
+            // For enum constructors, we need to determine the actual enum type
+            size_t scope_pos = function_name.find("::");
+            if (scope_pos != std::string::npos)
+            {
+                std::string enum_name = function_name.substr(0, scope_pos);
+                
+                // Look up if this is a parameterized enum type
+                // For cases like Result::Ok where we need Result<T,E>
+                // We can't determine the exact instantiation here, so we use a generic struct type
+                
+                // Create a simple struct type as placeholder - the actual type will be resolved
+                // when the enum constructor is generated
+                std::vector<llvm::Type*> fields = {
+                    llvm::Type::getInt1Ty(llvm_context),  // discriminant
+                    llvm::PointerType::get(llvm_context, 0)  // value field
+                };
+                
+                return llvm::StructType::get(llvm_context, fields);
+            }
+        }
+        
         return category_to_llvm_type(metadata.category, llvm_context);
     }
 
@@ -256,6 +289,63 @@ namespace Cryo::Codegen
         return metadata; // Returns Unknown category
     }
 
+    FunctionMetadata FunctionRegistry::classify_enum_constructor(const std::string &function_name,
+                                                                 const std::string &resolved_namespace) const
+    {
+        FunctionMetadata metadata;
+
+        // Check if this looks like an enum constructor: EnumName::VariantName
+        size_t scope_pos = function_name.find("::");
+        if (scope_pos == std::string::npos)
+        {
+            return metadata; // Not a scoped name
+        }
+
+        std::string enum_name = function_name.substr(0, scope_pos);
+        std::string variant_name = function_name.substr(scope_pos + 2);
+
+        std::cout << "[FunctionRegistry] Checking enum constructor: " << enum_name 
+                  << "::" << variant_name << std::endl;
+
+        // Look up the enum type in the type context
+        Cryo::Type *enum_type = _type_context.lookup_enum_type(enum_name);
+        if (!enum_type)
+        {
+            std::cout << "[FunctionRegistry] No enum type found for: " << enum_name << std::endl;
+            return metadata; // Not an enum
+        }
+
+        Cryo::EnumType *cryo_enum_type = dynamic_cast<Cryo::EnumType *>(enum_type);
+        if (!cryo_enum_type)
+        {
+            std::cout << "[FunctionRegistry] Type is not an enum: " << enum_name << std::endl;
+            return metadata; // Not a valid enum type
+        }
+
+        // Check if the variant exists in the enum
+        const auto &variants = cryo_enum_type->variants();
+        bool variant_found = std::find(variants.begin(), variants.end(), variant_name) != variants.end();
+        
+        if (!variant_found)
+        {
+            std::cout << "[FunctionRegistry] Variant " << variant_name 
+                      << " not found in enum " << enum_name << std::endl;
+            return metadata; // Variant doesn't exist
+        }
+
+        std::cout << "[FunctionRegistry] Detected enum constructor: " << function_name << std::endl;
+
+        // This is an enum constructor
+        metadata.category = FunctionCategory::StructFunction;
+        metadata.runtime_name = variant_name; // Use just the variant name
+        metadata.namespace_scope = enum_name;
+        metadata.is_variadic = false;
+        metadata.requires_this_pointer = false;
+        metadata.description = "Enum constructor for " + enum_name + "::" + variant_name;
+
+        return metadata;
+    }
+
     FunctionCategory FunctionRegistry::get_category_from_cryo_type(const Cryo::Type *cryo_type) const
     {
         if (!cryo_type)
@@ -305,6 +395,10 @@ namespace Cryo::Codegen
             return llvm::Type::getInt1Ty(context);
         case FunctionCategory::PointerFunction:
             return llvm::PointerType::get(context, 0);
+        case FunctionCategory::StructFunction:
+            // For enum constructors, we need to look up the actual struct type
+            // This is a placeholder - the actual type should be resolved elsewhere
+            return llvm::PointerType::get(context, 0); // Safe fallback
         case FunctionCategory::IntrinsicFunction:
         case FunctionCategory::SystemFunction:
         case FunctionCategory::RuntimeFunction:

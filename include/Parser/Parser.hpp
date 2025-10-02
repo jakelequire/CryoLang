@@ -63,6 +63,7 @@ namespace Cryo
         bool match(TokenKind kind);
         bool match(std::initializer_list<TokenKind> kinds);
         Token consume(TokenKind expected, const std::string &error_message);
+        Token consume_right_angle(); // Special handler for > in generic contexts
         bool is_at_end() const;
 
         // Error handling
@@ -119,6 +120,9 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> parse_logical_or();
         std::unique_ptr<ExpressionNode> parse_logical_and();
         std::unique_ptr<ExpressionNode> parse_equality();
+        std::unique_ptr<ExpressionNode> parse_bitwise_or();
+        std::unique_ptr<ExpressionNode> parse_bitwise_xor();
+        std::unique_ptr<ExpressionNode> parse_bitwise_and();
         std::unique_ptr<ExpressionNode> parse_relational();
         std::unique_ptr<ExpressionNode> parse_additive();
         std::unique_ptr<ExpressionNode> parse_multiplicative();

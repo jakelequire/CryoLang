@@ -903,6 +903,11 @@ namespace Cryo
         Type *parse_type_from_string(const std::string &type_str);
         Type *resolve_type_from_token_kind(int token_kind); // From your TokenKind enum
 
+        // Type alias resolution
+        Type *lookup_type_alias(const std::string &alias_name);
+        std::string resolve_parameterized_type_alias(const std::string &base_name,
+                                                     const std::string &type_args_str);
+
         // Type compatibility and conversion
         bool are_types_compatible(Type *lhs, Type *rhs);
         Type *get_common_type(Type *lhs, Type *rhs);

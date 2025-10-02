@@ -328,8 +328,34 @@ namespace Cryo
                 }
                 else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
                 {
+                    Type *enum_type = nullptr;
+                    if (!enum_decl->generic_parameters().empty())
+                    {
+                        // For generic enums, try to get the parameterized enum template from TypeContext
+                        auto parameterized_enum = type_context->get_parameterized_enum_template(enum_decl->name());
+                        if (parameterized_enum)
+                        {
+                            enum_type = parameterized_enum.get();
+                            std::cout << "[DEBUG] ModuleLoader: Found parameterized enum template for " << enum_decl->name() << std::endl;
+                        }
+                        else
+                        {
+                            std::cout << "[DEBUG] ModuleLoader: No parameterized enum template found for " << enum_decl->name() << std::endl;
+                        }
+                    }
+                    else
+                    {
+                        // For non-generic enums, create a regular enum type
+                        std::vector<std::string> variant_names;
+                        for (const auto &variant : enum_decl->variants())
+                        {
+                            variant_names.push_back(variant->name());
+                        }
+                        enum_type = type_context->get_enum_type(enum_decl->name(), std::move(variant_names), true);
+                    }
+
                     // Create type symbol for enum
-                    Symbol symbol(enum_decl->name(), SymbolKind::Type, enum_decl->location(), nullptr, module_name);
+                    Symbol symbol(enum_decl->name(), SymbolKind::Type, enum_decl->location(), enum_type, module_name);
                     symbol_map[enum_decl->name()] = symbol;
                 }
                 else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(decl))

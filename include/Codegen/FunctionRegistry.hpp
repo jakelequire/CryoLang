@@ -37,6 +37,7 @@ namespace Cryo::Codegen
         BooleanFunction,   // Functions returning booleans
         FloatFunction,     // Functions returning floats
         PointerFunction,   // Functions returning pointers (malloc, etc.)
+        StructFunction,    // Functions returning structs (enum constructors, etc.)
         IntrinsicFunction, // Compiler intrinsics
         SystemFunction,    // System calls
         RuntimeFunction    // Runtime library functions
@@ -136,6 +137,12 @@ namespace Cryo::Codegen
          * @brief Classify function based on intrinsic patterns
          */
         FunctionMetadata classify_intrinsic_function(const std::string &function_name) const;
+
+        /**
+         * @brief Classify function as enum constructor if it matches the pattern
+         */
+        FunctionMetadata classify_enum_constructor(const std::string &function_name,
+                                                   const std::string &resolved_namespace) const;
 
         /**
          * @brief Get return type category from Cryo type

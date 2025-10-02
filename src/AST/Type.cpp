@@ -890,14 +890,14 @@ namespace Cryo
 
     Type *TypeContext::get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple)
     {
-        std::cout << "[DEBUG] TypeContext::get_enum_type called with name=" << name 
+        std::cout << "[DEBUG] TypeContext::get_enum_type called with name=" << name
                   << " is_simple=" << is_simple << std::endl;
         std::cout << "[DEBUG] Call stack trace (simplified): TypeContext::get_enum_type" << std::endl;
-        
+
         auto it = _enum_types.find(name);
         if (it != _enum_types.end())
         {
-            std::cout << "[DEBUG] Found existing enum type for " << name 
+            std::cout << "[DEBUG] Found existing enum type for " << name
                       << " existing is_simple=" << it->second->is_simple_enum() << std::endl;
             return it->second.get();
         }
@@ -915,15 +915,15 @@ namespace Cryo
     Type *TypeContext::lookup_enum_type(const std::string &name)
     {
         std::cout << "[DEBUG] TypeContext::lookup_enum_type called with name=" << name << std::endl;
-        
+
         auto it = _enum_types.find(name);
         if (it != _enum_types.end())
         {
-            std::cout << "[DEBUG] Found existing enum type for " << name 
+            std::cout << "[DEBUG] Found existing enum type for " << name
                       << " is_simple=" << it->second->is_simple_enum() << std::endl;
             return it->second.get();
         }
-        
+
         std::cout << "[DEBUG] No existing enum type found for " << name << std::endl;
         return nullptr;
     }
@@ -1518,5 +1518,93 @@ namespace Cryo
         }
 
         return instantiated_layout->common_fields;
+    }
+
+    Type *TypeContext::lookup_type_alias(const std::string &alias_name)
+    {
+        // Search through complex types for type aliases
+        for (const auto &type : _complex_types)
+        {
+            if (type->kind() == TypeKind::TypeAlias)
+            {
+                std::string type_name = type->name();
+                // Check for exact match first
+                if (type_name == alias_name)
+                {
+                    return type.get();
+                }
+                // Check for generic type alias pattern: "BaseName<param1, param2, ...>"
+                // where we're looking for "BaseName"
+                size_t angle_pos = type_name.find('<');
+                if (angle_pos != std::string::npos)
+                {
+                    std::string base_name = type_name.substr(0, angle_pos);
+                    if (base_name == alias_name)
+                    {
+                        return type.get();
+                    }
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    std::string TypeContext::resolve_parameterized_type_alias(const std::string &base_name,
+                                                              const std::string &type_args_str)
+    {
+        // Look up the type alias
+        Type *alias_type = lookup_type_alias(base_name);
+        if (!alias_type || alias_type->kind() != TypeKind::TypeAlias)
+        {
+            // Not an alias, return original
+            return base_name + "<" + type_args_str + ">";
+        }
+
+        auto *type_alias = static_cast<TypeAlias *>(alias_type);
+        Type *target_type = type_alias->target_type();
+        if (!target_type)
+        {
+            // Invalid alias, return original
+            return base_name + "<" + type_args_str + ">";
+        }
+
+        std::string target_type_str = target_type->to_string();
+
+        // If the target type contains template parameters, substitute them
+        // This is a simple substitution - for a more robust implementation,
+        // we'd need to parse the generic parameters and map them properly
+        if (target_type_str.find('<') != std::string::npos)
+        {
+            // For parameterized aliases like AllocResult<T> = Result<T*, AllocError>
+            // We need to substitute T with the actual type arguments
+
+            // Simple case: if we have one type argument, replace T with it
+            if (type_args_str.find(',') == std::string::npos) // Single type argument
+            {
+                // Replace T with the type argument
+                size_t pos = 0;
+                std::string result = target_type_str;
+                while ((pos = result.find('T', pos)) != std::string::npos)
+                {
+                    // Check if this T is a standalone type parameter (not part of another word)
+                    bool is_standalone = (pos == 0 || !std::isalnum(result[pos - 1])) &&
+                                         (pos + 1 >= result.length() || !std::isalnum(result[pos + 1]));
+
+                    if (is_standalone)
+                    {
+                        result.replace(pos, 1, type_args_str);
+                        pos += type_args_str.length();
+                    }
+                    else
+                    {
+                        pos++;
+                    }
+                }
+                return result;
+            }
+        }
+
+        // If no substitution needed, return the target type as-is
+        return target_type_str;
     }
 }
