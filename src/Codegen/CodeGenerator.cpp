@@ -99,6 +99,48 @@ namespace Cryo::Codegen
         return _context_manager ? _context_manager->get_module() : nullptr;
     }
 
+    CodegenVisitor *CodeGenerator::get_visitor() const
+    {
+        return _visitor.get();
+    }
+
+    bool CodeGenerator::ensure_visitor_initialized()
+    {
+        if (_visitor)
+        {
+            return true; // Already initialized
+        }
+
+        try
+        {
+            // Initialize LLVM if not already done
+            if (!initialize_llvm())
+            {
+                report_error("Failed to initialize LLVM context for visitor initialization");
+                return false;
+            }
+
+            // Create the CodegenVisitor with the context manager
+            _visitor = std::make_unique<CodegenVisitor>(
+                *_context_manager,
+                _symbol_table,
+                _gdm);
+                
+            // Apply stdlib compilation mode to the newly created visitor
+            if (_stdlib_compilation_mode)
+            {
+                _visitor->set_stdlib_compilation_mode(true);
+            }
+
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            report_error(std::string("Failed to initialize visitor: ") + e.what());
+            return false;
+        }
+    }
+
     const std::string &CodeGenerator::get_last_error() const
     {
         return _last_error;

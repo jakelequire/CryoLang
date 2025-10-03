@@ -169,6 +169,16 @@ namespace Cryo::Codegen
          */
         TargetConfig *get_target_config() const;
 
+        /**
+         * @brief Get CodegenVisitor (for advanced manipulation during compilation)
+         */
+        CodegenVisitor *get_visitor() const;
+
+        /**
+         * @brief Ensure visitor is initialized (creates it if needed)
+         */
+        bool ensure_visitor_initialized();
+
         //===================================================================
         // Diagnostic & Debugging
         //===================================================================

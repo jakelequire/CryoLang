@@ -333,12 +333,23 @@ $(RUNTIME_LIB): $(RUNTIME_BC_FILES)
 	@echo "Creating runtime library: $(RUNTIME_LIB)"
 	@llvm-link $(RUNTIME_BC_FILES) -o $(RUNTIME_BUILD_DIR)/runtime_combined.bc
 ifeq ($(OS), Windows_NT)
-	@llc -filetype=obj $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(RUNTIME_BUILD_DIR)/runtime.o
+	@llc -filetype=obj $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
 else
-	@llc -filetype=obj -relocation-model=pic $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(RUNTIME_BUILD_DIR)/runtime.o
+	@llc -filetype=obj -relocation-model=pic $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
 endif
-	@llvm-ar rcs $(RUNTIME_LIB) $(RUNTIME_BUILD_DIR)/runtime.o
+	@llvm-ar rcs $(RUNTIME_LIB) $(BIN_DIR)stdlib/runtime.o
 	@echo "Runtime library created successfully: $(RUNTIME_LIB)"
+
+# Create runtime object file directly (used for linking main executable)
+$(BIN_DIR)stdlib/runtime.o: $(RUNTIME_BC_FILES)
+	@echo "Creating runtime object: $(BIN_DIR)stdlib/runtime.o"
+	@llvm-link $(RUNTIME_BC_FILES) -o $(RUNTIME_BUILD_DIR)/runtime_combined.bc
+ifeq ($(OS), Windows_NT)
+	@llc -filetype=obj $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
+else
+	@llc -filetype=obj -relocation-model=pic $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
+endif
+	@echo "Runtime object created successfully: $(BIN_DIR)stdlib/runtime.o"
 
 runtime-clean:
 ifeq ($(OS), Windows_NT)

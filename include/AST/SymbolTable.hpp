@@ -63,6 +63,7 @@ namespace Cryo
 
         // Access symbols for copying to other symbol tables
         const std::unordered_map<std::string, Symbol> &get_symbols() const { return symbols_; }
+        const std::unordered_map<std::string, std::unordered_map<std::string, Symbol>> &get_namespaces() const { return namespaces_; }
 
         // Built-in function registration
         bool declare_builtin_function(const std::string &name, const std::string &signature, TypeContext &type_context);

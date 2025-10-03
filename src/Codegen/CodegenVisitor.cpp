@@ -3435,6 +3435,160 @@ namespace Cryo::Codegen
         _errors.clear();
     }
 
+    void CodegenVisitor::pre_register_functions_from_symbol_table()
+    {
+        std::cout << "[DEBUG] Pre-registering functions from symbol table to prevent forward declaration conflicts..." << std::endl;
+        
+        // Get all symbols from the symbol table
+        const auto& symbols = _symbol_table.get_symbols();
+        
+        for (const auto& [symbol_name, symbol] : symbols)
+        {
+            // Only process function symbols
+            if (symbol.kind == Cryo::SymbolKind::Function && symbol.data_type)
+            {
+                std::cout << "[DEBUG] Pre-registering function: " << symbol_name << std::endl;
+                
+                // Check if this function is already registered in LLVM
+                auto module = _context_manager.get_module();
+                if (module && module->getFunction(symbol_name))
+                {
+                    std::cout << "[DEBUG] Function " << symbol_name << " already exists in LLVM module, skipping" << std::endl;
+                    continue;
+                }
+                
+                // Convert Cryo function type to LLVM function type
+                if (auto* func_type = dynamic_cast<Cryo::FunctionType*>(symbol.data_type))
+                {
+                    // Map parameter types
+                    std::vector<llvm::Type*> param_types;
+                    for (const auto& param_type : func_type->parameter_types())
+                    {
+                        llvm::Type* llvm_param_type = _type_mapper->map_type(param_type.get());
+                        if (llvm_param_type)
+                        {
+                            param_types.push_back(llvm_param_type);
+                        }
+                        else
+                        {
+                            std::cout << "[WARNING] Failed to map parameter type for function " << symbol_name << ", skipping" << std::endl;
+                            goto next_symbol; // Skip this function if we can't map parameter types
+                        }
+                    }
+                    
+                    // Map return type
+                    llvm::Type* return_type = _type_mapper->map_type(func_type->return_type().get());
+                    if (!return_type)
+                    {
+                        std::cout << "[WARNING] Failed to map return type for function " << symbol_name << ", skipping" << std::endl;
+                        continue;
+                    }
+                    
+                    // Create LLVM function type
+                    llvm::FunctionType* llvm_func_type = llvm::FunctionType::get(return_type, param_types, false);
+                    
+                    // Create LLVM function declaration
+                    llvm::Function* function = llvm::Function::Create(
+                        llvm_func_type,
+                        llvm::Function::ExternalLinkage,
+                        symbol_name,
+                        module
+                    );
+                    
+                    if (function)
+                    {
+                        // Store in our functions map for later lookup
+                        _functions[symbol_name] = function;
+                        std::cout << "[DEBUG] Successfully pre-registered function: " << symbol_name << std::endl;
+                    }
+                    else
+                    {
+                        std::cout << "[WARNING] Failed to create LLVM function for: " << symbol_name << std::endl;
+                    }
+                }
+                
+                next_symbol:;
+            }
+        }
+        
+        // Also pre-register namespaced functions
+        const auto& namespaces = _symbol_table.get_namespaces();
+        for (const auto& [namespace_name, namespace_symbols] : namespaces)
+        {
+            for (const auto& [symbol_name, symbol] : namespace_symbols)
+            {
+                if (symbol.kind == Cryo::SymbolKind::Function && symbol.data_type)
+                {
+                    std::string qualified_name = namespace_name + "::" + symbol_name;
+                    std::cout << "[DEBUG] Pre-registering namespaced function: " << qualified_name << std::endl;
+                    
+                    // Check if this function is already registered in LLVM
+                    auto module = _context_manager.get_module();
+                    if (module && module->getFunction(symbol_name)) // Use unqualified name for LLVM
+                    {
+                        std::cout << "[DEBUG] Function " << symbol_name << " already exists in LLVM module, skipping" << std::endl;
+                        continue;
+                    }
+                    
+                    // Convert Cryo function type to LLVM function type
+                    if (auto* func_type = dynamic_cast<Cryo::FunctionType*>(symbol.data_type))
+                    {
+                        // Map parameter types
+                        std::vector<llvm::Type*> param_types;
+                        for (const auto& param_type : func_type->parameter_types())
+                        {
+                            llvm::Type* llvm_param_type = _type_mapper->map_type(param_type.get());
+                            if (llvm_param_type)
+                            {
+                                param_types.push_back(llvm_param_type);
+                            }
+                            else
+                            {
+                                std::cout << "[WARNING] Failed to map parameter type for function " << qualified_name << ", skipping" << std::endl;
+                                goto next_ns_symbol;
+                            }
+                        }
+                        
+                        // Map return type
+                        llvm::Type* return_type = _type_mapper->map_type(func_type->return_type().get());
+                        if (!return_type)
+                        {
+                            std::cout << "[WARNING] Failed to map return type for function " << qualified_name << ", skipping" << std::endl;
+                            continue;
+                        }
+                        
+                        // Create LLVM function type
+                        llvm::FunctionType* llvm_func_type = llvm::FunctionType::get(return_type, param_types, false);
+                        
+                        // Create LLVM function declaration using the unqualified name for LLVM linking
+                        llvm::Function* function = llvm::Function::Create(
+                            llvm_func_type,
+                            llvm::Function::ExternalLinkage,
+                            symbol_name, // Use unqualified name for runtime linking
+                            module
+                        );
+                        
+                        if (function)
+                        {
+                            // Store in our functions map using both qualified and unqualified names
+                            _functions[qualified_name] = function;
+                            _functions[symbol_name] = function;
+                            std::cout << "[DEBUG] Successfully pre-registered namespaced function: " << qualified_name << " -> " << symbol_name << std::endl;
+                        }
+                        else
+                        {
+                            std::cout << "[WARNING] Failed to create LLVM function for: " << qualified_name << std::endl;
+                        }
+                    }
+                    
+                    next_ns_symbol:;
+                }
+            }
+        }
+        
+        std::cout << "[DEBUG] Pre-registration complete. Total functions registered: " << _functions.size() << std::endl;
+    }
+
     void CodegenVisitor::report_error(const std::string &message)
     {
         _has_errors = true;
@@ -3540,7 +3694,35 @@ namespace Cryo::Codegen
             std::cout << "[DEBUG] Function name generation - using simple IR name: " << function_name
                       << " (namespace: '" << _namespace_context << "')" << std::endl;
 
-            // Create function
+            // Check if function already exists in the module (from pre-registration)
+            llvm::Function *existing_function = module->getFunction(function_name);
+            if (existing_function)
+            {
+                std::cout << "[DEBUG] Function " << function_name << " already exists in module, reusing pre-registered declaration" << std::endl;
+                
+                // Verify the function type matches what we expect
+                llvm::FunctionType *expected_type = llvm::FunctionType::get(return_type, param_types, is_variadic);
+                if (existing_function->getFunctionType() == expected_type)
+                {
+                    // Set parameter names on the existing function
+                    auto param_it = param_names.begin();
+                    for (auto &arg : existing_function->args())
+                    {
+                        if (param_it != param_names.end())
+                        {
+                            arg.setName(*param_it);
+                            ++param_it;
+                        }
+                    }
+                    return existing_function;
+                }
+                else
+                {
+                    std::cout << "[WARNING] Function " << function_name << " exists but with different signature, creating new one" << std::endl;
+                }
+            }
+
+            // Create function if it doesn't exist or has different signature
             llvm::Function *function = llvm::Function::Create(
                 func_type, llvm::Function::ExternalLinkage, function_name, *module);
 
@@ -4998,12 +5180,68 @@ namespace Cryo::Codegen
                 break;
 
             // Logical operations
-            case TokenKind::TK_AMPAMP:
-                result = builder.CreateAnd(left_val, right_val, "logand.tmp");
+            case TokenKind::TK_AMPAMP: // Logical AND &&
+                {
+                    // Convert operands to boolean if they aren't already
+                    llvm::Value *left_bool = left_val;
+                    llvm::Value *right_bool = right_val;
+                    
+                    if (!left_val->getType()->isIntegerTy(1)) {
+                        if (left_val->getType()->isIntegerTy()) {
+                            left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
+                        } else if (left_val->getType()->isFloatingPointTy()) {
+                            left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
+                        } else {
+                            report_error("Cannot convert left operand to boolean for logical AND");
+                            return nullptr;
+                        }
+                    }
+                    
+                    if (!right_val->getType()->isIntegerTy(1)) {
+                        if (right_val->getType()->isIntegerTy()) {
+                            right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
+                        } else if (right_val->getType()->isFloatingPointTy()) {
+                            right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
+                        } else {
+                            report_error("Cannot convert right operand to boolean for logical AND");
+                            return nullptr;
+                        }
+                    }
+                    
+                    result = builder.CreateAnd(left_bool, right_bool, "logand.tmp");
+                }
                 break;
 
-            case TokenKind::TK_PIPEPIPE:
-                result = builder.CreateOr(left_val, right_val, "logor.tmp");
+            case TokenKind::TK_PIPEPIPE: // Logical OR ||
+                {
+                    // Convert operands to boolean if they aren't already
+                    llvm::Value *left_bool = left_val;
+                    llvm::Value *right_bool = right_val;
+                    
+                    if (!left_val->getType()->isIntegerTy(1)) {
+                        if (left_val->getType()->isIntegerTy()) {
+                            left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
+                        } else if (left_val->getType()->isFloatingPointTy()) {
+                            left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
+                        } else {
+                            report_error("Cannot convert left operand to boolean for logical OR");
+                            return nullptr;
+                        }
+                    }
+                    
+                    if (!right_val->getType()->isIntegerTy(1)) {
+                        if (right_val->getType()->isIntegerTy()) {
+                            right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
+                        } else if (right_val->getType()->isFloatingPointTy()) {
+                            right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
+                        } else {
+                            report_error("Cannot convert right operand to boolean for logical OR");
+                            return nullptr;
+                        }
+                    }
+                    
+                    result = builder.CreateOr(left_bool, right_bool, "logor.tmp");
+                }
                 break;
 
             default:
