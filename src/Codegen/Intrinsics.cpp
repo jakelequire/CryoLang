@@ -825,6 +825,7 @@ namespace Cryo::Codegen
 
         auto& builder = _context_manager.get_builder();
         auto& context = _context_manager.get_context();
+        auto* module = _context_manager.get_module();
 
         // Create printf function type: int printf(const char* format, ...)
         llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
@@ -832,8 +833,8 @@ namespace Cryo::Codegen
         llvm::FunctionType* printf_type = llvm::FunctionType::get(
             int_type, {char_ptr_type}, true); // variadic
 
-        // Get or create printf function
-        llvm::Function* printf_func = get_or_create_libc_function("printf", printf_type);
+        // Get or create the real printf function
+        llvm::Function* real_printf_func = get_or_create_libc_function("printf", printf_type);
 
         // Ensure format argument is a pointer
         if (!args[0]->getType()->isPointerTy())
@@ -842,8 +843,8 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Call printf
-        return builder.CreateCall(printf_func, args, "printf.result");
+        // Call printf directly with all provided arguments
+        return builder.CreateCall(real_printf_func, args, "printf.result");
     }
 
     llvm::Value* Intrinsics::generate_sprintf(const std::vector<llvm::Value*>& args)
