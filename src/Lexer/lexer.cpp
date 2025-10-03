@@ -460,6 +460,31 @@ namespace Cryo
             }
         }
 
+        // Handle type suffixes like u64, i32, f32, etc.
+        if (!at_end() && is_alpha(peek()))
+        {
+            // Look for common type suffixes
+            const char *suffix_start = _current;
+            while (!at_end() && is_alnum(peek()))
+            {
+                advance();
+            }
+            
+            // Validate that this is a valid type suffix
+            std::string_view suffix(suffix_start, _current - suffix_start);
+            if (suffix == "u8" || suffix == "u16" || suffix == "u32" || suffix == "u64" ||
+                suffix == "i8" || suffix == "i16" || suffix == "i32" || suffix == "i64" ||
+                suffix == "f32" || suffix == "f64" || suffix == "usize" || suffix == "isize")
+            {
+                // Valid suffix, include it in the numeric constant
+            }
+            else
+            {
+                // Not a valid suffix, backtrack
+                _current = suffix_start;
+            }
+        }
+
         std::string_view text(start, _current - start);
         return Token(TokenKind::TK_NUMERIC_CONSTANT, text,
                      SourceLocation(_current_location.line(),

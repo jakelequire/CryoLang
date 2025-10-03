@@ -40,6 +40,8 @@ namespace Cryo::Codegen
         llvm::Value* generate_free(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_realloc(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_calloc(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_mmap(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_munmap(const std::vector<llvm::Value*>& args);
 
         // Memory operations intrinsics
         llvm::Value* generate_memcpy(const std::vector<llvm::Value*>& args);

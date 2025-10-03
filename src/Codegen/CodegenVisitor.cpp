@@ -366,9 +366,101 @@ namespace Cryo::Codegen
                 llvm::Constant *initializer = nullptr;
                 if (node.has_initializer())
                 {
-                    // For now, only handle constant initializers for globals
+                    // Handle constant initializers for globals
                     if (auto literal = dynamic_cast<Cryo::LiteralNode *>(node.initializer()))
                     {
+                        // Create a constant of the correct type directly, instead of visiting the node
+                        auto &llvm_ctx = _context_manager.get_context();
+                        
+                        if (literal->literal_kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                        {
+                            std::string value_str = literal->value();
+                            
+                            // Check if it's a float (contains decimal point)
+                            if (value_str.find('.') != std::string::npos)
+                            {
+                                // Float literal - convert to the target type
+                                double double_val = std::stod(value_str);
+                                if (llvm_type->isFloatTy())
+                                {
+                                    initializer = llvm::ConstantFP::get(llvm_type, float(double_val));
+                                }
+                                else if (llvm_type->isDoubleTy())
+                                {
+                                    initializer = llvm::ConstantFP::get(llvm_type, double_val);
+                                }
+                                else
+                                {
+                                    // Try to convert to target type (might be int cast)
+                                    initializer = llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_ctx), double_val);
+                                }
+                            }
+                            else
+                            {
+                                // Integer literal - convert to the target type
+                                uint64_t int_val = 0;
+                                
+                                // Handle hex literals
+                                if (value_str.substr(0, 2) == "0x" || value_str.substr(0, 2) == "0X")
+                                {
+                                    int_val = std::stoull(value_str, nullptr, 16);
+                                }
+                                else
+                                {
+                                    int_val = std::stoull(value_str);
+                                }
+                                
+                                // Create constant of the correct type
+                                if (llvm_type->isIntegerTy())
+                                {
+                                    unsigned bit_width = llvm_type->getIntegerBitWidth();
+                                    initializer = llvm::ConstantInt::get(llvm_type, int_val);
+                                }
+                                else
+                                {
+                                    // Fallback to int32
+                                    initializer = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
+                                }
+                            }
+                        }
+                        else if (literal->literal_kind() == TokenKind::TK_BOOLEAN_LITERAL ||
+                                literal->literal_kind() == TokenKind::TK_KW_TRUE ||
+                                literal->literal_kind() == TokenKind::TK_KW_FALSE)
+                        {
+                            bool bool_val = (literal->value() == "true");
+                            if (llvm_type->isIntegerTy(1))
+                            {
+                                initializer = llvm::ConstantInt::get(llvm_type, bool_val);
+                            }
+                            else
+                            {
+                                initializer = llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_ctx), bool_val);
+                            }
+                        }
+                        else if (literal->literal_kind() == TokenKind::TK_KW_NULL)
+                        {
+                            if (llvm_type->isPointerTy())
+                            {
+                                initializer = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(llvm_type));
+                            }
+                            else
+                            {
+                                initializer = llvm::Constant::getNullValue(llvm_type);
+                            }
+                        }
+                        else
+                        {
+                            // For other literal types, fall back to the original method
+                            node.initializer()->accept(*this);
+                            if (auto const_val = llvm::dyn_cast<llvm::Constant>(get_current_value()))
+                            {
+                                initializer = const_val;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // For non-literal initializers, evaluate them
                         node.initializer()->accept(*this);
                         if (auto const_val = llvm::dyn_cast<llvm::Constant>(get_current_value()))
                         {
@@ -2943,6 +3035,17 @@ namespace Cryo::Codegen
 
             if (!object_ptr)
             {
+                // Try to find global variable
+                auto global_it = _globals.find(var_name);
+                if (global_it != _globals.end())
+                {
+                    std::cout << "[CodegenVisitor] Found global variable for member access: " << var_name << std::endl;
+                    object_ptr = global_it->second;
+                }
+            }
+
+            if (!object_ptr)
+            {
                 report_error("Variable not found for member access: " + var_name, node.object());
                 return;
             }
@@ -3094,7 +3197,67 @@ namespace Cryo::Codegen
             }
         }
 
-        // Strategy 3: Fallback pattern matching for specialized generic types
+        // Strategy 3: Try global variable type lookup if previous strategies failed
+        if (!struct_type && object_ptr)
+        {
+            std::cout << "[CodegenVisitor] Trying global variable type lookup" << std::endl;
+
+            // Check if this is a global variable - look up in _global_types
+            if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(node.object()))
+            {
+                std::string var_name = identifier->name();
+                auto global_type_it = _global_types.find(var_name);
+                if (global_type_it != _global_types.end())
+                {
+                    llvm::Type *global_type = global_type_it->second;
+                    std::cout << "[CodegenVisitor] Found global variable type for: " << var_name << std::endl;
+
+                    if (llvm::isa<llvm::StructType>(global_type))
+                    {
+                        // Direct struct type
+                        struct_type = global_type;
+                        
+                        // Find the type name
+                        for (const auto &[registered_name, registered_type] : _types)
+                        {
+                            if (registered_type == struct_type)
+                            {
+                                type_name = registered_name;
+                                field_index = _type_mapper->get_field_index(registered_name, member_name);
+                                std::cout << "[CodegenVisitor] Found global struct type: " << type_name
+                                          << ", field index: " << field_index << std::endl;
+                                break;
+                            }
+                        }
+                    }
+                    else if (global_type->isPointerTy())
+                    {
+                        // Pointer to struct type - need to find the pointed-to type
+                        std::cout << "[CodegenVisitor] Global variable is pointer type, finding pointed-to struct" << std::endl;
+                        
+                        // Look through registered types to find the struct this points to
+                        for (const auto &[registered_name, registered_type] : _types)
+                        {
+                            if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
+                            {
+                                llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
+                                if (global_type == expected_ptr_type)
+                                {
+                                    struct_type = struct_llvm_type;
+                                    type_name = registered_name;
+                                    field_index = _type_mapper->get_field_index(registered_name, member_name);
+                                    std::cout << "[CodegenVisitor] Found global pointer-to-struct type: " << type_name
+                                              << ", field index: " << field_index << std::endl;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strategy 4: Fallback pattern matching for specialized generic types
         if (!struct_type || field_index == -1)
         {
             std::cout << "[CodegenVisitor] Trying fallback pattern matching for specialized generic structs" << std::endl;
@@ -4093,9 +4256,32 @@ namespace Cryo::Codegen
                 // Handle assignment to member access: obj.field = value
                 else if (auto *left_member_access = dynamic_cast<Cryo::MemberAccessNode *>(node->left()))
                 {
-                    // Generate the object to get its pointer
-                    left_member_access->object()->accept(*this);
-                    llvm::Value *object_ptr = get_generated_value(left_member_access->object());
+                    llvm::Value *object_ptr = nullptr;
+
+                    // Check if the object is an identifier - get the pointer directly for globals
+                    if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(left_member_access->object()))
+                    {
+                        std::string var_name = identifier->name();
+                        
+                        // Try local variables first
+                        object_ptr = _value_context->get_alloca(var_name);
+                        
+                        if (!object_ptr)
+                        {
+                            // Try global variables - get the global pointer directly (don't load)
+                            auto global_it = _globals.find(var_name);
+                            if (global_it != _globals.end())
+                            {
+                                object_ptr = global_it->second; // This is already a pointer
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // For complex expressions, generate normally
+                        left_member_access->object()->accept(*this);
+                        object_ptr = get_generated_value(left_member_access->object());
+                    }
 
                     if (!object_ptr || !object_ptr->getType()->isPointerTy())
                     {
@@ -4163,6 +4349,43 @@ namespace Cryo::Codegen
                         {
                             // Direct struct type
                             struct_type = allocated_type;
+                        }
+                    }
+
+                    // Try global variable type lookup if we haven't found the struct type yet
+                    if (!struct_type && object_ptr)
+                    {
+                        if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(left_member_access->object()))
+                        {
+                            std::string var_name = identifier->name();
+                            auto global_type_it = _global_types.find(var_name);
+                            if (global_type_it != _global_types.end())
+                            {
+                                llvm::Type *global_type = global_type_it->second;
+                                if (llvm::isa<llvm::StructType>(global_type))
+                                {
+                                    // Direct struct type
+                                    struct_type = global_type;
+                                }
+                                else if (global_type->isPointerTy())
+                                {
+                                    // Pointer to struct type - need to find the pointed-to type
+                                    // Look through registered types to find the struct this points to
+                                    for (const auto &[registered_name, registered_type] : _types)
+                                    {
+                                        if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
+                                        {
+                                            llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
+                                            if (global_type == expected_ptr_type)
+                                            {
+                                                struct_type = struct_llvm_type;
+                                                type_name = registered_name;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -4698,13 +4921,89 @@ namespace Cryo::Codegen
                 }
                 break;
 
+            // Bitwise operations
+            case TokenKind::TK_PIPE: // Bitwise OR |
+                if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                {
+                    // Ensure both operands have the same type
+                    if (left_val->getType() != right_val->getType())
+                    {
+                        // Convert to the larger type
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
+                        if (left_val->getType() != target_type)
+                            left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                        if (right_val->getType() != target_type)
+                            right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                    }
+                    result = builder.CreateOr(left_val, right_val, "bitor.tmp");
+                }
+                else
+                {
+                    report_error("Bitwise OR operation requires integer operands");
+                    return nullptr;
+                }
+                break;
+
+            case TokenKind::TK_AMP: // Bitwise AND &
+                if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                {
+                    // Ensure both operands have the same type
+                    if (left_val->getType() != right_val->getType())
+                    {
+                        // Convert to the larger type
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
+                        if (left_val->getType() != target_type)
+                            left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                        if (right_val->getType() != target_type)
+                            right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                    }
+                    result = builder.CreateAnd(left_val, right_val, "bitand.tmp");
+                }
+                else
+                {
+                    report_error("Bitwise AND operation requires integer operands");
+                    return nullptr;
+                }
+                break;
+
+            case TokenKind::TK_CARET: // Bitwise XOR ^
+                if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                {
+                    // Ensure both operands have the same type
+                    if (left_val->getType() != right_val->getType())
+                    {
+                        // Convert to the larger type
+                        llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                      ? left_val->getType()
+                                                      : right_val->getType();
+
+                        if (left_val->getType() != target_type)
+                            left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                        if (right_val->getType() != target_type)
+                            right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                    }
+                    result = builder.CreateXor(left_val, right_val, "bitxor.tmp");
+                }
+                else
+                {
+                    report_error("Bitwise XOR operation requires integer operands");
+                    return nullptr;
+                }
+                break;
+
             // Logical operations
             case TokenKind::TK_AMPAMP:
-                result = builder.CreateAnd(left_val, right_val, "and.tmp");
+                result = builder.CreateAnd(left_val, right_val, "logand.tmp");
                 break;
 
             case TokenKind::TK_PIPEPIPE:
-                result = builder.CreateOr(left_val, right_val, "or.tmp");
+                result = builder.CreateOr(left_val, right_val, "logor.tmp");
                 break;
 
             default:
@@ -6474,8 +6773,9 @@ namespace Cryo::Codegen
         node->body()->accept(*this);
         exit_scope();
 
-        // Ensure body block ends with a branch back to condition
-        if (!body_block->getTerminator())
+        // Ensure current block ends with a branch back to condition
+        llvm::BasicBlock *current_block = builder.GetInsertBlock();
+        if (current_block && !current_block->getTerminator())
         {
             builder.CreateBr(condition_block);
         }
