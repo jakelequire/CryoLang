@@ -7,8 +7,8 @@ import <core/intrinsics>;
 // Production-quality core runtime with clean architecture
 //===================================================================
 
-// Forward declaration of user main function
-extern function __user_main__(argc: int, argv: string[]) -> int;
+// Forward declaration of user main function (simple signature for now)
+extern function _user_main_() -> int;
 
 //===================================================================
 // CORE TYPE DEFINITIONS
@@ -44,8 +44,6 @@ type ExitHandler = () -> void;
 // Global runtime context - single source of truth
 type struct RuntimeContext {
     state: RuntimeState;
-    argc: int;
-    argv: string[];
     
     // Heap management
     heap_initialized: boolean;
@@ -179,15 +177,13 @@ function heap_init() -> RuntimeError {
     return RuntimeError::SUCCESS;
 }
 
-function runtime_init(argc: int, argv: string[]) -> RuntimeError {
+function runtime_init() -> RuntimeError {
     // Prevent double initialization
     if (g_runtime.state != RuntimeState::UNINITIALIZED) {
         return RuntimeError::INITIALIZATION_FAILED;
     }
     
     g_runtime.state = RuntimeState::INITIALIZING;
-    g_runtime.argc = argc;
-    g_runtime.argv = argv;
     g_runtime.last_error = RuntimeError::SUCCESS;
     g_runtime.panic_in_progress = false;
     
@@ -272,7 +268,7 @@ function cryo_free(ptr: void*) -> void {
     
     // Mark as free and update statistics
     block.flags = BLOCK_FREE | BLOCK_MAGIC;
-    g_runtime.total_deallocations = g_runtime.total_deallocations + 1;
+    g_runtime.total_deallocations = g_runtime.total_deallocations + 1u64;
     g_runtime.bytes_allocated = g_runtime.bytes_allocated - block.size;
     
     // Add to free list and coalesce
@@ -323,6 +319,15 @@ function is_valid_block(block: HeapBlock*) -> boolean {
     
     return true;
 }
+
+function is_adjacent(block1: HeapBlock*, block2: HeapBlock*) -> boolean {
+    // Simple placeholder - check if blocks are logically adjacent
+    // In a real implementation, this would check actual memory addresses
+    if (block1 == null || block2 == null) {
+        return false;
+    }
+    return true; // Simplified for now
+}
  
 function add_to_free_list(block: HeapBlock*) -> void {
     block.next = g_free_list;
@@ -347,7 +352,7 @@ function cryo_panic(message: string, file: string, line: int) -> void {
     
     // Print panic information
     std::Intrinsics::__printf__("RUNTIME PANIC: %s\n", message);
-    if (file != null && line > 0) {
+    if (file != "" && line > 0) {
         std::Intrinsics::__printf__("Location: %s:%d\n", file, line);
     }
     
@@ -361,61 +366,62 @@ function cryo_panic(message: string, file: string, line: int) -> void {
     std::Intrinsics::__syscall_exit__(1);
 }
 
-// function print_runtime_stats() -> void {
-//     std::Intrinsics::__printf__("Runtime Statistics:\n");
-//     std::Intrinsics::__printf__("  Total allocations: %llu\n", g_runtime.total_allocations);
-//     std::Intrinsics::__printf__("  Total deallocations: %llu\n", g_runtime.total_deallocations);
-//     std::Intrinsics::__printf__("  Bytes allocated: %llu\n", g_runtime.bytes_allocated);
-//     std::Intrinsics::__printf__("  Peak allocation: %llu bytes\n", g_runtime.peak_allocation);
-//     
-//     if (g_runtime.bytes_allocated > 0) {
-//         std::Intrinsics::__printf__("  WARNING: %llu bytes leaked\n", g_runtime.bytes_allocated);
-//     }
-// }
-// 
-// //===================================================================
-// // RUNTIME SHUTDOWN
-// //===================================================================
-// 
-// function runtime_shutdown() -> void {
-//     if (g_runtime.state == RuntimeState::TERMINATED) {
-//         return;
-//     }
-//     
-//     g_runtime.state = RuntimeState::SHUTTING_DOWN;
-//     
-//     // Print final statistics in debug builds
-//     print_runtime_stats();
-//     
-//     // Free heap memory back to OS
-//     if (g_runtime.heap_initialized && g_runtime.heap_base != null) {
-//         std::Intrinsics::__munmap__(g_runtime.heap_base, g_runtime.heap_size);
-//         g_runtime.heap_base = null;
-//         g_runtime.heap_initialized = false;
-//     }
-//     
-//     g_runtime.state = RuntimeState::TERMINATED;
-// }
-// 
-// //===================================================================
-// // PUBLIC API
-// //===================================================================
-// 
-// // Main runtime entry point - called by system
-// function __cryo_main__(argc: int, argv: string*) -> int {
-//     // Initialize runtime
-//     const init_result: RuntimeError = runtime_init(argc, argv);
-//     if (init_result != RuntimeError::SUCCESS) {
-//         return init_result;
-//     }
-//     
-//     // Call user main function
-//     const user_result: int = __user_main__(argc, argv);
-//     
-//     // Clean shutdown
-//     runtime_shutdown();
-//     
-//     return user_result;
-// }
-// 
-// 
+function print_runtime_stats() -> void {
+    std::Intrinsics::__printf__("Runtime Statistics:\n");
+    std::Intrinsics::__printf__("  Total allocations: %llu\n", g_runtime.total_allocations);
+    std::Intrinsics::__printf__("  Total deallocations: %llu\n", g_runtime.total_deallocations);
+    std::Intrinsics::__printf__("  Bytes allocated: %llu\n", g_runtime.bytes_allocated);
+    std::Intrinsics::__printf__("  Peak allocation: %llu bytes\n", g_runtime.peak_allocation);
+    
+    if (g_runtime.bytes_allocated > 0u64) {
+        std::Intrinsics::__printf__("  WARNING: %llu bytes leaked\n", g_runtime.bytes_allocated);
+    }
+}
+
+//===================================================================
+// RUNTIME SHUTDOWN
+//===================================================================
+
+function runtime_shutdown() -> void {
+    if (g_runtime.state == RuntimeState::TERMINATED) {
+        return;
+    }
+    
+    g_runtime.state = RuntimeState::SHUTTING_DOWN;
+    
+    // Print final statistics in debug builds
+    print_runtime_stats();
+    
+    // Free heap memory back to OS
+    if (g_runtime.heap_initialized && g_runtime.heap_base != null) {
+        std::Intrinsics::__munmap__(g_runtime.heap_base, g_runtime.heap_size);
+        g_runtime.heap_base = null;
+        g_runtime.heap_initialized = false;
+    }
+    
+    g_runtime.state = RuntimeState::TERMINATED;
+}
+
+
+
+// Main runtime entry point - called by system
+function main() -> int {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] True `main` invoked...\n");
+
+    // Initialize runtime (simplified for now)
+    const init_result: RuntimeError = runtime_init();
+    if (init_result != RuntimeError::SUCCESS) {
+        return -1;
+    }
+    
+    // Call user main function (simplified)
+    const user_result: int = _user_main_();
+    
+    // Clean shutdown
+    runtime_shutdown();
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] True `main` exited with code %d\n", user_result);
+    
+    return user_result;
+}
+

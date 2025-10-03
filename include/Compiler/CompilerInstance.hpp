@@ -127,6 +127,9 @@ namespace Cryo
         bool parse_source_from_file(std::unique_ptr<File> file);
         void populate_symbol_table(ASTNode *node);
         void populate_symbol_table_with_scope(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name);
+        void collect_declarations_pass(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name);
+        void process_struct_declarations_for_preregistration(ASTNode *node);
+        void process_struct_declarations_recursive(ASTNode *node);
         std::string build_function_signature(FunctionDeclarationNode *func_decl);
         void inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name); // Auto-import core types
     };

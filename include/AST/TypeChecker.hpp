@@ -240,6 +240,7 @@ namespace Cryo
         // Load built-in functions from main SymbolTable
         void load_builtin_symbols(const SymbolTable &main_symbol_table);
         void load_intrinsic_symbols(const SymbolTable &main_symbol_table);
+        void load_user_symbols(const SymbolTable &main_symbol_table);
 
         // Generic type management
         void register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names);

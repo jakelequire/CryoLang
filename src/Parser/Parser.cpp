@@ -743,6 +743,18 @@ namespace Cryo
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
         std::string func_name = std::string(name_token.text());
 
+        // Runtime function name transformation: main -> _user_main_
+        // Only transform if this is not a stdlib module (no "std::" in current namespace)
+        if (func_name == "main" && _current_namespace.find("std::") == std::string::npos)
+        {
+            func_name = "_user_main_";
+            if (_diagnostic_manager)
+            {
+                // Optional: Report the transformation for debugging
+                // std::cout << "[DEBUG] Transformed main() -> _user_main_()" << std::endl;
+            }
+        }
+
         // Create function declaration early so we can add generic parameters
         auto func_decl = _builder.create_function_declaration(start_loc, func_name, "void", is_public);
 

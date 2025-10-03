@@ -178,6 +178,11 @@ namespace Cryo::Codegen
          */
         void clear_errors();
 
+        /**
+         * @brief Pre-register all functions from symbol table to prevent forward declaration conflicts
+         */
+        void pre_register_functions_from_symbol_table();
+
     private:
         //===================================================================
         // Context Management

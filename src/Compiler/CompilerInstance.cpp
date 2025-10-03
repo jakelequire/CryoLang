@@ -301,6 +301,10 @@ namespace Cryo
             // Load only newly added intrinsic symbols into type checker
             _type_checker->load_intrinsic_symbols(*_symbol_table);
 
+            std::cout << "[CompilerInstance] Loading user-defined symbols into type checker..." << std::endl;
+            // Load user-defined function symbols that were registered during Pass 1
+            _type_checker->load_user_symbols(*_symbol_table);
+
             std::cout << "[CompilerInstance] Phase 1: Type checking..." << std::endl;
             // Phase 1: Type checking
             _type_checker->check_program(*_ast_root);
@@ -456,9 +460,24 @@ namespace Cryo
 
         try
         {
-            // Configure linker with libcryo if stdlib linking is enabled
+            // Configure linker with runtime and stdlib if linking is enabled
             if (_stdlib_linking_enabled)
             {
+                // Add runtime first (contains true main function)
+                std::string runtime_path = "./bin/stdlib/runtime.o";
+                if (std::filesystem::exists(runtime_path))
+                {
+                    _linker->add_object_file(runtime_path);
+                    if (_debug_mode)
+                    {
+                        std::cout << "[DEBUG] Added runtime.o for runtime linking: " << runtime_path << std::endl;
+                    }
+                }
+                else
+                {
+                    std::cerr << "Warning: runtime.o not found at " << runtime_path << ", runtime functions may not link properly" << std::endl;
+                }
+
                 // Add libcryo.a to the linker
                 std::string libcryo_path = "./bin/stdlib/libcryo.a";
                 if (std::filesystem::exists(libcryo_path))
@@ -643,17 +662,49 @@ namespace Cryo
         // Inject auto-imports before processing user imports
         inject_auto_imports(_symbol_table.get(), "Global");
 
+        // Two-pass approach for proper forward reference resolution:
+        // Pass 1: Collect all declarations (functions, structs, enums, traits) first
+        std::cout << "[CompilerInstance] Pass 1: Collecting declarations..." << std::endl;
+        collect_declarations_pass(node, _symbol_table.get(), "Global");
+
+        // Pre-register functions in LLVM to prevent forward declaration conflicts
+        if (_codegen)
+        {
+            std::cout << "[CompilerInstance] Ensuring visitor is initialized for function pre-registration..." << std::endl;
+            if (_codegen->ensure_visitor_initialized())
+            {
+                std::cout << "[CompilerInstance] Processing struct declarations before function pre-registration..." << std::endl;
+                // First, process struct declarations to ensure TypeMapper has correct type information
+                process_struct_declarations_for_preregistration(node);
+                
+                std::cout << "[CompilerInstance] Pre-registering functions in LLVM module..." << std::endl;
+                _codegen->get_visitor()->pre_register_functions_from_symbol_table();
+            }
+            else
+            {
+                std::cout << "[WARNING] Failed to initialize CodegenVisitor for function pre-registration" << std::endl;
+            }
+        }
+        else
+        {
+            std::cout << "[WARNING] CodeGenerator not available for function pre-registration" << std::endl;
+        }
+
+        // Pass 2: Process function bodies and other code that can reference the symbols
+        std::cout << "[CompilerInstance] Pass 2: Processing function bodies and references..." << std::endl;
         populate_symbol_table_with_scope(node, _symbol_table.get(), "Global");
     }
 
-    void CompilerInstance::populate_symbol_table_with_scope(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name)
+    void CompilerInstance::collect_declarations_pass(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name)
     {
         if (!node || !current_scope)
             return;
 
-        // Handle function declarations
+        // Handle function declarations - only collect signature, not body
         if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(node))
         {
+            std::cout << "[CompilerInstance] Pass 1: Found function declaration: " << func_decl->name() << std::endl;
+            
             // Create function type from return type and parameters
             std::vector<Type *> param_types;
             for (const auto &param : func_decl->parameters())
@@ -677,6 +728,8 @@ namespace Cryo
                                           func_decl->location(), function_type, scope_name,
                                           func_decl->generic_parameters().empty() ? "" : enhanced_signature);
 
+            std::cout << "[CompilerInstance] Pass 1: Registered function: " << func_decl->name() << std::endl;
+
             // Register generic function templates if this function has generic parameters
             if (!func_decl->generic_parameters().empty())
             {
@@ -690,11 +743,7 @@ namespace Cryo
                 std::cout << "[CompilerInstance] Registered local generic function template: " << func_decl->name() << std::endl;
             }
 
-            // Recurse into function body with function name as new scope
-            if (func_decl->body())
-            {
-                populate_symbol_table_with_scope(func_decl->body(), current_scope, func_decl->name());
-            }
+            // Do NOT process function body in this pass
         }
         // Handle intrinsic function declarations
         else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(node))
@@ -719,70 +768,6 @@ namespace Cryo
                                           intrinsic_decl->location(), function_type, scope_name);
 
             std::cout << "[CompilerInstance] Registered intrinsic function '" << intrinsic_decl->name() << "' in symbol table" << std::endl;
-        }
-        // Handle import declarations
-        else if (auto import_decl = dynamic_cast<ImportDeclarationNode *>(node))
-        {
-            std::cout << "[CompilerInstance] Processing import: " << import_decl->path() << std::endl;
-
-            // Use the member ModuleLoader instance
-            _module_loader->set_stdlib_root("./stdlib");
-            _module_loader->set_current_file(_source_file);
-
-            // Load the import
-            auto result = _module_loader->load_import(*import_decl);
-
-            if (result.success)
-            {
-                if (import_decl->is_specific_import())
-                {
-                    // Check if this is a namespace alias (single specific import) or symbol imports (multiple)
-                    if (!result.namespace_alias.empty())
-                    {
-                        // Single specific import treated as namespace alias
-                        std::cout << "[CompilerInstance] Processing namespace alias '" << result.namespace_alias
-                                  << "' for module '" << result.module_name << "' with " << result.symbol_map.size() << " symbols" << std::endl;
-
-                        current_scope->register_namespace(result.namespace_alias, result.symbol_map);
-                        _imported_namespaces.push_back(result.namespace_alias); // Track for enhanced resolution
-                        std::cout << "[CompilerInstance] Registered namespace alias '" << result.namespace_alias << "' with "
-                                  << result.symbol_map.size() << " symbols" << std::endl;
-                    }
-                    else
-                    {
-                        // Multiple specific imports - add symbols directly to current scope
-                        std::cout << "[CompilerInstance] Processing specific symbol imports with " << result.symbol_map.size() << " symbols" << std::endl;
-
-                        for (const auto &[symbol_name, symbol] : result.symbol_map)
-                        {
-                            // Register each symbol directly in the current scope
-                            current_scope->declare_symbol(symbol_name, symbol.kind, symbol.declaration_location, symbol.data_type, scope_name);
-                            std::cout << "[CompilerInstance] Registered specific symbol: " << symbol_name << std::endl;
-                        }
-                    }
-                }
-                else
-                {
-                    // For wildcard imports, register the namespace and symbols
-                    std::string namespace_name = import_decl->has_alias() ? import_decl->alias() : result.module_name;
-
-                    if (!result.symbol_map.empty())
-                    {
-                        current_scope->register_namespace(namespace_name, result.symbol_map);
-                        _imported_namespaces.push_back(namespace_name); // Track for enhanced resolution
-                        std::cout << "[CompilerInstance] Registered namespace '" << namespace_name << "' with "
-                                  << result.symbol_map.size() << " symbols" << std::endl;
-                    }
-                    else
-                    {
-                        std::cout << "[CompilerInstance] Warning: Import succeeded but no symbols found in " << import_decl->path() << std::endl;
-                    }
-                }
-            }
-            else
-            {
-                std::cout << "[CompilerInstance] Failed to load import '" << import_decl->path() << "': " << result.error_message << std::endl;
-            }
         }
         // Handle struct declarations
         else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
@@ -863,7 +848,71 @@ namespace Cryo
                 std::cout << "[CompilerInstance] Registered local generic trait template: " << trait_decl->name() << std::endl;
             }
         }
-        // Handle variable declarations
+        // Handle import declarations (process in first pass since they affect symbol resolution)
+        else if (auto import_decl = dynamic_cast<ImportDeclarationNode *>(node))
+        {
+            std::cout << "[CompilerInstance] Processing import: " << import_decl->path() << std::endl;
+
+            // Use the member ModuleLoader instance
+            _module_loader->set_stdlib_root("./stdlib");
+            _module_loader->set_current_file(_source_file);
+
+            // Load the import
+            auto result = _module_loader->load_import(*import_decl);
+
+            if (result.success)
+            {
+                if (import_decl->is_specific_import())
+                {
+                    // Check if this is a namespace alias (single specific import) or symbol imports (multiple)
+                    if (!result.namespace_alias.empty())
+                    {
+                        // Single specific import treated as namespace alias
+                        std::cout << "[CompilerInstance] Processing namespace alias '" << result.namespace_alias
+                                  << "' for module '" << result.module_name << "' with " << result.symbol_map.size() << " symbols" << std::endl;
+
+                        current_scope->register_namespace(result.namespace_alias, result.symbol_map);
+                        _imported_namespaces.push_back(result.namespace_alias); // Track for enhanced resolution
+                        std::cout << "[CompilerInstance] Registered namespace alias '" << result.namespace_alias << "' with "
+                                  << result.symbol_map.size() << " symbols" << std::endl;
+                    }
+                    else
+                    {
+                        // Multiple specific imports - add symbols directly to current scope
+                        std::cout << "[CompilerInstance] Processing specific symbol imports with " << result.symbol_map.size() << " symbols" << std::endl;
+
+                        for (const auto &[symbol_name, symbol] : result.symbol_map)
+                        {
+                            // Register each symbol directly in the current scope
+                            current_scope->declare_symbol(symbol_name, symbol.kind, symbol.declaration_location, symbol.data_type, scope_name);
+                            std::cout << "[CompilerInstance] Registered specific symbol: " << symbol_name << std::endl;
+                        }
+                    }
+                }
+                else
+                {
+                    // For wildcard imports, register the namespace and symbols
+                    std::string namespace_name = import_decl->has_alias() ? import_decl->alias() : result.module_name;
+
+                    if (!result.symbol_map.empty())
+                    {
+                        current_scope->register_namespace(namespace_name, result.symbol_map);
+                        _imported_namespaces.push_back(namespace_name); // Track for enhanced resolution
+                        std::cout << "[CompilerInstance] Registered namespace '" << namespace_name << "' with "
+                                  << result.symbol_map.size() << " symbols" << std::endl;
+                    }
+                    else
+                    {
+                        std::cout << "[CompilerInstance] Warning: Import succeeded but no symbols found in " << import_decl->path() << std::endl;
+                    }
+                }
+            }
+            else
+            {
+                std::cout << "[CompilerInstance] Failed to load import '" << import_decl->path() << "': " << result.error_message << std::endl;
+            }
+        }
+        // Handle variable declarations (collect them in first pass too)
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
             // Parse variable type from string annotation
@@ -871,6 +920,80 @@ namespace Cryo
 
             current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
                                           var_decl->location(), var_type, scope_name);
+        }
+        // Handle declaration statements (our wrapper)
+        else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
+        {
+            if (decl_stmt->declaration())
+            {
+                collect_declarations_pass(decl_stmt->declaration(), current_scope, scope_name);
+            }
+        }
+        // Handle program nodes - recurse into statements
+        else if (auto program = dynamic_cast<ProgramNode *>(node))
+        {
+            const auto &statements = program->statements();
+            for (const auto &stmt : statements)
+            {
+                collect_declarations_pass(stmt.get(), current_scope, scope_name);
+            }
+        }
+        // Handle block statements - recurse into statements
+        else if (auto block = dynamic_cast<BlockStatementNode *>(node))
+        {
+            const auto &statements = block->statements();
+            for (const auto &stmt : statements)
+            {
+                collect_declarations_pass(stmt.get(), current_scope, scope_name);
+            }
+        }
+        // Skip all other node types in first pass (expressions, function calls, etc.)
+    }
+
+    void CompilerInstance::populate_symbol_table_with_scope(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name)
+    {
+        if (!node || !current_scope)
+            return;
+
+        // Handle function declarations - skip redeclaring, only process body
+        if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(node))
+        {
+            // Function declaration was already processed in first pass
+            // Only process the function body in this second pass
+            if (func_decl->body())
+            {
+                populate_symbol_table_with_scope(func_decl->body(), current_scope, func_decl->name());
+            }
+        }
+        // Handle intrinsic function declarations - skip, already processed in first pass
+        else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(node))
+        {
+            // Already processed in first pass, nothing to do
+        }
+        // Handle import declarations - skip, already processed in first pass
+        else if (auto import_decl = dynamic_cast<ImportDeclarationNode *>(node))
+        {
+            // Already processed in first pass, nothing to do
+        }
+        // Handle struct declarations - skip, already processed in first pass
+        else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
+        {
+            // Already processed in first pass, nothing to do
+        }
+        // Handle enum declarations - skip, already processed in first pass
+        else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(node))
+        {
+            // Already processed in first pass, nothing to do
+        }
+        // Handle trait declarations - skip, already processed in first pass
+        else if (auto trait_decl = dynamic_cast<TraitDeclarationNode *>(node))
+        {
+            // Already processed in first pass, nothing to do
+        }
+        // Handle variable declarations - skip, already processed in first pass
+        else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
+        {
+            // Already processed in first pass, nothing to do
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
@@ -1000,6 +1123,50 @@ namespace Cryo
         {
             std::cout << "[CompilerInstance] Warning: Failed to auto-import core/types: " << result.error_message << std::endl;
         }
+    }
+
+    void CompilerInstance::process_struct_declarations_for_preregistration(ASTNode *node)
+    {
+        if (!node || !_codegen || !_codegen->get_visitor())
+            return;
+
+        std::cout << "[CompilerInstance] Processing struct declarations for pre-registration..." << std::endl;
+
+        // Process the AST to find and register struct declarations with the TypeMapper
+        process_struct_declarations_recursive(node);
+    }
+
+    void CompilerInstance::process_struct_declarations_recursive(ASTNode *node)
+    {
+        if (!node)
+            return;
+
+        // If this is a struct declaration, process it
+        if (auto struct_decl = dynamic_cast<StructDeclarationNode*>(node))
+        {
+            std::cout << "[CompilerInstance] Pre-processing struct: " << struct_decl->name() << std::endl;
+            
+            // Visit the struct declaration to register it with TypeMapper
+            struct_decl->accept(*_codegen->get_visitor());
+        }
+        // If this is a program node, process all its statements
+        else if (auto program = dynamic_cast<ProgramNode*>(node))
+        {
+            for (const auto& statement : program->statements())
+            {
+                process_struct_declarations_recursive(statement.get());
+            }
+        }
+        // If this is a block statement, process its statements
+        else if (auto block = dynamic_cast<BlockStatementNode*>(node))
+        {
+            for (const auto& statement : block->statements())
+            {
+                process_struct_declarations_recursive(statement.get());
+            }
+        }
+        // For other nodes, we might need to recurse into their children
+        // but for now, we're mainly interested in top-level struct declarations
     }
 
     std::unique_ptr<CompilerInstance> create_compiler_instance()
