@@ -5,9 +5,11 @@ import <core/memory>;
 
 //===================================================================
 // CRYO RUNTIME SYSTEM
-// Self-contained runtime without C dependencies
-// Manual memory management with safety guarantees
+// Self-contained runtime
 //===================================================================
+
+// Forward declaration of user main function
+extern function __user_main__(argc: int, argv: string[]) -> int;
 
 //===================================================================
 // PROGRAM LIFECYCLE MANAGEMENT
@@ -24,6 +26,18 @@ type struct RuntimeState {
 }
 
 // Global runtime state
+
+
+// Exit handler function type (simplified for now)
+type ExitHandler = () -> void;
+
+//===================================================================
+// PROGRAM LIFECYCLE MANAGEMENT
+// CryoLang controls the entire program lifecycle
+//===================================================================
+
+
+// Global runtime state (simplified initialization)
 mut global_runtime: RuntimeState = RuntimeState({
     heap_initialized: false,
     signal_handlers_set: false,
@@ -31,26 +45,6 @@ mut global_runtime: RuntimeState = RuntimeState({
     argc: 0,
     argv: []
 });
-
-// Exit handler function type (simplified for now)
-// type ExitHandler = function() -> void;
-
-//===================================================================
-// PROGRAM LIFECYCLE MANAGEMENT
-// CryoLang controls the entire program lifecycle
-//===================================================================
-
-// Runtime initialization state
-type struct RuntimeState {
-    heap_initialized: boolean;
-    signal_handlers_set: boolean;
-    // exit_handlers: ExitHandler[];  // TODO: Function pointer arrays
-    argc: int;
-    argv: string[];
-}
-
-// Global runtime state (simplified initialization)
-mut global_runtime: RuntimeState;
 
 //===================================================================
 // PROGRAM ENTRY POINT - Simplified version
@@ -127,7 +121,6 @@ type struct HeapBlock {
     prev: HeapBlock*;
 }
 
-// Simple heap allocator state
 type struct HeapState {
     base_ptr: void*;
     total_size: u64;
@@ -156,11 +149,11 @@ function heap_initialize() -> boolean {
     heap_state.total_size = initial_heap_size;
     
     // Initialize the first free block
-    heap_state.free_list = heap_state.base_ptr as HeapBlock*;
-    (*heap_state.free_list).size = initial_heap_size - u64(sizeof(HeapBlock));
-    (*heap_state.free_list).is_free = true;
-    (*heap_state.free_list).next = null;
-    (*heap_state.free_list).prev = null;
+    heap_state.free_list = heap_state.base_ptr;
+    *heap_state.free_list.size = initial_heap_size - u64(sizeof(HeapBlock));
+    *heap_state.free_list.is_free = true;
+    *heap_state.free_list.next = null;
+    *heap_state.free_list.prev = null;
     
     global_runtime.heap_initialized = true;
     
@@ -193,7 +186,7 @@ function cryo_alloc(size: u64) -> void* {
             heap_state.total_allocations = heap_state.total_allocations + 1;
             
             // Return pointer to data (after the header)
-            return (current as void*) + sizeof(HeapBlock);
+            return (current) + sizeof(HeapBlock);
         }
         current = current.next;
     }
@@ -208,7 +201,7 @@ function cryo_free(ptr: void*) -> void {
     }
     
     // Get the block header
-    const block: HeapBlock* = (ptr - sizeof(HeapBlock)) as HeapBlock*;
+    const block: HeapBlock* = (ptr - sizeof(HeapBlock));
     block.is_free = true;
     
     heap_state.allocated_bytes = heap_state.allocated_bytes - block.size;
@@ -223,7 +216,7 @@ function split_block(block: HeapBlock*, size: u64) -> void {
     }
     
     // Create new block for the remaining space
-    const new_block: HeapBlock* = (block as void* + sizeof(HeapBlock) + size) as HeapBlock*;
+    const new_block: HeapBlock* = (block + sizeof(HeapBlock) + size);
     new_block.size = block.size - size - sizeof(HeapBlock);
     new_block.is_free = true;
     new_block.next = block.next;
@@ -296,7 +289,7 @@ function runtime_cleanup() -> void {
         std::Intrinsics::__free__(heap_state.base_ptr);
     }
 }
-2
+
 //===================================================================
 // PANIC AND ERROR HANDLING
 //===================================================================
@@ -341,28 +334,3 @@ function check_null_pointer(ptr: void*, file: string, line: int) -> void {
     }
 }
 
-//===================================================================
-// PUBLIC API FOR USER CODE
-//===================================================================
-
-// Safe allocation functions that users should use
-function allocate<T>(count: u64) -> T* {
-    const size: u64 = sizeof(T) * count;
-    const ptr: void* = cryo_alloc(size);
-    if (ptr == null) {
-        cryo_panic("Out of memory", __FILE__, __LINE__);
-    }
-    return ptr as T*;
-}
-
-function deallocate<T>(ptr: T*) -> void {
-    cryo_free(ptr as void*);
-}
-
-// Array allocation with bounds checking
-function allocate_array<T>(length: u64) -> T[] {
-    const ptr: T* = allocate<T>(length);
-    // Return array with length information embedded
-    // This would require compiler support for array types
-    return ptr as T[]; // Simplified for now
-}

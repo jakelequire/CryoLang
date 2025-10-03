@@ -578,10 +578,21 @@ namespace Cryo
             return parse_implementation_block();
         }
 
-        // Extern block
+        // Extern block or extern function
         if (_current_token.is(TokenKind::TK_KW_EXTERN))
         {
-            return parse_extern_block();
+            // Look ahead to see if this is "extern function" or "extern block"
+            if (peek_next().is(TokenKind::TK_KW_FUNCTION))
+            {
+                // This is "extern function ..." syntax
+                advance(); // consume 'extern'
+                return parse_extern_function_declaration();
+            }
+            else
+            {
+                // This is "extern \"C\" { ... }" syntax
+                return parse_extern_block();
+            }
         }
 
         // Intrinsic function declarations
