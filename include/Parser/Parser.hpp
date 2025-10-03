@@ -176,6 +176,11 @@ namespace Cryo
         bool is_unary_operator(TokenKind kind) const;
         bool is_assignment_operator(TokenKind kind) const;
 
+        // Function type parsing helpers
+        bool is_function_type_ahead();
+        std::string parse_function_type_syntax(const std::string &type_prefix);
+        std::string parse_generic_function_type_syntax(const std::string &type_prefix);
+
         // Look ahead utilities
         Token peek() const { return _current_token; }
         Token peek_next();

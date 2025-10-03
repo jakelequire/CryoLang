@@ -33,6 +33,10 @@ namespace Cryo::Codegen
             return generate_realloc(args);
         else if (intrinsic_name == "__calloc__")
             return generate_calloc(args);
+        else if (intrinsic_name == "__mmap__")
+            return generate_mmap(args);
+        else if (intrinsic_name == "__munmap__")
+            return generate_munmap(args);
 
         // Memory operations
         else if (intrinsic_name == "__memcpy__")
@@ -300,6 +304,71 @@ namespace Cryo::Codegen
 
         // Call calloc
         return builder.CreateCall(calloc_func, {num_arg, size_arg}, "calloc.result");
+    }
+
+    llvm::Value* Intrinsics::generate_mmap(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__mmap__ requires exactly 1 argument (size)");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        // For simplicity, we'll implement mmap as a malloc call
+        // In a real implementation, you'd want actual mmap system call
+        llvm::Type* size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType* malloc_type = llvm::FunctionType::get(
+            void_ptr_type, {size_t_type}, false);
+
+        // Get or create malloc function
+        llvm::Function* malloc_func = get_or_create_libc_function("malloc", malloc_type);
+
+        // Ensure size argument is size_t (i64)
+        llvm::Value* size_arg = ensure_type(args[0], size_t_type, "mmap.size");
+
+        // Call malloc (simplified mmap implementation)
+        return builder.CreateCall(malloc_func, {size_arg}, "mmap.result");
+    }
+
+    llvm::Value* Intrinsics::generate_munmap(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("__munmap__ requires exactly 2 arguments (ptr, size)");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        // For simplicity, we'll implement munmap as a free call
+        // In a real implementation, you'd want actual munmap system call
+        llvm::Type* void_type = llvm::Type::getVoidTy(context);
+        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType* free_type = llvm::FunctionType::get(
+            void_type, {void_ptr_type}, false);
+
+        // Get or create free function
+        llvm::Function* free_func = get_or_create_libc_function("free", free_type);
+
+        // Only use the pointer argument (ignore size for simplified implementation)
+        llvm::Value* ptr_arg = args[0];
+        if (!ptr_arg->getType()->isPointerTy())
+        {
+            report_error("__munmap__ first argument must be a pointer");
+            return nullptr;
+        }
+
+        // Call free (simplified munmap implementation)
+        builder.CreateCall(free_func, {ptr_arg});
+        
+        // munmap typically returns int (0 on success, -1 on error)
+        // For simplicity, always return 0
+        return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0);
     }
 
     // ========================================

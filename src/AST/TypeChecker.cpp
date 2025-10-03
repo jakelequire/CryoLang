@@ -1923,8 +1923,18 @@ namespace Cryo
         // Get the member name
         std::string member_name = node.member();
 
+        // Handle pointer types - automatically dereference for member access
+        std::string effective_type = object_type;
+        bool is_pointer_access = false;
+        if (object_type.back() == '*' && object_type.length() > 1)
+        {
+            // This is a pointer type, extract the pointee type
+            effective_type = object_type.substr(0, object_type.length() - 1);
+            is_pointer_access = true;
+        }
+
         // Check if this is an array type (ends with [])
-        bool is_array_type = (object_type.find("[]") != std::string::npos);
+        bool is_array_type = (effective_type.find("[]") != std::string::npos);
 
         // Handle built-in array properties
         if (is_array_type)
@@ -1941,17 +1951,17 @@ namespace Cryo
             }
             // For now, only support built-in array properties
             report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                         "Unknown array property '" + member_name + "' for type '" + object_type + "'");
+                         "Unknown array property '" + member_name + "' for type '" + effective_type + "'");
             node.set_type("unknown");
             return;
         }
 
         // For generic types, extract the base type name for field/method lookup
-        std::string lookup_type = object_type;
-        size_t generic_pos = object_type.find('<');
+        std::string lookup_type = effective_type;
+        size_t generic_pos = effective_type.find('<');
         if (generic_pos != std::string::npos)
         {
-            lookup_type = object_type.substr(0, generic_pos);
+            lookup_type = effective_type.substr(0, generic_pos);
         }
 
         // Look up the type by name to get struct/class information
@@ -1965,13 +1975,14 @@ namespace Cryo
                                   lookup_type == "void");
 
         // Check if this is a generic type (contains '<' and '>')
-        bool is_generic_type = (object_type.find('<') != std::string::npos &&
-                                object_type.find('>') != std::string::npos);
+        bool is_generic_type = (effective_type.find('<') != std::string::npos &&
+                                effective_type.find('>') != std::string::npos);
 
         if (!struct_type && !is_primitive_type && !is_generic_type)
         {
+            std::string display_type = is_pointer_access ? object_type + " (dereferenced from pointer)" : object_type;
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Cannot access member of non-struct/class type: " + object_type);
+                         "Cannot access member of non-struct/class type: " + display_type);
             node.set_type("unknown");
             return;
         }
@@ -1982,8 +1993,9 @@ namespace Cryo
             struct_type->kind() != TypeKind::Class &&
             struct_type->kind() != TypeKind::Generic)
         {
+            std::string display_type = is_pointer_access ? object_type + " (dereferenced from pointer)" : object_type;
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Cannot access member of non-struct/class type: " + object_type);
+                         "Cannot access member of non-struct/class type: " + display_type);
             node.set_type("unknown");
             return;
         }
@@ -1997,7 +2009,7 @@ namespace Cryo
             {
                 // Found the field - substitute generic type parameters if needed
                 std::string field_type = field_it->second->to_string();
-                std::string resolved_type = substitute_generic_type(field_type, object_type, lookup_type);
+                std::string resolved_type = substitute_generic_type(field_type, effective_type, lookup_type);
                 node.set_type(resolved_type);
                 return;
             }
@@ -2012,7 +2024,7 @@ namespace Cryo
             {
                 // Found the method - substitute generic type parameters if needed
                 std::string method_return_type = method_it->second->to_string();
-                std::string resolved_type = substitute_generic_type(method_return_type, object_type, lookup_type);
+                std::string resolved_type = substitute_generic_type(method_return_type, effective_type, lookup_type);
                 node.set_type(resolved_type);
                 return;
             }
@@ -2738,8 +2750,32 @@ namespace Cryo
     {
         std::string enum_name = node.name();
 
-        // Check for redefinition
-        if (_symbol_table->lookup_symbol(enum_name))
+        // Check if enum already exists in symbol table (from populate_symbol_table phase)
+        TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(enum_name);
+        if (existing_symbol && existing_symbol->type != nullptr)
+        {
+            // Enum type was already created during symbol table population
+            // Just handle variant registration for simple enums
+            if (node.is_simple_enum())
+            {
+                int variant_value = 0;
+                for (const auto &variant : node.variants())
+                {
+                    if (variant)
+                    {
+                        std::string variant_name = variant->name();
+                        Type *int_type = _type_context.get_int_type();
+                        _symbol_table->declare_symbol(variant_name, int_type, variant->location(), false);
+                        variant_value++;
+                    }
+                }
+            }
+            return;
+        }
+
+        // If not found or has null type, this is a fallback for cases where 
+        // populate_symbol_table didn't handle it properly
+        if (existing_symbol)
         {
             report_redefined_symbol(node.location(), enum_name);
             return;
@@ -3137,7 +3173,37 @@ namespace Cryo
         case TokenKind::TK_NUMERIC_CONSTANT:
         {
             const std::string &value = node.value();
-            // Simple heuristic: if contains '.', it's a float
+            
+            // Check for type suffixes first
+            if (value.ends_with("u8")) {
+                return _type_context.get_u8_type();
+            } else if (value.ends_with("u16")) {
+                return _type_context.get_u16_type();
+            } else if (value.ends_with("u32")) {
+                return _type_context.get_u32_type();
+            } else if (value.ends_with("u64")) {
+                return _type_context.get_u64_type();
+            } else if (value.ends_with("i8")) {
+                return _type_context.get_i8_type();
+            } else if (value.ends_with("i16")) {
+                return _type_context.get_i16_type();
+            } else if (value.ends_with("i32")) {
+                return _type_context.get_i32_type();
+            } else if (value.ends_with("i64")) {
+                return _type_context.get_i64_type();
+            } else if (value.ends_with("f32")) {
+                return _type_context.get_f32_type();
+            } else if (value.ends_with("f64")) {
+                return _type_context.get_f64_type();
+            } else if (value.ends_with("usize")) {
+                // Map usize to u64 for now
+                return _type_context.get_u64_type();
+            } else if (value.ends_with("isize")) {
+                // Map isize to i64 for now
+                return _type_context.get_i64_type();
+            }
+            
+            // No suffix - use heuristic based on content
             if (value.find('.') != std::string::npos)
             {
                 return _type_context.get_default_float_type();

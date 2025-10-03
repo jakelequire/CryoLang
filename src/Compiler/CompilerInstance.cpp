@@ -810,10 +810,25 @@ namespace Cryo
         // Handle enum declarations
         else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(node))
         {
-            // Don't create the enum type here - let the TypeChecker handle it properly
-            // Just add a placeholder in the symbol table for now
+            // Create the enum type during symbol table population for proper type resolution
+            std::vector<std::string> variant_names;
+            for (const auto& variant : enum_decl->variants()) {
+                variant_names.push_back(variant->name());
+            }
+            
+            // Check if this is a simple enum (all variants without associated types)
+            bool is_simple_enum = true;
+            for (const auto& variant : enum_decl->variants()) {
+                if (!variant->associated_types().empty()) {
+                    is_simple_enum = false;
+                    break;
+                }
+            }
+            
+            // Create enum type and register it
+            Type *enum_type = _ast_context->types().get_enum_type(enum_decl->name(), variant_names, is_simple_enum);
             current_scope->declare_symbol(enum_decl->name(), SymbolKind::Type,
-                                          enum_decl->location(), nullptr, scope_name);
+                                          enum_decl->location(), enum_type, scope_name);
 
             // Register generic enum templates if this enum has generic parameters
             if (!enum_decl->generic_parameters().empty())

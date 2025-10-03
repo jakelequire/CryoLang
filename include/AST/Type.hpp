@@ -347,6 +347,7 @@ namespace Cryo
         std::string to_string() const override;
 
         bool equals(const Type &other) const override;
+        bool is_assignable_from(const Type &other) const override;
     };
 
     // Function type
@@ -909,6 +910,7 @@ namespace Cryo
         // Type parsing utilities
         std::string normalize_generic_type_string(const std::string &type_str);
         Type *parse_type_from_string(const std::string &type_str);
+        Type *parse_function_type_from_string(const std::string &type_str);
         Type *resolve_type_from_token_kind(int token_kind); // From your TokenKind enum
 
         // Type alias resolution

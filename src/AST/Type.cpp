@@ -348,6 +348,35 @@ namespace Cryo
         return _pointee_type->equals(*other_ptr._pointee_type);
     }
 
+    bool PointerType::is_assignable_from(const Type &other) const
+    {
+        // Call base implementation first (handles same type, null, etc.)
+        if (Type::is_assignable_from(other))
+            return true;
+
+        // Allow any pointer type to be assigned to void*
+        if (_pointee_type->kind() == TypeKind::Void && other.kind() == TypeKind::Pointer)
+            return true;
+
+        // Allow void* to be assigned to any specific pointer type (common C pattern)
+        if (other.kind() == TypeKind::Pointer)
+        {
+            const auto &other_ptr = static_cast<const PointerType &>(other);
+            if (other_ptr._pointee_type->kind() == TypeKind::Void)
+                return true;
+        }
+
+        // Allow conversion between compatible pointer types
+        if (other.kind() == TypeKind::Pointer)
+        {
+            const auto &other_ptr = static_cast<const PointerType &>(other);
+            // Allow assignment if pointee types are assignable
+            return _pointee_type->is_assignable_from(*other_ptr._pointee_type);
+        }
+
+        return false;
+    }
+
     //===----------------------------------------------------------------------===//
     // Reference Type Implementation
     //===----------------------------------------------------------------------===//
@@ -630,6 +659,12 @@ namespace Cryo
         // Normalize the type string first to handle spacing inconsistencies
         std::string normalized_type_str = normalize_generic_type_string(type_str);
 
+        // Check for function types first (before basic types)
+        if (normalized_type_str.find("->") != std::string::npos)
+        {
+            return parse_function_type_from_string(normalized_type_str);
+        }
+
         // Basic type string parsing
         if (normalized_type_str == "void")
             return get_void_type();
@@ -742,6 +777,14 @@ namespace Cryo
             return get_struct_type(normalized_type_str);
         }
 
+        // Check for user-defined enum types FIRST (before struct types)
+        auto enum_it = _enum_types.find(normalized_type_str);
+        if (enum_it != _enum_types.end())
+        {
+            std::cout << "[DEBUG] parse_type_from_string: Found '" << normalized_type_str << "' in _enum_types" << std::endl;
+            return enum_it->second.get();
+        }
+
         // Check for user-defined struct types (including generic instantiation)
         auto struct_it = _struct_types.find(normalized_type_str);
         if (struct_it != _struct_types.end())
@@ -764,6 +807,142 @@ namespace Cryo
         }
 
         return get_unknown_type();
+    }
+
+    Type *TypeContext::parse_function_type_from_string(const std::string &type_str)
+    {
+        // Parse function type string like "() -> void" or "<T>(arg: T) -> T" or "(int, string) -> bool"
+        std::string normalized = type_str;
+        
+        // Check if it's a generic function type
+        bool is_generic = false;
+        std::string generics_part;
+        std::string function_part;
+        
+        if (normalized.front() == '<')
+        {
+            // Generic function type: <T>(params) -> return_type
+            size_t close_angle = normalized.find('>');
+            if (close_angle != std::string::npos)
+            {
+                is_generic = true;
+                generics_part = normalized.substr(1, close_angle - 1); // Extract T
+                function_part = normalized.substr(close_angle + 1);    // Extract (params) -> return_type
+            }
+            else
+            {
+                return get_unknown_type();
+            }
+        }
+        else
+        {
+            // Non-generic function type: (params) -> return_type
+            function_part = normalized;
+        }
+        
+        // Parse the function part: (params) -> return_type
+        size_t arrow_pos = function_part.find("->");
+        if (arrow_pos == std::string::npos)
+        {
+            return get_unknown_type();
+        }
+        
+        std::string params_part = function_part.substr(0, arrow_pos);
+        std::string return_part = function_part.substr(arrow_pos + 2);
+        
+        // Trim whitespace
+        params_part.erase(params_part.find_last_not_of(" \t") + 1);
+        params_part.erase(0, params_part.find_first_not_of(" \t"));
+        return_part.erase(return_part.find_last_not_of(" \t") + 1);
+        return_part.erase(0, return_part.find_first_not_of(" \t"));
+        
+        // Parse return type
+        Type *return_type = parse_type_from_string(return_part);
+        if (!return_type)
+        {
+            return get_unknown_type();
+        }
+        
+        // Parse parameter types
+        std::vector<Type *> param_types;
+        
+        if (params_part.size() >= 2 && params_part.front() == '(' && params_part.back() == ')')
+        {
+            std::string params_inner = params_part.substr(1, params_part.size() - 2);
+            
+            if (!params_inner.empty())
+            {
+                // Split parameters by comma
+                std::vector<std::string> param_strings;
+                std::string current_param;
+                int paren_depth = 0;
+                
+                for (char c : params_inner)
+                {
+                    if (c == '(')
+                    {
+                        paren_depth++;
+                        current_param += c;
+                    }
+                    else if (c == ')')
+                    {
+                        paren_depth--;
+                        current_param += c;
+                    }
+                    else if (c == ',' && paren_depth == 0)
+                    {
+                        // Trim and add parameter
+                        current_param.erase(current_param.find_last_not_of(" \t") + 1);
+                        current_param.erase(0, current_param.find_first_not_of(" \t"));
+                        if (!current_param.empty())
+                        {
+                            param_strings.push_back(current_param);
+                        }
+                        current_param.clear();
+                    }
+                    else
+                    {
+                        current_param += c;
+                    }
+                }
+                
+                // Add the last parameter
+                current_param.erase(current_param.find_last_not_of(" \t") + 1);
+                current_param.erase(0, current_param.find_first_not_of(" \t"));
+                if (!current_param.empty())
+                {
+                    param_strings.push_back(current_param);
+                }
+                
+                // Parse each parameter type
+                for (const std::string &param_str : param_strings)
+                {
+                    // Handle named parameters like "arg: T" - extract just the type part
+                    std::string type_part = param_str;
+                    size_t colon_pos = param_str.find(':');
+                    if (colon_pos != std::string::npos)
+                    {
+                        type_part = param_str.substr(colon_pos + 1);
+                        type_part.erase(type_part.find_last_not_of(" \t") + 1);
+                        type_part.erase(0, type_part.find_first_not_of(" \t"));
+                    }
+                    
+                    Type *param_type = parse_type_from_string(type_part);
+                    if (!param_type)
+                    {
+                        return get_unknown_type();
+                    }
+                    param_types.push_back(param_type);
+                }
+            }
+        }
+        else
+        {
+            return get_unknown_type();
+        }
+        
+        // Create function type
+        return create_function_type(return_type, param_types);
     }
 
     Type *TypeContext::resolve_type_from_token_kind(int token_kind)
