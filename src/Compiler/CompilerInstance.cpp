@@ -301,6 +301,10 @@ namespace Cryo
             // Load only newly added intrinsic symbols into type checker
             _type_checker->load_intrinsic_symbols(*_symbol_table);
 
+            std::cout << "[CompilerInstance] Loading runtime symbols into type checker..." << std::endl;
+            // Load runtime function symbols and make them available globally
+            _type_checker->load_runtime_symbols(*_symbol_table);
+
             std::cout << "[CompilerInstance] Loading user-defined symbols into type checker..." << std::endl;
             // Load user-defined function symbols that were registered during Pass 1
             _type_checker->load_user_symbols(*_symbol_table);
@@ -1122,6 +1126,39 @@ namespace Cryo
         else
         {
             std::cout << "[CompilerInstance] Warning: Failed to auto-import core/types: " << result.error_message << std::endl;
+        }
+
+        // Auto-import runtime functions 
+        std::cout << "[CompilerInstance] Injecting auto-import: runtime/runtime" << std::endl;
+
+        // Create a synthetic ImportDeclarationNode for runtime/runtime
+        // This simulates: import <runtime/runtime>;
+        auto runtime_import = std::make_unique<ImportDeclarationNode>(
+            SourceLocation(0, 0),                       // synthetic location
+            "runtime/runtime",                          // path
+            ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
+        );
+
+        // Load the runtime import
+        auto runtime_result = _module_loader->load_import(*runtime_import);
+
+        if (runtime_result.success)
+        {
+            // Register the namespace and symbols (wildcard import behavior)
+            if (!runtime_result.symbol_map.empty())
+            {
+                current_scope->register_namespace(runtime_result.module_name, runtime_result.symbol_map);
+                std::cout << "[CompilerInstance] Auto-imported runtime: registered namespace '" << runtime_result.module_name
+                          << "' with " << runtime_result.symbol_map.size() << " symbols" << std::endl;
+            }
+            else
+            {
+                std::cout << "[CompilerInstance] Warning: Auto-import succeeded but no symbols found in runtime" << std::endl;
+            }
+        }
+        else
+        {
+            std::cout << "[CompilerInstance] Warning: Failed to auto-import runtime: " << runtime_result.error_message << std::endl;
         }
     }
 

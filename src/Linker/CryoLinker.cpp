@@ -266,6 +266,11 @@ namespace Cryo::Linker
         linker_args.push_back("-lm");       // math library
         linker_args.push_back("-lpthread"); // pthread library
 
+// #if defined(_WIN32) || defined(_WIN64)
+//         // For Windows console applications, specify the console subsystem
+//         linker_args.push_back("-Wl,--subsystem,console");
+// #endif
+
         // Add output specification
         linker_args.push_back("-o");
         linker_args.push_back(output_path);

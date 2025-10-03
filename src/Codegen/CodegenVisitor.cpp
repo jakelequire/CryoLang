@@ -1415,6 +1415,9 @@ namespace Cryo::Codegen
         llvm::Type *struct_type = struct_type_it->second;
         llvm::Type *struct_ptr_type = llvm::PointerType::getUnqual(struct_type);
 
+        // Set struct type context for method generation
+        current_struct_type = target_type_name;
+
         // Generate all method implementations
         for (const auto &method : node.method_implementations())
         {
@@ -1563,6 +1566,9 @@ namespace Cryo::Codegen
             exit_scope();
             _current_function.reset();
         }
+
+        // Clear struct type context
+        current_struct_type.clear();
 
         register_value(&node, nullptr);
     }
@@ -3462,8 +3468,16 @@ namespace Cryo::Codegen
                 {
                     // Map parameter types
                     std::vector<llvm::Type*> param_types;
+                    bool has_variadic = false;
                     for (const auto& param_type : func_type->parameter_types())
                     {
+                        // Skip variadic parameters - they don't have concrete LLVM types
+                        if (param_type->kind() == Cryo::TypeKind::Variadic)
+                        {
+                            has_variadic = true;
+                            continue;
+                        }
+                        
                         llvm::Type* llvm_param_type = _type_mapper->map_type(param_type.get());
                         if (llvm_param_type)
                         {
@@ -3484,8 +3498,8 @@ namespace Cryo::Codegen
                         continue;
                     }
                     
-                    // Create LLVM function type
-                    llvm::FunctionType* llvm_func_type = llvm::FunctionType::get(return_type, param_types, false);
+                    // Create LLVM function type with variadic flag
+                    llvm::FunctionType* llvm_func_type = llvm::FunctionType::get(return_type, param_types, has_variadic);
                     
                     // Create LLVM function declaration
                     llvm::Function* function = llvm::Function::Create(
@@ -3535,8 +3549,16 @@ namespace Cryo::Codegen
                     {
                         // Map parameter types
                         std::vector<llvm::Type*> param_types;
+                        bool has_variadic = false;
                         for (const auto& param_type : func_type->parameter_types())
                         {
+                            // Skip variadic parameters - they don't have concrete LLVM types
+                            if (param_type->kind() == Cryo::TypeKind::Variadic)
+                            {
+                                has_variadic = true;
+                                continue;
+                            }
+                            
                             llvm::Type* llvm_param_type = _type_mapper->map_type(param_type.get());
                             if (llvm_param_type)
                             {
@@ -3557,8 +3579,8 @@ namespace Cryo::Codegen
                             continue;
                         }
                         
-                        // Create LLVM function type
-                        llvm::FunctionType* llvm_func_type = llvm::FunctionType::get(return_type, param_types, false);
+                        // Create LLVM function type with variadic flag
+                        llvm::FunctionType* llvm_func_type = llvm::FunctionType::get(return_type, param_types, has_variadic);
                         
                         // Create LLVM function declaration using the unqualified name for LLVM linking
                         llvm::Function* function = llvm::Function::Create(
@@ -3613,9 +3635,40 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::register_value(Cryo::ASTNode *node, llvm::Value *value)
     {
-        if (node)
+        if (!node)
+        {
+            std::cerr << "[ERROR] register_value called with null node pointer" << std::endl;
+            return;
+        }
+
+        // Validate node pointer isn't corrupted by checking it has a valid kind
+        try 
+        {
+            auto kind = node->kind();
+            if (static_cast<int>(kind) < 0 || static_cast<int>(kind) > 200) // reasonable range check
+            {
+                std::cerr << "[ERROR] register_value: node pointer appears corrupted (invalid kind: " 
+                         << static_cast<int>(kind) << ")" << std::endl;
+                return;
+            }
+        }
+        catch (...)
+        {
+            std::cerr << "[ERROR] register_value: exception accessing node->kind(), node pointer corrupted" << std::endl;
+            return;
+        }
+
+        try 
         {
             _node_values[node] = value;
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "[ERROR] register_value: exception inserting into hash map: " << e.what() << std::endl;
+        }
+        catch (...)
+        {
+            std::cerr << "[ERROR] register_value: unknown exception inserting into hash map" << std::endl;
         }
     }
 
@@ -3826,9 +3879,28 @@ namespace Cryo::Codegen
                     std::string param_name = var_decl->name();
                     std::string param_type_annotation = var_decl->type_annotation();
 
+                    std::cout << "[DEBUG] Processing parameter: " << param_name << " with type annotation: '" << param_type_annotation << "'" << std::endl;
+
+                    // Skip variadic parameters - they don't have concrete allocas
+                    if (param_type_annotation == "..." || param_type_annotation == "variadic" || param_name == "args" && param_type_annotation == "...")
+                    {
+                        std::cout << "[DEBUG] Skipping variadic parameter: " << param_name << " (type: '" << param_type_annotation << "')" << std::endl;
+                        // Variadic parameters are handled via va_list mechanism
+                        // Don't create allocas for them and don't advance arg_it
+                        continue;
+                    }
+
+                    std::cout << "[DEBUG] About to parse and map parameter type: " << param_type_annotation << std::endl;
+                    
                     // Map the parameter type from AST
                     Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(param_type_annotation);
-                    llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
+                    if (!cryo_param_type) {
+                        report_error("Failed to parse parameter type: " + param_name + " (" + param_type_annotation + ")");
+                        return false;
+                    }
+                    
+                    std::cout << "[DEBUG] Successfully parsed parameter type, now mapping to LLVM type" << std::endl;
+                    llvm::Type *param_type = _type_mapper->map_type(cryo_param_type);
                     if (!param_type)
                     {
                         report_error("Failed to map parameter type: " + param_name + " (" + param_type_annotation + ")");
@@ -5723,8 +5795,14 @@ namespace Cryo::Codegen
 
                     if (!type_name.empty())
                     {
-                        // Look up the method function
-                        std::string method_name = type_name + "::" + member_access->member();
+                        // Look up the method function - include namespace context to match how methods are stored
+                        std::string method_name;
+                        if (!_namespace_context.empty()) {
+                            method_name = _namespace_context + "::" + type_name + "::" + member_access->member();
+                        } else {
+                            method_name = type_name + "::" + member_access->member();
+                        }
+                        
                         auto method_it = _functions.find(method_name);
 
                         // If not found and this is a generic type, try different lookup strategies
@@ -5743,7 +5821,13 @@ namespace Cryo::Codegen
                                 std::replace(type_params.begin(), type_params.end(), ' ', '_');
                                 monomorphized_name = monomorphized_name.substr(0, angle_start) + "_" + type_params;
                             }
-                            std::string monomorphized_method_name = monomorphized_name + "::" + member_access->member();
+                            // Include namespace context to match how methods are stored
+                            std::string monomorphized_method_name;
+                            if (!_namespace_context.empty()) {
+                                monomorphized_method_name = _namespace_context + "::" + monomorphized_name + "::" + member_access->member();
+                            } else {
+                                monomorphized_method_name = monomorphized_name + "::" + member_access->member();
+                            }
                             method_it = _functions.find(monomorphized_method_name);
 
                             // Second try: Extract base type name for generic instantiation lookup fallback
@@ -5758,6 +5842,10 @@ namespace Cryo::Codegen
                         if (method_it != _functions.end())
                         {
                             llvm::Function *method_func = method_it->second;
+                            std::cout << "[DEBUG] Found method: " << method_name << std::endl;
+                            std::cout << "[DEBUG] Method function type: ";
+                            method_func->getFunctionType()->print(llvm::errs());
+                            std::cout << std::endl;
 
                             // Prepare arguments: this pointer + method arguments
                             std::vector<llvm::Value *> args;
@@ -5778,6 +5866,7 @@ namespace Cryo::Codegen
                             }
 
                             // Call the method
+                            std::cout << "[DEBUG] Calling method with " << args.size() << " arguments" << std::endl;
                             return builder.CreateCall(method_func, args);
                         }
                         else
@@ -6220,6 +6309,57 @@ namespace Cryo::Codegen
 
             // Call the function
             return builder.CreateCall(known_function, args);
+        }
+
+        // Check if this is a runtime function that should be available globally
+        std::string runtime_qualified_name = "std::Runtime::" + resolved_function_name;
+        auto runtime_func_it = _functions.find(runtime_qualified_name);
+        if (runtime_func_it != _functions.end())
+        {
+            llvm::Function *runtime_function = runtime_func_it->second;
+            std::cout << "[DEBUG] Found runtime function: " << resolved_function_name << " -> " << runtime_function->getName().str() << std::endl;
+
+            // Generate arguments for the runtime function call
+            std::vector<llvm::Value *> args;
+            for (const auto &arg : node->arguments())
+            {
+                arg->accept(*this);
+                llvm::Value *arg_value = get_current_value();
+                if (arg_value)
+                {
+                    args.push_back(arg_value);
+                }
+            }
+
+            // Call the runtime function
+            return builder.CreateCall(runtime_function, args);
+        }
+
+        // Check the symbol table for runtime functions
+        Symbol *runtime_symbol = _symbol_table.lookup_namespaced_symbol("std::Runtime", resolved_function_name);
+        if (runtime_symbol && runtime_symbol->kind == SymbolKind::Function)
+        {
+            std::cout << "[DEBUG] Found runtime function in symbol table: " << resolved_function_name << std::endl;
+            
+            // Create a forward declaration for the runtime function
+            llvm::Function *runtime_function = create_runtime_function_declaration(runtime_qualified_name, node);
+            if (runtime_function)
+            {
+                // Generate arguments for the runtime function call
+                std::vector<llvm::Value *> args;
+                for (const auto &arg : node->arguments())
+                {
+                    arg->accept(*this);
+                    llvm::Value *arg_value = get_current_value();
+                    if (arg_value)
+                    {
+                        args.push_back(arg_value);
+                    }
+                }
+
+                // Call the runtime function
+                return builder.CreateCall(runtime_function, args);
+            }
         }
 
         // Map Cryo function names to C runtime function names

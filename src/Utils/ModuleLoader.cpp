@@ -303,9 +303,9 @@ namespace Cryo
             {
                 if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
                 {
-                    // Create function symbol with nullptr type for now to avoid memory issues
-                    // The proper type will be resolved when the symbol is actually used
-                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_decl->location(), nullptr, module_name);
+                    // Create function symbol with proper type information
+                    Type *func_type = create_function_type_from_declaration(func_decl, type_context);
+                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_decl->location(), func_type, module_name);
                     symbol_map[func_decl->name()] = symbol;
                 }
                 else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(decl))
