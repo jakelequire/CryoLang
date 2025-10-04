@@ -13,11 +13,11 @@ std::string find_log_directory()
     // Try to find the CryoLang project root and create a logs directory
     std::vector<std::string> possible_roots = {
         // Current working directory + logs
-        std::filesystem::current_path() / "logs",
+        (std::filesystem::current_path() / "logs").string(),
         // Parent directories (look for CryoLang project structure)
-        std::filesystem::current_path().parent_path() / "logs",
-        std::filesystem::current_path().parent_path().parent_path() / "logs",
-        std::filesystem::current_path().parent_path().parent_path().parent_path() / "logs"};
+        (std::filesystem::current_path().parent_path() / "logs").string(),
+        (std::filesystem::current_path().parent_path().parent_path() / "logs").string(),
+        (std::filesystem::current_path().parent_path().parent_path().parent_path() / "logs").string()};
 
     // Add some common workspace locations
 #ifdef _WIN32
@@ -53,7 +53,7 @@ std::string find_log_directory()
     }
 
     // Fallback to current directory
-    return std::filesystem::current_path() / "logs";
+    return std::filesystem::current_path().string() + "/logs";
 }
 
 int main(int argc, char *argv[])
