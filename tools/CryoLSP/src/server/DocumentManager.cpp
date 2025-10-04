@@ -1,11 +1,20 @@
 #include "../../include/DocumentManager.hpp"
 #include "../../include/Logger.hpp"
+#include "../../include/analyzer/CryoAnalyzer.hpp"
 #include <algorithm>
 #include <cctype>
 #include <vector>
 
 namespace Cryo {
 namespace LSP {
+
+DocumentManager::DocumentManager() {
+    analyzer_ = std::make_unique<CryoLSP::CryoAnalyzer>();
+    Logger& logger = Logger::instance();
+    logger.info("DocumentManager", "DocumentManager initialized with CryoAnalyzer");
+}
+
+DocumentManager::~DocumentManager() = default;
 
 void DocumentManager::didOpen(const std::string& uri, const std::string& languageId, int version, const std::string& text) {
     Logger& logger = Logger::instance();
@@ -18,6 +27,16 @@ void DocumentManager::didOpen(const std::string& uri, const std::string& languag
     doc.text = text;
     
     documents_[uri] = doc;
+    
+    // Parse the file with CryoAnalyzer
+    if (languageId == "cryo") {
+        std::string file_path = uriToFilePath(uri);
+        if (analyzer_->parseFile(file_path, text)) {
+            logger.debug("DocumentManager", "Successfully parsed file: " + file_path);
+        } else {
+            logger.error("DocumentManager", "Failed to parse file: " + file_path);
+        }
+    }
 }
 
 void DocumentManager::didChange(const std::string& uri, int version, const std::string& text) {
@@ -28,6 +47,12 @@ void DocumentManager::didChange(const std::string& uri, int version, const std::
     if (it != documents_.end()) {
         it->second.version = version;
         it->second.text = text;
+        
+        // Update analyzer with new content
+        if (it->second.languageId == "cryo") {
+            std::string file_path = uriToFilePath(uri);
+            analyzer_->updateFileContent(file_path, text);
+        }
     }
 }
 
@@ -64,6 +89,32 @@ std::optional<HoverResult> DocumentManager::getHoverInfo(const std::string& uri,
         return std::nullopt;
     }
     
+    // Try to get hover info from CryoAnalyzer first
+    auto doc = getDocument(uri);
+    if (doc && doc->languageId == "cryo") {
+        std::string file_path = uriToFilePath(uri);
+        
+        CryoLSP::Position analyzer_pos;
+        analyzer_pos.line = position.line;
+        analyzer_pos.character = position.character;
+        
+        auto hover_info = analyzer_->getHoverInfo(file_path, analyzer_pos);
+        if (hover_info) {
+            // Format the hover content with syntax highlighting
+            std::string formatted_content = "```cryo\n" + hover_info->signature + "\n```";
+            if (!hover_info->documentation.empty()) {
+                formatted_content += "\n\n" + hover_info->documentation;
+            }
+            
+            Position start = findWordStart(text.value(), position);
+            Position end = findWordEnd(text.value(), position);
+            
+            logger.debug("DocumentManager", "Found symbol info: " + hover_info->name + " : " + hover_info->type);
+            return HoverResult(formatted_content, start, end);
+        }
+    }
+    
+    // Fallback to simple word-based hover
     std::string word = getWordAtPosition(text.value(), position);
     if (word.empty()) {
         logger.debug("DocumentManager", "No word found at position");
@@ -246,6 +297,35 @@ std::string DocumentManager::getHoverContentForSymbol(const std::string& symbol,
     
     // Generic symbol information
     return "**" + symbol + "** - CryoLang symbol\n\n*Hover over built-in types and keywords for more information*";
+}
+
+std::string DocumentManager::uriToFilePath(const std::string& uri) {
+    // Convert file:// URI to local file path
+    if (uri.substr(0, 7) == "file://") {
+        std::string path = uri.substr(7);
+        
+        // URL decode
+        std::string decoded;
+        for (size_t i = 0; i < path.length(); ++i) {
+            if (path[i] == '%' && i + 2 < path.length()) {
+                // Convert hex to char
+                int hex = std::stoi(path.substr(i + 1, 2), nullptr, 16);
+                decoded += static_cast<char>(hex);
+                i += 2;
+            } else {
+                decoded += path[i];
+            }
+        }
+        
+        // Convert forward slashes to backslashes on Windows
+        #ifdef _WIN32
+        std::replace(decoded.begin(), decoded.end(), '/', '\\');
+        #endif
+        
+        return decoded;
+    }
+    
+    return uri; // Fallback
 }
 
 } // namespace LSP

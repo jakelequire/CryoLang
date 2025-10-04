@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
-import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
+import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind, ErrorAction, CloseAction } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
 let clientStopped = false; // Flag to prevent auto-restart
@@ -110,9 +110,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Try multiple possible paths for the LSP server executable
     const possiblePaths = [
-        path.join(context.extensionPath, '..', '..', '..', 'bin', 'test-stdio.exe'), // Development
-        path.join(context.extensionPath, 'bin', 'test-stdio.exe'), // Bundled
-        'C:\\Programming\\apps\\CryoLang\\bin\\test-stdio.exe', // Absolute path
+        path.join(context.extensionPath, '..', '..', '..', 'bin', 'cryo-lsp.exe'), // Development
+        path.join(context.extensionPath, 'bin', 'cryo-lsp.exe'), // Bundled
+        'C:\\Programming\\apps\\CryoLang\\bin\\cryo-lsp.exe', // Absolute path
     ];
     
     let serverCommand = '';
@@ -158,45 +158,32 @@ export function activate(context: vscode.ExtensionContext) {
 
         LOG.info('LanguageServer', 'Configuring server options for LSP communication');
 
-        LOG.info('LanguageServer', 'Configuring server options for LSP communication');
-
-        // Use our C++ LSP server
+        // Use stdio communication (standard LSP mode)
         const serverOptions: ServerOptions = {
-            command: serverCommand,
-            options: {
-                env: process.env,
-                cwd: workspacePath
+            run: {
+                command: serverCommand,
+                transport: TransportKind.stdio
+            },
+            debug: {
+                command: serverCommand,
+                transport: TransportKind.stdio
             }
         };
 
-        // Client options
+        // Client options - minimal configuration with restart disabled
         const clientOptions: LanguageClientOptions = {
-            documentSelector: [{ scheme: 'file', language: 'cryo' }],
-            synchronize: {
-                fileEvents: vscode.workspace.createFileSystemWatcher('**/*.cryo')
-            },
-            // Disable automatic restart
+            documentSelector: [
+                { scheme: 'file', language: 'cryo' }
+            ],
+            // Disable automatic restart features
             connectionOptions: {
-                maxRestartCount: 0, // Never restart automatically
+                maxRestartCount: 0, // Disable auto-restart completely
+                cancellationStrategy: undefined
             },
-            // Better initialization handling
-            initializationOptions: {},
-            diagnosticCollectionName: 'cryo',
-            outputChannelName: 'Cryo Language Server',
-            // Add custom initialization handling to ensure initialized notification is sent
-            initializationFailedHandler: (error) => {
-                LOG.error('LanguageServer', 'LSP initialization failed: ' + String(error));
-                return false;
-            },
+            // Disable error recovery
             errorHandler: {
-                error: (error, message, count) => {
-                    LOG.error('LanguageServer', `LSP error ${count}: ${error}, message: ${message}`);
-                    return { action: 'Continue' as any };
-                },
-                closed: () => {
-                    LOG.error('LanguageServer', 'LSP connection closed');
-                    return { action: 'DoNotRestart' as any };
-                }
+                error: () => ({ action: ErrorAction.Shutdown }),
+                closed: () => ({ action: CloseAction.DoNotRestart })
             }
         };
 
@@ -210,9 +197,16 @@ export function activate(context: vscode.ExtensionContext) {
             clientOptions
         );
         
-        // Add event listeners for debugging
+        // Add event listeners for debugging and shutdown handling
         client.onDidChangeState((event) => {
             LOG.debug('LanguageServer', `Client state changed from ${event.oldState} to ${event.newState}`);
+            
+            // If the client stops unexpectedly and we didn't initiate it, mark as stopped
+            if (event.newState === 1 && !clientStopped) { // State 1 = Stopped
+                LOG.info('LanguageServer', 'Language server stopped unexpectedly, setting clientStopped flag to prevent auto-restart');
+                clientStopped = true;
+                vscode.window.showWarningMessage('Cryo Language Server stopped unexpectedly. Use "Cryo: Restart Language Server" to restart.');
+            }
         });
         
         // Show the output channel to make it visible
@@ -275,45 +269,26 @@ export function activate(context: vscode.ExtensionContext) {
             // Start the client in background
             client.start().then(() => {
                 LOG.info('LanguageServer', 'Client.start() completed successfully - LSP handshake complete');
+                
+                // Explicitly send initialized notification after a short delay
+                setTimeout(async () => {
+                    if (client && client.state === 3) {
+                        try {
+                            LOG.info('LanguageServer', 'Sending initialized notification explicitly...');
+                            await client.sendNotification('initialized', {});
+                            LOG.info('LanguageServer', 'Initialized notification sent successfully');
+                        } catch (error) {
+                            LOG.error('LanguageServer', 'Failed to send initialized notification: ' + String(error));
+                        }
+                    }
+                }, 100);
+                
             }).catch(error => {
                 LOG.error('LanguageServer', 'Client.start() failed: ' + String(error));
             });
             
-            // Register hover provider immediately - don't wait for client.start()
-            LOG.info('Extension', 'Registering hover provider immediately...');
-            const hoverProvider = vscode.languages.registerHoverProvider(
-                { scheme: 'file', language: 'cryo' },
-                {
-                    provideHover: async (document, position, token) => {
-                        LOG.debug('Extension', `Hover request at ${document.uri.toString()} line ${position.line} char ${position.character}`);
-                        
-                        // Check if client is ready
-                        if (client && client.state === 3) { // Running state
-                            try {
-                                LOG.debug('Extension', 'Client is running, sending hover request to LSP...');
-                                const result: any = await client.sendRequest('textDocument/hover', {
-                                    textDocument: { uri: document.uri.toString() },
-                                    position: { line: position.line, character: position.character }
-                                });
-                                
-                                LOG.debug('Extension', `Hover response: ${JSON.stringify(result)}`);
-                                
-                                if (result && result.contents) {
-                                    return new vscode.Hover(result.contents);
-                                }
-                            } catch (error) {
-                                LOG.error('Extension', `Hover request failed: ${error}`);
-                            }
-                        } else {
-                            LOG.debug('Extension', `Client not ready for hover request, state: ${client?.state || 'undefined'}`);
-                        }
-                        return null;
-                    }
-                }
-            );
-            
-            context.subscriptions.push(hoverProvider);
-            LOG.info('Extension', 'Hover provider registered successfully');
+            // Don't register a custom hover provider - let the Language Client handle it automatically
+            LOG.info('Extension', 'Letting Language Client handle hover requests automatically...');
             
             LOG.info('LanguageServer', 'Cryo Language Server connection established');
             
@@ -421,13 +396,33 @@ export function activate(context: vscode.ExtensionContext) {
     // Command to restart the language server (for development)
     const restartCommand = vscode.commands.registerCommand('cryo.restartLanguageServer', async () => {
         vscode.window.showInformationMessage('Restarting Cryo Language Server...');
+        LOG.info('Commands', 'Manual restart command initiated');
         
         try {
-            clientStopped = false; // Allow restart
+            // Reset the stopped flag to allow restart
+            clientStopped = false;
+            
+            // Stop existing client if running
+            if (client) {
+                LOG.info('Commands', 'Stopping existing client for restart...');
+                try {
+                    await client.stop(5000);
+                    client.dispose();
+                    client = undefined;
+                } catch (stopError) {
+                    LOG.error('Commands', 'Error stopping client during restart: ' + String(stopError));
+                }
+            }
+            
+            // Small delay to ensure cleanup
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Start fresh
             await startLanguageServer();
             vscode.window.showInformationMessage('Cryo Language Server restarted successfully!');
+            LOG.info('Commands', 'Manual restart completed successfully');
         } catch (error) {
-            console.error('Error restarting language server:', error);
+            LOG.error('Commands', 'Error restarting language server: ' + String(error));
             vscode.window.showErrorMessage(`Failed to restart language server: ${error}`);
         }
     });
@@ -435,15 +430,19 @@ export function activate(context: vscode.ExtensionContext) {
     // Command to shutdown the language server (for development)
     const shutdownCommand = vscode.commands.registerCommand('cryo.shutdownLanguageServer', async () => {
         if (!client) {
-            vscode.window.showWarningMessage('Cryo Language Server is not rrunning.');
+            vscode.window.showWarningMessage('Cryo Language Server is not running.');
+            LOG.info('Commands', 'Shutdown command called but no client is running');
             return;
         }
 
         try {
             vscode.window.showInformationMessage('Shutting down Cryo Language Server...');
-            console.log('Sending shutdown request to LSP server...');
+            LOG.info('Commands', 'Manual shutdown command initiated');
             
-            clientStopped = true; // Prevent auto-restart
+            // Set flag to prevent auto-restart BEFORE stopping the client
+            clientStopped = true;
+            
+            LOG.info('Commands', 'Sending shutdown request to LSP server...');
             
             // Stop the client with a longer timeout to ensure proper shutdown
             await client.stop(5000); // 5 second timeout
@@ -454,9 +453,9 @@ export function activate(context: vscode.ExtensionContext) {
             await new Promise(resolve => setTimeout(resolve, 2000));
             
             vscode.window.showInformationMessage('Cryo Language Server shut down successfully!');
-            console.log('LSP server shutdown complete - process should be released.');
+            LOG.info('Commands', 'LSP server shutdown complete - process should be released');
         } catch (error) {
-            console.error('Error shutting down language server:', error);
+            LOG.error('Commands', 'Error shutting down language server: ' + String(error));
             vscode.window.showErrorMessage(`Failed to shutdown language server: ${error}`);
         }
     });

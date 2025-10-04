@@ -9,7 +9,7 @@ namespace Cryo {
 namespace LSP {
 
 // Message Handler Types
-using RequestHandler = std::function<JsonValue(const std::string& id, const std::string& method, const JsonValue& params)>;
+using RequestHandler = std::function<JsonValue(const JsonValue& id, const std::string& method, const JsonValue& params)>;
 using NotificationHandler = std::function<void(const std::string& method, const JsonValue& params)>;
 
 class ProtocolHandler {
@@ -34,8 +34,8 @@ public:
     std::optional<std::string> processMessage(const std::string& messageJson);
     
     // Helper methods for creating responses
-    static std::string createSuccessResponse(const std::string& id, const JsonValue& result);
-    static std::string createErrorResponse(const std::string& id, LSPErrorCode code, const std::string& message);
+    static std::string createSuccessResponse(const JsonValue& id, const JsonValue& result);
+    static std::string createErrorResponse(const JsonValue& id, LSPErrorCode code, const std::string& message);
     static std::string createNotification(const std::string& method, const JsonValue& params = JsonValue{});
     
 private:

@@ -3,7 +3,13 @@
 #include <string>
 #include <unordered_map>
 #include <optional>
+#include <memory>
 #include "LSPMessage.hpp"
+
+// Forward declaration
+namespace CryoLSP {
+    class CryoAnalyzer;
+}
 
 namespace Cryo {
 namespace LSP {
@@ -28,8 +34,12 @@ struct HoverResult {
 class DocumentManager {
 private:
     std::unordered_map<std::string, TextDocumentItem> documents_;
+    std::unique_ptr<CryoLSP::CryoAnalyzer> analyzer_;
 
 public:
+    DocumentManager();
+    ~DocumentManager();
+    
     // Document lifecycle
     void didOpen(const std::string& uri, const std::string& languageId, int version, const std::string& text);
     void didChange(const std::string& uri, int version, const std::string& text);
@@ -48,6 +58,7 @@ private:
     Position findWordStart(const std::string& text, const Position& position);
     Position findWordEnd(const std::string& text, const Position& position);
     std::string getHoverContentForSymbol(const std::string& symbol, const std::string& uri);
+    std::string uriToFilePath(const std::string& uri);
 };
 
 } // namespace LSP
