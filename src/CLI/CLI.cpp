@@ -90,6 +90,7 @@ namespace Cryo::CLI
                          flag_name == "symbols" || flag_name == "show-symbols" ||
                          flag_name == "ir" || flag_name == "show-ir" ||
                          flag_name == "emit-llvm" ||
+                         flag_name == "analyze" ||
                          flag_name == "help" || flag_name == "h" ||
                          flag_name == "version" || flag_name == "v" ||
                          flag_name == "no-std" || flag_name == "stdlib-mode")
@@ -274,6 +275,7 @@ namespace Cryo::CLI
         std::cout << "  --symbols                           Show symbol table during compilation\n";
         std::cout << "  --ir                                Show generated LLVM IR\n";
         std::cout << "  --emit-llvm                         Emit LLVM bitcode (.bc) file\n";
+        std::cout << "  --analyze                           Output detailed analysis in JSON format (for LSP)\n";
         std::cout << "  -c, --compile-only                  Compile only, don't link\n";
         std::cout << "  -o, --output <file>                 Output file name\n\n";
 
@@ -381,6 +383,11 @@ namespace Cryo::CLI
         {
             std::cout << "\nGenerated LLVM IR:" << std::endl;
             compiler->dump_ir();
+        }
+
+        if (args.get_flag("analyze"))
+        {
+            std::cout << "\nAnalysis flag detected - using direct compiler integration for LSP features." << std::endl;
         }
 
         if (compilation_success)

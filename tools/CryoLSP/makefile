@@ -32,6 +32,9 @@ LSP_CXXFLAGS = $(CXXFLAGS) $(LSP_INCLUDES)
 # Link against minimal dependencies (standalone LSP server)
 LSP_LIBS = 
 
+# Cryo compiler library
+COMPILER_LIB = ../../bin/libcryo-compiler.a
+
 # OS-specific socket libraries
 ifeq ($(OS), Windows_NT)
     SOCKET_LIBS = -lws2_32 -lwsock32
@@ -64,9 +67,9 @@ endif
 	$(CXX) $(LSP_CXXFLAGS) -c $< -o $@
 
 # Link the LSP executable
-$(LSP_BIN_DIR)/$(LSP_TARGET): $(LSP_OBJECTS)
+$(LSP_BIN_DIR)/$(LSP_TARGET): $(LSP_OBJECTS) $(COMPILER_LIB)
 	@echo "Linking CryoLSP..."
-	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJECTS) $(LSP_LIBS) -o $@ $(LDFLAGS) $(SOCKET_LIBS)
+	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJECTS) $(COMPILER_LIB) $(LSP_LIBS) -o $@ $(LDFLAGS) $(SOCKET_LIBS)
 	@echo "✓ CryoLSP built successfully: $(LSP_BIN_DIR)/$(LSP_TARGET)"
 
 

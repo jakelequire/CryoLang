@@ -3,6 +3,8 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <chrono>
 
 #ifdef _WIN32
 #include <io.h>
@@ -127,8 +129,9 @@ bool StdioTransport::write_message(const std::string& message) {
     std::string header = "Content-Length: " + std::to_string(message.length()) + "\r\n\r\n";
     Logger::instance().debug("Transport", "Writing header: " + header);
     
-    std::cout << header;
-    std::cout << message;
+    // Write header and message as one atomic operation
+    std::string complete_message = header + message;
+    std::cout.write(complete_message.c_str(), complete_message.length());
     
     // Ensure everything is flushed immediately
     std::cout.flush();
@@ -136,6 +139,8 @@ bool StdioTransport::write_message(const std::string& message) {
     // On Windows, also sync the C stream
 #ifdef _WIN32
     fflush(stdout);
+    // Add a tiny delay to ensure VS Code processes the message
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
 #endif
     
     Logger::instance().debug("Transport", "Message written and flushed successfully");

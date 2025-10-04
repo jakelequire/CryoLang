@@ -40,14 +40,33 @@ struct FunctionSignature {
     Position definition_location;
 };
 
-// File analysis results with full compiler integration
-struct FileAnalysis {
-    Cryo::ProgramNode* ast; // Raw pointer to AST owned by compiler
-    std::unique_ptr<Cryo::CompilerInstance> compiler;
-    std::string content;
-    bool parsed_successfully;
+// Symbol information from compiler analysis
+struct SymbolInfo {
+    std::string name;
+    std::string type;
+    std::string kind; // "function", "variable", "struct", "class", etc.
+    Position location;
+    std::string documentation;
+};
+
+// Struct/class information from compiler analysis
+struct StructInfo {
+    std::string name;
+    std::vector<std::pair<std::string, std::string>> members; // name, type
+    std::vector<FunctionSignature> methods;
+    Position location;
+};
+
+// Compiler analysis results for a file
+struct CompilerAnalysis {
+    std::vector<FunctionSignature> functions;
+    std::vector<StructInfo> structs;
+    std::vector<SymbolInfo> symbols;
+    std::map<int, std::vector<SymbolInfo>> symbolsByLine; // line -> symbols on that line
+    bool analysis_successful = false;
+    std::string error_message;
     
-    FileAnalysis() : ast(nullptr), parsed_successfully(false) {}
+    CompilerAnalysis() = default;
 };
 
 class CryoAnalyzer {
@@ -55,7 +74,7 @@ public:
     CryoAnalyzer();
     ~CryoAnalyzer();
     
-    // Parse a file using direct compiler integration
+    // Parse a file and build AST/symbol information
     bool parseFile(const std::string& file_path, const std::string& content);
     
     // Get hover information for a position in a file
@@ -67,29 +86,32 @@ public:
     // Update file content (re-parse)
     void updateFileContent(const std::string& file_path, const std::string& content);
     
-    // Enhanced LSP features using direct compiler access
+    // Enhanced LSP features using AST
     std::optional<FunctionSignature> getFunctionSignature(const std::string& file_path, const Position& position);
     std::vector<HoverInfo> getStructMembers(const std::string& file_path, const std::string& struct_name);
     std::optional<Position> getDefinitionLocation(const std::string& file_path, const Position& position);
 
 private:
-    // File analysis results per file (with full compiler instances)
-    std::unordered_map<std::string, FileAnalysis> analyzed_files_;
+    // Compiler analysis results per file
+    std::unordered_map<std::string, CompilerAnalysis> analyzed_files_;
     
     // File content cache for fallback analysis
     std::unordered_map<std::string, std::string> file_contents_;
     
-    // Direct compiler-based analysis
-    HoverInfo analyzeWithCompiler(const std::string& file_path, const Position& position);
+    // Run Cryo compiler to analyze file and extract semantic information
+    CompilerAnalysis runCompilerAnalysis(const std::string& file_path, const std::string& content);
     
-    // Extract symbol information from symbol table
-    std::optional<Cryo::Symbol*> findSymbolInSymbolTable(const Cryo::SymbolTable& symbol_table, const std::string& symbol_name);
-    
-    // Extract function signature from AST
-    std::optional<FunctionSignature> extractFunctionFromAST(const Cryo::ProgramNode* ast, const Position& position);
+    // Parse compiler output to extract symbols, functions, structs, etc.
+    CompilerAnalysis parseCompilerOutput(const std::string& compiler_output);
     
     // Fallback simple analysis when compiler analysis fails
     HoverInfo analyzeSimplePattern(const std::string& content, const Position& position);
+    
+    // Helper to find symbol at position from compiler analysis
+    std::optional<SymbolInfo> findSymbolAtPosition(const std::string& file_path, const Position& position);
+    
+    // Helper to extract function signature from analysis
+    std::optional<FunctionSignature> extractFunctionAtPosition(const std::string& file_path, const Position& position);
     
     // Simple analysis helpers
     std::string getWordAtPosition(const std::string& content, const Position& position);
