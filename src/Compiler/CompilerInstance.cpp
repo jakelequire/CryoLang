@@ -1106,10 +1106,27 @@ namespace Cryo
         {
             // Already processed in first pass, nothing to do
         }
-        // Handle variable declarations - skip, already processed in first pass
+        // Handle variable declarations - add to current scope
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Already processed in first pass, nothing to do
+            // Parse variable type from string annotation
+            Type *var_type = _ast_context->types().parse_type_from_string(var_decl->type_annotation());
+            
+            // Add variable to current scope
+            bool success = current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
+                                                       var_decl->location(), var_type, scope_name);
+            
+            if (!success && _debug_mode)
+            {
+                std::cout << "[CompilerInstance] Warning: Variable '" << var_decl->name() 
+                         << "' already declared in scope '" << scope_name << "'" << std::endl;
+            }
+            else if (_debug_mode)
+            {
+                std::cout << "[CompilerInstance] Added variable '" << var_decl->name() 
+                         << "' to scope '" << scope_name << "' with type '" 
+                         << var_type->to_string() << "'" << std::endl;
+            }
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
