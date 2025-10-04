@@ -1,5 +1,6 @@
 #include "../../include/JsonParser.hpp"
 #include <sstream>
+#include <cmath>
 
 namespace Cryo {
 namespace LSP {
@@ -10,8 +11,14 @@ std::string JsonValue::toString() const {
             return "null";
         case Type::Bool:
             return boolValue_ ? "true" : "false";
-        case Type::Number:
-            return std::to_string(numberValue_);
+        case Type::Number: {
+            // Check if it's a whole number and format accordingly
+            if (numberValue_ == std::floor(numberValue_)) {
+                return std::to_string(static_cast<long long>(numberValue_));
+            } else {
+                return std::to_string(numberValue_);
+            }
+        }
         case Type::String:
             return "\"" + stringValue_ + "\"";
         case Type::Array: {

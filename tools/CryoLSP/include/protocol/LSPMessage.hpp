@@ -27,12 +27,12 @@ struct LSPMessage {
 
 // JSON-RPC Request
 struct Request : public LSPMessage {
-    std::string id;
+    JsonValue id;  // Changed from string to JsonValue to preserve type
     std::string method;
     JsonValue params;
     
     Request() = default;
-    Request(const std::string& id, const std::string& method, const JsonValue& params = JsonValue{})
+    Request(const JsonValue& id, const std::string& method, const JsonValue& params = JsonValue{})
         : id(id), method(method), params(params) {}
     
     MessageType getType() const override { return MessageType::Request; }
@@ -40,7 +40,7 @@ struct Request : public LSPMessage {
     JsonValue toJson() const override {
         JsonObject obj;
         obj["jsonrpc"] = JsonValue(jsonrpc);
-        obj["id"] = JsonValue(id);
+        obj["id"] = id;  // Preserve original type
         obj["method"] = JsonValue(method);
         if (!params.isNull()) {
             obj["params"] = params;
@@ -71,14 +71,14 @@ struct Request : public LSPMessage {
 
 // JSON-RPC Response
 struct Response : public LSPMessage {
-    std::string id;
+    JsonValue id;  // Changed from string to JsonValue to preserve type
     std::optional<JsonValue> result;
     std::optional<JsonValue> error;
     
     Response() = default;
-    Response(const std::string& id, const JsonValue& result)
+    Response(const JsonValue& id, const JsonValue& result)
         : id(id), result(result) {}
-    Response(const std::string& id, const JsonValue& error, bool)
+    Response(const JsonValue& id, const JsonValue& error, bool)
         : id(id), error(error) {}
     
     MessageType getType() const override { return MessageType::Response; }
@@ -86,7 +86,7 @@ struct Response : public LSPMessage {
     JsonValue toJson() const override {
         JsonObject obj;
         obj["jsonrpc"] = JsonValue(jsonrpc);
-        obj["id"] = JsonValue(id);
+        obj["id"] = id;  // Preserve original type
         
         if (result.has_value()) {
             obj["result"] = result.value();

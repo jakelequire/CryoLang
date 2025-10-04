@@ -14,15 +14,8 @@ std::optional<Request> Request::fromJson(const JsonValue& json) {
     Request req;
     req.jsonrpc = obj.at("jsonrpc").asString();
     
-    // Handle both string and numeric IDs
-    auto idValue = obj.at("id");
-    if (idValue.isString()) {
-        req.id = idValue.asString();
-    } else if (idValue.isNumber()) {
-        req.id = std::to_string(static_cast<int>(idValue.asNumber()));
-    } else {
-        return std::nullopt; // Invalid ID type
-    }
+    // Preserve the original ID type and value
+    req.id = obj.at("id");
     
     req.method = obj.at("method").asString();
     

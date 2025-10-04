@@ -12,13 +12,13 @@ std::optional<std::string> ProtocolHandler::processMessage(const std::string& me
         auto json = JsonParser::parse(messageJson);
         if (!json.has_value()) {
             logger.error("LSP", "Failed to parse JSON message: " + messageJson);
-            return createErrorResponse("", LSPErrorCode::ParseError, "Parse error");
+            return createErrorResponse(JsonValue(std::string("")), LSPErrorCode::ParseError, "Parse error");
         }
         
         auto jsonValue = json.value();
         if (!jsonValue.isObject()) {
             logger.error("LSP", "Message is not a JSON object");
-            return createErrorResponse("", LSPErrorCode::InvalidRequest, "Invalid request");
+            return createErrorResponse(JsonValue(std::string("")), LSPErrorCode::InvalidRequest, "Invalid request");
         }
         
         auto obj = jsonValue.asObject();
@@ -40,11 +40,11 @@ std::optional<std::string> ProtocolHandler::processMessage(const std::string& me
             logger.debug("LSP", "Attempting to parse as request...");
             auto request = Request::fromJson(jsonValue);
             if (request.has_value()) {
-                logger.info("LSP", "Processing request: " + request->method + " (id: " + request->id + ")");
+                logger.info("LSP", "Processing request: " + request->method + " (id: " + request->id.toString() + ")");
                 return handleRequest(request.value());
             } else {
                 logger.error("LSP", "Invalid request format - failed Request::fromJson");
-                return createErrorResponse("", LSPErrorCode::InvalidRequest, "Invalid request");
+                return createErrorResponse(JsonValue(std::string("")), LSPErrorCode::InvalidRequest, "Invalid request");
             }
         }
         // Check if it's a notification (no 'id' field but has 'method')
@@ -67,7 +67,7 @@ std::optional<std::string> ProtocolHandler::processMessage(const std::string& me
         
     } catch (const std::exception& e) {
         logger.error("LSP", "Exception while processing message: " + std::string(e.what()));
-        return createErrorResponse("", LSPErrorCode::InternalError, "Internal error");
+        return createErrorResponse(JsonValue(std::string("")), LSPErrorCode::InternalError, "Internal error");
     }
 }
 
@@ -106,12 +106,12 @@ void ProtocolHandler::handleNotification(const Notification& notification) {
     }
 }
 
-std::string ProtocolHandler::createSuccessResponse(const std::string& id, const JsonValue& result) {
+std::string ProtocolHandler::createSuccessResponse(const JsonValue& id, const JsonValue& result) {
     Response response(id, result);
     return response.toJson().toString();
 }
 
-std::string ProtocolHandler::createErrorResponse(const std::string& id, LSPErrorCode code, const std::string& message) {
+std::string ProtocolHandler::createErrorResponse(const JsonValue& id, LSPErrorCode code, const std::string& message) {
     LSPError error(code, message);
     Response response(id, error.toJson(), true);
     return response.toJson().toString();

@@ -56,6 +56,11 @@ endif
 # Compile LSP source files
 $(LSP_OBJ_DIR)/%.o: $(LSP_SRC_DIR)/%.cpp | $(LSP_OBJ_DIR)
 	@echo "Compiling LSP: $<"
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(dir $@)" mkdir "$(subst /,\,$(dir $@))"
+else
+	@mkdir -p $(dir $@)
+endif
 	$(CXX) $(LSP_CXXFLAGS) -c $< -o $@
 
 # Link the LSP executable

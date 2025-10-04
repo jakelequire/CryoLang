@@ -25,7 +25,10 @@ LanguageServer::LanguageServer(std::unique_ptr<Transport> transport)
 void LanguageServer::setupHandlers() {
     // Register basic handlers
     protocolHandler->registerRequestHandler("initialize", 
-        [this](const std::string& id, const std::string& method, const JsonValue& params) {
+        [this](const JsonValue& id, const std::string& method, const JsonValue& params) {
+            logger.info("LSP", "=== PROCESSING INITIALIZE REQUEST ===");
+            logger.debug("LSP", "Initialize params received (large payload)");
+            
             // Basic initialize response
             JsonObject caps;
             caps["textDocumentSync"] = JsonValue(1); // Full sync
@@ -35,18 +38,22 @@ void LanguageServer::setupHandlers() {
             result["capabilities"] = JsonValue(caps);
             
             state = ServerState::Initialized;
+            logger.info("LSP", "Server initialized and ready for requests (no initialized notification required)");
+            logger.info("LSP", "Capabilities configured: textDocumentSync=1, hoverProvider=true");
             return JsonValue(result);
         });
     
     protocolHandler->registerRequestHandler("shutdown", 
-        [this](const std::string& id, const std::string& method, const JsonValue& params) {
+        [this](const JsonValue& id, const std::string& method, const JsonValue& params) {
             state = ServerState::Shutdown;
             return JsonValue(); // null result
         });
     
     protocolHandler->registerNotificationHandler("initialized", 
         [this](const std::string& method, const JsonValue& params) {
-            logger.info("LSP", "Server initialized");
+            logger.info("LSP", "=== INITIALIZED NOTIFICATION RECEIVED ===");
+            logger.info("LSP", "Server is now fully ready for all requests");
+            logger.info("LSP", "LSP handshake completed successfully");
         });
     
     protocolHandler->registerNotificationHandler("exit", 
@@ -56,13 +63,15 @@ void LanguageServer::setupHandlers() {
     
     // Add textDocument/hover handler
     protocolHandler->registerRequestHandler("textDocument/hover", 
-        [this](const std::string& id, const std::string& method, const JsonValue& params) {
+        [this](const JsonValue& id, const std::string& method, const JsonValue& params) {
+            logger.info("LSP", "=== HOVER REQUEST RECEIVED (bypassing initialized check) ===");
             return handleHover(params);
         });
     
     // Add document lifecycle handlers
     protocolHandler->registerNotificationHandler("textDocument/didOpen", 
         [this](const std::string& method, const JsonValue& params) {
+            logger.info("LSP", "=== DID OPEN NOTIFICATION RECEIVED ===");
             handleDidOpen(params);
         });
     
@@ -80,9 +89,11 @@ void LanguageServer::setupHandlers() {
 bool LanguageServer::run() {
     logger.info("LSP", "Starting language server main loop");
     
+    int iteration = 0;
     while (state != ServerState::Shutdown) {
         try {
-            logger.debug("LSP", "Main loop iteration - checking transport active: " + std::string(transport->is_active() ? "true" : "false"));
+            iteration++;
+            logger.debug("LSP", "Main loop iteration #" + std::to_string(iteration) + " - state: " + std::to_string(static_cast<int>(state)) + ", transport active: " + (transport->is_active() ? "true" : "false"));
             
             // Read message from transport
             logger.debug("LSP", "Attempting to read message from transport...");
@@ -102,17 +113,17 @@ bool LanguageServer::run() {
                 }
             }
             
-            logger.info("LSP", "Received message, processing...");
+            logger.info("LSP", "Received message #" + std::to_string(iteration) + ", processing...");
             logger.debug("LSP", "Message preview: " + message->substr(0, std::min(200, static_cast<int>(message->length()))));
             processMessage(message.value());
             
         } catch (const std::exception& e) {
-            logger.error("LSP", "Exception in main loop: " + std::string(e.what()));
+            logger.error("LSP", "Exception in main loop iteration #" + std::to_string(iteration) + ": " + std::string(e.what()));
             // Continue running unless it's a critical error
         }
     }
     
-    logger.info("LSP", "Language server shutting down");
+    logger.info("LSP", "Language server shutting down after " + std::to_string(iteration) + " iterations");
     return true;
 }
 
