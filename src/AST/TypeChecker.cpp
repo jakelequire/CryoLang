@@ -4,6 +4,8 @@
 #include <sstream>
 #include <algorithm>
 #include <unordered_set>
+#include <string>
+#include <string_view>
 
 namespace Cryo
 {
@@ -960,12 +962,12 @@ namespace Cryo
         int copied_count = 0;
         const auto &namespaces = main_symbol_table.get_namespaces();
         auto runtime_ns_it = namespaces.find("std::Runtime");
-        
+
         if (runtime_ns_it != namespaces.end())
         {
             const auto &runtime_symbols = runtime_ns_it->second;
             std::cout << "DEBUG: Found std::Runtime namespace with " << runtime_symbols.size() << " symbols" << std::endl;
-            
+
             // Only load symbols that have valid type information to avoid crashes
             for (const auto &[name, symbol] : runtime_symbols)
             {
@@ -991,9 +993,9 @@ namespace Cryo
                 std::cout << "  - " << ns_name << " (" << symbols.size() << " symbols)" << std::endl;
             }
         }
-        
+
         std::cout << "Copied " << copied_count << " runtime symbols to TypeChecker symbol table" << std::endl;
-        
+
         // Note: Runtime functions without type information will be resolved via namespace lookup
         // during function call analysis. This is actually the preferred approach since it allows
         // the type system to resolve the correct function signature at call sites.
@@ -1490,7 +1492,7 @@ namespace Cryo
                     }
                 }
             }
-            
+
             report_undefined_symbol(node.location(), name);
             node.set_type(_type_context.get_unknown_type()->to_string());
         }
@@ -1764,7 +1766,7 @@ namespace Cryo
             if (node.callee()->kind() == NodeKind::ScopeResolution)
             {
                 std::string callee_type_str = node.callee()->type().value();
-                
+
                 // Check if this is a function signature (contains "->")
                 if (callee_type_str.find(" -> ") != std::string::npos)
                 {
@@ -2911,7 +2913,7 @@ namespace Cryo
             return;
         }
 
-        // If not found or has null type, this is a fallback for cases where 
+        // If not found or has null type, this is a fallback for cases where
         // populate_symbol_table didn't handle it properly
         if (existing_symbol)
         {
@@ -3311,36 +3313,59 @@ namespace Cryo
         case TokenKind::TK_NUMERIC_CONSTANT:
         {
             const std::string &value = node.value();
-            
+
             // Check for type suffixes first
-            if (value.ends_with("u8")) {
+            if (value.ends_with("u8"))
+            {
                 return _type_context.get_u8_type();
-            } else if (value.ends_with("u16")) {
+            }
+            else if (value.ends_with("u16"))
+            {
                 return _type_context.get_u16_type();
-            } else if (value.ends_with("u32")) {
+            }
+            else if (value.ends_with("u32"))
+            {
                 return _type_context.get_u32_type();
-            } else if (value.ends_with("u64")) {
+            }
+            else if (value.ends_with("u64"))
+            {
                 return _type_context.get_u64_type();
-            } else if (value.ends_with("i8")) {
+            }
+            else if (value.ends_with("i8"))
+            {
                 return _type_context.get_i8_type();
-            } else if (value.ends_with("i16")) {
+            }
+            else if (value.ends_with("i16"))
+            {
                 return _type_context.get_i16_type();
-            } else if (value.ends_with("i32")) {
+            }
+            else if (value.ends_with("i32"))
+            {
                 return _type_context.get_i32_type();
-            } else if (value.ends_with("i64")) {
+            }
+            else if (value.ends_with("i64"))
+            {
                 return _type_context.get_i64_type();
-            } else if (value.ends_with("f32")) {
+            }
+            else if (value.ends_with("f32"))
+            {
                 return _type_context.get_f32_type();
-            } else if (value.ends_with("f64")) {
+            }
+            else if (value.ends_with("f64"))
+            {
                 return _type_context.get_f64_type();
-            } else if (value.ends_with("usize")) {
+            }
+            else if (value.ends_with("usize"))
+            {
                 // Map usize to u64 for now
                 return _type_context.get_u64_type();
-            } else if (value.ends_with("isize")) {
+            }
+            else if (value.ends_with("isize"))
+            {
                 // Map isize to i64 for now
                 return _type_context.get_i64_type();
             }
-            
+
             // No suffix - use heuristic based on content
             if (value.find('.') != std::string::npos)
             {
