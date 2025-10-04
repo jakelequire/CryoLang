@@ -65,11 +65,13 @@ class JsonParser {
 public:
     static std::optional<JsonValue> parse(const std::string& json);
     static std::string serialize(const JsonValue& value);
+    static std::string escapeJsonString(const std::string& str);
 
 private:
     static std::optional<JsonValue> parseObject(const std::string& json);
     static std::optional<JsonValue> parseArray(const std::string& json);
     static size_t findTopLevelColon(const std::string& str);
+    static std::string unescapeString(const std::string& str);
 };
 
 } // namespace LSP

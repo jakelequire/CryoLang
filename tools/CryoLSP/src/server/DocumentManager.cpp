@@ -72,10 +72,13 @@ std::optional<TextDocumentItem> DocumentManager::getDocument(const std::string& 
 }
 
 std::optional<std::string> DocumentManager::getDocumentText(const std::string& uri) const {
+    Logger& logger = Logger::instance();
     auto doc = getDocument(uri);
     if (doc.has_value()) {
+        logger.debug("DocumentManager", "Retrieved document text for " + uri + ", length: " + std::to_string(doc->text.length()));
         return doc->text;
     }
+    logger.debug("DocumentManager", "No document found for URI: " + uri);
     return std::nullopt;
 }
 
@@ -86,7 +89,17 @@ std::optional<HoverResult> DocumentManager::getHoverInfo(const std::string& uri,
     auto text = getDocumentText(uri);
     if (!text.has_value()) {
         logger.debug("DocumentManager", "No document found for hover request");
-        return std::nullopt;
+        
+        // Provide a basic hover response even without document text
+        logger.info("DocumentManager", "Providing basic hover info without document text");
+        std::string basicHover = "```cryo\n// Cryo Language Symbol\n// Document not loaded - showing basic info\n```\n\n**Position**: Line " + 
+                                std::to_string(position.line) + ", Character " + std::to_string(position.character) +
+                                "\n\n**File**: " + uri;
+        
+        Position start = {position.line, position.character};
+        Position end = {position.line, position.character + 1};
+        
+        return HoverResult(basicHover, start, end);
     }
     
     // Try to get hover info from CryoAnalyzer first
@@ -123,6 +136,19 @@ std::optional<HoverResult> DocumentManager::getHoverInfo(const std::string& uri,
     
     logger.debug("DocumentManager", "Word at position: '" + word + "'");
     
+    // Check if this is our debugging fallback word
+    if (word.find("hover_fallback_") == 0) {
+        std::string debugContent = "```cryo\n// Debug Hover Information\n```\n\n";
+        debugContent += "**Position**: Line " + std::to_string(position.line) + ", Character " + std::to_string(position.character) + "\n\n";
+        debugContent += "**Issue**: Line parsing failed - document has content but line splitting isn't working correctly.\n\n";
+        debugContent += "**Word**: " + word;
+        
+        Position start = {position.line, position.character};
+        Position end = {position.line, position.character + 1};
+        
+        return HoverResult(debugContent, start, end);
+    }
+    
     std::string hoverContent = getHoverContentForSymbol(word, uri);
     if (hoverContent.empty()) {
         return std::nullopt;
@@ -135,31 +161,71 @@ std::optional<HoverResult> DocumentManager::getHoverInfo(const std::string& uri,
 }
 
 std::string DocumentManager::getWordAtPosition(const std::string& text, const Position& position) {
-    // Split text into lines
-    std::vector<std::string> lines;
-    std::string current_line;
+    Logger& logger = Logger::instance();
     
-    for (char c : text) {
+    // Debug: Check first 100 characters to see line endings
+    std::string sample = text.substr(0, std::min(100, static_cast<int>(text.length())));
+    logger.debug("DocumentManager", "Text sample (first 100 chars): '" + sample + "'");
+    
+    // Debug: Show character codes for the first few characters
+    std::string charCodes = "";
+    for (size_t i = 0; i < std::min(20, static_cast<int>(text.length())); ++i) {
+        charCodes += std::to_string((unsigned char)text[i]) + " ";
+    }
+    logger.debug("DocumentManager", "First 20 character codes: " + charCodes);
+    
+    // Count line endings to debug
+    int cr_count = 0, lf_count = 0, crlf_count = 0;
+    for (size_t i = 0; i < text.length(); ++i) {
+        char c = text[i];
+        if (c == '\r') {
+            cr_count++;
+            // Check if this is part of \r\n
+            if (i + 1 < text.length() && text[i + 1] == '\n') {
+                crlf_count++;
+            }
+        }
         if (c == '\n') {
-            lines.push_back(current_line);
-            current_line.clear();
-        } else if (c != '\r') {
-            current_line += c;
+            lf_count++;
         }
     }
-    if (!current_line.empty()) {
-        lines.push_back(current_line);
+    logger.debug("DocumentManager", "Line ending analysis: CR=" + std::to_string(cr_count) + 
+                 ", LF=" + std::to_string(lf_count) + ", CRLF=" + std::to_string(crlf_count));
+    
+    // Split text into lines - handle both \r\n and \n line endings
+    std::vector<std::string> lines;
+    std::istringstream stream(text);
+    std::string currentLine;
+    
+    // Use getline which properly handles both \n and \r\n
+    while (std::getline(stream, currentLine)) {
+        lines.push_back(currentLine);
     }
+    
+    // If text ends with a newline, add empty line
+    if (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+        lines.push_back("");
+    }
+    
+    logger.debug("DocumentManager", "Word detection: position " + std::to_string(position.line) + ":" + std::to_string(position.character) + 
+                 ", total lines: " + std::to_string(lines.size()) + ", text length: " + std::to_string(text.length()));
     
     // Check bounds
     if (position.line < 0 || position.line >= static_cast<int>(lines.size())) {
-        return "";
+        logger.debug("DocumentManager", "Line out of bounds: " + std::to_string(position.line) + " >= " + std::to_string(lines.size()));
+        
+        // For debugging: provide a basic response even when line is out of bounds
+        logger.info("DocumentManager", "Providing fallback hover for line " + std::to_string(position.line));
+        return "hover_fallback_line_" + std::to_string(position.line) + "_char_" + std::to_string(position.character);
     }
     
     const std::string& line = lines[position.line];
     if (position.character < 0 || position.character >= static_cast<int>(line.length())) {
+        logger.debug("DocumentManager", "Character out of bounds: " + std::to_string(position.character) + " >= " + std::to_string(line.length()));
         return "";
     }
+    
+    logger.debug("DocumentManager", "Line content preview: '" + line.substr(0, std::min(50, static_cast<int>(line.length()))) + "'");
     
     // Find word boundaries
     int start = position.character;
@@ -187,11 +253,15 @@ Position DocumentManager::findWordStart(const std::string& text, const Position&
     std::vector<std::string> lines;
     std::string current_line;
     
-    for (char c : text) {
+    for (size_t i = 0; i < text.length(); ++i) {
+        char c = text[i];
         if (c == '\n') {
             lines.push_back(current_line);
             current_line.clear();
-        } else if (c != '\r') {
+        } else if (c == '\r') {
+            // Skip \r characters
+            continue;
+        } else {
             current_line += c;
         }
     }
@@ -221,11 +291,15 @@ Position DocumentManager::findWordEnd(const std::string& text, const Position& p
     std::vector<std::string> lines;
     std::string current_line;
     
-    for (char c : text) {
+    for (size_t i = 0; i < text.length(); ++i) {
+        char c = text[i];
         if (c == '\n') {
             lines.push_back(current_line);
             current_line.clear();
-        } else if (c != '\r') {
+        } else if (c == '\r') {
+            // Skip \r characters
+            continue;
+        } else {
             current_line += c;
         }
     }
