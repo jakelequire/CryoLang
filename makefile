@@ -94,6 +94,11 @@ endif
 # Combine all object files
 ALL_OBJS := $(C_OBJS) $(CPP_OBJS)
 
+# ---------------------------------------------
+# Compiler library object files (exclude main.cpp)
+LIB_OBJS := $(filter-out $(OBJ_DIR)main.o,$(ALL_OBJS))
+COMPILER_LIB := $(BIN_DIR)libcryo-compiler.a
+
 # Add these directory rules
 $(BIN_DIR) $(OBJ_DIR):
 ifeq ($(OS), Windows_NT)
@@ -135,6 +140,17 @@ else
 endif
 	$(CXX) $(CXXFLAGS) $(ALL_OBJS) -o $@ $(LDFLAGS)
 
+# Compiler library target (for LSP integration)
+$(COMPILER_LIB): $(LIB_OBJS)
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$(dir $@))" $(MKDIR) "$(subst /,\,$(dir $@))"
+else
+	@$(MKDIR) $(dir $@)
+endif
+	@echo "Creating Cryo compiler library: $(COMPILER_LIB)"
+	ar rcs $@ $^
+	@echo "✓ Compiler library created successfully"
+
 # >>=======--------------------------------------------------=======<< #
 # >>=======                     Commands                     =======<< #
 # >>=======--------------------------------------------------=======<< #
@@ -147,10 +163,13 @@ BUILD_TIMER = ./scripts/build_timer.py
 # >>=======--------------------------------------------------=======<< #
 
 # Tools targets - delegate to individual tool makefiles
-.PHONY: tools lsp
+.PHONY: tools lsp compiler-lib
 tools: lsp
 
-lsp: $(MAIN_BIN)
+# Compiler library target for LSP integration
+compiler-lib: $(COMPILER_LIB)
+
+lsp: $(COMPILER_LIB)
 	@echo "Building CryoLSP..."
 	@$(MAKE) -C tools/CryoLSP
 

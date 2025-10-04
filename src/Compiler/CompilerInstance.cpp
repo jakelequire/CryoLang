@@ -196,6 +196,82 @@ namespace Cryo
         }
     }
 
+    bool CompilerInstance::compile_frontend_only(const std::string &source_file)
+    {
+        set_source_file(source_file);
+
+        // Create a file object and load it
+        auto file = make_file_from_path(source_file);
+        if (!file)
+        {
+            _diagnostic_manager->report_error(DiagnosticID::FileNotFound, DiagnosticCategory::System,
+                                              "Failed to create file object for: " + source_file,
+                                              SourceRange{}, source_file);
+            return false;
+        }
+
+        if (!file->load())
+        {
+            _diagnostic_manager->report_error(DiagnosticID::FileReadError, DiagnosticCategory::System,
+                                              "Failed to load source file: " + source_file,
+                                              SourceRange{}, source_file);
+            return false;
+        }
+
+        // Frontend-only parsing - stops before IR generation and codegen
+        reset_state();
+
+        try
+        {
+            // Store file information for diagnostics
+            std::string file_path = file->path();
+
+            // Phase 1: Create lexer
+            _lexer = std::make_unique<Lexer>(std::move(file));
+
+            // Phase 2: Create parser with lexer and AST context
+            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostic_manager.get(), file_path);
+
+            // Phase 3: Parse the program
+            if (!parse())
+            {
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Parser,
+                                                  "Parsing failed", SourceRange{}, file_path);
+                return false;
+            }
+
+            // Phase 4: Basic validation
+            if (!_ast_root)
+            {
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Parser,
+                                                  "No AST generated", SourceRange{}, file_path);
+                return false;
+            }
+
+            // Phase 5: Semantic analysis (including symbol table population)
+            if (!analyze())
+            {
+                std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
+                _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
+                                                  "Analysis failed in namespace '" + namespace_name + "'", SourceRange{}, file_path);
+                // For LSP, we continue even if analysis fails partially
+                // This allows hover to work even with some compilation errors
+            }
+
+            // Stop here - no IR generation or codegen for LSP
+            // Frontend-only compilation completed successfully
+
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
+                                              std::string("Frontend compilation exception: ") + e.what(),
+                                              SourceRange{}, _source_file);
+            return false;
+        }
+    }
+
     bool CompilerInstance::tokenize()
     {
         if (_source_file.empty())
@@ -282,7 +358,10 @@ namespace Cryo
 
     bool CompilerInstance::analyze()
     {
-        std::cout << "[CompilerInstance] Starting analysis phase..." << std::endl;
+        if (_debug_mode)
+        {
+            std::cout << "[CompilerInstance] Starting analysis phase..." << std::endl;
+        }
 
         if (!_ast_root)
         {
@@ -293,27 +372,45 @@ namespace Cryo
 
         try
         {
+        if (_debug_mode)
+        {
             std::cout << "[CompilerInstance] Phase 0: Symbol table population..." << std::endl;
+        }
             // Phase 0: Symbol table population (must happen before type checking)
             populate_symbol_table(_ast_root.get());
 
-            std::cout << "[CompilerInstance] Loading intrinsic symbols into type checker..." << std::endl;
+            if (_debug_mode)
+            {
+                std::cout << "[CompilerInstance] Loading intrinsic symbols into type checker..." << std::endl;
+            }
             // Load only newly added intrinsic symbols into type checker
             _type_checker->load_intrinsic_symbols(*_symbol_table);
 
-            std::cout << "[CompilerInstance] Loading runtime symbols into type checker..." << std::endl;
+            if (_debug_mode)
+            {
+                std::cout << "[CompilerInstance] Loading runtime symbols into type checker..." << std::endl;
+            }
             // Load runtime function symbols and make them available globally
             _type_checker->load_runtime_symbols(*_symbol_table);
 
-            std::cout << "[CompilerInstance] Loading user-defined symbols into type checker..." << std::endl;
+            if (_debug_mode)
+            {
+                std::cout << "[CompilerInstance] Loading user-defined symbols into type checker..." << std::endl;
+            }
             // Load user-defined function symbols that were registered during Pass 1
             _type_checker->load_user_symbols(*_symbol_table);
 
-            std::cout << "[CompilerInstance] Phase 1: Type checking..." << std::endl;
+            if (_debug_mode)
+            {
+                std::cout << "[CompilerInstance] Phase 1: Type checking..." << std::endl;
+            }
             // Phase 1: Type checking
             _type_checker->check_program(*_ast_root);
 
-            std::cout << "[CompilerInstance] Checking for type errors..." << std::endl;
+            if (_debug_mode)
+            {
+                std::cout << "[CompilerInstance] Checking for type errors..." << std::endl;
+            }
             if (_type_checker->has_errors())
             {
                 // Convert type errors to diagnostic manager errors
@@ -346,7 +443,10 @@ namespace Cryo
 
                 if (_debug_mode)
                 {
+                if (_debug_mode)
+                {
                     std::cout << "Type checking failed with " << _type_checker->error_count() << " errors." << std::endl;
+                }
                 }
                 return false;
             }
@@ -354,7 +454,10 @@ namespace Cryo
             // Phase 2: Monomorphization - Generate specialized versions of generic types
             if (_debug_mode)
             {
+            if (_debug_mode)
+            {
                 std::cout << "Starting monomorphization pass..." << std::endl;
+            }
             }
 
             const auto &required_instantiations = _type_checker->get_required_instantiations();
@@ -370,14 +473,20 @@ namespace Cryo
 
                 if (_debug_mode)
                 {
+                if (_debug_mode)
+                {
                     std::cout << "Monomorphization completed successfully." << std::endl;
+                }
                 }
             }
             else
             {
                 if (_debug_mode)
                 {
+                if (_debug_mode)
+                {
                     std::cout << "No generic instantiations required, skipping monomorphization." << std::endl;
+                }
                 }
             }
 
@@ -388,7 +497,10 @@ namespace Cryo
 
             if (_debug_mode)
             {
+            if (_debug_mode)
+            {
                 std::cout << "Type checking completed successfully." << std::endl;
+            }
             }
 
             return true;
