@@ -175,15 +175,25 @@ export function activate(context: vscode.ExtensionContext) {
             documentSelector: [
                 { scheme: 'file', language: 'cryo' }
             ],
-            // Disable automatic restart features
+            // Disable automatic restart features but allow normal operation
             connectionOptions: {
                 maxRestartCount: 0, // Disable auto-restart completely
                 cancellationStrategy: undefined
             },
-            // Disable error recovery
+            // Allow normal error recovery for hover and other features
             errorHandler: {
-                error: () => ({ action: ErrorAction.Shutdown }),
-                closed: () => ({ action: CloseAction.DoNotRestart })
+                error: (error, message, count) => {
+                    LOG.error('LanguageServer', `LSP Error (count: ${count}): ${error}, message: ${message}`);
+                    // Only shutdown on repeated errors (more than 3)
+                    if (count && count > 3) {
+                        return { action: ErrorAction.Shutdown };
+                    }
+                    return { action: ErrorAction.Continue };
+                },
+                closed: () => {
+                    LOG.info('LanguageServer', 'LSP connection closed');
+                    return { action: CloseAction.DoNotRestart };
+                }
             }
         };
 
@@ -220,69 +230,9 @@ export function activate(context: vscode.ExtensionContext) {
             // Start client and handle initialization properly
             LOG.info('LanguageServer', 'Client.start() promise created, starting asynchronously...');
             
-            // Wait for client to be ready and then manually trigger initialized if needed
-            setTimeout(async () => {
-                if (client && client.state === 3) {
-                    LOG.info('LanguageServer', 'Client is running, checking if server needs initialized notification...');
-                    
-                    try {
-                        // Try to send a simple hover request first to test if LSP is ready
-                        LOG.debug('LanguageServer', 'Testing LSP connection with a simple request...');
-                        const testResult = await client.sendRequest('textDocument/hover', {
-                            textDocument: { uri: 'file:///test' },
-                            position: { line: 0, character: 0 }
-                        });
-                        LOG.info('LanguageServer', 'LSP connection test successful, server is ready');
-                    } catch (testError) {
-                        LOG.error('LanguageServer', 'LSP connection test failed: ' + String(testError));
-                        
-                        // If the test fails, try sending initialized notification
-                        LOG.info('LanguageServer', 'Attempting to send initialized notification...');
-                        try {
-                            await client.sendNotification('initialized', {});
-                            LOG.info('LanguageServer', 'Initialized notification sent successfully');
-                            
-                            // Test again after sending initialized
-                            setTimeout(async () => {
-                                if (client) {
-                                    try {
-                                        const retestResult = await client.sendRequest('textDocument/hover', {
-                                            textDocument: { uri: 'file:///test' },
-                                            position: { line: 0, character: 0 }
-                                        });
-                                        LOG.info('LanguageServer', 'Post-initialized test successful');
-                                    } catch (retestError) {
-                                        LOG.error('LanguageServer', 'Post-initialized test still fails: ' + String(retestError));
-                                    }
-                                }
-                            }, 500);
-                            
-                        } catch (initError) {
-                            LOG.error('LanguageServer', 'Failed to send initialized notification: ' + String(initError));
-                        }
-                    }
-                } else {
-                    LOG.error('LanguageServer', `Client not ready - state: ${client?.state || 'undefined'}`);
-                }
-            }, 2000); // Wait 2 seconds for client to be fully ready
-            
             // Start the client in background
             client.start().then(() => {
                 LOG.info('LanguageServer', 'Client.start() completed successfully - LSP handshake complete');
-                
-                // Explicitly send initialized notification after a short delay
-                setTimeout(async () => {
-                    if (client && client.state === 3) {
-                        try {
-                            LOG.info('LanguageServer', 'Sending initialized notification explicitly...');
-                            await client.sendNotification('initialized', {});
-                            LOG.info('LanguageServer', 'Initialized notification sent successfully');
-                        } catch (error) {
-                            LOG.error('LanguageServer', 'Failed to send initialized notification: ' + String(error));
-                        }
-                    }
-                }, 100);
-                
             }).catch(error => {
                 LOG.error('LanguageServer', 'Client.start() failed: ' + String(error));
             });

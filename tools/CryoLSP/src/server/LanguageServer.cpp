@@ -247,11 +247,47 @@ void LanguageServer::handleDidOpen(const JsonValue& params) {
         
         auto textDoc = obj.at("textDocument").asObject();
         
+        // Debug: Log all available fields
+        logger.debug("LSP", "textDocument fields available:");
+        for (const auto& pair : textDoc) {
+            logger.debug("LSP", "  Field: " + pair.first + " (type: " + 
+                        (pair.second.isString() ? "string" : 
+                         pair.second.isNumber() ? "number" : 
+                         pair.second.isObject() ? "object" : "other") + ")");
+        }
+        
+        // Check for each field individually to see which one is missing
+        bool hasUri = textDoc.count("uri");
+        bool hasLanguageId = textDoc.count("languageId");  
+        bool hasVersion = textDoc.count("version");
+        bool hasText = textDoc.count("text");
+        
+        logger.debug("LSP", std::string("Field check: uri=") + (hasUri ? "yes" : "no") + 
+                            ", languageId=" + (hasLanguageId ? "yes" : "no") +
+                            ", version=" + (hasVersion ? "yes" : "no") +
+                            ", text=" + (hasText ? "yes" : "no"));
+        
+        // Use safer key checking to avoid unordered_map::at exceptions
+        if (!hasUri || !hasLanguageId || !hasVersion) {
+            logger.error("LSP", "Missing required fields in textDocument (uri, languageId, version)");
+            return;
+        }
+        
         std::string uri = textDoc.at("uri").asString();
         std::string languageId = textDoc.at("languageId").asString();
         int version = static_cast<int>(textDoc.at("version").asNumber());
-        std::string text = textDoc.at("text").asString();
         
+        // Get text if available, otherwise use empty string as fallback
+        std::string text = "";
+        if (hasText) {
+            text = textDoc.at("text").asString();
+        } else {
+            logger.info("LSP", "Text field missing from didOpen, using empty string");
+        }
+        
+        logger.info("LSP", "Document opened: " + uri + " (language: " + languageId + 
+                          ", version: " + std::to_string(version) + 
+                          ", text length: " + std::to_string(text.length()) + ")");
         documentManager->didOpen(uri, languageId, version, text);
         
     } catch (const std::exception& e) {
