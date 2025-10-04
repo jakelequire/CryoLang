@@ -187,7 +187,11 @@ namespace Cryo
             }
 
             // Force immediate sync
+#ifdef _WIN32
+            _commit(_fileno(stdout));
+#else
             fsync(STDOUT_FILENO);
+#endif
 
             Logger::instance().debug("Transport", "Writing header: Content-Length: " + std::to_string(content_length));
 
