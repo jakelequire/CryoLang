@@ -110,9 +110,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Try multiple possible paths for the LSP server executable
     const possiblePaths = [
-        path.join(context.extensionPath, '..', '..', '..', 'bin', 'cryo-lsp.exe'), // Development
-        path.join(context.extensionPath, 'bin', 'cryo-lsp.exe'), // Bundled
-        'C:\\Programming\\apps\\CryoLang\\bin\\cryo-lsp.exe', // Absolute path
+        path.join(context.extensionPath, '..', '..', '..', 'bin', 'test-stdio.exe'), // Development
+        path.join(context.extensionPath, 'bin', 'test-stdio.exe'), // Bundled
+        'C:\\Programming\\apps\\CryoLang\\bin\\test-stdio.exe', // Absolute path
     ];
     
     let serverCommand = '';
@@ -214,15 +214,106 @@ export function activate(context: vscode.ExtensionContext) {
         client.onDidChangeState((event) => {
             LOG.debug('LanguageServer', `Client state changed from ${event.oldState} to ${event.newState}`);
         });
+        
+        // Show the output channel to make it visible
+        client.outputChannel.show();
+        client.outputChannel.appendLine('=== Cryo Language Server Starting ===');
 
         try {
             // Start the client - with timeout to prevent hanging
             LOG.info('LanguageServer', 'Starting Cryo Language Client...');
             
-            // Wait for client to start properly - no timeout
-            LOG.info('LanguageServer', 'Client.start() promise created, awaiting...');
-            await client.start();
-            LOG.info('LanguageServer', 'Client.start() completed successfully - LSP handshake complete');
+            // Start client and handle initialization properly
+            LOG.info('LanguageServer', 'Client.start() promise created, starting asynchronously...');
+            
+            // Wait for client to be ready and then manually trigger initialized if needed
+            setTimeout(async () => {
+                if (client && client.state === 3) {
+                    LOG.info('LanguageServer', 'Client is running, checking if server needs initialized notification...');
+                    
+                    try {
+                        // Try to send a simple hover request first to test if LSP is ready
+                        LOG.debug('LanguageServer', 'Testing LSP connection with a simple request...');
+                        const testResult = await client.sendRequest('textDocument/hover', {
+                            textDocument: { uri: 'file:///test' },
+                            position: { line: 0, character: 0 }
+                        });
+                        LOG.info('LanguageServer', 'LSP connection test successful, server is ready');
+                    } catch (testError) {
+                        LOG.error('LanguageServer', 'LSP connection test failed: ' + String(testError));
+                        
+                        // If the test fails, try sending initialized notification
+                        LOG.info('LanguageServer', 'Attempting to send initialized notification...');
+                        try {
+                            await client.sendNotification('initialized', {});
+                            LOG.info('LanguageServer', 'Initialized notification sent successfully');
+                            
+                            // Test again after sending initialized
+                            setTimeout(async () => {
+                                if (client) {
+                                    try {
+                                        const retestResult = await client.sendRequest('textDocument/hover', {
+                                            textDocument: { uri: 'file:///test' },
+                                            position: { line: 0, character: 0 }
+                                        });
+                                        LOG.info('LanguageServer', 'Post-initialized test successful');
+                                    } catch (retestError) {
+                                        LOG.error('LanguageServer', 'Post-initialized test still fails: ' + String(retestError));
+                                    }
+                                }
+                            }, 500);
+                            
+                        } catch (initError) {
+                            LOG.error('LanguageServer', 'Failed to send initialized notification: ' + String(initError));
+                        }
+                    }
+                } else {
+                    LOG.error('LanguageServer', `Client not ready - state: ${client?.state || 'undefined'}`);
+                }
+            }, 2000); // Wait 2 seconds for client to be fully ready
+            
+            // Start the client in background
+            client.start().then(() => {
+                LOG.info('LanguageServer', 'Client.start() completed successfully - LSP handshake complete');
+            }).catch(error => {
+                LOG.error('LanguageServer', 'Client.start() failed: ' + String(error));
+            });
+            
+            // Register hover provider immediately - don't wait for client.start()
+            LOG.info('Extension', 'Registering hover provider immediately...');
+            const hoverProvider = vscode.languages.registerHoverProvider(
+                { scheme: 'file', language: 'cryo' },
+                {
+                    provideHover: async (document, position, token) => {
+                        LOG.debug('Extension', `Hover request at ${document.uri.toString()} line ${position.line} char ${position.character}`);
+                        
+                        // Check if client is ready
+                        if (client && client.state === 3) { // Running state
+                            try {
+                                LOG.debug('Extension', 'Client is running, sending hover request to LSP...');
+                                const result: any = await client.sendRequest('textDocument/hover', {
+                                    textDocument: { uri: document.uri.toString() },
+                                    position: { line: position.line, character: position.character }
+                                });
+                                
+                                LOG.debug('Extension', `Hover response: ${JSON.stringify(result)}`);
+                                
+                                if (result && result.contents) {
+                                    return new vscode.Hover(result.contents);
+                                }
+                            } catch (error) {
+                                LOG.error('Extension', `Hover request failed: ${error}`);
+                            }
+                        } else {
+                            LOG.debug('Extension', `Client not ready for hover request, state: ${client?.state || 'undefined'}`);
+                        }
+                        return null;
+                    }
+                }
+            );
+            
+            context.subscriptions.push(hoverProvider);
+            LOG.info('Extension', 'Hover provider registered successfully');
             
             LOG.info('LanguageServer', 'Cryo Language Server connection established');
             
@@ -234,16 +325,8 @@ export function activate(context: vscode.ExtensionContext) {
             // Client started successfully
             LOG.info('LanguageServer', 'Language client connected to LSP server');
             
-            // Note: Hover functionality is handled entirely by the LSP server
-            // The LanguageClient automatically registers hover provider capabilities
-            
-            // Note: Hover functionality is handled entirely by the LSP server
-            // No client-side hover provider needed
-            
             vscode.window.showInformationMessage('Cryo Language Server started');
             
-            // Give the server a moment to fully initialize
-            await new Promise(resolve => setTimeout(resolve, 1000));
             LOG.info('LanguageServer', 'Language client initialization complete');
             
             // Debug: Check if any .cryo files are currently open
