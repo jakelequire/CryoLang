@@ -19,9 +19,9 @@ LSP_OBJ_DIR = ../../bin/.o/LSP
 LSP_SRC_DIR = src
 LSP_INCLUDE_DIR = include
 
-# Find all source files
-LSP_SOURCES = $(wildcard $(LSP_SRC_DIR)/*.cpp)
-LSP_OBJECTS = $(LSP_SOURCES:$(LSP_SRC_DIR)/%.cpp=$(LSP_OBJ_DIR)/%.o)
+# Find all source files recursively
+LSP_SOURCES = $(shell find $(LSP_SRC_DIR) -name "*.cpp" 2>/dev/null || powershell -Command "Get-ChildItem -Path $(LSP_SRC_DIR) -Recurse -Filter '*.cpp' | ForEach-Object { $$_.FullName -replace '.*\\$(LSP_SRC_DIR)\\', '$(LSP_SRC_DIR)/' -replace '\\', '/' }")
+LSP_OBJECTS = $(patsubst $(LSP_SRC_DIR)/%.cpp,$(LSP_OBJ_DIR)/%.o,$(LSP_SOURCES))
 
 # Include paths - reuse from main project plus LSP includes
 LSP_INCLUDES = -I$(LSP_INCLUDE_DIR) -I../../include
@@ -29,34 +29,8 @@ LSP_INCLUDES = -I$(LSP_INCLUDE_DIR) -I../../include
 # Compiler settings - inherit from main project
 LSP_CXXFLAGS = $(CXXFLAGS) $(LSP_INCLUDES)
 
-# Link against main compiler libraries
-MAIN_OBJ_DIR = ../../bin/.o
-LSP_LIBS = \
-	$(MAIN_OBJ_DIR)/AST/ASTBuilder.o \
-	$(MAIN_OBJ_DIR)/AST/ASTContext.o \
-	$(MAIN_OBJ_DIR)/AST/ASTDumper.o \
-	$(MAIN_OBJ_DIR)/AST/ASTNode.o \
-	$(MAIN_OBJ_DIR)/AST/MonomorphizationPass.o \
-	$(MAIN_OBJ_DIR)/AST/SymbolTable.o \
-	$(MAIN_OBJ_DIR)/AST/TemplateRegistry.o \
-	$(MAIN_OBJ_DIR)/AST/Type.o \
-	$(MAIN_OBJ_DIR)/AST/TypeChecker.o \
-	$(MAIN_OBJ_DIR)/Codegen/CodeGenerator.o \
-	$(MAIN_OBJ_DIR)/Codegen/CodegenVisitor.o \
-	$(MAIN_OBJ_DIR)/Codegen/FunctionRegistry.o \
-	$(MAIN_OBJ_DIR)/Codegen/Intrinsics.o \
-	$(MAIN_OBJ_DIR)/Codegen/LLVMContext.o \
-	$(MAIN_OBJ_DIR)/Codegen/TargetConfig.o \
-	$(MAIN_OBJ_DIR)/Codegen/TypeMapper.o \
-	$(MAIN_OBJ_DIR)/Codegen/ValueContext.o \
-	$(MAIN_OBJ_DIR)/Linker/CryoLinker.o \
-	$(MAIN_OBJ_DIR)/Compiler/CompilerInstance.o \
-	$(MAIN_OBJ_DIR)/GDM/GDM.o \
-	$(MAIN_OBJ_DIR)/Lexer/lexer.o \
-	$(MAIN_OBJ_DIR)/Parser/Parser.o \
-	$(MAIN_OBJ_DIR)/Utils/file.o \
-	$(MAIN_OBJ_DIR)/Utils/RuntimeHeaderParser.o \
-	$(MAIN_OBJ_DIR)/Utils/ModuleLoader.o
+# Link against minimal dependencies (standalone LSP server)
+LSP_LIBS = 
 
 # OS-specific socket libraries
 ifeq ($(OS), Windows_NT)
@@ -85,25 +59,12 @@ $(LSP_OBJ_DIR)/%.o: $(LSP_SRC_DIR)/%.cpp | $(LSP_OBJ_DIR)
 	$(CXX) $(LSP_CXXFLAGS) -c $< -o $@
 
 # Link the LSP executable
-$(LSP_BIN_DIR)/$(LSP_TARGET): $(LSP_OBJECTS) | check-main-libs
+$(LSP_BIN_DIR)/$(LSP_TARGET): $(LSP_OBJECTS)
 	@echo "Linking CryoLSP..."
 	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJECTS) $(LSP_LIBS) -o $@ $(LDFLAGS) $(SOCKET_LIBS)
 	@echo "✓ CryoLSP built successfully: $(LSP_BIN_DIR)/$(LSP_TARGET)"
 
-# Check that main compiler libraries exist
-check-main-libs:
-	@echo "Checking main compiler libraries..."
-ifeq ($(OS), Windows_NT)
-	@if not exist "$(MAIN_OBJ_DIR)\AST\ASTBuilder.o" ( \
-		echo "Error: Main compiler libraries not found. Please run 'make' in the root directory first." && \
-		exit 1 \
-	)
-else
-	@if [ ! -f "$(MAIN_OBJ_DIR)/AST/ASTBuilder.o" ]; then \
-		echo "Error: Main compiler libraries not found. Please run 'make' in the root directory first."; \
-		exit 1; \
-	fi
-endif
+
 
 # Clean LSP build artifacts
 clean:
