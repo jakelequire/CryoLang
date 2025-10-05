@@ -38,6 +38,8 @@ namespace CryoLSP
         std::string scope;          // Full scope path (e.g., "std::IO")
         std::string qualified_name; // Full qualified name (e.g., "std::IO::println")
         Position definition_location;
+        Position start_pos;         // Start position for range highlighting
+        Position end_pos;           // End position for range highlighting
         bool has_errors = false;    // Whether symbol has compilation errors
     };
 
@@ -146,6 +148,10 @@ namespace CryoLSP
 
         // Enhanced hover info construction
         HoverInfo buildEnhancedHoverInfo(const Cryo::Symbol &symbol, const std::string &word, const std::string &file_path);
+        
+        // Function signature extraction from source text
+        std::string extractFunctionSignatureFromSource(const std::string &file_path, const std::string &function_name);
+        std::string extractParameterNamesFromAST(Cryo::FunctionDeclarationNode *function_node);
         std::string buildQualifiedSignature(const Cryo::Symbol &symbol, const std::string &file_path);
         std::string getSymbolDocumentation(const Cryo::Symbol &symbol, const std::string &symbol_name);
 

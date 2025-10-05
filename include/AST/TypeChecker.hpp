@@ -85,6 +85,7 @@ namespace Cryo
     // Forward declarations for AST nodes
     class StructDeclarationNode;
     class ClassDeclarationNode;
+    class FunctionDeclarationNode;
 
     struct TypedSymbol
     {
@@ -96,6 +97,7 @@ namespace Cryo
         // Store AST node pointers for complex types to access their structure
         StructDeclarationNode *struct_node = nullptr;
         ClassDeclarationNode *class_node = nullptr;
+        FunctionDeclarationNode *function_node = nullptr;
 
         TypedSymbol() = default; // Default constructor for containers
         TypedSymbol(const std::string &n, Type *t, SourceLocation loc)
@@ -106,6 +108,9 @@ namespace Cryo
 
         TypedSymbol(const std::string &n, Type *t, SourceLocation loc, ClassDeclarationNode *cnode)
             : name(n), type(t), declaration_location(loc), class_node(cnode) {}
+
+        TypedSymbol(const std::string &n, Type *t, SourceLocation loc, FunctionDeclarationNode *fnode)
+            : name(n), type(t), declaration_location(loc), function_node(fnode) {}
     };
 
     // Scoped symbol table for type checking
@@ -126,6 +131,8 @@ namespace Cryo
                             SourceLocation loc, StructDeclarationNode *struct_node);
         bool declare_symbol(const std::string &name, Type *type,
                             SourceLocation loc, ClassDeclarationNode *class_node);
+        bool declare_symbol(const std::string &name, Type *type,
+                            SourceLocation loc, FunctionDeclarationNode *function_node);
         TypedSymbol *lookup_symbol(const std::string &name);
         TypedSymbol *lookup_symbol_in_any_namespace(const std::string &symbol_name);
         bool is_symbol_defined(const std::string &name);
@@ -268,6 +275,13 @@ namespace Cryo
         // Type table access
         void print_type_table(std::ostream &os = std::cout) const { _symbol_table->print_type_table(os); }
 
+        // Symbol table access for LSP
+        TypedSymbol *lookup_symbol(const std::string &name) { return _symbol_table->lookup_symbol(name); }
+        TypedSymbol *lookup_symbol_in_any_namespace(const std::string &symbol_name) { return _symbol_table->lookup_symbol_in_any_namespace(symbol_name); }
+        
+        // Symbol table access for LSP
+        TypedSymbol *lookup_symbol(const std::string &name) const { return _symbol_table->lookup_symbol(name); }
+
         // Visitor methods - Program
         void visit(ProgramNode &node) override;
 
@@ -343,6 +357,7 @@ namespace Cryo
         void enter_scope();
         void exit_scope();
         bool declare_variable(const std::string &name, Type *type, SourceLocation loc, bool is_mutable);
+        bool declare_function(const std::string &name, Type *type, SourceLocation loc, FunctionDeclarationNode *function_node);
         Type *lookup_variable_type(const std::string &name);
 
         // Utility methods

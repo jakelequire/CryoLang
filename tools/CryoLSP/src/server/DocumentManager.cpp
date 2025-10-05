@@ -122,8 +122,21 @@ std::optional<HoverResult> DocumentManager::getHoverInfo(const std::string& uri,
                 formatted_content += "\n\n" + hover_info->documentation;
             }
             
-            Position start = findWordStart(text.value(), position);
-            Position end = findWordEnd(text.value(), position);
+            Position start, end;
+            
+            // Use specific range if provided by the analyzer (e.g., for literals)
+            if (hover_info->start_pos.line != -1 && hover_info->end_pos.line != -1) {
+                start = hover_info->start_pos;
+                end = hover_info->end_pos;
+                logger.debug("DocumentManager", "Using specific range from analyzer: {}:{} to {}:{}", 
+                           start.line, start.character, end.line, end.character);
+            } else {
+                // Fall back to word boundaries for regular symbols
+                start = findWordStart(text.value(), position);
+                end = findWordEnd(text.value(), position);
+                logger.debug("DocumentManager", "Using word boundary range: {}:{} to {}:{}", 
+                           start.line, start.character, end.line, end.character);
+            }
             
             logger.debug("DocumentManager", "Found enhanced symbol info: " + hover_info->name + " (" + hover_info->type + ") in scope: " + hover_info->scope);
             return HoverResult(formatted_content, start, end);

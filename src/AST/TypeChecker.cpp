@@ -98,6 +98,23 @@ namespace Cryo
         return true;
     }
 
+    bool TypedSymbolTable::declare_symbol(const std::string &name, Type *type,
+                                          SourceLocation loc, FunctionDeclarationNode *function_node)
+    {
+        // Check for redefinition in current scope only
+        if (_symbols.find(name) != _symbols.end())
+        {
+            return false; // Symbol already exists
+        }
+
+        TypedSymbol symbol(name, type, loc, function_node);
+        symbol.is_mutable = false;
+        symbol.is_initialized = true;
+
+        _symbols[name] = std::move(symbol);
+        return true;
+    }
+
     TypedSymbol *TypedSymbolTable::lookup_symbol(const std::string &name)
     {
         // Search current scope
@@ -1174,12 +1191,14 @@ namespace Cryo
                 // For now, allow redefinition if it's the same function
                 std::cout << "[DEBUG] Allowing redefinition for now" << std::endl;
             }
-            // Function exists with compatible type - this is OK
+            // Function exists with compatible type - update with AST node reference for LSP
+            std::cout << "[DEBUG] Updating existing function '" << func_name << "' with AST node reference" << std::endl;
+            existing_symbol->function_node = &node;
         }
         else
         {
             // Function doesn't exist yet, declare it
-            if (!declare_variable(func_name, func_type, node.location(), false))
+            if (!declare_function(func_name, func_type, node.location(), &node))
             {
                 report_redefined_symbol(node.location(), func_name);
             }
@@ -3669,6 +3688,11 @@ namespace Cryo
     bool TypeChecker::declare_variable(const std::string &name, Type *type, SourceLocation loc, bool is_mutable)
     {
         return _symbol_table->declare_symbol(name, type, loc, is_mutable);
+    }
+
+    bool TypeChecker::declare_function(const std::string &name, Type *type, SourceLocation loc, FunctionDeclarationNode *function_node)
+    {
+        return _symbol_table->declare_symbol(name, type, loc, function_node);
     }
 
     Type *TypeChecker::lookup_variable_type(const std::string &name)

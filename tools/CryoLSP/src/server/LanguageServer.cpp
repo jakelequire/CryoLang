@@ -254,11 +254,29 @@ namespace Cryo
 
                     JsonObject result;
                     result["contents"] = JsonValue(contents);
+                    
+                    // Add range for highlighting
+                    JsonObject start_pos;
+                    start_pos["line"] = JsonValue(static_cast<double>(hover_result->start.line));
+                    start_pos["character"] = JsonValue(static_cast<double>(hover_result->start.character));
+                    
+                    JsonObject end_pos;
+                    end_pos["line"] = JsonValue(static_cast<double>(hover_result->end.line));
+                    end_pos["character"] = JsonValue(static_cast<double>(hover_result->end.character));
+                    
+                    JsonObject range;
+                    range["start"] = JsonValue(start_pos);
+                    range["end"] = JsonValue(end_pos);
+                    
+                    result["range"] = JsonValue(range);
 
                     auto end_time = std::chrono::steady_clock::now();
                     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
                     logger.debug("LSP", "Hover request processed successfully in " + std::to_string(duration.count()) + "ms");
-                    logger.info("LSP", "Returning hover info: " + hover_result->contents.substr(0, 100) + "...");
+                    logger.info("LSP", "Returning hover info with range {}:{} to {}:{}: {}", 
+                              hover_result->start.line, hover_result->start.character,
+                              hover_result->end.line, hover_result->end.character,
+                              hover_result->contents.substr(0, 100) + "...");
 
                     return JsonValue(result);
                 } else {
