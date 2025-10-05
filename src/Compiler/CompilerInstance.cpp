@@ -402,6 +402,13 @@ namespace Cryo
 
             if (_debug_mode)
             {
+                std::cout << "[CompilerInstance] Processing imported modules for AST node updates..." << std::endl;
+            }
+            // Process imported modules to update symbols with AST node references
+            _type_checker->check_imported_modules(_module_loader->get_imported_asts());
+
+            if (_debug_mode)
+            {
                 std::cout << "[CompilerInstance] Phase 1: Type checking..." << std::endl;
             }
             // Phase 1: Type checking

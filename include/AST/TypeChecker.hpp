@@ -247,8 +247,8 @@ namespace Cryo
         // Load built-in functions from main SymbolTable
         void load_builtin_symbols(const SymbolTable &main_symbol_table);
         void load_intrinsic_symbols(const SymbolTable &main_symbol_table);
-        void load_user_symbols(const SymbolTable &main_symbol_table);
         void load_runtime_symbols(const SymbolTable &main_symbol_table);
+        void load_user_symbols(const SymbolTable &main_symbol_table);
 
         // Generic type management
         void register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names);
@@ -259,6 +259,9 @@ namespace Cryo
 
         // Main entry point
         void check_program(ProgramNode &program);
+
+        // Additional method to visit imported modules for complete symbol information
+        void check_imported_modules(const std::unordered_map<std::string, std::unique_ptr<ProgramNode>>& imported_asts);
 
         // Set current namespace context (called by compiler)
         void set_current_namespace(const std::string &namespace_name) { _current_namespace = namespace_name; }

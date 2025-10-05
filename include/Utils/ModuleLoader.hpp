@@ -79,6 +79,12 @@ namespace Cryo
          */
         void clear_cache();
 
+        /**
+         * @brief Get all imported AST nodes for additional processing
+         * @return Map of module names to their parsed AST nodes
+         */
+        const std::unordered_map<std::string, std::unique_ptr<ProgramNode>>& get_imported_asts() const;
+
     private:
         /**
          * @brief Load a module from filesystem and parse it
