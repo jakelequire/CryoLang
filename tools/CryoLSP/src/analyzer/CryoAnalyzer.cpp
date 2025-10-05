@@ -3,6 +3,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <algorithm>  // for std::replace
 #include <cstdlib>    // for std::getenv
 #include <functional> // for std::hash
 #include <chrono>     // for rate limiting
@@ -481,6 +482,69 @@ namespace CryoLSP
                 {
                     Logger::instance().debug("CryoAnalyzer", "Symbol '{}' not found in symbol table", word);
                 }
+                
+                // Try TypeChecker symbol table for more detailed function information
+                if (analysis.compiler && analysis.compiler->type_checker())
+                {
+                    Logger::instance().debug("CryoAnalyzer", "Checking TypeChecker symbol table for word='{}', qualified='{}'", word, qualified_symbol);
+                    
+                    // First try looking up the simple name
+                    auto typed_symbol = analysis.compiler->type_checker()->lookup_symbol(word);
+                    Logger::instance().debug("CryoAnalyzer", "Simple lookup for '{}': {}", word, typed_symbol ? "found" : "not found");
+                    
+                    // If not found and we have a qualified symbol, try that too
+                    if (!typed_symbol && !qualified_symbol.empty() && qualified_symbol != word)
+                    {
+                        Logger::instance().debug("CryoAnalyzer", "Trying qualified lookup in TypeChecker for '{}'", qualified_symbol);
+                        typed_symbol = analysis.compiler->type_checker()->lookup_symbol(qualified_symbol);
+                        Logger::instance().debug("CryoAnalyzer", "Qualified lookup for '{}': {}", qualified_symbol, typed_symbol ? "found" : "not found");
+                    }
+                    
+                    // Also try namespace-aware lookup
+                    if (!typed_symbol)
+                    {
+                        Logger::instance().debug("CryoAnalyzer", "Trying namespace-aware lookup in TypeChecker for '{}'", word);
+                        typed_symbol = analysis.compiler->type_checker()->lookup_symbol_in_any_namespace(word);
+                        Logger::instance().debug("CryoAnalyzer", "Namespace lookup for '{}': {}", word, typed_symbol ? "found" : "not found");
+                    }
+                    
+                    // If we have qualified_symbol like "IO::println", try just the function part
+                    if (!typed_symbol && !qualified_symbol.empty())
+                    {
+                        size_t pos = qualified_symbol.find_last_of("::");
+                        if (pos != std::string::npos && pos > 1)
+                        {
+                            std::string function_name = qualified_symbol.substr(pos + 1);
+                            Logger::instance().debug("CryoAnalyzer", "Trying function part lookup '{}' from qualified '{}'", function_name, qualified_symbol);
+                            typed_symbol = analysis.compiler->type_checker()->lookup_symbol(function_name);
+                            Logger::instance().debug("CryoAnalyzer", "Function part lookup for '{}': {}", function_name, typed_symbol ? "found" : "not found");
+                        }
+                    }
+                    
+                    if (typed_symbol && typed_symbol->function_node)
+                    {
+                        Logger::instance().debug("CryoAnalyzer", "Found function with AST node in TypeChecker: '{}'", word);
+                        HoverInfo info;
+                        info.name = word;
+                        info.kind = "function";
+                        info.signature = extractParameterNamesFromAST(typed_symbol->function_node);
+                        info.type = typed_symbol->type ? typed_symbol->type->to_string() : "unknown";
+                        info.qualified_name = !qualified_symbol.empty() ? qualified_symbol : word;
+                        if (typed_symbol->declaration_location.line() > 0)
+                        {
+                            info.definition_location = convertSourceLocationToPosition(typed_symbol->declaration_location);
+                        }
+                        return info;
+                    }
+                    else if (typed_symbol)
+                    {
+                        Logger::instance().debug("CryoAnalyzer", "Found symbol in TypeChecker but no function_node: '{}'", word);
+                    }
+                    else
+                    {
+                        Logger::instance().debug("CryoAnalyzer", "No symbol found in TypeChecker for any lookup attempt");
+                    }
+                }
             }
             else
             {
@@ -520,6 +584,119 @@ namespace CryoLSP
         // TODO: Implement AST traversal to find function at position
         // This would walk the AST to find function declaration nodes at the given position
         return std::nullopt;
+    }
+
+    std::string CryoAnalyzer::extractFunctionSignatureFromSource(const std::string &file_path, const std::string &function_name)
+    {
+        Logger::instance().debug("CryoAnalyzer", "Attempting to extract function signature for '{}' from '{}'", function_name, file_path);
+        try {
+            // Fix file path - convert backslashes to forward slashes and handle drive letters
+            std::string fixed_path = file_path;
+            if (fixed_path.starts_with("\\") && fixed_path.length() > 3 && fixed_path[2] == ':') {
+                // Handle paths like "\c:\..." - remove leading backslash
+                fixed_path = fixed_path.substr(1);
+            }
+            // Convert all backslashes to forward slashes
+            std::replace(fixed_path.begin(), fixed_path.end(), '\\', '/');
+            
+            Logger::instance().debug("CryoAnalyzer", "Fixed file path: '{}'", fixed_path);
+            
+            std::ifstream file(fixed_path);
+            if (!file.is_open()) {
+                Logger::instance().debug("CryoAnalyzer", "Failed to open file: {}", fixed_path);
+                return "";
+            }
+            
+            std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            file.close();
+            
+            // Pattern to match function declaration with full parameter names
+            // Handle both simple function names and qualified names (e.g., IO::println -> println)
+            std::string search_name = function_name;
+            size_t last_colon = function_name.find_last_of(':');
+            if (last_colon != std::string::npos && last_colon < function_name.length() - 1) {
+                search_name = function_name.substr(last_colon + 1);
+                Logger::instance().debug("CryoAnalyzer", "Extracted function name '{}' from qualified name '{}'", search_name, function_name);
+            }
+            
+            std::regex func_pattern(R"(\bfunction\s+)" + search_name + R"(\s*\(([^)]*)\)\s*(?:->\s*([^;{]+))?)");
+            std::smatch match;
+            
+            if (std::regex_search(content, match, func_pattern)) {
+                std::string params = match[1].str();
+                std::string return_type = match.size() > 2 ? match[2].str() : "";
+                
+                Logger::instance().debug("CryoAnalyzer", "Found function '{}' with params: '{}', return: '{}'", function_name, params, return_type);
+                
+                // Clean up whitespace
+                if (!params.empty()) {
+                    std::regex ws_pattern(R"(\s+)");
+                    params = std::regex_replace(params, ws_pattern, " ");
+                    size_t start = params.find_first_not_of(" \t\n\r\f\v");
+                    size_t end = params.find_last_not_of(" \t\n\r\f\v");
+                    if (start != std::string::npos && end != std::string::npos) {
+                        params = params.substr(start, end - start + 1);
+                    }
+                }
+                
+                if (!return_type.empty()) {
+                    return_type.erase(return_type.find_last_not_of(" \t\n\r\f\v") + 1);
+                    std::string result = "function " + function_name + "(" + params + ") -> " + return_type;
+                    Logger::instance().debug("CryoAnalyzer", "Extracted signature: '{}'", result);
+                    return result;
+                } else {
+                    std::string result = "function " + function_name + "(" + params + ")";
+                    Logger::instance().debug("CryoAnalyzer", "Extracted signature: '{}'", result);
+                    return result;
+                }
+            } else {
+                Logger::instance().debug("CryoAnalyzer", "No function pattern match found for '{}'", function_name);
+            }
+            
+            return "";
+        } catch (const std::exception &e) {
+            Logger::instance().debug("CryoAnalyzer", "Error extracting function signature: {}", e.what());
+            return "";
+        }
+    }
+
+    std::string CryoAnalyzer::extractParameterNamesFromAST(Cryo::FunctionDeclarationNode *function_node)
+    {
+        if (!function_node) {
+            return "";
+        }
+        
+        std::vector<std::string> param_strs;
+        const auto &parameters = function_node->parameters();
+        
+        for (const auto &param : parameters) {
+            if (param) {
+                std::string param_name = param->name();
+                std::string param_type = param->type_annotation();
+                
+                // Format as "name: type"
+                param_strs.push_back(param_name + ": " + param_type);
+            }
+        }
+        
+        // Build complete signature
+        std::string params = "";
+        if (!param_strs.empty()) {
+            params = param_strs[0];
+            for (size_t i = 1; i < param_strs.size(); ++i) {
+                params += ", " + param_strs[i];
+            }
+        }
+        
+        std::string return_type = function_node->return_type_annotation();
+        std::string result = "function " + function_node->name() + "(" + params + ")";
+        
+        if (return_type != "void") {
+            result += " -> " + return_type;
+        }
+        
+        Logger::instance().debug("CryoAnalyzer", "Extracted AST signature: '{}'", result);
+        return result;
     }
 
     HoverInfo CryoAnalyzer::analyzeSimplePattern(const std::string &content, const Position &position)
@@ -914,6 +1091,171 @@ namespace CryoLSP
         return (it != keyword_docs.end()) ? it->second : "";
     }
 
+    std::string CryoAnalyzer::getLiteralDocumentation(const std::string &literal, const std::string &content, const Position &position)
+    {
+        // Get the actual literal text from the line at position
+        std::string line = getLineAtPosition(content, position);
+        
+        // Find the literal at the current position
+        size_t line_offset = 0;
+        for (int i = 0; i < position.line; i++) {
+            size_t next_newline = content.find('\n', line_offset);
+            if (next_newline != std::string::npos) {
+                line_offset = next_newline + 1;
+            }
+        }
+        
+        size_t char_pos = line_offset + position.character;
+        
+        // Detect string literals by looking for quotes around the cursor position
+        if (char_pos < content.length()) {
+            // Look backwards and forwards for string quotes
+            size_t start_quote = std::string::npos;
+            size_t end_quote = std::string::npos;
+            
+            // Find the start quote (look backwards from cursor)
+            for (size_t i = char_pos; i > line_offset; --i) {
+                if (content[i] == '"' && (i == 0 || content[i-1] != '\\')) {
+                    start_quote = i;
+                    break;
+                }
+            }
+            
+            // If we found a start quote, look for the end quote
+            if (start_quote != std::string::npos) {
+                for (size_t i = start_quote + 1; i < content.length() && i < line_offset + line.length(); ++i) {
+                    if (content[i] == '"' && content[i-1] != '\\') {
+                        end_quote = i;
+                        break;
+                    }
+                }
+                
+                // If we have both quotes and cursor is between them, extract the string
+                if (end_quote != std::string::npos && char_pos >= start_quote && char_pos <= end_quote) {
+                    std::string string_literal = content.substr(start_quote, end_quote - start_quote + 1);
+                    std::string string_content = string_literal.substr(1, string_literal.length() - 2); // Remove quotes
+                    
+                    return "String literal: char[" + std::to_string(string_content.length()) + "](\"" + string_content + "\")";
+                }
+            }
+        }
+        
+        // Detect character literals
+        if (char_pos < content.length() && content[char_pos] == '\'') {
+            // Find the full character literal
+            size_t start = char_pos;
+            size_t end = start + 1;
+            if (end < content.length() && content[end] == '\\' && end + 1 < content.length()) {
+                end += 2; // Escaped character
+            } else if (end < content.length()) {
+                end++; // Regular character
+            }
+            if (end < content.length() && content[end] == '\'') end++; // Include closing quote
+            
+            std::string char_literal = content.substr(start, end - start);
+            return "Character literal: char(" + char_literal + ")";
+        }
+        
+        // Detect numeric literals
+        std::regex integer_pattern(R"(^-?\d+$)");
+        std::regex float_pattern(R"(^-?\d+\.\d*f?$|^-?\d*\.\d+f?$)");
+        std::regex hex_pattern(R"(^0[xX][0-9a-fA-F]+$)");
+        std::regex binary_pattern(R"(^0[bB][01]+$)");
+        
+        if (std::regex_match(literal, hex_pattern)) {
+            try {
+                unsigned long long value = std::stoull(literal, nullptr, 16);
+                std::string result = "Hexadecimal integer literal: " + literal + " (decimal: " + std::to_string(value) + ")";
+                
+                // Add binary representation for small values
+                if (value <= 0xFFFF) {
+                    std::string binary = "";
+                    unsigned long long temp = value;
+                    if (temp == 0) {
+                        binary = "0";
+                    } else {
+                        while (temp > 0) {
+                            binary = (temp % 2 ? "1" : "0") + binary;
+                            temp /= 2;
+                        }
+                    }
+                    result += ", binary: 0b" + binary;
+                }
+                
+                // Add information about bit representation
+                if (value <= 0xFF) {
+                    result += " (fits in 8-bit: u8)";
+                } else if (value <= 0xFFFF) {
+                    result += " (fits in 16-bit: u16)";
+                } else if (value <= 0xFFFFFFFF) {
+                    result += " (fits in 32-bit: u32)";
+                } else {
+                    result += " (requires 64-bit: u64)";
+                }
+                
+                return result;
+            } catch (...) {
+                return "Hexadecimal integer literal: " + literal;
+            }
+        }
+        
+        if (std::regex_match(literal, binary_pattern)) {
+            try {
+                std::string binary_digits = literal.substr(2); // Remove 0b prefix
+                unsigned long long value = std::stoull(binary_digits, nullptr, 2);
+                std::string result = "Binary integer literal: " + literal + " (decimal: " + std::to_string(value);
+                
+                // Add hex representation
+                std::stringstream hex_stream;
+                hex_stream << "0x" << std::hex << std::uppercase << value;
+                result += ", hex: " + hex_stream.str() + ")";
+                
+                return result;
+            } catch (...) {
+                return "Binary integer literal: " + literal;
+            }
+        }
+        
+        if (std::regex_match(literal, float_pattern)) {
+            if (literal.back() == 'f' || literal.back() == 'F') {
+                return "32-bit float literal: f32(" + literal + ")";
+            } else {
+                return "64-bit float literal: f64(" + literal + ")";
+            }
+        }
+        
+        if (std::regex_match(literal, integer_pattern)) {
+            try {
+                long long value = std::stoll(literal);
+                
+                // Determine the appropriate integer type based on value range
+                if (value >= -128 && value <= 127) {
+                    return "Integer literal: i8(" + literal + ") - fits in 8-bit signed";
+                } else if (value >= -32768 && value <= 32767) {
+                    return "Integer literal: i16(" + literal + ") - fits in 16-bit signed";
+                } else if (value >= -2147483648LL && value <= 2147483647LL) {
+                    return "Integer literal: i32(" + literal + ") - fits in 32-bit signed";
+                } else {
+                    return "Integer literal: i64(" + literal + ") - 64-bit signed";
+                }
+            } catch (...) {
+                return "Integer literal: " + literal;
+            }
+        }
+        
+        // Check for boolean literals
+        if (literal == "true" || literal == "false") {
+            return "Boolean literal: boolean(" + literal + ")";
+        }
+        
+        // Check for null literal
+        if (literal == "null") {
+            return "Null literal: null pointer value";
+        }
+        
+        return ""; // Not a recognized literal
+    }
+
     std::string CryoAnalyzer::getBuiltinFunctionDocumentation(const std::string &function_name)
     {
         static const std::unordered_map<std::string, std::string> builtin_docs = {
@@ -931,6 +1273,12 @@ namespace CryoLSP
     {
         HoverInfo info;
         info.name = word;
+        
+        // Initialize position fields to invalid values (will be overridden for literals)
+        info.start_pos.line = -1;
+        info.start_pos.character = -1;
+        info.end_pos.line = -1;
+        info.end_pos.character = -1;
 
         // Check if this is a primitive type first
         auto primitive_docs = getPrimitiveTypeDocumentation(word);
@@ -951,6 +1299,208 @@ namespace CryoLSP
             info.signature = word;
             info.documentation = keyword_docs;
             Logger::instance().debug("CryoAnalyzer", "Found keyword: {} -> {}", word, keyword_docs.substr(0, 50) + "...");
+            return info;
+        }
+
+        // Check if this is a literal (string, number, boolean, etc.)
+        // For literals, we need to check the actual character at position, not just the word
+        size_t line_offset = 0;
+        for (int i = 0; i < position.line; i++) {
+            size_t next_newline = content.find('\n', line_offset);
+            if (next_newline != std::string::npos) {
+                line_offset = next_newline + 1;
+            }
+        }
+        size_t char_pos = line_offset + position.character;
+        
+        // Helper function to count actual characters (treating escape sequences as single chars)
+        auto countActualChars = [](const std::string& str) -> size_t {
+            size_t count = 0;
+            for (size_t i = 0; i < str.length(); ++i) {
+                if (str[i] == '\\' && i + 1 < str.length()) {
+                    // Skip the next character as it's part of the escape sequence
+                    i++;
+                }
+                count++;
+            }
+            return count;
+        };
+        
+        // Check if we're hovering inside a string literal
+        if (char_pos < content.length()) {
+            // Look backwards and forwards for string quotes
+            size_t start_quote = std::string::npos;
+            size_t end_quote = std::string::npos;
+            
+            // Find the start quote (look backwards from cursor)
+            for (size_t i = char_pos; i > line_offset && i < content.length(); --i) {
+                if (content[i] == '"' && (i == 0 || content[i-1] != '\\')) {
+                    start_quote = i;
+                    break;
+                }
+            }
+            
+            // If we found a start quote, look for the end quote
+            if (start_quote != std::string::npos) {
+                // Find the end of the current line
+                size_t line_end = content.find('\n', line_offset);
+                if (line_end == std::string::npos) line_end = content.length();
+                
+                for (size_t i = start_quote + 1; i < content.length() && i < line_end; ++i) {
+                    if (content[i] == '"' && content[i-1] != '\\') {
+                        end_quote = i;
+                        break;
+                    }
+                }
+                
+                // If we have both quotes and cursor is between them, extract the full string
+                if (end_quote != std::string::npos && char_pos >= start_quote && char_pos <= end_quote) {
+                    std::string full_string = content.substr(start_quote, end_quote - start_quote + 1);
+                    std::string string_content = full_string.substr(1, full_string.length() - 2); // Remove quotes for length calculation
+                    size_t actual_char_count = countActualChars(string_content); // Count considering escape sequences
+                    
+                    // Calculate the start and end positions for the range
+                    Position start_position;
+                    start_position.line = position.line;
+                    start_position.character = static_cast<int>(start_quote - line_offset);
+                    
+                    Position end_position;
+                    end_position.line = position.line;
+                    end_position.character = static_cast<int>(end_quote + 1 - line_offset); // +1 to include the closing quote
+                    
+                    info.type = "string literal";
+                    info.kind = "literal";
+                    info.signature = "char[" + std::to_string(actual_char_count) + "](" + full_string + ")";
+                    info.documentation = "String literal containing " + std::to_string(actual_char_count) + " characters";
+                    info.start_pos = start_position;
+                    info.end_pos = end_position;
+                    Logger::instance().debug("CryoAnalyzer", "Found full string literal: {} at range {}:{} to {}:{}", 
+                                           full_string, start_position.line, start_position.character, 
+                                           end_position.line, end_position.character);
+                    return info;
+                }
+            }
+        }
+        
+        // Check if we're in a character literal by looking for single quotes
+        if (char_pos < content.length()) {
+            // Look backwards and forwards for character quotes
+            size_t start_quote = std::string::npos;
+            size_t end_quote = std::string::npos;
+            
+            // Find the start quote (look backwards from cursor)
+            for (size_t i = char_pos; i > line_offset && i < content.length(); --i) {
+                if (content[i] == '\'' && (i == 0 || content[i-1] != '\\')) {
+                    start_quote = i;
+                    break;
+                }
+            }
+            
+            // If we found a start quote, look for the end quote
+            if (start_quote != std::string::npos) {
+                // Find the end of the current line
+                size_t line_end = content.find('\n', line_offset);
+                if (line_end == std::string::npos) line_end = content.length();
+                
+                for (size_t i = start_quote + 1; i < content.length() && i < line_end; ++i) {
+                    if (content[i] == '\'' && content[i-1] != '\\') {
+                        end_quote = i;
+                        break;
+                    }
+                }
+                
+                // If we have both quotes and cursor is between them, extract the character
+                if (end_quote != std::string::npos && char_pos >= start_quote && char_pos <= end_quote) {
+                    std::string full_char = content.substr(start_quote, end_quote - start_quote + 1);
+                    std::string char_content = full_char.substr(1, full_char.length() - 2); // Remove quotes
+                    
+                    // Calculate the start and end positions for the range
+                    Position start_position;
+                    start_position.line = position.line;
+                    start_position.character = static_cast<int>(start_quote - line_offset);
+                    
+                    Position end_position;
+                    end_position.line = position.line;
+                    end_position.character = static_cast<int>(end_quote + 1 - line_offset); // +1 to include the closing quote
+                    
+                    std::string char_description;
+                    std::string detailed_info;
+                    unsigned char ascii_value = 0;
+                    bool has_ascii_value = false;
+                    
+                    if (char_content == "\\n") {
+                        char_description = "newline character";
+                        ascii_value = 10;
+                        has_ascii_value = true;
+                    } else if (char_content == "\\t") {
+                        char_description = "tab character";
+                        ascii_value = 9;
+                        has_ascii_value = true;
+                    } else if (char_content == "\\r") {
+                        char_description = "carriage return character";
+                        ascii_value = 13;
+                        has_ascii_value = true;
+                    } else if (char_content == "\\\\") {
+                        char_description = "backslash character";
+                        ascii_value = 92;
+                        has_ascii_value = true;
+                    } else if (char_content == "\\'") {
+                        char_description = "single quote character";
+                        ascii_value = 39;
+                        has_ascii_value = true;
+                    } else if (char_content == "\\0") {
+                        char_description = "null character";
+                        ascii_value = 0;
+                        has_ascii_value = true;
+                    } else if (char_content.length() == 1) {
+                        char_description = "character '" + char_content + "'";
+                        ascii_value = static_cast<unsigned char>(char_content[0]);
+                        has_ascii_value = true;
+                    } else {
+                        char_description = "escape sequence";
+                    }
+                    
+                    // Build detailed documentation with ASCII/Unicode info
+                    if (has_ascii_value) {
+                        std::string binary_str = "";
+                        for (int i = 7; i >= 0; i--) {
+                            binary_str += ((ascii_value >> i) & 1) ? "1" : "0";
+                        }
+                        
+                        // Convert to proper hex
+                        std::stringstream hex_stream;
+                        hex_stream << "0x" << std::hex << std::uppercase << static_cast<int>(ascii_value);
+                        
+                        detailed_info = "Character literal: " + char_description + "\n\n";
+                        detailed_info += "**ASCII/Unicode Value:** " + std::to_string(ascii_value) + "\n";
+                        detailed_info += "**Hexadecimal:** " + hex_stream.str() + "\n";
+                        detailed_info += "**Binary:** 0b" + binary_str;
+                    } else {
+                        detailed_info = "Character literal: " + char_description;
+                    }
+                    
+                    info.type = "character literal";
+                    info.kind = "literal";
+                    info.signature = "char(" + full_char + ")";
+                    info.documentation = detailed_info;
+                    info.start_pos = start_position;
+                    info.end_pos = end_position;
+                    Logger::instance().debug("CryoAnalyzer", "Found character literal: {} at range {}:{} to {}:{}", 
+                                           full_char, start_position.line, start_position.character, 
+                                           end_position.line, end_position.character);
+                    return info;
+                }
+            }
+        }
+        
+        // Check if the word itself is a numeric or boolean literal
+        auto literal_docs = getLiteralDocumentation(word, content, position);
+        if (!literal_docs.empty()) {
+            info.type = "literal";
+            info.kind = "literal";
+            info.signature = word;
+            info.documentation = literal_docs;
+            Logger::instance().debug("CryoAnalyzer", "Found literal: {} -> {}", word, literal_docs.substr(0, 50) + "...");
             return info;
         }
 
@@ -1499,8 +2049,17 @@ namespace CryoLSP
                 
                 if (symbol.data_type && symbol.data_type->to_string().find("(") != std::string::npos)
                 {
-                    // Function with signature: "function std::IO::println(string) -> i64"
-                    signature = "function " + qualified_name + symbol.data_type->to_string();
+                    // For functions, try to extract full signature with parameter names from source text
+                    Logger::instance().debug("CryoAnalyzer", "Found function symbol '{}', attempting source extraction", symbol.name);
+                    std::string full_signature = extractFunctionSignatureFromSource(file_path, symbol.name);
+                    if (!full_signature.empty()) {
+                        Logger::instance().debug("CryoAnalyzer", "Using extracted signature: '{}'", full_signature);
+                        signature = full_signature;
+                    } else {
+                        // Fallback to AST signature if text extraction fails
+                        Logger::instance().debug("CryoAnalyzer", "Source extraction failed, using AST signature");
+                        signature = "function " + qualified_name + symbol.data_type->to_string();
+                    }
                 }
                 else
                 {
