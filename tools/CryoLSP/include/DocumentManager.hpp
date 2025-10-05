@@ -4,11 +4,13 @@
 #include <unordered_map>
 #include <optional>
 #include <memory>
+#include <vector>
 #include "LSPMessage.hpp"
 
 // Forward declaration
 namespace CryoLSP {
     class CryoAnalyzer;
+    struct LSPDiagnostic; // Forward declare for header
 }
 
 namespace Cryo {
@@ -51,6 +53,10 @@ public:
     
     // Hover functionality
     std::optional<HoverResult> getHoverInfo(const std::string& uri, const Position& position);
+    
+    // Diagnostic functionality
+    std::vector<CryoLSP::LSPDiagnostic> getDiagnostics(const std::string& uri);
+    void clearDiagnostics(const std::string& uri);
     
 private:
     // Helper methods

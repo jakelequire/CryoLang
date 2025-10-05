@@ -304,5 +304,92 @@ struct VersionedTextDocumentIdentifier : public TextDocumentIdentifier {
     }
 };
 
+// LSP Diagnostic Support
+struct Diagnostic {
+    Range range;
+    std::string message;
+    std::optional<int> severity; // 1=Error, 2=Warning, 3=Information, 4=Hint
+    std::optional<std::string> code;
+    std::optional<std::string> source;
+    
+    Diagnostic() = default;
+    Diagnostic(const Range& range, const std::string& message, int severity = 1)
+        : range(range), message(message), severity(severity) {}
+    
+    JsonValue toJson() const {
+        JsonObject obj;
+        obj["range"] = range.toJson();
+        obj["message"] = JsonValue(message);
+        if (severity.has_value()) {
+            obj["severity"] = JsonValue(severity.value());
+        }
+        if (code.has_value()) {
+            obj["code"] = JsonValue(code.value());
+        }
+        if (source.has_value()) {
+            obj["source"] = JsonValue(source.value());
+        }
+        return JsonValue(obj);
+    }
+    
+    static std::optional<Diagnostic> fromJson(const JsonValue& json) {
+        if (!json.isObject()) return std::nullopt;
+        
+        auto obj = json.asObject();
+        if (!obj.count("range") || !obj.count("message")) return std::nullopt;
+        
+        auto range = Range::fromJson(obj.at("range"));
+        if (!range) return std::nullopt;
+        
+        Diagnostic diag(*range, obj.at("message").asString());
+        
+        if (obj.count("severity")) {
+            diag.severity = static_cast<int>(obj.at("severity").asNumber());
+        }
+        if (obj.count("code")) {
+            diag.code = obj.at("code").asString();
+        }
+        if (obj.count("source")) {
+            diag.source = obj.at("source").asString();
+        }
+        
+        return diag;
+    }
+};
+
+// Hover Support
+struct Hover {
+    JsonValue contents; // Can be string or MarkupContent
+    std::optional<Range> range;
+    
+    Hover() = default;
+    Hover(const JsonValue& contents) : contents(contents) {}
+    Hover(const JsonValue& contents, const Range& range) : contents(contents), range(range) {}
+    
+    JsonValue toJson() const {
+        JsonObject obj;
+        obj["contents"] = contents;
+        if (range.has_value()) {
+            obj["range"] = range.value().toJson();
+        }
+        return JsonValue(obj);
+    }
+    
+    static std::optional<Hover> fromJson(const JsonValue& json) {
+        if (!json.isObject()) return std::nullopt;
+        
+        auto obj = json.asObject();
+        if (!obj.count("contents")) return std::nullopt;
+        
+        Hover hover(obj.at("contents"));
+        if (obj.count("range")) {
+            auto r = Range::fromJson(obj.at("range"));
+            if (r) hover.range = *r;
+        }
+        
+        return hover;
+    }
+};
+
 } // namespace lsp
 } // namespace cryo

@@ -225,8 +225,15 @@ export function activate(context: vscode.ExtensionContext) {
             return new Promise((resolve, reject) => {
                 // Start the server process
                 const { spawn } = require('child_process');
+                
+                // Determine the CryoLang project root directory from the server command path
+                // serverCommand is something like "C:\Programming\apps\CryoLang\bin\cryo-lsp.exe"
+                const projectRoot = path.dirname(path.dirname(serverCommand)); // Go up from bin/ to project root
+                LOG.info('LanguageServer', `Setting LSP working directory to: ${projectRoot}`);
+                
                 const serverProcess = spawn(serverCommand, ['--socket', '--port', LSP_PORT.toString()], {
-                    stdio: 'pipe'
+                    stdio: 'pipe',
+                    cwd: projectRoot  // CRITICAL: Set working directory so LSP can find ./stdlib
                 });
                 
                 serverProcess.on('error', (error: any) => {

@@ -7,6 +7,12 @@
 #include <memory>
 #include <string>
 #include <map>
+#include <vector>
+
+// Forward declarations
+namespace CryoLSP {
+    struct LSPDiagnostic;
+}
 
 namespace Cryo {
 namespace LSP {
@@ -51,6 +57,11 @@ private:
     void handleDidOpen(const JsonValue& params);
     void handleDidChange(const JsonValue& params);
     void handleDidClose(const JsonValue& params);
+    
+    // Diagnostic support
+    void publishDiagnostics(const std::string& uri);
+    void clearDiagnostics(const std::string& uri);
+    JsonValue createDiagnosticNotification(const std::string& uri, const std::vector<CryoLSP::LSPDiagnostic>& diagnostics);
 };
 
 } // namespace LSP

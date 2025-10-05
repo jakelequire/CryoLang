@@ -113,8 +113,10 @@ std::optional<HoverResult> DocumentManager::getHoverInfo(const std::string& uri,
         
         auto hover_info = analyzer_->getHoverInfo(file_path, analyzer_pos);
         if (hover_info) {
-            // Format the hover content with syntax highlighting
+            // Clean, simple formatting showing just the signature
             std::string formatted_content = "```cryo\n" + hover_info->signature + "\n```";
+            
+            // Add documentation if available
             if (!hover_info->documentation.empty()) {
                 formatted_content += "\n\n" + hover_info->documentation;
             }
@@ -122,7 +124,7 @@ std::optional<HoverResult> DocumentManager::getHoverInfo(const std::string& uri,
             Position start = findWordStart(text.value(), position);
             Position end = findWordEnd(text.value(), position);
             
-            logger.debug("DocumentManager", "Found symbol info: " + hover_info->name + " : " + hover_info->type);
+            logger.debug("DocumentManager", "Found enhanced symbol info: " + hover_info->name + " (" + hover_info->type + ") in scope: " + hover_info->scope);
             return HoverResult(formatted_content, start, end);
         }
     }
@@ -400,6 +402,26 @@ std::string DocumentManager::uriToFilePath(const std::string& uri) {
     }
     
     return uri; // Fallback
+}
+
+// ========================================
+// Diagnostic Support
+// ========================================
+
+std::vector<CryoLSP::LSPDiagnostic> DocumentManager::getDiagnostics(const std::string& uri) {
+    Logger& logger = Logger::instance();
+    logger.debug("DocumentManager", "Getting diagnostics for: " + uri);
+    
+    std::string file_path = uriToFilePath(uri);
+    return analyzer_->getDiagnostics(file_path);
+}
+
+void DocumentManager::clearDiagnostics(const std::string& uri) {
+    Logger& logger = Logger::instance();
+    logger.debug("DocumentManager", "Clearing diagnostics for: " + uri);
+    
+    std::string file_path = uriToFilePath(uri);
+    analyzer_->clearDiagnostics(file_path);
 }
 
 } // namespace LSP
