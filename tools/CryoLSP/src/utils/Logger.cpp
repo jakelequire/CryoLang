@@ -67,14 +67,14 @@ void Logger::warn(const std::string& component, const std::string& message) {
 }
 
 void Logger::error(const std::string& component, const std::string& message) {
-    log_internal(Level::ERROR, component, message);
+    log_internal(Level::ERR, component, message);
 }
 
 void Logger::flush() {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (console_output_) {
-        std::cout.flush();
+        // In LSP servers, don't flush stdout as it's reserved for LSP protocol
         std::cerr.flush();
     }
     
@@ -109,11 +109,9 @@ void Logger::log_internal(Level level, const std::string& component, const std::
     std::string log_line = "[" + timestamp + "] [" + level_str + "] [" + component + "] " + message;
     
     if (console_output_) {
-        if (level >= Level::ERROR) {
-            std::cerr << log_line << std::endl;
-        } else {
-            std::cout << log_line << std::endl;
-        }
+        // In LSP servers, stdout is reserved for LSP protocol only
+        // All logging must go to stderr to avoid corrupting the protocol
+        std::cerr << log_line << std::endl;
     }
     
     if (file_output_ && file_stream_) {
@@ -139,7 +137,7 @@ std::string Logger::level_to_string(Level level) const {
         case Level::DEBUG: return "DEBUG";
         case Level::INFO:  return "INFO ";
         case Level::WARN:  return "WARN ";
-        case Level::ERROR: return "ERROR";
+        case Level::ERR: return "ERROR";
         default:           return "UNKNOWN";
     }
 }
