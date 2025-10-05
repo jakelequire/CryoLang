@@ -115,6 +115,9 @@ private:
     bool setup_server_socket();
     bool accept_client_connection();
     void cleanup_sockets();
+    bool read_headers(size_t& content_length);
+    std::optional<std::string> read_content(size_t length);
+    bool write_response(const std::string& content);
     
     int port_;
     int server_socket_;

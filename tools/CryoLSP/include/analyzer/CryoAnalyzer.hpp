@@ -108,6 +108,7 @@ namespace CryoLSP
 
         // Simple analysis helpers
         std::string getWordAtPosition(const std::string &content, const Position &position);
+        std::string getLineAtPosition(const std::string &content, const Position &position);
         HoverInfo analyzeSimpleSymbol(const std::string &word, const std::string &content, const Position &position);
         bool isVariableDeclaration(const std::string &word, const std::string &content, const Position &position);
         std::string getVariableType(const std::string &word, const std::string &content, const Position &position);

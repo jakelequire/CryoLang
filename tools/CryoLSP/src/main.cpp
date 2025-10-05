@@ -1,5 +1,6 @@
 #include "LanguageServer.hpp"
 #include "Transport.hpp"
+#include "TcpTransport.hpp"
 #include "Logger.hpp"
 #include <iostream>
 #include <memory>
@@ -70,11 +71,38 @@ int main(int argc, char *argv[])
 
         logger.set_file_output(log_file); // Write to log file
         logger.set_console_output(false); // Disable console output (interferes with LSP stdio)
-        logger.info("LSP", "Starting CryoLSP Language Server");
+        logger.info("LSP", "==== CryoLSP Language Server Starting ====");
+        logger.info("LSP", "Version: Debug Build");
         logger.info("LSP", "Log file: " + log_file);
+        logger.info("LSP", "Command line args: " + std::to_string(argc));
+        for (int i = 0; i < argc; i++) {
+            logger.info("LSP", "  arg[" + std::to_string(i) + "]: " + std::string(argv[i]));
+        }
+        logger.info("LSP", "Working directory: " + std::filesystem::current_path().string());
+        logger.info("LSP", "Waiting for VS Code initialize request...");
 
-        // Create transport (stdio by default)
-        auto transport = std::make_unique<StdioTransport>();
+        // Debug: Create a file to prove the server process actually started
+        try {
+            std::ofstream debug_file("c:\\Programming\\apps\\CryoLang\\logs\\server_started.txt");
+            debug_file << "CryoLSP server started at " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << std::endl;
+            debug_file.close();
+            logger.info("LSP", "Debug file created: server_started.txt");
+        } catch (...) {
+            logger.error("LSP", "Failed to create debug file");
+        }
+
+        // Create transport based on command line arguments
+        auto config = TransportFactory::parse_config(argc, argv);
+        auto transport = TransportFactory::create_from_config(config);
+
+        if (config.type == TransportFactory::TransportConfig::Socket)
+        {
+            logger.info("LSP", "Using TCP socket transport on port " + std::to_string(config.socket_port));
+        }
+        else
+        {
+            logger.info("LSP", "Using stdio transport");
+        }
 
         // Create and run the language server
         LanguageServer server(std::move(transport));

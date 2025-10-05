@@ -72,6 +72,18 @@ $(LSP_BIN_DIR)/$(LSP_TARGET): $(LSP_OBJECTS) $(COMPILER_LIB)
 	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJECTS) $(COMPILER_LIB) $(LSP_LIBS) -o $@ $(LDFLAGS) $(SOCKET_LIBS)
 	@echo "✓ CryoLSP built successfully: $(LSP_BIN_DIR)/$(LSP_TARGET)"
 
+# TCP version target
+tcp: $(LSP_BIN_DIR)/cryo-lsp-tcp$(BIN_SUFFIX)
+
+# TCP version objects (exclude main.o, include main_tcp.o and TcpTransport.o)
+LSP_TCP_OBJECTS = $(filter-out $(LSP_OBJ_DIR)/main.o,$(LSP_OBJECTS)) $(LSP_OBJ_DIR)/main_tcp.o $(LSP_OBJ_DIR)/transport/TcpTransport.o
+
+# Build TCP version
+$(LSP_BIN_DIR)/cryo-lsp-tcp$(BIN_SUFFIX): $(LSP_OBJ_DIR)/main_tcp.o $(LSP_OBJ_DIR)/transport/TcpTransport.o $(filter-out $(LSP_OBJ_DIR)/main.o,$(LSP_OBJECTS)) $(COMPILER_LIB)
+	@echo "Linking CryoLSP TCP..."
+	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJ_DIR)/main_tcp.o $(LSP_OBJ_DIR)/transport/TcpTransport.o $(filter-out $(LSP_OBJ_DIR)/main.o,$(LSP_OBJECTS)) $(COMPILER_LIB) $(LSP_LIBS) -o $@ $(LDFLAGS) $(SOCKET_LIBS)
+	@echo "✓ CryoLSP TCP built successfully: $(LSP_BIN_DIR)/cryo-lsp-tcp$(BIN_SUFFIX)"
+
 
 
 # Clean LSP build artifacts
@@ -91,10 +103,12 @@ help:
 	@echo "CryoLSP Build System"
 	@echo "===================="
 	@echo "Targets:"
-	@echo "  all     - Build the CryoLSP server (default)"
+	@echo "  all     - Build the CryoLSP server (default, stdio transport)"
+	@echo "  tcp     - Build the CryoLSP TCP server (TCP socket transport)"
 	@echo "  clean   - Clean LSP build artifacts"
 	@echo "  help    - Show this help message"
 	@echo ""
 	@echo "Output:"
-	@echo "  Binary: $(LSP_BIN_DIR)/$(LSP_TARGET)"
+	@echo "  Stdio Binary: $(LSP_BIN_DIR)/$(LSP_TARGET)"
+	@echo "  TCP Binary: $(LSP_BIN_DIR)/cryo-lsp-tcp$(BIN_SUFFIX)"
 	@echo "  Objects: $(LSP_OBJ_DIR)/"

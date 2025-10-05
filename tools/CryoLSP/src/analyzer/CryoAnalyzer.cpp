@@ -6,6 +6,7 @@
 #include <cstdlib>    // for std::getenv
 #include <functional> // for std::hash
 #include <chrono>     // for rate limiting
+#include <regex>      // for pattern matching
 
 using namespace CryoLSP;
 using namespace Cryo::LSP;
@@ -421,13 +422,70 @@ namespace CryoLSP
         return line.substr(start, end - start);
     }
 
+    std::string CryoAnalyzer::getLineAtPosition(const std::string &content, const Position &position)
+    {
+        std::istringstream stream(content);
+        std::string line;
+        int current_line = 0;
+
+        while (std::getline(stream, line) && current_line < position.line)
+        {
+            current_line++;
+        }
+
+        if (current_line == position.line)
+        {
+            return line;
+        }
+
+        return "";
+    }
+
     HoverInfo CryoAnalyzer::analyzeSimpleSymbol(const std::string &word, const std::string &content, const Position &position)
     {
         HoverInfo info;
         info.name = word;
 
-        // Fast fallback - don't do complex analysis that might be slow
-        // Just return basic info when symbol table lookup fails
+        // Try to extract type information from Cryo syntax patterns
+        std::string line = getLineAtPosition(content, position);
+        
+        // Pattern 1: Variable declaration "const/let/var name: type = value"
+        std::regex var_pattern(R"(\b(const|let|var)\s+)" + word + R"(\s*:\s*([^=\s]+))");
+        std::smatch var_match;
+        if (std::regex_search(line, var_match, var_pattern)) {
+            std::string type = var_match[2].str();
+            info.type = type;
+            info.kind = "variable";
+            info.signature = var_match[1].str() + " " + word + ": " + type;
+            Logger::instance().debug("CryoAnalyzer", "Found variable declaration: {} -> {}", word, type);
+            return info;
+        }
+        
+        // Pattern 2: Function declaration "function name(params) -> return_type"
+        std::regex func_pattern(R"(\bfunction\s+)" + word + R"(\s*\([^)]*\)\s*->\s*([^;{]+))");
+        std::smatch func_match;
+        if (std::regex_search(line, func_match, func_pattern)) {
+            std::string return_type = func_match[1].str();
+            // Trim whitespace
+            return_type.erase(return_type.find_last_not_of(" \t\n\r\f\v") + 1);
+            info.type = "function";
+            info.kind = "function";
+            info.signature = "function " + word + "() -> " + return_type;
+            Logger::instance().debug("CryoAnalyzer", "Found function declaration: {} -> {}", word, return_type);
+            return info;
+        }
+        
+        // Pattern 3: Function without return type "function name(params)"
+        std::regex func_simple_pattern(R"(\bfunction\s+)" + word + R"(\s*\([^)]*\))");
+        if (std::regex_search(line, func_simple_pattern)) {
+            info.type = "function";
+            info.kind = "function";
+            info.signature = "function " + word + "()";
+            Logger::instance().debug("CryoAnalyzer", "Found simple function declaration: {}", word);
+            return info;
+        }
+
+        // Fast fallback - basic hardcoded cases
         if (word == "main")
         {
             info.type = "function";

@@ -172,32 +172,140 @@ export function activate(context: vscode.ExtensionContext) {
 
         LOG.info('LanguageServer', 'Configuring server options for LSP communication');
 
-        // Use stdio communication (standard LSP mode)
-        const serverOptions: ServerOptions = {
-            run: {
-                command: serverCommand,
-                transport: TransportKind.stdio
-            },
-            debug: {
-                command: serverCommand,
-                transport: TransportKind.stdio
-            }
+        // Test server executable first
+        LOG.debug('LanguageServer', 'Testing server executable...');
+        try {
+            const testResult = await new Promise<string>((resolve, reject) => {
+                const testProcess = require('child_process').spawn(serverCommand, ['--version'], {
+                    stdio: ['pipe', 'pipe', 'pipe']
+                });
+                
+                let output = '';
+                testProcess.stdout.on('data', (data: Buffer) => {
+                    output += data.toString();
+                });
+                
+                testProcess.stderr.on('data', (data: Buffer) => {
+                    output += data.toString();
+                });
+                
+                testProcess.on('close', (code: number) => {
+                    LOG.debug('LanguageServer', `Test process exited with code: ${code}`);
+                    if (code === 0 || output.length > 0) {
+                        resolve(output);
+                    } else {
+                        reject(new Error(`Process exited with code ${code}`));
+                    }
+                });
+                
+                testProcess.on('error', (error: Error) => {
+                    reject(error);
+                });
+                
+                // Timeout after 5 seconds
+                setTimeout(() => {
+                    testProcess.kill();
+                    reject(new Error('Test timeout'));
+                }, 5000);
+            });
+            
+            LOG.debug('LanguageServer', 'Server executable test result: ' + testResult);
+        } catch (error) {
+            LOG.error('LanguageServer', 'Server executable test failed: ' + String(error));
+            // Continue anyway - server might not support --version
+        }
+
+        // Use TCP socket communication to avoid stdio pipe issues
+        const LSP_PORT = 8080;
+        
+        // First start the LSP server manually with socket transport
+        LOG.info('LanguageServer', `Starting LSP server with socket transport on port ${LSP_PORT}`);
+        
+        const serverOptions: ServerOptions = () => {
+            return new Promise((resolve, reject) => {
+                // Start the server process
+                const { spawn } = require('child_process');
+                const serverProcess = spawn(serverCommand, ['--socket', '--port', LSP_PORT.toString()], {
+                    stdio: 'pipe'
+                });
+                
+                serverProcess.on('error', (error: any) => {
+                    LOG.error('LanguageServer', `Failed to start server process: ${error}`);
+                    reject(error);
+                });
+                
+                // Wait a moment for server to start, then create socket connection
+                setTimeout(() => {
+                    const socket = net.connect(LSP_PORT, 'localhost');
+                    
+                    socket.on('connect', () => {
+                        LOG.info('LanguageServer', `Connected to LSP server on port ${LSP_PORT}`);
+                        resolve({
+                            reader: socket,
+                            writer: socket
+                        });
+                    });
+                    
+                    socket.on('error', (error: any) => {
+                        LOG.error('LanguageServer', `Socket connection failed: ${error}`);
+                        reject(error);
+                    });
+                }, 1000); // Wait 1 second for server to start
+            });
         };
 
-        // Client options - minimal configuration with restart disabled
+        LOG.debug('LanguageServer', 'Server options configured: ' + JSON.stringify({
+            command: serverCommand,
+            transport: 'socket',
+            port: LSP_PORT
+        }));
+
+        // Debug: Check if we can find the LSP server process after starting
+        async function checkLSPProcess(): Promise<void> {
+            try {
+                const { exec } = require('child_process');
+                const result = await new Promise<string>((resolve, reject) => {
+                    exec('tasklist /FI "IMAGENAME eq cryo-lsp.exe" /FO CSV', (error: any, stdout: string, stderr: string) => {
+                        if (error) {
+                            reject(error);
+                        } else {
+                            resolve(stdout);
+                        }
+                    });
+                });
+                
+                if (result.includes('cryo-lsp.exe')) {
+                    LOG.info('LanguageServer', 'LSP server process found running: ' + result.split('\n')[1]);
+                } else {
+                    LOG.error('LanguageServer', 'LSP server process NOT found in task list');
+                }
+            } catch (error) {
+                LOG.error('LanguageServer', 'Failed to check LSP process: ' + String(error));
+            }
+        }
+
+        // Client options - simplified configuration for better compatibility
         const clientOptions: LanguageClientOptions = {
             documentSelector: [
                 { scheme: 'file', language: 'cryo' }
             ],
-            // Disable automatic restart features but allow normal operation
+            // Simplified connection options
             connectionOptions: {
-                maxRestartCount: 0, // Disable auto-restart completely
-                cancellationStrategy: undefined
+                maxRestartCount: 0 // Disable auto-restart to prevent conflicts
             },
-            // Allow normal error recovery for hover and other features
+            // Standard error handler
             errorHandler: {
                 error: (error, message, count) => {
                     LOG.error('LanguageServer', `LSP Error (count: ${count}): ${error}, message: ${message}`);
+                    LOG.error('LanguageServer', `Error details: ${JSON.stringify(error)}`);
+                    
+                    // Log raw error information for debugging
+                    if (error && typeof error === 'object') {
+                        LOG.error('LanguageServer', `Error name: ${(error as any).name}`);
+                        LOG.error('LanguageServer', `Error message: ${(error as any).message}`);
+                        LOG.error('LanguageServer', `Error stack: ${(error as any).stack}`);
+                    }
+                    
                     // Only shutdown on repeated errors (more than 3)
                     if (count && count > 3) {
                         return { action: ErrorAction.Shutdown };
@@ -224,6 +332,8 @@ export function activate(context: vscode.ExtensionContext) {
         // Add event listeners for debugging and shutdown handling
         client.onDidChangeState((event) => {
             LOG.debug('LanguageServer', `Client state changed from ${event.oldState} to ${event.newState}`);
+            LOG.debug('LanguageServer', `State meanings: 1=Stopped, 2=Starting, 3=Running`);
+            LOG.debug('LanguageServer', `Current time: ${new Date().toISOString()}`);
 
             // If the client stops unexpectedly and we didn't initiate it, mark as stopped
             if (event.newState === 1 && !clientStopped) { // State 1 = Stopped
@@ -233,23 +343,80 @@ export function activate(context: vscode.ExtensionContext) {
             }
         });
 
-        // Show the output channel to make it visible
-        client.outputChannel.show();
+        // Add debugging for LSP lifecycle events
+        LOG.debug('LanguageServer', 'Setting up LSP lifecycle monitoring...');
+
+        // DO NOT show output channel - this can interfere with stdio transport
+        // client.outputChannel.show(); // REMOVED - potential stdio interference
         client.outputChannel.appendLine('=== Cryo Language Server Starting ===');
 
         try {
-            // Start the client - with timeout to prevent hanging
+            // Start the client and wait for initialization to complete
             LOG.info('LanguageServer', 'Starting Cryo Language Client...');
+            LOG.debug('LanguageServer', `Client instance created: ${!!client}`);
+            LOG.debug('LanguageServer', `Server command: ${serverCommand}`);
+            LOG.debug('LanguageServer', `Client initial state: ${client.state}`);
 
-            // Start client and handle initialization properly
-            LOG.info('LanguageServer', 'Client.start() promise created, starting asynchronously...');
-
-            // Start the client in background
-            client.start().then(() => {
-                LOG.info('LanguageServer', 'Client.start() completed successfully - LSP handshake complete');
-            }).catch(error => {
-                LOG.error('LanguageServer', 'Client.start() failed: ' + String(error));
+            // ALTERNATIVE APPROACH: Don't wait for client.start() promise
+            // VS Code LanguageClient start() promise seems to hang even when state=3
+            // Instead, monitor state changes and consider client ready when state=3
+            
+            LOG.info('LanguageServer', 'Starting client and monitoring state changes...');
+            LOG.debug('LanguageServer', `Starting client.start() at: ${new Date().toISOString()}`);
+            
+            // Track if client becomes ready via state change
+            let clientReady = false;
+            
+            // Monitor state changes - when state becomes 3, client is ready
+            const stateMonitor = client.onDidChangeState((event) => {
+                LOG.debug('LanguageServer', `State change during startup: ${event.oldState} -> ${event.newState}`);
+                if (event.newState === 3 && !clientReady) { // State 3 = Running
+                    LOG.info('LanguageServer', 'Client reached Running state - considering initialization complete');
+                    clientReady = true;
+                }
             });
+            
+            // Start the client (don't await the promise since it hangs)
+            const clientStartPromise = client.start().then(() => {
+                LOG.info('LanguageServer', 'Client.start() promise finally resolved');
+                return Promise.resolve();
+            }).catch((error: any) => {
+                LOG.error('LanguageServer', 'Client.start() promise rejected: ' + String(error));
+                throw error;
+            });
+            
+            // Wait for either:
+            // 1. Client state becomes 3 (Running) - indicates client is ready
+            // 2. 10 second timeout - if state never becomes 3
+            // 3. client.start() promise resolves (unlikely but possible)
+            
+            const stateReadyPromise = new Promise<void>((resolve, reject) => {
+                const checkInterval = setInterval(() => {
+                    if (clientReady || (client && client.state === 3)) {
+                        clearInterval(checkInterval);
+                        clearTimeout(timeout);
+                        stateMonitor.dispose();
+                        LOG.info('LanguageServer', 'Client ready via state monitoring');
+                        resolve();
+                    }
+                }, 100); // Check every 100ms
+                
+                const timeout = setTimeout(() => {
+                    clearInterval(checkInterval);
+                    stateMonitor.dispose();
+                    LOG.error('LanguageServer', 'Client state monitoring timeout after 10 seconds');
+                    LOG.error('LanguageServer', `Final client state: ${client?.state}`);
+                    reject(new Error('Client state monitoring timeout - client never reached Running state'));
+                }, 10000); // 10 second timeout
+            });
+            
+            LOG.debug('LanguageServer', 'Racing between state monitoring and promise resolution...');
+            
+            // Race between state monitoring and client start promise
+            await Promise.race([stateReadyPromise, clientStartPromise]);
+            
+            LOG.info('LanguageServer', 'Client initialization completed successfully');
+            LOG.debug('LanguageServer', `Final client state: ${client?.state || 'undefined'}`);
 
             // Don't register a custom hover provider - let the Language Client handle it automatically
             LOG.info('Extension', 'Letting Language Client handle hover requests automatically...');
@@ -262,11 +429,25 @@ export function activate(context: vscode.ExtensionContext) {
             }
 
             // Client started successfully
+            LOG.info('LanguageServer', 'Setting global client reference for hover provider...');
+            
+            // Ensure the global client reference is set for hover provider
+            if (client) {
+                LOG.debug('LanguageServer', 'Global client reference successfully set');
+                LOG.debug('LanguageServer', `Global client state: ${client.state}`);
+            } else {
+                LOG.error('LanguageServer', 'CRITICAL: Global client reference is null after successful start!');
+            }
             LOG.info('LanguageServer', 'Language client connected to LSP server');
 
             vscode.window.showInformationMessage('Cryo Language Server started');
 
             LOG.info('LanguageServer', 'Language client initialization complete');
+
+            // Debug: Check if LSP server process is actually running
+            setTimeout(async () => {
+                await checkLSPProcess();
+            }, 1000); // Wait 1 second for process to show up
 
             // Debug: Check if any .cryo files are currently open  
             const openDocuments = vscode.workspace.textDocuments.filter(doc => doc.languageId === 'cryo');
@@ -309,6 +490,100 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     context.subscriptions.push(onDidOpenTextDocument, onDidChangeActiveTextEditor);
+
+    // Add a hover provider for debugging - this will run even if LSP is not working
+    const debugHoverProvider = vscode.languages.registerHoverProvider('cryo', {
+        async provideHover(document, position, token) {
+            LOG.debug('HoverProvider', '=== HOVER REQUEST DETECTED ===');
+            LOG.debug('HoverProvider', `Document: ${document.fileName}`);
+            LOG.debug('HoverProvider', `Position: line ${position.line}, character ${position.character}`);
+            LOG.debug('HoverProvider', `Client state: ${client?.state || 'no client'}`);
+            
+            if (!client || client.state !== 3) {
+                LOG.info('HoverProvider', 'LSP client not ready - returning null for hover');
+                return null;
+            }
+            
+            LOG.debug('HoverProvider', 'LSP client is ready - attempting direct LSP hover request...');
+            
+            try {
+                // Try to send a direct hover request to the LSP server
+                const hoverRequest = {
+                    textDocument: {
+                        uri: document.uri.toString()
+                    },
+                    position: {
+                        line: position.line,
+                        character: position.character
+                    }
+                };
+                
+                LOG.debug('HoverProvider', 'Sending textDocument/hover request to LSP server...');
+                
+                // Add timeout to the LSP request since it might hang indefinitely
+                const timeoutPromise = new Promise<never>((_, reject) => {
+                    setTimeout(() => {
+                        reject(new Error('LSP hover request timeout after 3 seconds'));
+                    }, 3000);
+                });
+                
+                // Race between LSP request and timeout
+                const hoverResponse: any = await Promise.race([
+                    client.sendRequest('textDocument/hover', hoverRequest),
+                    timeoutPromise
+                ]);
+                
+                LOG.info('HoverProvider', 'Received hover response from LSP server: ' + JSON.stringify(hoverResponse));
+                
+                if (hoverResponse && hoverResponse.contents) {
+                    // Convert LSP hover response to VS Code hover
+                    const contents = Array.isArray(hoverResponse.contents) 
+                        ? hoverResponse.contents 
+                        : [hoverResponse.contents];
+                    
+                    return new vscode.Hover(contents.map((content: any) => {
+                        if (typeof content === 'string') {
+                            return content;
+                        } else if (content.value) {
+                            return new vscode.MarkdownString(content.value);
+                        }
+                        return String(content);
+                    }));
+                }
+                
+                // If no hover response, fall back to debug hover
+                LOG.info('HoverProvider', 'No hover response from LSP server, providing debug hover');
+                
+            } catch (error) {
+                LOG.error('HoverProvider', 'Failed to get hover from LSP server: ' + String(error));
+                LOG.debug('HoverProvider', 'Error details: ' + JSON.stringify(error));
+                
+                // Check if it's a timeout error specifically
+                if (String(error).includes('timeout')) {
+                    LOG.error('HoverProvider', 'LSP request timed out - server communication is broken');
+                } else {
+                    LOG.error('HoverProvider', 'LSP request failed with error: ' + String(error));
+                }
+            }
+            
+            // Fallback: Provide debug hover with LSP attempt status
+            const word = document.getText(document.getWordRangeAtPosition(position));
+            const testHover = new vscode.Hover([
+                `**CryoLang Debug Hover**`,
+                `Symbol: \`${word}\``,
+                `Position: Line ${position.line + 1}, Column ${position.character + 1}`,
+                `Client State: ${client.state} (Running)`,
+                `LSP Request: ⏱️ Request sent but timed out (server communication broken)`,
+                `---`,
+                `*Debug hover - LSP stdio pipe not working correctly.*`
+            ]);
+            
+            LOG.info('HoverProvider', `Providing debug hover for symbol: ${word}`);
+            return testHover;
+        }
+    });
+
+    context.subscriptions.push(debugHoverProvider);
 
     // Command to restart the language server (for development)
     const restartCommand = vscode.commands.registerCommand('cryo.restartLanguageServer', async () => {

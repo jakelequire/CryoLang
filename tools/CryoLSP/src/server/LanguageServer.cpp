@@ -40,8 +40,9 @@ namespace Cryo
                                                         result["capabilities"] = JsonValue(caps);
 
                                                         state = ServerState::Initialized;
-                                                        logger.info("LSP", "Server initialized and ready for requests (no initialized notification required)");
+                                                        logger.info("LSP", "Server initialized and ready for requests");
                                                         logger.info("LSP", "Capabilities configured: textDocumentSync=1, hoverProvider=true");
+                                                        logger.info("LSP", "VS Code compatibility: Server will accept requests immediately without waiting for 'initialized' notification");
                                                         return JsonValue(result);
                                                     });
 
@@ -112,10 +113,12 @@ namespace Cryo
                 try
                 {
                     iteration++;
-                    logger.debug("LSP", "Main loop iteration #" + std::to_string(iteration) + " - state: " + std::to_string(static_cast<int>(state)) + ", transport active: " + (transport->is_active() ? "true" : "false"));
+                    // Only log every 20th iteration to reduce spam when waiting for VS Code
+                    if (iteration % 20 == 0) {
+                        logger.debug("LSP", "Main loop iteration #" + std::to_string(iteration) + " - state: " + std::to_string(static_cast<int>(state)) + ", transport active: " + (transport->is_active() ? "true" : "false"));
+                    }
 
-                    // Read message from transport
-                    logger.debug("LSP", "Attempting to read message from transport...");
+                    // Read message from transport (don't log every attempt)
                     auto message = transport->read_message();
 
                     if (!message.has_value())
@@ -124,9 +127,12 @@ namespace Cryo
                         // No message or transport closed
                         if (transport->is_active())
                         {
-                            logger.debug("LSP", "Transport still active, continuing with delay");
-                            // Add a small delay to prevent busy-waiting
-                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            // Reduce logging frequency to prevent spam
+                            if (iteration % 10 == 0) {
+                                logger.debug("LSP", "Transport still active, continuing with delay (iteration " + std::to_string(iteration) + ")");
+                            }
+                            // Longer delay to prevent busy-waiting when VS Code sends no data
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
                             continue; // Try again
                         }
                         else
@@ -237,20 +243,27 @@ namespace Cryo
 
                 logger.info("LSP", "Hover request for " + uri + " at " + std::to_string(position.line) + ":" + std::to_string(position.character));
 
-                // TEMPORARY DEBUG: Return a minimal response using proper LSP Hover format
-                JsonObject contents;
-                contents["kind"] = JsonValue("plaintext");
-                contents["value"] = JsonValue("Simple test");
+                // Use DocumentManager to get real hover information
+                auto hover_result = documentManager->getHoverInfo(uri, position);
+                
+                if (hover_result.has_value()) {
+                    JsonObject contents;
+                    contents["kind"] = JsonValue("markdown");
+                    contents["value"] = JsonValue(hover_result->contents);
 
-                JsonObject result;
-                result["contents"] = JsonValue(contents);
+                    JsonObject result;
+                    result["contents"] = JsonValue(contents);
 
-                auto end_time = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-                logger.debug("LSP", "Hover request processed in " + std::to_string(duration.count()) + "ms");
+                    auto end_time = std::chrono::steady_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                    logger.debug("LSP", "Hover request processed successfully in " + std::to_string(duration.count()) + "ms");
+                    logger.info("LSP", "Returning hover info: " + hover_result->contents.substr(0, 100) + "...");
 
-                logger.info("LSP", "Returning minimal test response");
-                return JsonValue(result);
+                    return JsonValue(result);
+                } else {
+                    logger.info("LSP", "No hover information available for position");
+                    return JsonValue(); // null - no hover info
+                }
             }
             catch (const std::exception &e)
             {
