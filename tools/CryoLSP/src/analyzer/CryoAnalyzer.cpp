@@ -476,7 +476,7 @@ namespace CryoLSP
                 if (symbol)
                 {
                     Logger::instance().debug("CryoAnalyzer", "Found symbol '{}' in symbol table", word);
-                    return buildEnhancedHoverInfo(*symbol, !qualified_symbol.empty() ? qualified_symbol : word, file_path);
+                    return buildEnhancedHoverInfo(*symbol, !qualified_symbol.empty() ? qualified_symbol : word, file_path, analysis.compiler.get());
                 }
                 else
                 {
@@ -538,7 +538,8 @@ namespace CryoLSP
                     }
                     else if (typed_symbol)
                     {
-                        Logger::instance().debug("CryoAnalyzer", "Found symbol in TypeChecker but no function_node: '{}'", word);
+                        Logger::instance().debug("CryoAnalyzer", "Found symbol in TypeChecker but no function_node, falling back to SymbolTable lookup: '{}'", word);
+                        // Let the main SymbolTable lookup handle this case with the enhanced buildEnhancedHoverInfo
                     }
                     else
                     {
@@ -697,6 +698,131 @@ namespace CryoLSP
         
         Logger::instance().debug("CryoAnalyzer", "Extracted AST signature: '{}'", result);
         return result;
+    }
+
+    std::string CryoAnalyzer::extractParameterNamesFromAST(Cryo::FunctionDeclarationNode *function_node, const std::string &qualified_name)
+    {
+        if (!function_node) {
+            return "";
+        }
+        
+        std::vector<std::string> param_strs;
+        const auto &parameters = function_node->parameters();
+        
+        for (const auto &param : parameters) {
+            if (param) {
+                std::string param_name = param->name();
+                std::string param_type = param->type_annotation();
+                
+                // Format as "name: type"
+                param_strs.push_back(param_name + ": " + param_type);
+            }
+        }
+        
+        // Build complete signature with qualified name
+        std::string params = "";
+        if (!param_strs.empty()) {
+            params = param_strs[0];
+            for (size_t i = 1; i < param_strs.size(); ++i) {
+                params += ", " + param_strs[i];
+            }
+        }
+        
+        std::string return_type = function_node->return_type_annotation();
+        std::string result = "function " + qualified_name + "(" + params + ")";
+        
+        if (return_type != "void") {
+            result += " -> " + return_type;
+        }
+        
+        Logger::instance().debug("CryoAnalyzer", "Extracted AST signature with qualified name: '{}'", result);
+        return result;
+    }
+
+    Cryo::FunctionDeclarationNode* CryoAnalyzer::findFunctionInImportedModules(Cryo::CompilerInstance *compiler, const std::string &word, const std::string &qualified_symbol)
+    {
+        if (!compiler || !compiler->module_loader()) {
+            return nullptr;
+        }
+        
+        Logger::instance().debug("CryoAnalyzer", "Searching for function '{}' (qualified: '{}') in imported modules", word, qualified_symbol);
+        
+        // Get the imported ASTs from the ModuleLoader
+        const auto& imported_asts = compiler->module_loader()->get_imported_asts();
+        
+        Logger::instance().debug("CryoAnalyzer", "Found {} imported modules to search", imported_asts.size());
+        
+        for (const auto& [module_name, ast] : imported_asts) {
+            Logger::instance().debug("CryoAnalyzer", "Searching in module: '{}'", module_name);
+            
+            if (!ast) {
+                Logger::instance().debug("CryoAnalyzer", "Module '{}' has null AST", module_name);
+                continue;
+            }
+            
+            // Search for function declarations in this module
+            auto function_node = findFunctionInAST(ast.get(), word, qualified_symbol, module_name);
+            if (function_node) {
+                Logger::instance().debug("CryoAnalyzer", "Found function '{}' in module '{}'", word, module_name);
+                return function_node;
+            }
+        }
+        
+        Logger::instance().debug("CryoAnalyzer", "Function '{}' not found in any imported module", word);
+        return nullptr;
+    }
+
+    Cryo::FunctionDeclarationNode* CryoAnalyzer::findFunctionInAST(Cryo::ASTNode *node, const std::string &word, const std::string &qualified_symbol, const std::string &module_name)
+    {
+        if (!node) {
+            return nullptr;
+        }
+        
+        // Check if this is a function declaration node
+        if (auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(node)) {
+            std::string func_name = func_decl->name();
+            
+            // Try multiple matching strategies
+            bool matches = false;
+            
+            // 1. Direct name match
+            if (func_name == word) {
+                matches = true;
+                Logger::instance().debug("CryoAnalyzer", "Direct name match: '{}' == '{}'", func_name, word);
+            }
+            
+            // 2. Qualified name match (e.g., "IO::println" matches "println" in std::IO module)
+            if (!matches && !qualified_symbol.empty()) {
+                size_t pos = qualified_symbol.find_last_of("::");
+                if (pos != std::string::npos && pos > 1) {
+                    std::string function_part = qualified_symbol.substr(pos + 1);
+                    if (func_name == function_part) {
+                        std::string namespace_part = qualified_symbol.substr(0, pos - 1);
+                        // Check if this module corresponds to the namespace
+                        if (module_name.find(namespace_part) != std::string::npos || 
+                            module_name == "std::IO" && namespace_part == "IO") {
+                            matches = true;
+                            Logger::instance().debug("CryoAnalyzer", "Qualified match: '{}' in module '{}' for '{}'", func_name, module_name, qualified_symbol);
+                        }
+                    }
+                }
+            }
+            
+            if (matches) {
+                return func_decl;
+            }
+        }
+        
+        // For other node types, recursively search children
+        if (auto program = dynamic_cast<Cryo::ProgramNode*>(node)) {
+            for (const auto& stmt : program->statements()) {
+                if (auto result = findFunctionInAST(stmt.get(), word, qualified_symbol, module_name)) {
+                    return result;
+                }
+            }
+        }
+        
+        return nullptr;
     }
 
     HoverInfo CryoAnalyzer::analyzeSimplePattern(const std::string &content, const Position &position)
@@ -1959,7 +2085,7 @@ namespace CryoLSP
         return std::nullopt;
     }
 
-    HoverInfo CryoAnalyzer::buildEnhancedHoverInfo(const Cryo::Symbol &symbol, const std::string &word, const std::string &file_path)
+    HoverInfo CryoAnalyzer::buildEnhancedHoverInfo(const Cryo::Symbol &symbol, const std::string &word, const std::string &file_path, Cryo::CompilerInstance *compiler)
     {
         HoverInfo info;
 
@@ -2017,7 +2143,7 @@ namespace CryoLSP
         }
 
         // Build enhanced signature
-        info.signature = buildQualifiedSignature(symbol, file_path);
+        info.signature = buildQualifiedSignature(symbol, file_path, compiler);
 
         // Add documentation
         info.documentation = getSymbolDocumentation(symbol, word);
@@ -2032,7 +2158,7 @@ namespace CryoLSP
         return info;
     }
 
-    std::string CryoAnalyzer::buildQualifiedSignature(const Cryo::Symbol &symbol, const std::string &file_path)
+    std::string CryoAnalyzer::buildQualifiedSignature(const Cryo::Symbol &symbol, const std::string &file_path, Cryo::CompilerInstance *compiler)
     {
         std::string signature;
 
@@ -2056,9 +2182,28 @@ namespace CryoLSP
                         Logger::instance().debug("CryoAnalyzer", "Using extracted signature: '{}'", full_signature);
                         signature = full_signature;
                     } else {
-                        // Fallback to AST signature if text extraction fails
-                        Logger::instance().debug("CryoAnalyzer", "Source extraction failed, using AST signature");
-                        signature = "function " + qualified_name + symbol.data_type->to_string();
+                        // Try to find function in imported modules for parameter names
+                        Logger::instance().debug("CryoAnalyzer", "Source extraction failed, checking imported modules for '{}'", symbol.name);
+                        
+                        if (compiler) {
+                            auto imported_function_node = findFunctionInImportedModules(compiler, symbol.name, qualified_name);
+                            if (imported_function_node) {
+                                Logger::instance().debug("CryoAnalyzer", "Found function in imported modules, extracting parameter names");
+                                std::string ast_signature = extractParameterNamesFromAST(imported_function_node, qualified_name);
+                                if (!ast_signature.empty()) {
+                                    signature = ast_signature;
+                                } else {
+                                    Logger::instance().debug("CryoAnalyzer", "Failed to extract parameter names from AST, using fallback");
+                                    signature = "function " + qualified_name + symbol.data_type->to_string();
+                                }
+                            } else {
+                                Logger::instance().debug("CryoAnalyzer", "Function not found in imported modules, using AST signature");
+                                signature = "function " + qualified_name + symbol.data_type->to_string();
+                            }
+                        } else {
+                            Logger::instance().debug("CryoAnalyzer", "No compiler instance available, using AST signature as fallback");
+                            signature = "function " + qualified_name + symbol.data_type->to_string();
+                        }
                     }
                 }
                 else
@@ -2291,7 +2436,7 @@ namespace CryoLSP
         auto symbol = findQualifiedSymbol(*analysis.compiler->symbol_table(), qualified_name);
         if (symbol && symbol.value())
         {
-            return buildEnhancedHoverInfo(*symbol.value(), qualified_name, file_path);
+            return buildEnhancedHoverInfo(*symbol.value(), qualified_name, file_path, analysis.compiler.get());
         }
 
         return std::nullopt;
@@ -2322,7 +2467,8 @@ namespace CryoLSP
             return symbols;
         }
 
-        const auto &symbol_table = *analyzed_files_[file_path].compiler->symbol_table();
+        const auto &analysis = analyzed_files_[file_path];
+        const auto &symbol_table = *analysis.compiler->symbol_table();
 
         try
         {
@@ -2332,7 +2478,7 @@ namespace CryoLSP
                 const auto &global_symbols = symbol_table.get_symbols();
                 for (const auto &[name, symbol] : global_symbols)
                 {
-                    symbols.push_back(buildEnhancedHoverInfo(symbol, name, file_path));
+                    symbols.push_back(buildEnhancedHoverInfo(symbol, name, file_path, analysis.compiler.get()));
                 }
             }
             else
@@ -2344,7 +2490,7 @@ namespace CryoLSP
                 {
                     for (const auto &[name, symbol] : ns_it->second)
                     {
-                        symbols.push_back(buildEnhancedHoverInfo(symbol, name, file_path));
+                        symbols.push_back(buildEnhancedHoverInfo(symbol, name, file_path, analysis.compiler.get()));
                     }
                 }
             }

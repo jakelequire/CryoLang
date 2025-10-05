@@ -147,35 +147,37 @@ namespace CryoLSP
         Position convertSourceLocationToPosition(const Cryo::SourceLocation &loc);
 
         // Enhanced hover info construction
-        HoverInfo buildEnhancedHoverInfo(const Cryo::Symbol &symbol, const std::string &word, const std::string &file_path);
+        // Enhanced hover info building with compiler context
+        HoverInfo buildEnhancedHoverInfo(const Cryo::Symbol &symbol, const std::string &word, const std::string &file_path, Cryo::CompilerInstance *compiler = nullptr);
         
         // Function signature extraction from source text
         std::string extractFunctionSignatureFromSource(const std::string &file_path, const std::string &function_name);
         std::string extractParameterNamesFromAST(Cryo::FunctionDeclarationNode *function_node);
-        std::string buildQualifiedSignature(const Cryo::Symbol &symbol, const std::string &file_path);
+        std::string extractParameterNamesFromAST(Cryo::FunctionDeclarationNode *function_node, const std::string &qualified_name);
+        std::string buildQualifiedSignature(const Cryo::Symbol &symbol, const std::string &file_path, Cryo::CompilerInstance *compiler = nullptr);
         std::string getSymbolDocumentation(const Cryo::Symbol &symbol, const std::string &symbol_name);
-
-        // AST helper methods
-        bool findVariableMutability(const std::string &file_path, const std::string &variable_name);
-        bool findVariableInAST(Cryo::ASTNode *node, const std::string &variable_name);
         
-        // Extract function signature from AST
+        // Find function AST nodes in imported modules
+        Cryo::FunctionDeclarationNode* findFunctionInImportedModules(Cryo::CompilerInstance *compiler, const std::string &word, const std::string &qualified_symbol);
+        
+        // Helper method to recursively search for function declarations in an AST
+        Cryo::FunctionDeclarationNode* findFunctionInAST(Cryo::ASTNode *node, const std::string &word, const std::string &qualified_symbol, const std::string &module_name);
+
+        // Additional methods that should be declared
         std::optional<FunctionSignature> extractFunctionFromAST(const Cryo::ProgramNode *ast, const Position &position);
-
-        // Fallback simple analysis when compiler analysis fails
         HoverInfo analyzeSimplePattern(const std::string &content, const Position &position);
-
-        // Simple analysis helpers
         std::string getWordAtPosition(const std::string &content, const Position &position);
         std::string getLineAtPosition(const std::string &content, const Position &position);
-        std::string extractQualifiedSymbolAtPosition(const std::string &line, const Position &position);
-        HoverInfo analyzeSimpleSymbol(const std::string &word, const std::string &content, const Position &position);
         std::string getPrimitiveTypeDocumentation(const std::string &type_name);
         std::string getKeywordDocumentation(const std::string &keyword);
         std::string getLiteralDocumentation(const std::string &literal, const std::string &content, const Position &position);
         std::string getBuiltinFunctionDocumentation(const std::string &function_name);
+        HoverInfo analyzeSimpleSymbol(const std::string &word, const std::string &content, const Position &position);
         bool isVariableDeclaration(const std::string &word, const std::string &content, const Position &position);
         std::string getVariableType(const std::string &word, const std::string &content, const Position &position);
+        bool findVariableMutability(const std::string &file_path, const std::string &variable_name);
+        bool findVariableInAST(Cryo::ASTNode *node, const std::string &variable_name);
+        std::string extractQualifiedSymbolAtPosition(const std::string &line, const Position &position);
     };
 
 } // namespace CryoLSP

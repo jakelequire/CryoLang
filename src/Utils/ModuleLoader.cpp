@@ -577,4 +577,9 @@ namespace Cryo
         std::cout << "[DEBUG] ModuleLoader: Finished registering templates from module: " << module_name << std::endl;
     }
 
+    const std::unordered_map<std::string, std::unique_ptr<ProgramNode>>& ModuleLoader::get_imported_asts() const
+    {
+        return _imported_asts;
+    }
+
 } // namespace Cryo

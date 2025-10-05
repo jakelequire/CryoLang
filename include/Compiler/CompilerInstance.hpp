@@ -96,6 +96,7 @@ namespace Cryo
         TypeChecker *type_checker() const { return _type_checker.get(); }
         Cryo::Codegen::CodeGenerator *codegen() const { return _codegen.get(); }
         Cryo::Linker::CryoLinker *linker() const { return _linker.get(); }
+        ModuleLoader *module_loader() const { return _module_loader.get(); }
 
         // Standard library linking control
         void set_stdlib_linking(bool enable) { _stdlib_linking_enabled = enable; }
