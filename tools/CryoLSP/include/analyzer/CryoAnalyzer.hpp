@@ -12,6 +12,7 @@
 #include "Parser/Parser.hpp"
 #include "Lexer/lexer.hpp"
 #include "Utils/file.hpp"
+#include "GDM/GDM.hpp" // For diagnostic support
 
 #include <string>
 #include <optional>
@@ -19,6 +20,8 @@
 #include <unordered_map>
 #include <vector>
 #include <map>
+#include <chrono>
+#include <regex>
 
 namespace CryoLSP
 {
@@ -32,6 +35,10 @@ namespace CryoLSP
         std::string kind;
         std::string signature;
         std::string documentation;
+        std::string scope;          // Full scope path (e.g., "std::IO")
+        std::string qualified_name; // Full qualified name (e.g., "std::IO::println")
+        Position definition_location;
+        bool has_errors = false;    // Whether symbol has compilation errors
     };
 
     struct FunctionSignature
@@ -40,7 +47,20 @@ namespace CryoLSP
         std::string return_type;
         std::vector<std::pair<std::string, std::string>> parameters; // name, type
         std::string documentation;
+        std::string scope;
+        std::string qualified_name;
         Position definition_location;
+    };
+
+    // LSP Diagnostic compatible with VS Code
+    struct LSPDiagnostic
+    {
+        Position start;
+        Position end;
+        std::string message;
+        std::string severity; // "error", "warning", "info", "hint"
+        std::string source;   // "cryo-lsp"
+        std::string code;     // Error code if available
     };
 
     // File analysis results with full compiler integration
@@ -50,8 +70,10 @@ namespace CryoLSP
         std::unique_ptr<Cryo::CompilerInstance> compiler;
         std::string content;
         bool parsed_successfully;
+        std::vector<LSPDiagnostic> diagnostics; // Compilation errors/warnings
+        std::chrono::steady_clock::time_point last_analyzed;
 
-        FileAnalysis() : ast(nullptr), parsed_successfully(false) {}
+        FileAnalysis() : ast(nullptr), parsed_successfully(false), last_analyzed(std::chrono::steady_clock::now()) {}
     };
 
     class CryoAnalyzer
@@ -77,6 +99,15 @@ namespace CryoLSP
         std::vector<HoverInfo> getStructMembers(const std::string &file_path, const std::string &struct_name);
         std::optional<Position> getDefinitionLocation(const std::string &file_path, const Position &position);
 
+        // Diagnostic support
+        std::vector<LSPDiagnostic> getDiagnostics(const std::string &file_path);
+        void clearDiagnostics(const std::string &file_path);
+
+        // Scope-aware symbol resolution
+        std::optional<HoverInfo> getQualifiedSymbolInfo(const std::string &file_path, const std::string &qualified_name);
+        std::vector<std::string> getAvailableNamespaces(const std::string &file_path);
+        std::vector<HoverInfo> getAllSymbolsInScope(const std::string &file_path, const std::string &scope = "");
+
     private:
         // File analysis results per file (with full compiler instances)
         std::unordered_map<std::string, FileAnalysis> analyzed_files_;
@@ -97,9 +128,25 @@ namespace CryoLSP
         // Direct compiler-based analysis
         HoverInfo analyzeWithCompiler(const std::string &file_path, const Position &position);
 
-        // Extract symbol information from symbol table
+        // Enhanced symbol table search with scope support
         std::optional<Cryo::Symbol *> findSymbolInSymbolTable(const Cryo::SymbolTable &symbol_table, const std::string &symbol_name);
+        std::optional<Cryo::Symbol *> findQualifiedSymbol(const Cryo::SymbolTable &symbol_table, const std::string &qualified_name);
+        std::optional<Cryo::Symbol *> findSymbolWithImports(const Cryo::SymbolTable &symbol_table, const std::string &symbol_name, const std::vector<std::string> &imported_namespaces);
 
+        // Diagnostic extraction from compiler
+        std::vector<LSPDiagnostic> extractDiagnosticsFromCompiler(const Cryo::CompilerInstance &compiler);
+        LSPDiagnostic convertCryoDiagnosticToLSP(const Cryo::Diagnostic &diagnostic);
+        Position convertSourceLocationToPosition(const Cryo::SourceLocation &loc);
+
+        // Enhanced hover info construction
+        HoverInfo buildEnhancedHoverInfo(const Cryo::Symbol &symbol, const std::string &word, const std::string &file_path);
+        std::string buildQualifiedSignature(const Cryo::Symbol &symbol, const std::string &file_path);
+        std::string getSymbolDocumentation(const Cryo::Symbol &symbol, const std::string &symbol_name);
+
+        // AST helper methods
+        bool findVariableMutability(const std::string &file_path, const std::string &variable_name);
+        bool findVariableInAST(Cryo::ASTNode *node, const std::string &variable_name);
+        
         // Extract function signature from AST
         std::optional<FunctionSignature> extractFunctionFromAST(const Cryo::ProgramNode *ast, const Position &position);
 
@@ -109,7 +156,10 @@ namespace CryoLSP
         // Simple analysis helpers
         std::string getWordAtPosition(const std::string &content, const Position &position);
         std::string getLineAtPosition(const std::string &content, const Position &position);
+        std::string extractQualifiedSymbolAtPosition(const std::string &line, const Position &position);
         HoverInfo analyzeSimpleSymbol(const std::string &word, const std::string &content, const Position &position);
+        std::string getPrimitiveTypeDocumentation(const std::string &type_name);
+        std::string getBuiltinFunctionDocumentation(const std::string &function_name);
         bool isVariableDeclaration(const std::string &word, const std::string &content, const Position &position);
         std::string getVariableType(const std::string &word, const std::string &content, const Position &position);
     };

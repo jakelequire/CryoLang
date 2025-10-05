@@ -1,4 +1,5 @@
 #include "../../include/LanguageServer.hpp"
+#include "../../include/analyzer/CryoAnalyzer.hpp"
 #include <thread>
 #include <chrono>
 
@@ -341,6 +342,11 @@ namespace Cryo
                                        ", version: " + std::to_string(version) +
                                        ", text length: " + std::to_string(text.length()) + ")");
                 documentManager->didOpen(uri, languageId, version, text);
+                
+                // Publish diagnostics for Cryo files
+                if (languageId == "cryo") {
+                    publishDiagnostics(uri);
+                }
             }
             catch (const std::exception &e)
             {
@@ -380,6 +386,9 @@ namespace Cryo
                         {
                             std::string text = change.at("text").asString();
                             documentManager->didChange(uri, version, text);
+                            
+                            // Publish updated diagnostics
+                            publishDiagnostics(uri);
                         }
                     }
                 }
@@ -411,11 +420,113 @@ namespace Cryo
                 std::string uri = textDoc.at("uri").asString();
 
                 documentManager->didClose(uri);
+                
+                // Clear diagnostics when document is closed
+                clearDiagnostics(uri);
             }
             catch (const std::exception &e)
             {
                 logger.error("LSP", "Exception in handleDidClose: " + std::string(e.what()));
             }
+        }
+
+        // ========================================
+        // Diagnostic Support
+        // ========================================
+
+        void LanguageServer::publishDiagnostics(const std::string& uri) {
+            try {
+                logger.debug("LSP", "Publishing diagnostics for: " + uri);
+                
+                auto diagnostics = documentManager->getDiagnostics(uri);
+                auto notification = createDiagnosticNotification(uri, diagnostics);
+                
+                // Send the notification through transport
+                std::string message = notification.toString();
+                if (!transport->write_message(message)) {
+                    logger.error("LSP", "Failed to send diagnostic notification");
+                } else {
+                    logger.info("LSP", "Published " + std::to_string(diagnostics.size()) + " diagnostics for " + uri);
+                }
+            } catch (const std::exception& e) {
+                logger.error("LSP", "Exception in publishDiagnostics: " + std::string(e.what()));
+            }
+        }
+
+        void LanguageServer::clearDiagnostics(const std::string& uri) {
+            try {
+                logger.debug("LSP", "Clearing diagnostics for: " + uri);
+                
+                documentManager->clearDiagnostics(uri);
+                
+                // Send empty diagnostics to clear them in the client
+                std::vector<CryoLSP::LSPDiagnostic> empty_diagnostics;
+                auto notification = createDiagnosticNotification(uri, empty_diagnostics);
+                
+                std::string message = notification.toString();
+                if (!transport->write_message(message)) {
+                    logger.error("LSP", "Failed to send clear diagnostics notification");
+                } else {
+                    logger.info("LSP", "Cleared diagnostics for " + uri);
+                }
+            } catch (const std::exception& e) {
+                logger.error("LSP", "Exception in clearDiagnostics: " + std::string(e.what()));
+            }
+        }
+
+        JsonValue LanguageServer::createDiagnosticNotification(const std::string& uri, const std::vector<CryoLSP::LSPDiagnostic>& diagnostics) {
+            JsonObject notification;
+            notification["jsonrpc"] = JsonValue("2.0");
+            notification["method"] = JsonValue("textDocument/publishDiagnostics");
+            
+            JsonObject params;
+            params["uri"] = JsonValue(uri);
+            
+            // Convert CryoLSP diagnostics to LSP format
+            std::vector<JsonValue> lsp_diagnostics;
+            for (const auto& diag : diagnostics) {
+                JsonObject lsp_diag;
+                
+                // Range
+                JsonObject range;
+                JsonObject start;
+                start["line"] = JsonValue(diag.start.line);
+                start["character"] = JsonValue(diag.start.character);
+                JsonObject end;
+                end["line"] = JsonValue(diag.end.line);
+                end["character"] = JsonValue(diag.end.character);
+                range["start"] = JsonValue(start);
+                range["end"] = JsonValue(end);
+                lsp_diag["range"] = JsonValue(range);
+                
+                // Message
+                lsp_diag["message"] = JsonValue(diag.message);
+                
+                // Severity (1=Error, 2=Warning, 3=Information, 4=Hint)
+                int severity = 1; // Default to error
+                if (diag.severity == "error") severity = 1;
+                else if (diag.severity == "warning") severity = 2;
+                else if (diag.severity == "info") severity = 3;
+                else if (diag.severity == "hint") severity = 4;
+                lsp_diag["severity"] = JsonValue(severity);
+                
+                // Source
+                if (!diag.source.empty()) {
+                    lsp_diag["source"] = JsonValue(diag.source);
+                }
+                
+                // Code
+                if (!diag.code.empty()) {
+                    lsp_diag["code"] = JsonValue(diag.code);
+                }
+                
+                lsp_diagnostics.push_back(JsonValue(lsp_diag));
+            }
+            
+            params["diagnostics"] = JsonValue(lsp_diagnostics);
+            notification["params"] = JsonValue(params);
+            
+            return JsonValue(notification);
         }
 
     } // namespace LSP
