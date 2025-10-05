@@ -6,6 +6,7 @@
 #include <cstdlib>    // for std::getenv
 #include <functional> // for std::hash
 #include <chrono>     // for rate limiting
+#include <thread>     // for std::this_thread::sleep_for
 #include <regex>      // for pattern matching
 #include <unordered_map> // for documentation maps
 #include <filesystem> // for std::filesystem::exists
@@ -119,6 +120,33 @@ namespace CryoLSP
             
             Logger::instance().debug("CryoAnalyzer", "Created compiler instance with stdlib support for: {}", file_path);
 
+            // Enhanced crash protection: Try compilation with comprehensive error handling
+            bool should_skip_compilation = false;
+            std::string skip_reason = "";
+            
+            // Check file size first (files over 50KB are more likely to cause issues)
+            if (content.size() > 50000) {
+                should_skip_compilation = true;
+                skip_reason = "File too large (" + std::to_string(content.size()) + " bytes)";
+            }
+            
+            if (should_skip_compilation) {
+                Logger::instance().warn("CryoAnalyzer", "Skipping compilation for: {} - {}", file_path, skip_reason);
+                analysis.parsed_successfully = false;
+                
+                // Add a diagnostic explaining why we skipped it
+                LSPDiagnostic skip_diag;
+                skip_diag.start = {0, 0};
+                skip_diag.end = {0, 0};
+                skip_diag.message = "File skipped: " + skip_reason + " (basic hover still available)";
+                skip_diag.severity = "info";
+                skip_diag.source = "cryo-lsp";
+                skip_diag.code = "skip_compilation";
+                analysis.diagnostics.push_back(skip_diag);
+                
+                return true; // Return true to allow basic hover to work
+            }
+
             // Create a temporary file in the system temp directory
             std::string temp_dir;
             const char *temp_env = std::getenv("TMPDIR"); // Linux/macOS
@@ -156,12 +184,12 @@ namespace CryoLSP
             
             try
             {
-                Logger::instance().debug("CryoAnalyzer", "Starting compilation of: {}", file_path);
+                Logger::instance().debug("CryoAnalyzer", "Starting compilation with enhanced protection for: {}", file_path);
                 
-                // Add timeout protection - if compilation takes more than 10 seconds, abort
-                const auto COMPILATION_TIMEOUT = std::chrono::seconds(10);
+                // Add timeout protection - if compilation takes more than 5 seconds, abort
+                const auto COMPILATION_TIMEOUT = std::chrono::seconds(5);
                 
-                // Parse the file using the frontend-only compiler mode (no codegen)
+                // Attempt compilation in a controlled manner
                 compilation_success = analysis.compiler->compile_frontend_only(temp_file);
                 
                 auto elapsed = std::chrono::steady_clock::now() - start_time;
@@ -171,9 +199,14 @@ namespace CryoLSP
                         std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
                     compilation_success = false;
                 }
+                else if (compilation_success)
+                {
+                    Logger::instance().debug("CryoAnalyzer", "Compilation completed successfully in {}ms for: {}", 
+                        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), file_path);
+                }
                 else
                 {
-                    Logger::instance().debug("CryoAnalyzer", "Compilation completed in {}ms for: {}", 
+                    Logger::instance().debug("CryoAnalyzer", "Compilation failed but process completed safely in {}ms for: {}", 
                         std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), file_path);
                 }
 
@@ -244,34 +277,70 @@ namespace CryoLSP
             {
                 Logger::instance().error("CryoAnalyzer", "Memory allocation error during compilation of {}: {}", file_path, e.what());
                 analysis.parsed_successfully = false;
+                
+                // Add specific diagnostic for memory issues
+                LSPDiagnostic memory_diag;
+                memory_diag.start = {0, 0};
+                memory_diag.end = {0, 0};
+                memory_diag.message = "Compilation failed: Out of memory";
+                memory_diag.severity = "error";
+                memory_diag.source = "cryo-lsp";
+                memory_diag.code = "memory_error";
+                analysis.diagnostics.push_back(memory_diag);
             }
             catch (const std::runtime_error &e)
             {
                 Logger::instance().error("CryoAnalyzer", "Runtime error during compilation of {}: {}", file_path, e.what());
                 analysis.parsed_successfully = true; // Allow fallback hover
+                
+                // Add specific diagnostic for runtime issues
+                LSPDiagnostic runtime_diag;
+                runtime_diag.start = {0, 0};
+                runtime_diag.end = {0, 0};
+                runtime_diag.message = "Compilation warning: " + std::string(e.what()) + " (basic hover available)";
+                runtime_diag.severity = "warning";
+                runtime_diag.source = "cryo-lsp";
+                runtime_diag.code = "runtime_error";
+                analysis.diagnostics.push_back(runtime_diag);
             }
             catch (const std::exception &e)
             {
                 Logger::instance().error("CryoAnalyzer", "Exception during compilation of {}: {}", file_path, e.what());
                 analysis.parsed_successfully = true; // Allow fallback hover
 
-                // Add the exception as a diagnostic
-                if (analysis.diagnostics.empty())
-                {
-                    LSPDiagnostic error_diag;
-                    error_diag.start = {0, 0};
-                    error_diag.end = {0, 0};
-                    error_diag.message = "Compilation error: " + std::string(e.what());
+                // Add more informative diagnostic based on error type
+                LSPDiagnostic error_diag;
+                error_diag.start = {0, 0};
+                error_diag.end = {0, 0};
+                std::string error_msg = std::string(e.what());
+                if (error_msg.find("symbol") != std::string::npos || error_msg.find("undefined") != std::string::npos) {
+                    error_diag.message = "Symbol resolution issue: " + error_msg;
+                    error_diag.severity = "warning";
+                } else if (error_msg.find("syntax") != std::string::npos || error_msg.find("parse") != std::string::npos) {
+                    error_diag.message = "Syntax error: " + error_msg;
                     error_diag.severity = "error";
-                    error_diag.source = "cryo-lsp";
-                    error_diag.code = "compilation_error";
-                    analysis.diagnostics.push_back(error_diag);
+                } else {
+                    error_diag.message = "Compilation issue: " + error_msg + " (basic hover still available)";
+                    error_diag.severity = "warning";
                 }
+                error_diag.source = "cryo-lsp";
+                error_diag.code = "compilation_error";
+                analysis.diagnostics.push_back(error_diag);
             }
             catch (...)
             {
                 Logger::instance().error("CryoAnalyzer", "Unknown exception during compilation of: {}", file_path);
                 analysis.parsed_successfully = false;
+                
+                // Add diagnostic for unknown errors
+                LSPDiagnostic unknown_diag;
+                unknown_diag.start = {0, 0};
+                unknown_diag.end = {0, 0};
+                unknown_diag.message = "Unknown compilation error (file may have syntax issues)";
+                unknown_diag.severity = "error";
+                unknown_diag.source = "cryo-lsp";
+                unknown_diag.code = "unknown_error";
+                analysis.diagnostics.push_back(unknown_diag);
             }
 
             // Clean up temporary file
@@ -470,6 +539,169 @@ namespace CryoLSP
         return info;
     }
 
+    std::optional<HoverInfo> CryoAnalyzer::getHoverInfoWithRetry(const std::string &file_path, const Position &position, int max_retries)
+    {
+        Logger::instance().debug("CryoAnalyzer", "Getting hover info with retry for {}:{},{} (max_retries: {})", file_path, position.line, position.character, max_retries);
+
+        // Try the normal hover info first
+        auto hover_result = getHoverInfo(file_path, position);
+        
+        if (hover_result.has_value() && !hover_result->name.empty())
+        {
+            Logger::instance().debug("CryoAnalyzer", "Hover succeeded on first attempt");
+            return hover_result;
+        }
+
+        // If first attempt failed, try reprocessing the document
+        for (int retry = 1; retry <= max_retries; retry++)
+        {
+            Logger::instance().info("CryoAnalyzer", "Hover attempt {} failed, trying retry {}/{}", retry - 1, retry, max_retries);
+            
+            // Force reprocess the document with fresh compiler instance
+            if (forceReprocessDocument(file_path))
+            {
+                Logger::instance().debug("CryoAnalyzer", "Document reprocessed successfully on retry {}", retry);
+                
+                // Try hover again after reprocessing
+                hover_result = getHoverInfo(file_path, position);
+                if (hover_result.has_value() && !hover_result->name.empty())
+                {
+                    Logger::instance().info("CryoAnalyzer", "Hover succeeded on retry {}", retry);
+                    return hover_result;
+                }
+            }
+            else
+            {
+                Logger::instance().warn("CryoAnalyzer", "Document reprocessing failed on retry {}", retry);
+            }
+
+            // Wait a bit before next retry (exponential backoff)
+            if (retry < max_retries)
+            {
+                int delay_ms = 100 * retry; // 100ms, 200ms, etc.
+                Logger::instance().debug("CryoAnalyzer", "Waiting {}ms before next retry", delay_ms);
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            }
+        }
+
+        Logger::instance().error("CryoAnalyzer", "All {} retry attempts failed for hover at {}:{},{}", max_retries, file_path, position.line, position.character);
+        
+        // Return empty result - don't provide fallback
+        return std::nullopt;
+    }
+
+    bool CryoAnalyzer::forceReprocessDocument(const std::string &file_path)
+    {
+        Logger::instance().info("CryoAnalyzer", "Force reprocessing document: {}", file_path);
+
+        // Check if we have the file content
+        if (file_contents_.find(file_path) == file_contents_.end())
+        {
+            Logger::instance().error("CryoAnalyzer", "Cannot reprocess document - no content available for: {}", file_path);
+            return false;
+        }
+
+        const std::string &content = file_contents_[file_path];
+
+        try
+        {
+            // Clean up any existing analysis for this file
+            if (analyzed_files_.count(file_path))
+            {
+                FileAnalysis &existing = analyzed_files_[file_path];
+                if (existing.compiler)
+                {
+                    Logger::instance().debug("CryoAnalyzer", "Cleaning up existing compiler instance for reprocessing");
+                    existing.compiler.reset();
+                }
+                analyzed_files_.erase(file_path);
+            }
+
+            // Force a fresh parse with a new temporary file to avoid any caching issues
+            Logger::instance().debug("CryoAnalyzer", "Creating fresh temporary file for reprocessing");
+            
+            // Create a unique temporary file with timestamp to ensure freshness
+            auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            
+            std::string temp_dir;
+            const char *temp_env = std::getenv("TEMP");
+            if (temp_env) {
+                temp_dir = std::string(temp_env);
+            } else {
+                temp_dir = "/tmp";
+            }
+            
+            std::string temp_file = temp_dir + "/cryo_lsp_retry_" + std::to_string(timestamp) + "_" + 
+                                   std::to_string(std::hash<std::string>{}(file_path)) + ".cryo";
+            
+            std::ofstream temp_out(temp_file);
+            if (!temp_out)
+            {
+                Logger::instance().error("CryoAnalyzer", "Failed to create temporary file for reprocessing: {}", temp_file);
+                return false;
+            }
+            temp_out << content;
+            temp_out.close();
+
+            // Create a completely fresh analysis entry
+            FileAnalysis &analysis = analyzed_files_[file_path];
+            analysis.content = content;
+            analysis.parsed_successfully = false;
+            analysis.diagnostics.clear();
+            analysis.last_analyzed = std::chrono::steady_clock::now();
+
+            // Create fresh compiler instance
+            analysis.compiler = Cryo::create_compiler_instance();
+            analysis.compiler->set_debug_mode(true);
+            analysis.compiler->set_stdlib_linking(true);
+            
+            Logger::instance().debug("CryoAnalyzer", "Created fresh compiler instance for reprocessing");
+
+            // Attempt compilation with timeout protection
+            bool compilation_success = false;
+            auto start_time = std::chrono::steady_clock::now();
+            
+            try
+            {
+                compilation_success = analysis.compiler->compile_frontend_only(temp_file);
+                auto elapsed = std::chrono::steady_clock::now() - start_time;
+                
+                if (elapsed > std::chrono::seconds(5)) // 5 second timeout for retry
+                {
+                    Logger::instance().warn("CryoAnalyzer", "Reprocessing timeout for: {}", file_path);
+                    compilation_success = false;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                Logger::instance().error("CryoAnalyzer", "Exception during reprocessing: {}", e.what());
+                compilation_success = false;
+            }
+
+            // Clean up temporary file
+            std::remove(temp_file.c_str());
+
+            if (compilation_success)
+            {
+                analysis.parsed_successfully = true;
+                Logger::instance().info("CryoAnalyzer", "Document reprocessing successful: {}", file_path);
+                return true;
+            }
+            else
+            {
+                Logger::instance().warn("CryoAnalyzer", "Document reprocessing failed: {}", file_path);
+                analysis.parsed_successfully = false;
+                return false;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            Logger::instance().error("CryoAnalyzer", "Exception during document reprocessing: {}", e.what());
+            return false;
+        }
+    }
+
     std::optional<std::string> CryoAnalyzer::getSymbolAtPosition(const std::string &file_path, const Position &position)
     {
         if (file_contents_.count(file_path))
@@ -605,6 +837,83 @@ namespace CryoLSP
         return (it != primitive_docs.end()) ? it->second : "";
     }
 
+    std::string CryoAnalyzer::getKeywordDocumentation(const std::string &keyword)
+    {
+        static const std::unordered_map<std::string, std::string> keyword_docs = {
+            // Declaration keywords
+            {"const", "Declares an immutable variable that cannot be changed after initialization. Use for values that remain constant throughout their lifetime."},
+            {"mut", "Declares a mutable variable that can be modified after initialization. Required for variables that need to change their value."},
+            {"function", "Declares a function. Functions are reusable blocks of code that can accept parameters and return values."},
+            {"type", "Declares a type alias or custom type definition. Used to create new type names or define structs, classes, enums, and traits."},
+            {"struct", "Declares a structured data type with named fields. Structs are value types stored on the stack by default."},
+            {"class", "Declares a class with data members and methods. Classes support inheritance and encapsulation with public/private access control."},
+            {"enum", "Declares an enumeration type. Enums can be simple value lists or complex algebraic data types with associated data."},
+            {"trait", "Declares a trait interface that defines a set of methods. Traits enable polymorphism and code reuse across different types."},
+            {"implement", "Implements methods for a type or trait. Used to define the actual behavior for structs, classes, enums, and trait implementations."},
+            {"namespace", "Declares a namespace to organize code and prevent naming conflicts. Provides logical grouping of related functionality."},
+            {"import", "Imports symbols from other modules or namespaces. Makes external functionality available in the current scope."},
+            {"export", "Exports symbols from the current module, making them available for import in other modules."},
+            
+            // Control flow keywords
+            {"if", "Conditional statement that executes code based on a boolean condition. Can be followed by 'else if' and 'else' clauses."},
+            {"else", "Alternative branch for 'if' statements. Executes when the if condition is false."},
+            {"while", "Loop that continues executing while a condition remains true. Condition is checked before each iteration."},
+            {"for", "Loop with initialization, condition, and increment. Commonly used for iterating over ranges or collections."},
+            {"do", "Part of a do-while loop construct. Executes the loop body at least once before checking the condition."},
+            {"break", "Exits the current loop immediately. Control transfers to the statement following the loop."},
+            {"continue", "Skips the rest of the current loop iteration and jumps to the next iteration."},
+            {"return", "Returns a value from a function and exits the function immediately. Functions with void return type can use 'return' without a value."},
+            {"match", "Pattern matching construct for examining and destructuring values. More powerful than switch statements."},
+            {"switch", "Multi-way conditional statement that compares a value against multiple cases."},
+            {"case", "Individual branch in a switch statement. Specifies a value to match against."},
+            {"default", "Fallback case in a switch statement. Executes when no other case matches."},
+            
+            // Type keywords (these are duplicated from primitive types but serve as keywords too)
+            {"int", "Integer type keyword. Declares variables of 64-bit signed integer type."},
+            {"i8", "8-bit signed integer type keyword."},
+            {"i16", "16-bit signed integer type keyword."},
+            {"i32", "32-bit signed integer type keyword."},
+            {"i64", "64-bit signed integer type keyword."},
+            {"uint", "Unsigned integer type keyword. Typically 64-bit unsigned integer."},
+            {"u8", "8-bit unsigned integer type keyword."},
+            {"u16", "16-bit unsigned integer type keyword."},
+            {"u32", "32-bit unsigned integer type keyword."},
+            {"u64", "64-bit unsigned integer type keyword."},
+            {"float", "32-bit floating point type keyword."},
+            {"f32", "32-bit floating point type keyword."},
+            {"f64", "64-bit floating point type keyword."},
+            {"double", "64-bit floating point type keyword."},
+            {"boolean", "Boolean type keyword for true/false values."},
+            {"char", "Character type keyword for single Unicode characters."},
+            {"string", "String type keyword for UTF-8 text."},
+            {"void", "Void type keyword indicating no return value from functions."},
+            
+            // Access modifier keywords
+            {"public", "Access modifier that makes members visible and accessible from outside the class or module."},
+            {"private", "Access modifier that restricts member access to within the same class only."},
+            {"protected", "Access modifier that allows access within the class and its derived classes."},
+            {"static", "Modifier for class-level members that belong to the type itself rather than instances."},
+            {"extern", "Declares external linkage, typically for interfacing with C libraries or other external code."},
+            {"inline", "Suggests to the compiler that function calls should be expanded inline for performance."},
+            {"virtual", "Enables dynamic dispatch for methods in inheritance hierarchies."},
+            {"override", "Explicitly marks a method as overriding a virtual method from a base class."},
+            {"abstract", "Marks classes or methods as abstract, requiring implementation in derived classes."},
+            {"final", "Prevents further inheritance of classes or overriding of methods."},
+            
+            // Special keywords
+            {"this", "Reference to the current instance within methods. Used to access instance members and distinguish from parameters."},
+            {"true", "Boolean literal value representing logical truth."},
+            {"false", "Boolean literal value representing logical falsehood."},
+            {"null", "Null pointer literal representing an invalid or uninitialized pointer."},
+            {"sizeof", "Operator that returns the size in bytes of a type or variable at compile time."},
+            {"new", "Memory allocation operator that creates objects on the heap and returns a pointer."},
+            {"intrinsic", "Marks functions as compiler intrinsics that map directly to low-level operations or CPU instructions."}
+        };
+        
+        auto it = keyword_docs.find(keyword);
+        return (it != keyword_docs.end()) ? it->second : "";
+    }
+
     std::string CryoAnalyzer::getBuiltinFunctionDocumentation(const std::string &function_name)
     {
         static const std::unordered_map<std::string, std::string> builtin_docs = {
@@ -631,6 +940,17 @@ namespace CryoLSP
             info.signature = word;
             info.documentation = primitive_docs;
             Logger::instance().debug("CryoAnalyzer", "Found primitive type: {} -> {}", word, primitive_docs.substr(0, 50) + "...");
+            return info;
+        }
+
+        // Check if this is a keyword
+        auto keyword_docs = getKeywordDocumentation(word);
+        if (!keyword_docs.empty()) {
+            info.type = "keyword";
+            info.kind = "keyword";
+            info.signature = word;
+            info.documentation = keyword_docs;
+            Logger::instance().debug("CryoAnalyzer", "Found keyword: {} -> {}", word, keyword_docs.substr(0, 50) + "...");
             return info;
         }
 

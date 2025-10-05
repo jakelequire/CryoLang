@@ -111,7 +111,8 @@ std::optional<HoverResult> DocumentManager::getHoverInfo(const std::string& uri,
         analyzer_pos.line = position.line;
         analyzer_pos.character = position.character;
         
-        auto hover_info = analyzer_->getHoverInfo(file_path, analyzer_pos);
+        // Use retry mechanism for better reliability
+        auto hover_info = analyzer_->getHoverInfoWithRetry(file_path, analyzer_pos, 2);
         if (hover_info) {
             // Clean, simple formatting showing just the signature
             std::string formatted_content = "```cryo\n" + hover_info->signature + "\n```";

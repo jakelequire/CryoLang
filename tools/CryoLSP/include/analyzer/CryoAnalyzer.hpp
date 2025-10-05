@@ -88,6 +88,12 @@ namespace CryoLSP
         // Get hover information for a position in a file
         std::optional<HoverInfo> getHoverInfo(const std::string &file_path, const Position &position);
 
+        // Get hover information with retry mechanism
+        std::optional<HoverInfo> getHoverInfoWithRetry(const std::string &file_path, const Position &position, int max_retries = 2);
+
+        // Force reprocess a document with fresh compiler instance
+        bool forceReprocessDocument(const std::string &file_path);
+
         // Get symbol at a specific position
         std::optional<std::string> getSymbolAtPosition(const std::string &file_path, const Position &position);
 
@@ -159,6 +165,8 @@ namespace CryoLSP
         std::string extractQualifiedSymbolAtPosition(const std::string &line, const Position &position);
         HoverInfo analyzeSimpleSymbol(const std::string &word, const std::string &content, const Position &position);
         std::string getPrimitiveTypeDocumentation(const std::string &type_name);
+        std::string getKeywordDocumentation(const std::string &keyword);
+        std::string getLiteralDocumentation(const std::string &literal, const std::string &content, const Position &position);
         std::string getBuiltinFunctionDocumentation(const std::string &function_name);
         bool isVariableDeclaration(const std::string &word, const std::string &content, const Position &position);
         std::string getVariableType(const std::string &word, const std::string &content, const Position &position);

@@ -484,7 +484,7 @@ value--;        // Decrement
 `const` `mut` `function` `type` `struct` `class` `enum` `trait` `implement` `namespace` `import` `export`
 
 ### Control Flow
-`if` `else` `elif` `while` `for` `do` `break` `continue` `return` `match` `switch` `case` `default`
+`if` `else` `while` `for` `do` `break` `continue` `return` `match` `switch` `case` `default`
 
 ### Types
 `int` `i8` `i16` `i32` `i64` `uint` `u8` `u16` `u32` `u64` `float` `f32` `f64` `double` `boolean` `char` `string` `void`
@@ -493,7 +493,7 @@ value--;        // Decrement
 `public` `private` `protected` `static` `extern` `inline` `virtual` `override` `abstract` `final`
 
 ### Special
-`this` `true` `false` `null` `sizeof` `new` `ref` `move` `copy` `intrinsic`
+`this` `true` `false` `null` `sizeof` `new` `intrinsic`
 
 ## Development Tools
 
