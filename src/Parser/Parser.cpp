@@ -91,7 +91,17 @@ namespace Cryo
                 _current_token = Token(TokenKind::TK_EOF, "", SourceLocation{});
                 break;
             }
-        } while (_current_token.is(TokenKind::TK_COMMENT)); // Skip comment tokens
+            
+            // Collect documentation comments for later attachment
+            if (_current_token.is(TokenKind::TK_DOC_COMMENT_BLOCK) || 
+                _current_token.is(TokenKind::TK_DOC_COMMENT_LINE))
+            {
+                _pending_doc_comments.push_back(std::string(_current_token.text()));
+            }
+            
+        } while (_current_token.is(TokenKind::TK_COMMENT) || 
+                 _current_token.is(TokenKind::TK_DOC_COMMENT_BLOCK) ||
+                 _current_token.is(TokenKind::TK_DOC_COMMENT_LINE)); // Skip all comment tokens
     }
 
     bool Parser::match(TokenKind kind)
@@ -758,6 +768,9 @@ namespace Cryo
         // Create function declaration early so we can add generic parameters
         auto func_decl = _builder.create_function_declaration(start_loc, func_name, "void", is_public);
 
+        // Attach documentation if available
+        attach_documentation(func_decl.get());
+
         // Parse optional generic parameters
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
@@ -850,6 +863,9 @@ namespace Cryo
 
         // Create function declaration with type information (extern functions are public by default)
         auto func_decl = _builder.create_function_declaration(start_loc, func_name, return_type->to_string(), true);
+
+        // Attach documentation if available
+        attach_documentation(func_decl.get());
 
         // Set variadic flag if detected
         func_decl->set_variadic(is_variadic);
@@ -2617,6 +2633,9 @@ namespace Cryo
 
         auto struct_decl = _builder.create_struct_declaration(start_loc, struct_name);
 
+        // Attach documentation if available
+        attach_documentation(struct_decl.get());
+
         // Parse optional generic parameters
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
@@ -2679,6 +2698,9 @@ namespace Cryo
         std::string class_name = std::string(name_token.text());
 
         auto class_decl = _builder.create_class_declaration(start_loc, class_name);
+
+        // Attach documentation if available
+        attach_documentation(class_decl.get());
 
         // Parse optional generic parameters
         if (_current_token.is(TokenKind::TK_L_ANGLE))
@@ -2778,6 +2800,9 @@ namespace Cryo
         std::string trait_name = std::string(name_token.text());
 
         auto trait_decl = _builder.create_trait_declaration(start_loc, trait_name);
+
+        // Attach documentation if available
+        attach_documentation(trait_decl.get());
 
         // Parse optional generic parameters
         if (_current_token.is(TokenKind::TK_L_ANGLE))
@@ -3000,7 +3025,12 @@ namespace Cryo
                 return nullptr;
             }
             advance();                                                                // consume semicolon
-            return _builder.create_type_alias_declaration(start_loc, alias_name, ""); // Empty target for forward decl
+            auto type_alias = _builder.create_type_alias_declaration(start_loc, alias_name, ""); // Empty target for forward decl
+            
+            // Attach documentation if available
+            attach_documentation(type_alias.get());
+            
+            return type_alias;
         }
 
         consume(TokenKind::TK_EQUAL, "Expected '=' in type alias");
@@ -3010,7 +3040,12 @@ namespace Cryo
 
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after type alias");
 
-        return _builder.create_type_alias_declaration(start_loc, alias_name, target_type, generic_params);
+        auto type_alias = _builder.create_type_alias_declaration(start_loc, alias_name, target_type, generic_params);
+        
+        // Attach documentation if available
+        attach_documentation(type_alias.get());
+        
+        return type_alias;
     }
 
     std::unique_ptr<EnumDeclarationNode> Parser::parse_enum_declaration()
@@ -3029,6 +3064,9 @@ namespace Cryo
         std::string enum_name = std::string(name_token.text());
 
         auto enum_decl = _builder.create_enum_declaration(start_loc, enum_name);
+
+        // Attach documentation if available
+        attach_documentation(enum_decl.get());
 
         // Parse generic parameters if present
         if (_current_token.is(TokenKind::TK_L_ANGLE))
@@ -3686,5 +3724,119 @@ namespace Cryo
         function_type += return_type;
 
         return function_type;
+    }
+
+    // ================================================================
+    // Documentation Comment Handling
+    // ================================================================
+
+    void Parser::collect_documentation_comments()
+    {
+        // This method is called automatically by advance() now
+        // Documentation comments are collected in _pending_doc_comments
+    }
+
+    std::string Parser::extract_documentation_text()
+    {
+        if (_pending_doc_comments.empty())
+        {
+            return "";
+        }
+
+        std::string result;
+        for (const auto& comment : _pending_doc_comments)
+        {
+            std::string processed = comment;
+            
+            // Process block comments (/** ... */)
+            if (processed.substr(0, 3) == "/**")
+            {
+                // Remove /** and */ and clean up formatting
+                processed = processed.substr(3);
+                if (processed.size() >= 2 && processed.substr(processed.size() - 2) == "*/")
+                {
+                    processed = processed.substr(0, processed.size() - 2);
+                }
+                
+                // Clean up whitespace and asterisks at line beginnings
+                std::istringstream iss(processed);
+                std::string line;
+                std::vector<std::string> lines;
+                
+                while (std::getline(iss, line))
+                {
+                    // Trim leading whitespace
+                    size_t start = line.find_first_not_of(" \t");
+                    if (start != std::string::npos)
+                    {
+                        line = line.substr(start);
+                        // Remove leading * if present
+                        if (!line.empty() && line[0] == '*')
+                        {
+                            line = line.substr(1);
+                            // Remove one space after * if present
+                            if (!line.empty() && line[0] == ' ')
+                            {
+                                line = line.substr(1);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        line = "";
+                    }
+                    lines.push_back(line);
+                }
+                
+                // Join lines with newlines, but remove empty lines at start/end
+                while (!lines.empty() && lines.front().empty())
+                {
+                    lines.erase(lines.begin());
+                }
+                while (!lines.empty() && lines.back().empty())
+                {
+                    lines.pop_back();
+                }
+                
+                for (size_t i = 0; i < lines.size(); ++i)
+                {
+                    if (i > 0) result += "\n";
+                    result += lines[i];
+                }
+            }
+            // Process line comments (/// ...)
+            else if (processed.substr(0, 3) == "///")
+            {
+                // Remove /// and optional space
+                processed = processed.substr(3);
+                if (!processed.empty() && processed[0] == ' ')
+                {
+                    processed = processed.substr(1);
+                }
+                
+                if (!result.empty())
+                {
+                    result += "\n";
+                }
+                result += processed;
+            }
+        }
+
+        // Clear processed comments
+        _pending_doc_comments.clear();
+        
+        return result;
+    }
+
+    void Parser::attach_documentation(DeclarationNode* node)
+    {
+        if (node && !_pending_doc_comments.empty())
+        {
+            std::string doc_text = extract_documentation_text();
+            if (!doc_text.empty())
+            {
+                node->set_documentation(doc_text);
+            }
+        }
     }
 }

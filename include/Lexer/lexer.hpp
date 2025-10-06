@@ -165,6 +165,7 @@ private:
     Token lex_string(char quote);
     Token lex_character();
     Token lex_comment();
+    Token lex_doc_comment();
     TokenKind lex_punctuator(char c);
     
     // Helper methods

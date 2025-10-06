@@ -147,8 +147,16 @@ namespace Cryo
 
     class DeclarationNode : public ASTNode // Separate from StatementNode
     {
+    private:
+        std::string _documentation; // Documentation comment associated with this declaration
+
     public:
         DeclarationNode(NodeKind kind, SourceLocation loc) : ASTNode(kind, loc) {}
+
+        // Documentation support
+        const std::string& documentation() const { return _documentation; }
+        void set_documentation(const std::string& doc) { _documentation = doc; }
+        bool has_documentation() const { return !_documentation.empty(); }
 
         void print(std::ostream &os, int indent = 0) const override
         {
