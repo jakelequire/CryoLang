@@ -89,17 +89,7 @@ namespace Cryo
             static int attempt_count = 0;
             attempt_count++;
             
-            try {
-                std::ofstream debug_file("c:\\Programming\\apps\\CryoLang\\logs\\read_attempts.txt", std::ios::app);
-                debug_file << "Attempt #" << attempt_count << " at " 
-                          << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() 
-                          << " - EOF: " << std::cin.eof() 
-                          << ", Fail: " << std::cin.fail() 
-                          << ", Good: " << std::cin.good() << std::endl;
-                debug_file.close();
-            } catch (...) {
-                // Ignore debug file errors
-            }
+            // Debug file logging disabled to reduce log spam
 
             // Check stdin state before reading
             if (std::cin.eof())

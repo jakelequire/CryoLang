@@ -162,12 +162,25 @@ namespace CryoLSP
         
         // Helper method to recursively search for function declarations in an AST
         Cryo::FunctionDeclarationNode* findFunctionInAST(Cryo::ASTNode *node, const std::string &word, const std::string &qualified_symbol, const std::string &module_name);
+        
+        // Methods for struct/class hover previews
+        Cryo::StructDeclarationNode* findStructDeclarationInAST(Cryo::ASTNode *node, const std::string &struct_name);
+        Cryo::ClassDeclarationNode* findClassDeclarationInAST(Cryo::ASTNode *node, const std::string &class_name);
+        std::string buildStructPreview(Cryo::StructDeclarationNode *struct_node, const std::string &qualified_name);
+        std::string buildClassPreview(Cryo::ClassDeclarationNode *class_node, const std::string &qualified_name);
+        
+        // Methods for member access analysis
+        std::string extractMemberAccessContext(const std::string &line, const Position &position);
+        HoverInfo analyzeMemberAccess(const FileAnalysis &analysis, const std::string &context, const std::string &member_name, const std::string &file_path);
 
         // Additional methods that should be declared
         std::optional<FunctionSignature> extractFunctionFromAST(const Cryo::ProgramNode *ast, const Position &position);
         HoverInfo analyzeSimplePattern(const std::string &content, const Position &position);
         std::string getWordAtPosition(const std::string &content, const Position &position);
         std::string getLineAtPosition(const std::string &content, const Position &position);
+        
+        // Comment detection
+        bool isPositionInComment(const std::string &content, const Position &position);
         std::string getPrimitiveTypeDocumentation(const std::string &type_name);
         std::string getKeywordDocumentation(const std::string &keyword);
         std::string getLiteralDocumentation(const std::string &literal, const std::string &content, const Position &position);

@@ -91,13 +91,13 @@ namespace CryoLSP
                 FileAnalysis &existing = analyzed_files_[file_path];
                 if (existing.content == content && existing.parsed_successfully)
                 {
-                    Logger::instance().debug("CryoAnalyzer", "File content unchanged, reusing existing analysis: {}", file_path);
+                    // File content unchanged, reusing analysis
                     return true;
                 }
                 // Content changed, cleanup old compiler instance before creating new one
                 if (existing.compiler)
                 {
-                    Logger::instance().debug("CryoAnalyzer", "Cleaning up previous compiler instance for: {}", file_path);
+                    // Cleaning up previous compiler instance
                     existing.compiler.reset();
                 }
             }
@@ -116,7 +116,6 @@ namespace CryoLSP
             analysis.compiler = Cryo::create_compiler_instance();
             
             // Configure the compiler for LSP use - enable stdlib linking
-            analysis.compiler->set_debug_mode(true);
             analysis.compiler->set_stdlib_linking(true); // Enable stdlib for imports like <io/stdio>
             
             Logger::instance().debug("CryoAnalyzer", "Created compiler instance with stdlib support for: {}", file_path);
@@ -202,8 +201,7 @@ namespace CryoLSP
                 }
                 else if (compilation_success)
                 {
-                    Logger::instance().debug("CryoAnalyzer", "Compilation completed successfully in {}ms for: {}", 
-                        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), file_path);
+                    // Compilation completed successfully
                 }
                 else
                 {
@@ -240,13 +238,13 @@ namespace CryoLSP
                                 try
                                 {
                                     const auto &namespaces = symbol_table->get_namespaces();
-                                    Logger::instance().debug("CryoAnalyzer", "Found {} namespaces in symbol table", namespaces.size());
+                                    // Found namespaces
                                     
                                     for (const auto &[ns_name, symbols] : namespaces)
                                     {
                                         if (!ns_name.empty() && symbols.size() < 1000) // Sanity check
                                         {
-                                            Logger::instance().debug("CryoAnalyzer", "Namespace '{}' contains {} symbols", ns_name, symbols.size());
+                                            // Namespace symbols available
                                         }
                                     }
                                 }
@@ -386,7 +384,14 @@ namespace CryoLSP
         }
         last_hover_time_ = now;
 
-        Logger::instance().debug("CryoAnalyzer", "Getting hover info for {}:{},{}", file_path, position.line, position.character);
+        // Hover request received
+
+        // Check if the position is within a comment - if so, don't show hover
+        if (file_contents_.count(file_path) && isPositionInComment(file_contents_[file_path], position))
+        {
+            Logger::instance().info("CryoAnalyzer", "*** COMMENT DETECTED *** Position {}:{} is within a comment, skipping hover", position.line, position.character);
+            return std::nullopt;
+        }
 
         // First try to get info from compiler analysis
         if (analyzed_files_.count(file_path) && analyzed_files_[file_path].parsed_successfully)
@@ -417,6 +422,12 @@ namespace CryoLSP
             return info;
         }
 
+        // Check if the position is within a comment
+        if (isPositionInComment(analysis.content, position))
+        {
+            return info;
+        }
+
         // Get word at position for symbol lookup
         std::string word = getWordAtPosition(analysis.content, position);
         if (word.empty())
@@ -426,9 +437,18 @@ namespace CryoLSP
 
         info.name = word;
 
-        // Check if this is a qualified symbol (contains ::)
+        // Check if this is a qualified symbol (contains :: or .)
         std::string line = getLineAtPosition(analysis.content, position);
         std::string qualified_symbol = extractQualifiedSymbolAtPosition(line, position);
+        
+        // Check if this is a member access pattern (object.method)
+        std::string member_access_context = extractMemberAccessContext(line, position);
+        if (!member_access_context.empty()) {
+            HoverInfo member_info = analyzeMemberAccess(analysis, member_access_context, word, file_path);
+            if (!member_info.name.empty()) {
+                return member_info;
+            }
+        }
         
         Logger::instance().debug("CryoAnalyzer", "Analyzing symbol '{}', qualified form: '{}', line: '{}'", word, qualified_symbol, line);
 
@@ -439,30 +459,16 @@ namespace CryoLSP
             {
                 Cryo::Symbol *symbol = nullptr;
 
-                // Debug: Log what namespaces are available
-                const auto &namespaces = analysis.compiler->symbol_table()->get_namespaces();
-                Logger::instance().debug("CryoAnalyzer", "Available namespaces: {}", namespaces.size());
-                for (const auto &[ns_name, symbols] : namespaces)
-                {
-                    Logger::instance().debug("CryoAnalyzer", "  Namespace '{}' has {} symbols", ns_name, symbols.size());
-                    for (const auto &[sym_name, sym] : symbols)
-                    {
-                        Logger::instance().debug("CryoAnalyzer", "    - '{}' ({})", sym_name, sym.scope);
-                    }
-                }
-
-                // First try qualified lookup if we have a qualified symbol
+                // Try qualified lookup if we have a qualified symbol
                 if (!qualified_symbol.empty() && qualified_symbol != word)
                 {
                     symbol = findQualifiedSymbol(*analysis.compiler->symbol_table(), qualified_symbol).value_or(nullptr);
-                    Logger::instance().debug("CryoAnalyzer", "Qualified lookup for '{}': {}", qualified_symbol, symbol ? "found" : "not found");
                 }
 
                 // If qualified lookup failed or we don't have a qualified symbol, try regular lookup
                 if (!symbol)
                 {
                     symbol = findSymbolInSymbolTable(*analysis.compiler->symbol_table(), word).value_or(nullptr);
-                    Logger::instance().debug("CryoAnalyzer", "Regular lookup for '{}': {}", word, symbol ? "found" : "not found");
                 }
 
                 // If still not found, try namespace-aware lookup with common imports
@@ -470,7 +476,6 @@ namespace CryoLSP
                 {
                     std::vector<std::string> common_imports = {"std", "io", "core", "runtime"};
                     symbol = findSymbolWithImports(*analysis.compiler->symbol_table(), word, common_imports).value_or(nullptr);
-                    Logger::instance().debug("CryoAnalyzer", "Import-aware lookup for '{}': {}", word, symbol ? "found" : "not found");
                 }
 
                 if (symbol)
@@ -745,30 +750,19 @@ namespace CryoLSP
             return nullptr;
         }
         
-        Logger::instance().debug("CryoAnalyzer", "Searching for function '{}' (qualified: '{}') in imported modules", word, qualified_symbol);
-        
-        // Get the imported ASTs from the ModuleLoader
         const auto& imported_asts = compiler->module_loader()->get_imported_asts();
         
-        Logger::instance().debug("CryoAnalyzer", "Found {} imported modules to search", imported_asts.size());
-        
         for (const auto& [module_name, ast] : imported_asts) {
-            Logger::instance().debug("CryoAnalyzer", "Searching in module: '{}'", module_name);
-            
             if (!ast) {
-                Logger::instance().debug("CryoAnalyzer", "Module '{}' has null AST", module_name);
                 continue;
             }
             
-            // Search for function declarations in this module
             auto function_node = findFunctionInAST(ast.get(), word, qualified_symbol, module_name);
             if (function_node) {
-                Logger::instance().debug("CryoAnalyzer", "Found function '{}' in module '{}'", word, module_name);
                 return function_node;
             }
         }
         
-        Logger::instance().debug("CryoAnalyzer", "Function '{}' not found in any imported module", word);
         return nullptr;
     }
 
@@ -788,7 +782,6 @@ namespace CryoLSP
             // 1. Direct name match
             if (func_name == word) {
                 matches = true;
-                Logger::instance().debug("CryoAnalyzer", "Direct name match: '{}' == '{}'", func_name, word);
             }
             
             // 2. Qualified name match (e.g., "IO::println" matches "println" in std::IO module)
@@ -802,7 +795,6 @@ namespace CryoLSP
                         if (module_name.find(namespace_part) != std::string::npos || 
                             module_name == "std::IO" && namespace_part == "IO") {
                             matches = true;
-                            Logger::instance().debug("CryoAnalyzer", "Qualified match: '{}' in module '{}' for '{}'", func_name, module_name, qualified_symbol);
                         }
                     }
                 }
@@ -825,9 +817,376 @@ namespace CryoLSP
         return nullptr;
     }
 
+    Cryo::StructDeclarationNode* CryoAnalyzer::findStructDeclarationInAST(Cryo::ASTNode *node, const std::string &struct_name)
+    {
+        if (!node) {
+            return nullptr;
+        }
+        
+        // Check if this is a struct declaration node
+        if (auto struct_decl = dynamic_cast<Cryo::StructDeclarationNode*>(node)) {
+            if (struct_decl->name() == struct_name) {
+                return struct_decl;
+            }
+        }
+        
+        // For program nodes, recursively search children
+        if (auto program = dynamic_cast<Cryo::ProgramNode*>(node)) {
+            for (const auto& stmt : program->statements()) {
+                if (auto result = findStructDeclarationInAST(stmt.get(), struct_name)) {
+                    return result;
+                }
+            }
+        }
+        
+        return nullptr;
+    }
+
+    Cryo::ClassDeclarationNode* CryoAnalyzer::findClassDeclarationInAST(Cryo::ASTNode *node, const std::string &class_name)
+    {
+        if (!node) {
+            return nullptr;
+        }
+        
+        // Check if this is a class declaration node
+        if (auto class_decl = dynamic_cast<Cryo::ClassDeclarationNode*>(node)) {
+            if (class_decl->name() == class_name) {
+                return class_decl;
+            }
+        }
+        
+        // For program nodes, recursively search children
+        if (auto program = dynamic_cast<Cryo::ProgramNode*>(node)) {
+            for (const auto& stmt : program->statements()) {
+                if (auto result = findClassDeclarationInAST(stmt.get(), class_name)) {
+                    return result;
+                }
+            }
+        }
+        
+        return nullptr;
+    }
+
+    std::string CryoAnalyzer::buildStructPreview(Cryo::StructDeclarationNode *struct_node, const std::string &qualified_name)
+    {
+        if (!struct_node) {
+            return "";
+        }
+        
+        std::string preview = "type struct " + qualified_name;
+        
+        // Add generic parameters if any
+        const auto& generics = struct_node->generic_parameters();
+        if (!generics.empty()) {
+            preview += "<";
+            for (size_t i = 0; i < generics.size(); ++i) {
+                if (i > 0) preview += ", ";
+                preview += generics[i]->name();
+            }
+            preview += ">";
+        }
+        
+        preview += " {\n";
+        
+        // Add fields (max 5 total items)
+        const auto& fields = struct_node->fields();
+        const auto& methods = struct_node->methods();
+        
+        int item_count = 0;
+        const int max_items = 5;
+        
+        // Prioritize constructors first
+        for (const auto& method : methods) {
+            if (item_count >= max_items) break;
+            if (method && method->is_constructor()) {
+                preview += "    " + method->name() + "(";
+                const auto& params = method->parameters();
+                for (size_t i = 0; i < params.size(); ++i) {
+                    if (i > 0) preview += ", ";
+                    preview += params[i]->name() + ": " + params[i]->type_annotation();
+                }
+                preview += ");\n";
+                item_count++;
+            }
+        }
+        
+        // Add fields next
+        for (const auto& field : fields) {
+            if (item_count >= max_items) break;
+            if (field) {
+                preview += "    " + field->name() + ": " + field->type_annotation() + ";\n";
+                item_count++;
+            }
+        }
+        
+        // Add non-constructor methods
+        for (const auto& method : methods) {
+            if (item_count >= max_items) break;
+            if (method && !method->is_constructor()) {
+                preview += "    " + method->name() + "(";
+                const auto& params = method->parameters();
+                for (size_t i = 0; i < params.size(); ++i) {
+                    if (i > 0) preview += ", ";
+                    preview += params[i]->name() + ": " + params[i]->type_annotation();
+                }
+                preview += ")";
+                if (method->return_type_annotation() != "void") {
+                    preview += " -> " + method->return_type_annotation();
+                }
+                preview += ";\n";
+                item_count++;
+            }
+        }
+        
+        if (fields.size() + methods.size() > max_items) {
+            preview += "    // ...\n";
+        }
+        
+        preview += "}";
+        
+        return preview;
+    }
+
+    std::string CryoAnalyzer::buildClassPreview(Cryo::ClassDeclarationNode *class_node, const std::string &qualified_name)
+    {
+        if (!class_node) {
+            return "";
+        }
+        
+        std::string preview = "type class " + qualified_name;
+        
+        // Add generic parameters if any
+        const auto& generics = class_node->generic_parameters();
+        if (!generics.empty()) {
+            preview += "<";
+            for (size_t i = 0; i < generics.size(); ++i) {
+                if (i > 0) preview += ", ";
+                preview += generics[i]->name();
+            }
+            preview += ">";
+        }
+        
+        // Add base class if any
+        if (!class_node->base_class().empty()) {
+            preview += " : " + class_node->base_class();
+        }
+        
+        preview += " {\n";
+        
+        // Add fields and methods (max 5 total items)
+        const auto& fields = class_node->fields();
+        const auto& methods = class_node->methods();
+        
+        int item_count = 0;
+        const int max_items = 5;
+        
+        // Prioritize constructors first
+        for (const auto& method : methods) {
+            if (item_count >= max_items) break;
+            if (method && method->is_constructor()) {
+                preview += "    " + method->name() + "(";
+                const auto& params = method->parameters();
+                for (size_t i = 0; i < params.size(); ++i) {
+                    if (i > 0) preview += ", ";
+                    preview += params[i]->name() + ": " + params[i]->type_annotation();
+                }
+                preview += ");\n";
+                item_count++;
+            }
+        }
+        
+        // Add fields next
+        for (const auto& field : fields) {
+            if (item_count >= max_items) break;
+            if (field) {
+                preview += "    " + field->name() + ": " + field->type_annotation() + ";\n";
+                item_count++;
+            }
+        }
+        
+        // Add non-constructor methods
+        for (const auto& method : methods) {
+            if (item_count >= max_items) break;
+            if (method && !method->is_constructor()) {
+                preview += "    " + method->name() + "(";
+                const auto& params = method->parameters();
+                for (size_t i = 0; i < params.size(); ++i) {
+                    if (i > 0) preview += ", ";
+                    preview += params[i]->name() + ": " + params[i]->type_annotation();
+                }
+                preview += ")";
+                if (method->return_type_annotation() != "void") {
+                    preview += " -> " + method->return_type_annotation();
+                }
+                preview += ";\n";
+                item_count++;
+            }
+        }
+        
+        if (fields.size() + methods.size() > max_items) {
+            preview += "    // ...\n";
+        }
+        
+        preview += "}";
+        
+        return preview;
+    }
+
+    std::string CryoAnalyzer::extractMemberAccessContext(const std::string &line, const Position &position)
+    {
+        // Check if we're hovering over a member access pattern like "object.member"
+        if (position.character >= static_cast<int>(line.length()) || position.character == 0) {
+            return "";
+        }
+        
+        // Look for a dot before the current position
+        int dot_pos = -1;
+        for (int i = position.character - 1; i >= 0; i--) {
+            char c = line[i];
+            if (c == '.') {
+                dot_pos = i;
+                break;
+            }
+            if (!std::isalnum(c) && c != '_') {
+                break; // Hit a non-identifier character before finding a dot
+            }
+        }
+        
+        if (dot_pos == -1) {
+            return ""; // No dot found
+        }
+        
+        // Extract the object name before the dot
+        int start = dot_pos - 1;
+        while (start >= 0) {
+            char c = line[start];
+            if (std::isalnum(c) || c == '_') {
+                start--;
+            } else {
+                break;
+            }
+        }
+        start++; // Move to the first character of the identifier
+        
+        if (start >= dot_pos) {
+            return ""; // No valid identifier before the dot
+        }
+        
+        return line.substr(start, dot_pos - start);
+    }
+
+    HoverInfo CryoAnalyzer::analyzeMemberAccess(const FileAnalysis &analysis, const std::string &context, const std::string &member_name, const std::string &file_path)
+    {
+        HoverInfo info;
+        
+        if (!analysis.compiler || !analysis.compiler->symbol_table()) {
+            return info;
+        }
+        
+        // First, find the type of the object being accessed
+        auto object_symbol = analysis.compiler->symbol_table()->lookup_symbol(context);
+        if (!object_symbol) {
+            return info;
+        }
+        
+        // Get the type information
+        if (!object_symbol->data_type) {
+            return info;
+        }
+        
+        std::string type_name = object_symbol->data_type->to_string();
+        
+        // Remove any pointer/reference markers to get the base type
+        if (type_name.ends_with("*") || type_name.ends_with("&")) {
+            type_name = type_name.substr(0, type_name.length() - 1);
+        }
+        
+        // Find the struct/class declaration for this type
+        Cryo::StructDeclarationNode* struct_node = nullptr;
+        Cryo::ClassDeclarationNode* class_node = nullptr;
+        
+        // Check current file first
+        if (analysis.ast) {
+            struct_node = findStructDeclarationInAST(analysis.ast, type_name);
+            if (!struct_node) {
+                class_node = findClassDeclarationInAST(analysis.ast, type_name);
+            }
+        }
+        
+        // Check imported modules if not found locally
+        if (!struct_node && !class_node && analysis.compiler->module_loader()) {
+            const auto& imported_asts = analysis.compiler->module_loader()->get_imported_asts();
+            for (const auto& [module_name, ast] : imported_asts) {
+                if (!ast) continue;
+                
+                struct_node = findStructDeclarationInAST(ast.get(), type_name);
+                if (struct_node) break;
+                
+                class_node = findClassDeclarationInAST(ast.get(), type_name);
+                if (class_node) break;
+            }
+        }
+        
+        // Look for the method in the struct/class
+        if (struct_node) {
+            for (const auto& method : struct_node->methods()) {
+                if (method && method->name() == member_name) {
+                    info.name = member_name;
+                    info.kind = "method";
+                    info.signature = extractParameterNamesFromAST(method.get(), type_name + "::" + member_name);
+                    info.qualified_name = type_name + "::" + member_name;
+                    return info;
+                }
+            }
+            
+            // Check fields too
+            for (const auto& field : struct_node->fields()) {
+                if (field && field->name() == member_name) {
+                    info.name = member_name;
+                    info.kind = "field";
+                    info.signature = "field " + member_name + ": " + field->type_annotation();
+                    info.qualified_name = type_name + "::" + member_name;
+                    return info;
+                }
+            }
+        }
+        
+        if (class_node) {
+            for (const auto& method : class_node->methods()) {
+                if (method && method->name() == member_name) {
+                    info.name = member_name;
+                    info.kind = "method";
+                    info.signature = extractParameterNamesFromAST(method.get(), type_name + "::" + member_name);
+                    info.qualified_name = type_name + "::" + member_name;
+                    return info;
+                }
+            }
+            
+            // Check fields too
+            for (const auto& field : class_node->fields()) {
+                if (field && field->name() == member_name) {
+                    info.name = member_name;
+                    info.kind = "field";
+                    info.signature = "field " + member_name + ": " + field->type_annotation();
+                    info.qualified_name = type_name + "::" + member_name;
+                    return info;
+                }
+            }
+        }
+        
+        return info;
+    }
+
     HoverInfo CryoAnalyzer::analyzeSimplePattern(const std::string &content, const Position &position)
     {
         HoverInfo info;
+
+        // Check if the position is within a comment first
+        if (isPositionInComment(content, position))
+        {
+            Logger::instance().debug("CryoAnalyzer", "Position {}:{} is within a comment in simple pattern analysis, skipping", position.line, position.character);
+            return info;
+        }
 
         // Get word at position
         std::string word = getWordAtPosition(content, position);
@@ -956,7 +1315,6 @@ namespace CryoLSP
 
             // Create fresh compiler instance
             analysis.compiler = Cryo::create_compiler_instance();
-            analysis.compiler->set_debug_mode(true);
             analysis.compiler->set_stdlib_linking(true);
             
             Logger::instance().debug("CryoAnalyzer", "Created fresh compiler instance for reprocessing");
@@ -1097,6 +1455,75 @@ namespace CryoLSP
         }
 
         return "";
+    }
+
+    bool CryoAnalyzer::isPositionInComment(const std::string &content, const Position &position)
+    {
+        std::istringstream stream(content);
+        std::string line;
+        int current_line = 0;
+        bool in_block_comment = false;
+
+        // Process all lines up to and including the target line
+        while (std::getline(stream, line) && current_line <= position.line)
+        {
+            size_t pos = 0;
+            
+            while (pos < line.length())
+            {
+                if (!in_block_comment)
+                {
+                    // Check for line comment start
+                    if (pos < line.length() - 1 && line[pos] == '/' && line[pos + 1] == '/')
+                    {
+                        // If this is the target line, check if position is at or after the comment start
+                        if (current_line == position.line)
+                        {
+                            return position.character >= static_cast<int>(pos);
+                        }
+                        // Line comment continues to end of line, so skip rest of line
+                        break;
+                    }
+                    
+                    // Check for block comment start
+                    if (pos < line.length() - 1 && line[pos] == '/' && line[pos + 1] == '*')
+                    {
+                        in_block_comment = true;
+                        // If we're on the target line and position is at or after comment start
+                        if (current_line == position.line && position.character >= static_cast<int>(pos))
+                        {
+                            return true;
+                        }
+                        pos += 2;
+                        continue;
+                    }
+                }
+                else
+                {
+                    // We're in a block comment
+                    // If we're on the target line, we're definitely in a comment
+                    if (current_line == position.line)
+                    {
+                        return true;
+                    }
+                    
+                    // Check for block comment end
+                    if (pos < line.length() - 1 && line[pos] == '*' && line[pos + 1] == '/')
+                    {
+                        in_block_comment = false;
+                        pos += 2;
+                        continue;
+                    }
+                }
+                
+                pos++;
+            }
+            
+            current_line++;
+        }
+
+        // If we reached here and we're still in a block comment, return true
+        return in_block_comment;
     }
 
     std::string CryoAnalyzer::getPrimitiveTypeDocumentation(const std::string &type_name)
@@ -2228,10 +2655,49 @@ namespace CryoLSP
                 {
                     qualified_name = symbol.scope + "::" + symbol.name;
                 }
-                signature = "type " + qualified_name;
-                if (symbol.data_type)
-                {
-                    signature += " = " + symbol.data_type->to_string();
+                
+                // Try to find struct or class declaration for enhanced preview
+                if (compiler) {
+                    // Check current file first
+                    if (analyzed_files_.count(file_path) && analyzed_files_[file_path].ast) {
+                        auto struct_node = findStructDeclarationInAST(analyzed_files_[file_path].ast, symbol.name);
+                        if (struct_node) {
+                            signature = buildStructPreview(struct_node, qualified_name);
+                            break;
+                        }
+                        
+                        auto class_node = findClassDeclarationInAST(analyzed_files_[file_path].ast, symbol.name);
+                        if (class_node) {
+                            signature = buildClassPreview(class_node, qualified_name);
+                            break;
+                        }
+                    }
+                    
+                    // Check imported modules
+                    const auto& imported_asts = compiler->module_loader()->get_imported_asts();
+                    for (const auto& [module_name, ast] : imported_asts) {
+                        if (!ast) continue;
+                        
+                        auto struct_node = findStructDeclarationInAST(ast.get(), symbol.name);
+                        if (struct_node) {
+                            signature = buildStructPreview(struct_node, qualified_name);
+                            break;
+                        }
+                        
+                        auto class_node = findClassDeclarationInAST(ast.get(), symbol.name);
+                        if (class_node) {
+                            signature = buildClassPreview(class_node, qualified_name);
+                            break;
+                        }
+                    }
+                }
+                
+                // Fallback to basic type signature
+                if (signature.empty()) {
+                    signature = "type " + qualified_name;
+                    if (symbol.data_type) {
+                        signature += " = " + symbol.data_type->to_string();
+                    }
                 }
             }
             break;
