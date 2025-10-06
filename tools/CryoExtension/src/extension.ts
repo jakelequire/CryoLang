@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
-import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind, ErrorAction, CloseAction } from 'vscode-languageclient/node';
+import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind, ErrorAction, CloseAction, Trace } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
 let clientStopped = false; // Flag to prevent auto-restart
@@ -14,53 +14,17 @@ let lastHoverSuccess = Date.now(); // Track last successful hover
 
 // File logging utility
 function logToFile(level: string, component: string, message: string) {
-    try {
-        const timestamp = new Date().toISOString().replace('T', ' ').replace('Z', '');
-        const logLine = `[${timestamp}] [${level}] [${component}] ${message}\n`;
-
-        // Try to find the logs directory - look for CryoLang project root
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        let logsDir = '';
-
-        if (workspaceRoot) {
-            // Check if we're in the CryoLang project
-            if (workspaceRoot.includes('CryoLang')) {
-                logsDir = path.join(workspaceRoot, 'logs');
-            } else {
-                // Try to find CryoLang directory
-                const cryoPath = 'C:\\Programming\\apps\\CryoLang\\logs';
-                if (fs.existsSync(cryoPath)) {
-                    logsDir = cryoPath;
-                }
-            }
-        }
-
-        if (!logsDir) {
-            // Fallback to extension directory
-            logsDir = path.join(__dirname, '..', 'logs');
-        }
-
-        // Ensure logs directory exists
-        if (!fs.existsSync(logsDir)) {
-            fs.mkdirSync(logsDir, { recursive: true });
-        }
-
-        const logFile = path.join(logsDir, 'cryo-extension.log');
-        fs.appendFileSync(logFile, logLine);
-    } catch (error) {
-        console.error('Failed to write to log file:', error);
-    }
+    // File logging disabled to prevent log spam
+    return;
 }
 
-// Convenience logging functions
+// Convenience logging functions - reduced logging to prevent log spam
 const LOG = {
     debug: (component: string, message: string) => {
-        console.log(`[DEBUG] [${component}] ${message}`);
-        logToFile('DEBUG', component, message);
+        // Debug logging disabled to reduce log file size
     },
     info: (component: string, message: string) => {
-        console.log(`[INFO] [${component}] ${message}`);
-        logToFile('INFO', component, message);
+        // Info logging disabled to reduce log file size  
     },
     error: (component: string, message: string) => {
         console.error(`[ERROR] [${component}] ${message}`);
@@ -283,11 +247,11 @@ export function activate(context: vscode.ExtensionContext) {
         });
         
         serverProcess.stdout.on('data', (data: Buffer) => {
-            LOG.debug('LSPServer', `stdout: ${data.toString()}`);
+            // All LSP server stdout logging disabled to prevent log spam from compiler debug output
         });
         
         serverProcess.stderr.on('data', (data: Buffer) => {
-            LOG.debug('LSPServer', `stderr: ${data.toString()}`);
+            // All LSP server stderr logging disabled to prevent log spam from compiler debug output  
         });
         
         // Wait for server to start
@@ -320,6 +284,7 @@ export function activate(context: vscode.ExtensionContext) {
             documentSelector: [
                 { scheme: 'file', language: 'cryo' }
             ],
+            // Ensure only LSP provides hover, not built-in VS Code hover
             // Simplified connection options
             connectionOptions: {
                 maxRestartCount: 0 // Disable auto-restart to prevent conflicts
@@ -352,13 +317,16 @@ export function activate(context: vscode.ExtensionContext) {
 
         LOG.info('LanguageServer', 'Creating LanguageClient with options: ' + JSON.stringify({ documentSelector: clientOptions.documentSelector }));
 
-        // Create the language client
+        // Create the language client with minimal tracing
         client = new LanguageClient(
             'cryoLanguageServer',
             'Cryo Language Server',
             serverOptions,
             clientOptions
         );
+
+        // Disable all client tracing to reduce log output
+        client.setTrace(Trace.Off);
 
         // Add event listeners for debugging and shutdown handling
         client.onDidChangeState((event) => {
@@ -385,7 +353,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         // DO NOT show output channel - this can interfere with stdio transport
         // client.outputChannel.show(); // REMOVED - potential stdio interference
-        client.outputChannel.appendLine('=== Cryo Language Server Starting ===');
+        // client.outputChannel.appendLine('=== Cryo Language Server Starting ==='); // DISABLED - reduces log spam
 
         try {
             // Start the client - use a simpler approach
@@ -469,9 +437,8 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(onDidOpenTextDocument, onDidChangeActiveTextEditor);
 
-        // Don't register a custom hover provider - let the LanguageClient handle hover requests automatically
-        // The LSP server properly implements hover support, so the LanguageClient should handle it natively
-        LOG.info('Extension', 'Using built-in LanguageClient hover support (no custom provider needed)');    // Command to restart the language server (for development)
+    // Use the built-in LanguageClient hover support - let the server handle comment detection
+    LOG.info('Extension', 'Using built-in LanguageClient hover support (server handles comment detection)');    // Command to restart the language server (for development)
     const restartCommand = vscode.commands.registerCommand('cryo.restartLanguageServer', async () => {
         vscode.window.showInformationMessage('Restarting Cryo Language Server...');
         LOG.info('Commands', 'Manual restart command initiated');

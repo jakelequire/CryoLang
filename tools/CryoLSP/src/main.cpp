@@ -63,7 +63,7 @@ int main(int argc, char *argv[])
     {
         // Initialize logger with cross-platform log file path
         Logger &logger = Logger::instance();
-        logger.enable_debug_mode(true); // Enable debug logging
+        // Debug logging disabled to reduce log spam
 
         // Find appropriate log directory and create log file path
         std::string log_dir = find_log_directory();
@@ -83,10 +83,7 @@ int main(int argc, char *argv[])
 
         // Debug: Create a file to prove the server process actually started
         try {
-            std::ofstream debug_file("c:\\Programming\\apps\\CryoLang\\logs\\server_started.txt");
-            debug_file << "CryoLSP server started at " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << std::endl;
-            debug_file.close();
-            logger.info("LSP", "Debug file created: server_started.txt");
+            // Debug file creation disabled to reduce log spam
         } catch (...) {
             logger.error("LSP", "Failed to create debug file");
         }
