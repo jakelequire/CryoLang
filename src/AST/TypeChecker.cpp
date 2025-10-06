@@ -1049,29 +1049,12 @@ namespace Cryo
         }
     }
 
-    void TypeChecker::check_imported_modules(const std::unordered_map<std::string, std::unique_ptr<ProgramNode>>& imported_asts)
+    void TypeChecker::check_imported_modules(const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &imported_asts)
     {
         std::cout << "[DEBUG] TypeChecker: Processing " << imported_asts.size() << " imported modules for AST node updates" << std::endl;
-        
-        // Open debug file for detailed logging
-        std::ofstream debug_file("logs/debug_imported_modules.txt", std::ios::app);
-        
-        // Debug: Let's see what symbols are actually in the TypedSymbolTable
-        debug_file << "=== Current symbols in TypedSymbolTable ===" << std::endl;
         auto all_symbols = _symbol_table->get_symbols();
-        for (const auto& [name, symbol] : all_symbols) {
-            debug_file << "Symbol: '" << name << "' type: " << (symbol.type ? symbol.type->to_string() : "null") << std::endl;
-        }
-        debug_file << "=== End of symbol dump ===" << std::endl;
-        
-        // Debug: List all imported modules
-        for (const auto& [module_name, ast] : imported_asts)
-        {
-            std::cout << "[DEBUG] TypeChecker: Available imported module: '" << module_name << "'" << std::endl;
-            debug_file << "Available imported module: '" << module_name << "'" << std::endl;
-        }
-        
-        for (const auto& [module_name, ast] : imported_asts)
+
+        for (const auto &[module_name, ast] : imported_asts)
         {
             if (!ast)
             {
@@ -1081,7 +1064,7 @@ namespace Cryo
 
             std::cout << "[DEBUG] TypeChecker: Processing imported module: " << module_name << std::endl;
             std::cout << "[DEBUG] TypeChecker: Module has " << ast->statements().size() << " statements" << std::endl;
-            
+
             // Visit all top-level declarations in the imported module
             // This will update existing symbols with their AST node references
             int stmt_count = 0;
@@ -1090,70 +1073,74 @@ namespace Cryo
                 if (stmt)
                 {
                     std::cout << "[DEBUG] TypeChecker: Processing statement " << (++stmt_count) << " in module " << module_name << std::endl;
-                    debug_file << "Processing statement " << stmt_count << " in module " << module_name << std::endl;
-                    
+
                     // Debug: What kind of statement is this?
-                    const char* node_type = "unknown";
-                    switch(stmt->kind()) {
-                        case NodeKind::FunctionDeclaration: node_type = "FunctionDeclaration"; break;
-                        case NodeKind::ImportDeclaration: node_type = "ImportDeclaration"; break;
-                        case NodeKind::VariableDeclaration: node_type = "VariableDeclaration"; break;
-                        case NodeKind::StructDeclaration: node_type = "StructDeclaration"; break;
-                        case NodeKind::EnumDeclaration: node_type = "EnumDeclaration"; break;
-                        case NodeKind::IntrinsicDeclaration: node_type = "IntrinsicDeclaration"; break;
-                        case NodeKind::ExternBlock: node_type = "ExternBlock"; break;
-                        default: node_type = "other"; break;
+                    const char *node_type = "unknown";
+                    switch (stmt->kind())
+                    {
+                    case NodeKind::FunctionDeclaration:
+                        node_type = "FunctionDeclaration";
+                        break;
+                    case NodeKind::ImportDeclaration:
+                        node_type = "ImportDeclaration";
+                        break;
+                    case NodeKind::VariableDeclaration:
+                        node_type = "VariableDeclaration";
+                        break;
+                    case NodeKind::StructDeclaration:
+                        node_type = "StructDeclaration";
+                        break;
+                    case NodeKind::EnumDeclaration:
+                        node_type = "EnumDeclaration";
+                        break;
+                    case NodeKind::IntrinsicDeclaration:
+                        node_type = "IntrinsicDeclaration";
+                        break;
+                    case NodeKind::ExternBlock:
+                        node_type = "ExternBlock";
+                        break;
+                    default:
+                        node_type = "other";
+                        break;
                     }
-                    std::cout << "[DEBUG] TypeChecker: Statement type: " << node_type << std::endl;
-                    debug_file << "Statement type: " << node_type << std::endl;
-                    
+
                     // For function declarations, we need to check with qualified names
-                    if (stmt->kind() == NodeKind::FunctionDeclaration) {
-                        if (auto func_decl = dynamic_cast<FunctionDeclarationNode*>(stmt.get())) {
+                    if (stmt->kind() == NodeKind::FunctionDeclaration)
+                    {
+                        if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(stmt.get()))
+                        {
                             std::string func_name = func_decl->name();
                             std::string qualified_name = module_name + "::" + func_name;
-                            
-                            debug_file << "Function '" << func_name << "' qualified as '" << qualified_name << "'" << std::endl;
-                            
+
                             // Try multiple lookup strategies for imported module functions
                             TypedSymbol *existing_symbol = nullptr;
-                            
+
                             // Strategy 1: Look up unqualified name
                             existing_symbol = _symbol_table->lookup_symbol(func_name);
-                            if (existing_symbol) {
-                                debug_file << "Found '" << func_name << "' via unqualified lookup" << std::endl;
-                            } else {
+                            if (!existing_symbol)
+                            {
                                 // Strategy 2: Look up fully qualified name
                                 existing_symbol = _symbol_table->lookup_symbol(qualified_name);
-                                if (existing_symbol) {
-                                    debug_file << "Found '" << func_name << "' via qualified lookup as '" << qualified_name << "'" << std::endl;
-                                } else {
+                                if (existing_symbol)
+                                {
                                     // Strategy 3: Check namespaces
                                     existing_symbol = _symbol_table->lookup_symbol_in_any_namespace(func_name);
-                                    if (existing_symbol) {
-                                        debug_file << "Found '" << func_name << "' via namespace lookup" << std::endl;
-                                    } else {
-                                        debug_file << "Function '" << func_name << "' not found in symbol table" << std::endl;
-                                    }
                                 }
                             }
-                            
-                            if (existing_symbol) {
-                                debug_file << "Updating function '" << func_name << "' with AST node reference" << std::endl;
+                            if (existing_symbol)
+                            {
                                 existing_symbol->function_node = func_decl;
                             }
                         }
-                    } else {
+                    }
+                    else
+                    {
                         // For non-function statements, use normal visitor
                         stmt->accept(*this);
                     }
                 }
             }
         }
-        
-        std::cout << "[DEBUG] TypeChecker: Finished processing imported modules" << std::endl;
-        debug_file << "=== Finished processing imported modules ===" << std::endl;
-        debug_file.close();
     }
 
     //===----------------------------------------------------------------------===//
@@ -1238,9 +1225,6 @@ namespace Cryo
     void TypeChecker::visit(FunctionDeclarationNode &node)
     {
         const std::string &func_name = node.name();
-        
-        // Open debug file for detailed logging
-        std::ofstream debug_file("logs/debug_function_visitor.txt", std::ios::app);
 
         // Handle generic functions - enter generic context if needed
         bool is_generic_function = !node.generic_parameters().empty();
@@ -1287,22 +1271,15 @@ namespace Cryo
         FunctionType *func_type = static_cast<FunctionType *>(
             _type_context.create_function_type(return_type, param_types));
 
-        // Declare function in current scope if not already declared
-        std::cout << "[DEBUG] Looking up function symbol: '" << func_name << "'" << std::endl;
-        debug_file << "Looking up function symbol: '" << func_name << "'" << std::endl;
         TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(func_name);
-        if (!existing_symbol) {
+        if (!existing_symbol)
+        {
             std::cout << "[DEBUG] Not found in main symbols, checking namespaces..." << std::endl;
-            debug_file << "Not found in main symbols, checking namespaces..." << std::endl;
-            // Also check if it might be in a namespace (IO functions)
             TypedSymbol *ns_symbol = _symbol_table->lookup_symbol_in_any_namespace(func_name);
-            if (ns_symbol) {
+            if (ns_symbol)
+            {
                 std::cout << "[DEBUG] Found '" << func_name << "' in namespaces!" << std::endl;
-                debug_file << "Found '" << func_name << "' in namespaces!" << std::endl;
                 existing_symbol = ns_symbol; // Use the namespaced symbol
-            } else {
-                std::cout << "[DEBUG] '" << func_name << "' not found in any namespace either" << std::endl;
-                debug_file << "'" << func_name << "' not found in any namespace either" << std::endl;
             }
         }
         if (existing_symbol)
@@ -1320,9 +1297,7 @@ namespace Cryo
             }
             // Function exists with compatible type - update with AST node reference for LSP
             std::cout << "[DEBUG] Updating existing function '" << func_name << "' with AST node reference" << std::endl;
-            debug_file << "Updating existing function '" << func_name << "' with AST node reference" << std::endl;
             existing_symbol->function_node = &node;
-            debug_file.close();
         }
         else
         {
