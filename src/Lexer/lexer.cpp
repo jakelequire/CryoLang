@@ -379,13 +379,23 @@ namespace Cryo
             return lex_character();
         }
 
-        // Comments
+        // Comments and documentation comments
         if (c == '/' && peek() == '/')
         {
+            // Check if it's a documentation comment (///)
+            if (peek(1) == '/')
+            {
+                return lex_doc_comment();
+            }
             return lex_comment();
         }
         if (c == '/' && peek() == '*')
         {
+            // Check if it's a documentation comment (/**)
+            if (peek(1) == '*')
+            {
+                return lex_doc_comment();
+            }
             return lex_comment();
         }
 
@@ -595,6 +605,73 @@ namespace Cryo
 
         std::string_view text(start, _current - start);
         return Token(TokenKind::TK_COMMENT, text,
+                     SourceLocation(_current_location.line(),
+                                    _current_location.column() - text.length()));
+    }
+
+    Token Lexer::lex_doc_comment()
+    {
+        const char *start = _current - 1;
+        TokenKind doc_token_kind;
+
+        if (peek() == '/' && peek(1) == '/')
+        {
+            // Line documentation comment (///)
+            doc_token_kind = TokenKind::TK_DOC_COMMENT_LINE;
+            advance(); // consume second '/'
+            advance(); // consume third '/'
+            
+            // Skip optional space after ///
+            if (peek() == ' ')
+            {
+                advance();
+            }
+            
+            while (!at_end() && peek() != '\n')
+            {
+                advance();
+            }
+        }
+        else if (peek() == '*' && peek(1) == '*')
+        {
+            // Block documentation comment (/**)
+            doc_token_kind = TokenKind::TK_DOC_COMMENT_BLOCK;
+            advance(); // consume '*'
+            advance(); // consume second '*'
+            
+            // Skip optional space or newline after /**
+            if (peek() == ' ' || peek() == '\n')
+            {
+                if (peek() == '\n')
+                {
+                    _current_location.newline();
+                }
+                advance();
+            }
+
+            while (_current + 1 < _buffer_end)
+            {
+                if (peek() == '*' && *(_current + 1) == '/')
+                {
+                    advance(); // consume '*'
+                    advance(); // consume '/'
+                    break;
+                }
+                if (peek() == '\n')
+                {
+                    _current_location.newline();
+                }
+                advance();
+            }
+        }
+        else
+        {
+            // Fallback to regular comment if detection fails
+            return lex_comment();
+        }
+
+        std::string_view text(start, _current - start);
+        return Token(doc_token_kind, text,
                      SourceLocation(_current_location.line(),
                                     _current_location.column() - text.length()));
     }

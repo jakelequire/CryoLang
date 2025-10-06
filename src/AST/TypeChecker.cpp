@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <string>
 #include <string_view>
+#include <fstream>
 
 namespace Cryo
 {
@@ -1052,6 +1053,9 @@ namespace Cryo
     {
         std::cout << "[DEBUG] TypeChecker: Processing " << imported_asts.size() << " imported modules for AST node updates" << std::endl;
         
+        // Open debug file for detailed logging
+        std::ofstream debug_file("logs/debug_imported_modules.txt", std::ios::app);
+        
         // Debug: Let's see what symbols are actually in the TypedSymbolTable
         debug_file << "=== Current symbols in TypedSymbolTable ===" << std::endl;
         auto all_symbols = _symbol_table->get_symbols();
@@ -1234,6 +1238,9 @@ namespace Cryo
     void TypeChecker::visit(FunctionDeclarationNode &node)
     {
         const std::string &func_name = node.name();
+        
+        // Open debug file for detailed logging
+        std::ofstream debug_file("logs/debug_function_visitor.txt", std::ios::app);
 
         // Handle generic functions - enter generic context if needed
         bool is_generic_function = !node.generic_parameters().empty();

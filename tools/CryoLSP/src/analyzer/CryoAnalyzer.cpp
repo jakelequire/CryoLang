@@ -535,6 +535,7 @@ namespace CryoLSP
                         info.signature = extractParameterNamesFromAST(typed_symbol->function_node);
                         info.type = typed_symbol->type ? typed_symbol->type->to_string() : "unknown";
                         info.qualified_name = !qualified_symbol.empty() ? qualified_symbol : word;
+                        info.documentation = extractDocumentationFromASTNode(typed_symbol->function_node);
                         if (typed_symbol->declaration_location.line() > 0)
                         {
                             info.definition_location = convertSourceLocationToPosition(typed_symbol->declaration_location);
@@ -775,6 +776,8 @@ namespace CryoLSP
         // Check if this is a function declaration node
         if (auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(node)) {
             std::string func_name = func_decl->name();
+            Logger::instance().debug("CryoAnalyzer", "Checking function '{}' against search term '{}' (qualified: '{}')", 
+                func_name, word, qualified_symbol);
             
             // Try multiple matching strategies
             bool matches = false;
@@ -782,6 +785,7 @@ namespace CryoLSP
             // 1. Direct name match
             if (func_name == word) {
                 matches = true;
+                Logger::instance().debug("CryoAnalyzer", "Direct name match for '{}'", func_name);
             }
             
             // 2. Qualified name match (e.g., "IO::println" matches "println" in std::IO module)
@@ -801,6 +805,7 @@ namespace CryoLSP
             }
             
             if (matches) {
+                Logger::instance().debug("CryoAnalyzer", "Found matching function: '{}' for search term '{}'", func_name, word);
                 return func_decl;
             }
         }
@@ -2572,8 +2577,63 @@ namespace CryoLSP
         // Build enhanced signature
         info.signature = buildQualifiedSignature(symbol, file_path, compiler);
 
-        // Add documentation
-        info.documentation = getSymbolDocumentation(symbol, word);
+        // Add documentation - first try to get from AST node if available
+        std::string ast_documentation;
+        Logger::instance().debug("CryoAnalyzer", "Trying to get documentation for symbol '{}' of kind '{}'", 
+            symbol.name, static_cast<int>(symbol.kind));
+            
+        if (compiler && !file_path.empty())
+        {
+            Logger::instance().debug("CryoAnalyzer", "Compiler and file_path available, checking analyzed files");
+            
+            // Try to find the corresponding AST node and extract its documentation
+            if (analyzed_files_.count(file_path) && analyzed_files_[file_path].ast)
+            {
+                Logger::instance().debug("CryoAnalyzer", "Found analyzed file with AST, searching for declaration");
+                Cryo::DeclarationNode* declaration = nullptr;
+                
+                // Search for the declaration based on symbol kind
+                switch (symbol.kind)
+                {
+                case Cryo::SymbolKind::Function:
+                    Logger::instance().debug("CryoAnalyzer", "Searching for function declaration: '{}'", symbol.name);
+                    declaration = findFunctionInAST(analyzed_files_[file_path].ast, symbol.name, info.qualified_name, "");
+                    break;
+                case Cryo::SymbolKind::Type:
+                    Logger::instance().debug("CryoAnalyzer", "Searching for type declaration: '{}'", symbol.name);
+                    // Try to find struct or class declaration
+                    declaration = findStructDeclarationInAST(analyzed_files_[file_path].ast, symbol.name);
+                    if (!declaration)
+                    {
+                        declaration = findClassDeclarationInAST(analyzed_files_[file_path].ast, symbol.name);
+                    }
+                    break;
+                default:
+                    Logger::instance().debug("CryoAnalyzer", "Symbol kind not supported for AST documentation search");
+                    // For other symbol types, we don't currently search AST
+                    break;
+                }
+                
+                Logger::instance().debug("CryoAnalyzer", "Declaration search result: {}", declaration ? "found" : "not found");
+                
+                if (declaration)
+                {
+                    ast_documentation = extractDocumentationFromASTNode(declaration);
+                    Logger::instance().debug("CryoAnalyzer", "Extracted AST documentation for '{}': length={}, content='{}'", 
+                        symbol.name, ast_documentation.length(), ast_documentation.substr(0, 100) + (ast_documentation.length() > 100 ? "..." : ""));
+                }
+            }
+        }
+        
+        // Use AST documentation if available, otherwise fall back to static documentation
+        if (!ast_documentation.empty())
+        {
+            info.documentation = ast_documentation;
+        }
+        else
+        {
+            info.documentation = getSymbolDocumentation(symbol, word);
+        }
 
         // Convert source location if available
         if (symbol.declaration_location.line() > 0)
@@ -2880,6 +2940,67 @@ namespace CryoLSP
         }
 
         return doc;
+    }
+
+    std::string CryoAnalyzer::extractDocumentationFromASTNode(Cryo::DeclarationNode *declaration_node)
+    {
+        Logger::instance().debug("CryoAnalyzer", "extractDocumentationFromASTNode called with declaration_node: {}", 
+            declaration_node ? "valid" : "null");
+            
+        if (!declaration_node)
+        {
+            return "";
+        }
+
+        // Check if the declaration node has documentation
+        Logger::instance().debug("CryoAnalyzer", "Checking if declaration has documentation: {}", 
+            declaration_node->has_documentation() ? "yes" : "no");
+            
+        if (declaration_node->has_documentation())
+        {
+            std::string doc = declaration_node->documentation();
+            Logger::instance().debug("CryoAnalyzer", "Raw documentation content: '{}'", doc);
+            
+            // Clean up the documentation string - preserve structure but fix spacing
+            if (!doc.empty())
+            {
+                // Remove leading and trailing whitespace
+                doc.erase(0, doc.find_first_not_of(" \t\n\r"));
+                doc.erase(doc.find_last_not_of(" \t\n\r") + 1);
+                
+                // Process line by line, preserving content but normalizing whitespace
+                std::string cleaned_doc;
+                std::stringstream ss(doc);
+                std::string line;
+                bool first_line = true;
+                
+                while (std::getline(ss, line))
+                {
+                    // Remove leading whitespace from each line
+                    std::string trimmed = line;
+                    trimmed.erase(0, trimmed.find_first_not_of(" \t"));
+                    
+                    // Skip completely empty lines to avoid extra spacing
+                    if (trimmed.empty())
+                    {
+                        continue;
+                    }
+                    
+                    if (!first_line)
+                    {
+                        cleaned_doc += "\n";
+                    }
+                    first_line = false;
+                    
+                    cleaned_doc += trimmed;
+                }
+                
+                Logger::instance().debug("CryoAnalyzer", "Cleaned documentation: '{}'", cleaned_doc);
+                return cleaned_doc;
+            }
+        }
+
+        return "";
     }
 
     // ========================================

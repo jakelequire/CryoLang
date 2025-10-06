@@ -157,6 +157,9 @@ namespace CryoLSP
         std::string buildQualifiedSignature(const Cryo::Symbol &symbol, const std::string &file_path, Cryo::CompilerInstance *compiler = nullptr);
         std::string getSymbolDocumentation(const Cryo::Symbol &symbol, const std::string &symbol_name);
         
+        // Extract documentation from AST nodes
+        std::string extractDocumentationFromASTNode(Cryo::DeclarationNode *declaration_node);
+        
         // Find function AST nodes in imported modules
         Cryo::FunctionDeclarationNode* findFunctionInImportedModules(Cryo::CompilerInstance *compiler, const std::string &word, const std::string &qualified_symbol);
         
