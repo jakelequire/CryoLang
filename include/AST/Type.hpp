@@ -547,6 +547,11 @@ namespace Cryo
         // Create an instantiation of this parameterized type
         std::shared_ptr<ParameterizedType> instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const;
 
+        // New methods for migration from string-based operations
+        std::string get_mangled_name() const;
+        std::shared_ptr<ParameterizedType> substitute(const std::unordered_map<std::string, std::shared_ptr<Type>> &substitutions) const;
+        bool has_type_parameter(const std::string &param_name) const;
+
         // Type compatibility - only compatible with other parameterized types with same base
         bool is_assignable_from(const Type &other) const override;
         bool is_convertible_to(const Type &other) const override;
@@ -921,6 +926,11 @@ namespace Cryo
         // Type compatibility and conversion
         bool are_types_compatible(Type *lhs, Type *rhs);
         Type *get_common_type(Type *lhs, Type *rhs);
+
+        // New methods for migration from string-based operations
+        ParameterizedType *instantiate_generic(const std::string &base_name,
+                                               const std::vector<Type *> &args);
+        Type *resolve_scoped_type(const std::string &scope, const std::string &type_name);
 
     private:
         // Helper to register built-in parameterized enums

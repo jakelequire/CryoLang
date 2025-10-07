@@ -85,20 +85,20 @@ namespace Cryo
 
     std::unique_ptr<VariableDeclarationNode> ASTBuilder::create_variable_declaration(SourceLocation loc,
                                                                                      std::string name,
-                                                                                     std::string type_annotation,
+                                                                                     Cryo::Type *resolved_type,
                                                                                      std::unique_ptr<ExpressionNode> init,
                                                                                      bool is_mutable,
                                                                                      bool is_global)
     {
-        return std::make_unique<VariableDeclarationNode>(loc, std::move(name), std::move(type_annotation), std::move(init), is_mutable, is_global);
+        return std::make_unique<VariableDeclarationNode>(loc, std::move(name), resolved_type, std::move(init), is_mutable, is_global);
     }
 
     std::unique_ptr<FunctionDeclarationNode> ASTBuilder::create_function_declaration(SourceLocation loc,
                                                                                      std::string name,
-                                                                                     std::string return_type,
+                                                                                     Cryo::Type *return_type,
                                                                                      bool is_public)
     {
-        return std::make_unique<FunctionDeclarationNode>(loc, std::move(name), std::move(return_type), is_public);
+        return std::make_unique<FunctionDeclarationNode>(loc, std::move(name), return_type, is_public);
     }
 
     std::unique_ptr<CallExpressionNode> ASTBuilder::create_call_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> callee)
@@ -182,14 +182,14 @@ namespace Cryo
         return std::make_unique<GenericParameterNode>(loc, std::move(name));
     }
 
-    std::unique_ptr<StructFieldNode> ASTBuilder::create_struct_field(SourceLocation loc, std::string name, std::string type_annotation, Visibility visibility)
+    std::unique_ptr<StructFieldNode> ASTBuilder::create_struct_field(SourceLocation loc, std::string name, Cryo::Type *resolved_type, Visibility visibility)
     {
-        return std::make_unique<StructFieldNode>(loc, std::move(name), std::move(type_annotation), visibility);
+        return std::make_unique<StructFieldNode>(loc, std::move(name), resolved_type, visibility);
     }
 
-    std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, std::string return_type, Visibility visibility, bool is_constructor, bool is_destructor, bool is_static)
+    std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, Cryo::Type *return_type, Visibility visibility, bool is_constructor, bool is_destructor, bool is_static)
     {
-        return std::make_unique<StructMethodNode>(loc, std::move(name), std::move(return_type), visibility, is_constructor, is_destructor, is_static);
+        return std::make_unique<StructMethodNode>(loc, std::move(name), return_type, visibility, is_constructor, is_destructor, is_static);
     }
 
     std::unique_ptr<StructDeclarationNode> ASTBuilder::create_struct_declaration(SourceLocation loc, std::string name)

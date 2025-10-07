@@ -377,10 +377,10 @@ namespace Cryo
 
         try
         {
-        if (_debug_mode)
-        {
-            std::cout << "[CompilerInstance] Phase 0: Symbol table population..." << std::endl;
-        }
+            if (_debug_mode)
+            {
+                std::cout << "[CompilerInstance] Phase 0: Symbol table population..." << std::endl;
+            }
             // Phase 0: Symbol table population (must happen before type checking)
             populate_symbol_table(_ast_root.get());
 
@@ -455,10 +455,10 @@ namespace Cryo
 
                 if (_debug_mode)
                 {
-                if (_debug_mode)
-                {
-                    std::cout << "Type checking failed with " << _type_checker->error_count() << " errors." << std::endl;
-                }
+                    if (_debug_mode)
+                    {
+                        std::cout << "Type checking failed with " << _type_checker->error_count() << " errors." << std::endl;
+                    }
                 }
                 return false;
             }
@@ -466,16 +466,16 @@ namespace Cryo
             // Phase 2: Monomorphization - Generate specialized versions of generic types
             if (_debug_mode)
             {
-            if (_debug_mode)
-            {
-                std::cout << "Starting monomorphization pass..." << std::endl;
-            }
+                if (_debug_mode)
+                {
+                    std::cout << "Starting monomorphization pass..." << std::endl;
+                }
             }
 
             const auto &required_instantiations = _type_checker->get_required_instantiations();
             if (!required_instantiations.empty())
             {
-                bool monomorphization_success = _monomorphization_pass->monomorphize(*_ast_root, required_instantiations, *_template_registry);
+                bool monomorphization_success = _monomorphization_pass->monomorphize(*_ast_root, required_instantiations, *_template_registry, *_type_checker);
                 if (!monomorphization_success)
                 {
                     _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::Semantic,
@@ -485,20 +485,20 @@ namespace Cryo
 
                 if (_debug_mode)
                 {
-                if (_debug_mode)
-                {
-                    std::cout << "Monomorphization completed successfully." << std::endl;
-                }
+                    if (_debug_mode)
+                    {
+                        std::cout << "Monomorphization completed successfully." << std::endl;
+                    }
                 }
             }
             else
             {
                 if (_debug_mode)
                 {
-                if (_debug_mode)
-                {
-                    std::cout << "No generic instantiations required, skipping monomorphization." << std::endl;
-                }
+                    if (_debug_mode)
+                    {
+                        std::cout << "No generic instantiations required, skipping monomorphization." << std::endl;
+                    }
                 }
             }
 
@@ -509,10 +509,10 @@ namespace Cryo
 
             if (_debug_mode)
             {
-            if (_debug_mode)
-            {
-                std::cout << "Type checking completed successfully." << std::endl;
-            }
+                if (_debug_mode)
+                {
+                    std::cout << "Type checking completed successfully." << std::endl;
+                }
             }
 
             return true;
@@ -804,7 +804,7 @@ namespace Cryo
                 std::cout << "[CompilerInstance] Processing struct declarations before function pre-registration..." << std::endl;
                 // First, process struct declarations to ensure TypeMapper has correct type information
                 process_struct_declarations_for_preregistration(node);
-                
+
                 std::cout << "[CompilerInstance] Pre-registering functions in LLVM module..." << std::endl;
                 _codegen->get_visitor()->pre_register_functions_from_symbol_table();
             }
@@ -832,18 +832,18 @@ namespace Cryo
         if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(node))
         {
             std::cout << "[CompilerInstance] Pass 1: Found function declaration: " << func_decl->name() << std::endl;
-            
+
             // Create function type from return type and parameters
             std::vector<Type *> param_types;
             for (const auto &param : func_decl->parameters())
             {
-                // Parse parameter type from string annotation
-                Type *param_type = _ast_context->types().parse_type_from_string(param->type_annotation());
+                // Use resolved parameter type directly
+                Type *param_type = param->get_resolved_type();
                 param_types.push_back(param_type);
             }
 
-            // Parse return type
-            Type *return_type = _ast_context->types().parse_type_from_string(func_decl->return_type_annotation());
+            // Use resolved return type directly
+            Type *return_type = func_decl->get_resolved_return_type();
 
             // Create function type
             Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
@@ -880,13 +880,13 @@ namespace Cryo
             std::vector<Type *> param_types;
             for (const auto &param : intrinsic_decl->parameters())
             {
-                // Parse parameter type from string annotation
-                Type *param_type = _ast_context->types().parse_type_from_string(param->type_annotation());
+                // Use resolved parameter type directly
+                Type *param_type = param->get_resolved_type();
                 param_types.push_back(param_type);
             }
 
-            // Parse return type
-            Type *return_type = _ast_context->types().parse_type_from_string(intrinsic_decl->return_type_annotation());
+            // Use resolved return type directly
+            Type *return_type = intrinsic_decl->get_resolved_return_type();
 
             // Create function type
             Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
@@ -925,19 +925,22 @@ namespace Cryo
         {
             // Create the enum type during symbol table population for proper type resolution
             std::vector<std::string> variant_names;
-            for (const auto& variant : enum_decl->variants()) {
+            for (const auto &variant : enum_decl->variants())
+            {
                 variant_names.push_back(variant->name());
             }
-            
+
             // Check if this is a simple enum (all variants without associated types)
             bool is_simple_enum = true;
-            for (const auto& variant : enum_decl->variants()) {
-                if (!variant->associated_types().empty()) {
+            for (const auto &variant : enum_decl->variants())
+            {
+                if (!variant->associated_types().empty())
+                {
                     is_simple_enum = false;
                     break;
                 }
             }
-            
+
             // Create enum type and register it
             Type *enum_type = _ast_context->types().get_enum_type(enum_decl->name(), variant_names, is_simple_enum);
             current_scope->declare_symbol(enum_decl->name(), SymbolKind::Type,
@@ -1043,8 +1046,8 @@ namespace Cryo
         // Handle variable declarations (collect them in first pass too)
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Parse variable type from string annotation
-            Type *var_type = _ast_context->types().parse_type_from_string(var_decl->type_annotation());
+            // Use resolved variable type directly
+            Type *var_type = var_decl->get_resolved_type();
 
             current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
                                           var_decl->location(), var_type, scope_name);
@@ -1121,23 +1124,23 @@ namespace Cryo
         // Handle variable declarations - add to current scope
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Parse variable type from string annotation
-            Type *var_type = _ast_context->types().parse_type_from_string(var_decl->type_annotation());
-            
+            // Use resolved type from AST node
+            Type *var_type = var_decl->get_resolved_type();
+
             // Add variable to current scope
             bool success = current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
-                                                       var_decl->location(), var_type, scope_name);
-            
+                                                         var_decl->location(), var_type, scope_name);
+
             if (!success && _debug_mode)
             {
-                std::cout << "[CompilerInstance] Warning: Variable '" << var_decl->name() 
-                         << "' already declared in scope '" << scope_name << "'" << std::endl;
+                std::cout << "[CompilerInstance] Warning: Variable '" << var_decl->name()
+                          << "' already declared in scope '" << scope_name << "'" << std::endl;
             }
             else if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Added variable '" << var_decl->name() 
-                         << "' to scope '" << scope_name << "' with type '" 
-                         << var_type->to_string() << "'" << std::endl;
+                std::cout << "[CompilerInstance] Added variable '" << var_decl->name()
+                          << "' to scope '" << scope_name << "' with type '"
+                          << var_type->to_string() << "'" << std::endl;
             }
         }
         // Handle declaration statements (our wrapper)
@@ -1270,7 +1273,7 @@ namespace Cryo
             std::cout << "[CompilerInstance] Warning: Failed to auto-import core/types: " << result.error_message << std::endl;
         }
 
-        // Auto-import runtime functions 
+        // Auto-import runtime functions
         std::cout << "[CompilerInstance] Injecting auto-import: runtime/runtime" << std::endl;
 
         // Create a synthetic ImportDeclarationNode for runtime/runtime
@@ -1321,25 +1324,25 @@ namespace Cryo
             return;
 
         // If this is a struct declaration, process it
-        if (auto struct_decl = dynamic_cast<StructDeclarationNode*>(node))
+        if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
         {
             std::cout << "[CompilerInstance] Pre-processing struct: " << struct_decl->name() << std::endl;
-            
+
             // Visit the struct declaration to register it with TypeMapper
             struct_decl->accept(*_codegen->get_visitor());
         }
         // If this is a program node, process all its statements
-        else if (auto program = dynamic_cast<ProgramNode*>(node))
+        else if (auto program = dynamic_cast<ProgramNode *>(node))
         {
-            for (const auto& statement : program->statements())
+            for (const auto &statement : program->statements())
             {
                 process_struct_declarations_recursive(statement.get());
             }
         }
         // If this is a block statement, process its statements
-        else if (auto block = dynamic_cast<BlockStatementNode*>(node))
+        else if (auto block = dynamic_cast<BlockStatementNode *>(node))
         {
-            for (const auto& statement : block->statements())
+            for (const auto &statement : block->statements())
             {
                 process_struct_declarations_recursive(statement.get());
             }

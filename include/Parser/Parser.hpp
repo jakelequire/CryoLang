@@ -39,7 +39,7 @@ namespace Cryo
         bool _in_implementation_block = false;
         std::string _current_namespace = "Global"; // Current namespace context
         int _scope_depth = 0;                      // Track nesting depth (0 = global scope)
-        
+
         // Documentation comment collection
         std::vector<std::string> _pending_doc_comments; // Collected doc comments waiting to be attached
 
@@ -87,11 +87,11 @@ namespace Cryo
         std::string parse_type();
         Type *parse_type_annotation();              // New method that returns Type*
         std::vector<std::string> parse_type_list(); // For arrays like i32[][]
-        
+
         // Documentation comment handling
         void collect_documentation_comments();
         std::string extract_documentation_text();
-        void attach_documentation(DeclarationNode* node);
+        void attach_documentation(DeclarationNode *node);
 
         // Namespace parsing
         std::string parse_namespace();
@@ -192,5 +192,8 @@ namespace Cryo
         // Look ahead utilities
         Token peek() const { return _current_token; }
         Token peek_next();
+
+        // Type resolution helper
+        Type *resolve_type_from_string(const std::string &type_str);
     };
 }

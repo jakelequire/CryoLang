@@ -340,32 +340,29 @@ namespace Cryo::Codegen
         std::string struct_name = struct_type->name();
         std::cout << "[TypeMapper] map_struct_type called for: " << struct_name << std::endl;
 
-        // Special case: if this looks like a parameterized type (e.g., Array<int>),
-        // check if the monomorphized class (e.g., Array_int) is registered
+        // First, try to handle as a parameterized type using proper Type* objects
+        llvm::Type *parameterized_result = try_handle_as_parameterized_type(struct_type);
+        if (parameterized_result)
+        {
+            std::cout << "[TypeMapper] Successfully handled as parameterized type: " << struct_name << std::endl;
+            return parameterized_result;
+        }
+
+        // Legacy fallback: manual string parsing for parameterized types
+        // TODO: This should be eliminated once all type creation uses ParameterizedType objects
         if (struct_name.find('<') != std::string::npos && struct_name.find('>') != std::string::npos)
         {
-            // Extract base name and type arguments for parameterized types
-            size_t angle_pos = struct_name.find('<');
-            std::string base_name = struct_name.substr(0, angle_pos);
-
-            size_t close_angle = struct_name.find('>', angle_pos);
-            if (close_angle != std::string::npos)
+            auto parsed = parse_generic_type_string(struct_name);
+            if (!parsed.first.empty() && !parsed.second.empty())
             {
-                std::string type_args_str = struct_name.substr(angle_pos + 1, close_angle - angle_pos - 1);
+                std::string base_name = parsed.first;
+                std::vector<std::string> type_args = parsed.second;
 
                 // Generate the monomorphized name (e.g., Array<int> -> Array_int)
                 std::string monomorphized_name = base_name;
-                std::stringstream ss(type_args_str);
-                std::string arg;
-                while (std::getline(ss, arg, ','))
+                for (const auto &arg : type_args)
                 {
-                    // Trim whitespace
-                    arg.erase(0, arg.find_first_not_of(" \t"));
-                    arg.erase(arg.find_last_not_of(" \t") + 1);
-                    if (!arg.empty())
-                    {
-                        monomorphized_name += "_" + arg;
-                    }
+                    monomorphized_name += "_" + arg;
                 }
 
                 // Check if the monomorphized version exists as a class
@@ -422,12 +419,12 @@ namespace Cryo::Codegen
             {
                 if (field)
                 {
-                    std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << field->type_annotation() << std::endl;
+                    std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << (field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown") << std::endl;
 
-                    // Map field type using TypeContext
+                    // Map field type using resolved Type* directly
                     if (_type_context)
                     {
-                        auto field_cryo_type = _type_context->parse_type_from_string(field->type_annotation());
+                        auto field_cryo_type = field->get_resolved_type();
                         if (field_cryo_type)
                         {
                             llvm::Type *field_llvm_type = map_type(field_cryo_type);
@@ -501,12 +498,12 @@ namespace Cryo::Codegen
                         {
                             if (field)
                             {
-                                std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << field->type_annotation() << std::endl;
+                                std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << (field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown") << std::endl;
 
-                                // Map field type using TypeContext
+                                // Map field type using resolved Type* directly
                                 if (_type_context)
                                 {
-                                    auto field_cryo_type = _type_context->parse_type_from_string(field->type_annotation());
+                                    auto field_cryo_type = field->get_resolved_type();
                                     if (field_cryo_type)
                                     {
                                         llvm::Type *field_llvm_type = map_type(field_cryo_type);
@@ -719,8 +716,9 @@ namespace Cryo::Codegen
 
         std::cout << "[TypeMapper] Created struct type '" << struct_name << "' with " << field_types.size() << " fields" << std::endl;
 
-        // Cache the created type for future lookups
-        register_type(struct_name, llvm_struct);
+        // Cache the created type for future lookups (use both Type*-based and string-based)
+        register_type(struct_name, llvm_struct); // Legacy string-based caching
+        register_type(struct_type, llvm_struct); // Preferred Type*-based caching
 
         return llvm_struct;
     }
@@ -764,10 +762,10 @@ namespace Cryo::Codegen
                 {
                     std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << field->type_annotation() << std::endl;
 
-                    // Map field type using TypeContext
+                    // Map field type using resolved type
                     if (_type_context)
                     {
-                        auto field_cryo_type = _type_context->parse_type_from_string(field->type_annotation());
+                        auto field_cryo_type = field->get_resolved_type();
                         if (field_cryo_type)
                         {
                             llvm::Type *field_llvm_type = map_type(field_cryo_type);
@@ -815,8 +813,9 @@ namespace Cryo::Codegen
 
         std::cout << "[TypeMapper] Created class type '" << class_name << "' with " << field_types.size() << " fields" << std::endl;
 
-        // Cache the created type for future lookups
-        register_type(class_name, llvm_class);
+        // Cache the created type for future lookups (use both Type*-based and string-based)
+        register_type(class_name, llvm_class); // Legacy string-based caching
+        register_type(class_type, llvm_class); // Preferred Type*-based caching
 
         return llvm_class;
     }
@@ -1115,6 +1114,49 @@ namespace Cryo::Codegen
     }
 
     //===================================================================
+    // Type-Safe Caching Implementation (Migration Enhancement)
+    //===================================================================
+
+    void TypeMapper::register_type(Cryo::Type *cryo_type, llvm::Type *llvm_type)
+    {
+        if (!cryo_type || !llvm_type)
+        {
+            return;
+        }
+
+        // Store in Type*-based cache (preferred)
+        _cryo_type_cache[cryo_type] = llvm_type;
+
+        // Also store in string-based cache for backward compatibility during migration
+        std::string type_name = cryo_type->to_string();
+        if (!type_name.empty())
+        {
+            _type_cache[type_name] = llvm_type;
+        }
+    }
+
+    llvm::Type *TypeMapper::lookup_type(Cryo::Type *cryo_type)
+    {
+        if (!cryo_type)
+        {
+            return nullptr;
+        }
+
+        auto it = _cryo_type_cache.find(cryo_type);
+        return (it != _cryo_type_cache.end()) ? it->second : nullptr;
+    }
+
+    bool TypeMapper::has_type(Cryo::Type *cryo_type)
+    {
+        if (!cryo_type)
+        {
+            return false;
+        }
+
+        return _cryo_type_cache.find(cryo_type) != _cryo_type_cache.end();
+    }
+
+    //===================================================================
     // Error Handling
     //===================================================================
 
@@ -1134,6 +1176,97 @@ namespace Cryo::Codegen
         auto &llvm_context = _context_manager.get_context();
         return llvm::StructType::create(llvm_context, name);
     }
+
+    //===================================================================
+    // Helper Methods for Type System Migration
+    //===================================================================
+
+    llvm::Type *TypeMapper::try_handle_as_parameterized_type(Cryo::StructType *struct_type)
+    {
+        if (!struct_type || !_type_context)
+        {
+            return nullptr;
+        }
+
+        std::string struct_name = struct_type->name();
+
+        // Try to parse as a parameterized type using proper type objects instead of strings
+        auto parsed = parse_generic_type_string(struct_name);
+        if (parsed.first.empty() || parsed.second.empty())
+        {
+            return nullptr; // Not a generic type
+        }
+
+        std::string base_name = parsed.first;
+        std::vector<std::string> type_arg_strings = parsed.second;
+
+        // Convert string type arguments to Type objects
+        std::vector<Cryo::Type *> type_args;
+        for (const auto &type_arg_str : type_arg_strings)
+        {
+            Cryo::Type *arg_type = _type_context->parse_type_from_string(type_arg_str);
+            if (arg_type)
+            {
+                type_args.push_back(arg_type);
+            }
+        }
+
+        if (type_args.size() != type_arg_strings.size())
+        {
+            return nullptr; // Failed to parse some type arguments
+        }
+
+        // Use TypeContext to instantiate the generic type properly
+        Cryo::ParameterizedType *param_type = _type_context->instantiate_generic(base_name, type_args);
+        if (param_type)
+        {
+            // Use the parameterized type mapping instead of manual string manipulation
+            return map_parameterized_type(param_type);
+        }
+
+        return nullptr;
+    }
+
+    std::pair<std::string, std::vector<std::string>> TypeMapper::parse_generic_type_string(const std::string &type_name)
+    {
+        // Return empty pair if not a generic type
+        if (type_name.find('<') == std::string::npos || type_name.find('>') == std::string::npos)
+        {
+            return {"", {}};
+        }
+
+        size_t angle_pos = type_name.find('<');
+        std::string base_name = type_name.substr(0, angle_pos);
+
+        size_t close_angle = type_name.find('>', angle_pos);
+        if (close_angle == std::string::npos)
+        {
+            return {"", {}}; // Malformed generic type
+        }
+
+        std::string type_args_str = type_name.substr(angle_pos + 1, close_angle - angle_pos - 1);
+
+        // Parse type arguments
+        std::vector<std::string> type_args;
+        std::stringstream ss(type_args_str);
+        std::string arg;
+        while (std::getline(ss, arg, ','))
+        {
+            // Trim whitespace
+            arg.erase(0, arg.find_first_not_of(" \t"));
+            arg.erase(arg.find_last_not_of(" \t") + 1);
+            if (!arg.empty())
+            {
+                type_args.push_back(arg);
+            }
+        }
+
+        return {base_name, type_args};
+    }
+
+    //===================================================================
+    // Utility Functions
+    //===================================================================
 
     // Helper function to convert generic type names to instantiated names
     // e.g., "Pair<int,string>" -> "Pair_int_string"

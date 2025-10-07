@@ -10,6 +10,7 @@ namespace Cryo
 {
     // Forward declarations
     class TemplateRegistry;
+    class TypeChecker;
     /**
      * Monomorphization Pass
      *
@@ -34,11 +35,13 @@ namespace Cryo
          * @param program The root program node to process
          * @param required_instantiations List of generic instantiations needed
          * @param template_registry Registry containing all available generic templates
+         * @param type_checker TypeChecker instance for resolving type strings to Type* objects
          * @return True if monomorphization succeeded, false otherwise
          */
         bool monomorphize(ProgramNode &program,
                           const std::vector<GenericInstantiation> &required_instantiations,
-                          const class TemplateRegistry &template_registry);
+                          const class TemplateRegistry &template_registry,
+                          class TypeChecker &type_checker);
 
     private:
         /**
@@ -183,7 +186,30 @@ namespace Cryo
             ExpressionNode *original_expr,
             const std::unordered_map<std::string, std::string> &type_substitutions);
 
+        /**
+         * Convert string-based type substitutions to Type*-based substitutions.
+         *
+         * @param string_substitutions Map from generic parameter name to concrete type string
+         * @return Map from generic parameter name to concrete Type* object
+         */
+        std::unordered_map<std::string, std::shared_ptr<Type>> convert_to_type_substitutions(
+            const std::unordered_map<std::string, std::string> &string_substitutions);
+
+        /**
+         * Substitute generic types in a Type* object with concrete types.
+         *
+         * @param original_type The original Type* object that may contain generic parameters
+         * @param type_substitutions Map from generic parameter name to concrete Type* object
+         * @return New Type* object with substitutions applied, or original if no substitution needed
+         */
+        std::shared_ptr<Type> substitute_type(
+            Type *original_type,
+            const std::unordered_map<std::string, std::shared_ptr<Type>> &type_substitutions);
+
         // Track generated specializations to avoid duplicates
         std::unordered_map<std::string, ASTNode *> _generated_specializations;
+
+        // TypeChecker reference for type resolution (set during monomorphize call)
+        TypeChecker *_type_checker = nullptr;
     };
 }
