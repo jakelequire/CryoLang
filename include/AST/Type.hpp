@@ -410,6 +410,42 @@ namespace Cryo
         bool equals(const Type &other) const override;
     };
 
+    // Tuple type for multiple values
+    class TupleType : public Type
+    {
+    private:
+        std::vector<std::shared_ptr<Type>> _element_types;
+
+    public:
+        TupleType(std::vector<std::shared_ptr<Type>> element_types)
+            : Type(TypeKind::Tuple), _element_types(std::move(element_types))
+        {
+            // Build name like (int, string, bool)
+            _name = "(";
+            for (size_t i = 0; i < _element_types.size(); ++i)
+            {
+                if (i > 0)
+                    _name += ", ";
+                _name += _element_types[i]->name();
+            }
+            _name += ")";
+        }
+
+        const std::vector<std::shared_ptr<Type>> &element_types() const { return _element_types; }
+        size_t element_count() const { return _element_types.size(); }
+        std::shared_ptr<Type> element_type(size_t index) const
+        {
+            return index < _element_types.size() ? _element_types[index] : nullptr;
+        }
+
+        bool is_value_type() const override { return true; }
+        size_t size_bytes() const override;
+        size_t alignment() const override;
+        std::string to_string() const override { return _name; }
+
+        bool equals(const Type &other) const override;
+    };
+
     // Auto type (for type inference)
     class AutoType : public Type
     {
@@ -869,6 +905,7 @@ namespace Cryo
         Type *create_pointer_type(Type *pointee_type);
         Type *create_reference_type(Type *referent_type);
         Type *create_optional_type(Type *wrapped_type);
+        Type *create_tuple_type(const std::vector<Type *> &element_types);
         Type *create_function_type(Type *return_type, std::vector<Type *> param_types, bool is_variadic = false);
 
         // Create user-defined types

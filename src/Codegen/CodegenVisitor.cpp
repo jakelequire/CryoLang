@@ -237,7 +237,7 @@ namespace Cryo::Codegen
         if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(&node))
         {
             // Check if this method was already processed by looking for the generated function
-            std::string potential_scoped_name = current_primitive_type + "::" + node.name();
+            std::string potential_scoped_name = (current_primitive_type ? current_primitive_type->to_string() : "") + "::" + node.name();
             auto module = _context_manager.get_module();
             if (module && module->getFunction(potential_scoped_name))
             {
@@ -589,7 +589,7 @@ namespace Cryo::Codegen
                 _value_context->set_value(var_name, alloca, alloca, element_type);
 
                 // Store the variable type for later method call resolution
-                _variable_types[var_name] = cryo_type->to_string();
+                _variable_types[var_name] = cryo_type;
 
                 register_value(&node, alloca);
 
@@ -1276,7 +1276,7 @@ namespace Cryo::Codegen
         std::cout << "[CodegenVisitor] Visiting StructMethodNode: " << node.name() << std::endl;
 
         // Check if we're in a primitive implementation block context
-        if (!current_primitive_type.empty())
+        if (current_primitive_type != nullptr)
         {
             // Primitive method - needs special handling for 'this' parameter
             generate_primitive_method(&node, current_primitive_type);
@@ -1393,8 +1393,47 @@ namespace Cryo::Codegen
             return;
         }
 
-        // Check if this is a primitive type first
-        Cryo::Type *cryo_target_type = _symbol_table.get_type_context()->parse_type_from_string(target_type_name);
+        // Check if this is a primitive type first - use resolved type if available
+        Cryo::Type *cryo_target_type = nullptr;
+
+        // ImplementationBlockNode doesn't have resolved type, so look up by name
+        cryo_target_type = _symbol_table.get_type_context()->get_struct_type(target_type_name);
+        if (!cryo_target_type)
+        {
+            // Try to find the type by checking specific primitive types by name
+            if (target_type_name == "i8")
+                cryo_target_type = _symbol_table.get_type_context()->get_i8_type();
+            else if (target_type_name == "i16")
+                cryo_target_type = _symbol_table.get_type_context()->get_i16_type();
+            else if (target_type_name == "i32")
+                cryo_target_type = _symbol_table.get_type_context()->get_i32_type();
+            else if (target_type_name == "i64")
+                cryo_target_type = _symbol_table.get_type_context()->get_i64_type();
+            else if (target_type_name == "int")
+                cryo_target_type = _symbol_table.get_type_context()->get_int_type();
+            else if (target_type_name == "u8")
+                cryo_target_type = _symbol_table.get_type_context()->get_u8_type();
+            else if (target_type_name == "u16")
+                cryo_target_type = _symbol_table.get_type_context()->get_u16_type();
+            else if (target_type_name == "u32")
+                cryo_target_type = _symbol_table.get_type_context()->get_u32_type();
+            else if (target_type_name == "u64")
+                cryo_target_type = _symbol_table.get_type_context()->get_u64_type();
+            else if (target_type_name == "f32")
+                cryo_target_type = _symbol_table.get_type_context()->get_f32_type();
+            else if (target_type_name == "f64")
+                cryo_target_type = _symbol_table.get_type_context()->get_f64_type();
+            else if (target_type_name == "float")
+                cryo_target_type = _symbol_table.get_type_context()->get_default_float_type();
+            else if (target_type_name == "bool")
+                cryo_target_type = _symbol_table.get_type_context()->get_boolean_type();
+            else if (target_type_name == "char")
+                cryo_target_type = _symbol_table.get_type_context()->get_char_type();
+            else if (target_type_name == "string")
+                cryo_target_type = _symbol_table.get_type_context()->get_string_type();
+            else if (target_type_name == "void")
+                cryo_target_type = _symbol_table.get_type_context()->get_void_type();
+        }
         llvm::Type *primitive_type = cryo_target_type ? _type_mapper->map_type(cryo_target_type) : nullptr;
         std::cout << "[DEBUG] Implementation block for: " << target_type_name
                   << ", mapped type: " << (primitive_type ? "valid" : "null")
@@ -1405,7 +1444,7 @@ namespace Cryo::Codegen
             std::cout << "[CodegenVisitor] Generating implementation block for primitive type: " << target_type_name << std::endl;
 
             // Set primitive type context for method generation
-            current_primitive_type = target_type_name;
+            current_primitive_type = cryo_target_type;
 
             // Generate all method implementations for primitive type
             for (const auto &method : node.method_implementations())
@@ -1419,7 +1458,7 @@ namespace Cryo::Codegen
             }
 
             // Clear primitive type context
-            current_primitive_type.clear();
+            current_primitive_type = nullptr;
             return; // We've handled the primitive implementation
         }
 
@@ -2696,24 +2735,21 @@ namespace Cryo::Codegen
             auto type_it = _variable_types.find(array_var_name);
             if (type_it != _variable_types.end())
             {
-                std::string var_type = type_it->second;
+                Cryo::Type *var_type = type_it->second;
                 // Check if this is an Array<T> type
-                if (var_type.find("Array<") == 0 && var_type.find('>') != std::string::npos)
+                if (var_type && var_type->kind() == TypeKind::Array)
                 {
+                    auto *array_type = static_cast<ArrayType *>(var_type);
                     std::cout << "[CodegenVisitor] Special Array<T> direct access for variable '"
-                              << array_var_name << "' of type '" << var_type << "'" << std::endl;
+                              << array_var_name << "' of type '" << var_type->to_string() << "'" << std::endl;
 
-                    // Extract the element type (T)
-                    size_t start = var_type.find('<') + 1;
-                    size_t end = var_type.find('>');
-                    std::string element_type_str = var_type.substr(start, end - start);
-
-                    // Get the element type for Array operations
-                    Cryo::Type *cryo_element_type = _symbol_table.get_type_context()->parse_type_from_string(element_type_str);
+                    // Get the element type directly from the ArrayType
+                    Cryo::Type *cryo_element_type = array_type->element_type().get();
                     llvm::Type *llvm_element_type = cryo_element_type ? _type_mapper->map_type(cryo_element_type) : nullptr;
 
                     if (!llvm_element_type)
                     {
+                        std::string element_type_str = cryo_element_type ? cryo_element_type->to_string() : "unknown";
                         report_error("Could not resolve element type for Array indexing: " + element_type_str, &node);
                         return;
                     }
@@ -4018,11 +4054,12 @@ namespace Cryo::Codegen
         }
     }
 
-    void CodegenVisitor::generate_primitive_method(Cryo::StructMethodNode *node, const std::string &primitive_type_name)
+    void CodegenVisitor::generate_primitive_method(Cryo::StructMethodNode *node, Cryo::Type *primitive_type)
     {
         if (!node)
             return;
 
+        std::string primitive_type_name = primitive_type ? primitive_type->to_string() : "unknown";
         std::cout << "[CodegenVisitor] Generating primitive method: " << primitive_type_name << "::" << node->name() << std::endl;
 
         // Debug: Check _value_context at the very start
@@ -4044,10 +4081,10 @@ namespace Cryo::Codegen
             return;
         }
 
-        // Get primitive type for 'this' parameter
-        Cryo::Type *cryo_primitive_type = _symbol_table.get_type_context()->parse_type_from_string(primitive_type_name);
-        llvm::Type *primitive_type = cryo_primitive_type ? _type_mapper->map_type(cryo_primitive_type) : nullptr;
-        if (!primitive_type)
+        // Get primitive type for 'this' parameter - use the already resolved type
+        Cryo::Type *cryo_primitive_type = primitive_type;
+        llvm::Type *llvm_primitive_type = cryo_primitive_type ? _type_mapper->map_type(cryo_primitive_type) : nullptr;
+        if (!llvm_primitive_type)
         {
             report_error("Cannot map primitive type: " + primitive_type_name);
             return;
@@ -4057,7 +4094,7 @@ namespace Cryo::Codegen
         std::vector<llvm::Type *> param_types;
 
         // Add 'this' parameter (pointer to primitive type)
-        param_types.push_back(llvm::PointerType::getUnqual(primitive_type));
+        param_types.push_back(llvm::PointerType::getUnqual(llvm_primitive_type));
 
         // Add regular parameters
         for (const auto &param : node->parameters())
@@ -4122,7 +4159,7 @@ namespace Cryo::Codegen
         arg_it = func->arg_begin();
 
         // Handle 'this' parameter
-        llvm::AllocaInst *this_alloca = create_entry_block_alloca(func, llvm::PointerType::getUnqual(primitive_type), "this");
+        llvm::AllocaInst *this_alloca = create_entry_block_alloca(func, llvm::PointerType::getUnqual(llvm_primitive_type), "this");
         if (this_alloca)
         {
             builder.CreateStore(&*arg_it, this_alloca);
@@ -4138,7 +4175,7 @@ namespace Cryo::Codegen
             std::cout << "[DEBUG] Setting 'this' value in context, _value_context=" << _value_context.get() << std::endl;
 
             // Add to value context so it can be resolved in the function body
-            _value_context->set_value("this", this_alloca, this_alloca, llvm::PointerType::getUnqual(primitive_type));
+            _value_context->set_value("this", this_alloca, this_alloca, llvm::PointerType::getUnqual(llvm_primitive_type));
         }
         ++arg_it;
 
@@ -4319,7 +4356,48 @@ namespace Cryo::Codegen
         std::vector<llvm::Type *> param_types;
         for (const auto &type_name : variant->associated_types())
         {
-            Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(type_name);
+            // Look up type without string parsing - check primitive types first, then structs
+            Cryo::Type *cryo_param_type = nullptr;
+            if (type_name == "i8")
+                cryo_param_type = _symbol_table.get_type_context()->get_i8_type();
+            else if (type_name == "i16")
+                cryo_param_type = _symbol_table.get_type_context()->get_i16_type();
+            else if (type_name == "i32")
+                cryo_param_type = _symbol_table.get_type_context()->get_i32_type();
+            else if (type_name == "i64")
+                cryo_param_type = _symbol_table.get_type_context()->get_i64_type();
+            else if (type_name == "int")
+                cryo_param_type = _symbol_table.get_type_context()->get_int_type();
+            else if (type_name == "u8")
+                cryo_param_type = _symbol_table.get_type_context()->get_u8_type();
+            else if (type_name == "u16")
+                cryo_param_type = _symbol_table.get_type_context()->get_u16_type();
+            else if (type_name == "u32")
+                cryo_param_type = _symbol_table.get_type_context()->get_u32_type();
+            else if (type_name == "u64")
+                cryo_param_type = _symbol_table.get_type_context()->get_u64_type();
+            else if (type_name == "f32")
+                cryo_param_type = _symbol_table.get_type_context()->get_f32_type();
+            else if (type_name == "f64")
+                cryo_param_type = _symbol_table.get_type_context()->get_f64_type();
+            else if (type_name == "float")
+                cryo_param_type = _symbol_table.get_type_context()->get_default_float_type();
+            else if (type_name == "bool")
+                cryo_param_type = _symbol_table.get_type_context()->get_boolean_type();
+            else if (type_name == "char")
+                cryo_param_type = _symbol_table.get_type_context()->get_char_type();
+            else if (type_name == "string")
+                cryo_param_type = _symbol_table.get_type_context()->get_string_type();
+            else if (type_name == "void")
+                cryo_param_type = _symbol_table.get_type_context()->get_void_type();
+            else
+            {
+                cryo_param_type = _symbol_table.get_type_context()->get_struct_type(type_name);
+            }
+            if (!cryo_param_type)
+            {
+                cryo_param_type = _symbol_table.get_type_context()->lookup_enum_type(type_name);
+            }
             llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
             if (param_type)
             {
@@ -5809,7 +5887,7 @@ namespace Cryo::Codegen
                     auto type_it = _variable_types.find(object_name);
                     if (type_it != _variable_types.end())
                     {
-                        type_name = type_it->second;
+                        type_name = type_it->second ? type_it->second->to_string() : "";
 
                         // Keep the original generic type name for method lookup
                         // The specialized methods are stored with the full generic name like "GenericStruct<int>::get_value"
@@ -6434,7 +6512,7 @@ namespace Cryo::Codegen
 
                 // Check if this is a primitive type method call
                 auto type_it = _variable_types.find(object_name);
-                if (type_it != _variable_types.end() && is_primitive_type(type_it->second))
+                if (type_it != _variable_types.end() && type_it->second && is_primitive_type(type_it->second->to_string()))
                 {
                     // This is a primitive method call - add the object as 'this' pointer
                     llvm::Value *object_value = _value_context->get_value(object_name);
@@ -6944,7 +7022,7 @@ namespace Cryo::Codegen
             {
                 std::string object_name = object_identifier->name();
                 auto type_it = _variable_types.find(object_name);
-                if (type_it != _variable_types.end() && is_primitive_type(type_it->second))
+                if (type_it != _variable_types.end() && type_it->second && is_primitive_type(type_it->second->to_string()))
                 {
                     is_primitive_method_call = true;
                     // Add 'this' pointer parameter (string pointer for string methods)
@@ -8119,7 +8197,48 @@ namespace Cryo::Codegen
                 std::vector<std::shared_ptr<Cryo::Type>> type_args_as_types;
                 for (const std::string &type_arg : type_args)
                 {
-                    Cryo::Type *arg_type = _symbol_table.get_type_context()->parse_type_from_string(type_arg);
+                    // Look up type without string parsing - check multiple type contexts
+                    Cryo::Type *arg_type = nullptr;
+                    if (type_arg == "i8")
+                        arg_type = _symbol_table.get_type_context()->get_i8_type();
+                    else if (type_arg == "i16")
+                        arg_type = _symbol_table.get_type_context()->get_i16_type();
+                    else if (type_arg == "i32")
+                        arg_type = _symbol_table.get_type_context()->get_i32_type();
+                    else if (type_arg == "i64")
+                        arg_type = _symbol_table.get_type_context()->get_i64_type();
+                    else if (type_arg == "int")
+                        arg_type = _symbol_table.get_type_context()->get_int_type();
+                    else if (type_arg == "u8")
+                        arg_type = _symbol_table.get_type_context()->get_u8_type();
+                    else if (type_arg == "u16")
+                        arg_type = _symbol_table.get_type_context()->get_u16_type();
+                    else if (type_arg == "u32")
+                        arg_type = _symbol_table.get_type_context()->get_u32_type();
+                    else if (type_arg == "u64")
+                        arg_type = _symbol_table.get_type_context()->get_u64_type();
+                    else if (type_arg == "f32")
+                        arg_type = _symbol_table.get_type_context()->get_f32_type();
+                    else if (type_arg == "f64")
+                        arg_type = _symbol_table.get_type_context()->get_f64_type();
+                    else if (type_arg == "float")
+                        arg_type = _symbol_table.get_type_context()->get_default_float_type();
+                    else if (type_arg == "bool")
+                        arg_type = _symbol_table.get_type_context()->get_boolean_type();
+                    else if (type_arg == "char")
+                        arg_type = _symbol_table.get_type_context()->get_char_type();
+                    else if (type_arg == "string")
+                        arg_type = _symbol_table.get_type_context()->get_string_type();
+                    else if (type_arg == "void")
+                        arg_type = _symbol_table.get_type_context()->get_void_type();
+                    else
+                    {
+                        arg_type = _symbol_table.get_type_context()->get_struct_type(type_arg);
+                    }
+                    if (!arg_type)
+                    {
+                        arg_type = _symbol_table.get_type_context()->lookup_enum_type(type_arg);
+                    }
                     if (arg_type)
                     {
                         type_args_as_types.push_back(std::shared_ptr<Cryo::Type>(arg_type));
@@ -8458,7 +8577,48 @@ namespace Cryo::Codegen
         param_types.push_back(llvm::PointerType::get(struct_type, 0)); // 'this' pointer
 
         // For our test case, we know there's one parameter of the generic type
-        Cryo::Type *cryo_param_type = _symbol_table.get_type_context()->parse_type_from_string(type_args[0]);
+        // Look up type without string parsing - check multiple type contexts
+        Cryo::Type *cryo_param_type = nullptr;
+        if (type_args[0] == "i8")
+            cryo_param_type = _symbol_table.get_type_context()->get_i8_type();
+        else if (type_args[0] == "i16")
+            cryo_param_type = _symbol_table.get_type_context()->get_i16_type();
+        else if (type_args[0] == "i32")
+            cryo_param_type = _symbol_table.get_type_context()->get_i32_type();
+        else if (type_args[0] == "i64")
+            cryo_param_type = _symbol_table.get_type_context()->get_i64_type();
+        else if (type_args[0] == "int")
+            cryo_param_type = _symbol_table.get_type_context()->get_int_type();
+        else if (type_args[0] == "u8")
+            cryo_param_type = _symbol_table.get_type_context()->get_u8_type();
+        else if (type_args[0] == "u16")
+            cryo_param_type = _symbol_table.get_type_context()->get_u16_type();
+        else if (type_args[0] == "u32")
+            cryo_param_type = _symbol_table.get_type_context()->get_u32_type();
+        else if (type_args[0] == "u64")
+            cryo_param_type = _symbol_table.get_type_context()->get_u64_type();
+        else if (type_args[0] == "f32")
+            cryo_param_type = _symbol_table.get_type_context()->get_f32_type();
+        else if (type_args[0] == "f64")
+            cryo_param_type = _symbol_table.get_type_context()->get_f64_type();
+        else if (type_args[0] == "float")
+            cryo_param_type = _symbol_table.get_type_context()->get_default_float_type();
+        else if (type_args[0] == "bool")
+            cryo_param_type = _symbol_table.get_type_context()->get_boolean_type();
+        else if (type_args[0] == "char")
+            cryo_param_type = _symbol_table.get_type_context()->get_char_type();
+        else if (type_args[0] == "string")
+            cryo_param_type = _symbol_table.get_type_context()->get_string_type();
+        else if (type_args[0] == "void")
+            cryo_param_type = _symbol_table.get_type_context()->get_void_type();
+        else
+        {
+            cryo_param_type = _symbol_table.get_type_context()->get_struct_type(type_args[0]);
+        }
+        if (!cryo_param_type)
+        {
+            cryo_param_type = _symbol_table.get_type_context()->lookup_enum_type(type_args[0]);
+        }
         llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr; // T mapped to concrete type (int)
         if (!param_type)
         {
@@ -8781,9 +8941,49 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Get LLVM types for source and target
+        // Get LLVM types for source and target - look up target type without string parsing
         llvm::Type *source_type = source_value->getType();
-        Cryo::Type *cryo_target_type = _symbol_table.get_type_context()->parse_type_from_string(target_type);
+        Cryo::Type *cryo_target_type = nullptr;
+        if (target_type == "i8")
+            cryo_target_type = _symbol_table.get_type_context()->get_i8_type();
+        else if (target_type == "i16")
+            cryo_target_type = _symbol_table.get_type_context()->get_i16_type();
+        else if (target_type == "i32")
+            cryo_target_type = _symbol_table.get_type_context()->get_i32_type();
+        else if (target_type == "i64")
+            cryo_target_type = _symbol_table.get_type_context()->get_i64_type();
+        else if (target_type == "int")
+            cryo_target_type = _symbol_table.get_type_context()->get_int_type();
+        else if (target_type == "u8")
+            cryo_target_type = _symbol_table.get_type_context()->get_u8_type();
+        else if (target_type == "u16")
+            cryo_target_type = _symbol_table.get_type_context()->get_u16_type();
+        else if (target_type == "u32")
+            cryo_target_type = _symbol_table.get_type_context()->get_u32_type();
+        else if (target_type == "u64")
+            cryo_target_type = _symbol_table.get_type_context()->get_u64_type();
+        else if (target_type == "f32")
+            cryo_target_type = _symbol_table.get_type_context()->get_f32_type();
+        else if (target_type == "f64")
+            cryo_target_type = _symbol_table.get_type_context()->get_f64_type();
+        else if (target_type == "float")
+            cryo_target_type = _symbol_table.get_type_context()->get_default_float_type();
+        else if (target_type == "bool")
+            cryo_target_type = _symbol_table.get_type_context()->get_boolean_type();
+        else if (target_type == "char")
+            cryo_target_type = _symbol_table.get_type_context()->get_char_type();
+        else if (target_type == "string")
+            cryo_target_type = _symbol_table.get_type_context()->get_string_type();
+        else if (target_type == "void")
+            cryo_target_type = _symbol_table.get_type_context()->get_void_type();
+        else
+        {
+            cryo_target_type = _symbol_table.get_type_context()->get_struct_type(target_type);
+        }
+        if (!cryo_target_type)
+        {
+            cryo_target_type = _symbol_table.get_type_context()->lookup_enum_type(target_type);
+        }
         llvm::Type *target_llvm_type = cryo_target_type ? _type_mapper->map_type(cryo_target_type) : nullptr;
 
         if (!target_llvm_type)

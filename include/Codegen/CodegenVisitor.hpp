@@ -273,7 +273,7 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::GlobalVariable *> _globals;
         std::unordered_map<std::string, llvm::Type *> _global_types;   // Track global variable element types
         std::unordered_map<std::string, llvm::Value *> _enum_variants; // Track enum variants for scope resolution
-        std::unordered_map<std::string, std::string> _variable_types;  // Track variable name -> type annotation string
+        std::unordered_map<std::string, Cryo::Type *> _variable_types; // Track variable name -> resolved type object
 
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
@@ -282,7 +282,7 @@ namespace Cryo::Codegen
         bool _stdlib_compilation_mode; // Generate full implementations for imports in stdlib mode
 
         // Primitive type context for method generation
-        std::string current_primitive_type;                             // Track current primitive type being implemented
+        Cryo::Type *current_primitive_type = nullptr;                   // Track current primitive type being implemented
         std::string current_struct_type;                                // Track current struct type being implemented
         std::set<Cryo::StructMethodNode *> processed_primitive_methods; // Track already processed primitive methods
 
@@ -313,7 +313,7 @@ namespace Cryo::Codegen
         llvm::Function *generate_function_declaration(Cryo::FunctionDeclarationNode *node);
         llvm::Function *generate_method_declaration(Cryo::StructMethodNode *method, llvm::Type *struct_type);
         bool generate_function_body(Cryo::FunctionDeclarationNode *node, llvm::Function *function);
-        void generate_primitive_method(Cryo::StructMethodNode *node, const std::string &primitive_type_name);
+        void generate_primitive_method(Cryo::StructMethodNode *node, Cryo::Type *primitive_type);
 
         // Generic type generation
         llvm::Function *generate_generic_constructor(const std::string &instantiated_type,

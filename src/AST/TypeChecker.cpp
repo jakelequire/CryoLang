@@ -785,9 +785,62 @@ namespace Cryo
         // Check for tuple types first (before checking for generic syntax)
         if (type_string.front() == '(' && type_string.back() == ')')
         {
-            std::cout << "[DEBUG] TypeChecker: '" << type_string << "' is a tuple type, deferring to type context" << std::endl;
-            // Tuple types should be handled by the main type context, not as generic instantiations
-            return _type_context.parse_type_from_string(type_string);
+            std::cout << "[DEBUG] TypeChecker: '" << type_string << "' is a tuple type, creating proper TupleType" << std::endl;
+
+            // Parse tuple element types from "(type1, type2, type3)" syntax
+            std::string inner = type_string.substr(1, type_string.length() - 2); // Remove parentheses
+
+            std::vector<Type *> element_types;
+            if (!inner.empty())
+            {
+                // Split by comma and recursively resolve each element type
+                std::vector<std::string> element_strings;
+                size_t start = 0;
+                int paren_depth = 0;
+
+                for (size_t i = 0; i < inner.length(); ++i)
+                {
+                    if (inner[i] == '(')
+                        paren_depth++;
+                    else if (inner[i] == ')')
+                        paren_depth--;
+                    else if (inner[i] == ',' && paren_depth == 0)
+                    {
+                        element_strings.push_back(inner.substr(start, i - start));
+                        start = i + 1;
+                        // Skip whitespace
+                        while (start < inner.length() && std::isspace(inner[start]))
+                            start++;
+                    }
+                }
+                // Add the last element
+                if (start < inner.length())
+                {
+                    element_strings.push_back(inner.substr(start));
+                }
+
+                // Resolve each element type
+                for (const std::string &element_str : element_strings)
+                {
+                    std::string trimmed = element_str;
+                    // Trim whitespace
+                    trimmed.erase(0, trimmed.find_first_not_of(" \t"));
+                    trimmed.erase(trimmed.find_last_not_of(" \t") + 1);
+
+                    Type *element_type = resolve_type_with_generic_context(trimmed);
+                    if (element_type)
+                    {
+                        element_types.push_back(element_type);
+                    }
+                    else
+                    {
+                        std::cout << "[ERROR] Failed to resolve tuple element type: " << trimmed << std::endl;
+                        return nullptr;
+                    }
+                }
+            }
+
+            return _type_context.create_tuple_type(element_types);
         }
 
         // Check for reference types (&Type<T>) - strip the & for template lookup
@@ -875,8 +928,72 @@ namespace Cryo
             }
         }
 
-        // Fall back to normal type parsing
-        return _type_context.parse_type_from_string(type_string);
+        // Fall back to direct type lookups without string parsing
+        std::cout << "[DEBUG] TypeChecker: Attempting direct type lookup for '" << type_string << "'" << std::endl;
+
+        // Try primitive types
+        if (type_string == "void")
+            return _type_context.get_void_type();
+        if (type_string == "bool")
+            return _type_context.get_boolean_type();
+        if (type_string == "char")
+            return _type_context.get_char_type();
+        if (type_string == "string")
+            return _type_context.get_string_type();
+        if (type_string == "auto")
+            return _type_context.get_auto_type();
+
+        // Integer types
+        if (type_string == "i8")
+            return _type_context.get_i8_type();
+        if (type_string == "i16")
+            return _type_context.get_i16_type();
+        if (type_string == "i32")
+            return _type_context.get_i32_type();
+        if (type_string == "i64")
+            return _type_context.get_i64_type();
+        if (type_string == "int")
+            return _type_context.get_int_type();
+        if (type_string == "u8")
+            return _type_context.get_u8_type();
+        if (type_string == "u16")
+            return _type_context.get_u16_type();
+        if (type_string == "u32")
+            return _type_context.get_u32_type();
+        if (type_string == "u64")
+            return _type_context.get_u64_type();
+
+        // Float types
+        if (type_string == "f32")
+            return _type_context.get_f32_type();
+        if (type_string == "f64")
+            return _type_context.get_f64_type();
+        if (type_string == "float")
+            return _type_context.get_default_float_type();
+
+        // Try user-defined types
+        Type *struct_type = _type_context.get_struct_type(type_string);
+        if (struct_type)
+            return struct_type;
+
+        Type *class_type = _type_context.get_class_type(type_string);
+        if (class_type)
+            return class_type;
+
+        Type *trait_type = _type_context.get_trait_type(type_string);
+        if (trait_type)
+            return trait_type;
+
+        Type *enum_type = _type_context.lookup_enum_type(type_string);
+        if (enum_type)
+            return enum_type;
+
+        Type *generic_type = _type_context.get_generic_type(type_string);
+        if (generic_type)
+            return generic_type;
+
+        std::cout << "[ERROR] TypeChecker: Failed to resolve type '" << type_string << "' - type not found" << std::endl;
+        return nullptr;
     }
 
     //===----------------------------------------------------------------------===//
@@ -1180,7 +1297,7 @@ namespace Cryo
             // Visit the initializer to determine its type
             node.initializer()->accept(*this);
             inferred_type = node.initializer()->type().has_value()
-                                ? _type_context.parse_type_from_string(node.initializer()->type().value())
+                                ? resolve_type_with_generic_context(node.initializer()->type().value())
                                 : nullptr;
         }
 
