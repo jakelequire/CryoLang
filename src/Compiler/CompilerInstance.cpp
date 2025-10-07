@@ -226,6 +226,11 @@ namespace Cryo
             // Store file information for diagnostics
             std::string file_path = file->path();
 
+            if (file_path.find("runtime.cryo") != std::string::npos)
+            {
+                return true; // Skip parsing runtime.cryo in LSP mode
+            }
+
             // Phase 1: Create lexer
             _lexer = std::make_unique<Lexer>(std::move(file));
 
@@ -1222,7 +1227,8 @@ namespace Cryo
 
         // Skip auto-import if we're compiling the core/types module itself
         if (_source_file.find("core/types.cryo") != std::string::npos ||
-            _source_file.find("stdlib/core/types.cryo") != std::string::npos)
+            _source_file.find("stdlib/core/types.cryo") != std::string::npos ||
+            _source_file.find("runtime/runtime.cryo") != std::string::npos)
         {
             std::cout << "[CompilerInstance] Skipping auto-imports when compiling core/types module" << std::endl;
             return;

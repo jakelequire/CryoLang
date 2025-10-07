@@ -49,6 +49,11 @@ namespace Cryo::Codegen
         llvm::Value* generate_memcmp(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_memmove(const std::vector<llvm::Value*>& args);
 
+        // Pointer arithmetic intrinsics
+        llvm::Value* generate_ptr_add(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_ptr_sub(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_ptr_diff(const std::vector<llvm::Value*>& args);
+
         // System call intrinsics
         llvm::Value* generate_syscall_write(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_syscall_read(const std::vector<llvm::Value*>& args);

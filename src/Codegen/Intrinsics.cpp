@@ -48,6 +48,14 @@ namespace Cryo::Codegen
         else if (intrinsic_name == "__memmove__")
             return generate_memmove(args);
 
+        // Pointer arithmetic operations
+        else if (intrinsic_name == "__ptr_add__")
+            return generate_ptr_add(args);
+        else if (intrinsic_name == "__ptr_sub__")
+            return generate_ptr_sub(args);
+        else if (intrinsic_name == "__ptr_diff__")
+            return generate_ptr_diff(args);
+
         // System calls
         else if (intrinsic_name == "__syscall_write__")
             return generate_syscall_write(args);
@@ -522,6 +530,118 @@ namespace Cryo::Codegen
 
         // Return dest pointer
         return dest;
+    }
+
+    // ========================================
+    // Pointer Arithmetic Intrinsics
+    // ========================================
+
+    llvm::Value* Intrinsics::generate_ptr_add(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("__ptr_add__ requires exactly 2 arguments (ptr, offset)");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        llvm::Value* ptr = args[0];
+        llvm::Value* offset = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("__ptr_add__ first argument must be a pointer");
+            return nullptr;
+        }
+
+        // Convert pointer to i8* for byte arithmetic
+        llvm::Type* i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Value* byte_ptr = builder.CreateBitCast(ptr, i8_ptr_type, "ptr_as_bytes");
+
+        // Ensure offset is i64
+        llvm::Value* offset_i64 = ensure_type(offset, llvm::Type::getInt64Ty(context), "ptr_add.offset");
+        
+        // Use getelementptr for pointer arithmetic
+        llvm::Value* result_ptr = builder.CreateGEP(
+            llvm::Type::getInt8Ty(context),
+            byte_ptr,
+            offset_i64,
+            "ptr_add_result"
+        );
+
+        // Cast back to original pointer type
+        return builder.CreateBitCast(result_ptr, ptr->getType(), "ptr_add_cast");
+    }
+
+    llvm::Value* Intrinsics::generate_ptr_sub(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("__ptr_sub__ requires exactly 2 arguments (ptr, offset)");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        llvm::Value* ptr = args[0];
+        llvm::Value* offset = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("__ptr_sub__ first argument must be a pointer");
+            return nullptr;
+        }
+
+        // Convert pointer to i8* for byte arithmetic
+        llvm::Type* i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Value* byte_ptr = builder.CreateBitCast(ptr, i8_ptr_type, "ptr_as_bytes");
+
+        // Ensure offset is i64 and negate it
+        llvm::Value* offset_i64 = ensure_type(offset, llvm::Type::getInt64Ty(context), "ptr_sub.offset");
+        llvm::Value* neg_offset = builder.CreateNeg(offset_i64, "neg_offset");
+        
+        // Use getelementptr for pointer arithmetic
+        llvm::Value* result_ptr = builder.CreateGEP(
+            llvm::Type::getInt8Ty(context),
+            byte_ptr,
+            neg_offset,
+            "ptr_sub_result"
+        );
+
+        // Cast back to original pointer type
+        return builder.CreateBitCast(result_ptr, ptr->getType(), "ptr_sub_cast");
+    }
+
+    llvm::Value* Intrinsics::generate_ptr_diff(const std::vector<llvm::Value*>& args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("__ptr_diff__ requires exactly 2 arguments (ptr1, ptr2)");
+            return nullptr;
+        }
+
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        llvm::Value* ptr1 = args[0];
+        llvm::Value* ptr2 = args[1];
+
+        if (!ptr1->getType()->isPointerTy() || !ptr2->getType()->isPointerTy())
+        {
+            report_error("__ptr_diff__ both arguments must be pointers");
+            return nullptr;
+        }
+
+        // Convert pointers to integers for arithmetic
+        llvm::Type* int_ptr_type = llvm::Type::getIntNTy(context, 64);
+        llvm::Value* int_ptr1 = builder.CreatePtrToInt(ptr1, int_ptr_type, "ptr1_as_int");
+        llvm::Value* int_ptr2 = builder.CreatePtrToInt(ptr2, int_ptr_type, "ptr2_as_int");
+
+        // Calculate difference
+        return builder.CreateSub(int_ptr1, int_ptr2, "ptr_diff_result");
     }
 
     // ========================================
