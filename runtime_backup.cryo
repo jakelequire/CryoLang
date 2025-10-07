@@ -1,0 +1,515 @@
+namespace std::Runtime;
+
+import <core/intrinsics>;
+
+//===================================================================
+// CRYO RUNTIME SYSTEM
+// Production-quality core runtime with clean architecture
+//===================================================================
+
+// Forward declaration of user main function (simple signature for now)
+extern function _user_main_() -> int;
+
+//===================================================================
+// CORE TYPE DEFINITIONS
+//===================================================================
+
+// Runtime error codes
+enum RuntimeError {
+    SUCCESS,
+    INITIALIZATION_FAILED,
+    HEAP_EXHAUSTED,
+    INVALID_POINTER,
+    BOUNDS_VIOLATION,
+    DOUBLE_FREE,
+    SYSTEM_ERROR
+}
+
+// Runtime lifecycle states
+enum RuntimeState {
+    UNINITIALIZED,
+    INITIALIZING,
+    RUNNING,
+    SHUTTING_DOWN,
+    TERMINATED
+}
+
+// Exit handler function type
+type ExitHandler = () -> void;
+
+//===================================================================
+// RUNTIME CORE STATE
+//===================================================================
+
+// Global runtime context - single source of truth
+type struct RuntimeContext {
+    state: RuntimeState;
+    
+    // Heap management
+    heap_initialized: boolean;
+    heap_base: void*;
+    heap_size: u64;
+    
+    // Statistics and diagnostics
+    total_allocations: u64;
+    total_deallocations: u64;
+    bytes_allocated: u64;
+    peak_allocation: u64;
+    
+    // Error handling
+    last_error: RuntimeError;
+    panic_in_progress: boolean;
+}
+
+// Global runtime instance - initialized to zero
+mut g_runtime: RuntimeContext;
+
+//===================================================================
+// HEAP MANAGEMENT - DOUBLY-LINKED FREE LIST ALLOCATOR
+//===================================================================
+
+// Heap block header (16-byte aligned for performance)
+type struct HeapBlock {
+    size: u64;           // Size of user data area
+    flags: u64;          // Status flags and metadata
+    next: HeapBlock*;    // Next block in free list
+    prev: HeapBlock*;    // Previous block in free list
+}
+
+
+// Block flags
+const BLOCK_FREE: i64       = 0x0;                  // Free block
+const BLOCK_ALLOCATED: i64  = 0x1;                  // Mark block as allocated
+const BLOCK_GUARD: i64      = 0x2;                  // Guard block
+const BLOCK_MAGIC: i64      = 0xDEADBEEF00000000;   // Magic number for integrity check
+
+// Heap configuration
+const DEFAULT_HEAP_SIZE: u64 = 16777216;  // 16MB
+const MIN_BLOCK_SIZE: u64    = 32;        // Minimum allocation size
+const BLOCK_ALIGNMENT: u64   = 16;        // Block alignment
+const HEAP_GUARD_SIZE: u64   = 4096;      // Guard pages at heap boundaries
+
+// Free list head
+mut g_free_list: HeapBlock*;
+
+//===================================================================
+// UTILITY FUNCTIONS  
+//===================================================================
+
+function set_runtime_error(error: RuntimeError) -> void {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Setting last error: %d\n", error);
+    g_runtime.last_error = error;
+}
+
+function get_last_error() -> RuntimeError {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Getting last error: %d\n", g_runtime.last_error);
+    return g_runtime.last_error;
+}
+
+function align_size(size: u64, alignment: u64) -> u64 {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Aligning size: %llu to alignment: %llu\n", size, alignment);
+    // Round up to the next multiple of alignment
+    // Formula: ((size + alignment - 1) / alignment) * alignment
+    const size_plus_align: u64 = size + alignment;
+    const size_plus_align_minus_1: u64 = u64(size_plus_align - u64(1));
+    const divided: u64 = u64(size_plus_align_minus_1 / alignment);
+    const aligned: u64 = u64(divided * alignment);
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Aligned result: %llu\n", aligned);
+    return aligned;
+}
+
+function get_user_data_ptr(block: HeapBlock*) -> void* {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Getting user data pointer from block: ptr=%p\n", block);
+    // Calculate user data pointer by adding the size of HeapBlock header to the block pointer
+    // The user data area starts immediately after the HeapBlock structure
+    const header_size: u64 = sizeof(HeapBlock);
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Header size: %llu bytes\n", header_size);
+    
+    // Use pointer arithmetic to get the user data area
+    mut user_data_ptr: void* = std::Intrinsics::__ptr_add__(block, header_size);
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] User data pointer: %p\n", user_data_ptr);
+    
+    return user_data_ptr;
+}
+
+function find_free_block(size: u64) -> HeapBlock* {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Finding free block: size=%llu bytes\n", size);
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] g_free_list: %p\n", g_free_list);
+    mut current: HeapBlock* = g_free_list;
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] current: %p\n", current);
+    while (current != null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Checking block: ptr=%p, size=%llu bytes\n", get_user_data_ptr(current), current.size);
+        if (current.size >= size) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] Found free block: ptr=%p, size=%llu bytes\n", get_user_data_ptr(current), current.size);
+            return current;
+        }
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Block too small: ptr=%p, size=%llu bytes\n", get_user_data_ptr(current), current.size);
+        current = current.next;
+    }
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] No suitable free block found\n");
+    return null;
+}
+
+function split_block(block: HeapBlock*, size: u64) -> void {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] [UNIMPLEMENTED] Splitting block: ptr=%p, requested size=%llu bytes\n", get_user_data_ptr(block), size);
+    // For now, simplified version without actual block splitting
+    // This is a placeholder until we have proper pointer arithmetic
+    block.size = size;
+}
+
+function remove_from_free_list(block: HeapBlock*) -> void {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Removing block from free list: ptr=%p\n", get_user_data_ptr(block));
+    if (block.prev != null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Updating previous block's next pointer\n");
+        block.prev.next = block.next;
+    } else {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Updating free list head\n");
+        g_free_list = block.next;
+    }
+    
+    if (block.next != null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Updating next block's previous pointer\n");
+        block.next.prev = block.prev;
+    }
+
+    block.prev = null;
+    block.next = null;
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Block removed from free list: ptr=%p\n", get_user_data_ptr(block));
+}
+
+//===================================================================
+// RUNTIME INITIALIZATION
+//===================================================================
+
+function setup_signal_handlers() -> void {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] [UNINITIALIZED] Setting up signal handlers...\n");
+    // Register handlers for critical signals
+    // SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGTERM
+    // These will call cryo_panic with appropriate messages
+    return;
+}
+
+function heap_init() -> RuntimeError {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Initializing heap...\n");
+    // Request memory from OS via intrinsic
+    g_runtime.heap_base = std::Intrinsics::__mmap__(DEFAULT_HEAP_SIZE);
+    if (g_runtime.heap_base == null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Heap initialization failed: mmap returned null\n");
+        return RuntimeError::SYSTEM_ERROR;
+    }
+    
+    g_runtime.heap_size = DEFAULT_HEAP_SIZE;
+    g_runtime.heap_initialized = true;
+    
+    // Initialize first free block
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Setting g_free_list to heap_base: %p\n", g_runtime.heap_base);
+    g_free_list = g_runtime.heap_base;
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] g_free_list set to: %p\n", g_free_list);
+    
+    g_free_list.size = DEFAULT_HEAP_SIZE - sizeof(HeapBlock);
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Setting g_free_list.size to: %llu\n", g_free_list.size);
+    
+    g_free_list.flags = BLOCK_FREE | BLOCK_MAGIC;
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Setting g_free_list.flags to: %llu\n", g_free_list.flags);
+    
+    g_free_list.next = null;
+    g_free_list.prev = null;
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Initialized free list pointers to null\n");
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Heap initialized: base=%p, size=%llu bytes\n", g_runtime.heap_base, g_runtime.heap_size);
+    return RuntimeError::SUCCESS;
+}
+
+function runtime_init() -> RuntimeError {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Initializing runtime...\n");
+    // Prevent double initialization
+    if (g_runtime.state != RuntimeState::UNINITIALIZED) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Runtime already initialized or in invalid state\n");
+        return RuntimeError::INITIALIZATION_FAILED;
+    }
+    
+    g_runtime.state = RuntimeState::INITIALIZING;
+    g_runtime.last_error = RuntimeError::SUCCESS;
+    g_runtime.panic_in_progress = false;
+    
+    // Initialize heap
+    const heap_result: RuntimeError = heap_init();
+    if (heap_result != RuntimeError::SUCCESS) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Heap initialization failed during runtime init\n");
+        g_runtime.state = RuntimeState::UNINITIALIZED;
+        return heap_result;
+    }
+    
+    // Setup signal handlers for graceful error handling
+    setup_signal_handlers();
+
+    g_runtime.state = RuntimeState::RUNNING;
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Runtime initialized successfully.\n");
+    return RuntimeError::SUCCESS;
+}
+
+//===================================================================
+// HEAP IMPLEMENTATION
+//===================================================================
+
+function cryo_alloc(size: u64) -> void* {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Allocating memory: size=%llu bytes\n", size);
+    if (!g_runtime.heap_initialized) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Heap not initialized\n");
+        set_runtime_error(RuntimeError::INITIALIZATION_FAILED);
+        return null;
+    }
+    
+    if (size == 0u64) {
+        return null;
+    }
+    
+    // Align size to BLOCK_ALIGNMENT
+    const aligned_size: u64 = align_size(size, BLOCK_ALIGNMENT);
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Aligned size: %llu bytes\n", aligned_size);
+    
+    // Find suitable free block
+    mut block: HeapBlock* = find_free_block(aligned_size);
+    if (block == null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] No suitable free block found\n");
+        set_runtime_error(RuntimeError::HEAP_EXHAUSTED);
+        return null;
+    }
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Found free block: ptr=%p, size=%llu bytes\n", get_user_data_ptr(block), block.size);
+    
+    // Split block if significantly larger than needed
+    if (block.size > aligned_size + sizeof(HeapBlock) + MIN_BLOCK_SIZE) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Splitting block: ptr=%p\n", get_user_data_ptr(block));
+        split_block(block, aligned_size);
+    }
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Using block: ptr=%p, size=%llu bytes\n", get_user_data_ptr(block), block.size);
+    
+    // Mark block as allocated
+    block.flags = BLOCK_ALLOCATED | BLOCK_MAGIC;
+    remove_from_free_list(block);
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Block marked as allocated: ptr=%p\n", get_user_data_ptr(block));
+    
+    // Update statistics
+    g_runtime.total_allocations = g_runtime.total_allocations + 1u64;
+    g_runtime.bytes_allocated = g_runtime.bytes_allocated + block.size;
+    if (g_runtime.bytes_allocated > g_runtime.peak_allocation) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] New peak allocation: %llu bytes\n", g_runtime.bytes_allocated);
+        g_runtime.peak_allocation = g_runtime.bytes_allocated;
+    }
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Allocated memory: ptr=%p, size=%llu bytes\n", get_user_data_ptr(block), block.size);
+    // Return pointer to user data (after header)
+    return get_user_data_ptr(block);
+}
+
+function cryo_free(_ptr: void*) -> void {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Freeing memory: ptr=%p\n", _ptr);
+    if (_ptr == null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Invalid pointer: null\n");
+        return;
+    }
+    
+    // Get block header from user pointer
+    const block: HeapBlock* = get_block_from_ptr(_ptr);
+    
+    // Validate block
+    if (!is_valid_block(block)) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Invalid block detected during free: ptr=%p\n", _ptr);
+        set_runtime_error(RuntimeError::INVALID_POINTER);
+        return;
+    }
+    
+    if (block.flags & BLOCK_FREE) {
+        // Double free detected
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Double free detected: ptr=%p\n", _ptr);
+        set_runtime_error(RuntimeError::DOUBLE_FREE);
+        cryo_panic("Double free detected", "", 0);
+        return;
+    }
+
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Freeing block: ptr=%p, size=%llu bytes\n", get_user_data_ptr(block), block.size);
+    
+    // Mark as free and update statistics
+    block.flags = BLOCK_FREE | BLOCK_MAGIC;
+    g_runtime.total_deallocations = g_runtime.total_deallocations + 1u64;
+    g_runtime.bytes_allocated = g_runtime.bytes_allocated - block.size;
+    
+    // Add to free list and coalesce
+    add_to_free_list(block);
+    coalesce_block(block);
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Memory freed: ptr=%p\n", _ptr);
+}
+
+//===================================================================
+// HEAP HELPER FUNCTIONS
+//===================================================================
+
+function coalesce_block(block: HeapBlock*) -> void {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing block: ptr=%p\n", get_user_data_ptr(block));
+    // Coalesce with next block if free and adjacent
+    if (block.next != null && (block.next.flags & BLOCK_FREE) && is_adjacent(block, block.next)) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing with next block: ptr=%p\n", get_user_data_ptr(block.next));
+        block.size = block.size + sizeof(HeapBlock) + block.next.size;
+        remove_from_free_list(block.next);
+        block.next = block.next.next;
+        if (block.next != null) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] Updating next block's previous pointer\n");
+            block.next.prev = block;
+        }
+    }
+    
+    // Coalesce with previous block if free and adjacent
+    if (block.prev != null && (block.prev.flags & BLOCK_FREE) && is_adjacent(block.prev, block)) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing with previous block: ptr=%p\n", get_user_data_ptr(block.prev));
+        block.prev.size = block.prev.size + sizeof(HeapBlock) + block.size;
+        remove_from_free_list(block);
+        block.prev.next = block.next;
+        if (block.next != null) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] Updating next block's previous pointer\n");
+            block.next.prev = block.prev;
+        }
+    }
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing complete for block: ptr=%p\n", get_user_data_ptr(block));
+}
+
+
+function get_block_from_ptr(_ptr: void*) -> HeapBlock* {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] [UNIMPLEMENTED] Getting block from pointer: ptr=%p\n", _ptr);
+    // Placeholder - need proper pointer arithmetic support
+    return _ptr;
+}
+
+function is_valid_block(block: HeapBlock*) -> boolean {
+    if (block == null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Invalid block: null pointer\n");
+        return false;
+    }
+    
+    if ((block.flags & BLOCK_MAGIC) != BLOCK_MAGIC) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Invalid block: incorrect magic number\n");
+        return false;
+    }
+    
+    return true;
+}
+
+function is_adjacent(block1: HeapBlock*, block2: HeapBlock*) -> boolean {
+    // Simple placeholder - check if blocks are logically adjacent
+    // In a real implementation, this would check actual memory addresses
+    if (block1 == null || block2 == null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Invalid blocks: block1=%p, block2=%p\n", block1, block2);
+        return false;
+    }
+    return true; // Simplified for now
+}
+
+function add_to_free_list(block: HeapBlock*) -> void {
+    // Insert block at the head of the free list
+     std::Intrinsics::__printf__("[DEBUG::RUNTIME] Adding block to free list: ptr=%p\n", get_user_data_ptr(block));
+    block.next = g_free_list;
+    block.prev = null;
+    
+    if (g_free_list != null) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Updating free list's next pointer\n");
+        g_free_list.prev = block;
+    }
+    
+    g_free_list = block;
+}
+
+function cryo_panic(message: string, file: string, line: int) -> void {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Panic invoked: %s\n", message);
+    // Prevent recursive panics
+    if (g_runtime.panic_in_progress) {
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Recursive panic detected, forcing exit\n");
+        std::Intrinsics::__syscall_exit__(127);
+        return;
+    }
+    
+    g_runtime.panic_in_progress = true;
+    g_runtime.state = RuntimeState::SHUTTING_DOWN;
+    
+    // Print panic information
+    std::Intrinsics::__printf__("RUNTIME PANIC: %s\n", message);
+    if (file != "" && line > 0) {
+        std::Intrinsics::__printf__("Location: %s:%d\n", file, line);
+    }
+    
+    // Print runtime statistics
+    print_runtime_stats();
+    
+    // Attempt graceful shutdown
+    runtime_shutdown();
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] Panic shutdown complete\n");
+    
+    // Force exit
+    std::Intrinsics::__syscall_exit__(1);
+}
+
+function print_runtime_stats() -> void {
+    std::Intrinsics::__printf__("Runtime Statistics:\n");
+    std::Intrinsics::__printf__("  Total allocations: %llu\n", g_runtime.total_allocations);
+    std::Intrinsics::__printf__("  Total deallocations: %llu\n", g_runtime.total_deallocations);
+    std::Intrinsics::__printf__("  Bytes allocated: %llu\n", g_runtime.bytes_allocated);
+    std::Intrinsics::__printf__("  Peak allocation: %llu bytes\n", g_runtime.peak_allocation);
+    std::Intrinsics::__printf__("  Heap size: %llu bytes\n", g_runtime.heap_size);
+    
+    if (g_runtime.bytes_allocated > 0u64) {
+        std::Intrinsics::__printf__("  WARNING: %llu bytes leaked\n", g_runtime.bytes_allocated);
+    }
+}
+
+//===================================================================
+// RUNTIME SHUTDOWN
+//===================================================================
+
+function runtime_shutdown() -> void {
+    if (g_runtime.state == RuntimeState::TERMINATED) {
+        return;
+    }
+    
+    g_runtime.state = RuntimeState::SHUTTING_DOWN;
+    
+    // Print final statistics in debug builds
+    print_runtime_stats();
+    
+    // Free heap memory back to OS
+    if (g_runtime.heap_initialized && g_runtime.heap_base != null) {
+        std::Intrinsics::__munmap__(g_runtime.heap_base, g_runtime.heap_size);
+        g_runtime.heap_base = null;
+        g_runtime.heap_initialized = false;
+    }
+    
+    g_runtime.state = RuntimeState::TERMINATED;
+}
+
+
+
+// Main runtime entry point - called by system
+function main() -> int {
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] True `main` invoked...\n");
+
+    // Initialize runtime (simplified for now)
+    const init_result: RuntimeError = runtime_init();
+    if (init_result != RuntimeError::SUCCESS) {
+        return -1;
+    }
+    
+    // Call user main function (simplified)
+    const user_result: int = _user_main_();
+    
+    // Clean shutdown
+    runtime_shutdown();
+
+    std::Intrinsics::__printf__("[DEBUG::RUNTIME] True `main` exited with code %d\n", user_result);
+    
+    return user_result;
+}
