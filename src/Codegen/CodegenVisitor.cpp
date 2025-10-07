@@ -146,9 +146,26 @@ namespace Cryo::Codegen
 
         std::cout << "[DEBUG] Processing main program with " << node.statements().size() << " statements" << std::endl;
 
-        // Three-pass processing to ensure proper dependency order
-        // Pass 1: Process all enum declarations first (needed for struct/class methods)
-        std::cout << "[DEBUG] Pass 1: Processing enum declarations" << std::endl;
+        // Four-pass processing to ensure proper dependency order
+        // Pass 1: Process all global variable declarations first (including constants)
+        std::cout << "[DEBUG] Pass 1: Processing global variable declarations" << std::endl;
+        for (size_t i = 0; i < node.statements().size(); ++i)
+        {
+            auto &stmt = node.statements()[i];
+            if (stmt)
+            {
+                // Check if this is a global variable declaration
+                if (stmt->kind() == NodeKind::VariableDeclaration)
+                {
+                    std::cout << "[DEBUG] Processing global variable declaration " << (i + 1) << "/" << node.statements().size() << std::endl;
+                    stmt->accept(*this);
+                    std::cout << "[DEBUG] Completed global variable declaration " << (i + 1) << std::endl;
+                }
+            }
+        }
+
+        // Pass 2: Process all enum declarations (needed for struct/class methods)
+        std::cout << "[DEBUG] Pass 2: Processing enum declarations" << std::endl;
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
@@ -164,8 +181,8 @@ namespace Cryo::Codegen
             }
         }
 
-        // Pass 2: Process all struct and class declarations
-        std::cout << "[DEBUG] Pass 2: Processing struct and class declarations" << std::endl;
+        // Pass 3: Process all struct and class declarations
+        std::cout << "[DEBUG] Pass 3: Processing struct and class declarations" << std::endl;
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
@@ -182,15 +199,16 @@ namespace Cryo::Codegen
             }
         }
 
-        // Pass 3: Process all other statements
-        std::cout << "[DEBUG] Pass 3: Processing other statements" << std::endl;
+        // Pass 4: Process all other statements
+        std::cout << "[DEBUG] Pass 4: Processing other statements" << std::endl;
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
             if (stmt)
             {
-                // Skip enum, struct and class declarations (already processed)
-                if (stmt->kind() == NodeKind::EnumDeclaration ||
+                // Skip variable declarations, enum, struct and class declarations (already processed)
+                if (stmt->kind() == NodeKind::VariableDeclaration ||
+                    stmt->kind() == NodeKind::EnumDeclaration ||
                     stmt->kind() == NodeKind::StructDeclaration ||
                     stmt->kind() == NodeKind::ClassDeclaration)
                 {
