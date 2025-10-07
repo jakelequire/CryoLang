@@ -1,5 +1,6 @@
 #pragma once
 #include "Lexer/lexer.hpp"
+#include "AST/Type.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -11,6 +12,9 @@ namespace Cryo
 {
     // Forward declaration for visitor pattern
     class ASTVisitor;
+
+    // Forward declaration for type system (for migration support)
+    class Type;
 
     // Forward declarations for pattern matching
     class MatchArmNode;
@@ -154,8 +158,8 @@ namespace Cryo
         DeclarationNode(NodeKind kind, SourceLocation loc) : ASTNode(kind, loc) {}
 
         // Documentation support
-        const std::string& documentation() const { return _documentation; }
-        void set_documentation(const std::string& doc) { _documentation = doc; }
+        const std::string &documentation() const { return _documentation; }
+        void set_documentation(const std::string &doc) { _documentation = doc; }
         bool has_documentation() const { return !_documentation.empty(); }
 
         void print(std::ostream &os, int indent = 0) const override
@@ -394,38 +398,55 @@ namespace Cryo
     {
     private:
         std::string _name;
-        std::string _type_annotation; // Type annotation from source code
         std::unique_ptr<ExpressionNode> _initializer;
         bool _is_mutable = false; // const vs mut
         bool _is_auto = false;    // auto type inference
         bool _is_global = false;  // whether this variable is declared at global scope
 
+        // Core type system - NO STRING OPERATIONS
+        Cryo::Type *_resolved_type = nullptr; // Primary type storage
+
     public:
         VariableDeclarationNode(SourceLocation loc, std::string name,
-                                std::string type_annotation = "",
+                                Cryo::Type *resolved_type = nullptr,
                                 std::unique_ptr<ExpressionNode> init = nullptr,
                                 bool is_mutable = false,
                                 bool is_global = false)
             : DeclarationNode(NodeKind::VariableDeclaration, loc),
-              _name(std::move(name)), _type_annotation(std::move(type_annotation)),
-              _initializer(std::move(init)), _is_mutable(is_mutable), _is_global(is_global)
+              _name(std::move(name)), _initializer(std::move(init)),
+              _is_mutable(is_mutable), _is_global(is_global), _resolved_type(resolved_type)
         {
-            _is_auto = (_type_annotation == "auto" || _type_annotation.empty());
+            _is_auto = (resolved_type == nullptr); // Auto if no type provided
         }
 
         const std::string &name() const { return _name; }
-        const std::string &type_annotation() const { return _type_annotation; }
         ExpressionNode *initializer() const { return _initializer.get(); }
         bool is_mutable() const { return _is_mutable; }
         bool is_auto() const { return _is_auto; }
         bool has_initializer() const { return _initializer != nullptr; }
         bool is_global() const { return _is_global; }
 
-        // Type annotation setters
+        // Core type system access - PREFERRED
+        Cryo::Type *get_resolved_type() const { return _resolved_type; }
+        void set_resolved_type(Cryo::Type *type)
+        {
+            _resolved_type = type;
+            _is_auto = (type == nullptr);
+        }
+        bool has_resolved_type() const { return _resolved_type != nullptr; }
+
+        // DEPRECATED: String-based type operations - REMOVE THESE
+        [[deprecated("Use get_resolved_type() instead - string operations being eliminated")]]
+        const std::string type_annotation() const
+        {
+            return _resolved_type ? _resolved_type->to_string() : "auto";
+        }
+
+        [[deprecated("Use set_resolved_type() instead - string operations being eliminated")]]
         void set_type_annotation(const std::string &type)
         {
-            _type_annotation = type;
-            _is_auto = (type == "auto");
+            // This should not be used - parser must resolve to Type* directly
+            _is_auto = (type == "auto" || type.empty());
         }
 
         // Scope setters
@@ -436,8 +457,10 @@ namespace Cryo
             os << std::string(indent, ' ') << "VariableDecl: "
                << (_is_global ? "global " : "")
                << (_is_mutable ? "mut " : "const ") << _name;
-            if (!_type_annotation.empty())
-                os << ": " << _type_annotation;
+            if (_resolved_type)
+                os << ": " << _resolved_type->to_string();
+            else if (_is_auto)
+                os << ": auto";
             os << std::endl;
             if (_initializer)
                 _initializer->print(os, indent + 2);
@@ -451,21 +474,40 @@ namespace Cryo
     {
     private:
         std::string _name;
-        std::string _return_type_annotation = "void";
         std::vector<std::unique_ptr<VariableDeclarationNode>> _parameters;
         std::unique_ptr<BlockStatementNode> _body; // Optional implementation for compiler hints
 
+        // Core type system - NO STRING OPERATIONS
+        Cryo::Type *_resolved_return_type = nullptr; // Primary return type storage
+
     public:
         IntrinsicDeclarationNode(SourceLocation loc, std::string name,
-                                 std::string return_type = "void")
+                                 Cryo::Type *return_type = nullptr)
             : DeclarationNode(NodeKind::IntrinsicDeclaration, loc),
-              _name(std::move(name)), _return_type_annotation(std::move(return_type)) {}
+              _name(std::move(name)), _resolved_return_type(return_type) {}
 
         const std::string &name() const { return _name; }
-        const std::string &return_type_annotation() const { return _return_type_annotation; }
         const std::vector<std::unique_ptr<VariableDeclarationNode>> &parameters() const { return _parameters; }
         BlockStatementNode *body() const { return _body.get(); }
         size_t parameter_count() const { return _parameters.size(); }
+
+        // Core type system access - PREFERRED
+        Cryo::Type *get_resolved_return_type() const { return _resolved_return_type; }
+        void set_resolved_return_type(Cryo::Type *type) { _resolved_return_type = type; }
+        bool has_resolved_return_type() const { return _resolved_return_type != nullptr; }
+
+        // DEPRECATED: String-based type operations - REMOVE THESE
+        [[deprecated("Use get_resolved_return_type() instead - string operations being eliminated")]]
+        const std::string return_type_annotation() const
+        {
+            return _resolved_return_type ? _resolved_return_type->to_string() : "void";
+        }
+
+        [[deprecated("Use set_resolved_return_type() instead - string operations being eliminated")]]
+        void set_return_type(const std::string &return_type)
+        {
+            // This should not be used - parser must resolve to Type* directly
+        }
 
         void add_parameter(std::unique_ptr<VariableDeclarationNode> param)
         {
@@ -477,11 +519,6 @@ namespace Cryo
             _body = std::move(body);
         }
 
-        void set_return_type(const std::string &return_type)
-        {
-            _return_type_annotation = return_type;
-        }
-
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "IntrinsicDecl: " << _name << "(";
@@ -490,9 +527,9 @@ namespace Cryo
                 if (i > 0)
                     os << ", ";
                 if (_parameters[i])
-                    os << _parameters[i]->type_annotation() << " " << _parameters[i]->name();
+                    os << (_parameters[i]->get_resolved_type() ? _parameters[i]->get_resolved_type()->to_string() : "unknown") << " " << _parameters[i]->name();
             }
-            os << ") -> " << _return_type_annotation << std::endl;
+            os << ") -> " << (_resolved_return_type ? _resolved_return_type->to_string() : "void") << std::endl;
 
             if (!_parameters.empty())
             {
@@ -647,7 +684,6 @@ namespace Cryo
     {
     private:
         std::string _name;
-        std::string _return_type_annotation = "void"; // Return type annotation
         std::vector<std::unique_ptr<VariableDeclarationNode>> _parameters;
         std::vector<std::unique_ptr<GenericParameterNode>> _generic_parameters;
         std::vector<TraitBound> _trait_bounds; // Where clause trait bounds
@@ -657,16 +693,18 @@ namespace Cryo
         bool _is_inline = false;
         bool _is_variadic = false; // Variadic function (...args)
 
+        // Core type system - NO STRING OPERATIONS
+        Cryo::Type *_resolved_return_type = nullptr; // Primary return type storage
+
     public:
         FunctionDeclarationNode(SourceLocation loc, std::string name,
-                                std::string return_type = "void",
+                                Cryo::Type *return_type = nullptr,
                                 bool is_public = false)
             : DeclarationNode(NodeKind::FunctionDeclaration, loc),
-              _name(std::move(name)), _return_type_annotation(std::move(return_type)),
+              _name(std::move(name)), _resolved_return_type(return_type),
               _is_public(is_public) {}
 
         const std::string &name() const { return _name; }
-        const std::string &return_type_annotation() const { return _return_type_annotation; }
         const std::vector<std::unique_ptr<VariableDeclarationNode>> &parameters() const { return _parameters; }
         const std::vector<std::unique_ptr<GenericParameterNode>> &generic_parameters() const { return _generic_parameters; }
         const std::vector<TraitBound> &trait_bounds() const { return _trait_bounds; }
@@ -676,6 +714,18 @@ namespace Cryo
         bool is_static() const { return _is_static; }
         bool is_inline() const { return _is_inline; }
         bool is_variadic() const { return _is_variadic; }
+
+        // Core type system access - PREFERRED
+        Cryo::Type *get_resolved_return_type() const { return _resolved_return_type; }
+        void set_resolved_return_type(Cryo::Type *type) { _resolved_return_type = type; }
+        bool has_resolved_return_type() const { return _resolved_return_type != nullptr; }
+
+        // DEPRECATED: String-based type operations - REMOVE THESE
+        [[deprecated("Use get_resolved_return_type() instead - string operations being eliminated")]]
+        const std::string return_type_annotation() const
+        {
+            return _resolved_return_type ? _resolved_return_type->to_string() : "void";
+        }
         size_t parameter_count() const { return _parameters.size(); }
 
         void add_parameter(std::unique_ptr<VariableDeclarationNode> param)
@@ -698,9 +748,10 @@ namespace Cryo
             _body = std::move(body);
         }
 
+        [[deprecated("Use set_resolved_return_type() instead - string operations being eliminated")]]
         void set_return_type(const std::string &return_type)
         {
-            _return_type_annotation = return_type;
+            // This should not be used - parser must resolve to Type* directly
         }
 
         void set_visibility(bool is_public) { _is_public = is_public; }
@@ -717,11 +768,11 @@ namespace Cryo
                 if (i > 0)
                     os << ", ";
                 if (_parameters[i])
-                    os << _parameters[i]->type_annotation() << " " << _parameters[i]->name();
+                    os << (_parameters[i]->get_resolved_type() ? _parameters[i]->get_resolved_type()->to_string() : "unknown") << " " << _parameters[i]->name();
             }
             if (_is_variadic)
                 os << "...";
-            os << ") -> " << _return_type_annotation << std::endl;
+            os << ") -> " << (_resolved_return_type ? _resolved_return_type->to_string() : "void") << std::endl;
 
             if (!_parameters.empty())
             {
@@ -748,26 +799,49 @@ namespace Cryo
     {
     private:
         std::string _name;
-        std::string _type_annotation;
         Visibility _visibility;
         std::unique_ptr<ExpressionNode> _default_value;
 
+        // Core type system - NO STRING OPERATIONS
+        Cryo::Type *_resolved_type = nullptr; // Primary type storage
+
     public:
-        StructFieldNode(SourceLocation loc, std::string name, std::string type_annotation,
+        StructFieldNode(SourceLocation loc, std::string name, Cryo::Type *resolved_type,
                         Visibility visibility = Visibility::Public)
             : DeclarationNode(NodeKind::VariableDeclaration, loc),
-              _name(std::move(name)), _type_annotation(std::move(type_annotation)),
+              _name(std::move(name)), _resolved_type(resolved_type),
               _visibility(visibility) {}
 
         const std::string &name() const { return _name; }
-        const std::string &type_annotation() const { return _type_annotation; }
         Visibility visibility() const { return _visibility; }
         ExpressionNode *default_value() const { return _default_value.get(); }
 
-        // Compatibility methods for TypeChecker
-        const std::string &field_type() const { return _type_annotation; }
+        // Core type system access - PREFERRED
+        Cryo::Type *get_resolved_type() const { return _resolved_type; }
+        void set_resolved_type(Cryo::Type *type) { _resolved_type = type; }
+        bool has_resolved_type() const { return _resolved_type != nullptr; }
+
+        // DEPRECATED: String-based type operations - REMOVE THESE
+        [[deprecated("Use get_resolved_type() instead - string operations being eliminated")]]
+        const std::string type_annotation() const
+        {
+            return _resolved_type ? _resolved_type->to_string() : "unknown";
+        }
+
+        [[deprecated("Use get_resolved_type() instead - string operations being eliminated")]]
+        const std::string &field_type() const
+        {
+            static std::string temp = _resolved_type ? _resolved_type->to_string() : "unknown";
+            return temp;
+        }
+
+        [[deprecated("Use set_resolved_type() instead - string operations being eliminated")]]
+        void set_type(const std::string &type)
+        {
+            // This should not be used - parser must resolve to Type* directly
+        }
+
         bool is_mutable() const { return _visibility != Visibility::Private; }
-        void set_type(const std::string &type) { _type_annotation = type; }
 
         void set_default_value(std::unique_ptr<ExpressionNode> value)
         {
@@ -781,7 +855,7 @@ namespace Cryo
                 os << "private ";
             else if (_visibility == Visibility::Protected)
                 os << "protected ";
-            os << _name << ": " << _type_annotation;
+            os << _name << ": " << (_resolved_type ? _resolved_type->to_string() : "unknown");
             if (_default_value)
             {
                 os << " = ";
@@ -803,10 +877,10 @@ namespace Cryo
         bool _is_static;
 
     public:
-        StructMethodNode(SourceLocation loc, std::string name, std::string return_type,
+        StructMethodNode(SourceLocation loc, std::string name, Cryo::Type *return_type,
                          Visibility visibility = Visibility::Public, bool is_constructor = false,
                          bool is_destructor = false, bool is_static = false)
-            : FunctionDeclarationNode(loc, std::move(name), std::move(return_type)),
+            : FunctionDeclarationNode(loc, std::move(name), return_type),
               _visibility(visibility), _is_constructor(is_constructor),
               _is_destructor(is_destructor), _is_static(is_static) {}
 

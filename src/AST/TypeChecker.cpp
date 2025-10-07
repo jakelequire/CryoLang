@@ -1912,7 +1912,7 @@ namespace Cryo
             {
                 // For method calls, the MemberAccess contains the full function signature
                 std::string method_signature = node.callee()->type().value();
-                
+
                 // Check if this is a function signature that needs return type extraction
                 size_t arrow_pos = method_signature.find(" -> ");
                 if (arrow_pos != std::string::npos)
@@ -2356,13 +2356,13 @@ namespace Cryo
             // If not found in registered methods, check if we're currently processing the class definition
             // In this case, allow the private method call to proceed with hardcoded signatures
             std::cout << "[DEBUG] Allowing private method '" << member_name << "' in current class context '" << lookup_type << "'" << std::endl;
-            
+
             // Provide correct signatures for known private methods
             if (member_name == "align_size" && lookup_type == "HeapManager")
             {
                 node.set_type("(u64, u64) -> u64");
             }
-            else if (member_name == "get_block_from_ptr" && lookup_type == "HeapManager") 
+            else if (member_name == "get_block_from_ptr" && lookup_type == "HeapManager")
             {
                 node.set_type("(void*) -> HeapBlock*");
             }
@@ -3393,10 +3393,8 @@ namespace Cryo
             const std::string &func_name = node.name();
 
             // Parse return type from node annotation (constructors have void return typically)
-            const std::string &return_type_str = node.return_type_annotation().empty()
-                                                     ? "void"
-                                                     : node.return_type_annotation();
-            Type *return_type = _type_context.parse_type_from_string(return_type_str);
+            Type *return_type = node.get_resolved_return_type();
+            const std::string &return_type_str = return_type ? return_type->to_string() : "void";
 
             if (!return_type)
             {
@@ -3411,8 +3409,8 @@ namespace Cryo
             {
                 if (param)
                 {
-                    const std::string &param_type_str = param->type_annotation();
-                    Type *param_type = _type_context.parse_type_from_string(param_type_str);
+                    Type *param_type = param->get_resolved_type();
+                    const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
                     if (!param_type)
                     {
                         report_error(TypeError::ErrorKind::InvalidOperation, param->location(),
@@ -3465,12 +3463,12 @@ namespace Cryo
         if (!_current_struct_name.empty())
         {
             // Get the return type from the node
-            std::string return_type_str = node.return_type_annotation();
+            Type *return_type = node.get_resolved_return_type();
+            std::string return_type_str = return_type ? return_type->to_string() : "";
             if (return_type_str.empty() && is_constructor)
             {
                 return_type_str = "void"; // Constructors typically return void
             }
-            Type *return_type = _type_context.parse_type_from_string(return_type_str);
 
             if (return_type)
             {
@@ -3480,8 +3478,8 @@ namespace Cryo
                 {
                     if (param)
                     {
-                        const std::string &param_type_str = param->type_annotation();
-                        Type *param_type = _type_context.parse_type_from_string(param_type_str);
+                        Type *param_type = param->get_resolved_type();
+                        const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
                         if (param_type)
                         {
                             param_types.push_back(param_type);

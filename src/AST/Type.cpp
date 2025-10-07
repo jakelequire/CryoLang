@@ -1,5 +1,6 @@
 #include "AST/Type.hpp"
-#include "Lexer/lexer.hpp" // For TokenKind enum
+#include "AST/TemplateRegistry.hpp" // For TemplateRegistry in instantiate_generic
+#include "Lexer/lexer.hpp"          // For TokenKind enum
 #include <sstream>
 #include <algorithm>
 #include <iostream>
@@ -813,12 +814,12 @@ namespace Cryo
     {
         // Parse function type string like "() -> void" or "<T>(arg: T) -> T" or "(int, string) -> bool"
         std::string normalized = type_str;
-        
+
         // Check if it's a generic function type
         bool is_generic = false;
         std::string generics_part;
         std::string function_part;
-        
+
         if (normalized.front() == '<')
         {
             // Generic function type: <T>(params) -> return_type
@@ -839,44 +840,44 @@ namespace Cryo
             // Non-generic function type: (params) -> return_type
             function_part = normalized;
         }
-        
+
         // Parse the function part: (params) -> return_type
         size_t arrow_pos = function_part.find("->");
         if (arrow_pos == std::string::npos)
         {
             return get_unknown_type();
         }
-        
+
         std::string params_part = function_part.substr(0, arrow_pos);
         std::string return_part = function_part.substr(arrow_pos + 2);
-        
+
         // Trim whitespace
         params_part.erase(params_part.find_last_not_of(" \t") + 1);
         params_part.erase(0, params_part.find_first_not_of(" \t"));
         return_part.erase(return_part.find_last_not_of(" \t") + 1);
         return_part.erase(0, return_part.find_first_not_of(" \t"));
-        
+
         // Parse return type
         Type *return_type = parse_type_from_string(return_part);
         if (!return_type)
         {
             return get_unknown_type();
         }
-        
+
         // Parse parameter types
         std::vector<Type *> param_types;
-        
+
         if (params_part.size() >= 2 && params_part.front() == '(' && params_part.back() == ')')
         {
             std::string params_inner = params_part.substr(1, params_part.size() - 2);
-            
+
             if (!params_inner.empty())
             {
                 // Split parameters by comma
                 std::vector<std::string> param_strings;
                 std::string current_param;
                 int paren_depth = 0;
-                
+
                 for (char c : params_inner)
                 {
                     if (c == '(')
@@ -905,7 +906,7 @@ namespace Cryo
                         current_param += c;
                     }
                 }
-                
+
                 // Add the last parameter
                 current_param.erase(current_param.find_last_not_of(" \t") + 1);
                 current_param.erase(0, current_param.find_first_not_of(" \t"));
@@ -913,7 +914,7 @@ namespace Cryo
                 {
                     param_strings.push_back(current_param);
                 }
-                
+
                 // Parse each parameter type
                 for (const std::string &param_str : param_strings)
                 {
@@ -926,7 +927,7 @@ namespace Cryo
                         type_part.erase(type_part.find_last_not_of(" \t") + 1);
                         type_part.erase(0, type_part.find_first_not_of(" \t"));
                     }
-                    
+
                     Type *param_type = parse_type_from_string(type_part);
                     if (!param_type)
                     {
@@ -940,7 +941,7 @@ namespace Cryo
         {
             return get_unknown_type();
         }
-        
+
         // Create function type
         return create_function_type(return_type, param_types);
     }
@@ -1121,6 +1122,90 @@ namespace Cryo
         Type *type_ptr = generic_type.get();
         _generic_types[name] = std::move(generic_type);
         return type_ptr;
+    }
+
+    ParameterizedType *TypeContext::instantiate_generic(const std::string &base_name,
+                                                        const std::vector<Type *> &args)
+    {
+        // First check if we have a template for this base name
+        // This would typically be registered when parsing template definitions
+        if (_global_template_registry)
+        {
+            auto *template_info = _global_template_registry->find_template(base_name);
+            if (template_info)
+            {
+                // For now, create a basic parameterized type since TemplateInfo
+                // doesn't have an instantiate method like TypeRegistry
+                std::vector<std::shared_ptr<Type>> shared_args;
+                for (auto *arg : args)
+                {
+                    shared_args.push_back(std::shared_ptr<Type>(arg, [](Type *) {}));
+                }
+
+                auto instantiation = std::make_unique<ParameterizedType>(base_name, shared_args);
+                ParameterizedType *result = instantiation.get();
+                _complex_types.push_back(std::move(instantiation));
+
+                return result;
+            }
+        }
+
+        // Fallback: create a basic parameterized type if no template found
+        std::vector<std::shared_ptr<Type>> shared_args;
+        for (auto *arg : args)
+        {
+            shared_args.push_back(std::shared_ptr<Type>(arg, [](Type *) {}));
+        }
+
+        auto instantiation = std::make_unique<ParameterizedType>(base_name, shared_args);
+        ParameterizedType *result = instantiation.get();
+        _complex_types.push_back(std::move(instantiation));
+
+        return result;
+    }
+
+    Type *TypeContext::resolve_scoped_type(const std::string &scope, const std::string &type_name)
+    {
+        // Handle scoped type resolution like "Std::Runtime::MemoryBlock"
+        std::string full_name = scope + "::" + type_name;
+
+        // First try to find it as a struct type
+        Type *struct_type = get_struct_type(full_name);
+        if (struct_type && struct_type->kind() != TypeKind::Unknown)
+        {
+            return struct_type;
+        }
+
+        // Try as a class type
+        Type *class_type = get_class_type(full_name);
+        if (class_type && class_type->kind() != TypeKind::Unknown)
+        {
+            return class_type;
+        }
+
+        // Try as an enum type
+        auto it = _enum_types.find(full_name);
+        if (it != _enum_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Try as a trait type
+        Type *trait_type = get_trait_type(full_name);
+        if (trait_type && trait_type->kind() != TypeKind::Unknown)
+        {
+            return trait_type;
+        }
+
+        // Try as a generic type parameter
+        Type *generic_type = get_generic_type(full_name);
+        if (generic_type && generic_type->kind() != TypeKind::Unknown)
+        {
+            return generic_type;
+        }
+
+        // If not found, return unknown type
+        return get_unknown_type();
     }
 
     //===----------------------------------------------------------------------===//
@@ -1308,6 +1393,121 @@ namespace Cryo
     std::string ParameterizedType::to_string() const
     {
         return get_instantiated_name();
+    }
+
+    std::string ParameterizedType::get_mangled_name() const
+    {
+        if (is_template())
+        {
+            // Template itself doesn't have a mangled name, return base name
+            return _base_name;
+        }
+
+        // For instantiated types, create mangled name like "Array_int" instead of "Array<int>"
+        std::string mangled = _base_name;
+        for (const auto &param : _type_params)
+        {
+            mangled += "_" + param->to_string();
+        }
+
+        // Replace any remaining angle brackets or special characters that might cause issues
+        std::replace(mangled.begin(), mangled.end(), '<', '_');
+        std::replace(mangled.begin(), mangled.end(), '>', '_');
+        std::replace(mangled.begin(), mangled.end(), ',', '_');
+        std::replace(mangled.begin(), mangled.end(), ' ', '_');
+
+        return mangled;
+    }
+
+    std::shared_ptr<ParameterizedType> ParameterizedType::substitute(const std::unordered_map<std::string, std::shared_ptr<Type>> &substitutions) const
+    {
+        if (!is_template())
+        {
+            // For instantiated types, substitute within the type parameters
+            std::vector<std::shared_ptr<Type>> new_params;
+            bool changed = false;
+
+            for (const auto &param : _type_params)
+            {
+                std::shared_ptr<Type> substituted_param = param;
+
+                // If the parameter is itself a generic type that needs substitution
+                if (param->kind() == TypeKind::Generic)
+                {
+                    auto it = substitutions.find(param->name());
+                    if (it != substitutions.end())
+                    {
+                        substituted_param = it->second;
+                        changed = true;
+                    }
+                }
+                // If the parameter is a parameterized type, recursively substitute
+                else if (param->kind() == TypeKind::Parameterized)
+                {
+                    auto param_type = std::static_pointer_cast<ParameterizedType>(param);
+                    auto substituted_nested = param_type->substitute(substitutions);
+                    if (substituted_nested)
+                    {
+                        substituted_param = substituted_nested;
+                        changed = true;
+                    }
+                }
+
+                new_params.push_back(substituted_param);
+            }
+
+            if (changed)
+            {
+                return std::make_shared<ParameterizedType>(_base_name, new_params);
+            }
+            return nullptr; // No substitution needed
+        }
+
+        // For template types, create instantiation if all parameters can be substituted
+        std::vector<std::shared_ptr<Type>> concrete_types;
+        for (const auto &param_name : _param_names)
+        {
+            auto it = substitutions.find(param_name);
+            if (it != substitutions.end())
+            {
+                concrete_types.push_back(it->second);
+            }
+            else
+            {
+                // Cannot fully substitute - return nullptr
+                return nullptr;
+            }
+        }
+
+        return std::make_shared<ParameterizedType>(_base_name, concrete_types);
+    }
+
+    bool ParameterizedType::has_type_parameter(const std::string &param_name) const
+    {
+        // Check if this parameterized type has the given parameter name
+        if (is_template())
+        {
+            return std::find(_param_names.begin(), _param_names.end(), param_name) != _param_names.end();
+        }
+
+        // For instantiated types, check recursively in type parameters
+        for (const auto &param : _type_params)
+        {
+            if (param->kind() == TypeKind::Generic && param->name() == param_name)
+            {
+                return true;
+            }
+            else if (param->kind() == TypeKind::Parameterized)
+            {
+                auto param_type = std::static_pointer_cast<ParameterizedType>(param);
+                if (param_type->has_type_parameter(param_name))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     //===----------------------------------------------------------------------===//

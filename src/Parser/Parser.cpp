@@ -91,15 +91,15 @@ namespace Cryo
                 _current_token = Token(TokenKind::TK_EOF, "", SourceLocation{});
                 break;
             }
-            
+
             // Collect documentation comments for later attachment
-            if (_current_token.is(TokenKind::TK_DOC_COMMENT_BLOCK) || 
+            if (_current_token.is(TokenKind::TK_DOC_COMMENT_BLOCK) ||
                 _current_token.is(TokenKind::TK_DOC_COMMENT_LINE))
             {
                 _pending_doc_comments.push_back(std::string(_current_token.text()));
             }
-            
-        } while (_current_token.is(TokenKind::TK_COMMENT) || 
+
+        } while (_current_token.is(TokenKind::TK_COMMENT) ||
                  _current_token.is(TokenKind::TK_DOC_COMMENT_BLOCK) ||
                  _current_token.is(TokenKind::TK_DOC_COMMENT_LINE)); // Skip all comment tokens
     }
@@ -725,7 +725,7 @@ namespace Cryo
         // Determine if this is a global variable based on current scope
         bool is_global = is_global_scope();
 
-        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, var_type->to_string(), std::move(initializer), is_mutable, is_global);
+        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, var_type, std::move(initializer), is_mutable, is_global);
 
         return var_decl;
     }
@@ -766,7 +766,8 @@ namespace Cryo
         }
 
         // Create function declaration early so we can add generic parameters
-        auto func_decl = _builder.create_function_declaration(start_loc, func_name, "void", is_public);
+        Type *void_type = resolve_type_from_string("void");
+        auto func_decl = _builder.create_function_declaration(start_loc, func_name, void_type, is_public);
 
         // Attach documentation if available
         attach_documentation(func_decl.get());
@@ -804,7 +805,7 @@ namespace Cryo
         }
 
         // Update return type in the already created function declaration
-        func_decl->set_return_type(return_type->to_string());
+        func_decl->set_resolved_return_type(return_type);
 
         // Parse optional where clause
         if (_current_token.is(TokenKind::TK_KW_WHERE))
@@ -862,7 +863,7 @@ namespace Cryo
         }
 
         // Create function declaration with type information (extern functions are public by default)
-        auto func_decl = _builder.create_function_declaration(start_loc, func_name, return_type->to_string(), true);
+        auto func_decl = _builder.create_function_declaration(start_loc, func_name, return_type, true);
 
         // Attach documentation if available
         attach_documentation(func_decl.get());
@@ -953,7 +954,7 @@ namespace Cryo
         }
 
         // Create intrinsic declaration
-        auto intrinsic_decl = std::make_unique<IntrinsicDeclarationNode>(start_loc, func_name, return_type->to_string());
+        auto intrinsic_decl = std::make_unique<IntrinsicDeclarationNode>(start_loc, func_name, return_type);
 
         // Set variadic flag if detected (though intrinsics might not need this)
         // intrinsic_decl->set_variadic(is_variadic);  // Commented out unless IntrinsicDeclarationNode supports it
@@ -2293,7 +2294,7 @@ namespace Cryo
         Type *param_type = parse_type_annotation();
 
         // Create parameter as variable declaration (without initializer)
-        return _builder.create_variable_declaration(name_token.location(), param_name, param_type->to_string());
+        return _builder.create_variable_declaration(name_token.location(), param_name, param_type);
     }
 
     bool Parser::peek_variadic_parameter()
@@ -2317,9 +2318,10 @@ namespace Cryo
         // Consume the ellipsis
         consume(TokenKind::TK_ELLIPSIS, "Expected '...' for variadic parameter");
 
-        // For variadic parameters, we'll use a special type string to indicate it's variadic
+        // For variadic parameters, we'll use a special type to indicate it's variadic
         // The actual type will be handled by the codegen later
-        return _builder.create_variable_declaration(name_token.location(), param_name, "...");
+        Type *variadic_type = resolve_type_from_string("...");
+        return _builder.create_variable_declaration(name_token.location(), param_name, variadic_type);
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_call_expression(std::unique_ptr<ExpressionNode> expr)
@@ -2907,14 +2909,17 @@ namespace Cryo
                     consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
                     // Parse return type
-                    std::string return_type = "void";
+                    std::string return_type_str = "void";
                     if (_current_token.is(TokenKind::TK_ARROW))
                     {
                         advance(); // consume '->'
-                        return_type = parse_type();
+                        return_type_str = parse_type();
                     }
 
                     consume(TokenKind::TK_SEMICOLON, "Expected ';' after trait method signature");
+
+                    // Resolve return type string to Type* object
+                    Type *return_type = resolve_type_from_string(return_type_str);
 
                     // Create a function declaration (trait methods are just signatures)
                     auto method_decl = _builder.create_function_declaration(
@@ -3024,12 +3029,12 @@ namespace Cryo
                 error("Generic forward declarations are not yet supported");
                 return nullptr;
             }
-            advance();                                                                // consume semicolon
+            advance();                                                                           // consume semicolon
             auto type_alias = _builder.create_type_alias_declaration(start_loc, alias_name, ""); // Empty target for forward decl
-            
+
             // Attach documentation if available
             attach_documentation(type_alias.get());
-            
+
             return type_alias;
         }
 
@@ -3041,10 +3046,10 @@ namespace Cryo
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after type alias");
 
         auto type_alias = _builder.create_type_alias_declaration(start_loc, alias_name, target_type, generic_params);
-        
+
         // Attach documentation if available
         attach_documentation(type_alias.get());
-        
+
         return type_alias;
     }
 
@@ -3242,9 +3247,10 @@ namespace Cryo
                     consume(TokenKind::TK_SEMICOLON, "Expected ';' after field implementation");
 
                     // Create a field node with the default value
+                    Type *auto_type = resolve_type_from_string("auto"); // Type will be inferred
                     auto field = _builder.create_struct_field(field_token.location(),
                                                               std::string(field_token.text()),
-                                                              "auto", // Type will be inferred
+                                                              auto_type,
                                                               Visibility::Public);
                     field->set_default_value(std::move(value));
                     impl_block->add_field_implementation(std::move(field));
@@ -3398,7 +3404,8 @@ namespace Cryo
 
         consume(TokenKind::TK_COLON, "Expected ':' after field name");
 
-        std::string field_type = parse_type();
+        std::string field_type_str = parse_type();
+        Type *field_type = resolve_type_from_string(field_type_str);
 
         auto field = _builder.create_struct_field(start_loc, field_name, field_type, visibility);
 
@@ -3501,16 +3508,19 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type (optional for constructors)
-        std::string return_type = "void";
+        std::string return_type_str = "void";
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
-            return_type = parse_type();
+            return_type_str = parse_type();
         }
         else if (is_constructor)
         {
-            return_type = "void"; // Constructors don't have explicit return types
+            return_type_str = "void"; // Constructors don't have explicit return types
         }
+
+        // Resolve the return type string to a Type* object
+        Type *return_type = resolve_type_from_string(return_type_str);
 
         auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static);
 
@@ -3572,11 +3582,11 @@ namespace Cryo
     {
         // Simple heuristic: if we're at '(' and the peeked token suggests function parameters,
         // we'll tentatively treat it as a function type and let the parsing fail gracefully if wrong
-        
+
         // For now, let's use a simpler approach: look at context clues
         // If we're in a type alias context (which we are), () followed by -> is likely a function type
         // We can check if the next few tokens after '(' look like parameter syntax
-        
+
         // This is a simplified heuristic - in practice, we might need to be more sophisticated
         return true; // For function types in type alias context, assume it's a function type
     }
@@ -3584,7 +3594,7 @@ namespace Cryo
     std::string Parser::parse_function_type_syntax(const std::string &type_prefix)
     {
         std::string function_type = type_prefix;
-        
+
         // Consume '('
         consume(TokenKind::TK_L_PAREN, "Expected '('");
         function_type += "(";
@@ -3627,7 +3637,7 @@ namespace Cryo
     std::string Parser::parse_generic_function_type_syntax(const std::string &type_prefix)
     {
         std::string function_type = type_prefix;
-        
+
         // Consume '<'
         consume(TokenKind::TK_L_ANGLE, "Expected '<'");
         function_type += "<";
@@ -3678,10 +3688,10 @@ namespace Cryo
                         // Named parameter: arg: T
                         function_type += std::string(_current_token.text());
                         advance(); // consume parameter name
-                        
+
                         consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
                         function_type += ": ";
-                        
+
                         std::string param_type = parse_type();
                         function_type += param_type;
                     }
@@ -3744,10 +3754,10 @@ namespace Cryo
         }
 
         std::string result;
-        for (const auto& comment : _pending_doc_comments)
+        for (const auto &comment : _pending_doc_comments)
         {
             std::string processed = comment;
-            
+
             // Process block comments (/** ... */)
             if (processed.substr(0, 3) == "/**")
             {
@@ -3757,12 +3767,12 @@ namespace Cryo
                 {
                     processed = processed.substr(0, processed.size() - 2);
                 }
-                
+
                 // Clean up whitespace and asterisks at line beginnings
                 std::istringstream iss(processed);
                 std::string line;
                 std::vector<std::string> lines;
-                
+
                 while (std::getline(iss, line))
                 {
                     // Trim leading whitespace
@@ -3787,7 +3797,7 @@ namespace Cryo
                     }
                     lines.push_back(line);
                 }
-                
+
                 // Join lines with newlines, but remove empty lines at start/end
                 while (!lines.empty() && lines.front().empty())
                 {
@@ -3797,10 +3807,11 @@ namespace Cryo
                 {
                     lines.pop_back();
                 }
-                
+
                 for (size_t i = 0; i < lines.size(); ++i)
                 {
-                    if (i > 0) result += "\n";
+                    if (i > 0)
+                        result += "\n";
                     result += lines[i];
                 }
             }
@@ -3813,7 +3824,7 @@ namespace Cryo
                 {
                     processed = processed.substr(1);
                 }
-                
+
                 if (!result.empty())
                 {
                     result += "\n";
@@ -3824,11 +3835,11 @@ namespace Cryo
 
         // Clear processed comments
         _pending_doc_comments.clear();
-        
+
         return result;
     }
 
-    void Parser::attach_documentation(DeclarationNode* node)
+    void Parser::attach_documentation(DeclarationNode *node)
     {
         if (node && !_pending_doc_comments.empty())
         {
@@ -3838,5 +3849,66 @@ namespace Cryo
                 node->set_documentation(doc_text);
             }
         }
+    }
+
+    Type *Parser::resolve_type_from_string(const std::string &type_str)
+    {
+        // Handle basic built-in types first
+        if (type_str == "void")
+            return _context.types().get_void_type();
+        if (type_str == "int" || type_str == "i32")
+            return _context.types().get_i32_type();
+        if (type_str == "i8")
+            return _context.types().get_i8_type();
+        if (type_str == "i16")
+            return _context.types().get_i16_type();
+        if (type_str == "i64")
+            return _context.types().get_i64_type();
+        if (type_str == "f32")
+            return _context.types().get_f32_type();
+        if (type_str == "f64")
+            return _context.types().get_f64_type();
+        if (type_str == "bool")
+            return _context.types().get_boolean_type();
+        if (type_str == "char")
+            return _context.types().get_char_type();
+        if (type_str == "string" || type_str == "str")
+            return _context.types().get_string_type();
+        if (type_str == "auto")
+            return _context.types().get_auto_type(); // Auto type inference
+        if (type_str == "...")
+            return _context.types().get_variadic_type(); // Variadic type
+
+        // Try to resolve as a struct/class type
+        Type *struct_type = _context.types().get_struct_type(type_str);
+        if (struct_type && struct_type->kind() != TypeKind::Unknown)
+        {
+            return struct_type;
+        }
+
+        // Try to resolve as a class type
+        Type *class_type = _context.types().get_class_type(type_str);
+        if (class_type && class_type->kind() != TypeKind::Unknown)
+        {
+            return class_type;
+        }
+
+        // Try to resolve as an enum type
+        Type *enum_type = _context.types().get_enum_type(type_str, {}, false);
+        if (enum_type && enum_type->kind() != TypeKind::Unknown)
+        {
+            return enum_type;
+        }
+
+        // Could be a generic parameter
+        Type *generic_type = _context.types().get_generic_type(type_str);
+        if (generic_type)
+        {
+            return generic_type;
+        }
+
+        // If all else fails, return unknown type
+        std::cerr << "[Parser] WARNING: Could not resolve type '" << type_str << "', returning unknown type" << std::endl;
+        return _context.types().get_unknown_type();
     }
 }

@@ -384,12 +384,9 @@ namespace Cryo
 
         // Get return type
         Type *return_type = nullptr;
-        const std::string &return_type_str = func_decl->return_type_annotation();
-        if (!return_type_str.empty() && return_type_str != "void")
-        {
-            return_type = type_context->parse_type_from_string(return_type_str);
-        }
-        else
+        return_type = func_decl->get_resolved_return_type();
+        const std::string &return_type_str = return_type ? return_type->to_string() : "void";
+        if (!return_type || return_type_str == "void")
         {
             // Default to void for functions without explicit return type or explicit void
             return_type = type_context->get_void_type();
@@ -399,25 +396,16 @@ namespace Cryo
         std::vector<Type *> parameter_types;
         for (const auto &param : func_decl->parameters())
         {
-            const std::string &param_type_str = param->type_annotation();
-            if (!param_type_str.empty())
+            Type *param_type = param->get_resolved_type();
+            if (param_type)
             {
-                Type *param_type = type_context->parse_type_from_string(param_type_str);
-                if (param_type)
-                {
-                    parameter_types.push_back(param_type);
-                }
-                else
-                {
-                    std::cerr << "Warning: Failed to parse parameter type '" << param_type_str
-                              << "' for function '" << func_decl->name() << "'" << std::endl;
-                    return nullptr;
-                }
+                parameter_types.push_back(param_type);
             }
             else
             {
-                std::cerr << "Warning: Parameter '" << param->name()
-                          << "' in function '" << func_decl->name() << "' has no type annotation" << std::endl;
+                const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
+                std::cerr << "Warning: Failed to get resolved type for parameter '" << param->name()
+                          << "' (type: " << param_type_str << ") in function '" << func_decl->name() << "'" << std::endl;
                 return nullptr;
             }
         }
@@ -577,7 +565,7 @@ namespace Cryo
         std::cout << "[DEBUG] ModuleLoader: Finished registering templates from module: " << module_name << std::endl;
     }
 
-    const std::unordered_map<std::string, std::unique_ptr<ProgramNode>>& ModuleLoader::get_imported_asts() const
+    const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &ModuleLoader::get_imported_asts() const
     {
         return _imported_asts;
     }

@@ -270,6 +270,31 @@ namespace Cryo::Codegen
         void clear_cache();
 
         //===================================================================
+        // Type-Safe Caching (Migration Enhancement)
+        //===================================================================
+
+        /**
+         * @brief Register type by Type object (preferred over string-based registration)
+         * @param cryo_type Cryo Type object
+         * @param llvm_type Corresponding LLVM type
+         */
+        void register_type(Cryo::Type *cryo_type, llvm::Type *llvm_type);
+
+        /**
+         * @brief Lookup type by Type object (preferred over string-based lookup)
+         * @param cryo_type Cryo Type object
+         * @return LLVM type or nullptr if not found
+         */
+        llvm::Type *lookup_type(Cryo::Type *cryo_type);
+
+        /**
+         * @brief Check if type is registered by Type object
+         * @param cryo_type Cryo Type object
+         * @return true if type exists in cache
+         */
+        bool has_type(Cryo::Type *cryo_type);
+
+        //===================================================================
         // Field Metadata Management
         //===================================================================
 
@@ -417,6 +442,20 @@ namespace Cryo::Codegen
         //===================================================================
         // Private Implementation
         //===================================================================
+
+        /**
+         * @brief Try to handle struct_type as a parameterized type using Type* objects
+         * @param struct_type The struct type to analyze
+         * @return LLVM type if successfully handled as parameterized type, nullptr otherwise
+         */
+        llvm::Type *try_handle_as_parameterized_type(Cryo::StructType *struct_type);
+
+        /**
+         * @brief Parse generic type string manually (legacy fallback)
+         * @param type_name String containing generic type like "Array<int>"
+         * @return Parsed base name and type arguments, empty if not generic
+         */
+        std::pair<std::string, std::vector<std::string>> parse_generic_type_string(const std::string &type_name);
 
         LLVMContextManager &_context_manager;
         Cryo::TypeContext *_type_context;
