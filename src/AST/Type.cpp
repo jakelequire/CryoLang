@@ -485,6 +485,47 @@ namespace Cryo
     }
 
     //===----------------------------------------------------------------------===//
+    // TupleType Implementation
+    //===----------------------------------------------------------------------===//
+
+    size_t TupleType::size_bytes() const
+    {
+        size_t total_size = 0;
+        for (const auto &element : _element_types)
+        {
+            total_size += element->size_bytes();
+        }
+        return total_size;
+    }
+
+    size_t TupleType::alignment() const
+    {
+        size_t max_alignment = 1;
+        for (const auto &element : _element_types)
+        {
+            max_alignment = std::max(max_alignment, element->alignment());
+        }
+        return max_alignment;
+    }
+
+    bool TupleType::equals(const Type &other) const
+    {
+        if (other.kind() != TypeKind::Tuple)
+            return false;
+
+        const auto &other_tuple = static_cast<const TupleType &>(other);
+        if (_element_types.size() != other_tuple._element_types.size())
+            return false;
+
+        for (size_t i = 0; i < _element_types.size(); ++i)
+        {
+            if (!_element_types[i]->equals(*other_tuple._element_types[i]))
+                return false;
+        }
+        return true;
+    }
+
+    //===----------------------------------------------------------------------===//
     // TypeContext Implementation
     //===----------------------------------------------------------------------===//
 
@@ -608,6 +649,21 @@ namespace Cryo
 
         Type *result = optional_type.get();
         _complex_types.push_back(std::move(optional_type));
+
+        return result;
+    }
+
+    Type *TypeContext::create_tuple_type(const std::vector<Type *> &element_types)
+    {
+        std::vector<std::shared_ptr<Type>> shared_elements;
+        for (Type *element : element_types)
+        {
+            shared_elements.push_back(std::shared_ptr<Type>(element, [](Type *) {}));
+        }
+
+        auto tuple_type = std::make_unique<TupleType>(std::move(shared_elements));
+        Type *result = tuple_type.get();
+        _complex_types.push_back(std::move(tuple_type));
 
         return result;
     }
