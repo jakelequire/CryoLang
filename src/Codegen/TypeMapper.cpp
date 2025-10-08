@@ -322,12 +322,13 @@ namespace Cryo::Codegen
                 is_signed_val = true;  // int is signed
                 std::cout << "[DEBUG] TypeMapper::map_integer_type() - using fallback values: size=4, signed=true" << std::endl;
             } else {
-                // Additional protection: Try size_bytes() in a nested try-catch
+                // CRITICAL FIX: Protect ALL size_bytes() calls, not just fallback
+                std::cout << "[DEBUG] TypeMapper::map_integer_type() - attempting size_bytes() for kind: " << static_cast<int>(int_kind_check) << std::endl;
                 try {
                     byte_size = int_type->size_bytes();
                     std::cout << "[DEBUG] TypeMapper::map_integer_type() - size_bytes() succeeded, size: " << byte_size << std::endl;
                 } catch (...) {
-                    std::cout << "[ERROR] TypeMapper::map_integer_type() - size_bytes() crashed, using fallback" << std::endl;
+                    std::cout << "[ERROR] TypeMapper::map_integer_type() - size_bytes() crashed for kind " << static_cast<int>(int_kind_check) << ", using fallback" << std::endl;
                     // Use fallback based on integer kind
                     switch (int_kind_check) {
                         case Cryo::IntegerKind::I8:
@@ -357,13 +358,13 @@ namespace Cryo::Codegen
                     std::cout << "[DEBUG] TypeMapper::map_integer_type() - fallback size_bytes: " << byte_size << std::endl;
                 }
                 
-                std::cout << "[DEBUG] TypeMapper::map_integer_type() - calling is_signed()" << std::endl;
+                std::cout << "[DEBUG] TypeMapper::map_integer_type() - attempting is_signed() for kind: " << static_cast<int>(int_kind_check) << std::endl;
                 // Additional protection for is_signed() as well
                 try {
                     is_signed_val = int_type->is_signed();
                     std::cout << "[DEBUG] TypeMapper::map_integer_type() - is_signed() succeeded, signed: " << is_signed_val << std::endl;
                 } catch (...) {
-                    std::cout << "[ERROR] TypeMapper::map_integer_type() - is_signed() crashed, using fallback" << std::endl;
+                    std::cout << "[ERROR] TypeMapper::map_integer_type() - is_signed() crashed for kind " << static_cast<int>(int_kind_check) << ", using fallback" << std::endl;
                     // Use fallback based on integer kind
                     switch (int_kind_check) {
                         case Cryo::IntegerKind::I8:

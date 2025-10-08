@@ -31,7 +31,8 @@ namespace Cryo
         _template_registry = std::make_unique<TemplateRegistry>();
 
         // Create module loader - needs to be created after symbol table and template registry
-        _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry);
+        // Pass the main ASTContext to ensure all modules use the same TypeContext
+        _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry, *_ast_context);
 
         // Note: CodeGenerator will be created after parsing when namespace is known
 

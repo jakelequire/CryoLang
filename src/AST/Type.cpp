@@ -574,18 +574,48 @@ namespace Cryo
     {
         std::cout << "[DEBUG] TypeContext::get_integer_type() called with kind=" << static_cast<int>(kind) << " is_signed=" << is_signed << std::endl;
         
+        // Validate the IntegerKind input to prevent corruption
+        int kind_int = static_cast<int>(kind);
+        if (kind_int < 0 || kind_int > static_cast<int>(IntegerKind::UInt)) {
+            std::cout << "[ERROR] TypeContext::get_integer_type() - invalid IntegerKind: " << kind_int << std::endl;
+            // Default to a safe integer type
+            kind = IntegerKind::I32;
+            kind_int = static_cast<int>(kind);
+        }
+        
         // Create a hash key for the integer type
-        int key = static_cast<int>(kind) * 2 + (is_signed ? 0 : 1);
+        int key = kind_int * 2 + (is_signed ? 0 : 1);
+        std::cout << "[DEBUG] TypeContext::get_integer_type() - calculated cache key=" << key << " (kind=" << kind_int << ", signed=" << is_signed << ")" << std::endl;
+        std::cout << "[DEBUG] TypeContext::get_integer_type() - current cache size=" << _integer_types.size() << std::endl;
 
         auto it = _integer_types.find(key);
         if (it != _integer_types.end())
         {
             std::cout << "[DEBUG] TypeContext::get_integer_type() - found cached type, pointer=" << it->second.get() << std::endl;
-            return it->second.get();
+            // Validate cached type before returning
+            try {
+                auto cached_type = it->second.get();
+                if (cached_type && cached_type->kind() == TypeKind::Integer) {
+                    return cached_type;
+                } else {
+                    std::cout << "[ERROR] TypeContext::get_integer_type() - cached type is corrupted, recreating" << std::endl;
+                    _integer_types.erase(it);
+                }
+            } catch (...) {
+                std::cout << "[ERROR] TypeContext::get_integer_type() - cached type validation failed, recreating" << std::endl;
+                _integer_types.erase(it);
+            }
         }
 
-        // Create new integer type
+        // Create new integer type with additional validation
         std::cout << "[DEBUG] TypeContext::get_integer_type() - creating new IntegerType" << std::endl;
+        
+        // Validate construction parameters one more time
+        if (kind_int < 0 || kind_int > static_cast<int>(IntegerKind::UInt)) {
+            std::cout << "[ERROR] TypeContext::get_integer_type() - refusing to create type with invalid kind" << std::endl;
+            return nullptr;
+        }
+        
         auto int_type = std::make_unique<IntegerType>(kind, is_signed);
         Type *result = int_type.get();
         std::cout << "[DEBUG] TypeContext::get_integer_type() - created IntegerType, pointer=" << result << std::endl;
@@ -595,13 +625,21 @@ namespace Cryo
         try {
             auto test_kind = result->kind();
             std::cout << "[DEBUG] TypeContext::get_integer_type() - kind() test passed, kind=" << TypeKindToString(test_kind) << " (" << static_cast<int>(test_kind) << ")" << std::endl;
+            
+            // Additional validation - ensure the name was properly set
+            auto test_name = result->name();
+            if (test_name.empty()) {
+                std::cout << "[ERROR] TypeContext::get_integer_type() - type name is empty, possible constructor issue" << std::endl;
+                return nullptr;
+            }
+            std::cout << "[DEBUG] TypeContext::get_integer_type() - name validation passed: '" << test_name << "'" << std::endl;
         } catch (...) {
-            std::cout << "[ERROR] TypeContext::get_integer_type() - kind() test failed!" << std::endl;
+            std::cout << "[ERROR] TypeContext::get_integer_type() - type validation failed!" << std::endl;
             return nullptr;
         }
         
         _integer_types[key] = std::move(int_type);
-        std::cout << "[DEBUG] TypeContext::get_integer_type() - stored in cache and returning" << std::endl;
+        std::cout << "[DEBUG] TypeContext::get_integer_type() - stored in cache with key=" << key << ", cache size now=" << _integer_types.size() << std::endl;
 
         return result;
     }
@@ -626,25 +664,70 @@ namespace Cryo
 
     Type *TypeContext::create_array_type(Type *element_type, std::optional<size_t> size)
     {
-        // In practice, you'd want to cache these too
-        auto array_type = std::make_unique<ArrayType>(
-            std::shared_ptr<Type>(element_type, [](Type *) {}), // Non-owning shared_ptr
-            size);
+        if (!element_type) {
+            std::cout << "[ERROR] TypeContext::create_array_type() - null element type" << std::endl;
+            return nullptr;
+        }
+        
+        // Generate a unique key for array type caching
+        std::string array_key = element_type->name() + "[]";
+        if (size.has_value()) {
+            array_key = element_type->name() + "[" + std::to_string(*size) + "]";
+        }
+        
+        // Check if we already have this array type (simple name-based check)
+        for (const auto& existing_type : _complex_types) {
+            if (existing_type->name() == array_key) {
+                std::cout << "[DEBUG] TypeContext::create_array_type() - found cached array type: " << array_key << std::endl;
+                return existing_type.get();
+            }
+        }
+        
+        // Create a non-owning shared_ptr since TypeContext manages the lifetime
+        // This is safe because element_type is guaranteed to live as long as TypeContext
+        std::shared_ptr<Type> element_shared(element_type, [](Type*) {
+            // Non-deleting deleter - TypeContext owns the element type
+        });
+        
+        auto array_type = std::make_unique<ArrayType>(element_shared, size);
 
         Type *result = array_type.get();
         _complex_types.push_back(std::move(array_type));
 
+        std::cout << "[DEBUG] TypeContext::create_array_type() - created new array type: " << array_key << std::endl;
         return result;
     }
 
     Type *TypeContext::create_pointer_type(Type *pointee_type)
     {
-        auto pointer_type = std::make_unique<PointerType>(
-            std::shared_ptr<Type>(pointee_type, [](Type *) {}));
+        if (!pointee_type) {
+            std::cout << "[ERROR] TypeContext::create_pointer_type() - null pointee type" << std::endl;
+            return nullptr;
+        }
+        
+        // Generate the pointer type name (automatically set by PointerType constructor)
+        std::string pointer_key = pointee_type->name() + "*";
+        
+        // Check if we already have this pointer type (simple name-based check)
+        for (const auto& existing_type : _complex_types) {
+            if (existing_type->name() == pointer_key) {
+                std::cout << "[DEBUG] TypeContext::create_pointer_type() - found cached pointer type: " << pointer_key << std::endl;
+                return existing_type.get();
+            }
+        }
+        
+        // Create a non-owning shared_ptr since TypeContext manages the lifetime
+        // This is safe because pointee_type is guaranteed to live as long as TypeContext
+        std::shared_ptr<Type> pointee_shared(pointee_type, [](Type*) {
+            // Non-deleting deleter - TypeContext owns the pointee type
+        });
+        
+        auto pointer_type = std::make_unique<PointerType>(pointee_shared);
 
         Type *result = pointer_type.get();
         _complex_types.push_back(std::move(pointer_type));
 
+        std::cout << "[DEBUG] TypeContext::create_pointer_type() - created new pointer type: " << pointer_key << std::endl;
         return result;
     }
 

@@ -163,6 +163,9 @@ namespace Cryo
         std::string _name;
         TypeQualifiers _qualifiers;
         mutable std::string _cached_string; // For toString() caching
+        
+        // Protected setter for derived classes to update the name
+        void set_name(const std::string &name) { _name = name; _cached_string.clear(); }
 
     public:
         Type(TypeKind kind, const std::string &name = "")
