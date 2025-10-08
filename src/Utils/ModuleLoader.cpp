@@ -11,8 +11,8 @@
 
 namespace Cryo
 {
-    ModuleLoader::ModuleLoader(SymbolTable &symbol_table, TemplateRegistry &template_registry)
-        : _symbol_table(symbol_table), _template_registry(template_registry)
+    ModuleLoader::ModuleLoader(SymbolTable &symbol_table, TemplateRegistry &template_registry, ASTContext &ast_context)
+        : _symbol_table(symbol_table), _template_registry(template_registry), _ast_context(ast_context)
     {
         // Default stdlib location - can be overridden
         _stdlib_root = "./stdlib";
@@ -189,11 +189,12 @@ namespace Cryo
             auto lexer = std::make_unique<Lexer>(std::move(file));
             std::cout << "[DEBUG] ModuleLoader: Created Lexer" << std::endl;
 
-            // Create ASTContext for parsing
-            ASTContext ast_context;
+            // Use the main ASTContext instead of creating a new one
+            // This ensures all types use the same TypeContext and prevents corruption
+            std::cout << "[DEBUG] ModuleLoader: Using main ASTContext for type consistency" << std::endl;
 
-            // Create parser with the lexer and context
-            Parser parser(std::move(lexer), ast_context);
+            // Create parser with the lexer and main context
+            Parser parser(std::move(lexer), _ast_context);
             std::cout << "[DEBUG] ModuleLoader: Created Parser" << std::endl;
 
             // Parse the program

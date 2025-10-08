@@ -15,6 +15,7 @@ namespace Cryo
     // Forward declarations
     class Parser;
     class CompilerInstance;
+    class ASTContext;
 
     /**
      * @brief Handles module loading and import resolution for the Cryo compiler
@@ -39,12 +40,13 @@ namespace Cryo
         std::unordered_set<std::string> _loading_modules;              // Track modules currently being loaded (cycle detection)
         SymbolTable &_symbol_table;                                    // Reference to main symbol table
         TemplateRegistry &_template_registry;                          // Reference to template registry for cross-module templates
+        ASTContext &_ast_context;                                      // Reference to main AST context for type consistency
         
         // Storage for imported ASTs to keep them alive for template registration
         std::unordered_map<std::string, std::unique_ptr<ProgramNode>> _imported_asts;
 
     public:
-        explicit ModuleLoader(SymbolTable &symbol_table, TemplateRegistry &template_registry);
+        explicit ModuleLoader(SymbolTable &symbol_table, TemplateRegistry &template_registry, ASTContext &ast_context);
         ~ModuleLoader() = default;
 
         /**
