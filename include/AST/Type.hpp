@@ -1138,7 +1138,8 @@ namespace Cryo
 
         /// @deprecated Use AST-based parsing instead
         /// Types should be constructed in the frontend and parsed only once into AST nodes.
-        [[deprecated("Complete migration to AST-based type parsing")]]
+        /// Use parse_type_from_string_via_tokens for new code
+        [[deprecated("Use parse_type_from_string_via_tokens - Complete migration to token-based type parsing")]]
         Type *parse_type_from_string(const std::string &type_str);
 
         // ===== NEW: Token-based Type Parsing (Primary pathway) =====
@@ -1147,6 +1148,9 @@ namespace Cryo
         /// This guarantees correct tokenization and prevents parsing errors
         Type *parse_type_from_tokens(Lexer &lexer);
         Type *parse_type_from_token_stream(const std::vector<Token> &tokens, size_t &index);
+        
+        /// Helper method to parse type from string using token-based approach
+        Type *parse_type_from_string_via_tokens(const std::string &type_str);
         
         /// Parse primitive types from individual tokens
         Type *parse_primitive_type_from_token(TokenKind token_kind);

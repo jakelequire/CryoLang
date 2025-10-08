@@ -461,7 +461,7 @@ namespace Cryo
         {
             return type_context.get_string_type();
         }
-        else if (clean_type == "bool" || clean_type == "boolean")
+        else if (clean_type == "boolean")
         {
             return type_context.get_boolean_type();
         }

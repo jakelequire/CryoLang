@@ -1555,7 +1555,6 @@ namespace CryoLSP
             {"string", "UTF-8 encoded string type. Managed string with automatic memory handling"},
             {"char", "Single character type (32-bit Unicode code point)"},
             {"boolean", "Boolean type with values true or false"},
-            {"bool", "Boolean type with values true or false"},
             {"void", "Unit type representing no value (used in function return types)"},
             
             // Special types

@@ -115,6 +115,9 @@ private:
     const char* _current;
     const char* _buffer_start;
     const char* _buffer_end;
+    
+    // For spot lexing - holds string content when not using a file
+    std::string _spot_content;
 
     SourceLocation _current_location;
     Token _current_token;
@@ -128,8 +131,11 @@ private:
     static const std::unordered_map<std::string_view, TokenKind> _keywords;
     
 public:
-    // Constructor
+    // Constructors
     explicit Lexer(std::unique_ptr<File> file);
+    
+    // Constructor for spot lexing from string content
+    explicit Lexer(const std::string& content);
     
     // Destructor
     ~Lexer() = default;

@@ -350,8 +350,8 @@ std::string DocumentManager::getHoverContentForSymbol(const std::string& symbol,
     if (symbol == "string") {
         return "**string** - UTF-8 string type\n\nExample: `let name: string = \"Hello\";`";
     }
-    if (symbol == "bool") {
-        return "**bool** - Boolean type (true/false)\n\nExample: `let flag: bool = true;`";
+    if (symbol == "boolean") {
+        return "**boolean** - Boolean type (true/false)\n\nExample: `let flag: bool = true;`";
     }
     if (symbol == "float") {
         return "**float** - 64-bit floating point type\n\nExample: `let pi: float = 3.14159;`";
@@ -361,17 +361,20 @@ std::string DocumentManager::getHoverContentForSymbol(const std::string& symbol,
     }
     
     // Keywords
-    if (symbol == "fn") {
-        return "**fn** - Function declaration keyword\n\nExample: `fn myFunction() -> int { return 42; }`";
+    if (symbol == "function") {
+        return "**function** - Function declaration keyword\n\nExample: `function myFunction() -> int { return 42; }`";
     }
-    if (symbol == "let") {
-        return "**let** - Variable declaration keyword\n\nExample: `let x: int = 10;`";
+    if (symbol == "mut") {
+        return "**mut** - Mutable variable declaration keyword\n\nExample: `mut x: int = 10;`";
     }
     if (symbol == "struct") {
-        return "**struct** - Structure declaration keyword\n\nExample: `struct Point { x: int, y: int }`";
+        return "**struct** - Structure declaration keyword\n\nExample: `type struct Point { x: int, y: int }`";
     }
     if (symbol == "class") {
-        return "**class** - Class declaration keyword\n\nExample: `class MyClass { ... }`";
+        return "**class** - Class declaration keyword\n\nExample: `type class MyClass { ... }`";
+    }
+    if (symbol == "type") {
+        return "**type** - Type alias or definition keyword\n\nExample: `type MyInt = int;\n\ntype struct MyStruct { a: int, b: string };`";
     }
     if (symbol == "if") {
         return "**if** - Conditional statement keyword\n\nExample: `if (condition) { ... }`";
@@ -379,12 +382,16 @@ std::string DocumentManager::getHoverContentForSymbol(const std::string& symbol,
     if (symbol == "return") {
         return "**return** - Return statement keyword\n\nExample: `return value;`";
     }
-    
-    // Built-in functions
-    if (symbol == "print") {
-        return "**print** - Built-in function to output text\n\nExample: `print(\"Hello, World!\");`";
+    if (symbol == "import") {
+        return "**import** - Module import keyword\n\nExample: `import \"mymodule.cryo\";`";
     }
-    
+    if (symbol == "namespace") {
+        return "**namespace** - Namespace declaration keyword\n\nExample: `namespace MyNamespace { ... }`";
+    }
+    if (symbol == "null") {
+        return "**null** - Null literal\n\nRepresents a null or absent value.";
+    }
+
     // Generic symbol information
     return "**" + symbol + "** - CryoLang symbol\n\n*Hover over built-in types and keywords for more information*";
 }

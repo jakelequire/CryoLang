@@ -997,26 +997,75 @@ namespace Cryo
                 return parse_generic_type_from_tokens(tokens, index);
             }
             
+            // First check if it's a primitive type (to avoid creating incorrect ClassType)
+            if (type_name == "u8") return get_u8_type();
+            if (type_name == "u16") return get_u16_type();
+            if (type_name == "u32") return get_u32_type();
+            if (type_name == "u64") return get_u64_type();
+            if (type_name == "i8") return get_i8_type();
+            if (type_name == "i16") return get_i16_type();
+            if (type_name == "i32") return get_i32_type();
+            if (type_name == "i64") return get_i64_type();
+            if (type_name == "f32") return get_f32_type();
+            if (type_name == "f64") return get_f64_type();
+            if (type_name == "boolean") return get_boolean_type();
+            if (type_name == "string") return get_string_type();
+            if (type_name == "void") return get_void_type();
+            
             // Simple user-defined type
             // Try struct, class, enum, trait types
             Type *user_type = get_struct_type(type_name);
-            if (user_type && user_type->kind() != TypeKind::Unknown)
-                return user_type;
+            if (user_type && user_type->kind() != TypeKind::Unknown) {
+                // Handle pointer modifiers for user-defined types
+                Type *result_type = user_type;
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                    ++index; // consume '*'
+                    result_type = create_pointer_type(result_type);
+                }
+                return result_type;
+            }
                 
             user_type = get_class_type(type_name);
-            if (user_type && user_type->kind() != TypeKind::Unknown)
-                return user_type;
+            if (user_type && user_type->kind() != TypeKind::Unknown) {
+                // Handle pointer modifiers for user-defined types
+                Type *result_type = user_type;
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                    ++index; // consume '*'
+                    result_type = create_pointer_type(result_type);
+                }
+                return result_type;
+            }
                 
             user_type = lookup_enum_type(type_name);
-            if (user_type)
-                return user_type;
+            if (user_type) {
+                // Handle pointer modifiers for user-defined types
+                Type *result_type = user_type;
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                    ++index; // consume '*'
+                    result_type = create_pointer_type(result_type);
+                }
+                return result_type;
+            }
                 
             user_type = get_trait_type(type_name);
-            if (user_type && user_type->kind() != TypeKind::Unknown)
-                return user_type;
+            if (user_type && user_type->kind() != TypeKind::Unknown) {
+                // Handle pointer modifiers for user-defined types
+                Type *result_type = user_type;
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                    ++index; // consume '*'
+                    result_type = create_pointer_type(result_type);
+                }
+                return result_type;
+            }
                 
-            // Generic parameter
-            return get_generic_type(type_name);
+            // Generic parameter - also handle pointers
+            Type *generic_type = get_generic_type(type_name);
+            Type *result_type = generic_type;
+            while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                ++index; // consume '*'
+                result_type = create_pointer_type(result_type);
+            }
+            return result_type;
         }
         
         return nullptr; // Unable to parse type
@@ -1042,6 +1091,13 @@ namespace Cryo
         // Parse the collected tokens
         size_t index = 0;
         return parse_type_from_token_stream(tokens, index);
+    }
+
+    Type *TypeContext::parse_type_from_string_via_tokens(const std::string &type_str)
+    {
+        // Create a spot lexer for the type string
+        Lexer type_lexer(type_str);
+        return parse_type_from_tokens(type_lexer);
     }
 
     Type *TypeContext::parse_generic_type_from_tokens(const std::vector<Token> &tokens, size_t &index)
@@ -1119,7 +1175,7 @@ namespace Cryo
         if (normalized_type_str.length() > 2 && normalized_type_str.substr(normalized_type_str.length() - 2) == "[]")
         {
             std::string element_type_str = normalized_type_str.substr(0, normalized_type_str.length() - 2);
-            Type *element_type = parse_type_from_string(element_type_str);
+            Type *element_type = parse_type_from_string_via_tokens(element_type_str);
             if (element_type)
             {
                 return create_array_type(element_type);
@@ -1130,7 +1186,7 @@ namespace Cryo
         if (normalized_type_str.length() > 1 && normalized_type_str.back() == '*')
         {
             std::string pointee_type_str = normalized_type_str.substr(0, normalized_type_str.length() - 1);
-            Type *pointee_type = parse_type_from_string(pointee_type_str);
+            Type *pointee_type = parse_type_from_string_via_tokens(pointee_type_str);
             if (pointee_type)
             {
                 return create_pointer_type(pointee_type);
@@ -1141,7 +1197,7 @@ namespace Cryo
         if (normalized_type_str.length() > 1 && normalized_type_str.front() == '&')
         {
             std::string referent_type_str = normalized_type_str.substr(1);
-            Type *referent_type = parse_type_from_string(referent_type_str);
+            Type *referent_type = parse_type_from_string_via_tokens(referent_type_str);
             if (referent_type)
             {
                 return create_reference_type(referent_type);
@@ -1159,7 +1215,7 @@ namespace Cryo
             if (base_name == "ptr")
             {
                 // ptr<T> = T* - create a pointer type to T
-                Type *pointee_type = parse_type_from_string(params_str);
+                Type *pointee_type = parse_type_from_string_via_tokens(params_str);
                 if (pointee_type)
                 {
                     return create_pointer_type(pointee_type);
@@ -1168,7 +1224,7 @@ namespace Cryo
             else if (base_name == "const_ptr")
             {
                 // const_ptr<T> = const T* - for now, treat same as ptr<T>
-                Type *pointee_type = parse_type_from_string(params_str);
+                Type *pointee_type = parse_type_from_string_via_tokens(params_str);
                 if (pointee_type)
                 {
                     return create_pointer_type(pointee_type);
@@ -1259,7 +1315,7 @@ namespace Cryo
         return_part.erase(0, return_part.find_first_not_of(" \t"));
 
         // Parse return type
-        Type *return_type = parse_type_from_string(return_part);
+        Type *return_type = parse_type_from_string_via_tokens(return_part);
         if (!return_type)
         {
             return get_unknown_type();
@@ -1329,7 +1385,7 @@ namespace Cryo
                         type_part.erase(0, type_part.find_first_not_of(" \t"));
                     }
 
-                    Type *param_type = parse_type_from_string(type_part);
+                    Type *param_type = parse_type_from_string_via_tokens(type_part);
                     if (!param_type)
                     {
                         return get_unknown_type();
@@ -1427,6 +1483,18 @@ namespace Cryo
         if (it != _struct_types.end())
         {
             return it->second.get();
+        }
+
+        // Prevent creating struct types for built-in type names
+        // This prevents accidental creation of struct types for primitive types like "u64"
+        if (name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "int" ||
+            name == "u8" || name == "u16" || name == "u32" || name == "u64" ||
+            name == "f32" || name == "f64" || name == "float" || name == "double" ||
+            name == "boolean" || name == "char" || name == "string" || name == "void")
+        {
+            std::cout << "[DEBUG] Attempted to create struct type for built-in type name: " << name << std::endl;
+            std::cout << "[DEBUG] Returning unknown type instead of creating struct" << std::endl;
+            return get_unknown_type();
         }
 
         // Create new struct type
@@ -2159,8 +2227,8 @@ namespace Cryo
         std::vector<Type *> concrete_types;
         for (const auto &param_str : param_strs)
         {
-            // This is simplified - you'd need proper type parsing here
-            Type *param_type = _type_context->parse_type_from_string(param_str);
+            // Use token-based type parsing
+            Type *param_type = _type_context->parse_type_from_string_via_tokens(param_str);
             if (!param_type)
                 return nullptr;
             concrete_types.push_back(param_type);
