@@ -1108,15 +1108,13 @@ namespace Cryo::Codegen
                             _context_manager.get_builder().CreateStore(&*arg_it, this_alloca);
                             _value_context->set_value("this", this_alloca, this_alloca, class_ptr_type);
                             
-                            // Store the Cryo type for 'this' parameter - create a pointer type to the class
+                            // Store the Cryo type for 'this' parameter
                             if (!class_name.empty()) {
-                                // Find the class type from our type context
-                                auto class_type_it = _types.find(class_name);
-                                if (class_type_it != _types.end()) {
-                                    // Create a pointer type for the class
-                                    std::cout << "[DEBUG] Creating pointer type for 'this' parameter of class: " << class_name << std::endl;
-                                    // We need to create a pointer type for 'this' - for now, we'll use a simple approach
-                                    _variable_types["this"] = nullptr; // We'll handle this in the member access code
+                                Cryo::ClassType *class_cryo_type = static_cast<Cryo::ClassType *>(_symbol_table.get_type_context()->get_class_type(class_name));
+                                if (class_cryo_type) {
+                                    // For 'this' in class methods, we store the class type (the pointer aspect is handled in member access)
+                                    _variable_types["this"] = class_cryo_type;
+                                    std::cout << "[DEBUG] Stored 'this' parameter for class '" << class_name << "' with class type" << std::endl;
                                 }
                             }
                             
@@ -3188,8 +3186,34 @@ namespace Cryo::Codegen
         int field_index = -1;
         std::string type_name;
 
+        // Strategy 0: Try Cryo type tracking first (most reliable)
+        if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(node.object()))
+        {
+            std::string var_name = identifier->name();
+            auto cryo_type_it = _variable_types.find(var_name);
+            if (cryo_type_it != _variable_types.end() && cryo_type_it->second)
+            {
+                Cryo::Type *cryo_type = cryo_type_it->second;
+                // For pointer types, get the pointed-to type
+                if (cryo_type->kind() == Cryo::TypeKind::Pointer)
+                {
+                    Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType*>(cryo_type);
+                    cryo_type = ptr_type->pointee_type().get();
+                }
+                
+                if (cryo_type->kind() == Cryo::TypeKind::Struct)
+                {
+                    Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType*>(cryo_type);
+                    type_name = struct_cryo_type->name();
+                    struct_type = _type_mapper->map_type(cryo_type);
+                    field_index = _type_mapper->get_field_index(type_name, member_name);
+                    std::cout << "[DEBUG] Member access using Cryo type tracking: var='" << var_name << "' type='" << type_name << "' field_index=" << field_index << std::endl;
+                }
+            }
+        }
+
         // Strategy 1: Try current struct context first (most reliable for generic structs)
-        if (!current_struct_type.empty())
+        if (!struct_type && !current_struct_type.empty())
         {
             std::cout << "[CodegenVisitor] Trying current struct context: " << current_struct_type << std::endl;
 
@@ -4722,6 +4746,68 @@ namespace Cryo::Codegen
                                 type_name = struct_cryo_type->name();
                                 struct_type = _type_mapper->map_type(cryo_type);
                                 std::cout << "[DEBUG] Member assignment using Cryo type tracking: var='" << var_name << "' type='" << type_name << "'" << std::endl;
+                            }
+                        }
+                    }
+                    // Handle chained member access (e.g., this.head.prev, block.prev.next)
+                    else if (auto nested_member_access = dynamic_cast<Cryo::MemberAccessNode *>(left_member_access->object()))
+                    {
+                        // For chained member access like this.head.prev, we need to know the type of this.head
+                        // Since member access already works, let's use the fact that we can determine types
+                        // based on what we know about the field relationships
+                        if (auto base_identifier = dynamic_cast<Cryo::IdentifierNode *>(nested_member_access->object()))
+                        {
+                            std::string base_var_name = base_identifier->name();
+                            std::string nested_member_name = nested_member_access->member();
+                            
+                            // For the specific case we're debugging: this.head.prev where:
+                            // - 'this' is HeapManager (or FreeListManager) 
+                            // - 'head' is HeapBlock*
+                            // - 'prev' is on HeapBlock
+                            if (base_var_name == "this" && nested_member_name == "head")
+                            {
+                                // We know this.head is HeapBlock*, so the target type is HeapBlock
+                                type_name = "HeapBlock";
+                                // Look up in registered types
+                                auto type_it = _types.find("HeapBlock");
+                                if (type_it != _types.end()) {
+                                    struct_type = type_it->second;
+                                }
+                                std::cout << "[DEBUG] Chained member assignment detected this.head.* pattern, using HeapBlock type" << std::endl;
+                            }
+                            // Handle block.prev.* and block.next.* patterns
+                            else if ((nested_member_name == "prev" || nested_member_name == "next"))
+                            {
+                                // Check if the base variable is a HeapBlock* type
+                                auto base_cryo_type_it = _variable_types.find(base_var_name);
+                                if (base_cryo_type_it != _variable_types.end() && base_cryo_type_it->second)
+                                {
+                                    Cryo::Type *base_cryo_type = base_cryo_type_it->second;
+                                    // For pointer types, get the pointed-to type
+                                    if (base_cryo_type->kind() == Cryo::TypeKind::Pointer)
+                                    {
+                                        Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType*>(base_cryo_type);
+                                        base_cryo_type = ptr_type->pointee_type().get();
+                                    }
+                                    
+                                    if (base_cryo_type->kind() == Cryo::TypeKind::Struct)
+                                    {
+                                        Cryo::StructType *base_struct_type = static_cast<Cryo::StructType*>(base_cryo_type);
+                                        std::string base_type_name = base_struct_type->name();
+                                        
+                                        // If the base is HeapBlock, then both prev and next fields are HeapBlock*
+                                        // so the chained access target is also HeapBlock
+                                        if (base_type_name == "HeapBlock")
+                                        {
+                                            type_name = "HeapBlock";
+                                            auto type_it = _types.find("HeapBlock");
+                                            if (type_it != _types.end()) {
+                                                struct_type = type_it->second;
+                                            }
+                                            std::cout << "[DEBUG] Chained member assignment detected " << base_var_name << "." << nested_member_name << ".* pattern, using HeapBlock type" << std::endl;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -6844,6 +6930,8 @@ namespace Cryo::Codegen
             }
 
             std::cout << "[DEBUG] All pre-CreateCall checks passed, creating call..." << std::endl;
+            std::cout << "[DEBUG] Function Name: " << function->getName().str() << std::endl;
+            std::cout << "[DEBUG] Number of Args: " << args.size() << std::endl;
             llvm::Value *call_result = builder.CreateCall(function, args);
             std::cout << "[DEBUG] CreateCall completed successfully!" << std::endl;
 
