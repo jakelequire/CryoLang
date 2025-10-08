@@ -183,6 +183,11 @@ namespace Cryo::Codegen
          */
         void pre_register_functions_from_symbol_table();
 
+        /**
+         * @brief Get TypeMapper for manual AST node registration
+         */
+        TypeMapper *get_type_mapper() const { return _type_mapper.get(); }
+
     private:
         //===================================================================
         // Context Management

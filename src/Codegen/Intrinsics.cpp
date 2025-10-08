@@ -93,6 +93,8 @@ namespace Cryo::Codegen
             return generate_sprintf(args);
         else if (intrinsic_name == "__fprintf__")
             return generate_fprintf(args);
+        else if (intrinsic_name == "__panic__")
+            return generate_panic(args);
 
         // String conversion operations
         else if (intrinsic_name == "__float32_to_string__")
@@ -1028,6 +1030,42 @@ namespace Cryo::Codegen
 
         // Call fprintf
         return builder.CreateCall(fprintf_func, args, "fprintf.result");
+    }
+
+    llvm::Value* Intrinsics::generate_panic(const std::vector<llvm::Value*>& args)
+    {
+        // __panic__ can be called with 0 args (just panic) or 1 arg (panic with message)
+        auto& builder = _context_manager.get_builder();
+        auto& context = _context_manager.get_context();
+
+        if (args.size() > 1)
+        {
+            report_error("__panic__ requires 0 or 1 arguments (optional message)");
+            return nullptr;
+        }
+
+        if (!args.empty())
+        {
+            // If message provided, print it first
+            llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
+            llvm::Type* int_type = llvm::Type::getInt32Ty(context);
+            llvm::FunctionType* printf_type = llvm::FunctionType::get(
+                int_type, {char_ptr_type}, true); // variadic
+
+            llvm::Function* printf_func = get_or_create_libc_function("printf", printf_type);
+            
+            if (args[0]->getType()->isPointerTy())
+            {
+                // Print the panic message
+                builder.CreateCall(printf_func, args, "panic.print");
+            }
+        }
+
+        // Exit with status code 1 (indicating error)
+        llvm::Value* exit_code = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
+        std::vector<llvm::Value*> exit_args = {exit_code};
+        
+        return generate_syscall_exit(exit_args);
     }
 
     // ========================================

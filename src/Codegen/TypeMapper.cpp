@@ -925,7 +925,58 @@ namespace Cryo::Codegen
             }
             else
             {
-                std::cout << "[TypeMapper] No AST node found for struct: " << struct_name << ", creating empty struct" << std::endl;
+                // Check if this is actually a class registered as such
+                auto class_it = _class_ast_nodes.find(struct_name);
+                if (class_it != _class_ast_nodes.end())
+                {
+                    std::cout << "[TypeMapper] Found class AST node for struct: " << struct_name << ", generating field types" << std::endl;
+                    auto class_node = class_it->second;
+
+                    for (const auto &field : class_node->fields())
+                    {
+                        if (field)
+                        {
+                            std::cout << "[TypeMapper] Processing class field: " << field->name() << " : " << (field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown") << std::endl;
+
+                            // Map field type using resolved Type* directly
+                            if (_type_context)
+                            {
+                                auto field_cryo_type = field->get_resolved_type();
+                                if (field_cryo_type)
+                                {
+                                    llvm::Type *field_llvm_type = map_type(field_cryo_type);
+                                    if (field_llvm_type)
+                                    {
+                                        field_types.push_back(field_llvm_type);
+                                        std::cout << "[TypeMapper] Mapped class field '" << field->name() << "' to LLVM type" << std::endl;
+                                    }
+                                    else
+                                    {
+                                        std::cerr << "[TypeMapper] Failed to map class field type: " << field->type_annotation() << std::endl;
+                                        // Use a placeholder pointer type for failed field mappings
+                                        field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                    }
+                                }
+                                else
+                                {
+                                    std::cerr << "[TypeMapper] Failed to parse class field type: " << field->type_annotation() << std::endl;
+                                    // Use a placeholder pointer type for failed field parsing
+                                    field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                }
+                            }
+                            else
+                            {
+                                std::cerr << "[TypeMapper] No TypeContext available for class field type mapping" << std::endl;
+                                // Use a placeholder pointer type when no TypeContext
+                                field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    std::cout << "[TypeMapper] No AST node found for struct: " << struct_name << ", creating empty struct" << std::endl;
+                }
             }
         }
 

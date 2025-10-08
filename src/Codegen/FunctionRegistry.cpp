@@ -251,8 +251,7 @@ namespace Cryo::Codegen
         }
         else
         {
-            // Fallback for functions not in symbol table
-            metadata.category = FunctionCategory::VoidFunction;
+            metadata.category = FunctionCategory::VoidFunction; // fallback
         }
 
         metadata.runtime_name = runtime_name;

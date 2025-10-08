@@ -75,6 +75,7 @@ namespace Cryo::Codegen
         llvm::Value* generate_printf(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_sprintf(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_fprintf(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_panic(const std::vector<llvm::Value*>& args);
 
         // String conversion intrinsics
         llvm::Value* generate_float32_to_string(const std::vector<llvm::Value*>& args);

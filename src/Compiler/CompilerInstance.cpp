@@ -1,4 +1,6 @@
 #include "Compiler/CompilerInstance.hpp"
+#include "Codegen/TypeMapper.hpp"
+#include "Codegen/CodegenVisitor.hpp"
 #include "Utils/file.hpp"
 #include <iostream>
 #include <fstream>
@@ -350,6 +352,10 @@ namespace Cryo
             {
                 std::cout << "[DEBUG] Created CodeGenerator with module name: '" << namespace_for_module << "'" << std::endl;
             }
+
+            // Register struct/class AST nodes with TypeMapper immediately after CodeGenerator creation
+            // This ensures AST nodes are registered before any TypeMapper operations during analysis
+            register_ast_nodes_with_typemapper();
 
             return _ast_root != nullptr;
         }
@@ -908,6 +914,31 @@ namespace Cryo
             current_scope->declare_symbol(struct_decl->name(), SymbolKind::Type,
                                           struct_decl->location(), struct_type, scope_name);
 
+            // Register struct methods with fully qualified names
+            for (const auto &method : struct_decl->methods())
+            {
+                if (method)
+                {
+                    std::string method_name = scope_name + "::" + struct_decl->name() + "::" + method->name();
+                    std::cout << "[CompilerInstance] Pass 1: Found struct method: " << method_name << std::endl;
+
+                    // Create function type for the method
+                    std::vector<Type *> param_types;
+                    for (const auto &param : method->parameters())
+                    {
+                        Type *param_type = param->get_resolved_type();
+                        param_types.push_back(param_type);
+                    }
+
+                    Type *return_type = method->get_resolved_return_type();
+                    Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
+
+                    // Register method in symbol table with fully qualified name
+                    current_scope->declare_symbol(method_name, SymbolKind::Function,
+                                                  method->location(), function_type, scope_name);
+                }
+            }
+
             // Register generic struct templates if this struct has generic parameters
             if (!struct_decl->generic_parameters().empty())
             {
@@ -919,6 +950,54 @@ namespace Cryo
                     ""      // No source file path for main file templates
                 );
                 std::cout << "[CompilerInstance] Registered local generic struct template: " << struct_decl->name() << std::endl;
+            }
+        }
+        // Handle class declarations
+        else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(node))
+        {
+            // Get or create class type
+            Type *class_type = _ast_context->types().get_class_type(class_decl->name());
+
+            // Add class to symbol table as a Type symbol
+            current_scope->declare_symbol(class_decl->name(), SymbolKind::Type,
+                                          class_decl->location(), class_type, scope_name);
+
+            // Register class methods with fully qualified names
+            for (const auto &method : class_decl->methods())
+            {
+                if (method)
+                {
+                    std::string method_name = scope_name + "::" + class_decl->name() + "::" + method->name();
+                    std::cout << "[CompilerInstance] Pass 1: Found class method: " << method_name << std::endl;
+
+                    // Create function type for the method
+                    std::vector<Type *> param_types;
+                    for (const auto &param : method->parameters())
+                    {
+                        Type *param_type = param->get_resolved_type();
+                        param_types.push_back(param_type);
+                    }
+
+                    Type *return_type = method->get_resolved_return_type();
+                    Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
+
+                    // Register method in symbol table with fully qualified name
+                    current_scope->declare_symbol(method_name, SymbolKind::Function,
+                                                  method->location(), function_type, scope_name);
+                }
+            }
+
+            // Register generic class templates if this class has generic parameters
+            if (!class_decl->generic_parameters().empty())
+            {
+                std::cout << "[CompilerInstance] Registering local generic class template: " << class_decl->name() << std::endl;
+                _template_registry->register_class_template(
+                    class_decl->name(),
+                    class_decl,
+                    "Main", // Use "Main" as the module name for local templates
+                    ""      // No source file path for main file templates
+                );
+                std::cout << "[CompilerInstance] Registered local generic class template: " << class_decl->name() << std::endl;
             }
         }
         // Handle enum declarations
@@ -1317,6 +1396,77 @@ namespace Cryo
 
         // Process the AST to find and register struct declarations with the TypeMapper
         process_struct_declarations_recursive(node);
+    }
+
+    void CompilerInstance::register_ast_nodes_with_typemapper()
+    {
+        if (!_codegen || !_ast_root)
+        {
+            return;
+        }
+
+        // Ensure the visitor is initialized first
+        if (!_codegen->ensure_visitor_initialized())
+        {
+            std::cerr << "[CompilerInstance] Failed to initialize CodegenVisitor for AST node registration" << std::endl;
+            return;
+        }
+
+        Codegen::CodegenVisitor *visitor = _codegen->get_visitor();
+        if (!visitor)
+        {
+            std::cerr << "[CompilerInstance] Failed to get CodegenVisitor for AST node registration" << std::endl;
+            return;
+        }
+
+        Codegen::TypeMapper *type_mapper = visitor->get_type_mapper();
+        if (!type_mapper)
+        {
+            std::cerr << "[CompilerInstance] Failed to get TypeMapper for AST node registration" << std::endl;
+            return;
+        }
+
+        std::cout << "[CompilerInstance] Registering struct/class AST nodes with TypeMapper..." << std::endl;
+        
+        // Recursively find and register all struct/class declarations
+        register_ast_nodes_recursive(_ast_root.get(), type_mapper);
+        
+        std::cout << "[CompilerInstance] Completed AST node registration with TypeMapper" << std::endl;
+    }
+
+    void CompilerInstance::register_ast_nodes_recursive(ASTNode *node, Codegen::TypeMapper *type_mapper)
+    {
+        if (!node || !type_mapper)
+            return;
+
+        // Register struct declarations
+        if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
+        {
+            std::cout << "[CompilerInstance] Registering struct AST node: " << struct_decl->name() << std::endl;
+            type_mapper->register_struct_ast_node(struct_decl);
+        }
+        // Register class declarations  
+        else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(node))
+        {
+            std::cout << "[CompilerInstance] Registering class AST node: " << class_decl->name() << std::endl;
+            type_mapper->register_class_ast_node(class_decl);
+        }
+        // Recurse into program nodes
+        else if (auto program = dynamic_cast<ProgramNode *>(node))
+        {
+            for (const auto &statement : program->statements())
+            {
+                register_ast_nodes_recursive(statement.get(), type_mapper);
+            }
+        }
+        // Recurse into block statements
+        else if (auto block = dynamic_cast<BlockStatementNode *>(node))
+        {
+            for (const auto &statement : block->statements())
+            {
+                register_ast_nodes_recursive(statement.get(), type_mapper);
+            }
+        }
     }
 
     void CompilerInstance::process_struct_declarations_recursive(ASTNode *node)
