@@ -877,6 +877,16 @@ namespace Cryo::Codegen
                         llvm::AllocaInst *this_alloca = _context_manager.get_builder().CreateAlloca(struct_ptr_type, nullptr, "this");
                         _context_manager.get_builder().CreateStore(&*param_arg_it, this_alloca);
                         _value_context->set_value("this", this_alloca, this_alloca, struct_ptr_type);
+                        
+                        // Store the Cryo type for 'this' parameter
+                        std::string struct_name = node.name();
+                        Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(_symbol_table.get_type_context()->get_struct_type(struct_name));
+                        if (struct_cryo_type) {
+                            // For 'this' in struct methods, we store the struct type (the pointer aspect is handled in member access)
+                            _variable_types["this"] = struct_cryo_type;
+                            std::cout << "[DEBUG] Stored 'this' parameter for struct '" << struct_name << "' with struct type" << std::endl;
+                        }
+                        
                         ++param_arg_it;
                     }
 
@@ -1097,6 +1107,19 @@ namespace Cryo::Codegen
                         {
                             _context_manager.get_builder().CreateStore(&*arg_it, this_alloca);
                             _value_context->set_value("this", this_alloca, this_alloca, class_ptr_type);
+                            
+                            // Store the Cryo type for 'this' parameter - create a pointer type to the class
+                            if (!class_name.empty()) {
+                                // Find the class type from our type context
+                                auto class_type_it = _types.find(class_name);
+                                if (class_type_it != _types.end()) {
+                                    // Create a pointer type for the class
+                                    std::cout << "[DEBUG] Creating pointer type for 'this' parameter of class: " << class_name << std::endl;
+                                    // We need to create a pointer type for 'this' - for now, we'll use a simple approach
+                                    _variable_types["this"] = nullptr; // We'll handle this in the member access code
+                                }
+                            }
+                            
                             std::cout << "[CodegenVisitor] 'this' parameter set up successfully for class method" << std::endl;
                         }
                         else
@@ -1122,6 +1145,10 @@ namespace Cryo::Codegen
                                 {
                                     _context_manager.get_builder().CreateStore(&*arg_it, param_alloca);
                                     _value_context->set_value(param_name, param_alloca, param_alloca, param_type);
+                                    
+                                    // Store the Cryo type for member access resolution
+                                    _variable_types[param_name] = cryo_param_type;
+                                    std::cout << "[DEBUG] Stored parameter '" << param_name << "' with type: " << (cryo_param_type ? cryo_param_type->to_string() : "null") << std::endl;
                                 }
                             }
                             ++arg_it;
@@ -1425,7 +1452,7 @@ namespace Cryo::Codegen
                 cryo_target_type = _symbol_table.get_type_context()->get_f64_type();
             else if (target_type_name == "float")
                 cryo_target_type = _symbol_table.get_type_context()->get_default_float_type();
-            else if (target_type_name == "bool")
+            else if (target_type_name == "boolean")
                 cryo_target_type = _symbol_table.get_type_context()->get_boolean_type();
             else if (target_type_name == "char")
                 cryo_target_type = _symbol_table.get_type_context()->get_char_type();
@@ -2458,7 +2485,7 @@ namespace Cryo::Codegen
         {
             size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8);
         }
-        else if (type_name == "bool")
+        else if (type_name == "boolean")
         {
             size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
         }
@@ -3375,6 +3402,17 @@ namespace Cryo::Codegen
                 struct_ptr = create_load(object_ptr, allocated_type, "struct_ptr");
                 std::cout << "[CodegenVisitor] Loaded struct pointer for member access" << std::endl;
             }
+        }
+
+        // Debug: Check field count vs requested index
+        unsigned int actual_field_count = struct_type->getNumContainedTypes();
+        std::cout << "[CodegenVisitor] About to access field index " << field_index 
+                  << " in struct with " << actual_field_count << " fields" << std::endl;
+        
+        if (field_index >= actual_field_count) {
+            std::cout << "[ERROR] Field index " << field_index << " is out of range for struct with " 
+                      << actual_field_count << " fields!" << std::endl;
+            return;
         }
 
         // Create GEP instruction to access the field
@@ -4402,7 +4440,7 @@ namespace Cryo::Codegen
                 cryo_param_type = _symbol_table.get_type_context()->get_f64_type();
             else if (type_name == "float")
                 cryo_param_type = _symbol_table.get_type_context()->get_default_float_type();
-            else if (type_name == "bool")
+            else if (type_name == "boolean")
                 cryo_param_type = _symbol_table.get_type_context()->get_boolean_type();
             else if (type_name == "char")
                 cryo_param_type = _symbol_table.get_type_context()->get_char_type();
@@ -4663,8 +4701,35 @@ namespace Cryo::Codegen
                     int field_index = -1;
                     std::string type_name;
 
-                    // First, identify the type name from the LLVM type (same logic as member access)
-                    if (auto *argument = llvm::dyn_cast<llvm::Argument>(object_ptr))
+                    // First, try to use Cryo type information from our variable tracking
+                    if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(left_member_access->object()))
+                    {
+                        std::string var_name = identifier->name();
+                        auto cryo_type_it = _variable_types.find(var_name);
+                        if (cryo_type_it != _variable_types.end() && cryo_type_it->second)
+                        {
+                            Cryo::Type *cryo_type = cryo_type_it->second;
+                            // For pointer types, get the pointed-to type
+                            if (cryo_type->kind() == Cryo::TypeKind::Pointer)
+                            {
+                                Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType*>(cryo_type);
+                                cryo_type = ptr_type->pointee_type().get();
+                            }
+                            
+                            if (cryo_type->kind() == Cryo::TypeKind::Struct)
+                            {
+                                Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType*>(cryo_type);
+                                type_name = struct_cryo_type->name();
+                                struct_type = _type_mapper->map_type(cryo_type);
+                                std::cout << "[DEBUG] Member assignment using Cryo type tracking: var='" << var_name << "' type='" << type_name << "'" << std::endl;
+                            }
+                        }
+                    }
+
+                    // If we couldn't resolve using Cryo types, fall back to LLVM type analysis
+                    if (struct_type == nullptr)
+                    {
+                        if (auto *argument = llvm::dyn_cast<llvm::Argument>(object_ptr))
                     {
                         // For function arguments (like 'this'), object_ptr is already the struct pointer
                         llvm::Type *arg_type = argument->getType();
@@ -4765,6 +4830,7 @@ namespace Cryo::Codegen
                             }
                         }
                     }
+                    } // End of LLVM type analysis fallback
 
                     // Use TypeMapper to get field information
                     if (!type_name.empty())
@@ -5896,10 +5962,13 @@ namespace Cryo::Codegen
                 // This might be a struct method call like p.move(args...)
                 // Check if the object is a variable (struct instance)
                 std::string object_name = object_identifier->name();
+                std::cout << "[DEBUG] Member access with object identifier: '" << object_name << "'" << std::endl;
+                
                 llvm::Value *object_value = _value_context->get_value(object_name);
 
                 if (object_value && object_value->getType()->isPointerTy())
                 {
+                    std::cout << "[DEBUG] Object value found, proceeding with struct method call" << std::endl;
                     // This looks like a struct/class method call
                     // Look up the variable's actual type from our type tracking
                     std::string type_name;
@@ -5914,9 +5983,38 @@ namespace Cryo::Codegen
                         std::cout << "[CodegenVisitor] Using type name '" << type_name
                                   << "' for method lookup" << std::endl;
                     }
+                    else
+                    {
+                        std::cout << "[DEBUG] Type not found in _variable_types for: '" << object_name << "'" << std::endl;
+                        
+                        // For 'this' parameter, try to determine the type from the LLVM type
+                        if (object_name == "this" && object_value)
+                        {
+                            std::cout << "[DEBUG] Attempting to determine 'this' type from LLVM type" << std::endl;
+                            
+                            // Try to get the class name from the pointer type
+                            if (object_value->getType()->isPointerTy())
+                            {
+                                // In LLVM 20, we don't have getElementType() for pointers
+                                // Instead, search our type registry by matching pointer types
+                                for (const auto &[class_name, llvm_type] : _types)
+                                {
+                                    llvm::Type *ptr_type = llvm::PointerType::getUnqual(llvm_type);
+                                    if (ptr_type == object_value->getType())
+                                    {
+                                        type_name = class_name;
+                                        std::cout << "[DEBUG] Found 'this' type from LLVM type: '" << type_name << "'" << std::endl;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     if (!type_name.empty())
                     {
+                        std::cout << "[DEBUG] About to build method name with type: '" << type_name << "', member: '" << member_access->member() << "'" << std::endl;
+                        
                         // Look up the method function - include namespace context to match how methods are stored
                         std::string method_name;
                         if (!_namespace_context.empty())
@@ -5928,6 +6026,7 @@ namespace Cryo::Codegen
                             method_name = type_name + "::" + member_access->member();
                         }
 
+                        std::cout << "[DEBUG] Built method name: '" << method_name << "'" << std::endl;
                         auto method_it = _functions.find(method_name);
 
                         // If not found and this is a generic type, try different lookup strategies
@@ -6016,6 +6115,14 @@ namespace Cryo::Codegen
                                 resolved_function_name = function_name; // Update resolved name
                             }
                         }
+                    }
+                }
+                else
+                {
+                    std::cout << "[DEBUG] Object value not found or not a pointer, object_name: '" << object_name << "'" << std::endl;
+                    std::cout << "[DEBUG] object_value = " << (object_value ? "not null" : "null") << std::endl;
+                    if (object_value) {
+                        std::cout << "[DEBUG] object_value type is pointer: " << (object_value->getType()->isPointerTy() ? "yes" : "no") << std::endl;
                     }
                 }
             }
@@ -6775,11 +6882,17 @@ namespace Cryo::Codegen
     std::string Cryo::Codegen::CodegenVisitor::extract_function_name_from_member_access(Cryo::MemberAccessNode *node)
     {
         if (!node)
+        {
+            std::cout << "[DEBUG] extract_function_name_from_member_access: node is null" << std::endl;
             return "";
+        }
 
+        std::string member_name = node->member();
+        std::cout << "[DEBUG] extract_function_name_from_member_access: member name = '" << member_name << "'" << std::endl;
+        
         // For Std::Runtime::print_int, we want "print_int"
         // This is a simplified extraction - just get the final member name
-        return node->member();
+        return member_name;
     }
 
     std::string Cryo::Codegen::CodegenVisitor::map_cryo_to_c_function(const std::string &cryo_name)
@@ -8243,7 +8356,7 @@ namespace Cryo::Codegen
                         arg_type = _symbol_table.get_type_context()->get_f64_type();
                     else if (type_arg == "float")
                         arg_type = _symbol_table.get_type_context()->get_default_float_type();
-                    else if (type_arg == "bool")
+                    else if (type_arg == "boolean")
                         arg_type = _symbol_table.get_type_context()->get_boolean_type();
                     else if (type_arg == "char")
                         arg_type = _symbol_table.get_type_context()->get_char_type();
@@ -8623,7 +8736,7 @@ namespace Cryo::Codegen
             cryo_param_type = _symbol_table.get_type_context()->get_f64_type();
         else if (type_args[0] == "float")
             cryo_param_type = _symbol_table.get_type_context()->get_default_float_type();
-        else if (type_args[0] == "bool")
+        else if (type_args[0] == "boolean")
             cryo_param_type = _symbol_table.get_type_context()->get_boolean_type();
         else if (type_args[0] == "char")
             cryo_param_type = _symbol_table.get_type_context()->get_char_type();
@@ -8920,7 +9033,7 @@ namespace Cryo::Codegen
             "i8", "i16", "i32", "i64", "int",
             "u8", "u16", "u32", "u64", "uint",
             "f32", "f64", "float", "double",
-            "bool", "boolean", "char", "string", "void",
+            "boolean", "char", "string", "void",
             "ptr", "const_ptr"};
 
         return primitive_types.find(type_name) != primitive_types.end();
@@ -8988,7 +9101,7 @@ namespace Cryo::Codegen
             cryo_target_type = _symbol_table.get_type_context()->get_f64_type();
         else if (target_type == "float")
             cryo_target_type = _symbol_table.get_type_context()->get_default_float_type();
-        else if (target_type == "bool")
+        else if (target_type == "boolean")
             cryo_target_type = _symbol_table.get_type_context()->get_boolean_type();
         else if (target_type == "char")
             cryo_target_type = _symbol_table.get_type_context()->get_char_type();
@@ -9083,7 +9196,7 @@ namespace Cryo::Codegen
         {
             param_type = _type_mapper->get_float_type(64);
         }
-        else if (type_arg == "bool")
+        else if (type_arg == "boolean")
         {
             param_type = _type_mapper->get_boolean_type();
         }

@@ -868,10 +868,21 @@ namespace Cryo
                 std::string type_args_str = clean_type_string.substr(open_bracket + 1,
                                                                      close_bracket - open_bracket - 1);
 
+                // Trim whitespace from base_type and type_args_str
+                base_type.erase(0, base_type.find_first_not_of(" \t"));
+                base_type.erase(base_type.find_last_not_of(" \t") + 1);
+                type_args_str.erase(0, type_args_str.find_first_not_of(" \t"));
+                type_args_str.erase(type_args_str.find_last_not_of(" \t") + 1);
+
                 std::cout << "[DEBUG] TypeChecker: base_type='" << base_type << "', type_args='" << type_args_str << "'" << std::endl;
 
                 // Check if base_type is a type alias first
+                std::cout << "[DEBUG] TypeChecker: Looking for type alias '" << base_type << "' in symbol table..." << std::endl;
                 TypedSymbol *alias_symbol = _symbol_table->lookup_symbol(base_type);
+                std::cout << "[DEBUG] TypeChecker: Symbol lookup result: " << (alias_symbol ? "found" : "not found") << std::endl;
+                if (alias_symbol && alias_symbol->type) {
+                    std::cout << "[DEBUG] TypeChecker: Symbol type kind: " << static_cast<int>(alias_symbol->type->kind()) << std::endl;
+                }
                 if (alias_symbol && alias_symbol->type && alias_symbol->type->kind() == TypeKind::TypeAlias)
                 {
                     std::cout << "[DEBUG] TypeChecker: Found type alias '" << base_type << "', expanding..." << std::endl;
@@ -934,7 +945,7 @@ namespace Cryo
         // Try primitive types
         if (type_string == "void")
             return _type_context.get_void_type();
-        if (type_string == "bool")
+        if (type_string == "boolean")
             return _type_context.get_boolean_type();
         if (type_string == "char")
             return _type_context.get_char_type();
@@ -992,13 +1003,17 @@ namespace Cryo
         if (generic_type)
             return generic_type;
 
-        // Try TypeContext's comprehensive type parsing as fallback
-        std::cout << "[DEBUG] TypeChecker: Not found in main symbols, checking TypeContext parsing..." << std::endl;
-        Type *parsed_type = _type_context.parse_type_from_string(type_string);
+        // Try TypeContext's token-based type parsing as fallback
+        std::cout << "[DEBUG] TypeChecker: Not found in main symbols, checking TypeContext token-based parsing..." << std::endl;
+        
+        // Create a lexer from the type string for token-based parsing
+        Lexer type_lexer(type_string);
+        
+        Type *parsed_type = _type_context.parse_type_from_tokens(type_lexer);
         if (parsed_type && parsed_type->kind() != TypeKind::Unknown)
         {
             std::cout << "[DEBUG] TypeChecker: Successfully parsed '" << type_string 
-                      << "' via TypeContext (fallback string parsing)" << std::endl;
+                      << "' via TypeContext (token-based parsing)" << std::endl;
             return parsed_type;
         }
 
@@ -2256,7 +2271,7 @@ namespace Cryo
             node.set_type("u64");
             return;
         }
-        else if (type_name == "bool")
+        else if (type_name == "boolean")
         {
             node.set_type("u64");
             return;
@@ -2409,7 +2424,7 @@ namespace Cryo
                                   lookup_type == "uint" || lookup_type == "u8" || lookup_type == "u16" ||
                                   lookup_type == "u32" || lookup_type == "u64" || lookup_type == "float" ||
                                   lookup_type == "f32" || lookup_type == "f64" || lookup_type == "double" ||
-                                  lookup_type == "boolean" || lookup_type == "bool" || lookup_type == "char" ||
+                                  lookup_type == "boolean" || lookup_type == "char" ||
                                   lookup_type == "void");
 
         // Check if this is a generic type (contains '<' and '>')
@@ -3119,6 +3134,26 @@ namespace Cryo
             return;
         }
 
+        // Collect generic parameter names
+        std::vector<std::string> generic_param_names;
+        for (const auto &generic_param : node.generic_parameters())
+        {
+            if (generic_param)
+            {
+                generic_param_names.push_back(generic_param->name());
+            }
+        }
+
+        // Track if we entered a generic context
+        bool entered_generic_context = false;
+
+        // Enter generic context if this is a generic trait
+        if (!generic_param_names.empty())
+        {
+            enter_generic_context(trait_name, generic_param_names, node.location());
+            entered_generic_context = true;
+        }
+
         // Register trait type in symbol table
         Type *trait_type = _type_context.get_trait_type(trait_name);
         _symbol_table->declare_symbol(trait_name, trait_type, node.location(), &node);
@@ -3161,6 +3196,12 @@ namespace Cryo
 
         // Exit trait scope
         exit_scope();
+
+        // Exit generic context if we entered one
+        if (entered_generic_context)
+        {
+            exit_generic_context();
+        }
 
         // TraitDeclarationNode doesn't have set_type method, so we don't call it
     }
@@ -3283,6 +3324,16 @@ namespace Cryo
             }
         }
 
+        // Track if we entered a generic context
+        bool entered_generic_context = false;
+
+        // Enter generic context if this is a generic enum
+        if (!generic_param_names.empty())
+        {
+            enter_generic_context(enum_name, generic_param_names, node.location());
+            entered_generic_context = true;
+        }
+
         // Collect variant information
         std::vector<std::string> variant_names;
         bool is_simple_enum = node.is_simple_enum();
@@ -3351,6 +3402,12 @@ namespace Cryo
             }
         }
 
+        // Exit generic context if we entered one
+        if (entered_generic_context)
+        {
+            exit_generic_context();
+        }
+
         // EnumDeclarationNode is a DeclarationNode, not ExpressionNode, so no set_type call needed
     }
 
@@ -3409,7 +3466,7 @@ namespace Cryo
                 base_type_name == "uint" || base_type_name == "u8" || base_type_name == "u16" ||
                 base_type_name == "u32" || base_type_name == "u64" || base_type_name == "float" ||
                 base_type_name == "f32" || base_type_name == "f64" || base_type_name == "double" ||
-                base_type_name == "boolean" || base_type_name == "bool" || base_type_name == "char" ||
+                base_type_name == "boolean" || base_type_name == "char" ||
                 base_type_name == "void")
             {
                 is_primitive_type = true;
@@ -3507,9 +3564,15 @@ namespace Cryo
             return;
         }
 
-        // Get field type from type annotation
-        std::string field_type_str = node.field_type();
-        Type *field_type = lookup_type_by_name(field_type_str);
+        // Get field type from resolved type (avoid deprecated string methods)
+        Type *field_type = node.get_resolved_type();
+        std::string field_type_str = field_type ? field_type->name() : "unknown";
+
+        // Debug: Check generic context state when processing struct fields
+        std::cout << "[DEBUG] Processing struct field '" << field_name 
+                  << "' with resolved type: " << field_type_str 
+                  << ", is_in_generic_context: " << is_in_generic_context() 
+                  << ", generic_context_stack_size: " << _generic_context_stack.size() << std::endl;
 
         if (field_type && field_type->kind() != TypeKind::Unknown)
         {
@@ -4056,7 +4119,7 @@ namespace Cryo
     {
         // Handle basic types using TypeContext specific methods
         if (type_name == "void") return _type_context.get_void_type();
-        if (type_name == "bool" || type_name == "boolean") return _type_context.get_boolean_type();
+        if (type_name == "boolean") return _type_context.get_boolean_type();
         if (type_name == "char") return _type_context.get_char_type();
         if (type_name == "string") return _type_context.get_string_type();
 

@@ -275,6 +275,16 @@ namespace Cryo
         }
     }
 
+    Lexer::Lexer(const std::string& content)
+        : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), _token_count(0)
+    {
+        // Set up buffer pointers to reference the spot content
+        _buffer = std::string_view(_spot_content);
+        _buffer_start = _buffer.data();
+        _buffer_end = _buffer_start + _buffer.size();
+        _current = _buffer_start;
+    }
+
     Token Lexer::next_token()
     {
         if (_peeked_token.has_value())

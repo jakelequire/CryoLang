@@ -3811,7 +3811,7 @@ namespace Cryo
             return _context.types().get_f32_type();
         if (type_str == "f64")
             return _context.types().get_f64_type();
-        if (type_str == "bool")
+        if (type_str == "boolean")
             return _context.types().get_boolean_type();
         if (type_str == "char")
             return _context.types().get_char_type();

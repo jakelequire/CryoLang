@@ -25,21 +25,27 @@ namespace Cryo::Codegen
 
     llvm::Type *TypeMapper::map_type(Cryo::Type *cryo_type)
     {
+        std::cout << "[DEBUG] TypeMapper::map_type() - ENTRY" << std::endl;
+        
         if (!cryo_type)
         {
+            std::cout << "[DEBUG] TypeMapper::map_type() - null type passed!" << std::endl;
             report_error("Cannot map null type");
             return nullptr;
         }
 
         // Debug output to track which type is being mapped with protection
         std::string type_name = "UNKNOWN";
+        TypeKind type_kind = TypeKind::Void;
         try {
             type_name = cryo_type->name();
+            type_kind = cryo_type->kind();
             std::cout << "[DEBUG] TypeMapper::map_type() - attempting to map type: " << type_name << std::endl;
+            std::cout << "[DEBUG] TypeMapper::map_type() - type pointer: " << cryo_type << std::endl;
+            std::cout << "[DEBUG] TypeMapper::map_type() - type kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
         } catch (...) {
-            std::cout << "[DEBUG] TypeMapper::map_type() - attempting to map type: <name() failed>" << std::endl;
+            std::cout << "[DEBUG] TypeMapper::map_type() - attempting to map type: <name() or kind() failed>" << std::endl;
         }
-        std::cout << "[DEBUG] TypeMapper::map_type() - type pointer: " << cryo_type << std::endl;
 
         // Check cache first using type pointer as key
         auto cache_it = _cryo_type_cache.find(cryo_type);
@@ -84,11 +90,9 @@ namespace Cryo::Codegen
         }
         
         llvm::Type *llvm_type = nullptr;
-        TypeKind type_kind;
         
-        // Safely get the type kind with protection
+        // Safely get the type kind with protection (already retrieved above)
         try {
-            type_kind = cryo_type->kind();
             std::cout << "[DEBUG] TypeMapper::map_type() - successfully got kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
         } catch (...) {
             std::cout << "[ERROR] TypeMapper::map_type() - pure virtual method crash detected on kind()" << std::endl;
@@ -168,6 +172,7 @@ namespace Cryo::Codegen
             break;
 
         case Cryo::TypeKind::Class:
+            std::cout << "[DEBUG] TypeMapper - mapping Class type: " << cryo_type->name() << std::endl;
             llvm_type = map_class_type(static_cast<Cryo::ClassType *>(cryo_type));
             break;
 
@@ -203,6 +208,19 @@ namespace Cryo::Codegen
             // Variadic parameters are special and shouldn't be mapped to concrete LLVM types
             report_error("Variadic type should not be mapped to concrete LLVM type");
             return nullptr;
+
+        case Cryo::TypeKind::TypeAlias:
+            // Resolve the type alias to its target type and map that instead
+            {
+                auto alias_type = dynamic_cast<Cryo::TypeAlias*>(cryo_type);
+                if (alias_type && alias_type->target_type()) {
+                    std::cout << "[DEBUG] TypeMapper - resolving TypeAlias '" << alias_type->name() << "' to target type: " << alias_type->target_type()->name() << std::endl;
+                    return map_type(alias_type->target_type());
+                } else {
+                    report_error("Invalid TypeAlias encountered in TypeMapper: " + (alias_type ? alias_type->name() : "unknown"));
+                    return nullptr;
+                }
+            }
 
         default:
             report_error("Unsupported type kind: " + std::to_string(static_cast<int>(cryo_type->kind())));
@@ -528,6 +546,17 @@ namespace Cryo::Codegen
         // Check if we already have this struct type in cache
         std::string struct_name = struct_type->name();
         std::cout << "[TypeMapper] map_struct_type called for: " << struct_name << std::endl;
+        
+        // CRITICAL CHECK: Prevent mapping primitive types as structs
+        if (struct_name == "u64" || struct_name == "i64" || struct_name == "u32" || struct_name == "i32" ||
+            struct_name == "u16" || struct_name == "i16" || struct_name == "u8" || struct_name == "i8" ||
+            struct_name == "f32" || struct_name == "f64" || struct_name == "float" || struct_name == "double" ||
+            struct_name == "int" || struct_name == "uint" || struct_name == "boolean" || struct_name == "char" ||
+            struct_name == "string" || struct_name == "void") {
+            std::cout << "[ERROR] TypeMapper::map_struct_type - ATTEMPTED TO MAP PRIMITIVE TYPE AS STRUCT: " << struct_name << std::endl;
+            report_error("Attempted to map primitive type as struct: " + struct_name);
+            return nullptr;
+        }
 
         // First, try to handle as a parameterized type using proper Type* objects
         llvm::Type *parameterized_result = try_handle_as_parameterized_type(struct_type);
@@ -1462,7 +1491,7 @@ namespace Cryo::Codegen
 
         // Handle basic types using TypeContext specific methods
         if (type_name == "void") return _type_context->get_void_type();
-        if (type_name == "bool" || type_name == "boolean") return _type_context->get_boolean_type();
+        if (type_name == "boolean") return _type_context->get_boolean_type();
         if (type_name == "char") return _type_context->get_char_type();
         if (type_name == "string") return _type_context->get_string_type();
 
@@ -1477,7 +1506,12 @@ namespace Cryo::Codegen
         if (type_name == "u8") return _type_context->get_u8_type();
         if (type_name == "u16") return _type_context->get_u16_type();
         if (type_name == "u32") return _type_context->get_u32_type();
-        if (type_name == "u64") return _type_context->get_u64_type();
+        if (type_name == "u64") {
+            std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - returning u64 integer type from get_u64_type()" << std::endl;
+            auto* result = _type_context->get_u64_type();
+            std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - u64 type kind: " << TypeKindToString(result->kind()) << std::endl;
+            return result;
+        }
 
         // Float types
         if (type_name == "f32") return _type_context->get_f32_type();
@@ -1506,6 +1540,7 @@ namespace Cryo::Codegen
         // Try looking up as struct type
         Cryo::Type *struct_type = _type_context->get_struct_type(type_name);
         if (struct_type && struct_type->kind() != Cryo::TypeKind::Unknown) {
+            std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - found struct type for: " << type_name << std::endl;
             return struct_type;
         }
 

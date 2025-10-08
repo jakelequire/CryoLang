@@ -284,7 +284,7 @@ namespace Cryo
 
         // Handle basic types using TypeContext specific methods
         if (type_name == "void") return type_context.get_void_type();
-        if (type_name == "bool" || type_name == "boolean") return type_context.get_boolean_type();
+        if (type_name == "boolean") return type_context.get_boolean_type();
         if (type_name == "char") return type_context.get_char_type();
         if (type_name == "string") return type_context.get_string_type();
 
