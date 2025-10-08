@@ -6,6 +6,13 @@
 #include <optional>
 #include <algorithm>
 
+// Forward declarations
+namespace Cryo { 
+    class Lexer; 
+    enum class TokenKind; 
+    struct Token;
+}
+
 namespace Cryo
 {
     // Forward declarations
@@ -47,12 +54,70 @@ namespace Cryo
         Tuple,
         TypeAlias,
 
+        // Built-in parameterized enum types
+        OptionType,    // Option<T>
+        ResultType,    // Result<T,E>
+        
+        // Built-in parameterized class types
+        ArrayType,     // Array<T>
+        VectorType,    // Vector<T>
+        PtrType,       // ptr<T>
+        ConstPtrType,  // const_ptr<T>
+
         // Special types
         Auto,    // For type inference
         Unknown, // Error recovery
         Never,   // Bottom type (functions that never return)
         Null,    // Null pointer type
         Variadic // Variadic parameter type (...)
+    };
+
+    // Utility function to convert TypeKind to readable string
+    inline const char* TypeKindToString(TypeKind kind) {
+        switch (kind) {
+            case TypeKind::Void: return "Void";
+            case TypeKind::Boolean: return "Boolean";
+            case TypeKind::Integer: return "Integer";
+            case TypeKind::Float: return "Float";
+            case TypeKind::Char: return "Char";
+            case TypeKind::String: return "String";
+            case TypeKind::Array: return "Array";
+            case TypeKind::Pointer: return "Pointer";
+            case TypeKind::Reference: return "Reference";
+            case TypeKind::Function: return "Function";
+            case TypeKind::Struct: return "Struct";
+            case TypeKind::Class: return "Class";
+            case TypeKind::Interface: return "Interface";
+            case TypeKind::Trait: return "Trait";
+            case TypeKind::Enum: return "Enum";
+            case TypeKind::Union: return "Union";
+            case TypeKind::Generic: return "Generic";
+            case TypeKind::Parameterized: return "Parameterized";
+            case TypeKind::Optional: return "Optional";
+            case TypeKind::Tuple: return "Tuple";
+            case TypeKind::TypeAlias: return "TypeAlias";
+            case TypeKind::OptionType: return "OptionType";
+            case TypeKind::ResultType: return "ResultType";
+            case TypeKind::ArrayType: return "ArrayType";
+            case TypeKind::VectorType: return "VectorType";
+            case TypeKind::PtrType: return "PtrType";
+            case TypeKind::ConstPtrType: return "ConstPtrType";
+            case TypeKind::Auto: return "Auto";
+            case TypeKind::Unknown: return "Unknown";
+            case TypeKind::Never: return "Never";
+            case TypeKind::Null: return "Null";
+            case TypeKind::Variadic: return "Variadic";
+            default: return "UnknownTypeKind";
+        }
+    }
+
+    // Pattern identification for parameterized enum types
+    enum class EnumTypePattern
+    {
+        None,           // Not a pattern enum
+        Optional,       // Option<T> pattern
+        Result,         // Result<T,E> pattern
+        Custom          // User-defined pattern enum
     };
 
     // Integer type specifications
@@ -516,42 +581,129 @@ namespace Cryo
         std::string to_string() const override { return name(); }
     };
 
-    // Parameterized type (e.g., Array<T>, Option<T>)
+    // Base class for parameterized types (e.g., Array<T>, Option<T>)
     class ParameterizedType : public Type
     {
-    private:
-        std::string _base_name;                          // "Array", "Option", etc.
+    protected:
+        TypeKind _param_type_kind;                       // TypeKind::OptionType, ArrayType, etc.
         std::vector<std::shared_ptr<Type>> _type_params; // [T, U, ...]
         std::vector<std::string> _param_names;           // ["T", "U", ...] for template params
         mutable std::string _cached_instantiated_name;   // "Array<int>", "Option<string>"
-        std::shared_ptr<EnumType> _base_enum_type;       // If this is an enum parameterization
 
     public:
+        ParameterizedType(TypeKind param_type_kind,
+                          const std::vector<std::string> &param_names)
+            : Type(TypeKind::Parameterized, get_base_name_from_kind(param_type_kind)),
+              _param_type_kind(param_type_kind),
+              _param_names(param_names) {}
+
+        ParameterizedType(TypeKind param_type_kind,
+                          const std::vector<std::shared_ptr<Type>> &type_params)
+            : Type(TypeKind::Parameterized, get_base_name_from_kind(param_type_kind)),
+              _param_type_kind(param_type_kind), _type_params(type_params) {}
+
+        // Legacy constructor for backward compatibility (to be deprecated)
         ParameterizedType(const std::string &base_name,
                           const std::vector<std::string> &param_names)
             : Type(TypeKind::Parameterized, base_name),
-              _base_name(base_name), _param_names(param_names) {}
+              _param_type_kind(get_parameterized_type_kind_from_string(base_name)),
+              _param_names(param_names) {}
 
         ParameterizedType(const std::string &base_name,
                           const std::vector<std::shared_ptr<Type>> &type_params)
             : Type(TypeKind::Parameterized, base_name),
-              _base_name(base_name), _type_params(type_params) {}
+              _param_type_kind(get_parameterized_type_kind_from_string(base_name)),
+              _type_params(type_params) {}
 
-        // Accessors
-        const std::string &base_name() const { return _base_name; }
+        virtual ~ParameterizedType() = default;
+
+        // Core accessors
+        TypeKind param_type_kind() const { return _param_type_kind; }
+        const std::string &base_name() const { return name(); } // Use Type::name() instead of _base_name
         const std::vector<std::shared_ptr<Type>> &type_parameters() const { return _type_params; }
         const std::vector<std::string> &parameter_names() const { return _param_names; }
         size_t parameter_count() const { return std::max(_type_params.size(), _param_names.size()); }
 
-        // Check if this is a template (has parameter names) vs instantiation (has concrete types)
+        // Template vs instantiation checking
         bool is_template() const { return !_param_names.empty() && _type_params.empty(); }
         bool is_instantiation() const { return !_type_params.empty(); }
 
-        // Enum-specific methods
-        void set_base_enum_type(std::shared_ptr<EnumType> enum_type) { _base_enum_type = enum_type; }
-        std::shared_ptr<EnumType> get_base_enum_type() const { return _base_enum_type; }
-        bool is_enum_instantiation() const { return _base_enum_type != nullptr; }
+        // Virtual methods for specialized behavior
+        virtual std::string get_instantiated_name() const;
+        virtual std::shared_ptr<ParameterizedType> instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const
+        {
+            // Default implementation creates base ParameterizedType
+            if (!is_template() || concrete_types.size() != _param_names.size())
+                return nullptr;
+                
+            return std::make_shared<ParameterizedType>(_param_type_kind, concrete_types);
+        }
 
+        // Core parameterized type operations
+        std::string get_mangled_name() const;
+        std::shared_ptr<ParameterizedType> substitute(const std::unordered_map<std::string, std::shared_ptr<Type>> &substitutions) const;
+        bool has_type_parameter(const std::string &param_name) const;
+
+        // Type compatibility - only compatible with other parameterized types with same base
+        bool is_assignable_from(const Type &other) const override;
+        bool is_convertible_to(const Type &other) const override;
+
+        // Default implementations (can be overridden by specializations)
+        size_t size_bytes() const override;
+        size_t alignment() const override;
+        std::string to_string() const override;
+
+        // Static utility methods
+        static std::string get_base_name_from_kind(TypeKind kind)
+        {
+            switch (kind)
+            {
+            case TypeKind::OptionType: return "Option";
+            case TypeKind::ResultType: return "Result";
+            case TypeKind::ArrayType: return "Array";
+            case TypeKind::VectorType: return "Vector";
+            case TypeKind::PtrType: return "ptr";
+            case TypeKind::ConstPtrType: return "const_ptr";
+            default: return "Unknown";
+            }
+        }
+
+        static EnumTypePattern get_enum_pattern_from_kind(TypeKind kind)
+        {
+            switch (kind)
+            {
+            case TypeKind::OptionType: return EnumTypePattern::Optional;
+            case TypeKind::ResultType: return EnumTypePattern::Result;
+            default: return EnumTypePattern::None;
+            }
+        }
+
+        static bool is_enum_pattern_type(TypeKind kind)
+        {
+            return kind == TypeKind::OptionType || kind == TypeKind::ResultType;
+        }
+
+        static TypeKind get_parameterized_type_kind_from_string(const std::string &base_name)
+        {
+            if (base_name == "Option") return TypeKind::OptionType;
+            if (base_name == "Result") return TypeKind::ResultType;
+            if (base_name == "Array") return TypeKind::ArrayType;
+            if (base_name == "Vector") return TypeKind::VectorType;
+            if (base_name == "ptr") return TypeKind::PtrType;
+            if (base_name == "const_ptr") return TypeKind::ConstPtrType;
+            return TypeKind::Parameterized; // Default to generic parameterized type
+        }
+
+    private:
+    };
+
+    // Specialized class for parameterized enums (Option<T>, Result<T,E>)
+    class ParameterizedEnumType : public ParameterizedType
+    {
+    private:
+        std::shared_ptr<EnumType> _base_enum_type;
+
+    public:
         // Layout information for enum instantiations
         struct FieldLayout
         {
@@ -561,41 +713,59 @@ namespace Cryo
             size_t size;
         };
 
-        // Get field layout for instantiated enum types
+        ParameterizedEnumType(TypeKind enum_type_kind,
+                              const std::vector<std::string> &param_names,
+                              std::shared_ptr<EnumType> base_enum)
+            : ParameterizedType(enum_type_kind, param_names), _base_enum_type(base_enum) {}
+
+        ParameterizedEnumType(TypeKind enum_type_kind,
+                              const std::vector<std::shared_ptr<Type>> &type_params,
+                              std::shared_ptr<EnumType> base_enum)
+            : ParameterizedType(enum_type_kind, type_params), _base_enum_type(base_enum) {}
+
+        // Enum-specific accessors
+        std::shared_ptr<EnumType> get_base_enum_type() const { return _base_enum_type; }
+        void set_base_enum_type(std::shared_ptr<EnumType> enum_type) { _base_enum_type = enum_type; }
+
+        // Pattern detection using TypeKind instead of string checks
+        EnumTypePattern get_pattern() const { return get_enum_pattern_from_kind(_param_type_kind); }
+        bool is_optional_like() const { return _param_type_kind == TypeKind::OptionType; }
+        bool is_result_like() const { return _param_type_kind == TypeKind::ResultType; }
+
+        // Enum layout and pattern queries
         std::vector<FieldLayout> get_enum_field_layout() const;
 
-        // Query specific layout patterns
-        bool is_optional_like() const;
-        bool is_result_like() const;
-
-        // Get discriminant information for enum types
+        // Discriminant information
         bool has_discriminant() const;
         size_t get_discriminant_size() const;
         size_t get_discriminant_offset() const { return 0; } // Usually at offset 0
 
-        // Get data field information
+        // Data field information
         std::vector<std::shared_ptr<Type>> get_data_field_types() const;
         size_t get_data_offset() const; // Offset where data starts after discriminant
 
-        // Get instantiated name like "Array<int>"
-        std::string get_instantiated_name() const;
+        // Override for enum-specific instantiation
+        std::shared_ptr<ParameterizedType> instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const override;
 
-        // Create an instantiation of this parameterized type
-        std::shared_ptr<ParameterizedType> instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const;
-
-        // New methods for migration from string-based operations
-        std::string get_mangled_name() const;
-        std::shared_ptr<ParameterizedType> substitute(const std::unordered_map<std::string, std::shared_ptr<Type>> &substitutions) const;
-        bool has_type_parameter(const std::string &param_name) const;
-
-        // Type compatibility - only compatible with other parameterized types with same base
-        bool is_assignable_from(const Type &other) const override;
-        bool is_convertible_to(const Type &other) const override;
-
-        // Size is only known for instantiated types
+        // Override size calculations for enum layouts
         size_t size_bytes() const override;
         size_t alignment() const override;
-        std::string to_string() const override;
+    };
+
+    // Specialized class for parameterized classes/structs (Array<T>, Vector<T>)
+    class ParameterizedClassType : public ParameterizedType
+    {
+    public:
+        ParameterizedClassType(TypeKind class_type_kind,
+                               const std::vector<std::string> &param_names)
+            : ParameterizedType(class_type_kind, param_names) {}
+
+        ParameterizedClassType(TypeKind class_type_kind,
+                               const std::vector<std::shared_ptr<Type>> &type_params)
+            : ParameterizedType(class_type_kind, type_params) {}
+
+        // Override for class-specific instantiation
+        std::shared_ptr<ParameterizedType> instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const override;
     };
 
     // Struct type (user-defined)
@@ -859,9 +1029,9 @@ namespace Cryo
         // Complex type cache
         std::vector<std::unique_ptr<Type>> _complex_types;
 
-        // Parameterized enum registry
+        // Simplified parameterized type registries
         std::unordered_map<std::string, std::shared_ptr<EnumType>> _parameterized_enum_templates;
-        std::unordered_map<std::string, std::unique_ptr<EnumLayout>> _enum_layout_templates;
+        std::unordered_map<std::string, std::unique_ptr<ParameterizedType>> _parameterized_type_templates;
 
         // Global template registry access for AST-based analysis
         TemplateRegistry *_global_template_registry = nullptr;
@@ -916,19 +1086,44 @@ namespace Cryo
         Type *lookup_enum_type(const std::string &name); // Lookup existing enum type only
         Type *get_generic_type(const std::string &name);
 
-        // Parameterized types
+        // Parameterized types - simplified interface
         ParameterizedType *create_parameterized_type(const std::string &base_name,
                                                      const std::vector<std::string> &param_names);
+        
+        // Type kind conversion helpers
+        TypeKind get_parameterized_type_kind(const std::string &base_name);
+        bool is_enum_pattern_type(TypeKind kind);
+        
+        // New TypeKind-based registration
+        void register_parameterized_enum_type(TypeKind enum_type_kind,
+                                              const std::vector<std::string> &type_params,
+                                              std::unique_ptr<EnumLayout> layout_template);
+        
+        // Specialized factory methods for cleaner separation
+        ParameterizedEnumType *create_parameterized_enum_type(const std::string &base_name,
+                                                              const std::vector<std::string> &param_names,
+                                                              std::shared_ptr<EnumType> base_enum);
+                                                              
+        ParameterizedClassType *create_parameterized_class_type(const std::string &base_name,
+                                                                const std::vector<std::string> &param_names);
+
+        // Instantiation methods
         ParameterizedType *instantiate_parameterized_type(const std::string &base_name,
                                                           const std::vector<Type *> &concrete_types);
+                                                          
+        ParameterizedEnumType *instantiate_parameterized_enum(const std::string &base_name,
+                                                              const std::vector<Type *> &concrete_types);
+                                                              
+        ParameterizedClassType *instantiate_parameterized_class(const std::string &base_name,
+                                                                const std::vector<Type *> &concrete_types);
 
         // Create type aliases
         Type *create_type_alias(const std::string &alias_name, Type *target_type);
 
-        // Enum metadata registry
-        void register_parameterized_enum(const std::string &base_name,
-                                         const std::vector<std::string> &type_params,
-                                         std::unique_ptr<EnumLayout> layout_template);
+        // Enum metadata registry - simplified since enum logic is in ParameterizedEnumType
+        void register_parameterized_enum_template(const std::string &base_name,
+                                                  const std::vector<std::string> &type_params,
+                                                  std::shared_ptr<EnumType> base_enum);
 
         std::shared_ptr<EnumType> get_parameterized_enum_template(const std::string &base_name);
 
@@ -936,25 +1131,30 @@ namespace Cryo
         void set_global_template_registry(TemplateRegistry *registry) { _global_template_registry = registry; }
         TemplateRegistry *get_global_template_registry() const { return _global_template_registry; }
 
-        std::shared_ptr<ParameterizedType> instantiate_parameterized_enum(
-            const std::string &base_name,
-            const std::vector<Type *> &concrete_types);
-
-        // Query enum layout patterns without hard-coding names
-        bool is_optional_pattern_enum(const std::string &base_name) const;
-        bool is_result_pattern_enum(const std::string &base_name) const;
-
-        // Get enum field layout generically
-        std::vector<std::shared_ptr<Type>> get_enum_field_types(
-            const std::string &base_name,
-            const std::vector<Type *> &concrete_types) const;
-
         // Type parsing utilities
 
         /// @deprecated Use AST-based parsing instead
         /// Types should be constructed in the frontend and parsed only once into AST nodes.
         [[deprecated("Complete migration to AST-based type parsing")]]
         Type *parse_type_from_string(const std::string &type_str);
+
+        // ===== NEW: Token-based Type Parsing (Primary pathway) =====
+        
+        /// Primary type parsing pathway using lexer tokens (preferred)
+        /// This guarantees correct tokenization and prevents parsing errors
+        Type *parse_type_from_tokens(Lexer &lexer);
+        Type *parse_type_from_token_stream(const std::vector<Token> &tokens, size_t &index);
+        
+        /// Parse primitive types from individual tokens
+        Type *parse_primitive_type_from_token(TokenKind token_kind);
+        
+        /// Parse compound types (pointers, arrays, etc.) from token stream
+        Type *parse_pointer_type_from_tokens(const std::vector<Token> &tokens, size_t &index);
+        Type *parse_array_type_from_tokens(const std::vector<Token> &tokens, size_t &index);
+        Type *parse_function_type_from_tokens(const std::vector<Token> &tokens, size_t &index);
+        Type *parse_generic_type_from_tokens(const std::vector<Token> &tokens, size_t &index);
+
+        // ===== Legacy: String-based Type Parsing (Fallback only) =====
 
         std::string normalize_generic_type_string(const std::string &type_str);
         Type *parse_function_type_from_string(const std::string &type_str);

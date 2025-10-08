@@ -992,7 +992,65 @@ namespace Cryo
         if (generic_type)
             return generic_type;
 
+        // Try TypeContext's comprehensive type parsing as fallback
+        std::cout << "[DEBUG] TypeChecker: Not found in main symbols, checking TypeContext parsing..." << std::endl;
+        Type *parsed_type = _type_context.parse_type_from_string(type_string);
+        if (parsed_type && parsed_type->kind() != TypeKind::Unknown)
+        {
+            std::cout << "[DEBUG] TypeChecker: Successfully parsed '" << type_string 
+                      << "' via TypeContext (fallback string parsing)" << std::endl;
+            return parsed_type;
+        }
+
+        // Check namespaces
+        std::cout << "[DEBUG] TypeChecker: Not found in main symbols, checking namespaces..." << std::endl;
+        
+        // Final fallback - use symbol table to search any namespace
+        TypedSymbol *symbol = _symbol_table->lookup_symbol_in_any_namespace(type_string);
+        if (symbol && symbol->type)
+        {
+            std::cout << "[DEBUG] TypeChecker: Found '" << type_string 
+                      << "' in namespaces" << std::endl;
+            return symbol->type;
+        }
+
         std::cout << "[ERROR] TypeChecker: Failed to resolve type '" << type_string << "' - type not found" << std::endl;
+        return nullptr;
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Token-based Type Resolution (Preferred)
+    //===----------------------------------------------------------------------===//
+
+    Type *TypeChecker::resolve_type_from_tokens(Lexer &lexer)
+    {
+        std::cout << "[DEBUG] TypeChecker: Using token-based type resolution" << std::endl;
+        
+        // Delegate to TypeContext's token-based parsing
+        Type *parsed_type = _type_context.parse_type_from_tokens(lexer);
+        if (parsed_type)
+        {
+            std::cout << "[DEBUG] TypeChecker: Successfully resolved type via tokens" << std::endl;
+            return parsed_type;
+        }
+        
+        std::cout << "[DEBUG] TypeChecker: Token-based parsing failed" << std::endl;
+        return nullptr;
+    }
+
+    Type *TypeChecker::resolve_type_from_token_stream(const std::vector<Token> &tokens, size_t &index)
+    {
+        std::cout << "[DEBUG] TypeChecker: Using token stream type resolution" << std::endl;
+        
+        // Delegate to TypeContext's token stream parsing
+        Type *parsed_type = _type_context.parse_type_from_token_stream(tokens, index);
+        if (parsed_type)
+        {
+            std::cout << "[DEBUG] TypeChecker: Successfully resolved type via token stream" << std::endl;
+            return parsed_type;
+        }
+        
+        std::cout << "[DEBUG] TypeChecker: Token stream parsing failed" << std::endl;
         return nullptr;
     }
 

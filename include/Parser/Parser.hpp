@@ -195,5 +195,8 @@ namespace Cryo
 
         // Type resolution helper
         Type *resolve_type_from_string(const std::string &type_str);
+        
+        // Enhanced type parsing using tokens
+        Type *parse_type_annotation_with_tokens();
     };
 }

@@ -555,7 +555,7 @@ namespace Cryo
             option_layout->tag_size = 1; // bool
             option_layout->alignment = sizeof(void *);
 
-            register_parameterized_enum("Option", {"T"}, std::move(option_layout));
+            register_parameterized_enum_type(TypeKind::OptionType, {"T"}, std::move(option_layout));
         }
 
         // Register Result<T,E> enum
@@ -566,25 +566,42 @@ namespace Cryo
             result_layout->tag_size = 1; // bool
             result_layout->alignment = sizeof(void *);
 
-            register_parameterized_enum("Result", {"T", "E"}, std::move(result_layout));
+            register_parameterized_enum_type(TypeKind::ResultType, {"T", "E"}, std::move(result_layout));
         }
     }
 
     Type *TypeContext::get_integer_type(IntegerKind kind, bool is_signed)
     {
+        std::cout << "[DEBUG] TypeContext::get_integer_type() called with kind=" << static_cast<int>(kind) << " is_signed=" << is_signed << std::endl;
+        
         // Create a hash key for the integer type
         int key = static_cast<int>(kind) * 2 + (is_signed ? 0 : 1);
 
         auto it = _integer_types.find(key);
         if (it != _integer_types.end())
         {
+            std::cout << "[DEBUG] TypeContext::get_integer_type() - found cached type, pointer=" << it->second.get() << std::endl;
             return it->second.get();
         }
 
         // Create new integer type
+        std::cout << "[DEBUG] TypeContext::get_integer_type() - creating new IntegerType" << std::endl;
         auto int_type = std::make_unique<IntegerType>(kind, is_signed);
         Type *result = int_type.get();
+        std::cout << "[DEBUG] TypeContext::get_integer_type() - created IntegerType, pointer=" << result << std::endl;
+        std::cout << "[DEBUG] TypeContext::get_integer_type() - about to test kind() method on new type" << std::endl;
+        
+        // Test the new type before storing it
+        try {
+            auto test_kind = result->kind();
+            std::cout << "[DEBUG] TypeContext::get_integer_type() - kind() test passed, kind=" << TypeKindToString(test_kind) << " (" << static_cast<int>(test_kind) << ")" << std::endl;
+        } catch (...) {
+            std::cout << "[ERROR] TypeContext::get_integer_type() - kind() test failed!" << std::endl;
+            return nullptr;
+        }
+        
         _integer_types[key] = std::move(int_type);
+        std::cout << "[DEBUG] TypeContext::get_integer_type() - stored in cache and returning" << std::endl;
 
         return result;
     }
@@ -710,6 +727,251 @@ namespace Cryo
 
         return result;
     }
+
+    //===----------------------------------------------------------------------===//
+    // Token-based Type Parsing (Primary pathway)
+    //===----------------------------------------------------------------------===//
+
+    Type *TypeContext::parse_primitive_type_from_token(TokenKind token_kind)
+    {
+        switch (token_kind)
+        {
+        case TokenKind::TK_KW_VOID:
+            return get_void_type();
+        case TokenKind::TK_KW_BOOLEAN:
+            return get_boolean_type();
+        case TokenKind::TK_KW_CHAR:
+            return get_char_type();
+        case TokenKind::TK_KW_STRING:
+            return get_string_type();
+        
+        // Integer types
+        case TokenKind::TK_KW_I8:
+            return get_i8_type();
+        case TokenKind::TK_KW_I16:
+            return get_i16_type();
+        case TokenKind::TK_KW_I32:
+            return get_i32_type();
+        case TokenKind::TK_KW_I64:
+            return get_i64_type();
+        case TokenKind::TK_KW_INT:
+            return get_int_type();
+            
+        // Unsigned integer types
+        case TokenKind::TK_KW_UINT8:
+            return get_u8_type();
+        case TokenKind::TK_KW_UINT16:
+            return get_u16_type();
+        case TokenKind::TK_KW_UINT32:
+            return get_u32_type();
+        case TokenKind::TK_KW_UINT64:
+            return get_u64_type();
+        case TokenKind::TK_KW_UINT:
+            return get_integer_type(IntegerKind::UInt, false);
+            
+        // Float types
+        case TokenKind::TK_KW_F32:
+            return get_f32_type();
+        case TokenKind::TK_KW_F64:
+            return get_f64_type();
+        case TokenKind::TK_KW_FLOAT:
+            return get_default_float_type();
+        case TokenKind::TK_KW_DOUBLE:
+            return get_f64_type(); // double is alias for f64
+            
+        // Special types
+        case TokenKind::TK_KW_AUTO:
+            return get_auto_type();
+        case TokenKind::TK_KW_NULL:
+            return get_null_type();
+            
+        default:
+            return nullptr; // Not a primitive type token
+        }
+    }
+
+    Type *TypeContext::parse_pointer_type_from_tokens(const std::vector<Token> &tokens, size_t &index)
+    {
+        // Expect: <base_type> '*'
+        if (index >= tokens.size())
+            return nullptr;
+            
+        // Parse the base type first
+        Type *base_type = parse_type_from_token_stream(tokens, index);
+        if (!base_type)
+            return nullptr;
+            
+        // Check for '*' token
+        if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
+        {
+            ++index; // consume '*'
+            return create_pointer_type(base_type);
+        }
+        
+        // Not a pointer type, return the base type
+        return base_type;
+    }
+
+    Type *TypeContext::parse_array_type_from_tokens(const std::vector<Token> &tokens, size_t &index)
+    {
+        // Expect: <element_type> '[' [size] ']'
+        if (index >= tokens.size())
+            return nullptr;
+            
+        // Parse the element type first  
+        Type *element_type = parse_type_from_token_stream(tokens, index);
+        if (!element_type)
+            return nullptr;
+            
+        // Check for '[' token
+        if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
+        {
+            ++index; // consume '['
+            
+            std::optional<size_t> array_size;
+            
+            // Check for size (optional)
+            if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
+            {
+                // Parse the numeric constant for array size
+                std::string size_str = std::string(tokens[index].text());
+                array_size = std::stoull(size_str);
+                ++index; // consume size
+            }
+            
+            // Expect ']'
+            if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
+            {
+                ++index; // consume ']'
+                return create_array_type(element_type, array_size);
+            }
+            
+            return nullptr; // Malformed array type
+        }
+        
+        // Not an array type, return the element type
+        return element_type;
+    }
+
+    Type *TypeContext::parse_type_from_token_stream(const std::vector<Token> &tokens, size_t &index)
+    {
+        if (index >= tokens.size())
+            return nullptr;
+            
+        const Token &current_token = tokens[index];
+        
+        // Try primitive types first
+        Type *primitive_type = parse_primitive_type_from_token(current_token.kind());
+        if (primitive_type)
+        {
+            ++index; // consume the primitive type token
+            
+            // Handle pointer modifiers directly here
+            Type *result_type = primitive_type;
+            while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
+            {
+                ++index; // consume '*'
+                result_type = create_pointer_type(result_type);
+            }
+            
+            // Handle array modifiers
+            while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
+            {
+                ++index; // consume '['
+                
+                std::optional<size_t> array_size;
+                if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                {
+                    std::string size_str = std::string(tokens[index].text());
+                    array_size = std::stoull(size_str);
+                    ++index; // consume size
+                }
+                
+                // Expect ']'
+                if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
+                {
+                    ++index; // consume ']'
+                    result_type = create_array_type(result_type, array_size);
+                }
+                else
+                {
+                    return nullptr; // Malformed array type
+                }
+            }
+            
+            return result_type;
+        }
+        
+        // Handle identifiers (user-defined types, generic parameters)
+        if (current_token.kind() == TokenKind::TK_IDENTIFIER)
+        {
+            std::string type_name = std::string(current_token.text());
+            ++index; // consume identifier
+            
+            // Check for generic instantiation: Type<T, U>
+            if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_ANGLE)
+            {
+                return parse_generic_type_from_tokens(tokens, index);
+            }
+            
+            // Simple user-defined type
+            // Try struct, class, enum, trait types
+            Type *user_type = get_struct_type(type_name);
+            if (user_type && user_type->kind() != TypeKind::Unknown)
+                return user_type;
+                
+            user_type = get_class_type(type_name);
+            if (user_type && user_type->kind() != TypeKind::Unknown)
+                return user_type;
+                
+            user_type = lookup_enum_type(type_name);
+            if (user_type)
+                return user_type;
+                
+            user_type = get_trait_type(type_name);
+            if (user_type && user_type->kind() != TypeKind::Unknown)
+                return user_type;
+                
+            // Generic parameter
+            return get_generic_type(type_name);
+        }
+        
+        return nullptr; // Unable to parse type
+    }
+
+    Type *TypeContext::parse_type_from_tokens(Lexer &lexer)
+    {
+        // Tokenize the current type expression from lexer
+        std::vector<Token> tokens;
+        Token current_token = lexer.next_token();
+        
+        // Collect tokens until we hit a delimiter or EOF
+        while (!current_token.is_eof() && 
+               current_token.kind() != TokenKind::TK_SEMICOLON &&
+               current_token.kind() != TokenKind::TK_COMMA &&
+               current_token.kind() != TokenKind::TK_R_PAREN &&
+               current_token.kind() != TokenKind::TK_R_BRACE)
+        {
+            tokens.push_back(current_token);
+            current_token = lexer.next_token();
+        }
+        
+        // Parse the collected tokens
+        size_t index = 0;
+        return parse_type_from_token_stream(tokens, index);
+    }
+
+    Type *TypeContext::parse_generic_type_from_tokens(const std::vector<Token> &tokens, size_t &index)
+    {
+        // This is a simplified implementation
+        // For now, fall back to string parsing for complex generic types
+        // TODO: Implement full token-based generic parsing
+        return nullptr;
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Legacy String-based Type Parsing (Deprecated)
+    //===----------------------------------------------------------------------===//
 
     Type *TypeContext::parse_type_from_string(const std::string &type_str)
     {
@@ -1180,40 +1442,76 @@ namespace Cryo
         return type_ptr;
     }
 
+    void TypeContext::register_parameterized_enum_type(TypeKind enum_type_kind,
+                                                       const std::vector<std::string> &type_params,
+                                                       std::unique_ptr<EnumLayout> layout_template)
+    {
+        std::string base_name = ParameterizedType::get_base_name_from_kind(enum_type_kind);
+        
+        // Create enum variants based on layout pattern
+        std::vector<EnumVariant> variants;
+
+        if (layout_template->pattern == EnumLayout::LayoutPattern::OptionalType)
+        {
+            variants.emplace_back("None");
+            variants.emplace_back("Some", std::vector<std::shared_ptr<Type>>{std::make_shared<GenericType>(type_params[0])});
+        }
+        else if (layout_template->pattern == EnumLayout::LayoutPattern::ResultType)
+        {
+            variants.emplace_back("Ok", std::vector<std::shared_ptr<Type>>{std::make_shared<GenericType>(type_params[0])});
+            variants.emplace_back("Err", std::vector<std::shared_ptr<Type>>{std::make_shared<GenericType>(type_params[1])});
+        }
+
+        auto enum_template = std::make_shared<EnumType>(base_name, std::move(variants), type_params, std::move(layout_template));
+        _parameterized_enum_templates[base_name] = enum_template;
+    }
+
+    // Helper function to convert string base names to TypeKind
+    TypeKind TypeContext::get_parameterized_type_kind(const std::string &base_name)
+    {
+        if (base_name == "Option") return TypeKind::OptionType;
+        if (base_name == "Result") return TypeKind::ResultType;
+        if (base_name == "Array") return TypeKind::ArrayType;
+        if (base_name == "Vector") return TypeKind::VectorType;
+        if (base_name == "ptr") return TypeKind::PtrType;
+        if (base_name == "const_ptr") return TypeKind::ConstPtrType;
+        // Default to generic parameterized type
+        return TypeKind::Parameterized;
+    }
+
+    bool TypeContext::is_enum_pattern_type(TypeKind kind)
+    {
+        return kind == TypeKind::OptionType || kind == TypeKind::ResultType;
+    }
+
     ParameterizedType *TypeContext::instantiate_generic(const std::string &base_name,
                                                         const std::vector<Type *> &args)
     {
-        // First check if we have a template for this base name
-        // This would typically be registered when parsing template definitions
-        if (_global_template_registry)
-        {
-            auto *template_info = _global_template_registry->find_template(base_name);
-            if (template_info)
-            {
-                // For now, create a basic parameterized type since TemplateInfo
-                // doesn't have an instantiate method like TypeRegistry
-                std::vector<std::shared_ptr<Type>> shared_args;
-                for (auto *arg : args)
-                {
-                    shared_args.push_back(std::shared_ptr<Type>(arg, [](Type *) {}));
-                }
-
-                auto instantiation = std::make_unique<ParameterizedType>(base_name, shared_args);
-                ParameterizedType *result = instantiation.get();
-                _complex_types.push_back(std::move(instantiation));
-
-                return result;
-            }
-        }
-
-        // Fallback: create a basic parameterized type if no template found
+        // Convert base name to TypeKind
+        TypeKind param_kind = get_parameterized_type_kind(base_name);
+        
+        // Convert args to shared_ptr
         std::vector<std::shared_ptr<Type>> shared_args;
         for (auto *arg : args)
         {
             shared_args.push_back(std::shared_ptr<Type>(arg, [](Type *) {}));
         }
 
-        auto instantiation = std::make_unique<ParameterizedType>(base_name, shared_args);
+        // Create appropriate specialized type based on pattern
+        std::unique_ptr<ParameterizedType> instantiation;
+        
+        if (is_enum_pattern_type(param_kind))
+        {
+            // Create enum-specific type
+            auto enum_template = get_parameterized_enum_template(base_name);
+            instantiation = std::make_unique<ParameterizedEnumType>(param_kind, shared_args, enum_template);
+        }
+        else
+        {
+            // Create class-specific type
+            instantiation = std::make_unique<ParameterizedClassType>(param_kind, shared_args);
+        }
+
         ParameterizedType *result = instantiation.get();
         _complex_types.push_back(std::move(instantiation));
 
@@ -1304,7 +1602,7 @@ namespace Cryo
     }
 
     //===----------------------------------------------------------------------===//
-    // ParameterizedType Implementation
+    // ParameterizedType Base Implementation
     //===----------------------------------------------------------------------===//
 
     std::string ParameterizedType::get_instantiated_name() const
@@ -1314,7 +1612,7 @@ namespace Cryo
             if (is_template())
             {
                 // For templates like Array<T>, return the template name
-                _cached_instantiated_name = _base_name + "<";
+                _cached_instantiated_name = name() + "<";
                 for (size_t i = 0; i < _param_names.size(); ++i)
                 {
                     if (i > 0)
@@ -1326,7 +1624,7 @@ namespace Cryo
             else if (is_instantiation())
             {
                 // For instantiations like Array<int>, return the concrete name
-                _cached_instantiated_name = _base_name + "<";
+                _cached_instantiated_name = name() + "<";
                 for (size_t i = 0; i < _type_params.size(); ++i)
                 {
                     if (i > 0)
@@ -1337,34 +1635,16 @@ namespace Cryo
             }
             else
             {
-                _cached_instantiated_name = _base_name;
+                _cached_instantiated_name = name();
             }
         }
         return _cached_instantiated_name;
     }
 
-    std::shared_ptr<ParameterizedType> ParameterizedType::instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const
-    {
-        if (!is_template())
-        {
-            // Already instantiated or not a template
-            return nullptr;
-        }
-
-        if (concrete_types.size() != _param_names.size())
-        {
-            // Mismatched parameter count
-            return nullptr;
-        }
-
-        auto instantiation = std::make_shared<ParameterizedType>(_base_name, concrete_types);
-        return instantiation;
-    }
-
     bool ParameterizedType::is_assignable_from(const Type &other) const
     {
         // Special case: pointer types (ptr<T>) can accept null
-        if (other.kind() == TypeKind::Null && (_base_name == "ptr" || _base_name == "const_ptr"))
+        if (other.kind() == TypeKind::Null && (_param_type_kind == TypeKind::PtrType || _param_type_kind == TypeKind::ConstPtrType))
         {
             return true;
         }
@@ -1374,8 +1654,8 @@ namespace Cryo
 
         const ParameterizedType &other_param = static_cast<const ParameterizedType &>(other);
 
-        // Must have same base name
-        if (_base_name != other_param._base_name)
+        // Must have same param type kind
+        if (_param_type_kind != other_param._param_type_kind)
             return false;
 
         // If both are instantiations, check type parameter compatibility
@@ -1409,21 +1689,12 @@ namespace Cryo
             return 0;
         }
 
-        // For instantiations, calculate size based on the concrete type structure
-        // This is a simplified implementation - in practice you'd need to know
-        // the actual struct layout for each parameterized type
-        if (_base_name == "Array")
+        // Default implementation for basic parameterized types
+        // Specialized classes will override this for specific behavior
+        if (_param_type_kind == TypeKind::ArrayType)
         {
             // Array<T> has: T* elements, u64 length, u64 capacity
             return sizeof(void *) + sizeof(uint64_t) + sizeof(uint64_t);
-        }
-        else if (_base_name == "Option")
-        {
-            // Option<T> might be implemented as: bool has_value, T value
-            if (!_type_params.empty())
-            {
-                return sizeof(bool) + _type_params[0]->size_bytes();
-            }
         }
 
         // Default fallback
@@ -1456,11 +1727,11 @@ namespace Cryo
         if (is_template())
         {
             // Template itself doesn't have a mangled name, return base name
-            return _base_name;
+            return name();
         }
 
         // For instantiated types, create mangled name like "Array_int" instead of "Array<int>"
-        std::string mangled = _base_name;
+        std::string mangled = name();
         for (const auto &param : _type_params)
         {
             mangled += "_" + param->to_string();
@@ -1514,7 +1785,8 @@ namespace Cryo
 
             if (changed)
             {
-                return std::make_shared<ParameterizedType>(_base_name, new_params);
+                // For now, create base ParameterizedType - this could be improved with virtual factory method
+                return std::make_shared<ParameterizedType>(_param_type_kind, new_params);
             }
             return nullptr; // No substitution needed
         }
@@ -1535,7 +1807,7 @@ namespace Cryo
             }
         }
 
-        return std::make_shared<ParameterizedType>(_base_name, concrete_types);
+        return std::make_shared<ParameterizedType>(_param_type_kind, concrete_types);
     }
 
     bool ParameterizedType::has_type_parameter(const std::string &param_name) const
@@ -1564,6 +1836,173 @@ namespace Cryo
         }
 
         return false;
+    }
+
+    //===----------------------------------------------------------------------===//
+    // ParameterizedEnumType Implementation
+    //===----------------------------------------------------------------------===//
+
+    std::shared_ptr<ParameterizedType> ParameterizedEnumType::instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const
+    {
+        if (!is_template())
+        {
+            // Already instantiated or not a template
+            return nullptr;
+        }
+
+        if (concrete_types.size() != _param_names.size())
+        {
+            // Mismatched parameter count
+            return nullptr;
+        }
+
+        auto instantiation = std::make_shared<ParameterizedEnumType>(_param_type_kind, concrete_types, _base_enum_type);
+        return instantiation;
+    }
+
+    std::vector<ParameterizedEnumType::FieldLayout> ParameterizedEnumType::get_enum_field_layout() const
+    {
+        std::vector<FieldLayout> layout;
+        
+        if (!_base_enum_type)
+        {
+            return layout; // Empty layout if no base enum
+        }
+
+        // Implementation depends on the specific enum variant structure
+        // This is a simplified version - real implementation would analyze enum variants
+        if (is_optional_like())
+        {
+            // Option<T> layout: discriminant (1 byte) + value (T bytes, if Some)
+            layout.push_back({"discriminant", std::make_shared<IntegerType>(IntegerKind::U8, false), 0, 1});
+            
+            if (!_type_params.empty())
+            {
+                size_t value_offset = 1; // After discriminant
+                auto value_type = _type_params[0];
+                layout.push_back({"value", value_type, value_offset, value_type->size_bytes()});
+            }
+        }
+        else if (is_result_like())
+        {
+            // Result<T,E> layout: discriminant + union of T and E
+            layout.push_back({"discriminant", std::make_shared<IntegerType>(IntegerKind::U8, false), 0, 1});
+            
+            if (_type_params.size() >= 2)
+            {
+                size_t value_offset = 1;
+                size_t max_size = std::max(_type_params[0]->size_bytes(), _type_params[1]->size_bytes());
+                layout.push_back({"ok_value", _type_params[0], value_offset, max_size});
+                layout.push_back({"err_value", _type_params[1], value_offset, max_size});
+            }
+        }
+
+        return layout;
+    }
+
+    bool ParameterizedEnumType::has_discriminant() const
+    {
+        return _base_enum_type && _base_enum_type->uses_discriminant_tag();
+    }
+
+    size_t ParameterizedEnumType::get_discriminant_size() const
+    {
+        if (!has_discriminant())
+            return 0;
+        
+        return _base_enum_type->get_discriminant_size();
+    }
+
+    std::vector<std::shared_ptr<Type>> ParameterizedEnumType::get_data_field_types() const
+    {
+        std::vector<std::shared_ptr<Type>> field_types;
+        
+        for (const auto &param : _type_params)
+        {
+            field_types.push_back(param);
+        }
+        
+        return field_types;
+    }
+
+    size_t ParameterizedEnumType::get_data_offset() const
+    {
+        return has_discriminant() ? get_discriminant_size() : 0;
+    }
+
+    size_t ParameterizedEnumType::size_bytes() const
+    {
+        if (is_template())
+        {
+            return 0; // Template has no concrete size
+        }
+
+        size_t total_size = 0;
+        
+        // Add discriminant size
+        if (has_discriminant())
+        {
+            total_size += get_discriminant_size();
+        }
+
+        // Add data size based on enum pattern
+        if (is_optional_like() && !_type_params.empty())
+        {
+            // Option<T>: discriminant + T (when Some)
+            total_size += _type_params[0]->size_bytes();
+        }
+        else if (is_result_like() && _type_params.size() >= 2)
+        {
+            // Result<T,E>: discriminant + max(T, E)
+            total_size += std::max(_type_params[0]->size_bytes(), _type_params[1]->size_bytes());
+        }
+        else
+        {
+            // Generic enum: discriminant + largest variant
+            size_t max_variant_size = 0;
+            for (const auto &param : _type_params)
+            {
+                max_variant_size = std::max(max_variant_size, param->size_bytes());
+            }
+            total_size += max_variant_size;
+        }
+
+        return total_size;
+    }
+
+    size_t ParameterizedEnumType::alignment() const
+    {
+        if (is_template())
+            return 1;
+
+        size_t max_align = get_discriminant_size(); // Discriminant alignment
+        
+        for (const auto &param : _type_params)
+        {
+            max_align = std::max(max_align, param->alignment());
+        }
+        
+        return max_align;
+    }
+
+    //===----------------------------------------------------------------------===//
+    // ParameterizedClassType Implementation
+    //===----------------------------------------------------------------------===//
+
+    std::shared_ptr<ParameterizedType> ParameterizedClassType::instantiate(const std::vector<std::shared_ptr<Type>> &concrete_types) const
+    {
+        if (!is_template())
+        {
+            return nullptr; // Already instantiated or not a template
+        }
+
+        if (concrete_types.size() != _param_names.size())
+        {
+            return nullptr; // Mismatched parameter count
+        }
+
+        auto instantiation = std::make_shared<ParameterizedClassType>(_param_type_kind, concrete_types);
+        return instantiation;
     }
 
     //===----------------------------------------------------------------------===//
@@ -1745,110 +2184,11 @@ namespace Cryo
     }
 
     //===----------------------------------------------------------------------===//
-    // ParameterizedType Enhanced Implementation
-    //===----------------------------------------------------------------------===//
-
-    std::vector<ParameterizedType::FieldLayout> ParameterizedType::get_enum_field_layout() const
-    {
-        std::vector<FieldLayout> fields;
-
-        if (!is_enum_instantiation() || !_base_enum_type)
-        {
-            return fields;
-        }
-
-        const auto *layout = _base_enum_type->get_layout();
-        if (!layout || layout->common_fields.empty())
-        {
-            return fields;
-        }
-
-        size_t current_offset = 0;
-        for (size_t i = 0; i < layout->common_fields.size(); ++i)
-        {
-            FieldLayout field;
-            field.type = layout->common_fields[i];
-            field.size = field.type->size_bytes();
-            field.offset = current_offset;
-
-            if (i == 0 && layout->uses_tag)
-            {
-                field.name = "discriminant";
-            }
-            else
-            {
-                field.name = "field_" + std::to_string(i);
-            }
-
-            fields.push_back(field);
-            current_offset += field.size;
-        }
-
-        return fields;
-    }
-
-    bool ParameterizedType::is_optional_like() const
-    {
-        return is_enum_instantiation() && _base_enum_type && _base_enum_type->is_optional_pattern();
-    }
-
-    bool ParameterizedType::is_result_like() const
-    {
-        return is_enum_instantiation() && _base_enum_type && _base_enum_type->is_result_pattern();
-    }
-
-    bool ParameterizedType::has_discriminant() const
-    {
-        return is_enum_instantiation() && _base_enum_type && _base_enum_type->uses_discriminant_tag();
-    }
-
-    size_t ParameterizedType::get_discriminant_size() const
-    {
-        if (!is_enum_instantiation() || !_base_enum_type)
-        {
-            return 0;
-        }
-        return _base_enum_type->get_discriminant_size();
-    }
-
-    std::vector<std::shared_ptr<Type>> ParameterizedType::get_data_field_types() const
-    {
-        if (!is_enum_instantiation() || !_base_enum_type)
-        {
-            return {};
-        }
-
-        const auto *layout = _base_enum_type->get_layout();
-        if (!layout || layout->common_fields.empty())
-        {
-            return {};
-        }
-
-        // Skip discriminant field if present
-        std::vector<std::shared_ptr<Type>> data_fields;
-        size_t start_idx = layout->uses_tag ? 1 : 0;
-
-        for (size_t i = start_idx; i < layout->common_fields.size(); ++i)
-        {
-            data_fields.push_back(layout->common_fields[i]);
-        }
-
-        return data_fields;
-    }
-
-    size_t ParameterizedType::get_data_offset() const
-    {
-        if (!has_discriminant())
-        {
-            return 0;
-        }
-        return get_discriminant_size();
-    }
-
-    //===----------------------------------------------------------------------===//
     // TypeContext Enhanced Implementation
     //===----------------------------------------------------------------------===//
 
+    // FIXME: Temporarily disabled - method signature changed
+    /*
     void TypeContext::register_parameterized_enum(const std::string &base_name,
                                                   const std::vector<std::string> &type_params,
                                                   std::unique_ptr<EnumLayout> layout_template)
@@ -1870,6 +2210,7 @@ namespace Cryo
         auto enum_template = std::make_shared<EnumType>(base_name, std::move(variants), type_params, std::move(layout_template));
         _parameterized_enum_templates[base_name] = enum_template;
     }
+    */
 
     std::shared_ptr<EnumType> TypeContext::get_parameterized_enum_template(const std::string &base_name)
     {
@@ -1877,6 +2218,8 @@ namespace Cryo
         return (it != _parameterized_enum_templates.end()) ? it->second : nullptr;
     }
 
+    // FIXME: Temporarily disabled - return type changed
+    /*
     std::shared_ptr<ParameterizedType> TypeContext::instantiate_parameterized_enum(
         const std::string &base_name,
         const std::vector<Type *> &concrete_types)
@@ -1901,7 +2244,10 @@ namespace Cryo
 
         return parameterized;
     }
+    */
 
+    // FIXME: Temporarily disabled - method not in header
+    /*
     bool TypeContext::is_optional_pattern_enum(const std::string &base_name) const
     {
         auto it = _parameterized_enum_templates.find(base_name);
@@ -1954,6 +2300,7 @@ namespace Cryo
 
         return instantiated_layout->common_fields;
     }
+    */
 
     Type *TypeContext::lookup_type_alias(const std::string &alias_name)
     {

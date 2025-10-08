@@ -3601,14 +3601,32 @@ namespace Cryo::Codegen
                         // Map parameter types
                         std::vector<llvm::Type *> param_types;
                         bool has_variadic = false;
-                        for (const auto &param_type : func_type->parameter_types())
+                        std::cout << "[DEBUG] Function " << qualified_name << " has " << func_type->parameter_types().size() << " parameters" << std::endl;
+                        
+                        for (size_t i = 0; i < func_type->parameter_types().size(); ++i)
                         {
+                            const auto &param_type = func_type->parameter_types()[i];
+                            std::cout << "[DEBUG] Processing parameter " << i << " for function " << qualified_name << std::endl;
+                            std::cout << "[DEBUG] Parameter type pointer: " << param_type.get() << std::endl;
+                            
+                            if (!param_type)
+                            {
+                                std::cout << "[ERROR] Parameter " << i << " is null!" << std::endl;
+                                goto next_namespace_symbol;
+                            }
+                            
+                            std::cout << "[DEBUG] About to call kind() on parameter " << i << std::endl;
+                            
                             // Skip variadic parameters - they don't have concrete LLVM types
                             if (param_type->kind() == Cryo::TypeKind::Variadic)
                             {
+                                std::cout << "[DEBUG] Parameter " << i << " is variadic, skipping" << std::endl;
                                 has_variadic = true;
                                 continue;
                             }
+
+                            std::cout << "[DEBUG] Parameter " << i << " kind: " << static_cast<int>(param_type->kind()) << std::endl;
+                            std::cout << "[DEBUG] About to call map_type on parameter " << i << std::endl;
 
                             llvm::Type *llvm_param_type = _type_mapper->map_type(param_type.get());
                             if (llvm_param_type)
@@ -3618,9 +3636,11 @@ namespace Cryo::Codegen
                             else
                             {
                                 std::cout << "[WARNING] Failed to map parameter type for function " << qualified_name << ", skipping" << std::endl;
-                                goto next_ns_symbol;
+                                goto next_namespace_symbol;
                             }
                         }
+
+                        std::cout << "[DEBUG] Finished processing all parameters for " << qualified_name << std::endl;
 
                         // Map return type
                         llvm::Type *return_type = _type_mapper->map_type(func_type->return_type().get());
@@ -3653,7 +3673,7 @@ namespace Cryo::Codegen
                         }
                     }
 
-                next_ns_symbol:;
+                next_namespace_symbol:;
                 }
             }
         }

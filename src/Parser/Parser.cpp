@@ -366,7 +366,7 @@ namespace Cryo
 
     Type *Parser::parse_type_annotation()
     {
-        // Handle reference types (&type, &mut type)
+        // Handle reference types (&type, &mut type) - keep existing logic
         if (_current_token.is(TokenKind::TK_AMP))
         {
             advance(); // consume '&'
@@ -385,123 +385,8 @@ namespace Cryo
             return _context.types().create_reference_type(base_type);
         }
 
-        if (!is_type_token())
-        {
-            error("Expected type");
-            return _context.types().get_unknown_type();
-        }
-
-        Token type_token = _current_token;
-        advance();
-
-        Type *base_type;
-
-        // Handle 'This' keyword for trait-scoped types
-        if (type_token.is(TokenKind::TK_KW_THIS_TYPE))
-        {
-            std::string type_name = "This";
-
-            // Check for scope resolution (This::Error)
-            if (_current_token.is(TokenKind::TK_COLONCOLON))
-            {
-                advance(); // consume '::'
-                if (!_current_token.is(TokenKind::TK_IDENTIFIER))
-                {
-                    error("Expected identifier after 'This::'");
-                    return _context.types().get_unknown_type();
-                }
-
-                std::string member_name = std::string(_current_token.text());
-                advance();
-
-                type_name += "::" + member_name;
-            }
-
-            // For now, create as a generic type (trait associated type)
-            base_type = _context.types().get_generic_type(type_name);
-        }
-        // Handle identifiers (could be generic parameters or user-defined types)
-        else if (type_token.is(TokenKind::TK_IDENTIFIER))
-        {
-            std::string type_name = std::string(type_token.text());
-
-            // Check if this is a generic instantiation (e.g., SimpleGeneric<int>)
-            if (_current_token.is(TokenKind::TK_L_ANGLE))
-            {
-                // Parse generic type instantiation
-                advance(); // consume '<'
-
-                std::vector<Type *> type_args;
-
-                // Parse type arguments
-                do
-                {
-                    Type *arg_type = parse_type_annotation();
-                    type_args.push_back(arg_type);
-
-                    if (_current_token.is(TokenKind::TK_COMMA))
-                    {
-                        advance(); // consume ','
-                    }
-                    else
-                    {
-                        break;
-                    }
-                } while (true);
-
-                consume_right_angle(); // Use special handler for nested generics
-
-                // For now, create an instantiated generic type name
-                // TODO: In a more complete implementation, we would create proper instantiated types
-                std::string instantiated_name = type_name + "<";
-                for (size_t i = 0; i < type_args.size(); ++i)
-                {
-                    if (i > 0)
-                        instantiated_name += ",";
-                    instantiated_name += type_args[i]->to_string();
-                }
-                instantiated_name += ">";
-
-                // Create or get the instantiated type
-                base_type = _context.types().get_struct_type(instantiated_name);
-            }
-            else
-            {
-                // Try to resolve as a struct/class type first
-                Type *struct_type = _context.types().get_struct_type(type_name);
-                if (struct_type && struct_type->kind() != TypeKind::Unknown)
-                {
-                    base_type = struct_type;
-                }
-                else
-                {
-                    // Could be a generic parameter - create/get generic type
-                    base_type = _context.types().get_generic_type(type_name);
-                }
-            }
-        }
-        else
-        {
-            // Get base type from token kind for built-in types
-            base_type = _context.types().resolve_type_from_token_kind(static_cast<int>(type_token.kind()));
-        }
-
-        // Handle array types (e.g., i32[], str[][])
-        while (_current_token.is(TokenKind::TK_L_SQUARE))
-        {
-            consume(TokenKind::TK_L_SQUARE, "Expected '['");
-            consume(TokenKind::TK_R_SQUARE, "Expected ']'");
-            base_type = _context.types().create_array_type(base_type);
-        }
-
-        // Handle pointer types (type *)
-        while (_current_token.is(TokenKind::TK_STAR))
-        {
-            advance(); // consume '*'
-            base_type = _context.types().create_pointer_type(base_type);
-        }
-
-        return base_type;
+        // Use the new comprehensive token-based parsing system
+        return parse_type_annotation_with_tokens();
     }
 
     // Namespace parsing
@@ -2909,17 +2794,14 @@ namespace Cryo
                     consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
                     // Parse return type
-                    std::string return_type_str = "void";
+                    Type *return_type = _context.types().get_void_type(); // Default to void
                     if (_current_token.is(TokenKind::TK_ARROW))
                     {
                         advance(); // consume '->'
-                        return_type_str = parse_type();
+                        return_type = parse_type_annotation();
                     }
 
                     consume(TokenKind::TK_SEMICOLON, "Expected ';' after trait method signature");
-
-                    // Resolve return type string to Type* object
-                    Type *return_type = resolve_type_from_string(return_type_str);
 
                     // Create a function declaration (trait methods are just signatures)
                     auto method_decl = _builder.create_function_declaration(
@@ -3404,8 +3286,7 @@ namespace Cryo
 
         consume(TokenKind::TK_COLON, "Expected ':' after field name");
 
-        std::string field_type_str = parse_type();
-        Type *field_type = resolve_type_from_string(field_type_str);
+        Type *field_type = parse_type_annotation();
 
         auto field = _builder.create_struct_field(start_loc, field_name, field_type, visibility);
 
@@ -3508,19 +3389,16 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type (optional for constructors)
-        std::string return_type_str = "void";
+        Type *return_type = _context.types().get_void_type(); // Default to void
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
-            return_type_str = parse_type();
+            return_type = parse_type_annotation();
         }
         else if (is_constructor)
         {
-            return_type_str = "void"; // Constructors don't have explicit return types
+            return_type = _context.types().get_void_type(); // Constructors don't have explicit return types
         }
-
-        // Resolve the return type string to a Type* object
-        Type *return_type = resolve_type_from_string(return_type_str);
 
         auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static);
 
@@ -3849,6 +3727,71 @@ namespace Cryo
                 node->set_documentation(doc_text);
             }
         }
+    }
+
+    Type *Parser::parse_type_annotation_with_tokens()
+    {
+        // Create a string stream to build type tokens
+        std::string type_string = "";
+        std::vector<Token> collected_tokens;
+        
+        // Collect tokens that form the complete type expression
+        // This handles complex types like: const int**, Option<Result<T, E>>, etc.
+        while (is_type_token() || 
+               _current_token.is(TokenKind::TK_L_ANGLE) ||
+               _current_token.is(TokenKind::TK_R_ANGLE) ||
+               _current_token.is(TokenKind::TK_L_SQUARE) ||
+               _current_token.is(TokenKind::TK_R_SQUARE) ||
+               _current_token.is(TokenKind::TK_STAR) ||
+               _current_token.is(TokenKind::TK_AMP) ||
+               _current_token.is(TokenKind::TK_COMMA) ||
+               _current_token.is(TokenKind::TK_COLONCOLON) ||
+               _current_token.is(TokenKind::TK_KW_CONST) ||
+               _current_token.is(TokenKind::TK_KW_MUT) ||
+               _current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            collected_tokens.push_back(_current_token);
+            type_string += std::string(_current_token.text()) + " ";
+            advance();
+            
+            // Break on certain terminators
+            if (_current_token.is(TokenKind::TK_SEMICOLON) ||
+                _current_token.is(TokenKind::TK_COMMA) ||
+                _current_token.is(TokenKind::TK_R_PAREN) ||
+                _current_token.is(TokenKind::TK_R_BRACE) ||
+                _current_token.is(TokenKind::TK_EQUAL) ||
+                _current_token.is_eof())
+            {
+                break;
+            }
+        }
+        
+        if (collected_tokens.empty())
+        {
+            error("Expected type annotation");
+            return _context.types().get_unknown_type();
+        }
+        
+        // Use the token-based parsing system
+        size_t index = 0;
+        Type *parsed_type = _context.types().parse_type_from_token_stream(collected_tokens, index);
+        
+        if (!parsed_type)
+        {
+            // Fallback to string-based parsing if token parsing fails
+            std::cout << "[DEBUG] Parser: Token-based parsing failed for '" << type_string 
+                      << "' (collected " << collected_tokens.size() << " tokens), falling back to string parsing" << std::endl;
+            if (!collected_tokens.empty()) {
+                std::cout << "[DEBUG] First token: " << static_cast<int>(collected_tokens[0].kind()) 
+                          << " (" << std::string(collected_tokens[0].text()) << ")" << std::endl;
+            }
+            
+            // Trim whitespace
+            type_string.erase(type_string.find_last_not_of(" \t\n\r\f\v") + 1);
+            parsed_type = resolve_type_from_string(type_string);
+        }
+        
+        return parsed_type ? parsed_type : _context.types().get_unknown_type();
     }
 
     Type *Parser::resolve_type_from_string(const std::string &type_str)

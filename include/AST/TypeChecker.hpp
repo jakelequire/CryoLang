@@ -230,6 +230,10 @@ namespace Cryo
 
         // Enhanced type resolution that considers generic context
         Type *resolve_type_with_generic_context(const std::string &type_string);
+        
+        // NEW: Token-based type resolution (preferred)
+        Type *resolve_type_from_tokens(Lexer &lexer);
+        Type *resolve_type_from_token_stream(const std::vector<Token> &tokens, size_t &index);
 
         // Generic instantiation tracking methods
         void track_instantiation(const std::string &base_name,
