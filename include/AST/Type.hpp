@@ -950,8 +950,13 @@ namespace Cryo
             const std::vector<Type *> &concrete_types) const;
 
         // Type parsing utilities
-        std::string normalize_generic_type_string(const std::string &type_str);
+
+        /// @deprecated Use AST-based parsing instead
+        /// Types should be constructed in the frontend and parsed only once into AST nodes.
+        [[deprecated("Complete migration to AST-based type parsing")]]
         Type *parse_type_from_string(const std::string &type_str);
+
+        std::string normalize_generic_type_string(const std::string &type_str);
         Type *parse_function_type_from_string(const std::string &type_str);
         Type *resolve_type_from_token_kind(int token_kind); // From your TokenKind enum
 

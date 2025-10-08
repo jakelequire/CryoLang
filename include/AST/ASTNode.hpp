@@ -119,14 +119,30 @@ namespace Cryo
     class ExpressionNode : public ASTNode
     {
     private:
-        std::optional<std::string> _resolved_type; // For future type system
+        // Core type system - NO STRING OPERATIONS
+        Cryo::Type *_resolved_type = nullptr; // Primary type storage
 
     public:
         ExpressionNode(NodeKind kind, SourceLocation loc) : ASTNode(kind, loc) {}
 
-        // Type system support
-        void set_type(const std::string &type) { _resolved_type = type; }
-        std::optional<std::string> type() const { return _resolved_type; }
+        // Core type system access - PREFERRED
+        Cryo::Type *get_resolved_type() const { return _resolved_type; }
+        void set_resolved_type(Cryo::Type *type) { _resolved_type = type; }
+        bool has_resolved_type() const { return _resolved_type != nullptr; }
+
+        // DEPRECATED: String-based type operations - REMOVE THESE
+        [[deprecated("Use set_resolved_type() instead - string operations being eliminated")]]
+        void set_type(const std::string &type) { 
+            // This should not be used - parser must resolve to Type* directly
+        }
+        
+        [[deprecated("Use get_resolved_type() instead - string operations being eliminated")]]
+        std::optional<std::string> type() const { 
+            if (_resolved_type) {
+                return _resolved_type->to_string();
+            }
+            return std::nullopt;
+        }
 
         void print(std::ostream &os, int indent = 0) const override
         {
@@ -1173,20 +1189,38 @@ namespace Cryo
     {
     private:
         std::string _alias_name;
-        std::string _target_type;
         std::vector<std::string> _generic_params; // Generic parameters like <T, U>
+        
+        // Core type system - NO STRING OPERATIONS
+        Cryo::Type *_resolved_target_type = nullptr; // Primary target type storage
 
     public:
-        TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name, std::string target_type, std::vector<std::string> generic_params = {})
+        TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name, 
+                                Cryo::Type *target_type = nullptr, 
+                                std::vector<std::string> generic_params = {})
             : DeclarationNode(NodeKind::TypeAliasDeclaration, loc),
-              _alias_name(std::move(alias_name)), _target_type(std::move(target_type)), _generic_params(std::move(generic_params)) {}
+              _alias_name(std::move(alias_name)), _resolved_target_type(target_type),
+              _generic_params(std::move(generic_params)) {}
 
         const std::string &alias_name() const { return _alias_name; }
-        const std::string &target_type() const { return _target_type; }
         const std::vector<std::string> &generic_params() const { return _generic_params; }
         bool is_generic() const { return !_generic_params.empty(); }
 
-        void set_type(const std::string &type) { _target_type = type; }
+        // Core type system access - PREFERRED
+        Cryo::Type *get_resolved_target_type() const { return _resolved_target_type; }
+        void set_resolved_target_type(Cryo::Type *type) { _resolved_target_type = type; }
+        bool has_resolved_target_type() const { return _resolved_target_type != nullptr; }
+
+        // DEPRECATED: String-based type operations - REMOVE THESE
+        [[deprecated("Use get_resolved_target_type() instead - string operations being eliminated")]]
+        const std::string target_type() const { 
+            return _resolved_target_type ? _resolved_target_type->to_string() : "unknown";
+        }
+        
+        [[deprecated("Use set_resolved_target_type() instead - string operations being eliminated")]]
+        void set_type(const std::string &type) { 
+            // This should not be used - parser must resolve to Type* directly
+        }
 
         void print(std::ostream &os, int indent = 0) const override
         {
@@ -1202,7 +1236,7 @@ namespace Cryo
                 }
                 os << ">";
             }
-            os << " = " << _target_type << std::endl;
+            os << " = " << (_resolved_target_type ? _resolved_target_type->to_string() : "unknown") << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;

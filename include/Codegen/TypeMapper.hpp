@@ -457,6 +457,13 @@ namespace Cryo::Codegen
          */
         std::pair<std::string, std::vector<std::string>> parse_generic_type_string(const std::string &type_name);
 
+        /**
+         * @brief Lookup type by name using TypeContext (replacement for parse_type_from_string)
+         * @param type_name String name of the type to look up
+         * @return Type* if found, nullptr otherwise
+         */
+        Cryo::Type *lookup_type_by_name(const std::string &type_name);
+
         LLVMContextManager &_context_manager;
         Cryo::TypeContext *_type_context;
 

@@ -335,6 +335,9 @@ namespace Cryo
         Type *infer_binary_expression_type(const BinaryExpressionNode &node);
         Type *resolve_type_from_annotation(const std::string &type_annotation);
 
+        // Type lookup helpers to replace parse_type_from_string
+        Type *lookup_type_by_name(const std::string &type_name);
+
         // Type compatibility checking
         bool check_assignment_compatibility(Type *lhs_type, Type *rhs_type, SourceLocation loc);
         bool check_binary_operation_compatibility(TokenKind op, Type *lhs_type, Type *rhs_type, SourceLocation loc);

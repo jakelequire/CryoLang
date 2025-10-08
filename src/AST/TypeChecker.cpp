@@ -1500,10 +1500,9 @@ namespace Cryo
             // Check return expression type
             node.expression()->accept(*this);
 
-            if (node.expression()->type().has_value())
+            if (node.expression()->has_resolved_type())
             {
-                Type *expr_type = _type_context.parse_type_from_string(
-                    node.expression()->type().value());
+                Type *expr_type = node.expression()->get_resolved_type();
 
                 if (_current_function_return_type &&
                     !check_assignment_compatibility(_current_function_return_type, expr_type, node.location()))
@@ -1532,10 +1531,9 @@ namespace Cryo
         {
             node.condition()->accept(*this);
 
-            if (node.condition()->type().has_value())
+            if (node.condition()->has_resolved_type())
             {
-                Type *cond_type = _type_context.parse_type_from_string(
-                    node.condition()->type().value());
+                Type *cond_type = node.condition()->get_resolved_type();
 
                 if (!is_boolean_context_valid(cond_type))
                 {
@@ -1564,10 +1562,9 @@ namespace Cryo
         {
             node.condition()->accept(*this);
 
-            if (node.condition()->type().has_value())
+            if (node.condition()->has_resolved_type())
             {
-                Type *cond_type = _type_context.parse_type_from_string(
-                    node.condition()->type().value());
+                Type *cond_type = node.condition()->get_resolved_type();
 
                 if (!is_boolean_context_valid(cond_type))
                 {
@@ -1604,10 +1601,9 @@ namespace Cryo
         {
             node.condition()->accept(*this);
 
-            if (node.condition()->type().has_value())
+            if (node.condition()->has_resolved_type())
             {
-                Type *cond_type = _type_context.parse_type_from_string(
-                    node.condition()->type().value());
+                Type *cond_type = node.condition()->get_resolved_type();
 
                 if (!is_boolean_context_valid(cond_type))
                 {
@@ -1760,14 +1756,14 @@ namespace Cryo
             Type *left_type = nullptr;
             Type *right_type = nullptr;
 
-            if (node.left()->type().has_value())
+            if (node.left()->has_resolved_type())
             {
-                left_type = _type_context.parse_type_from_string(node.left()->type().value());
+                left_type = node.left()->get_resolved_type();
             }
 
-            if (node.right()->type().has_value())
+            if (node.right()->has_resolved_type())
             {
-                right_type = _type_context.parse_type_from_string(node.right()->type().value());
+                right_type = node.right()->get_resolved_type();
             }
 
             if (left_type && right_type)
@@ -1878,8 +1874,8 @@ namespace Cryo
         {
             node.operand()->accept(*this);
 
-            Type *operand_type = node.operand()->type().has_value()
-                                     ? _type_context.parse_type_from_string(node.operand()->type().value())
+            Type *operand_type = node.operand()->has_resolved_type()
+                                     ? node.operand()->get_resolved_type()
                                      : nullptr;
 
             if (operand_type)
@@ -1987,9 +1983,9 @@ namespace Cryo
             if (arg)
             {
                 arg->accept(*this);
-                if (arg->type().has_value())
+                if (arg->has_resolved_type())
                 {
-                    Type *arg_type = _type_context.parse_type_from_string(arg->type().value());
+                    Type *arg_type = arg->get_resolved_type();
                     arg_types.push_back(arg_type);
                 }
                 else
@@ -2046,33 +2042,25 @@ namespace Cryo
                 return;
             }
 
-            std::string callee_type_str = node.callee()->type().value();
-
-            // Skip reparsing for function types - the type was already correctly computed
-            // during symbol declaration. Just verify it looks like a function signature.
-            if (callee_type_str.find("->") != std::string::npos || callee_type_str.find("(") == 0)
-            {
-                // This is a function type string - trust it and proceed
-                // For now, we'll assume all well-formed function signatures are callable
-                // TODO: Implement proper return type extraction from signature
-
-                // Extract return type from function signature like "(int, int) -> int"
-                size_t arrow_pos = callee_type_str.find(" -> ");
-                if (arrow_pos != std::string::npos)
-                {
-                    std::string return_type_str = callee_type_str.substr(arrow_pos + 4);
-                    node.set_type(return_type_str);
-                }
-                else
-                {
-                    // Fallback for malformed signatures
-                    node.set_type("unknown");
-                }
+            // Get the callee's resolved type directly
+            Type *callee_type = node.callee()->get_resolved_type();
+            
+            // If callee type is not resolved, fall back to unknown
+            if (!callee_type) {
+                report_error(TypeError::ErrorKind::NonCallableType, node.location(),
+                             "Cannot determine type of expression being called");
+                node.set_type(_type_context.get_unknown_type()->to_string());
                 return;
             }
 
-            // For non-function types, use the original parsing logic
-            Type *callee_type = _type_context.parse_type_from_string(callee_type_str);
+            // Skip reparsing for function types - the type was already correctly computed
+            if (callee_type->kind() == TypeKind::Function)
+            {
+                // This is a function type - extract return type
+                FunctionType *func_type = static_cast<FunctionType *>(callee_type);
+                node.set_type(func_type->return_type()->to_string());
+                return;
+            }
 
             if (callee_type->kind() != TypeKind::Function)
             {
@@ -3156,7 +3144,7 @@ namespace Cryo
             full_signature += ">";
 
             // Create a type alias that shows the generic nature
-            Type *target_type = _type_context.parse_type_from_string(node.target_type());
+            Type *target_type = node.get_resolved_target_type();
             if (!target_type)
             {
                 target_type = _type_context.get_unknown_type();
@@ -3167,10 +3155,10 @@ namespace Cryo
             return;
         }
 
-        std::string target_type_str = node.target_type();
+        Type *target_type = node.get_resolved_target_type();
 
-        // Handle forward declarations (empty target type)
-        if (target_type_str.empty())
+        // Handle forward declarations (null target type)
+        if (!target_type)
         {
             // Forward declaration - create TypeAlias with unknown target for now
             Type *forward_alias = _type_context.create_type_alias(alias_name, _type_context.get_unknown_type());
@@ -3179,8 +3167,6 @@ namespace Cryo
         }
 
         // Visit target type to ensure it's valid
-        Type *target_type = _type_context.parse_type_from_string(target_type_str);
-
         if (target_type && target_type->kind() != TypeKind::Unknown)
         {
             // Create TypeAlias wrapping the target type
@@ -3190,7 +3176,7 @@ namespace Cryo
         else
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Invalid target type for type alias: " + target_type_str);
+                         "Invalid target type for type alias: " + (target_type ? target_type->to_string() : "unknown"));
         }
     }
 
@@ -3292,7 +3278,8 @@ namespace Cryo
                         }
                         else
                         {
-                            Type *param_type = _type_context.parse_type_from_string(type_str);
+                            // Resolve the type string to a Type* object through TypeContext
+                            Type *param_type = lookup_type_by_name(type_str);
                             if (param_type)
                             {
                                 param_types.push_back(param_type);
@@ -3331,7 +3318,7 @@ namespace Cryo
                 }
 
                 // Otherwise, validate as a concrete type
-                Type *type = _type_context.parse_type_from_string(type_str);
+                Type *type = lookup_type_by_name(type_str);
                 if (!type || type->kind() == TypeKind::Unknown)
                 {
                     report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
@@ -3369,7 +3356,7 @@ namespace Cryo
             {
                 is_primitive_type = true;
                 // Create a primitive type using type context
-                target_type = _type_context.parse_type_from_string(base_type_name);
+                target_type = lookup_type_by_name(base_type_name);
             }
             else
             {
@@ -3464,7 +3451,7 @@ namespace Cryo
 
         // Get field type from type annotation
         std::string field_type_str = node.field_type();
-        Type *field_type = _type_context.parse_type_from_string(field_type_str);
+        Type *field_type = lookup_type_by_name(field_type_str);
 
         if (field_type && field_type->kind() != TypeKind::Unknown)
         {
@@ -3722,14 +3709,14 @@ namespace Cryo
         Type *lhs_type = nullptr;
         Type *rhs_type = nullptr;
 
-        if (node.left() && node.left()->type().has_value())
+        if (node.left() && node.left()->has_resolved_type())
         {
-            lhs_type = _type_context.parse_type_from_string(node.left()->type().value());
+            lhs_type = node.left()->get_resolved_type();
         }
 
-        if (node.right() && node.right()->type().has_value())
+        if (node.right() && node.right()->has_resolved_type())
         {
-            rhs_type = _type_context.parse_type_from_string(node.right()->type().value());
+            rhs_type = node.right()->get_resolved_type();
         }
 
         if (!lhs_type || !rhs_type)
@@ -4005,6 +3992,73 @@ namespace Cryo
     {
         TypedSymbol *symbol = _symbol_table->lookup_symbol(name);
         return symbol ? symbol->type : nullptr;
+    }
+
+    Type *TypeChecker::lookup_type_by_name(const std::string &type_name)
+    {
+        // Handle basic types using TypeContext specific methods
+        if (type_name == "void") return _type_context.get_void_type();
+        if (type_name == "bool" || type_name == "boolean") return _type_context.get_boolean_type();
+        if (type_name == "char") return _type_context.get_char_type();
+        if (type_name == "string") return _type_context.get_string_type();
+
+        // Integer types
+        if (type_name == "i8") return _type_context.get_i8_type();
+        if (type_name == "i16") return _type_context.get_i16_type();
+        if (type_name == "i32") return _type_context.get_i32_type();
+        if (type_name == "i64") return _type_context.get_i64_type();
+        if (type_name == "int") return _type_context.get_int_type();
+
+        // Unsigned integer types
+        if (type_name == "u8") return _type_context.get_u8_type();
+        if (type_name == "u16") return _type_context.get_u16_type();
+        if (type_name == "u32") return _type_context.get_u32_type();
+        if (type_name == "u64") return _type_context.get_u64_type();
+
+        // Float types
+        if (type_name == "f32") return _type_context.get_f32_type();
+        if (type_name == "f64") return _type_context.get_f64_type();
+        if (type_name == "float") return _type_context.get_default_float_type();
+        if (type_name == "double") return _type_context.get_f64_type();
+
+        // Check for pointer types (ends with '*')
+        if (type_name.back() == '*') {
+            std::string pointee_type = type_name.substr(0, type_name.length() - 1);
+            Type *pointee = lookup_type_by_name(pointee_type);
+            if (pointee) {
+                return _type_context.create_pointer_type(pointee);
+            }
+        }
+
+        // Check for reference types (ends with '&')
+        if (type_name.back() == '&') {
+            std::string referent_type = type_name.substr(0, type_name.length() - 1);
+            Type *referent = lookup_type_by_name(referent_type);
+            if (referent) {
+                return _type_context.create_reference_type(referent);
+            }
+        }
+
+        // Look up user-defined types (struct, class, enum)
+        Type *user_type = lookup_variable_type(type_name);
+        if (user_type) {
+            return user_type;
+        }
+
+        // Try looking up as enum type
+        Type *enum_type = _type_context.lookup_enum_type(type_name);
+        if (enum_type) {
+            return enum_type;
+        }
+
+        // Try looking up as type alias
+        Type *alias_type = _type_context.lookup_type_alias(type_name);
+        if (alias_type) {
+            return alias_type;
+        }
+
+        // Fall back to unknown type
+        return _type_context.get_unknown_type();
     }
 
     //===----------------------------------------------------------------------===//

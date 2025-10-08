@@ -577,7 +577,7 @@ namespace Cryo::Codegen
                                     // Map field type using TypeContext
                                     if (_type_context)
                                     {
-                                        auto field_cryo_type = _type_context->parse_type_from_string(field_type);
+                                        auto field_cryo_type = lookup_type_by_name(field_type);
                                         if (field_cryo_type)
                                         {
                                             llvm::Type *field_llvm_type = map_type(field_cryo_type);
@@ -669,7 +669,7 @@ namespace Cryo::Codegen
                         arg.erase(arg.find_last_not_of(" \t") + 1);
                         if (!arg.empty())
                         {
-                            Cryo::Type *arg_type = _type_context->parse_type_from_string(arg);
+                            Cryo::Type *arg_type = lookup_type_by_name(arg);
                             if (arg_type)
                             {
                                 type_args.push_back(arg_type);
@@ -1204,7 +1204,7 @@ namespace Cryo::Codegen
         std::vector<Cryo::Type *> type_args;
         for (const auto &type_arg_str : type_arg_strings)
         {
-            Cryo::Type *arg_type = _type_context->parse_type_from_string(type_arg_str);
+            Cryo::Type *arg_type = lookup_type_by_name(type_arg_str);
             if (arg_type)
             {
                 type_args.push_back(arg_type);
@@ -1262,6 +1262,84 @@ namespace Cryo::Codegen
         }
 
         return {base_name, type_args};
+    }
+
+    Cryo::Type *TypeMapper::lookup_type_by_name(const std::string &type_name)
+    {
+        if (!_type_context)
+        {
+            return nullptr;
+        }
+
+        // Handle basic types using TypeContext specific methods
+        if (type_name == "void") return _type_context->get_void_type();
+        if (type_name == "bool" || type_name == "boolean") return _type_context->get_boolean_type();
+        if (type_name == "char") return _type_context->get_char_type();
+        if (type_name == "string") return _type_context->get_string_type();
+
+        // Integer types
+        if (type_name == "i8") return _type_context->get_i8_type();
+        if (type_name == "i16") return _type_context->get_i16_type();
+        if (type_name == "i32") return _type_context->get_i32_type();
+        if (type_name == "i64") return _type_context->get_i64_type();
+        if (type_name == "int") return _type_context->get_int_type();
+
+        // Unsigned integer types
+        if (type_name == "u8") return _type_context->get_u8_type();
+        if (type_name == "u16") return _type_context->get_u16_type();
+        if (type_name == "u32") return _type_context->get_u32_type();
+        if (type_name == "u64") return _type_context->get_u64_type();
+
+        // Float types
+        if (type_name == "f32") return _type_context->get_f32_type();
+        if (type_name == "f64") return _type_context->get_f64_type();
+        if (type_name == "float") return _type_context->get_default_float_type();
+        if (type_name == "double") return _type_context->get_f64_type();
+
+        // Check for pointer types (ends with '*')
+        if (type_name.back() == '*') {
+            std::string pointee_type = type_name.substr(0, type_name.length() - 1);
+            Cryo::Type *pointee = lookup_type_by_name(pointee_type);
+            if (pointee) {
+                return _type_context->create_pointer_type(pointee);
+            }
+        }
+
+        // Check for reference types (ends with '&')
+        if (type_name.back() == '&') {
+            std::string referent_type = type_name.substr(0, type_name.length() - 1);
+            Cryo::Type *referent = lookup_type_by_name(referent_type);
+            if (referent) {
+                return _type_context->create_reference_type(referent);
+            }
+        }
+
+        // Try looking up as struct type
+        Cryo::Type *struct_type = _type_context->get_struct_type(type_name);
+        if (struct_type && struct_type->kind() != Cryo::TypeKind::Unknown) {
+            return struct_type;
+        }
+
+        // Try looking up as class type  
+        Cryo::Type *class_type = _type_context->get_class_type(type_name);
+        if (class_type && class_type->kind() != Cryo::TypeKind::Unknown) {
+            return class_type;
+        }
+
+        // Try looking up as enum type
+        Cryo::Type *enum_type = _type_context->lookup_enum_type(type_name);
+        if (enum_type) {
+            return enum_type;
+        }
+
+        // Try looking up as type alias
+        Cryo::Type *alias_type = _type_context->lookup_type_alias(type_name);
+        if (alias_type) {
+            return alias_type;
+        }
+
+        // Fall back to unknown type
+        return _type_context->get_unknown_type();
     }
 
     //===================================================================
