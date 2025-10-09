@@ -26,7 +26,7 @@ namespace Cryo::Codegen
     llvm::Type *TypeMapper::map_type(Cryo::Type *cryo_type)
     {
         std::cout << "[DEBUG] TypeMapper::map_type() - ENTRY" << std::endl;
-        
+
         if (!cryo_type)
         {
             std::cout << "[DEBUG] TypeMapper::map_type() - null type passed!" << std::endl;
@@ -37,23 +37,29 @@ namespace Cryo::Codegen
         // Debug output to track which type is being mapped with protection
         std::string type_name = "CORRUPTED_TYPE";
         TypeKind type_kind = TypeKind::Void;
-        
+
         // Completely avoid virtual function calls on potentially corrupted Type objects
         std::cout << "[DEBUG] TypeMapper::map_type() - ENTRY" << std::endl;
         std::cout << "[DEBUG] TypeMapper::map_type() - avoiding name() call due to potential corruption" << std::endl;
         std::cout << "[DEBUG] TypeMapper::map_type() - type pointer: " << cryo_type << std::endl;
-        
-        try {
+
+        try
+        {
             std::cout << "[DEBUG] TypeMapper::map_type() - about to call kind() method" << std::endl;
-            
-            if (cryo_type && cryo_type != nullptr) {
+
+            if (cryo_type && cryo_type != nullptr)
+            {
                 type_kind = cryo_type->kind();
                 std::cout << "[DEBUG] TypeMapper::map_type() - successfully got kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
-            } else {
+            }
+            else
+            {
                 std::cout << "[DEBUG] TypeMapper::map_type() - null pointer detected" << std::endl;
                 return nullptr;
             }
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::cout << "[DEBUG] TypeMapper::map_type() - kind() failed, type is corrupted" << std::endl;
             return nullptr;
         }
@@ -67,42 +73,53 @@ namespace Cryo::Codegen
         }
 
         std::cout << "[DEBUG] TypeMapper::map_type() - about to call kind() method" << std::endl;
-        
+
         // Add protective check to prevent pure virtual method crash
-        try {
+        try
+        {
             // Avoid name() call completely due to corruption issues
             std::cout << "[DEBUG] TypeMapper::map_type() - vtable test passed, avoiding name() call" << std::endl;
-            
+
             // Check for empty/invalid names which could indicate corruption
-            if (type_name.empty()) {
+            if (type_name.empty())
+            {
                 std::cout << "[ERROR] TypeMapper::map_type() - detected empty type name, possible corruption" << std::endl;
                 // For empty names that might be int types, try to recover
-                try {
+                try
+                {
                     auto kind_test = cryo_type->kind();
-                    if (kind_test == TypeKind::Integer) {
+                    if (kind_test == TypeKind::Integer)
+                    {
                         std::cout << "[DEBUG] TypeMapper::map_type() - empty name but Integer kind, using default i32" << std::endl;
                         return llvm::Type::getInt32Ty(_context_manager.get_context());
                     }
-                } catch (...) {
+                }
+                catch (...)
+                {
                     std::cout << "[ERROR] TypeMapper::map_type() - cannot determine kind for empty name type" << std::endl;
                     return nullptr;
                 }
             }
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::cout << "[ERROR] TypeMapper::map_type() - corrupted type object detected!" << std::endl;
             report_error("Corrupted type object detected during type mapping");
             return nullptr;
         }
-        
+
         llvm::Type *llvm_type = nullptr;
-        
+
         // Safely get the type kind with protection (already retrieved above)
-        try {
+        try
+        {
             std::cout << "[DEBUG] TypeMapper::map_type() - successfully got kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::cout << "[ERROR] TypeMapper::map_type() - pure virtual method crash detected on kind()" << std::endl;
             std::cout << "[DEBUG] TypeMapper::map_type() - avoiding virtual function calls, falling back to safe defaults" << std::endl;
-            
+
             // Cannot safely call any virtual functions on corrupted type object
             // Fall back to safe default type
             std::cout << "[DEBUG] TypeMapper::map_type() - using safe fallback to i32 type" << std::endl;
@@ -197,11 +214,14 @@ namespace Cryo::Codegen
         case Cryo::TypeKind::TypeAlias:
             // Resolve the type alias to its target type and map that instead
             {
-                auto alias_type = dynamic_cast<Cryo::TypeAlias*>(cryo_type);
-                if (alias_type && alias_type->target_type()) {
+                auto alias_type = dynamic_cast<Cryo::TypeAlias *>(cryo_type);
+                if (alias_type && alias_type->target_type())
+                {
                     std::cout << "[DEBUG] TypeMapper - resolving TypeAlias '" << alias_type->name() << "' to target type: " << alias_type->target_type()->name() << std::endl;
                     return map_type(alias_type->target_type());
-                } else {
+                }
+                else
+                {
                     report_error("Invalid TypeAlias encountered in TypeMapper: " + (alias_type ? alias_type->name() : "unknown"));
                     return nullptr;
                 }
@@ -288,20 +308,22 @@ namespace Cryo::Codegen
         }
 
         std::cout << "[DEBUG] TypeMapper::map_integer_type() - starting, type pointer: " << int_type << std::endl;
-        
+
         // Test vtable validity before calling virtual methods
         // Comprehensive object validation
-        try {
+        try
+        {
             std::cout << "[DEBUG] TypeMapper::map_integer_type() - testing vtable before size_bytes()" << std::endl;
             auto test_kind = int_type->kind();
             std::cout << "[DEBUG] TypeMapper::map_integer_type() - vtable test passed, kind: " << TypeKindToString(test_kind) << std::endl;
-            
+
             // Additional validation - check if this is actually an IntegerType
             std::cout << "[DEBUG] TypeMapper::map_integer_type() - testing integer_kind() method" << std::endl;
             auto int_kind = int_type->integer_kind();
             std::cout << "[DEBUG] TypeMapper::map_integer_type() - integer_kind() test passed, int_kind: " << static_cast<int>(int_kind) << std::endl;
-            
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::cout << "[ERROR] TypeMapper::map_integer_type() - vtable corruption detected!" << std::endl;
             report_error("Corrupted IntegerType object in map_integer_type");
             return nullptr;
@@ -310,88 +332,102 @@ namespace Cryo::Codegen
         // Convert size_bytes to bit width with protection
         size_t byte_size;
         bool is_signed_val;
-        
-        try {
+
+        try
+        {
             std::cout << "[DEBUG] TypeMapper::map_integer_type() - calling size_bytes()" << std::endl;
-            
+
             // Double-check the integer kind value before calling size_bytes
             auto int_kind_check = int_type->integer_kind();
             std::cout << "[DEBUG] TypeMapper::map_integer_type() - final int_kind check: " << static_cast<int>(int_kind_check) << std::endl;
-            
+
             // Special detection for problematic Int type (kind=10) from runtime.cryo
-            if (int_kind_check == Cryo::IntegerKind::Int) {
+            if (int_kind_check == Cryo::IntegerKind::Int)
+            {
                 std::cout << "[DEBUG] TypeMapper::map_integer_type() - detected problematic Int type, using fallback" << std::endl;
-                byte_size = 4;  // Default int size
-                is_signed_val = true;  // int is signed
+                byte_size = 4;        // Default int size
+                is_signed_val = true; // int is signed
                 std::cout << "[DEBUG] TypeMapper::map_integer_type() - using fallback values: size=4, signed=true" << std::endl;
-            } else {
+            }
+            else
+            {
                 // CRITICAL FIX: Protect ALL size_bytes() calls, not just fallback
                 std::cout << "[DEBUG] TypeMapper::map_integer_type() - attempting size_bytes() for kind: " << static_cast<int>(int_kind_check) << std::endl;
-                try {
+                try
+                {
                     byte_size = int_type->size_bytes();
                     std::cout << "[DEBUG] TypeMapper::map_integer_type() - size_bytes() succeeded, size: " << byte_size << std::endl;
-                } catch (...) {
+                }
+                catch (...)
+                {
                     std::cout << "[ERROR] TypeMapper::map_integer_type() - size_bytes() crashed for kind " << static_cast<int>(int_kind_check) << ", using fallback" << std::endl;
                     // Use fallback based on integer kind
-                    switch (int_kind_check) {
-                        case Cryo::IntegerKind::I8:
-                        case Cryo::IntegerKind::U8:
-                            byte_size = 1;
-                            break;
-                        case Cryo::IntegerKind::I16:
-                        case Cryo::IntegerKind::U16:
-                            byte_size = 2;
-                            break;
-                        case Cryo::IntegerKind::I32:
-                        case Cryo::IntegerKind::U32:
-                        case Cryo::IntegerKind::Int:
-                        case Cryo::IntegerKind::UInt:
-                        default:
-                            byte_size = 4;
-                            break;
-                        case Cryo::IntegerKind::I64:
-                        case Cryo::IntegerKind::U64:
-                            byte_size = 8;
-                            break;
-                        case Cryo::IntegerKind::I128:
-                        case Cryo::IntegerKind::U128:
-                            byte_size = 16;
-                            break;
+                    switch (int_kind_check)
+                    {
+                    case Cryo::IntegerKind::I8:
+                    case Cryo::IntegerKind::U8:
+                        byte_size = 1;
+                        break;
+                    case Cryo::IntegerKind::I16:
+                    case Cryo::IntegerKind::U16:
+                        byte_size = 2;
+                        break;
+                    case Cryo::IntegerKind::I32:
+                    case Cryo::IntegerKind::U32:
+                    case Cryo::IntegerKind::Int:
+                    case Cryo::IntegerKind::UInt:
+                    default:
+                        byte_size = 4;
+                        break;
+                    case Cryo::IntegerKind::I64:
+                    case Cryo::IntegerKind::U64:
+                        byte_size = 8;
+                        break;
+                    case Cryo::IntegerKind::I128:
+                    case Cryo::IntegerKind::U128:
+                        byte_size = 16;
+                        break;
                     }
                     std::cout << "[DEBUG] TypeMapper::map_integer_type() - fallback size_bytes: " << byte_size << std::endl;
                 }
-                
+
                 std::cout << "[DEBUG] TypeMapper::map_integer_type() - attempting is_signed() for kind: " << static_cast<int>(int_kind_check) << std::endl;
                 // Additional protection for is_signed() as well
-                try {
+                try
+                {
                     is_signed_val = int_type->is_signed();
                     std::cout << "[DEBUG] TypeMapper::map_integer_type() - is_signed() succeeded, signed: " << is_signed_val << std::endl;
-                } catch (...) {
+                }
+                catch (...)
+                {
                     std::cout << "[ERROR] TypeMapper::map_integer_type() - is_signed() crashed for kind " << static_cast<int>(int_kind_check) << ", using fallback" << std::endl;
                     // Use fallback based on integer kind
-                    switch (int_kind_check) {
-                        case Cryo::IntegerKind::I8:
-                        case Cryo::IntegerKind::I16:
-                        case Cryo::IntegerKind::I32:
-                        case Cryo::IntegerKind::I64:
-                        case Cryo::IntegerKind::I128:
-                        case Cryo::IntegerKind::Int:
-                            is_signed_val = true;
-                            break;
-                        case Cryo::IntegerKind::U8:
-                        case Cryo::IntegerKind::U16:
-                        case Cryo::IntegerKind::U32:
-                        case Cryo::IntegerKind::U64:
-                        case Cryo::IntegerKind::U128:
-                        case Cryo::IntegerKind::UInt:
-                        default:
-                            is_signed_val = false;
-                            break;
+                    switch (int_kind_check)
+                    {
+                    case Cryo::IntegerKind::I8:
+                    case Cryo::IntegerKind::I16:
+                    case Cryo::IntegerKind::I32:
+                    case Cryo::IntegerKind::I64:
+                    case Cryo::IntegerKind::I128:
+                    case Cryo::IntegerKind::Int:
+                        is_signed_val = true;
+                        break;
+                    case Cryo::IntegerKind::U8:
+                    case Cryo::IntegerKind::U16:
+                    case Cryo::IntegerKind::U32:
+                    case Cryo::IntegerKind::U64:
+                    case Cryo::IntegerKind::U128:
+                    case Cryo::IntegerKind::UInt:
+                    default:
+                        is_signed_val = false;
+                        break;
                     }
                     std::cout << "[DEBUG] TypeMapper::map_integer_type() - fallback is_signed: " << is_signed_val << std::endl;
                 }
             }
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::cout << "[ERROR] TypeMapper::map_integer_type() - pure virtual method crash detected in virtual method calls!" << std::endl;
             report_error("Pure virtual method crash in IntegerType virtual methods");
             return nullptr;
@@ -531,13 +567,14 @@ namespace Cryo::Codegen
         // Check if we already have this struct type in cache
         std::string struct_name = struct_type->name();
         std::cout << "[TypeMapper] map_struct_type called for: " << struct_name << std::endl;
-        
+
         // CRITICAL CHECK: Prevent mapping primitive types as structs
         if (struct_name == "u64" || struct_name == "i64" || struct_name == "u32" || struct_name == "i32" ||
             struct_name == "u16" || struct_name == "i16" || struct_name == "u8" || struct_name == "i8" ||
             struct_name == "f32" || struct_name == "f64" || struct_name == "float" || struct_name == "double" ||
             struct_name == "int" || struct_name == "uint" || struct_name == "boolean" || struct_name == "char" ||
-            struct_name == "string" || struct_name == "void") {
+            struct_name == "string" || struct_name == "void")
+        {
             std::cout << "[ERROR] TypeMapper::map_struct_type - ATTEMPTED TO MAP PRIMITIVE TYPE AS STRUCT: " << struct_name << std::endl;
             report_error("Attempted to map primitive type as struct: " + struct_name);
             return nullptr;
@@ -917,11 +954,38 @@ namespace Cryo::Codegen
                     std::cout << "[TypeMapper] Found class AST node for struct: " << struct_name << ", generating field types" << std::endl;
                     auto class_node = class_it->second;
 
-                    for (const auto &field : class_node->fields())
+                    // CRITICAL FIX: Use safe index-based iteration instead of range-based to avoid iterator corruption
+                    const auto &fields_vec = class_node->fields();
+                    size_t num_fields = fields_vec.size();
+                    std::cout << "[TypeMapper] Class has " << num_fields << " fields" << std::endl;
+
+                    for (size_t i = 0; i < num_fields; ++i)
                     {
-                        if (field)
+                        // CRITICAL: Validate pointer before dereferencing
+                        const auto &field_ptr = fields_vec[i];
+                        if (!field_ptr || field_ptr.get() == nullptr)
                         {
-                            std::cout << "[TypeMapper] Processing class field: " << field->name() << " : " << (field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown") << std::endl;
+                            std::cerr << "[TypeMapper] WARNING: Null field pointer at index " << i << " in class " << struct_name << std::endl;
+                            field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                            continue;
+                        }
+
+                        // Get field safely
+                        auto *field = field_ptr.get();
+
+                        // CRITICAL: Validate field pointer before any operations
+                        if (!field)
+                        {
+                            std::cerr << "[TypeMapper] ERROR: field pointer is null at index " << i << std::endl;
+                            field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                            continue;
+                        }
+
+                        // Wrap all field operations in try-catch to handle potential corruption
+                        try
+                        {
+                            std::string field_name = field->name();
+                            std::cout << "[TypeMapper] Processing class field[" << i << "]: " << field_name << std::endl;
 
                             // Map field type using resolved Type* directly
                             if (_type_context)
@@ -929,11 +993,29 @@ namespace Cryo::Codegen
                                 auto field_cryo_type = field->get_resolved_type();
                                 if (field_cryo_type)
                                 {
+                                    // CRITICAL: Safely check if we can call virtual methods on this type
+                                    std::string type_str = "<corrupted>";
+                                    try
+                                    {
+                                        // Test if the type pointer is valid by checking vtable
+                                        auto test_kind = field_cryo_type->kind();
+                                        if (test_kind != Cryo::TypeKind::Unknown)
+                                        {
+                                            type_str = field_cryo_type->to_string();
+                                        }
+                                    }
+                                    catch (...)
+                                    {
+                                        std::cerr << "[TypeMapper] EXCEPTION: Type pointer is corrupt for field '" << field_name << "'" << std::endl;
+                                    }
+
+                                    std::cout << "[TypeMapper] Field '" << field_name << "' has resolved type: " << type_str << std::endl;
+
                                     llvm::Type *field_llvm_type = map_type(field_cryo_type);
                                     if (field_llvm_type)
                                     {
                                         field_types.push_back(field_llvm_type);
-                                        std::cout << "[TypeMapper] Mapped class field '" << field->name() << "' to LLVM type" << std::endl;
+                                        std::cout << "[TypeMapper] Mapped class field '" << field_name << "' to LLVM type" << std::endl;
                                     }
                                     else
                                     {
@@ -944,9 +1026,33 @@ namespace Cryo::Codegen
                                 }
                                 else
                                 {
-                                    std::cerr << "[TypeMapper] Failed to parse class field type: " << field->type_annotation() << std::endl;
-                                    // Use a placeholder pointer type for failed field parsing
-                                    field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                    std::cerr << "[TypeMapper] Field '" << field_name << "' has NULL resolved type, annotation: " << field->type_annotation() << std::endl;
+
+                                    // CRITICAL FIX: Try to resolve the type manually if resolved type is null
+                                    std::string type_annotation = field->type_annotation();
+                                    auto manually_resolved_type = lookup_type_by_name(type_annotation);
+
+                                    if (manually_resolved_type && manually_resolved_type->kind() != Cryo::TypeKind::Unknown)
+                                    {
+                                        std::cout << "[TypeMapper] Manually resolved field type: " << type_annotation << std::endl;
+                                        llvm::Type *field_llvm_type = map_type(manually_resolved_type);
+                                        if (field_llvm_type)
+                                        {
+                                            field_types.push_back(field_llvm_type);
+                                            std::cout << "[TypeMapper] Successfully mapped manually resolved field '" << field_name << "'" << std::endl;
+                                        }
+                                        else
+                                        {
+                                            std::cerr << "[TypeMapper] Manual resolution succeeded but mapping failed for field: " << field_name << std::endl;
+                                            field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                        }
+                                    }
+                                    else
+                                    {
+                                        std::cerr << "[TypeMapper] Manual resolution failed for field type: " << type_annotation << std::endl;
+                                        // Use a placeholder pointer type for failed field parsing
+                                        field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                    }
                                 }
                             }
                             else
@@ -956,28 +1062,38 @@ namespace Cryo::Codegen
                                 field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                             }
                         }
+                        catch (const std::exception &e)
+                        {
+                            std::cerr << "[TypeMapper] Exception while processing field " << i << " in class " << struct_name << ": " << e.what() << std::endl;
+                            field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                        }
+                        catch (...)
+                        {
+                            std::cerr << "[TypeMapper] Unknown exception while processing field " << i << " in class " << struct_name << std::endl;
+                            field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                        }
                     }
                 }
                 else
                 {
                     // Check if this struct should actually be an enum before creating empty struct
-                    if (_type_context && _type_context->lookup_enum_type(struct_name)) 
+                    if (_type_context && _type_context->lookup_enum_type(struct_name))
                     {
                         std::cout << "[TypeMapper] Detected struct '" << struct_name << "' should be enum, redirecting to enum type mapping" << std::endl;
-                        
+
                         // Look up the actual enum type and redirect
                         auto enum_type = _type_context->lookup_enum_type(struct_name);
-                        if (enum_type) 
+                        if (enum_type)
                         {
                             // Remove the incorrectly cached struct type
                             _struct_cache.erase(struct_name);
-                            
+
                             // Cast to EnumType* and map as enum instead
-                            auto cryo_enum_type = static_cast<Cryo::EnumType*>(enum_type);
+                            auto cryo_enum_type = static_cast<Cryo::EnumType *>(enum_type);
                             return map_enum_type(cryo_enum_type);
                         }
                     }
-                    
+
                     std::cout << "[TypeMapper] No AST node found for struct: " << struct_name << ", creating empty struct" << std::endl;
                 }
             }
@@ -1544,75 +1660,100 @@ namespace Cryo::Codegen
         }
 
         // Handle basic types using TypeContext specific methods
-        if (type_name == "void") return _type_context->get_void_type();
-        if (type_name == "boolean") return _type_context->get_boolean_type();
-        if (type_name == "char") return _type_context->get_char_type();
-        if (type_name == "string") return _type_context->get_string_type();
+        if (type_name == "void")
+            return _type_context->get_void_type();
+        if (type_name == "boolean")
+            return _type_context->get_boolean_type();
+        if (type_name == "char")
+            return _type_context->get_char_type();
+        if (type_name == "string")
+            return _type_context->get_string_type();
 
         // Integer types
-        if (type_name == "i8") return _type_context->get_i8_type();
-        if (type_name == "i16") return _type_context->get_i16_type();
-        if (type_name == "i32") return _type_context->get_i32_type();
-        if (type_name == "i64") return _type_context->get_i64_type();
-        if (type_name == "int") return _type_context->get_int_type();
+        if (type_name == "i8")
+            return _type_context->get_i8_type();
+        if (type_name == "i16")
+            return _type_context->get_i16_type();
+        if (type_name == "i32")
+            return _type_context->get_i32_type();
+        if (type_name == "i64")
+            return _type_context->get_i64_type();
+        if (type_name == "int")
+            return _type_context->get_int_type();
 
         // Unsigned integer types
-        if (type_name == "u8") return _type_context->get_u8_type();
-        if (type_name == "u16") return _type_context->get_u16_type();
-        if (type_name == "u32") return _type_context->get_u32_type();
-        if (type_name == "u64") {
+        if (type_name == "u8")
+            return _type_context->get_u8_type();
+        if (type_name == "u16")
+            return _type_context->get_u16_type();
+        if (type_name == "u32")
+            return _type_context->get_u32_type();
+        if (type_name == "u64")
+        {
             std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - returning u64 integer type from get_u64_type()" << std::endl;
-            auto* result = _type_context->get_u64_type();
+            auto *result = _type_context->get_u64_type();
             std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - u64 type kind: " << TypeKindToString(result->kind()) << std::endl;
             return result;
         }
 
         // Float types
-        if (type_name == "f32") return _type_context->get_f32_type();
-        if (type_name == "f64") return _type_context->get_f64_type();
-        if (type_name == "float") return _type_context->get_default_float_type();
-        if (type_name == "double") return _type_context->get_f64_type();
+        if (type_name == "f32")
+            return _type_context->get_f32_type();
+        if (type_name == "f64")
+            return _type_context->get_f64_type();
+        if (type_name == "float")
+            return _type_context->get_default_float_type();
+        if (type_name == "double")
+            return _type_context->get_f64_type();
 
         // Check for pointer types (ends with '*')
-        if (type_name.back() == '*') {
+        if (type_name.back() == '*')
+        {
             std::string pointee_type = type_name.substr(0, type_name.length() - 1);
             Cryo::Type *pointee = lookup_type_by_name(pointee_type);
-            if (pointee) {
+            if (pointee)
+            {
                 return _type_context->create_pointer_type(pointee);
             }
         }
 
         // Check for reference types (ends with '&')
-        if (type_name.back() == '&') {
+        if (type_name.back() == '&')
+        {
             std::string referent_type = type_name.substr(0, type_name.length() - 1);
             Cryo::Type *referent = lookup_type_by_name(referent_type);
-            if (referent) {
+            if (referent)
+            {
                 return _type_context->create_reference_type(referent);
             }
         }
 
         // Try looking up as struct type
         Cryo::Type *struct_type = _type_context->get_struct_type(type_name);
-        if (struct_type && struct_type->kind() != Cryo::TypeKind::Unknown) {
+        if (struct_type && struct_type->kind() != Cryo::TypeKind::Unknown)
+        {
             std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - found struct type for: " << type_name << std::endl;
             return struct_type;
         }
 
-        // Try looking up as class type  
+        // Try looking up as class type
         Cryo::Type *class_type = _type_context->get_class_type(type_name);
-        if (class_type && class_type->kind() != Cryo::TypeKind::Unknown) {
+        if (class_type && class_type->kind() != Cryo::TypeKind::Unknown)
+        {
             return class_type;
         }
 
         // Try looking up as enum type
         Cryo::Type *enum_type = _type_context->lookup_enum_type(type_name);
-        if (enum_type) {
+        if (enum_type)
+        {
             return enum_type;
         }
 
         // Try looking up as type alias
         Cryo::Type *alias_type = _type_context->lookup_type_alias(type_name);
-        if (alias_type) {
+        if (alias_type)
+        {
             return alias_type;
         }
 

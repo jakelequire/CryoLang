@@ -2985,6 +2985,34 @@ namespace Cryo
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after enum body");
 
+        // CRITICAL FIX: Register enum type immediately during parsing
+        // This allows later type annotations to resolve to this enum
+        // Determine if this is a simple enum (all variants have no associated data)
+        bool is_simple_enum = true;
+        std::vector<std::string> variant_names;
+
+        for (const auto &variant : enum_decl->variants())
+        {
+            if (variant)
+            {
+                variant_names.push_back(variant->name());
+                // If any variant has associated types, it's not a simple enum
+                if (!variant->associated_types().empty())
+                {
+                    is_simple_enum = false;
+                }
+            }
+        }
+
+        // Register the enum type in TypeContext so future type resolution can find it
+        // Skip registration for generic enums (they'll be handled by template system)
+        if (enum_decl->generic_parameters().empty())
+        {
+            _context.types().get_enum_type(enum_name, variant_names, is_simple_enum);
+            std::cout << "[Parser] Registered enum type: " << enum_name
+                      << " (simple=" << is_simple_enum << ", variants=" << variant_names.size() << ")" << std::endl;
+        }
+
         return enum_decl;
     }
 
@@ -3734,10 +3762,10 @@ namespace Cryo
         // Create a string stream to build type tokens
         std::string type_string = "";
         std::vector<Token> collected_tokens;
-        
+
         // Collect tokens that form the complete type expression
         // This handles complex types like: const int**, Option<Result<T, E>>, etc.
-        while (is_type_token() || 
+        while (is_type_token() ||
                _current_token.is(TokenKind::TK_L_ANGLE) ||
                _current_token.is(TokenKind::TK_R_ANGLE) ||
                _current_token.is(TokenKind::TK_L_SQUARE) ||
@@ -3753,7 +3781,7 @@ namespace Cryo
             collected_tokens.push_back(_current_token);
             type_string += std::string(_current_token.text()) + " ";
             advance();
-            
+
             // Break on certain terminators
             if (_current_token.is(TokenKind::TK_SEMICOLON) ||
                 _current_token.is(TokenKind::TK_COMMA) ||
@@ -3765,32 +3793,33 @@ namespace Cryo
                 break;
             }
         }
-        
+
         if (collected_tokens.empty())
         {
             error("Expected type annotation");
             return _context.types().get_unknown_type();
         }
-        
+
         // Use the token-based parsing system
         size_t index = 0;
         Type *parsed_type = _context.types().parse_type_from_token_stream(collected_tokens, index);
-        
+
         if (!parsed_type)
         {
             // Fallback to string-based parsing if token parsing fails
-            std::cout << "[DEBUG] Parser: Token-based parsing failed for '" << type_string 
+            std::cout << "[DEBUG] Parser: Token-based parsing failed for '" << type_string
                       << "' (collected " << collected_tokens.size() << " tokens), falling back to string parsing" << std::endl;
-            if (!collected_tokens.empty()) {
-                std::cout << "[DEBUG] First token: " << static_cast<int>(collected_tokens[0].kind()) 
+            if (!collected_tokens.empty())
+            {
+                std::cout << "[DEBUG] First token: " << static_cast<int>(collected_tokens[0].kind())
                           << " (" << std::string(collected_tokens[0].text()) << ")" << std::endl;
             }
-            
+
             // Trim whitespace
             type_string.erase(type_string.find_last_not_of(" \t\n\r\f\v") + 1);
             parsed_type = resolve_type_from_string(type_string);
         }
-        
+
         return parsed_type ? parsed_type : _context.types().get_unknown_type();
     }
 
@@ -3823,7 +3852,7 @@ namespace Cryo
             return _context.types().get_variadic_type(); // Variadic type
 
         // Try to resolve as a struct/class type
-        Type *struct_type = _context.types().get_struct_type(type_str);
+        Type *struct_type = _context.types().lookup_struct_type(type_str);
         if (struct_type && struct_type->kind() != TypeKind::Unknown)
         {
             return struct_type;
@@ -3854,7 +3883,7 @@ namespace Cryo
         // we'll return an unknown type and let the TypeChecker resolve it properly
         // when all types are available during type checking phase
         std::cerr << "[Parser] DEBUG: Could not resolve '" << type_str << "' during parsing, deferring to type checker" << std::endl;
-        
+
         // Return unknown type - the TypeChecker will attempt to resolve it again during type checking
         // when all enum and struct declarations have been processed
         return _context.types().get_unknown_type();
