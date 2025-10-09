@@ -261,40 +261,33 @@ public:
         }
         
         // Align size
-        // const aligned_size: u64 = this.align_size(size, BLOCK_ALIGNMENT);
-        const aligned_size: u64 = 16;
+        const aligned_size: u64 = this.align_size(size, BLOCK_ALIGNMENT);
         std::Intrinsics::__printf__("[DEBUG::RUNTIME] Aligned size: %llu bytes\n", aligned_size);
         
         // Find free block
-        // const block: HeapBlock* = this.free_list.find_free_block(aligned_size);
-        // if (block == null) {
-        //     std::Intrinsics::__printf__("[DEBUG::RUNTIME] No suitable free block found\n");
-        //     return null;
-        // }
-        // 
-        // // Split block if it's much larger than needed
-        // if (block.size > aligned_size + sizeof(HeapBlock) + MIN_BLOCK_SIZE) {
-        //     std::Intrinsics::__printf__("[DEBUG::RUNTIME] Splitting block: ptr=%p\n", block.get_user_data_ptr());
-        //     const new_block: HeapBlock* = block.split(aligned_size);
-        //     if (new_block != null) {
-        //         this.free_list.add_block(new_block);
-        //     }
-        // }
-        // 
-        // // Remove from free list and mark as allocated
-        // this.free_list.remove_block(block);
-        // block.mark_allocated();
-        // 
-        // std::Intrinsics::__printf__("[DEBUG::RUNTIME] Allocated memory: ptr=%p, size=%llu bytes\n",
-        //                           block.get_user_data_ptr(), block.size);
-        //
-        // return block.get_user_data_ptr();
-        const __ptr: void* = std::Intrinsics::__malloc__(aligned_size);
-        if (__ptr == null) {
-            std::Intrinsics::__printf__("[DEBUG::RUNTIME] System malloc failed\n");
+        const block: HeapBlock* = this.free_list.find_free_block(aligned_size);
+        if (block == null) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] No suitable free block found\n");
             return null;
         }
-        return __ptr;
+        
+        // // Split block if it's much larger than needed
+        if (block.size > aligned_size + sizeof(HeapBlock) + MIN_BLOCK_SIZE) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] Splitting block: ptr=%p\n", block.get_user_data_ptr());
+            const new_block: HeapBlock* = block.split(aligned_size);
+            if (new_block != null) {
+                this.free_list.add_block(new_block);
+            }
+        }
+        
+        // // Remove from free list and mark as allocated
+        this.free_list.remove_block(block);
+        block.mark_allocated();
+        
+        std::Intrinsics::__printf__("[DEBUG::RUNTIME] Allocated memory: ptr=%p, size=%llu bytes\n",
+                                  block.get_user_data_ptr(), block.size);
+        
+        return block.get_user_data_ptr();
     }
 
     // Free allocated memory
@@ -307,27 +300,27 @@ public:
         }
         
         // Get block header from user pointer
-       //  const block: HeapBlock* = this.get_block_from_ptr(_ptr);
-       //  
-       //  if (!block.is_valid()) {
-       //      std::Intrinsics::__printf__("[DEBUG::RUNTIME] Invalid block detected during free: ptr=%p\n", _ptr);
-       //      return;
-       //  }
-       //  
-       //  if (block.is_free()) {
-       //      std::Intrinsics::__printf__("[DEBUG::RUNTIME] Double free detected: ptr=%p\n", _ptr);
-       //      std::Intrinsics::__panic__("Double free detected");
-       //      return;
-       //  }
-       //  
-       //  // Mark as free and add to free list
-       //  block.mark_free();
-       //  this.free_list.add_block(block);
-       //  
-       //  // Coalesce with adjacent blocks
-       //  this.coalesce_block(block);
-       //  
-       //  std::Intrinsics::__printf__("[DEBUG::RUNTIME] Memory freed: ptr=%p\n", _ptr);
+       const block: HeapBlock* = this.get_block_from_ptr(_ptr);
+       
+       if (!block.is_valid()) {
+           std::Intrinsics::__printf__("[DEBUG::RUNTIME] Invalid block detected during free: ptr=%p\n", _ptr);
+           return;
+       }
+       
+       if (block.is_free()) {
+           std::Intrinsics::__printf__("[DEBUG::RUNTIME] Double free detected: ptr=%p\n", _ptr);
+           std::Intrinsics::__panic__("Double free detected");
+           return;
+       }
+       
+       // Mark as free and add to free list
+       block.mark_free();
+       this.free_list.add_block(block);
+       
+       // Coalesce with adjacent blocks
+       this.coalesce_block(block);
+       
+       std::Intrinsics::__printf__("[DEBUG::RUNTIME] Memory freed: ptr=%p\n", _ptr);
 
        return;
     }
@@ -341,6 +334,15 @@ public:
             std::Intrinsics::__printf__("[DEBUG::RUNTIME] Heap shutdown complete\n");
             return;
         }
+        if (this.heap_base == null) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] Heap base is null, cannot shutdown\n");
+            return;
+        }
+        if (!this.is_initialized) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] Heap not initialized, nothing to shutdown\n");
+            return;
+        }
+
         std::Intrinsics::__printf__("[DEBUG::RUNTIME] Heap not initialized or already shutdown\n");
         return;
     }
@@ -366,32 +368,32 @@ private:
         std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing block: ptr=%p\n", block.get_user_data_ptr());
         
         // Try to merge with next block
-        // if (block.next != null && block.next.is_free()) {
-        //     std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing with next block: ptr=%p\n", 
-        //                                block.next.get_user_data_ptr());
-        //     
-        //     this.free_list.remove_block(block.next);
-        //     block.size = block.size + sizeof(HeapBlock) + block.next.size;
-        //     block.next = block.next.next;
-        //     
-        //     if (block.next != null) {
-        //         block.next.prev = block;
-        //     }
-        // }
+        if (block.next != null && block.next.is_free()) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing with next block: ptr=%p\n", 
+                                       block.next.get_user_data_ptr());
+            
+            this.free_list.remove_block(block.next);
+            block.size = block.size + sizeof(HeapBlock) + block.next.size;
+            block.next = block.next.next;
+            
+            if (block.next != null) {
+                block.next.prev = block;
+            }
+        }
         
         // Try to merge with previous block
-        // if (block.prev != null && block.prev.is_free()) {
-        //     std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing with previous block: ptr=%p\n", 
-        //                                block.prev.get_user_data_ptr());
-        //     
-        //     this.free_list.remove_block(block);
-        //     block.prev.size = block.prev.size + sizeof(HeapBlock) + block.size;
-        //     block.prev.next = block.next;
-        //     
-        //     if (block.next != null) {
-        //         block.next.prev = block.prev;
-        //     }
-        // }
+        if (block.prev != null && block.prev.is_free()) {
+            std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing with previous block: ptr=%p\n", 
+                                       block.prev.get_user_data_ptr());
+            
+            this.free_list.remove_block(block);
+            block.prev.size = block.prev.size + sizeof(HeapBlock) + block.size;
+            block.prev.next = block.next;
+            
+            if (block.next != null) {
+                block.next.prev = block.prev;
+            }
+        }
         
         std::Intrinsics::__printf__("[DEBUG::RUNTIME] Coalescing complete for block: ptr=%p\n", 
                                    block.get_user_data_ptr());

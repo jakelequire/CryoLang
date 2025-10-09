@@ -819,7 +819,7 @@ namespace Cryo::Codegen
                 // Map return type
                 llvm::Type *return_type = llvm::Type::getVoidTy(context);
                 Cryo::Type *cryo_return_type = method->get_resolved_return_type();
-                if (cryo_return_type && cryo_return_type->to_string() != "void")
+                if (cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
                 {
                     llvm::Type *mapped_return_type = _type_mapper->map_type(cryo_return_type);
                     if (mapped_return_type)
@@ -989,6 +989,8 @@ namespace Cryo::Codegen
         std::cout << "[CodegenVisitor] Created LLVM class type for " << class_name << std::endl;
 
         // Generate methods defined in the class
+        // Use two-pass approach: first create all function declarations, then generate bodies
+        // This ensures private methods can be called by public methods regardless of declaration order
         auto &context = _context_manager.get_context();
         auto module = _context_manager.get_module();
 
@@ -996,9 +998,11 @@ namespace Cryo::Codegen
         {
             llvm::Type *class_ptr_type = llvm::PointerType::getUnqual(class_type);
 
+            // FIRST PASS: Create function declarations for all methods
+            std::cout << "[DEBUG] Pass 1: Creating function declarations for all methods in " << class_name << std::endl;
             for (const auto &method : node.methods())
             {
-                std::cout << "[CodegenVisitor] Generating method: " << class_name << "::" << method->name() << std::endl;
+                std::cout << "[CodegenVisitor] Generating method declaration: " << class_name << "::" << method->name() << std::endl;
 
                 std::string method_name = method->name();
                 std::string qualified_name;
@@ -1046,7 +1050,7 @@ namespace Cryo::Codegen
                 // Map return type
                 llvm::Type *return_type = llvm::Type::getVoidTy(context);
                 Cryo::Type *cryo_return_type = method->get_resolved_return_type();
-                if (cryo_return_type && cryo_return_type->to_string() != "void")
+                if (cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
                 {
                     llvm::Type *mapped_return_type = _type_mapper->map_type(cryo_return_type);
                     if (mapped_return_type)
@@ -1082,10 +1086,41 @@ namespace Cryo::Codegen
                         ++arg_it;
                     }
                 }
+            }
+
+            // SECOND PASS: Generate function bodies for all methods
+            std::cout << "[DEBUG] Pass 2: Generating function bodies for all methods in " << class_name << std::endl;
+            for (const auto &method : node.methods())
+            {
+                std::string method_name = method->name();
+                std::string qualified_name;
+
+                // Build the same qualified name as in pass 1
+                if (!_namespace_context.empty())
+                {
+                    qualified_name = _namespace_context + "::" + class_name + "::" + method_name;
+                }
+                else
+                {
+                    qualified_name = class_name + "::" + method_name;
+                }
+
+                // Retrieve the function we created in pass 1
+                auto func_it = _functions.find(qualified_name);
+                if (func_it == _functions.end())
+                {
+                    std::cerr << "[ERROR] Failed to find function declaration for method: " << qualified_name << std::endl;
+                    continue;
+                }
+                llvm::Function *func = func_it->second;
+
+                bool is_static = method->is_static();
 
                 // Generate method body if it exists
                 if (method->body())
                 {
+                    std::cout << "[CodegenVisitor] Generating method body: " << qualified_name << std::endl;
+
                     // Create basic block for method entry
                     llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", func);
                     _context_manager.get_builder().SetInsertPoint(entry_block);
@@ -1097,8 +1132,8 @@ namespace Cryo::Codegen
                     // Enter function scope
                     enter_scope(entry_block);
 
-                    // Create allocas and store parameter values - reset arg_it to beginning
-                    arg_it = func->arg_begin();
+                    // Create allocas and store parameter values
+                    auto arg_it = func->arg_begin();
 
                     // Handle 'this' parameter first (only for non-static methods)
                     if (!is_static && arg_it != func->arg_end())
@@ -1159,6 +1194,9 @@ namespace Cryo::Codegen
 
                     // Generate method body
                     method->body()->accept(*this);
+
+                    // Get return type from function
+                    llvm::Type *return_type = func->getReturnType();
 
                     // Add return if not already present
                     if (!entry_block->getTerminator())
@@ -1542,7 +1580,7 @@ namespace Cryo::Codegen
             // Determine return type
             llvm::Type *return_type = llvm::Type::getVoidTy(context);
             Cryo::Type *cryo_return_type = method->get_resolved_return_type();
-            if (cryo_return_type && cryo_return_type->to_string() != "void")
+            if (cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
             {
                 llvm::Type *mapped_return_type = _type_mapper->map_type(cryo_return_type);
                 if (mapped_return_type)
@@ -3832,7 +3870,7 @@ namespace Cryo::Codegen
             // Map return type
             llvm::Type *return_type = nullptr;
             Cryo::Type *cryo_return_type = node->get_resolved_return_type();
-            if (cryo_return_type && cryo_return_type->to_string() != "void")
+            if (cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
             {
                 return_type = _type_mapper->map_type(cryo_return_type);
             }
@@ -4205,7 +4243,7 @@ namespace Cryo::Codegen
         // Map return type
         llvm::Type *return_type = nullptr;
         Cryo::Type *cryo_return_type = node->get_resolved_return_type();
-        if (cryo_return_type && cryo_return_type->to_string() != "void")
+        if (cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
         {
             return_type = _type_mapper->map_type(cryo_return_type);
         }
@@ -4988,7 +5026,204 @@ namespace Cryo::Codegen
                 }
             }
 
-            // For non-assignment operations, generate both operands normally
+            // For non-assignment operations, handle based on operator type
+            // Short-circuit operators (&&, ||) require special handling
+            if (op_kind == TokenKind::TK_AMPAMP || op_kind == TokenKind::TK_PIPEPIPE)
+            {
+                // For short-circuit evaluation, only evaluate left first
+                // Right will be evaluated conditionally
+                node->left()->accept(*this);
+                llvm::Value *left_val = get_current_value();
+
+                if (!left_val)
+                {
+                    report_error("Failed to generate left operand of binary expression");
+                    return nullptr;
+                }
+
+                auto &llvm_ctx = _context_manager.get_context();
+                llvm::Function *current_function = builder.GetInsertBlock()->getParent();
+
+                std::cout << "[DEBUG] SHORT-CIRCUIT: Entering short-circuit evaluation for operator: "
+                          << (op_kind == TokenKind::TK_AMPAMP ? "&&" : "||") << std::endl;
+
+                if (op_kind == TokenKind::TK_AMPAMP)
+                {
+                    // Logical AND: left && right
+                    // If left is false, skip right and return false
+                    llvm::BasicBlock *land_lhs = builder.GetInsertBlock();
+                    llvm::BasicBlock *land_rhs = llvm::BasicBlock::Create(llvm_ctx, "land.rhs", current_function);
+                    llvm::BasicBlock *land_end = llvm::BasicBlock::Create(llvm_ctx, "land.end", current_function);
+
+                    // Convert left to boolean
+                    llvm::Value *left_bool = left_val;
+                    if (!left_val->getType()->isIntegerTy(1))
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
+                        }
+                        else if (left_val->getType()->isFloatingPointTy())
+                        {
+                            left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
+                        }
+                        else
+                        {
+                            report_error("Cannot convert left operand to boolean for logical AND");
+                            return nullptr;
+                        }
+                    }
+
+                    // Branch: if left is true, evaluate right; otherwise skip to end
+                    builder.CreateCondBr(left_bool, land_rhs, land_end);
+
+                    // Evaluate right operand in land.rhs block
+                    builder.SetInsertPoint(land_rhs);
+                    std::cout << "[DEBUG] Short-circuit AND: About to evaluate right operand" << std::endl;
+                    node->right()->accept(*this);
+                    llvm::Value *right_val = get_current_value();
+                    std::cout << "[DEBUG] Short-circuit AND: Right operand evaluated, right_val="
+                              << (right_val ? "non-null" : "NULL")
+                              << ", builder now in block: " << builder.GetInsertBlock()->getName().str() << std::endl;
+
+                    if (!right_val)
+                    {
+                        report_error("Failed to generate right operand for logical AND");
+                        return nullptr;
+                    }
+
+                    // Convert right to boolean
+                    llvm::Value *right_bool = right_val;
+                    std::string type_str;
+                    llvm::raw_string_ostream rso(type_str);
+                    right_val->getType()->print(rso);
+                    std::cout << "[DEBUG] Short-circuit AND: right_val type: " << rso.str() << std::endl;
+                    if (!right_val->getType()->isIntegerTy(1))
+                    {
+                        std::cout << "[DEBUG] Short-circuit AND: right_val is not i1, attempting conversion" << std::endl;
+                        if (right_val->getType()->isIntegerTy())
+                        {
+                            std::cout << "[DEBUG] Short-circuit AND: Converting integer to boolean" << std::endl;
+                            right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
+                        }
+                        else if (right_val->getType()->isFloatingPointTy())
+                        {
+                            std::cout << "[DEBUG] Short-circuit AND: Converting float to boolean" << std::endl;
+                            right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
+                        }
+                        else
+                        {
+                            std::string err_type_str;
+                            llvm::raw_string_ostream err_rso(err_type_str);
+                            right_val->getType()->print(err_rso);
+                            std::cout << "[DEBUG] Short-circuit AND: Cannot convert type to boolean: " << err_rso.str() << std::endl;
+                            report_error("Cannot convert right operand to boolean for logical AND");
+                            return nullptr;
+                        }
+                    }
+                    else
+                    {
+                        std::cout << "[DEBUG] Short-circuit AND: right_val is already i1, no conversion needed" << std::endl;
+                    }
+
+                    std::cout << "[DEBUG] Short-circuit AND: About to create branch to land_end" << std::endl;
+                    builder.CreateBr(land_end);
+                    std::cout << "[DEBUG] Short-circuit AND: Branch created" << std::endl;
+                    llvm::BasicBlock *land_rhs_end = builder.GetInsertBlock();
+
+                    // Create PHI node to merge results
+                    builder.SetInsertPoint(land_end);
+                    llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx), 2, "logand.result");
+                    phi->addIncoming(llvm::ConstantInt::getFalse(llvm_ctx), land_lhs);
+                    phi->addIncoming(right_bool, land_rhs_end);
+
+                    std::cout << "[DEBUG] Short-circuit AND: land_lhs name=" << land_lhs->getName().str()
+                              << ", land_rhs name=" << land_rhs_end->getName().str()
+                              << ", land_end name=" << land_end->getName().str() << std::endl;
+                    std::cout << "[DEBUG] Short-circuit AND: land_lhs terminator=" << (land_lhs->getTerminator() != nullptr)
+                              << ", land_rhs terminator=" << (land_rhs_end->getTerminator() != nullptr)
+                              << ", land_end terminator=" << (land_end->getTerminator() != nullptr) << std::endl;
+                    std::cout << "[DEBUG] Short-circuit AND: Builder position after setting to land_end: "
+                              << builder.GetInsertBlock()->getName().str() << std::endl;
+
+                    // Note: land_end intentionally has no terminator yet - the caller (if-statement)
+                    // will add the appropriate branch after getting the condition value
+                    return phi;
+                }
+                else // TK_PIPEPIPE
+                {
+                    // Logical OR: left || right
+                    // If left is true, skip right and return true
+                    llvm::BasicBlock *lor_lhs = builder.GetInsertBlock();
+                    llvm::BasicBlock *lor_rhs = llvm::BasicBlock::Create(llvm_ctx, "lor.rhs", current_function);
+                    llvm::BasicBlock *lor_end = llvm::BasicBlock::Create(llvm_ctx, "lor.end", current_function);
+
+                    // Convert left to boolean
+                    llvm::Value *left_bool = left_val;
+                    if (!left_val->getType()->isIntegerTy(1))
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
+                        }
+                        else if (left_val->getType()->isFloatingPointTy())
+                        {
+                            left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
+                        }
+                        else
+                        {
+                            report_error("Cannot convert left operand to boolean for logical OR");
+                            return nullptr;
+                        }
+                    }
+
+                    // Branch: if left is false, evaluate right; otherwise skip to end
+                    builder.CreateCondBr(left_bool, lor_end, lor_rhs);
+
+                    // Evaluate right operand in lor.rhs block
+                    builder.SetInsertPoint(lor_rhs);
+                    node->right()->accept(*this);
+                    llvm::Value *right_val = get_current_value();
+
+                    if (!right_val)
+                    {
+                        report_error("Failed to generate right operand for logical OR");
+                        return nullptr;
+                    }
+
+                    // Convert right to boolean
+                    llvm::Value *right_bool = right_val;
+                    if (!right_val->getType()->isIntegerTy(1))
+                    {
+                        if (right_val->getType()->isIntegerTy())
+                        {
+                            right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
+                        }
+                        else if (right_val->getType()->isFloatingPointTy())
+                        {
+                            right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
+                        }
+                        else
+                        {
+                            report_error("Cannot convert right operand to boolean for logical OR");
+                            return nullptr;
+                        }
+                    }
+
+                    builder.CreateBr(lor_end);
+                    llvm::BasicBlock *lor_rhs_end = builder.GetInsertBlock();
+
+                    // Create PHI node to merge results
+                    builder.SetInsertPoint(lor_end);
+                    llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx), 2, "logor.result");
+                    phi->addIncoming(llvm::ConstantInt::getTrue(llvm_ctx), lor_lhs);
+                    phi->addIncoming(right_bool, lor_rhs_end);
+
+                    return phi;
+                }
+            }
+
+            // For all other operations, generate both operands normally
             // Generate left operand
             node->left()->accept(*this);
             llvm::Value *left_val = get_current_value();
@@ -5524,95 +5759,6 @@ namespace Cryo::Codegen
                     return nullptr;
                 }
                 break;
-
-            // Logical operations
-            case TokenKind::TK_AMPAMP: // Logical AND &&
-            {
-                // Convert operands to boolean if they aren't already
-                llvm::Value *left_bool = left_val;
-                llvm::Value *right_bool = right_val;
-
-                if (!left_val->getType()->isIntegerTy(1))
-                {
-                    if (left_val->getType()->isIntegerTy())
-                    {
-                        left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
-                    }
-                    else if (left_val->getType()->isFloatingPointTy())
-                    {
-                        left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
-                    }
-                    else
-                    {
-                        report_error("Cannot convert left operand to boolean for logical AND");
-                        return nullptr;
-                    }
-                }
-
-                if (!right_val->getType()->isIntegerTy(1))
-                {
-                    if (right_val->getType()->isIntegerTy())
-                    {
-                        right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
-                    }
-                    else if (right_val->getType()->isFloatingPointTy())
-                    {
-                        right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
-                    }
-                    else
-                    {
-                        report_error("Cannot convert right operand to boolean for logical AND");
-                        return nullptr;
-                    }
-                }
-
-                result = builder.CreateAnd(left_bool, right_bool, "logand.tmp");
-            }
-            break;
-
-            case TokenKind::TK_PIPEPIPE: // Logical OR ||
-            {
-                // Convert operands to boolean if they aren't already
-                llvm::Value *left_bool = left_val;
-                llvm::Value *right_bool = right_val;
-
-                if (!left_val->getType()->isIntegerTy(1))
-                {
-                    if (left_val->getType()->isIntegerTy())
-                    {
-                        left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
-                    }
-                    else if (left_val->getType()->isFloatingPointTy())
-                    {
-                        left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
-                    }
-                    else
-                    {
-                        report_error("Cannot convert left operand to boolean for logical OR");
-                        return nullptr;
-                    }
-                }
-
-                if (!right_val->getType()->isIntegerTy(1))
-                {
-                    if (right_val->getType()->isIntegerTy())
-                    {
-                        right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
-                    }
-                    else if (right_val->getType()->isFloatingPointTy())
-                    {
-                        right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
-                    }
-                    else
-                    {
-                        report_error("Cannot convert right operand to boolean for logical OR");
-                        return nullptr;
-                    }
-                }
-
-                result = builder.CreateOr(left_bool, right_bool, "logor.tmp");
-            }
-            break;
 
             default:
                 report_error("Unsupported binary operator: " + node->operator_token().to_string());
@@ -7666,18 +7812,10 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         llvm::Function *function = builder.GetInsertBlock()->getParent();
 
-        // Create basic blocks for control flow
-        llvm::BasicBlock *then_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.then", function);
-        llvm::BasicBlock *else_block = nullptr;
-        llvm::BasicBlock *merge_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.end", function);
+        std::cout << "[DEBUG] IF-STATEMENT ENTRY: Current block before anything: " << builder.GetInsertBlock()->getName().str() << std::endl;
 
-        // Create else block if there's an else clause
-        if (node->else_statement())
-        {
-            else_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.else", function);
-        }
-
-        // Generate condition expression
+        // Generate condition expression FIRST
+        // (Don't create then/else/merge blocks yet - condition might create its own control flow)
         node->condition()->accept(*this);
         llvm::Value *condition_val = get_current_value();
 
@@ -7686,6 +7824,11 @@ namespace Cryo::Codegen
             report_error("Failed to generate if condition");
             return;
         }
+
+        // After condition evaluation, we might be in a block created by short-circuit evaluation
+        // (e.g., land.end or lor.end) that intentionally has no terminator.
+        // We need to ensure we're in a valid state before creating then/else/merge blocks.
+        llvm::BasicBlock *condition_block = builder.GetInsertBlock();
 
         // Convert condition to i1 if needed
         if (!condition_val->getType()->isIntegerTy(1))
@@ -7702,7 +7845,32 @@ namespace Cryo::Codegen
             }
         }
 
-        // Branch based on condition
+        // NOW create the control flow blocks (after condition is evaluated)
+        llvm::BasicBlock *then_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.then", function);
+        llvm::BasicBlock *else_block = nullptr;
+        llvm::BasicBlock *merge_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.end", function);
+
+        // Create else block if there's an else clause
+        if (node->else_statement())
+        {
+            else_block = llvm::BasicBlock::Create(_context_manager.get_context(), "if.else", function);
+        }
+
+        // Branch based on condition FROM the block where condition was evaluated
+        // CRITICAL: The condition_block might not have a terminator yet (e.g., land.end from short-circuit)
+        // We MUST add the branch terminator now
+        std::cout << "[DEBUG] IF-STATEMENT: About to create branch from block: " << condition_block->getName().str()
+                  << " (ptr=" << (void *)condition_block << ")"
+                  << ", has terminator before branch: " << (condition_block->getTerminator() != nullptr) << std::endl;
+
+        // Check if condition_block already has a terminator (shouldn't happen, but be safe)
+        if (condition_block->getTerminator())
+        {
+            report_error("Condition block already has terminator before if-statement branch");
+            return;
+        }
+
+        // Add the conditional branch
         if (else_block)
         {
             builder.CreateCondBr(condition_val, then_block, else_block);
@@ -7712,18 +7880,45 @@ namespace Cryo::Codegen
             builder.CreateCondBr(condition_val, then_block, merge_block);
         }
 
+        std::cout << "[DEBUG] IF-STATEMENT: After creating branch, block " << condition_block->getName().str()
+                  << " (ptr=" << (void *)condition_block << ")"
+                  << " has terminator: " << (condition_block->getTerminator() != nullptr) << std::endl;
+        std::cout << "[DEBUG] IF-STATEMENT: Branch target: then_block=" << then_block->getName().str()
+                  << " (ptr=" << (void *)then_block << ")" << std::endl;
+
         // Generate then block
         builder.SetInsertPoint(then_block);
+        std::cout << "[DEBUG] IF-STATEMENT: Generating then block, insert point: " << then_block->getName().str() << std::endl;
+        std::cout << "[DEBUG] IF-STATEMENT: then_block is empty: " << then_block->empty() << std::endl;
         enter_scope(then_block);
         node->then_statement()->accept(*this);
         exit_scope();
+        std::cout << "[DEBUG] IF-STATEMENT: After then body generation, current block: " << builder.GetInsertBlock()->getName().str() << std::endl;
+        std::cout << "[DEBUG] IF-STATEMENT: then_block is empty: " << then_block->empty() << std::endl;
+        std::cout << "[DEBUG] IF-STATEMENT: then_block has terminator: " << (then_block->getTerminator() != nullptr) << std::endl;
 
         // Ensure the current block (which might not be then_block if the statement
         // contained nested control flow) ends with a branch to merge
         llvm::BasicBlock *currentBlock = builder.GetInsertBlock();
+        std::cout << "[DEBUG] IF-STATEMENT: Checking terminator for block: " << currentBlock->getName().str()
+                  << ", has terminator: " << (currentBlock->getTerminator() != nullptr) << std::endl;
         if (currentBlock && !currentBlock->getTerminator())
         {
+            std::cout << "[DEBUG] IF-STATEMENT: Adding branch to merge block from current block" << std::endl;
             builder.CreateBr(merge_block);
+        }
+
+        // CRITICAL FIX: Also ensure then_block itself has a terminator
+        // If the body generation moved the insert point away (due to nested control flow),
+        // then_block might have instructions but no terminator
+        if (then_block && !then_block->getTerminator())
+        {
+            std::cout << "[DEBUG] IF-STATEMENT: then_block lacks terminator, adding branch to merge" << std::endl;
+            // Temporarily set insert point to then_block to add the terminator
+            llvm::BasicBlock *saved_block = builder.GetInsertBlock();
+            builder.SetInsertPoint(then_block);
+            builder.CreateBr(merge_block);
+            builder.SetInsertPoint(saved_block);
         }
 
         // Generate else block if present
@@ -7744,6 +7939,15 @@ namespace Cryo::Codegen
 
         // Continue with merge block
         builder.SetInsertPoint(merge_block);
+
+        // CRITICAL: Do NOT add terminators to then_block, else_block, or merge_block here!
+        // - then_block and else_block should already have terminators (added above)
+        // - merge_block should NOT have a terminator yet - it's where execution continues
+        //   and subsequent statements will add to it
+
+        std::cout << "[DEBUG] IF-STATEMENT CLEANUP: then_block=" << then_block->getName().str()
+                  << ", has_term=" << (then_block->getTerminator() != nullptr)
+                  << ", is_empty=" << then_block->empty() << std::endl;
     }
     void CodegenVisitor::generate_while_loop(Cryo::WhileStatementNode *node)
     {
