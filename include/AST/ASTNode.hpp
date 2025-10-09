@@ -97,6 +97,56 @@ namespace Cryo
         Unknown
     };
 
+    inline std::string NodeKindToString(NodeKind kind) {
+        switch (kind)
+        {
+        case NodeKind::Expression: return "Expression";
+        case NodeKind::Statement: return "Statement";
+        case NodeKind::Declaration: return "Declaration";
+        case NodeKind::Literal: return "Literal";
+        case NodeKind::Identifier: return "Identifier";
+        case NodeKind::BinaryExpression: return "BinaryExpression";
+        case NodeKind::UnaryExpression: return "UnaryExpression";
+        case NodeKind::TernaryExpression: return "TernaryExpression";
+        case NodeKind::CallExpression: return "CallExpression";
+        case NodeKind::NewExpression: return "NewExpression";
+        case NodeKind::SizeofExpression: return "SizeofExpression";
+        case NodeKind::StructLiteral: return "StructLiteral";
+        case NodeKind::ArrayLiteral: return "ArrayLiteral";
+        case NodeKind::ArrayAccess: return "ArrayAccess";
+        case NodeKind::MemberAccess: return "MemberAccess";
+        case NodeKind::ScopeResolution: return "ScopeResolution";
+        case NodeKind::BlockStatement: return "BlockStatement";
+        case NodeKind::ReturnStatement: return "ReturnStatement";
+        case NodeKind::IfStatement: return "IfStatement";
+        case NodeKind::WhileStatement: return "WhileStatement";
+        case NodeKind::ForStatement: return "ForStatement";
+        case NodeKind::MatchStatement: return "MatchStatement";
+        case NodeKind::SwitchStatement: return "SwitchStatement";
+        case NodeKind::CaseStatement: return "CaseStatement";
+        case NodeKind::BreakStatement: return "BreakStatement";
+        case NodeKind::ContinueStatement: return "ContinueStatement";
+        case NodeKind::ExpressionStatement: return "ExpressionStatement";
+        case NodeKind::DeclarationStatement: return "DeclarationStatement";
+        case NodeKind::VariableDeclaration: return "VariableDeclaration";
+        case NodeKind::FunctionDeclaration: return "FunctionDeclaration";
+        case NodeKind::IntrinsicDeclaration: return "IntrinsicDeclaration";
+        case NodeKind::ImportDeclaration: return "ImportDeclaration";
+        case NodeKind::StructDeclaration: return "StructDeclaration";
+        case NodeKind::ClassDeclaration: return "ClassDeclaration";
+        case NodeKind::EnumDeclaration: return "EnumDeclaration";
+        case NodeKind::TraitDeclaration: return "TraitDeclaration";
+        case NodeKind::TypeAliasDeclaration: return "TypeAliasDeclaration";
+        case NodeKind::ImplementationBlock: return "ImplementationBlock";
+        case NodeKind::ExternBlock: return "ExternBlock";
+        case NodeKind::Program: return "Program";
+        case NodeKind::MatchArm: return "MatchArm";
+        case NodeKind::Pattern: return "Pattern";
+        case NodeKind::EnumPattern: return "EnumPattern";
+        default: return "Unknown";
+    }
+    }
+
     class ASTNode
     {
     protected:
@@ -740,7 +790,27 @@ namespace Cryo
         [[deprecated("Use get_resolved_return_type() instead - string operations being eliminated")]]
         const std::string return_type_annotation() const
         {
-            return _resolved_return_type ? _resolved_return_type->to_string() : "void";
+            if (_resolved_return_type) {
+                std::string type_str = _resolved_return_type->to_string();
+                std::string type_name = _resolved_return_type->name();
+                std::cerr << "[DEBUG] return_type_annotation: type_str='" << type_str << "', type_name='" << type_name << "'" << std::endl;
+                
+                // Safety check: if to_string() returns empty, fall back to the name
+                if (type_str.empty() && !type_name.empty()) {
+                    std::cerr << "[DEBUG] return_type_annotation: using type name '" << type_name << "'" << std::endl;
+                    return type_name;
+                }
+                // If both are empty, this means the type resolution failed during parsing
+                // Return a placeholder that the TypeChecker can properly resolve
+                if (type_str.empty()) {
+                    std::cerr << "[DEBUG] return_type_annotation: both empty, returning UNRESOLVED_TYPE" << std::endl;
+                    return "UNRESOLVED_TYPE";
+                }
+                std::cerr << "[DEBUG] return_type_annotation: returning type_str '" << type_str << "'" << std::endl;
+                return type_str;
+            }
+            std::cerr << "[DEBUG] return_type_annotation: no resolved type, returning void" << std::endl;
+            return "void";
         }
         size_t parameter_count() const { return _parameters.size(); }
 

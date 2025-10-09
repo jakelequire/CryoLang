@@ -137,6 +137,24 @@ namespace Cryo
         UInt // Default unsigned integer
     };
 
+    inline std::string IntegerKindToString(IntegerKind kind) {
+        switch (kind) {
+            case IntegerKind::I8: return "i8";
+            case IntegerKind::I16: return "i16";
+            case IntegerKind::I32: return "i32";
+            case IntegerKind::I64: return "i64";
+            case IntegerKind::I128: return "i128";
+            case IntegerKind::U8: return "u8";
+            case IntegerKind::U16: return "u16";
+            case IntegerKind::U32: return "u32";
+            case IntegerKind::U64: return "u64";
+            case IntegerKind::U128: return "u128";
+            case IntegerKind::Int: return "int";
+            case IntegerKind::UInt: return "uint";
+            default: return "unknown_integer_kind";
+        }
+    }
+
     // Float type specifications
     enum class FloatKind
     {

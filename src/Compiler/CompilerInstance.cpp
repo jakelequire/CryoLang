@@ -552,12 +552,16 @@ namespace Cryo
         try
         {
             // Set source file and namespace context before generating IR
+            std::cout << "[CompilerInstance] Setting source info for codegen..." << std::endl;
             _codegen->set_source_info(_source_file, _current_namespace);
 
+            std::cout << "[CompilerInstance] Starting IR generation..." << std::endl;
             bool success = _codegen->generate_ir(_ast_root.get());
+            std::cout << "[CompilerInstance] IR generation completed with result: " << (success ? "success" : "failure") << std::endl;
 
             if (!success)
             {
+                std::cout << "[CompilerInstance] IR generation failed with error: " << _codegen->get_last_error() << std::endl;
                 _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::CodeGen,
                                                   "Code generation failed: " + _codegen->get_last_error(),
                                                   SourceRange{}, _source_file);
