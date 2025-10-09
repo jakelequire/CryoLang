@@ -318,7 +318,12 @@ stdlib-memory:
 # =================================================================
 
 .PHONY: runtime runtime-clean
-runtime: $(RUNTIME_LIB)
+runtime: 
+	@if [ -d "$(RUNTIME_BUILD_DIR)" ]; then \
+		echo "Cleaning existing runtime build directory..."; \
+		rm -rf $(RUNTIME_BUILD_DIR); \
+	fi
+	@$(MAKE) $(RUNTIME_LIB)
 
 gdb-runtime:
 	@echo "Building runtime through gdb for debugging..."

@@ -1753,6 +1753,8 @@ namespace Cryo
             if (_current_struct_type)
             {
                 node.set_type(_current_struct_type->to_string());
+                node.set_resolved_type(_current_struct_type); // CRITICAL: Set resolved type for 'this'
+                std::cout << "[TypeChecker] Set 'this' type to: " << _current_struct_type->to_string() << std::endl;
             }
             else
             {
@@ -2362,6 +2364,8 @@ namespace Cryo
 
     void TypeChecker::visit(MemberAccessNode &node)
     {
+        std::cout << "[TypeChecker] Visiting MemberAccessNode: member='" << node.member() << "'" << std::endl;
+
         // Visit the object expression first
         if (node.object())
         {
@@ -2373,8 +2377,11 @@ namespace Cryo
                                       ? node.object()->type().value()
                                       : "unknown";
 
+        std::cout << "[TypeChecker] Member '" << node.member() << "' - object_type: '" << object_type << "'" << std::endl;
+
         if (object_type == "unknown")
         {
+            std::cout << "[TypeChecker] Object type is unknown, cannot resolve member access" << std::endl;
             node.set_type("unknown");
             return;
         }
@@ -2460,9 +2467,11 @@ namespace Cryo
         }
 
         // Look up field in struct field map
+        std::cout << "[TypeChecker] Looking up field '" << member_name << "' in struct '" << lookup_type << "'" << std::endl;
         auto struct_it = _struct_fields.find(lookup_type);
         if (struct_it != _struct_fields.end())
         {
+            std::cout << "[TypeChecker] Found struct '" << lookup_type << "' in _struct_fields with " << struct_it->second.size() << " fields" << std::endl;
             auto field_it = struct_it->second.find(member_name);
             if (field_it != struct_it->second.end())
             {
@@ -2470,8 +2479,21 @@ namespace Cryo
                 std::string field_type = field_it->second->to_string();
                 std::string resolved_type = substitute_generic_type(field_type, effective_type, lookup_type);
                 node.set_type(resolved_type);
+
+                // CRITICAL: Store the resolved Type* so Codegen can access it
+                node.set_resolved_type(field_it->second);
+                std::cout << "[TypeChecker] Set resolved type for member '" << member_name
+                          << "' of '" << lookup_type << "' to: " << field_it->second->to_string() << std::endl;
                 return;
             }
+            else
+            {
+                std::cout << "[TypeChecker] Field '" << member_name << "' NOT found in struct '" << lookup_type << "'" << std::endl;
+            }
+        }
+        else
+        {
+            std::cout << "[TypeChecker] Struct '" << lookup_type << "' NOT found in _struct_fields map" << std::endl;
         }
 
         // Look up method in struct method map
@@ -3915,6 +3937,46 @@ namespace Cryo
     {
         if (!lhs_type || !rhs_type)
             return false;
+
+        // Special case: void* can be implicitly converted to any pointer type
+        // NOTE: Due to type system issues, pointer types may report kind=Struct but have "*" in their name
+        std::string lhs_str = lhs_type->to_string();
+        std::string rhs_str = rhs_type->to_string();
+        bool lhs_looks_like_pointer = (!lhs_str.empty() && lhs_str.back() == '*');
+        bool rhs_looks_like_pointer = (!rhs_str.empty() && rhs_str.back() == '*');
+
+        if (rhs_looks_like_pointer && lhs_looks_like_pointer)
+        {
+            // Check if RHS is void*
+            if (rhs_str == "void*")
+            {
+                std::cout << "[TypeChecker] Allowing implicit conversion from void* to " << lhs_str << std::endl;
+                return true;
+            }
+        }
+
+        if (rhs_type->kind() == TypeKind::Pointer && lhs_type->kind() == TypeKind::Pointer)
+        {
+            std::cout << "[TypeChecker] Both types are pointers, checking for void* conversion" << std::endl;
+            auto rhs_ptr = static_cast<PointerType *>(rhs_type);
+            auto lhs_ptr = static_cast<PointerType *>(lhs_type);
+
+            // Check if RHS is void* (void pointer can convert to any pointer)
+            auto rhs_pointee = rhs_ptr->pointee_type();
+            std::cout << "[TypeChecker] RHS pointee type: " << (rhs_pointee ? rhs_pointee->to_string() : "NULL")
+                      << " (kind=" << (rhs_pointee ? std::to_string(static_cast<int>(rhs_pointee->kind())) : "N/A") << ")" << std::endl;
+
+            if (rhs_pointee && rhs_pointee->kind() == TypeKind::Void)
+            {
+                std::cout << "[TypeChecker] Allowing implicit conversion from void* to "
+                          << lhs_type->to_string() << std::endl;
+                return true;
+            }
+            else
+            {
+                std::cout << "[TypeChecker] RHS is not void*, cannot do implicit conversion" << std::endl;
+            }
+        }
 
         // Check if the assignment is valid
         bool is_assignable = lhs_type->is_assignable_from(*rhs_type);

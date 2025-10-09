@@ -514,7 +514,8 @@ namespace Cryo::Codegen
                     initializer, var_name);
 
                 _globals[var_name] = global_var;
-                _global_types[var_name] = llvm_type; // Store the type for later access
+                _global_types[var_name] = llvm_type;   // Store the type for later access
+                _variable_types[var_name] = cryo_type; // Store Cryo type for method lookup
                 register_value(&node, global_var);
             }
             else
@@ -877,16 +878,17 @@ namespace Cryo::Codegen
                         llvm::AllocaInst *this_alloca = _context_manager.get_builder().CreateAlloca(struct_ptr_type, nullptr, "this");
                         _context_manager.get_builder().CreateStore(&*param_arg_it, this_alloca);
                         _value_context->set_value("this", this_alloca, this_alloca, struct_ptr_type);
-                        
+
                         // Store the Cryo type for 'this' parameter
                         std::string struct_name = node.name();
                         Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(_symbol_table.get_type_context()->get_struct_type(struct_name));
-                        if (struct_cryo_type) {
+                        if (struct_cryo_type)
+                        {
                             // For 'this' in struct methods, we store the struct type (the pointer aspect is handled in member access)
                             _variable_types["this"] = struct_cryo_type;
                             std::cout << "[DEBUG] Stored 'this' parameter for struct '" << struct_name << "' with struct type" << std::endl;
                         }
-                        
+
                         ++param_arg_it;
                     }
 
@@ -1107,17 +1109,19 @@ namespace Cryo::Codegen
                         {
                             _context_manager.get_builder().CreateStore(&*arg_it, this_alloca);
                             _value_context->set_value("this", this_alloca, this_alloca, class_ptr_type);
-                            
+
                             // Store the Cryo type for 'this' parameter
-                            if (!class_name.empty()) {
+                            if (!class_name.empty())
+                            {
                                 Cryo::ClassType *class_cryo_type = static_cast<Cryo::ClassType *>(_symbol_table.get_type_context()->get_class_type(class_name));
-                                if (class_cryo_type) {
+                                if (class_cryo_type)
+                                {
                                     // For 'this' in class methods, we store the class type (the pointer aspect is handled in member access)
                                     _variable_types["this"] = class_cryo_type;
                                     std::cout << "[DEBUG] Stored 'this' parameter for class '" << class_name << "' with class type" << std::endl;
                                 }
                             }
-                            
+
                             std::cout << "[CodegenVisitor] 'this' parameter set up successfully for class method" << std::endl;
                         }
                         else
@@ -1143,7 +1147,7 @@ namespace Cryo::Codegen
                                 {
                                     _context_manager.get_builder().CreateStore(&*arg_it, param_alloca);
                                     _value_context->set_value(param_name, param_alloca, param_alloca, param_type);
-                                    
+
                                     // Store the Cryo type for member access resolution
                                     _variable_types[param_name] = cryo_param_type;
                                     std::cout << "[DEBUG] Stored parameter '" << param_name << "' with type: " << (cryo_param_type ? cryo_param_type->to_string() : "null") << std::endl;
@@ -3197,13 +3201,13 @@ namespace Cryo::Codegen
                 // For pointer types, get the pointed-to type
                 if (cryo_type->kind() == Cryo::TypeKind::Pointer)
                 {
-                    Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType*>(cryo_type);
+                    Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(cryo_type);
                     cryo_type = ptr_type->pointee_type().get();
                 }
-                
+
                 if (cryo_type->kind() == Cryo::TypeKind::Struct)
                 {
-                    Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType*>(cryo_type);
+                    Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(cryo_type);
                     type_name = struct_cryo_type->name();
                     struct_type = _type_mapper->map_type(cryo_type);
                     field_index = _type_mapper->get_field_index(type_name, member_name);
@@ -3430,11 +3434,12 @@ namespace Cryo::Codegen
 
         // Debug: Check field count vs requested index
         unsigned int actual_field_count = struct_type->getNumContainedTypes();
-        std::cout << "[CodegenVisitor] About to access field index " << field_index 
+        std::cout << "[CodegenVisitor] About to access field index " << field_index
                   << " in struct with " << actual_field_count << " fields" << std::endl;
-        
-        if (field_index >= actual_field_count) {
-            std::cout << "[ERROR] Field index " << field_index << " is out of range for struct with " 
+
+        if (field_index >= actual_field_count)
+        {
+            std::cout << "[ERROR] Field index " << field_index << " is out of range for struct with "
                       << actual_field_count << " fields!" << std::endl;
             return;
         }
@@ -3448,6 +3453,11 @@ namespace Cryo::Codegen
         llvm::Value *field_value = create_load(field_ptr, field_type, member_name + "_val");
 
         std::cout << "[CodegenVisitor] Successfully generated field access for: " << member_name << std::endl;
+
+        // IMPORTANT: Store BOTH the pointer (for method calls) and the value (for regular access)
+        // Store the field pointer with a special key so we can retrieve it for method calls
+        _value_context->set_value("__field_ptr_" + std::to_string(reinterpret_cast<uintptr_t>(&node)), field_ptr);
+
         register_value(&node, field_value);
         set_current_value(field_value); // Make sure the value is available for binary expressions
     }
@@ -3664,21 +3674,21 @@ namespace Cryo::Codegen
                         std::vector<llvm::Type *> param_types;
                         bool has_variadic = false;
                         std::cout << "[DEBUG] Function " << qualified_name << " has " << func_type->parameter_types().size() << " parameters" << std::endl;
-                        
+
                         for (size_t i = 0; i < func_type->parameter_types().size(); ++i)
                         {
                             const auto &param_type = func_type->parameter_types()[i];
                             std::cout << "[DEBUG] Processing parameter " << i << " for function " << qualified_name << std::endl;
                             std::cout << "[DEBUG] Parameter type pointer: " << param_type.get() << std::endl;
-                            
+
                             if (!param_type)
                             {
                                 std::cout << "[ERROR] Parameter " << i << " is null!" << std::endl;
                                 goto next_namespace_symbol;
                             }
-                            
+
                             std::cout << "[DEBUG] About to call kind() on parameter " << i << std::endl;
-                            
+
                             // Skip variadic parameters - they don't have concrete LLVM types
                             if (param_type->kind() == Cryo::TypeKind::Variadic)
                             {
@@ -4736,13 +4746,13 @@ namespace Cryo::Codegen
                             // For pointer types, get the pointed-to type
                             if (cryo_type->kind() == Cryo::TypeKind::Pointer)
                             {
-                                Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType*>(cryo_type);
+                                Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(cryo_type);
                                 cryo_type = ptr_type->pointee_type().get();
                             }
-                            
+
                             if (cryo_type->kind() == Cryo::TypeKind::Struct)
                             {
-                                Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType*>(cryo_type);
+                                Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(cryo_type);
                                 type_name = struct_cryo_type->name();
                                 struct_type = _type_mapper->map_type(cryo_type);
                                 std::cout << "[DEBUG] Member assignment using Cryo type tracking: var='" << var_name << "' type='" << type_name << "'" << std::endl;
@@ -4759,9 +4769,9 @@ namespace Cryo::Codegen
                         {
                             std::string base_var_name = base_identifier->name();
                             std::string nested_member_name = nested_member_access->member();
-                            
+
                             // For the specific case we're debugging: this.head.prev where:
-                            // - 'this' is HeapManager (or FreeListManager) 
+                            // - 'this' is HeapManager (or FreeListManager)
                             // - 'head' is HeapBlock*
                             // - 'prev' is on HeapBlock
                             if (base_var_name == "this" && nested_member_name == "head")
@@ -4770,7 +4780,8 @@ namespace Cryo::Codegen
                                 type_name = "HeapBlock";
                                 // Look up in registered types
                                 auto type_it = _types.find("HeapBlock");
-                                if (type_it != _types.end()) {
+                                if (type_it != _types.end())
+                                {
                                     struct_type = type_it->second;
                                 }
                                 std::cout << "[DEBUG] Chained member assignment detected this.head.* pattern, using HeapBlock type" << std::endl;
@@ -4786,22 +4797,23 @@ namespace Cryo::Codegen
                                     // For pointer types, get the pointed-to type
                                     if (base_cryo_type->kind() == Cryo::TypeKind::Pointer)
                                     {
-                                        Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType*>(base_cryo_type);
+                                        Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(base_cryo_type);
                                         base_cryo_type = ptr_type->pointee_type().get();
                                     }
-                                    
+
                                     if (base_cryo_type->kind() == Cryo::TypeKind::Struct)
                                     {
-                                        Cryo::StructType *base_struct_type = static_cast<Cryo::StructType*>(base_cryo_type);
+                                        Cryo::StructType *base_struct_type = static_cast<Cryo::StructType *>(base_cryo_type);
                                         std::string base_type_name = base_struct_type->name();
-                                        
+
                                         // If the base is HeapBlock, then both prev and next fields are HeapBlock*
                                         // so the chained access target is also HeapBlock
                                         if (base_type_name == "HeapBlock")
                                         {
                                             type_name = "HeapBlock";
                                             auto type_it = _types.find("HeapBlock");
-                                            if (type_it != _types.end()) {
+                                            if (type_it != _types.end())
+                                            {
                                                 struct_type = type_it->second;
                                             }
                                             std::cout << "[DEBUG] Chained member assignment detected " << base_var_name << "." << nested_member_name << ".* pattern, using HeapBlock type" << std::endl;
@@ -4816,106 +4828,106 @@ namespace Cryo::Codegen
                     if (struct_type == nullptr)
                     {
                         if (auto *argument = llvm::dyn_cast<llvm::Argument>(object_ptr))
-                    {
-                        // For function arguments (like 'this'), object_ptr is already the struct pointer
-                        llvm::Type *arg_type = argument->getType();
-                        if (arg_type->isPointerTy())
                         {
-                            // Look through registered types to find the struct
-                            for (const auto &[registered_name, registered_type] : _types)
+                            // For function arguments (like 'this'), object_ptr is already the struct pointer
+                            llvm::Type *arg_type = argument->getType();
+                            if (arg_type->isPointerTy())
                             {
-                                if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
+                                // Look through registered types to find the struct
+                                for (const auto &[registered_name, registered_type] : _types)
                                 {
-                                    llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
-                                    if (arg_type == expected_ptr_type)
+                                    if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
                                     {
-                                        struct_type = struct_llvm_type;
-                                        type_name = registered_name;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    else if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
-                    {
-                        // For stack-allocated objects, get the allocated type
-                        llvm::Type *allocated_type = alloca_inst->getAllocatedType();
-
-                        // Check if it's a pointer type (like 'this' parameters)
-                        if (allocated_type->isPointerTy())
-                        {
-                            // For pointer types, we need the pointed-to type
-                            for (const auto &[registered_name, registered_type] : _types)
-                            {
-                                if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
-                                {
-                                    llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
-                                    if (allocated_type == expected_ptr_type)
-                                    {
-                                        struct_type = struct_llvm_type;
-                                        type_name = registered_name;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        else if (llvm::isa<llvm::StructType>(allocated_type))
-                        {
-                            // Direct struct type
-                            struct_type = allocated_type;
-                        }
-                    }
-
-                    // Try global variable type lookup if we haven't found the struct type yet
-                    if (!struct_type && object_ptr)
-                    {
-                        if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(left_member_access->object()))
-                        {
-                            std::string var_name = identifier->name();
-                            auto global_type_it = _global_types.find(var_name);
-                            if (global_type_it != _global_types.end())
-                            {
-                                llvm::Type *global_type = global_type_it->second;
-                                if (llvm::isa<llvm::StructType>(global_type))
-                                {
-                                    // Direct struct type
-                                    struct_type = global_type;
-                                }
-                                else if (global_type->isPointerTy())
-                                {
-                                    // Pointer to struct type - need to find the pointed-to type
-                                    // Look through registered types to find the struct this points to
-                                    for (const auto &[registered_name, registered_type] : _types)
-                                    {
-                                        if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
+                                        llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
+                                        if (arg_type == expected_ptr_type)
                                         {
-                                            llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
-                                            if (global_type == expected_ptr_type)
+                                            struct_type = struct_llvm_type;
+                                            type_name = registered_name;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
+                        {
+                            // For stack-allocated objects, get the allocated type
+                            llvm::Type *allocated_type = alloca_inst->getAllocatedType();
+
+                            // Check if it's a pointer type (like 'this' parameters)
+                            if (allocated_type->isPointerTy())
+                            {
+                                // For pointer types, we need the pointed-to type
+                                for (const auto &[registered_name, registered_type] : _types)
+                                {
+                                    if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
+                                    {
+                                        llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
+                                        if (allocated_type == expected_ptr_type)
+                                        {
+                                            struct_type = struct_llvm_type;
+                                            type_name = registered_name;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            else if (llvm::isa<llvm::StructType>(allocated_type))
+                            {
+                                // Direct struct type
+                                struct_type = allocated_type;
+                            }
+                        }
+
+                        // Try global variable type lookup if we haven't found the struct type yet
+                        if (!struct_type && object_ptr)
+                        {
+                            if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(left_member_access->object()))
+                            {
+                                std::string var_name = identifier->name();
+                                auto global_type_it = _global_types.find(var_name);
+                                if (global_type_it != _global_types.end())
+                                {
+                                    llvm::Type *global_type = global_type_it->second;
+                                    if (llvm::isa<llvm::StructType>(global_type))
+                                    {
+                                        // Direct struct type
+                                        struct_type = global_type;
+                                    }
+                                    else if (global_type->isPointerTy())
+                                    {
+                                        // Pointer to struct type - need to find the pointed-to type
+                                        // Look through registered types to find the struct this points to
+                                        for (const auto &[registered_name, registered_type] : _types)
+                                        {
+                                            if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
                                             {
-                                                struct_type = struct_llvm_type;
-                                                type_name = registered_name;
-                                                break;
+                                                llvm::Type *expected_ptr_type = llvm::PointerType::getUnqual(struct_llvm_type);
+                                                if (global_type == expected_ptr_type)
+                                                {
+                                                    struct_type = struct_llvm_type;
+                                                    type_name = registered_name;
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Find the type name by matching the LLVM struct type against registered types
-                    if (struct_type && llvm::isa<llvm::StructType>(struct_type) && type_name.empty())
-                    {
-                        for (const auto &[registered_name, registered_type] : _types)
+                        // Find the type name by matching the LLVM struct type against registered types
+                        if (struct_type && llvm::isa<llvm::StructType>(struct_type) && type_name.empty())
                         {
-                            if (registered_type == struct_type)
+                            for (const auto &[registered_name, registered_type] : _types)
                             {
-                                type_name = registered_name;
-                                break;
+                                if (registered_type == struct_type)
+                                {
+                                    type_name = registered_name;
+                                    break;
+                                }
                             }
                         }
-                    }
                     } // End of LLVM type analysis fallback
 
                     // Use TypeMapper to get field information
@@ -6043,13 +6055,29 @@ namespace Cryo::Codegen
             }
 
             // Handle member access - could be namespaced calls or struct method calls
+
+            // Debug: Check what type the object is
+            std::cout << "[DEBUG] Checking member access object type for method: " << member_access->member() << std::endl;
+            if (dynamic_cast<IdentifierNode *>(member_access->object()))
+            {
+                std::cout << "[DEBUG]   Object is IdentifierNode" << std::endl;
+            }
+            else if (dynamic_cast<MemberAccessNode *>(member_access->object()))
+            {
+                std::cout << "[DEBUG]   Object is MemberAccessNode (NESTED ACCESS)" << std::endl;
+            }
+            else
+            {
+                std::cout << "[DEBUG]   Object is some other type" << std::endl;
+            }
+
             if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
             {
                 // This might be a struct method call like p.move(args...)
                 // Check if the object is a variable (struct instance)
                 std::string object_name = object_identifier->name();
                 std::cout << "[DEBUG] Member access with object identifier: '" << object_name << "'" << std::endl;
-                
+
                 llvm::Value *object_value = _value_context->get_value(object_name);
 
                 if (object_value && object_value->getType()->isPointerTy())
@@ -6072,12 +6100,12 @@ namespace Cryo::Codegen
                     else
                     {
                         std::cout << "[DEBUG] Type not found in _variable_types for: '" << object_name << "'" << std::endl;
-                        
+
                         // For 'this' parameter, try to determine the type from the LLVM type
                         if (object_name == "this" && object_value)
                         {
                             std::cout << "[DEBUG] Attempting to determine 'this' type from LLVM type" << std::endl;
-                            
+
                             // Try to get the class name from the pointer type
                             if (object_value->getType()->isPointerTy())
                             {
@@ -6100,7 +6128,7 @@ namespace Cryo::Codegen
                     if (!type_name.empty())
                     {
                         std::cout << "[DEBUG] About to build method name with type: '" << type_name << "', member: '" << member_access->member() << "'" << std::endl;
-                        
+
                         // Strip pointer asterisk from type name for method lookup
                         // Methods are registered with base type names (e.g., "HeapBlock") but variables
                         // are tracked with pointer types (e.g., "HeapBlock*")
@@ -6110,7 +6138,7 @@ namespace Cryo::Codegen
                             base_type_name.pop_back();
                             std::cout << "[DEBUG] Stripped pointer asterisk: '" << type_name << "' -> '" << base_type_name << "'" << std::endl;
                         }
-                        
+
                         // Look up the method function - include namespace context to match how methods are stored
                         std::string method_name;
                         if (!_namespace_context.empty())
@@ -6217,10 +6245,292 @@ namespace Cryo::Codegen
                 {
                     std::cout << "[DEBUG] Object value not found or not a pointer, object_name: '" << object_name << "'" << std::endl;
                     std::cout << "[DEBUG] object_value = " << (object_value ? "not null" : "null") << std::endl;
-                    if (object_value) {
+                    if (object_value)
+                    {
                         std::cout << "[DEBUG] object_value type is pointer: " << (object_value->getType()->isPointerTy() ? "yes" : "no") << std::endl;
                     }
+
+                    // CRITICAL FIX: Check if this is a global variable
+                    llvm::Value *global_value = module->getNamedGlobal(object_name);
+                    if (global_value)
+                    {
+                        std::cout << "[DEBUG] Found global variable: '" << object_name << "'" << std::endl;
+
+                        // Get the type of the global variable
+                        std::string type_name;
+                        auto type_it = _variable_types.find(object_name);
+                        if (type_it != _variable_types.end())
+                        {
+                            type_name = type_it->second ? type_it->second->to_string() : "";
+                            std::cout << "[DEBUG] Global variable type: '" << type_name << "'" << std::endl;
+                        }
+
+                        if (!type_name.empty())
+                        {
+                            // Strip pointer asterisk from type name for method lookup first
+                            std::string base_type_name = type_name;
+                            if (base_type_name.back() == '*')
+                            {
+                                base_type_name.pop_back();
+                            }
+
+                            // Load the global variable value
+                            // In LLVM 20, we need to get the value type from our type registry
+                            llvm::Type *value_type = nullptr;
+                            auto llvm_type_it = _types.find(base_type_name);
+                            if (llvm_type_it != _types.end())
+                            {
+                                value_type = llvm_type_it->second;
+                            }
+
+                            if (!value_type)
+                            {
+                                std::cerr << "[ERROR] Could not determine type for global variable: " << object_name << std::endl;
+                                function_name = extract_function_name_from_member_access(member_access);
+                                resolved_function_name = function_name;
+                                // Continue to avoid leaving function_name empty
+                            }
+                            else
+                            {
+                                // For method calls on global variables, we pass the pointer to the global
+                                // (the global variable itself is the pointer, we don't need to load it)
+
+                                // Build method name with namespace
+                                std::string method_name;
+                                if (!_namespace_context.empty())
+                                {
+                                    method_name = _namespace_context + "::" + base_type_name + "::" + member_access->member();
+                                }
+                                else
+                                {
+                                    method_name = base_type_name + "::" + member_access->member();
+                                }
+
+                                std::cout << "[DEBUG] Looking up global variable method: '" << method_name << "'" << std::endl;
+
+                                // Debug: List all functions starting with the class name
+                                std::cout << "[DEBUG] Available functions with prefix '" << base_type_name << "':" << std::endl;
+                                for (const auto &[func_name, func] : _functions)
+                                {
+                                    if (func_name.find(base_type_name) == 0)
+                                    {
+                                        std::cout << "[DEBUG]   - " << func_name << std::endl;
+                                    }
+                                }
+
+                                auto method_it = _functions.find(method_name);
+
+                                if (method_it != _functions.end())
+                                {
+                                    llvm::Function *method_func = method_it->second;
+                                    std::cout << "[DEBUG] Found method for global variable: " << method_name << std::endl;
+
+                                    // Debug: Print function signature
+                                    std::cout << "[DEBUG] Method function type: ";
+                                    method_func->getFunctionType()->print(llvm::outs());
+                                    std::cout << std::endl;
+                                    std::cout << "[DEBUG] Method has " << method_func->getFunctionType()->getNumParams() << " parameters" << std::endl;
+
+                                    // Prepare arguments: this pointer + method arguments
+                                    std::vector<llvm::Value *> args;
+                                    args.push_back(global_value); // Pass pointer to global variable as 'this'
+
+                                    // Generate method arguments
+                                    for (const auto &arg : node->arguments())
+                                    {
+                                        if (arg)
+                                        {
+                                            arg->accept(*this);
+                                            llvm::Value *arg_value = get_current_value();
+                                            if (arg_value)
+                                            {
+                                                args.push_back(arg_value);
+                                            }
+                                        }
+                                    }
+
+                                    // Call the method
+                                    std::cout << "[DEBUG] Calling global variable method with " << args.size() << " arguments" << std::endl;
+                                    return builder.CreateCall(method_func, args);
+                                }
+                                else
+                                {
+                                    std::cout << "[ERROR] Method not found for global variable: " << method_name << std::endl;
+                                    // Fall through to extract function name
+                                }
+                            }
+                        }
+                    }
+
+                    // If we get here, extract the function name normally
+                    function_name = extract_function_name_from_member_access(member_access);
+                    resolved_function_name = function_name;
                 }
+            }
+            else if (auto *nested_member_access = dynamic_cast<MemberAccessNode *>(member_access->object()))
+            {
+                // Handle nested member access like this.stats.record_allocation()
+                // We need to evaluate the nested access to get its type
+                std::cout << "[DEBUG] Found nested member access: object is also a MemberAccessNode" << std::endl;
+
+                // For nested member access, we need to get a pointer to pass as 'this'
+                // Example: this.stats.record_allocation()
+                // We need to find the type of 'this.stats' to build the correct method name
+
+                // Try to get the resolved type from TypeChecker first
+                Cryo::Type *nested_type = nested_member_access->get_resolved_type();
+
+                std::cout << "[DEBUG] Nested member access resolved type from TypeChecker: " << (nested_type ? nested_type->to_string() : "NULL") << std::endl;
+
+                // If TypeChecker didn't resolve it, we'll manually determine the type
+                if (!nested_type)
+                {
+                    std::cout << "[DEBUG] Manually determining nested type from base object and field" << std::endl;
+
+                    // For nested access like this.stats, we need to:
+                    // 1. Find the type of the base object (this)
+                    // 2. Look up the field type (stats) in that struct/class
+
+                    if (auto *base_identifier = dynamic_cast<IdentifierNode *>(nested_member_access->object()))
+                    {
+                        std::string base_name = base_identifier->name();
+                        std::cout << "[DEBUG] Base object name: '" << base_name << "'" << std::endl;
+
+                        // Look up the base object's type
+                        auto base_type_it = _variable_types.find(base_name);
+                        if (base_type_it != _variable_types.end() && base_type_it->second)
+                        {
+                            Cryo::Type *base_type = base_type_it->second;
+                            std::string base_type_name = base_type->to_string();
+                            std::cout << "[DEBUG] Base object type: '" << base_type_name << "'" << std::endl;
+
+                            // Strip pointer if present
+                            if (!base_type_name.empty() && base_type_name.back() == '*')
+                            {
+                                base_type_name.pop_back();
+                            }
+
+                            // Now look up the field type in the struct/class
+                            std::string field_name = nested_member_access->member();
+                            std::cout << "[DEBUG] Looking up field '" << field_name << "' in type '" << base_type_name << "'" << std::endl;
+
+                            // Look up the field in the symbol table
+                            std::string qualified_field_name = base_type_name + "::" + field_name;
+                            std::cout << "[DEBUG] Trying qualified lookup: '" << qualified_field_name << "'" << std::endl;
+
+                            auto field_symbol = _symbol_table.lookup_symbol(qualified_field_name);
+                            if (field_symbol)
+                            {
+                                std::cout << "[DEBUG] Found field symbol with kind: " << static_cast<int>(field_symbol->kind) << std::endl;
+
+                                // Get the field's type
+                                nested_type = field_symbol->data_type;
+                                if (nested_type)
+                                {
+                                    std::cout << "[DEBUG] Field type from symbol table: '" << nested_type->to_string() << "'" << std::endl;
+                                }
+                            }
+                            else
+                            {
+                                std::cout << "[DEBUG] Field symbol not found in symbol table" << std::endl;
+                                std::cout << "[ERROR] TypeChecker should have resolved field type for '" << field_name << "' in '" << base_type_name << "'" << std::endl;
+                            }
+                        }
+                    }
+                }
+
+                if (!nested_type)
+                {
+                    std::cout << "[DEBUG] Could not determine nested type, falling back to extraction" << std::endl;
+                    function_name = extract_function_name_from_member_access(member_access);
+                    resolved_function_name = function_name;
+                }
+                else if (nested_type)
+                {
+                    std::string nested_type_name = nested_type->to_string();
+                    std::cout << "[DEBUG] Nested object type: '" << nested_type_name << "'" << std::endl;
+
+                    // Strip pointer asterisk if present
+                    if (!nested_type_name.empty() && nested_type_name.back() == '*')
+                    {
+                        nested_type_name.pop_back();
+                    }
+
+                    // Build the method name with the nested object's type
+                    std::string method_name;
+                    if (!_namespace_context.empty())
+                    {
+                        method_name = _namespace_context + "::" + nested_type_name + "::" + member_access->member();
+                    }
+                    else
+                    {
+                        method_name = nested_type_name + "::" + member_access->member();
+                    }
+
+                    std::cout << "[DEBUG] Looking up nested method: '" << method_name << "'" << std::endl;
+                    auto method_it = _functions.find(method_name);
+
+                    if (method_it != _functions.end())
+                    {
+                        llvm::Function *method_func = method_it->second;
+                        std::cout << "[DEBUG] Found nested method: " << method_name << std::endl;
+
+                        // Now we need to generate a pointer to the nested object
+                        // Visit the nested member access to generate both value and pointer
+                        nested_member_access->accept(*this);
+
+                        // Try to get the field pointer (GEP result) instead of the loaded value
+                        std::string field_ptr_key = "__field_ptr_" + std::to_string(reinterpret_cast<uintptr_t>(nested_member_access));
+                        llvm::Value *nested_object_ptr = _value_context->get_value(field_ptr_key);
+
+                        if (!nested_object_ptr)
+                        {
+                            // Fallback to the regular generated value (for backwards compatibility)
+                            nested_object_ptr = get_generated_value(nested_member_access);
+                            std::cout << "[DEBUG] Using fallback generated value for nested object" << std::endl;
+                        }
+                        else
+                        {
+                            std::cout << "[DEBUG] Using field pointer for nested object method call" << std::endl;
+                        }
+
+                        std::cout << "[DEBUG] Generated nested object pointer: " << (nested_object_ptr ? "SUCCESS" : "FAIL") << std::endl;
+
+                        if (nested_object_ptr)
+                        {
+                            // Prepare arguments: this pointer + method arguments
+                            std::vector<llvm::Value *> args;
+                            args.push_back(nested_object_ptr); // 'this' pointer for the nested object
+
+                            // Generate method arguments
+                            for (const auto &arg : node->arguments())
+                            {
+                                if (arg)
+                                {
+                                    arg->accept(*this);
+                                    llvm::Value *arg_value = get_current_value();
+                                    if (arg_value)
+                                    {
+                                        args.push_back(arg_value);
+                                    }
+                                }
+                            }
+
+                            // Call the method
+                            std::cout << "[DEBUG] Calling nested method with " << args.size() << " arguments" << std::endl;
+                            return builder.CreateCall(method_func, args);
+                        }
+                    }
+                    else
+                    {
+                        std::cout << "[ERROR] Method not found for nested object: " << method_name << std::endl;
+                        // Fall through to extract function name
+                    }
+                }
+
+                // If we couldn't resolve it, fall back to extraction
+                function_name = extract_function_name_from_member_access(member_access);
+                resolved_function_name = function_name;
             }
             else
             {
@@ -6987,7 +7297,7 @@ namespace Cryo::Codegen
 
         std::string member_name = node->member();
         std::cout << "[DEBUG] extract_function_name_from_member_access: member name = '" << member_name << "'" << std::endl;
-        
+
         // For Std::Runtime::print_int, we want "print_int"
         // This is a simplified extraction - just get the final member name
         return member_name;
