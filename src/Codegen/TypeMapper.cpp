@@ -975,6 +975,24 @@ namespace Cryo::Codegen
                 }
                 else
                 {
+                    // Check if this struct should actually be an enum before creating empty struct
+                    if (_type_context && _type_context->lookup_enum_type(struct_name)) 
+                    {
+                        std::cout << "[TypeMapper] Detected struct '" << struct_name << "' should be enum, redirecting to enum type mapping" << std::endl;
+                        
+                        // Look up the actual enum type and redirect
+                        auto enum_type = _type_context->lookup_enum_type(struct_name);
+                        if (enum_type) 
+                        {
+                            // Remove the incorrectly cached struct type
+                            _struct_cache.erase(struct_name);
+                            
+                            // Cast to EnumType* and map as enum instead
+                            auto cryo_enum_type = static_cast<Cryo::EnumType*>(enum_type);
+                            return map_enum_type(cryo_enum_type);
+                        }
+                    }
+                    
                     std::cout << "[TypeMapper] No AST node found for struct: " << struct_name << ", creating empty struct" << std::endl;
                 }
             }

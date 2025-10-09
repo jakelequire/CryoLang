@@ -572,7 +572,7 @@ namespace Cryo
 
     Type *TypeContext::get_integer_type(IntegerKind kind, bool is_signed)
     {
-        std::cout << "[DEBUG] TypeContext::get_integer_type() called with kind=" << static_cast<int>(kind) << " is_signed=" << is_signed << std::endl;
+        std::cout << "[DEBUG] TypeContext::get_integer_type() called with kind=" << IntegerKindToString(kind) << " is_signed=" << is_signed << std::endl;
         
         // Validate the IntegerKind input to prevent corruption
         int kind_int = static_cast<int>(kind);
@@ -585,7 +585,7 @@ namespace Cryo
         
         // Create a hash key for the integer type
         int key = kind_int * 2 + (is_signed ? 0 : 1);
-        std::cout << "[DEBUG] TypeContext::get_integer_type() - calculated cache key=" << key << " (kind=" << kind_int << ", signed=" << is_signed << ")" << std::endl;
+        std::cout << "[DEBUG] TypeContext::get_integer_type() - calculated cache key=" << key << " (int_kind=" << IntegerKindToString(kind) << ", signed=" << is_signed << ")" << std::endl;
         std::cout << "[DEBUG] TypeContext::get_integer_type() - current cache size=" << _integer_types.size() << std::endl;
 
         auto it = _integer_types.find(key);
@@ -1485,6 +1485,16 @@ namespace Cryo
             return it->second.get();
         }
 
+        // Check if an enum type with this name already exists - if so, return the enum type
+        // This prevents creating struct types for names that should be enum types
+        Type *existing_enum = lookup_enum_type(name);
+        if (existing_enum)
+        {
+            std::cout << "[DEBUG] Attempted to create struct type for '" << name 
+                      << "' but enum type already exists - returning enum type instead" << std::endl;
+            return existing_enum;
+        }
+
         // Prevent creating struct types for built-in type names
         // This prevents accidental creation of struct types for primitive types like "u64"
         if (name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "int" ||
@@ -1549,6 +1559,16 @@ namespace Cryo
             std::cout << "[DEBUG] Found existing enum type for " << name
                       << " existing is_simple=" << it->second->is_simple_enum() << std::endl;
             return it->second.get();
+        }
+
+        // If there's a conflicting struct type with the same name, remove it
+        // This handles cases where struct types were created before enum types were available
+        auto struct_it = _struct_types.find(name);
+        if (struct_it != _struct_types.end())
+        {
+            std::cout << "[DEBUG] Removing conflicting struct type '" << name 
+                      << "' to make way for enum type" << std::endl;
+            _struct_types.erase(struct_it);
         }
 
         // Create new enum type

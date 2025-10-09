@@ -334,17 +334,15 @@ ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
 	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
 	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode --ir -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
-		echo "[RUNTIME] Compilation failed, creating stub file..." && \
-		echo "; Compilation failed for $*.cryo" > $(RUNTIME_BUILD_DIR)/$*.bc && \
-		echo "; Stub file created to satisfy build system" >> $(RUNTIME_BUILD_DIR)/$*.bc \
+		echo "[RUNTIME] Compilation failed for $*.cryo" && \
+		exit 1 \
 	)
 else
 	@mkdir -p $(dir $@)
 	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
 	@$(MAIN_BIN) $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(shell pwd)/$@ || ( \
-		echo "[RUNTIME] Compilation failed, creating stub file..." && \
-		echo "; Compilation failed for $*.cryo" > $@ && \
-		echo "; Stub file created to satisfy build system" >> $@ \
+		echo "[RUNTIME] Compilation failed for $*.cryo" && \
+		exit 1 \
 	)
 endif
 

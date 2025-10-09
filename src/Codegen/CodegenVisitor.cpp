@@ -6101,26 +6101,36 @@ namespace Cryo::Codegen
                     {
                         std::cout << "[DEBUG] About to build method name with type: '" << type_name << "', member: '" << member_access->member() << "'" << std::endl;
                         
+                        // Strip pointer asterisk from type name for method lookup
+                        // Methods are registered with base type names (e.g., "HeapBlock") but variables
+                        // are tracked with pointer types (e.g., "HeapBlock*")
+                        std::string base_type_name = type_name;
+                        if (base_type_name.back() == '*')
+                        {
+                            base_type_name.pop_back();
+                            std::cout << "[DEBUG] Stripped pointer asterisk: '" << type_name << "' -> '" << base_type_name << "'" << std::endl;
+                        }
+                        
                         // Look up the method function - include namespace context to match how methods are stored
                         std::string method_name;
                         if (!_namespace_context.empty())
                         {
-                            method_name = _namespace_context + "::" + type_name + "::" + member_access->member();
+                            method_name = _namespace_context + "::" + base_type_name + "::" + member_access->member();
                         }
                         else
                         {
-                            method_name = type_name + "::" + member_access->member();
+                            method_name = base_type_name + "::" + member_access->member();
                         }
 
                         std::cout << "[DEBUG] Built method name: '" << method_name << "'" << std::endl;
                         auto method_it = _functions.find(method_name);
 
                         // If not found and this is a generic type, try different lookup strategies
-                        if (method_it == _functions.end() && type_name.find('<') != std::string::npos)
+                        if (method_it == _functions.end() && base_type_name.find('<') != std::string::npos)
                         {
                             // First try: Convert angle bracket format to underscore format for monomorphized types
                             // GenericStruct<int> -> GenericStruct_int
-                            std::string monomorphized_name = type_name;
+                            std::string monomorphized_name = base_type_name;
                             size_t angle_start = monomorphized_name.find('<');
                             size_t angle_end = monomorphized_name.find('>', angle_start);
                             if (angle_start != std::string::npos && angle_end != std::string::npos)
@@ -6146,7 +6156,7 @@ namespace Cryo::Codegen
                             // Second try: Extract base type name for generic instantiation lookup fallback
                             if (method_it == _functions.end())
                             {
-                                std::string base_name = type_name.substr(0, type_name.find('<'));
+                                std::string base_name = base_type_name.substr(0, base_type_name.find('<'));
                                 std::string fallback_method_name = base_name + "::" + member_access->member();
                                 method_it = _functions.find(fallback_method_name);
                             }
@@ -6184,11 +6194,11 @@ namespace Cryo::Codegen
                         }
                         else
                         {
-                            std::cout << "[CodegenVisitor] Method not found: " << method_name << " for type: " << type_name << std::endl;
+                            std::cout << "[CodegenVisitor] Method not found: " << method_name << " for type: " << base_type_name << std::endl;
 
                             // For primitive types, use the fully qualified method name instead of just the member name
                             // This allows linking with precompiled primitive methods in libcryo.a
-                            if (is_primitive_type(type_name))
+                            if (is_primitive_type(base_type_name))
                             {
                                 std::cout << "[CodegenVisitor] Using qualified name for primitive method: " << method_name << std::endl;
                                 function_name = method_name;          // Use string::length instead of just length

@@ -3850,8 +3850,13 @@ namespace Cryo
             return generic_type;
         }
 
-        // If all else fails, return unknown type
-        std::cerr << "[Parser] WARNING: Could not resolve type '" << type_str << "', returning unknown type" << std::endl;
+        // For unresolved types that might be enums or structs defined later in the file,
+        // we'll return an unknown type and let the TypeChecker resolve it properly
+        // when all types are available during type checking phase
+        std::cerr << "[Parser] DEBUG: Could not resolve '" << type_str << "' during parsing, deferring to type checker" << std::endl;
+        
+        // Return unknown type - the TypeChecker will attempt to resolve it again during type checking
+        // when all enum and struct declarations have been processed
         return _context.types().get_unknown_type();
     }
 }
