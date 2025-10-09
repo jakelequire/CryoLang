@@ -428,7 +428,7 @@ namespace Cryo
         {
             if (i > 0)
                 oss << ", ";
-            
+
             // Avoid virtual function calls on potentially corrupted parameter types
             std::cerr << "[FunctionType] WARNING: Avoiding virtual function calls on parameter type at index " << i << " due to potential Type corruption, using 'void'" << std::endl;
             oss << "void";
@@ -439,7 +439,7 @@ namespace Cryo
                 oss << ", ";
             oss << "...";
         }
-        
+
         // Guard against null return type to prevent crashes
         if (_return_type == nullptr)
         {
@@ -448,36 +448,36 @@ namespace Cryo
         }
         else
         {
-            try 
+            try
             {
                 // Get the raw pointer and check if it's valid
-                Type* raw_ptr = _return_type.get();
-                if (raw_ptr == nullptr) 
+                Type *raw_ptr = _return_type.get();
+                if (raw_ptr == nullptr)
                 {
                     std::cerr << "[FunctionType] ERROR: shared_ptr is not null but get() returns null!" << std::endl;
                     oss << ") -> <bad_ptr>";
                 }
-                else 
+                else
                 {
                     // Additional safety check - try to read the virtual function table
                     // by checking if we can safely cast to a void*
-                    void* vptr_test = static_cast<void*>(raw_ptr);
-                    if (vptr_test == nullptr) 
+                    void *vptr_test = static_cast<void *>(raw_ptr);
+                    if (vptr_test == nullptr)
                     {
                         std::cerr << "[FunctionType] ERROR: Object pointer cast failed!" << std::endl;
                         oss << ") -> <cast_fail>";
                     }
-                    else 
+                    else
                     {
                         // Since we know the return type objects can be corrupted,
                         // and try-catch doesn't catch segmentation faults,
                         // let's just use a safe default to avoid crashes entirely
-                        std::string return_type_str = "void";  // Safe default
-                        
+                        std::string return_type_str = "void"; // Safe default
+
                         // Skip all virtual function calls to avoid segfaults
                         // This is a temporary workaround until the root cause is fixed
                         std::cerr << "[FunctionType] WARNING: Avoiding virtual function calls due to potential Type corruption, using 'void'" << std::endl;
-                        
+
                         oss << ") -> " << return_type_str;
                     }
                 }
@@ -624,16 +624,17 @@ namespace Cryo
     Type *TypeContext::get_integer_type(IntegerKind kind, bool is_signed)
     {
         std::cout << "[DEBUG] TypeContext::get_integer_type() called with kind=" << IntegerKindToString(kind) << " is_signed=" << is_signed << std::endl;
-        
+
         // Validate the IntegerKind input to prevent corruption
         int kind_int = static_cast<int>(kind);
-        if (kind_int < 0 || kind_int > static_cast<int>(IntegerKind::UInt)) {
+        if (kind_int < 0 || kind_int > static_cast<int>(IntegerKind::UInt))
+        {
             std::cout << "[ERROR] TypeContext::get_integer_type() - invalid IntegerKind: " << kind_int << std::endl;
             // Default to a safe integer type
             kind = IntegerKind::I32;
             kind_int = static_cast<int>(kind);
         }
-        
+
         // Create a hash key for the integer type
         int key = kind_int * 2 + (is_signed ? 0 : 1);
         std::cout << "[DEBUG] TypeContext::get_integer_type() - calculated cache key=" << key << " (int_kind=" << IntegerKindToString(kind) << ", signed=" << is_signed << ")" << std::endl;
@@ -644,15 +645,21 @@ namespace Cryo
         {
             std::cout << "[DEBUG] TypeContext::get_integer_type() - found cached type, pointer=" << it->second.get() << std::endl;
             // Validate cached type before returning
-            try {
+            try
+            {
                 auto cached_type = it->second.get();
-                if (cached_type && cached_type->kind() == TypeKind::Integer) {
+                if (cached_type && cached_type->kind() == TypeKind::Integer)
+                {
                     return cached_type;
-                } else {
+                }
+                else
+                {
                     std::cout << "[ERROR] TypeContext::get_integer_type() - cached type is corrupted, recreating" << std::endl;
                     _integer_types.erase(it);
                 }
-            } catch (...) {
+            }
+            catch (...)
+            {
                 std::cout << "[ERROR] TypeContext::get_integer_type() - cached type validation failed, recreating" << std::endl;
                 _integer_types.erase(it);
             }
@@ -660,35 +667,40 @@ namespace Cryo
 
         // Create new integer type with additional validation
         std::cout << "[DEBUG] TypeContext::get_integer_type() - creating new IntegerType" << std::endl;
-        
+
         // Validate construction parameters one more time
-        if (kind_int < 0 || kind_int > static_cast<int>(IntegerKind::UInt)) {
+        if (kind_int < 0 || kind_int > static_cast<int>(IntegerKind::UInt))
+        {
             std::cout << "[ERROR] TypeContext::get_integer_type() - refusing to create type with invalid kind" << std::endl;
             return nullptr;
         }
-        
+
         auto int_type = std::make_unique<IntegerType>(kind, is_signed);
         Type *result = int_type.get();
         std::cout << "[DEBUG] TypeContext::get_integer_type() - created IntegerType, pointer=" << result << std::endl;
         std::cout << "[DEBUG] TypeContext::get_integer_type() - about to test kind() method on new type" << std::endl;
-        
+
         // Test the new type before storing it
-        try {
+        try
+        {
             auto test_kind = result->kind();
             std::cout << "[DEBUG] TypeContext::get_integer_type() - kind() test passed, kind=" << TypeKindToString(test_kind) << " (" << static_cast<int>(test_kind) << ")" << std::endl;
-            
+
             // Additional validation - ensure the name was properly set
             auto test_name = result->name();
-            if (test_name.empty()) {
+            if (test_name.empty())
+            {
                 std::cout << "[ERROR] TypeContext::get_integer_type() - type name is empty, possible constructor issue" << std::endl;
                 return nullptr;
             }
             std::cout << "[DEBUG] TypeContext::get_integer_type() - name validation passed: '" << test_name << "'" << std::endl;
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::cout << "[ERROR] TypeContext::get_integer_type() - type validation failed!" << std::endl;
             return nullptr;
         }
-        
+
         _integer_types[key] = std::move(int_type);
         std::cout << "[DEBUG] TypeContext::get_integer_type() - stored in cache with key=" << key << ", cache size now=" << _integer_types.size() << std::endl;
 
@@ -715,31 +727,36 @@ namespace Cryo
 
     Type *TypeContext::create_array_type(Type *element_type, std::optional<size_t> size)
     {
-        if (!element_type) {
+        if (!element_type)
+        {
             std::cout << "[ERROR] TypeContext::create_array_type() - null element type" << std::endl;
             return nullptr;
         }
-        
+
         // Generate a unique key for array type caching
         std::string array_key = element_type->name() + "[]";
-        if (size.has_value()) {
+        if (size.has_value())
+        {
             array_key = element_type->name() + "[" + std::to_string(*size) + "]";
         }
-        
+
         // Check if we already have this array type (simple name-based check)
-        for (const auto& existing_type : _complex_types) {
-            if (existing_type->name() == array_key) {
+        for (const auto &existing_type : _complex_types)
+        {
+            if (existing_type->name() == array_key)
+            {
                 std::cout << "[DEBUG] TypeContext::create_array_type() - found cached array type: " << array_key << std::endl;
                 return existing_type.get();
             }
         }
-        
+
         // Create a non-owning shared_ptr since TypeContext manages the lifetime
         // This is safe because element_type is guaranteed to live as long as TypeContext
-        std::shared_ptr<Type> element_shared(element_type, [](Type*) {
-            // Non-deleting deleter - TypeContext owns the element type
-        });
-        
+        std::shared_ptr<Type> element_shared(element_type, [](Type *)
+                                             {
+                                                 // Non-deleting deleter - TypeContext owns the element type
+                                             });
+
         auto array_type = std::make_unique<ArrayType>(element_shared, size);
 
         Type *result = array_type.get();
@@ -751,28 +768,32 @@ namespace Cryo
 
     Type *TypeContext::create_pointer_type(Type *pointee_type)
     {
-        if (!pointee_type) {
+        if (!pointee_type)
+        {
             std::cout << "[ERROR] TypeContext::create_pointer_type() - null pointee type" << std::endl;
             return nullptr;
         }
-        
+
         // Generate the pointer type name (automatically set by PointerType constructor)
         std::string pointer_key = pointee_type->name() + "*";
-        
+
         // Check if we already have this pointer type (simple name-based check)
-        for (const auto& existing_type : _complex_types) {
-            if (existing_type->name() == pointer_key) {
+        for (const auto &existing_type : _complex_types)
+        {
+            if (existing_type->name() == pointer_key)
+            {
                 std::cout << "[DEBUG] TypeContext::create_pointer_type() - found cached pointer type: " << pointer_key << std::endl;
                 return existing_type.get();
             }
         }
-        
+
         // Create a non-owning shared_ptr since TypeContext manages the lifetime
         // This is safe because pointee_type is guaranteed to live as long as TypeContext
-        std::shared_ptr<Type> pointee_shared(pointee_type, [](Type*) {
-            // Non-deleting deleter - TypeContext owns the pointee type
-        });
-        
+        std::shared_ptr<Type> pointee_shared(pointee_type, [](Type *)
+                                             {
+                                                 // Non-deleting deleter - TypeContext owns the pointee type
+                                             });
+
         auto pointer_type = std::make_unique<PointerType>(pointee_shared);
 
         Type *result = pointer_type.get();
@@ -878,7 +899,7 @@ namespace Cryo
             return get_char_type();
         case TokenKind::TK_KW_STRING:
             return get_string_type();
-        
+
         // Integer types
         case TokenKind::TK_KW_I8:
             return get_i8_type();
@@ -890,7 +911,7 @@ namespace Cryo
             return get_i64_type();
         case TokenKind::TK_KW_INT:
             return get_int_type();
-            
+
         // Unsigned integer types
         case TokenKind::TK_KW_UINT8:
             return get_u8_type();
@@ -902,7 +923,7 @@ namespace Cryo
             return get_u64_type();
         case TokenKind::TK_KW_UINT:
             return get_integer_type(IntegerKind::UInt, false);
-            
+
         // Float types
         case TokenKind::TK_KW_F32:
             return get_f32_type();
@@ -912,13 +933,13 @@ namespace Cryo
             return get_default_float_type();
         case TokenKind::TK_KW_DOUBLE:
             return get_f64_type(); // double is alias for f64
-            
+
         // Special types
         case TokenKind::TK_KW_AUTO:
             return get_auto_type();
         case TokenKind::TK_KW_NULL:
             return get_null_type();
-            
+
         default:
             return nullptr; // Not a primitive type token
         }
@@ -929,19 +950,19 @@ namespace Cryo
         // Expect: <base_type> '*'
         if (index >= tokens.size())
             return nullptr;
-            
+
         // Parse the base type first
         Type *base_type = parse_type_from_token_stream(tokens, index);
         if (!base_type)
             return nullptr;
-            
+
         // Check for '*' token
         if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
         {
             ++index; // consume '*'
             return create_pointer_type(base_type);
         }
-        
+
         // Not a pointer type, return the base type
         return base_type;
     }
@@ -951,19 +972,19 @@ namespace Cryo
         // Expect: <element_type> '[' [size] ']'
         if (index >= tokens.size())
             return nullptr;
-            
-        // Parse the element type first  
+
+        // Parse the element type first
         Type *element_type = parse_type_from_token_stream(tokens, index);
         if (!element_type)
             return nullptr;
-            
+
         // Check for '[' token
         if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
         {
             ++index; // consume '['
-            
+
             std::optional<size_t> array_size;
-            
+
             // Check for size (optional)
             if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
             {
@@ -972,17 +993,17 @@ namespace Cryo
                 array_size = std::stoull(size_str);
                 ++index; // consume size
             }
-            
+
             // Expect ']'
             if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
             {
                 ++index; // consume ']'
                 return create_array_type(element_type, array_size);
             }
-            
+
             return nullptr; // Malformed array type
         }
-        
+
         // Not an array type, return the element type
         return element_type;
     }
@@ -991,15 +1012,15 @@ namespace Cryo
     {
         if (index >= tokens.size())
             return nullptr;
-            
+
         const Token &current_token = tokens[index];
-        
+
         // Try primitive types first
         Type *primitive_type = parse_primitive_type_from_token(current_token.kind());
         if (primitive_type)
         {
             ++index; // consume the primitive type token
-            
+
             // Handle pointer modifiers directly here
             Type *result_type = primitive_type;
             while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
@@ -1007,12 +1028,12 @@ namespace Cryo
                 ++index; // consume '*'
                 result_type = create_pointer_type(result_type);
             }
-            
+
             // Handle array modifiers
             while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
             {
                 ++index; // consume '['
-                
+
                 std::optional<size_t> array_size;
                 if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
                 {
@@ -1020,7 +1041,7 @@ namespace Cryo
                     array_size = std::stoull(size_str);
                     ++index; // consume size
                 }
-                
+
                 // Expect ']'
                 if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
                 {
@@ -1032,93 +1053,115 @@ namespace Cryo
                     return nullptr; // Malformed array type
                 }
             }
-            
+
             return result_type;
         }
-        
+
         // Handle identifiers (user-defined types, generic parameters)
         if (current_token.kind() == TokenKind::TK_IDENTIFIER)
         {
             std::string type_name = std::string(current_token.text());
             ++index; // consume identifier
-            
+
             // Check for generic instantiation: Type<T, U>
             if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_ANGLE)
             {
                 return parse_generic_type_from_tokens(tokens, index);
             }
-            
+
             // First check if it's a primitive type (to avoid creating incorrect ClassType)
-            if (type_name == "u8") return get_u8_type();
-            if (type_name == "u16") return get_u16_type();
-            if (type_name == "u32") return get_u32_type();
-            if (type_name == "u64") return get_u64_type();
-            if (type_name == "i8") return get_i8_type();
-            if (type_name == "i16") return get_i16_type();
-            if (type_name == "i32") return get_i32_type();
-            if (type_name == "i64") return get_i64_type();
-            if (type_name == "f32") return get_f32_type();
-            if (type_name == "f64") return get_f64_type();
-            if (type_name == "boolean") return get_boolean_type();
-            if (type_name == "string") return get_string_type();
-            if (type_name == "void") return get_void_type();
-            
+            if (type_name == "u8")
+                return get_u8_type();
+            if (type_name == "u16")
+                return get_u16_type();
+            if (type_name == "u32")
+                return get_u32_type();
+            if (type_name == "u64")
+                return get_u64_type();
+            if (type_name == "i8")
+                return get_i8_type();
+            if (type_name == "i16")
+                return get_i16_type();
+            if (type_name == "i32")
+                return get_i32_type();
+            if (type_name == "i64")
+                return get_i64_type();
+            if (type_name == "f32")
+                return get_f32_type();
+            if (type_name == "f64")
+                return get_f64_type();
+            if (type_name == "boolean")
+                return get_boolean_type();
+            if (type_name == "string")
+                return get_string_type();
+            if (type_name == "void")
+                return get_void_type();
+
             // Simple user-defined type
             // Try struct, class, enum, trait types
             Type *user_type = get_struct_type(type_name);
-            if (user_type && user_type->kind() != TypeKind::Unknown) {
+            if (user_type && user_type->kind() != TypeKind::Unknown)
+            {
                 // Handle pointer modifiers for user-defined types
                 Type *result_type = user_type;
-                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
+                {
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
                 return result_type;
             }
-                
+
             user_type = get_class_type(type_name);
-            if (user_type && user_type->kind() != TypeKind::Unknown) {
+            if (user_type && user_type->kind() != TypeKind::Unknown)
+            {
                 // Handle pointer modifiers for user-defined types
                 Type *result_type = user_type;
-                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
+                {
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
                 return result_type;
             }
-                
+
             user_type = lookup_enum_type(type_name);
-            if (user_type) {
+            if (user_type)
+            {
                 // Handle pointer modifiers for user-defined types
                 Type *result_type = user_type;
-                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
+                {
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
                 return result_type;
             }
-                
+
             user_type = get_trait_type(type_name);
-            if (user_type && user_type->kind() != TypeKind::Unknown) {
+            if (user_type && user_type->kind() != TypeKind::Unknown)
+            {
                 // Handle pointer modifiers for user-defined types
                 Type *result_type = user_type;
-                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
+                {
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
                 return result_type;
             }
-                
+
             // Generic parameter - also handle pointers
             Type *generic_type = get_generic_type(type_name);
             Type *result_type = generic_type;
-            while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR) {
+            while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
+            {
                 ++index; // consume '*'
                 result_type = create_pointer_type(result_type);
             }
             return result_type;
         }
-        
+
         return nullptr; // Unable to parse type
     }
 
@@ -1127,9 +1170,9 @@ namespace Cryo
         // Tokenize the current type expression from lexer
         std::vector<Token> tokens;
         Token current_token = lexer.next_token();
-        
+
         // Collect tokens until we hit a delimiter or EOF
-        while (!current_token.is_eof() && 
+        while (!current_token.is_eof() &&
                current_token.kind() != TokenKind::TK_SEMICOLON &&
                current_token.kind() != TokenKind::TK_COMMA &&
                current_token.kind() != TokenKind::TK_R_PAREN &&
@@ -1138,7 +1181,7 @@ namespace Cryo
             tokens.push_back(current_token);
             current_token = lexer.next_token();
         }
-        
+
         // Parse the collected tokens
         size_t index = 0;
         return parse_type_from_token_stream(tokens, index);
@@ -1541,7 +1584,7 @@ namespace Cryo
         Type *existing_enum = lookup_enum_type(name);
         if (existing_enum)
         {
-            std::cout << "[DEBUG] Attempted to create struct type for '" << name 
+            std::cout << "[DEBUG] Attempted to create struct type for '" << name
                       << "' but enum type already exists - returning enum type instead" << std::endl;
             return existing_enum;
         }
@@ -1566,10 +1609,29 @@ namespace Cryo
         return result;
     }
 
+    Type *TypeContext::lookup_struct_type(const std::string &name)
+    {
+        auto it = _struct_types.find(name);
+        if (it != _struct_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Check if an enum type with this name exists
+        Type *existing_enum = lookup_enum_type(name);
+        if (existing_enum)
+        {
+            return existing_enum;
+        }
+
+        // Return null if not found - don't create
+        return nullptr;
+    }
+
     Type *TypeContext::get_class_type(const std::string &name)
     {
         std::cout << "[DEBUG] TypeContext::get_class_type() called with name='" << name << "'" << std::endl;
-        
+
         auto it = _class_types.find(name);
         if (it != _class_types.end())
         {
@@ -1578,7 +1640,7 @@ namespace Cryo
         }
 
         std::cout << "[DEBUG] TypeContext::get_class_type() - creating new class type for '" << name << "'" << std::endl;
-        
+
         // Create new class type
         auto class_type = std::make_unique<ClassType>(name);
         Type *result = class_type.get();
@@ -1623,7 +1685,7 @@ namespace Cryo
         auto struct_it = _struct_types.find(name);
         if (struct_it != _struct_types.end())
         {
-            std::cout << "[DEBUG] Removing conflicting struct type '" << name 
+            std::cout << "[DEBUG] Removing conflicting struct type '" << name
                       << "' to make way for enum type" << std::endl;
             _struct_types.erase(struct_it);
         }
@@ -1675,7 +1737,7 @@ namespace Cryo
                                                        std::unique_ptr<EnumLayout> layout_template)
     {
         std::string base_name = ParameterizedType::get_base_name_from_kind(enum_type_kind);
-        
+
         // Create enum variants based on layout pattern
         std::vector<EnumVariant> variants;
 
@@ -1697,12 +1759,18 @@ namespace Cryo
     // Helper function to convert string base names to TypeKind
     TypeKind TypeContext::get_parameterized_type_kind(const std::string &base_name)
     {
-        if (base_name == "Option") return TypeKind::OptionType;
-        if (base_name == "Result") return TypeKind::ResultType;
-        if (base_name == "Array") return TypeKind::ArrayType;
-        if (base_name == "Vector") return TypeKind::VectorType;
-        if (base_name == "ptr") return TypeKind::PtrType;
-        if (base_name == "const_ptr") return TypeKind::ConstPtrType;
+        if (base_name == "Option")
+            return TypeKind::OptionType;
+        if (base_name == "Result")
+            return TypeKind::ResultType;
+        if (base_name == "Array")
+            return TypeKind::ArrayType;
+        if (base_name == "Vector")
+            return TypeKind::VectorType;
+        if (base_name == "ptr")
+            return TypeKind::PtrType;
+        if (base_name == "const_ptr")
+            return TypeKind::ConstPtrType;
         // Default to generic parameterized type
         return TypeKind::Parameterized;
     }
@@ -1717,7 +1785,7 @@ namespace Cryo
     {
         // Convert base name to TypeKind
         TypeKind param_kind = get_parameterized_type_kind(base_name);
-        
+
         // Convert args to shared_ptr
         std::vector<std::shared_ptr<Type>> shared_args;
         for (auto *arg : args)
@@ -1727,7 +1795,7 @@ namespace Cryo
 
         // Create appropriate specialized type based on pattern
         std::unique_ptr<ParameterizedType> instantiation;
-        
+
         if (is_enum_pattern_type(param_kind))
         {
             // Create enum-specific type
@@ -2091,7 +2159,7 @@ namespace Cryo
     std::vector<ParameterizedEnumType::FieldLayout> ParameterizedEnumType::get_enum_field_layout() const
     {
         std::vector<FieldLayout> layout;
-        
+
         if (!_base_enum_type)
         {
             return layout; // Empty layout if no base enum
@@ -2103,7 +2171,7 @@ namespace Cryo
         {
             // Option<T> layout: discriminant (1 byte) + value (T bytes, if Some)
             layout.push_back({"discriminant", std::make_shared<IntegerType>(IntegerKind::U8, false), 0, 1});
-            
+
             if (!_type_params.empty())
             {
                 size_t value_offset = 1; // After discriminant
@@ -2115,7 +2183,7 @@ namespace Cryo
         {
             // Result<T,E> layout: discriminant + union of T and E
             layout.push_back({"discriminant", std::make_shared<IntegerType>(IntegerKind::U8, false), 0, 1});
-            
+
             if (_type_params.size() >= 2)
             {
                 size_t value_offset = 1;
@@ -2137,19 +2205,19 @@ namespace Cryo
     {
         if (!has_discriminant())
             return 0;
-        
+
         return _base_enum_type->get_discriminant_size();
     }
 
     std::vector<std::shared_ptr<Type>> ParameterizedEnumType::get_data_field_types() const
     {
         std::vector<std::shared_ptr<Type>> field_types;
-        
+
         for (const auto &param : _type_params)
         {
             field_types.push_back(param);
         }
-        
+
         return field_types;
     }
 
@@ -2166,7 +2234,7 @@ namespace Cryo
         }
 
         size_t total_size = 0;
-        
+
         // Add discriminant size
         if (has_discriminant())
         {
@@ -2204,12 +2272,12 @@ namespace Cryo
             return 1;
 
         size_t max_align = get_discriminant_size(); // Discriminant alignment
-        
+
         for (const auto &param : _type_params)
         {
             max_align = std::max(max_align, param->alignment());
         }
-        
+
         return max_align;
     }
 

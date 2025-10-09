@@ -880,7 +880,8 @@ namespace Cryo
                 std::cout << "[DEBUG] TypeChecker: Looking for type alias '" << base_type << "' in symbol table..." << std::endl;
                 TypedSymbol *alias_symbol = _symbol_table->lookup_symbol(base_type);
                 std::cout << "[DEBUG] TypeChecker: Symbol lookup result: " << (alias_symbol ? "found" : "not found") << std::endl;
-                if (alias_symbol && alias_symbol->type) {
+                if (alias_symbol && alias_symbol->type)
+                {
                     std::cout << "[DEBUG] TypeChecker: Symbol type kind: " << static_cast<int>(alias_symbol->type->kind()) << std::endl;
                 }
                 if (alias_symbol && alias_symbol->type && alias_symbol->type->kind() == TypeKind::TypeAlias)
@@ -1009,26 +1010,26 @@ namespace Cryo
 
         // Try TypeContext's token-based type parsing as fallback
         std::cout << "[DEBUG] TypeChecker: Not found in main symbols, checking TypeContext token-based parsing..." << std::endl;
-        
+
         // Create a lexer from the type string for token-based parsing
         Lexer type_lexer(type_string);
-        
+
         Type *parsed_type = _type_context.parse_type_from_tokens(type_lexer);
         if (parsed_type && parsed_type->kind() != TypeKind::Unknown)
         {
-            std::cout << "[DEBUG] TypeChecker: Successfully parsed '" << type_string 
+            std::cout << "[DEBUG] TypeChecker: Successfully parsed '" << type_string
                       << "' via TypeContext (token-based parsing)" << std::endl;
             return parsed_type;
         }
 
         // Check namespaces
         std::cout << "[DEBUG] TypeChecker: Not found in main symbols, checking namespaces..." << std::endl;
-        
+
         // Final fallback - use symbol table to search any namespace
         TypedSymbol *symbol = _symbol_table->lookup_symbol_in_any_namespace(type_string);
         if (symbol && symbol->type)
         {
-            std::cout << "[DEBUG] TypeChecker: Found '" << type_string 
+            std::cout << "[DEBUG] TypeChecker: Found '" << type_string
                       << "' in namespaces" << std::endl;
             return symbol->type;
         }
@@ -1044,7 +1045,7 @@ namespace Cryo
     Type *TypeChecker::resolve_type_from_tokens(Lexer &lexer)
     {
         std::cout << "[DEBUG] TypeChecker: Using token-based type resolution" << std::endl;
-        
+
         // Delegate to TypeContext's token-based parsing
         Type *parsed_type = _type_context.parse_type_from_tokens(lexer);
         if (parsed_type)
@@ -1052,7 +1053,7 @@ namespace Cryo
             std::cout << "[DEBUG] TypeChecker: Successfully resolved type via tokens" << std::endl;
             return parsed_type;
         }
-        
+
         std::cout << "[DEBUG] TypeChecker: Token-based parsing failed" << std::endl;
         return nullptr;
     }
@@ -1060,7 +1061,7 @@ namespace Cryo
     Type *TypeChecker::resolve_type_from_token_stream(const std::vector<Token> &tokens, size_t &index)
     {
         std::cout << "[DEBUG] TypeChecker: Using token stream type resolution" << std::endl;
-        
+
         // Delegate to TypeContext's token stream parsing
         Type *parsed_type = _type_context.parse_type_from_token_stream(tokens, index);
         if (parsed_type)
@@ -1068,7 +1069,7 @@ namespace Cryo
             std::cout << "[DEBUG] TypeChecker: Successfully resolved type via token stream" << std::endl;
             return parsed_type;
         }
-        
+
         std::cout << "[DEBUG] TypeChecker: Token stream parsing failed" << std::endl;
         return nullptr;
     }
@@ -2121,9 +2122,10 @@ namespace Cryo
 
             // Get the callee's resolved type directly
             Type *callee_type = node.callee()->get_resolved_type();
-            
+
             // If callee type is not resolved, fall back to unknown
-            if (!callee_type) {
+            if (!callee_type)
+            {
                 report_error(TypeError::ErrorKind::NonCallableType, node.location(),
                              "Cannot determine type of expression being called");
                 node.set_type(_type_context.get_unknown_type()->to_string());
@@ -3570,12 +3572,43 @@ namespace Cryo
 
         // Get field type from resolved type (avoid deprecated string methods)
         Type *field_type = node.get_resolved_type();
-        std::string field_type_str = field_type ? field_type->name() : "unknown";
+        std::string field_type_str = "unknown";
+
+        // CRITICAL: Safely get type name - the pointer might be corrupt
+        if (field_type)
+        {
+            try
+            {
+                field_type_str = field_type->name();
+            }
+            catch (...)
+            {
+                std::cerr << "[TypeChecker] ERROR: Corrupt type pointer for field '" << field_name
+                          << "', attempting to re-resolve from annotation" << std::endl;
+                field_type = nullptr; // Mark as needing resolution
+            }
+        }
+
+        // If field type is unknown or corrupt, try to resolve it from the type annotation
+        if (!field_type || field_type->kind() == TypeKind::Unknown || field_type_str.empty())
+        {
+            std::string type_annotation = node.type_annotation();
+            std::cout << "[TypeChecker] Re-resolving field '" << field_name
+                      << "' type from annotation: " << type_annotation << std::endl;
+
+            field_type = resolve_type_with_generic_context(type_annotation);
+            if (field_type && field_type->kind() != TypeKind::Unknown)
+            {
+                node.set_resolved_type(field_type);
+                field_type_str = field_type->name();
+                std::cout << "[TypeChecker] Successfully re-resolved field type to: " << field_type_str << std::endl;
+            }
+        }
 
         // Debug: Check generic context state when processing struct fields
-        std::cout << "[DEBUG] Processing struct field '" << field_name 
-                  << "' with resolved type: " << field_type_str 
-                  << ", is_in_generic_context: " << is_in_generic_context() 
+        std::cout << "[DEBUG] Processing struct field '" << field_name
+                  << "' with resolved type: " << field_type_str
+                  << ", is_in_generic_context: " << is_in_generic_context()
                   << ", generic_context_stack_size: " << _generic_context_stack.size() << std::endl;
 
         if (field_type && field_type->kind() != TypeKind::Unknown)
@@ -4122,63 +4155,87 @@ namespace Cryo
     Type *TypeChecker::lookup_type_by_name(const std::string &type_name)
     {
         // Handle basic types using TypeContext specific methods
-        if (type_name == "void") return _type_context.get_void_type();
-        if (type_name == "boolean") return _type_context.get_boolean_type();
-        if (type_name == "char") return _type_context.get_char_type();
-        if (type_name == "string") return _type_context.get_string_type();
+        if (type_name == "void")
+            return _type_context.get_void_type();
+        if (type_name == "boolean")
+            return _type_context.get_boolean_type();
+        if (type_name == "char")
+            return _type_context.get_char_type();
+        if (type_name == "string")
+            return _type_context.get_string_type();
 
         // Integer types
-        if (type_name == "i8") return _type_context.get_i8_type();
-        if (type_name == "i16") return _type_context.get_i16_type();
-        if (type_name == "i32") return _type_context.get_i32_type();
-        if (type_name == "i64") return _type_context.get_i64_type();
-        if (type_name == "int") return _type_context.get_int_type();
+        if (type_name == "i8")
+            return _type_context.get_i8_type();
+        if (type_name == "i16")
+            return _type_context.get_i16_type();
+        if (type_name == "i32")
+            return _type_context.get_i32_type();
+        if (type_name == "i64")
+            return _type_context.get_i64_type();
+        if (type_name == "int")
+            return _type_context.get_int_type();
 
         // Unsigned integer types
-        if (type_name == "u8") return _type_context.get_u8_type();
-        if (type_name == "u16") return _type_context.get_u16_type();
-        if (type_name == "u32") return _type_context.get_u32_type();
-        if (type_name == "u64") return _type_context.get_u64_type();
+        if (type_name == "u8")
+            return _type_context.get_u8_type();
+        if (type_name == "u16")
+            return _type_context.get_u16_type();
+        if (type_name == "u32")
+            return _type_context.get_u32_type();
+        if (type_name == "u64")
+            return _type_context.get_u64_type();
 
         // Float types
-        if (type_name == "f32") return _type_context.get_f32_type();
-        if (type_name == "f64") return _type_context.get_f64_type();
-        if (type_name == "float") return _type_context.get_default_float_type();
-        if (type_name == "double") return _type_context.get_f64_type();
+        if (type_name == "f32")
+            return _type_context.get_f32_type();
+        if (type_name == "f64")
+            return _type_context.get_f64_type();
+        if (type_name == "float")
+            return _type_context.get_default_float_type();
+        if (type_name == "double")
+            return _type_context.get_f64_type();
 
         // Check for pointer types (ends with '*')
-        if (type_name.back() == '*') {
+        if (type_name.back() == '*')
+        {
             std::string pointee_type = type_name.substr(0, type_name.length() - 1);
             Type *pointee = lookup_type_by_name(pointee_type);
-            if (pointee) {
+            if (pointee)
+            {
                 return _type_context.create_pointer_type(pointee);
             }
         }
 
         // Check for reference types (ends with '&')
-        if (type_name.back() == '&') {
+        if (type_name.back() == '&')
+        {
             std::string referent_type = type_name.substr(0, type_name.length() - 1);
             Type *referent = lookup_type_by_name(referent_type);
-            if (referent) {
+            if (referent)
+            {
                 return _type_context.create_reference_type(referent);
             }
         }
 
         // Look up user-defined types (struct, class, enum)
         Type *user_type = lookup_variable_type(type_name);
-        if (user_type) {
+        if (user_type)
+        {
             return user_type;
         }
 
         // Try looking up as enum type
         Type *enum_type = _type_context.lookup_enum_type(type_name);
-        if (enum_type) {
+        if (enum_type)
+        {
             return enum_type;
         }
 
         // Try looking up as type alias
         Type *alias_type = _type_context.lookup_type_alias(type_name);
-        if (alias_type) {
+        if (alias_type)
+        {
             return alias_type;
         }
 

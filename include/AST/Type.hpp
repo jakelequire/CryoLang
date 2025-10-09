@@ -7,9 +7,10 @@
 #include <algorithm>
 
 // Forward declarations
-namespace Cryo { 
-    class Lexer; 
-    enum class TokenKind; 
+namespace Cryo
+{
+    class Lexer;
+    enum class TokenKind;
     struct Token;
 }
 
@@ -55,14 +56,14 @@ namespace Cryo
         TypeAlias,
 
         // Built-in parameterized enum types
-        OptionType,    // Option<T>
-        ResultType,    // Result<T,E>
-        
+        OptionType, // Option<T>
+        ResultType, // Result<T,E>
+
         // Built-in parameterized class types
-        ArrayType,     // Array<T>
-        VectorType,    // Vector<T>
-        PtrType,       // ptr<T>
-        ConstPtrType,  // const_ptr<T>
+        ArrayType,    // Array<T>
+        VectorType,   // Vector<T>
+        PtrType,      // ptr<T>
+        ConstPtrType, // const_ptr<T>
 
         // Special types
         Auto,    // For type inference
@@ -73,51 +74,86 @@ namespace Cryo
     };
 
     // Utility function to convert TypeKind to readable string
-    inline const char* TypeKindToString(TypeKind kind) {
-        switch (kind) {
-            case TypeKind::Void: return "Void";
-            case TypeKind::Boolean: return "Boolean";
-            case TypeKind::Integer: return "Integer";
-            case TypeKind::Float: return "Float";
-            case TypeKind::Char: return "Char";
-            case TypeKind::String: return "String";
-            case TypeKind::Array: return "Array";
-            case TypeKind::Pointer: return "Pointer";
-            case TypeKind::Reference: return "Reference";
-            case TypeKind::Function: return "Function";
-            case TypeKind::Struct: return "Struct";
-            case TypeKind::Class: return "Class";
-            case TypeKind::Interface: return "Interface";
-            case TypeKind::Trait: return "Trait";
-            case TypeKind::Enum: return "Enum";
-            case TypeKind::Union: return "Union";
-            case TypeKind::Generic: return "Generic";
-            case TypeKind::Parameterized: return "Parameterized";
-            case TypeKind::Optional: return "Optional";
-            case TypeKind::Tuple: return "Tuple";
-            case TypeKind::TypeAlias: return "TypeAlias";
-            case TypeKind::OptionType: return "OptionType";
-            case TypeKind::ResultType: return "ResultType";
-            case TypeKind::ArrayType: return "ArrayType";
-            case TypeKind::VectorType: return "VectorType";
-            case TypeKind::PtrType: return "PtrType";
-            case TypeKind::ConstPtrType: return "ConstPtrType";
-            case TypeKind::Auto: return "Auto";
-            case TypeKind::Unknown: return "Unknown";
-            case TypeKind::Never: return "Never";
-            case TypeKind::Null: return "Null";
-            case TypeKind::Variadic: return "Variadic";
-            default: return "UnknownTypeKind";
+    inline const char *TypeKindToString(TypeKind kind)
+    {
+        switch (kind)
+        {
+        case TypeKind::Void:
+            return "Void";
+        case TypeKind::Boolean:
+            return "Boolean";
+        case TypeKind::Integer:
+            return "Integer";
+        case TypeKind::Float:
+            return "Float";
+        case TypeKind::Char:
+            return "Char";
+        case TypeKind::String:
+            return "String";
+        case TypeKind::Array:
+            return "Array";
+        case TypeKind::Pointer:
+            return "Pointer";
+        case TypeKind::Reference:
+            return "Reference";
+        case TypeKind::Function:
+            return "Function";
+        case TypeKind::Struct:
+            return "Struct";
+        case TypeKind::Class:
+            return "Class";
+        case TypeKind::Interface:
+            return "Interface";
+        case TypeKind::Trait:
+            return "Trait";
+        case TypeKind::Enum:
+            return "Enum";
+        case TypeKind::Union:
+            return "Union";
+        case TypeKind::Generic:
+            return "Generic";
+        case TypeKind::Parameterized:
+            return "Parameterized";
+        case TypeKind::Optional:
+            return "Optional";
+        case TypeKind::Tuple:
+            return "Tuple";
+        case TypeKind::TypeAlias:
+            return "TypeAlias";
+        case TypeKind::OptionType:
+            return "OptionType";
+        case TypeKind::ResultType:
+            return "ResultType";
+        case TypeKind::ArrayType:
+            return "ArrayType";
+        case TypeKind::VectorType:
+            return "VectorType";
+        case TypeKind::PtrType:
+            return "PtrType";
+        case TypeKind::ConstPtrType:
+            return "ConstPtrType";
+        case TypeKind::Auto:
+            return "Auto";
+        case TypeKind::Unknown:
+            return "Unknown";
+        case TypeKind::Never:
+            return "Never";
+        case TypeKind::Null:
+            return "Null";
+        case TypeKind::Variadic:
+            return "Variadic";
+        default:
+            return "UnknownTypeKind";
         }
     }
 
     // Pattern identification for parameterized enum types
     enum class EnumTypePattern
     {
-        None,           // Not a pattern enum
-        Optional,       // Option<T> pattern
-        Result,         // Result<T,E> pattern
-        Custom          // User-defined pattern enum
+        None,     // Not a pattern enum
+        Optional, // Option<T> pattern
+        Result,   // Result<T,E> pattern
+        Custom    // User-defined pattern enum
     };
 
     // Integer type specifications
@@ -137,21 +173,36 @@ namespace Cryo
         UInt // Default unsigned integer
     };
 
-    inline std::string IntegerKindToString(IntegerKind kind) {
-        switch (kind) {
-            case IntegerKind::I8: return "i8";
-            case IntegerKind::I16: return "i16";
-            case IntegerKind::I32: return "i32";
-            case IntegerKind::I64: return "i64";
-            case IntegerKind::I128: return "i128";
-            case IntegerKind::U8: return "u8";
-            case IntegerKind::U16: return "u16";
-            case IntegerKind::U32: return "u32";
-            case IntegerKind::U64: return "u64";
-            case IntegerKind::U128: return "u128";
-            case IntegerKind::Int: return "int";
-            case IntegerKind::UInt: return "uint";
-            default: return "unknown_integer_kind";
+    inline std::string IntegerKindToString(IntegerKind kind)
+    {
+        switch (kind)
+        {
+        case IntegerKind::I8:
+            return "i8";
+        case IntegerKind::I16:
+            return "i16";
+        case IntegerKind::I32:
+            return "i32";
+        case IntegerKind::I64:
+            return "i64";
+        case IntegerKind::I128:
+            return "i128";
+        case IntegerKind::U8:
+            return "u8";
+        case IntegerKind::U16:
+            return "u16";
+        case IntegerKind::U32:
+            return "u32";
+        case IntegerKind::U64:
+            return "u64";
+        case IntegerKind::U128:
+            return "u128";
+        case IntegerKind::Int:
+            return "int";
+        case IntegerKind::UInt:
+            return "uint";
+        default:
+            return "unknown_integer_kind";
         }
     }
 
@@ -181,9 +232,13 @@ namespace Cryo
         std::string _name;
         TypeQualifiers _qualifiers;
         mutable std::string _cached_string; // For toString() caching
-        
+
         // Protected setter for derived classes to update the name
-        void set_name(const std::string &name) { _name = name; _cached_string.clear(); }
+        void set_name(const std::string &name)
+        {
+            _name = name;
+            _cached_string.clear();
+        }
 
     public:
         Type(TypeKind kind, const std::string &name = "")
@@ -656,7 +711,7 @@ namespace Cryo
             // Default implementation creates base ParameterizedType
             if (!is_template() || concrete_types.size() != _param_names.size())
                 return nullptr;
-                
+
             return std::make_shared<ParameterizedType>(_param_type_kind, concrete_types);
         }
 
@@ -679,13 +734,20 @@ namespace Cryo
         {
             switch (kind)
             {
-            case TypeKind::OptionType: return "Option";
-            case TypeKind::ResultType: return "Result";
-            case TypeKind::ArrayType: return "Array";
-            case TypeKind::VectorType: return "Vector";
-            case TypeKind::PtrType: return "ptr";
-            case TypeKind::ConstPtrType: return "const_ptr";
-            default: return "Unknown";
+            case TypeKind::OptionType:
+                return "Option";
+            case TypeKind::ResultType:
+                return "Result";
+            case TypeKind::ArrayType:
+                return "Array";
+            case TypeKind::VectorType:
+                return "Vector";
+            case TypeKind::PtrType:
+                return "ptr";
+            case TypeKind::ConstPtrType:
+                return "const_ptr";
+            default:
+                return "Unknown";
             }
         }
 
@@ -693,9 +755,12 @@ namespace Cryo
         {
             switch (kind)
             {
-            case TypeKind::OptionType: return EnumTypePattern::Optional;
-            case TypeKind::ResultType: return EnumTypePattern::Result;
-            default: return EnumTypePattern::None;
+            case TypeKind::OptionType:
+                return EnumTypePattern::Optional;
+            case TypeKind::ResultType:
+                return EnumTypePattern::Result;
+            default:
+                return EnumTypePattern::None;
             }
         }
 
@@ -706,12 +771,18 @@ namespace Cryo
 
         static TypeKind get_parameterized_type_kind_from_string(const std::string &base_name)
         {
-            if (base_name == "Option") return TypeKind::OptionType;
-            if (base_name == "Result") return TypeKind::ResultType;
-            if (base_name == "Array") return TypeKind::ArrayType;
-            if (base_name == "Vector") return TypeKind::VectorType;
-            if (base_name == "ptr") return TypeKind::PtrType;
-            if (base_name == "const_ptr") return TypeKind::ConstPtrType;
+            if (base_name == "Option")
+                return TypeKind::OptionType;
+            if (base_name == "Result")
+                return TypeKind::ResultType;
+            if (base_name == "Array")
+                return TypeKind::ArrayType;
+            if (base_name == "Vector")
+                return TypeKind::VectorType;
+            if (base_name == "ptr")
+                return TypeKind::PtrType;
+            if (base_name == "const_ptr")
+                return TypeKind::ConstPtrType;
             return TypeKind::Parameterized; // Default to generic parameterized type
         }
 
@@ -1101,6 +1172,7 @@ namespace Cryo
 
         // Create user-defined types
         Type *get_struct_type(const std::string &name);
+        Type *lookup_struct_type(const std::string &name); // Lookup existing struct type without creating
         Type *get_class_type(const std::string &name);
         Type *get_trait_type(const std::string &name);
         Type *get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple);
@@ -1110,31 +1182,31 @@ namespace Cryo
         // Parameterized types - simplified interface
         ParameterizedType *create_parameterized_type(const std::string &base_name,
                                                      const std::vector<std::string> &param_names);
-        
+
         // Type kind conversion helpers
         TypeKind get_parameterized_type_kind(const std::string &base_name);
         bool is_enum_pattern_type(TypeKind kind);
-        
+
         // New TypeKind-based registration
         void register_parameterized_enum_type(TypeKind enum_type_kind,
                                               const std::vector<std::string> &type_params,
                                               std::unique_ptr<EnumLayout> layout_template);
-        
+
         // Specialized factory methods for cleaner separation
         ParameterizedEnumType *create_parameterized_enum_type(const std::string &base_name,
                                                               const std::vector<std::string> &param_names,
                                                               std::shared_ptr<EnumType> base_enum);
-                                                              
+
         ParameterizedClassType *create_parameterized_class_type(const std::string &base_name,
                                                                 const std::vector<std::string> &param_names);
 
         // Instantiation methods
         ParameterizedType *instantiate_parameterized_type(const std::string &base_name,
                                                           const std::vector<Type *> &concrete_types);
-                                                          
+
         ParameterizedEnumType *instantiate_parameterized_enum(const std::string &base_name,
                                                               const std::vector<Type *> &concrete_types);
-                                                              
+
         ParameterizedClassType *instantiate_parameterized_class(const std::string &base_name,
                                                                 const std::vector<Type *> &concrete_types);
 
@@ -1161,18 +1233,18 @@ namespace Cryo
         Type *parse_type_from_string(const std::string &type_str);
 
         // ===== NEW: Token-based Type Parsing (Primary pathway) =====
-        
+
         /// Primary type parsing pathway using lexer tokens (preferred)
         /// This guarantees correct tokenization and prevents parsing errors
         Type *parse_type_from_tokens(Lexer &lexer);
         Type *parse_type_from_token_stream(const std::vector<Token> &tokens, size_t &index);
-        
+
         /// Helper method to parse type from string using token-based approach
         Type *parse_type_from_string_via_tokens(const std::string &type_str);
-        
+
         /// Parse primitive types from individual tokens
         Type *parse_primitive_type_from_token(TokenKind token_kind);
-        
+
         /// Parse compound types (pointers, arrays, etc.) from token stream
         Type *parse_pointer_type_from_tokens(const std::vector<Token> &tokens, size_t &index);
         Type *parse_array_type_from_tokens(const std::vector<Token> &tokens, size_t &index);

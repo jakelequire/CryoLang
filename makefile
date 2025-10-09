@@ -320,6 +320,21 @@ stdlib-memory:
 .PHONY: runtime runtime-clean
 runtime: $(RUNTIME_LIB)
 
+gdb-runtime:
+	@echo "Building runtime through gdb for debugging..."
+	@echo "Creating GDB command script..."
+	@echo "set pagination off" > /tmp/gdb_commands.txt
+	@echo "set logging file gdb_runtime.log" >> /tmp/gdb_commands.txt
+	@echo "set logging overwrite on" >> /tmp/gdb_commands.txt
+	@echo "set logging enabled on" >> /tmp/gdb_commands.txt
+	@echo "run" >> /tmp/gdb_commands.txt
+	@echo "thread apply all bt full" >> /tmp/gdb_commands.txt
+	@echo "info registers" >> /tmp/gdb_commands.txt
+	@echo "quit" >> /tmp/gdb_commands.txt
+	@gdb -batch -x /tmp/gdb_commands.txt --args $(MAIN_BIN) $(RUNTIME_DIR)/runtime.cryo --emit-llvm -c --stdlib-mode --ir -o $(RUNTIME_BUILD_DIR)/runtime.bc
+	@echo "GDB output saved to gdb_runtime.log"
+	@rm /tmp/gdb_commands.txt
+
 $(RUNTIME_BUILD_DIR):
 ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$@)" mkdir "$(subst /,\,$@)"
@@ -333,7 +348,7 @@ $(RUNTIME_BUILD_DIR)/%.bc: $(RUNTIME_DIR)/%.cryo $(MAIN_BIN) | $(RUNTIME_BUILD_D
 ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
 	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
-	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode --ir -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
+	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --ir --emit-llvm -c --stdlib-mode -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
 		echo "[RUNTIME] Compilation failed for $*.cryo" && \
 		exit 1 \
 	)
