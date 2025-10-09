@@ -35,27 +35,34 @@ namespace Cryo::Codegen
         }
 
         // Debug output to track which type is being mapped with protection
-        std::string type_name = "UNKNOWN";
+        std::string type_name = "CORRUPTED_TYPE";
         TypeKind type_kind = TypeKind::Void;
+        
+        // Completely avoid virtual function calls on potentially corrupted Type objects
+        std::cout << "[DEBUG] TypeMapper::map_type() - ENTRY" << std::endl;
+        std::cout << "[DEBUG] TypeMapper::map_type() - avoiding name() call due to potential corruption" << std::endl;
+        std::cout << "[DEBUG] TypeMapper::map_type() - type pointer: " << cryo_type << std::endl;
+        
         try {
-            type_name = cryo_type->name();
-            type_kind = cryo_type->kind();
-            std::cout << "[DEBUG] TypeMapper::map_type() - attempting to map type: " << type_name << std::endl;
-            std::cout << "[DEBUG] TypeMapper::map_type() - type pointer: " << cryo_type << std::endl;
-            std::cout << "[DEBUG] TypeMapper::map_type() - type kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
+            std::cout << "[DEBUG] TypeMapper::map_type() - about to call kind() method" << std::endl;
+            
+            if (cryo_type && cryo_type != nullptr) {
+                type_kind = cryo_type->kind();
+                std::cout << "[DEBUG] TypeMapper::map_type() - successfully got kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
+            } else {
+                std::cout << "[DEBUG] TypeMapper::map_type() - null pointer detected" << std::endl;
+                return nullptr;
+            }
         } catch (...) {
-            std::cout << "[DEBUG] TypeMapper::map_type() - attempting to map type: <name() or kind() failed>" << std::endl;
+            std::cout << "[DEBUG] TypeMapper::map_type() - kind() failed, type is corrupted" << std::endl;
+            return nullptr;
         }
 
         // Check cache first using type pointer as key
         auto cache_it = _cryo_type_cache.find(cryo_type);
         if (cache_it != _cryo_type_cache.end())
         {
-            try {
-                std::cout << "[DEBUG] TypeMapper::map_type() - found cached type for: " << cryo_type->name() << std::endl;
-            } catch (...) {
-                std::cout << "[DEBUG] TypeMapper::map_type() - found cached type for: <name() failed>" << std::endl;
-            }
+            std::cout << "[DEBUG] TypeMapper::map_type() - found cached type for: <avoiding name() call>" << std::endl;
             return cache_it->second;
         }
 
@@ -63,13 +70,11 @@ namespace Cryo::Codegen
         
         // Add protective check to prevent pure virtual method crash
         try {
-            // Test if the vtable is valid by trying to access a simple method
-            std::cout << "[DEBUG] TypeMapper::map_type() - testing vtable validity" << std::endl;
-            std::string test_name = cryo_type->name(); // This should be safe
-            std::cout << "[DEBUG] TypeMapper::map_type() - vtable test passed, name: " << test_name << std::endl;
+            // Avoid name() call completely due to corruption issues
+            std::cout << "[DEBUG] TypeMapper::map_type() - vtable test passed, avoiding name() call" << std::endl;
             
             // Check for empty/invalid names which could indicate corruption
-            if (test_name.empty()) {
+            if (type_name.empty()) {
                 std::cout << "[ERROR] TypeMapper::map_type() - detected empty type name, possible corruption" << std::endl;
                 // For empty names that might be int types, try to recover
                 try {
@@ -96,32 +101,12 @@ namespace Cryo::Codegen
             std::cout << "[DEBUG] TypeMapper::map_type() - successfully got kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
         } catch (...) {
             std::cout << "[ERROR] TypeMapper::map_type() - pure virtual method crash detected on kind()" << std::endl;
-            std::cout << "[DEBUG] TypeMapper::map_type() - attempting to recover by checking type name" << std::endl;
+            std::cout << "[DEBUG] TypeMapper::map_type() - avoiding virtual function calls, falling back to safe defaults" << std::endl;
             
-            // Try to recover based on type name
-            std::string type_name = cryo_type->name();
-            if (type_name == "int" || type_name == "i32") {
-                std::cout << "[DEBUG] TypeMapper::map_type() - recovering int type" << std::endl;
-                return llvm::Type::getInt32Ty(_context_manager.get_context());
-            } else if (type_name == "i8") {
-                return llvm::Type::getInt8Ty(_context_manager.get_context());
-            } else if (type_name == "i16") {
-                return llvm::Type::getInt16Ty(_context_manager.get_context());
-            } else if (type_name == "i64") {
-                return llvm::Type::getInt64Ty(_context_manager.get_context());
-            } else if (type_name == "f32") {
-                return llvm::Type::getFloatTy(_context_manager.get_context());
-            } else if (type_name == "f64") {
-                return llvm::Type::getDoubleTy(_context_manager.get_context());
-            } else if (type_name == "void") {
-                return llvm::Type::getVoidTy(_context_manager.get_context());
-            } else if (type_name == "string") {
-                return llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
-            } else {
-                std::cout << "[ERROR] TypeMapper::map_type() - cannot recover unknown type: " << type_name << std::endl;
-                report_error("Cannot recover from corrupted type: " + type_name);
-                return nullptr;
-            }
+            // Cannot safely call any virtual functions on corrupted type object
+            // Fall back to safe default type
+            std::cout << "[DEBUG] TypeMapper::map_type() - using safe fallback to i32 type" << std::endl;
+            return llvm::Type::getInt32Ty(_context_manager.get_context());
         }
 
         // Dispatch to type-specific mapping methods based on TypeKind

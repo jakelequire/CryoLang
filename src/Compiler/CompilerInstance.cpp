@@ -855,6 +855,14 @@ namespace Cryo
 
             // Use resolved return type directly
             Type *return_type = func_decl->get_resolved_return_type();
+            
+            // Handle functions that may not have resolved return types yet
+            if (return_type == nullptr)
+            {
+                std::cerr << "[CompilerInstance] Warning: Function '" << func_decl->name() 
+                          << "' has null return type, defaulting to void" << std::endl;
+                return_type = _ast_context->types().get_void_type(); // Safe fallback
+            }
 
             // Create function type
             Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
@@ -898,6 +906,14 @@ namespace Cryo
 
             // Use resolved return type directly
             Type *return_type = intrinsic_decl->get_resolved_return_type();
+            
+            // Handle intrinsics that may not have resolved return types yet
+            if (return_type == nullptr)
+            {
+                std::cerr << "[CompilerInstance] Warning: Intrinsic '" << intrinsic_decl->name() 
+                          << "' has null return type, defaulting to void" << std::endl;
+                return_type = _ast_context->types().get_void_type(); // Safe fallback
+            }
 
             // Create function type
             Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
@@ -935,6 +951,22 @@ namespace Cryo
                     }
 
                     Type *return_type = method->get_resolved_return_type();
+                    
+                    // Handle constructors that may not have resolved return types yet
+                    if (return_type == nullptr)
+                    {
+                        if (method->is_constructor())
+                        {
+                            return_type = _ast_context->types().get_void_type();
+                        }
+                        else
+                        {
+                            std::cerr << "[CompilerInstance] Warning: Struct method '" << method_name 
+                                      << "' has null return type and is not a constructor" << std::endl;
+                            return_type = _ast_context->types().get_void_type(); // Safe fallback
+                        }
+                    }
+                    
                     Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
@@ -983,6 +1015,22 @@ namespace Cryo
                     }
 
                     Type *return_type = method->get_resolved_return_type();
+                    
+                    // Handle constructors that may not have resolved return types yet
+                    if (return_type == nullptr)
+                    {
+                        if (method->is_constructor())
+                        {
+                            return_type = _ast_context->types().get_void_type();
+                        }
+                        else
+                        {
+                            std::cerr << "[CompilerInstance] Warning: Method '" << method_name 
+                                      << "' has null return type and is not a constructor" << std::endl;
+                            return_type = _ast_context->types().get_void_type(); // Safe fallback
+                        }
+                    }
+                    
                     Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
