@@ -1050,6 +1050,7 @@ namespace Cryo::Codegen
                 // Map return type
                 llvm::Type *return_type = llvm::Type::getVoidTy(context);
                 Cryo::Type *cryo_return_type = method->get_resolved_return_type();
+                std::cout << "[DEBUG] Method " << method_name << " cryo_return_type=" << (cryo_return_type ? "non-null" : "null") << " kind=" << (cryo_return_type ? std::to_string((int)cryo_return_type->kind()) : "N/A") << std::endl;
                 if (cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
                 {
                     llvm::Type *mapped_return_type = _type_mapper->map_type(cryo_return_type);
@@ -5088,6 +5089,21 @@ namespace Cryo::Codegen
 
                     if (!right_val)
                     {
+                        // CRITICAL: Before returning error, we must terminate all created blocks
+                        // Terminate the current block and land_end
+                        llvm::BasicBlock *current_block = builder.GetInsertBlock();
+                        if (current_block && !current_block->getTerminator())
+                        {
+                            builder.CreateBr(land_end);
+                        }
+                        builder.SetInsertPoint(land_end);
+                        builder.CreateUnreachable();
+
+                        // CRITICAL: Move builder to a dummy block so caller doesn't try to add more code
+                        // to the terminated land_end block
+                        llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
+                        builder.SetInsertPoint(dummy_block);
+
                         report_error("Failed to generate right operand for logical AND");
                         return nullptr;
                     }
@@ -5117,6 +5133,25 @@ namespace Cryo::Codegen
                             llvm::raw_string_ostream err_rso(err_type_str);
                             right_val->getType()->print(err_rso);
                             std::cout << "[DEBUG] Short-circuit AND: Cannot convert type to boolean: " << err_rso.str() << std::endl;
+
+                            // CRITICAL: Before returning error, we must terminate all created blocks
+                            // to prevent "does not have terminator" verification errors
+
+                            // Terminate the current block (where we tried to evaluate right side)
+                            llvm::BasicBlock *current_block = builder.GetInsertBlock();
+                            if (current_block && !current_block->getTerminator())
+                            {
+                                builder.CreateBr(land_end);
+                            }
+
+                            // Terminate land_end with unreachable (this is an error path)
+                            builder.SetInsertPoint(land_end);
+                            builder.CreateUnreachable();
+
+                            // Create a dummy block and position builder there to avoid "terminator in middle" errors
+                            llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
+                            builder.SetInsertPoint(dummy_block);
+
                             report_error("Cannot convert right operand to boolean for logical AND");
                             return nullptr;
                         }
@@ -5187,6 +5222,19 @@ namespace Cryo::Codegen
 
                     if (!right_val)
                     {
+                        // CRITICAL: Before returning error, we must terminate all created blocks
+                        llvm::BasicBlock *current_block = builder.GetInsertBlock();
+                        if (current_block && !current_block->getTerminator())
+                        {
+                            builder.CreateBr(lor_end);
+                        }
+                        builder.SetInsertPoint(lor_end);
+                        builder.CreateUnreachable();
+
+                        // Create a dummy block and position builder there to avoid "terminator in middle" errors
+                        llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
+                        builder.SetInsertPoint(dummy_block);
+
                         report_error("Failed to generate right operand for logical OR");
                         return nullptr;
                     }
@@ -5205,6 +5253,24 @@ namespace Cryo::Codegen
                         }
                         else
                         {
+                            // CRITICAL: Before returning error, we must terminate all created blocks
+                            // to prevent "does not have terminator" verification errors
+
+                            // Terminate the current block (where we tried to evaluate right side)
+                            llvm::BasicBlock *current_block = builder.GetInsertBlock();
+                            if (current_block && !current_block->getTerminator())
+                            {
+                                builder.CreateBr(lor_end);
+                            }
+
+                            // Terminate lor_end with unreachable (this is an error path)
+                            builder.SetInsertPoint(lor_end);
+                            builder.CreateUnreachable();
+
+                            // Create a dummy block and position builder there to avoid "terminator in middle" errors
+                            llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
+                            builder.SetInsertPoint(dummy_block);
+
                             report_error("Cannot convert right operand to boolean for logical OR");
                             return nullptr;
                         }
