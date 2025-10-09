@@ -791,8 +791,19 @@ namespace Cryo
         const std::string return_type_annotation() const
         {
             if (_resolved_return_type) {
-                std::string type_str = _resolved_return_type->to_string();
-                std::string type_name = _resolved_return_type->name();
+                // Apply defensive programming to avoid virtual function crashes
+                std::string type_str = "CORRUPTED_TYPE";
+                std::string type_name = "CORRUPTED_TYPE";
+                
+                try {
+                    type_str = _resolved_return_type->to_string();
+                    type_name = _resolved_return_type->name();
+                } catch (...) {
+                    std::cerr << "[ERROR] return_type_annotation: virtual function crash detected, using safe defaults" << std::endl;
+                    type_str = "void";
+                    type_name = "void";
+                }
+                
                 std::cerr << "[DEBUG] return_type_annotation: type_str='" << type_str << "', type_name='" << type_name << "'" << std::endl;
                 
                 // Safety check: if to_string() returns empty, fall back to the name

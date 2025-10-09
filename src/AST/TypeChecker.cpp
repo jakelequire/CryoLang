@@ -988,8 +988,12 @@ namespace Cryo
             return struct_type;
 
         Type *class_type = _type_context.get_class_type(type_string);
+        std::cout << "[DEBUG] TypeChecker: get_class_type returned: " << (class_type ? "valid pointer" : "nullptr") << std::endl;
         if (class_type)
+        {
+            std::cout << "[DEBUG] TypeChecker: class_type name='" << class_type->name() << "', kind=" << static_cast<int>(class_type->kind()) << std::endl;
             return class_type;
+        }
 
         Type *trait_type = _type_context.get_trait_type(type_string);
         if (trait_type)
