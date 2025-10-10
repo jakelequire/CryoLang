@@ -335,12 +335,12 @@ public:
     }
 
     // Free allocated memory
-    deallocate(_ptr: void*) -> void {
+    deallocate(_ptr: void*) -> u64 {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::deallocate} Freeing memory: ptr=%p\n", _ptr);
         
         if (_ptr == null) {
             Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::deallocate} Invalid pointer: null\n");
-            return;
+            return u64(0);
         }
         
         // Get block header from user pointer
@@ -348,14 +348,17 @@ public:
        
        if (!block.is_valid()) {
            Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::deallocate} Invalid block detected during free: ptr=%p\n", _ptr);
-           return;
+           return u64(0);
        }
        
        if (block.is_free()) {
            Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::deallocate} Double free detected: ptr=%p\n", _ptr);
            Intrinsics::__panic__("{HeapManager::deallocate} Double free detected");
-           return;
+           return u64(0);
        }
+       
+       // Get the size before marking as free
+       const block_size: u64 = block.size;
        
        // Mark as free and add to free list
        block.mark_free();
@@ -366,7 +369,7 @@ public:
 
        Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::deallocate} Memory freed: ptr=%p\n", _ptr);
 
-       return;
+       return block_size;
     }
 
     // Shutdown heap
@@ -416,9 +419,12 @@ private:
     // Coalesce block with adjacent free blocks
     coalesce_block(block: HeapBlock*) -> void {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing block: ptr=%p\n", block.get_user_data_ptr());
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Block details: next=%p, prev=%p\n", block.next, block.prev);
         
         // Try to merge with next block
-        if (block.next != null && block.next.is_free()) {
+        if (block.next != null) {
+            Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Checking next block: ptr=%p\n", block.next);
+            if (block.next.is_free()) {
             Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing with next block: ptr=%p\n",
                                        block.next.get_user_data_ptr());
             
@@ -430,10 +436,17 @@ private:
                 Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Updating next block's previous pointer: ptr=%p\n", block.next.get_user_data_ptr());
                 block.next.prev = block;
             }
+            } else {
+                Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Next block is not free\n");
+            }
+        } else {
+            Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} No next block to coalesce\n");
         }
         
         // Try to merge with previous block
-        if (block.prev != null && block.prev.is_free()) {
+        if (block.prev != null) {
+            Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Checking previous block: ptr=%p\n", block.prev);
+            if (block.prev.is_free()) {
             Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing with previous block: ptr=%p\n", 
                                        block.prev.get_user_data_ptr());
             
@@ -445,6 +458,11 @@ private:
                 Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Updating next block's previous pointer: ptr=%p\n", block.next.get_user_data_ptr());
                 block.next.prev = block.prev;
             }
+            } else {
+                Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Previous block is not free\n");
+            }
+        } else {
+            Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} No previous block to coalesce\n");
         }
 
         Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing complete for block: ptr=%p\n", 
@@ -620,9 +638,10 @@ public:
 
     // Free memory
     deallocate(ptr: void*) -> void {
-        // TODO: Get size from block header for statistics
-        this.heap.deallocate(ptr);
-        // this.stats.record_deallocation(size);
+        const size: u64 = this.heap.deallocate(ptr);
+        if (size > 0) {
+            this.stats.record_deallocation(size);
+        }
         return;
     }
 
@@ -704,9 +723,9 @@ function cryo_free(ptr: void*) -> void {
 //     g_runtime_manager.set_error(error);
 // }
 
-// function cryo_panic(message: string, file: string, line: i32) -> void {
-//     g_runtime_manager.panic(message, file, line);
-// }
+function cryo_panic(message: string, file: string, line: i32) -> void {
+    g_runtime_manager.panic(message, file, line);
+}
 
 //===================================================================
 // MAIN RUNTIME FUNCTION
