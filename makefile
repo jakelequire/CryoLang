@@ -319,10 +319,14 @@ stdlib-memory:
 
 .PHONY: runtime runtime-clean
 runtime: 
+ifeq ($(OS), Windows_NT)
+	@if exist "$(subst /,\,$(RUNTIME_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(RUNTIME_BUILD_DIR))"
+else
 	@if [ -d "$(RUNTIME_BUILD_DIR)" ]; then \
 		echo "Cleaning existing runtime build directory..."; \
 		rm -rf $(RUNTIME_BUILD_DIR); \
 	fi
+endif
 	@$(MAKE) $(RUNTIME_LIB)
 
 gdb-runtime:
