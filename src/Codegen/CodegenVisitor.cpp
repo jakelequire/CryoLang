@@ -3458,14 +3458,15 @@ namespace Cryo::Codegen
         std::cout << "  field_index: " << field_index << std::endl;
 
         // Handle the case where object_ptr might be a pointer to the struct
-        // (like 'this' parameters which are stored as pointers)
+        // For variables like "initial_block: HeapBlock*", we have an alloca containing a pointer
+        // We need to load the pointer value to access struct fields
         llvm::Value *struct_ptr = object_ptr;
         if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
         {
             llvm::Type *allocated_type = alloca_inst->getAllocatedType();
             if (allocated_type->isPointerTy())
             {
-                // For pointer-to-struct, load the pointer first
+                // Load the pointer from the alloca to get the actual struct pointer
                 struct_ptr = create_load(object_ptr, allocated_type, "struct_ptr");
                 std::cout << "[CodegenVisitor] Loaded struct pointer for member access" << std::endl;
             }
@@ -6412,7 +6413,21 @@ namespace Cryo::Codegen
 
                             // Prepare arguments: this pointer + method arguments
                             std::vector<llvm::Value *> args;
-                            args.push_back(object_value); // 'this' pointer
+                            
+                            // For struct method calls, we need to handle pointer variables correctly
+                            llvm::Value *this_ptr = object_value;
+                            if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_value))
+                            {
+                                llvm::Type *allocated_type = alloca_inst->getAllocatedType();
+                                if (allocated_type->isPointerTy())
+                                {
+                                    // This is a pointer variable - load the pointer value for method calls
+                                    this_ptr = create_load(object_value, allocated_type, "struct_ptr");
+                                    std::cout << "[DEBUG] Loaded pointer for struct method call" << std::endl;
+                                }
+                            }
+                            
+                            args.push_back(this_ptr); // 'this' pointer
 
                             // Generate method arguments
                             for (const auto &arg : node->arguments())
@@ -6741,8 +6756,21 @@ namespace Cryo::Codegen
                 }
 
                 // If we couldn't resolve it, fall back to extraction
-                function_name = extract_function_name_from_member_access(member_access);
-                resolved_function_name = function_name;
+                std::cout << "[ERROR] CRITICAL: Nested member access resolution failed completely!" << std::endl;
+                std::cout << "[ERROR] This will cause method calls to lose object context!" << std::endl;
+                std::cout << "[ERROR] Member access: " << member_access->member() << std::endl;
+                if (auto *nested_member_access = dynamic_cast<MemberAccessNode *>(member_access->object()))
+                {
+                    std::cout << "[ERROR] Nested member: " << nested_member_access->member() << std::endl;
+                    if (auto *base_identifier = dynamic_cast<IdentifierNode *>(nested_member_access->object()))
+                    {
+                        std::cout << "[ERROR] Base identifier: " << base_identifier->name() << std::endl;
+                    }
+                }
+                
+                // Instead of falling back to function extraction, we should report an error
+                report_error("Failed to resolve nested member access for method call: " + member_access->member());
+                return nullptr;
             }
             else
             {
