@@ -334,6 +334,40 @@ public:
         return block.get_user_data_ptr();
     }
 
+    reallocate(ptr: void*, new_size: u64) -> void* {
+        if (ptr == null) {
+            return this.allocate(new_size);
+        }
+
+        if (new_size == 0) {
+            this.deallocate(ptr);
+            return null;
+        }
+
+        const block: HeapBlock* = this.get_block_from_ptr(ptr);
+        const aligned_new_size: u64 = this.align_size(new_size, BLOCK_ALIGNMENT);
+
+        // If new size fits in current block, just return it
+        if (aligned_new_size <= block.size) {
+            Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::reallocate} Reusing existing block\n");
+            return ptr;
+        }
+
+        // Allocate new block
+        const new_ptr: void* = this.allocate(new_size);
+        if (new_ptr == null) {
+            return null;  // Keep old allocation on failure
+        }
+
+        // Copy old data
+        cryo_memcpy(new_ptr, ptr, block.size);
+
+        // Free old block
+        this.deallocate(ptr);
+
+        return new_ptr;
+    }
+
     // Free allocated memory
     deallocate(_ptr: void*) -> u64 {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::deallocate} Freeing memory: ptr=%p\n", _ptr);
@@ -482,12 +516,31 @@ public:
     bytes_allocated: u64;
     peak_allocation: u64;
 
+    // New fields for enhanced statistics
+    current_allocations: u64;     // Active allocations
+    failed_allocations: u64;      // OOM count
+    fragmentation_ratio: f64;     // Heap fragmentation
+    largest_free_block: u64;      // For fragmentation tracking
+    
+    // Allocation size histogram (future)
+    small_allocs: u64;   // < 64 bytes
+    medium_allocs: u64;  // 64 - 4096 bytes
+    large_allocs: u64;   // > 4096 bytes
+
     StatisticsManager() {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::StatisticsManager} Initializing StatisticsManager\n");
         this.total_allocations = u64(0);
         this.total_deallocations = u64(0);
         this.bytes_allocated = u64(0);
         this.peak_allocation = u64(0);
+        // New fields
+        this.current_allocations = u64(0);
+        this.failed_allocations = u64(0);
+        this.fragmentation_ratio = 0.0;
+        this.largest_free_block = u64(0);
+        this.small_allocs = u64(0);
+        this.medium_allocs = u64(0);
+        this.large_allocs = u64(0);
     }
 
     // Record allocation
@@ -513,16 +566,30 @@ public:
 
     // Print statistics
     print_stats() -> void {
-        Intrinsics::__printf__("========================= [ RUNTIME STATS ] =========================\n");
-        Intrinsics::__printf__("Runtime Statistics:\n");
-        Intrinsics::__printf__("  Total allocations: %llu\n", this.total_allocations);
-        Intrinsics::__printf__("  Total deallocations: %llu\n", this.total_deallocations);
-        Intrinsics::__printf__("  Bytes allocated: %llu\n", this.bytes_allocated);
-        Intrinsics::__printf__("  Peak allocation: %llu bytes\n", this.peak_allocation);
-        Intrinsics::__printf__("=====================================================================\n");
-
-        if (this.bytes_allocated > u64(64)) {
-            Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::print_stats} WARNING: %llu bytes leaked\n", this.bytes_allocated);
+        Intrinsics::__printf__("═══════════════════════════════════════════════════════════\n");
+        Intrinsics::__printf__("                RUNTIME STATISTICS                         \n");
+        Intrinsics::__printf__("═══════════════════════════════════════════════════════════\n");
+        Intrinsics::__printf__("Allocations:\n");
+        Intrinsics::__printf__("  Total allocations:   %10llu\n", this.total_allocations);
+        Intrinsics::__printf__("  Total deallocations: %10llu\n", this.total_deallocations);
+        Intrinsics::__printf__("  Current allocations: %10llu\n", this.current_allocations);
+        Intrinsics::__printf__("  Failed allocations:  %10llu\n", this.failed_allocations);
+        Intrinsics::__printf__("\n");
+        Intrinsics::__printf__("Memory Usage:\n");
+        Intrinsics::__printf__("  Bytes allocated:     %10llu bytes\n", this.bytes_allocated);
+        Intrinsics::__printf__("  Peak allocation:     %10llu bytes\n", this.peak_allocation);
+        Intrinsics::__printf__("  Largest free block:  %10llu bytes\n", this.largest_free_block);
+        Intrinsics::__printf__("\n");
+        Intrinsics::__printf__("Allocation Sizes:\n");
+        Intrinsics::__printf__("  Small  (< 64B):      %10llu\n", this.small_allocs);
+        Intrinsics::__printf__("  Medium (64B-4KB):    %10llu\n", this.medium_allocs);
+        Intrinsics::__printf__("  Large  (> 4KB):      %10llu\n", this.large_allocs);
+        Intrinsics::__printf__("═══════════════════════════════════════════════════════════\n");
+        
+        if (this.current_allocations > 0) {
+            Intrinsics::__printf__("\nWARNING: Memory leak detected!\n");
+            Intrinsics::__printf__("   %llu allocations not freed (%llu bytes)\n",
+                                   this.current_allocations, this.bytes_allocated);
         }
         return;
     }
@@ -702,10 +769,27 @@ mut g_runtime_manager: RuntimeManager;
 // PUBLIC API FUNCTIONS
 //===================================================================
 
+function cryo_assert(condition: boolean, message: string) -> void {
+    if (!condition) {
+        g_runtime_manager.panic(message, "assertion", 0);
+    }
+    return;
+}
+
 function cryo_alloc(size: u64) -> void* {
     Intrinsics::__printf__("[DEBUG::RUNTIME] {cryo_alloc} Allocating memory: size=%llu bytes\n", size);
     const ptr: void* = g_runtime_manager.allocate(size);
     return ptr;
+}
+
+function cryo_realloc(ptr: void*, new_size: u64) -> void* {
+    return g_runtime_manager.heap.reallocate(ptr, new_size);
+}
+
+function cryo_memcpy(dest: void*, src: void*, size: u64) -> void* {
+    cryo_assert(dest != null, "memcpy: destination is null");
+    cryo_assert(src != null, "memcpy: source is null");
+    return Intrinsics::__memcpy__(dest, src, size);
 }
 
 function cryo_free(ptr: void*) -> void {
