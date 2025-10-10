@@ -38,9 +38,9 @@ namespace CryoLSP
         std::string scope;          // Full scope path (e.g., "std::IO")
         std::string qualified_name; // Full qualified name (e.g., "std::IO::println")
         Position definition_location;
-        Position start_pos;         // Start position for range highlighting
-        Position end_pos;           // End position for range highlighting
-        bool has_errors = false;    // Whether symbol has compilation errors
+        Position start_pos;      // Start position for range highlighting
+        Position end_pos;        // End position for range highlighting
+        bool has_errors = false; // Whether symbol has compilation errors
     };
 
     struct FunctionSignature
@@ -149,39 +149,41 @@ namespace CryoLSP
         // Enhanced hover info construction
         // Enhanced hover info building with compiler context
         HoverInfo buildEnhancedHoverInfo(const Cryo::Symbol &symbol, const std::string &word, const std::string &file_path, Cryo::CompilerInstance *compiler = nullptr);
-        
+
         // Function signature extraction from source text
         std::string extractFunctionSignatureFromSource(const std::string &file_path, const std::string &function_name);
         std::string extractParameterNamesFromAST(Cryo::FunctionDeclarationNode *function_node);
         std::string extractParameterNamesFromAST(Cryo::FunctionDeclarationNode *function_node, const std::string &qualified_name);
+        std::string extractParameterTypeFromAST(const std::string &file_path, const std::string &param_name, const std::string &scope);
         std::string buildQualifiedSignature(const Cryo::Symbol &symbol, const std::string &file_path, Cryo::CompilerInstance *compiler = nullptr);
         std::string getSymbolDocumentation(const Cryo::Symbol &symbol, const std::string &symbol_name);
-        
+
         // Extract documentation from AST nodes
         std::string extractDocumentationFromASTNode(Cryo::DeclarationNode *declaration_node);
-        
+
         // Find function AST nodes in imported modules
-        Cryo::FunctionDeclarationNode* findFunctionInImportedModules(Cryo::CompilerInstance *compiler, const std::string &word, const std::string &qualified_symbol);
-        
+        Cryo::FunctionDeclarationNode *findFunctionInImportedModules(Cryo::CompilerInstance *compiler, const std::string &word, const std::string &qualified_symbol);
+
         // Helper method to recursively search for function declarations in an AST
-        Cryo::FunctionDeclarationNode* findFunctionInAST(Cryo::ASTNode *node, const std::string &word, const std::string &qualified_symbol, const std::string &module_name);
-        
+        Cryo::FunctionDeclarationNode *findFunctionInAST(Cryo::ASTNode *node, const std::string &word, const std::string &qualified_symbol, const std::string &module_name);
+
         // Methods for struct/class hover previews
-        Cryo::StructDeclarationNode* findStructDeclarationInAST(Cryo::ASTNode *node, const std::string &struct_name);
-        Cryo::ClassDeclarationNode* findClassDeclarationInAST(Cryo::ASTNode *node, const std::string &class_name);
+        Cryo::StructDeclarationNode *findStructDeclarationInAST(Cryo::ASTNode *node, const std::string &struct_name);
+        Cryo::ClassDeclarationNode *findClassDeclarationInAST(Cryo::ASTNode *node, const std::string &class_name);
         std::string buildStructPreview(Cryo::StructDeclarationNode *struct_node, const std::string &qualified_name);
         std::string buildClassPreview(Cryo::ClassDeclarationNode *class_node, const std::string &qualified_name);
-        
+
         // Methods for member access analysis
         std::string extractMemberAccessContext(const std::string &line, const Position &position);
         HoverInfo analyzeMemberAccess(const FileAnalysis &analysis, const std::string &context, const std::string &member_name, const std::string &file_path);
+        HoverInfo analyzeDeclarationContext(const std::string &file_path, const std::string &word, const std::string &line, const Position &position);
 
         // Additional methods that should be declared
         std::optional<FunctionSignature> extractFunctionFromAST(const Cryo::ProgramNode *ast, const Position &position);
         HoverInfo analyzeSimplePattern(const std::string &content, const Position &position);
         std::string getWordAtPosition(const std::string &content, const Position &position);
         std::string getLineAtPosition(const std::string &content, const Position &position);
-        
+
         // Comment detection
         bool isPositionInComment(const std::string &content, const Position &position);
         std::string getPrimitiveTypeDocumentation(const std::string &type_name);
