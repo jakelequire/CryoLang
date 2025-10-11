@@ -1,4 +1,5 @@
 #include "AST/TemplateRegistry.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 
 namespace Cryo
@@ -17,8 +18,7 @@ namespace Cryo
             return;
         }
 
-        std::cout << "[TemplateRegistry] Registering class template: " << base_name
-                  << " from module: " << module_namespace << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering class template: {} from module: {}", base_name, module_namespace);
 
         // Extract generic parameter names to avoid pointer issues
         std::vector<std::string> param_names;
@@ -27,7 +27,7 @@ namespace Cryo
             if (param)
             {
                 param_names.push_back(param->name());
-                std::cout << "[TemplateRegistry] Extracted parameter: " << param->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "Extracted parameter: {}", param->name());
             }
         }
 
@@ -52,15 +52,14 @@ namespace Cryo
             return;
         }
 
-        std::cout << "[TemplateRegistry] Registering struct template: " << base_name
-                  << " from module: " << module_namespace << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering struct template: {} from module: {}", base_name, module_namespace);
 
         // Extract parameter names before any potential pointer corruption
         std::vector<std::string> param_names;
         for (const auto &param : template_node->generic_parameters())
         {
             param_names.push_back(param->name());
-            std::cout << "[TemplateRegistry] Extracted parameter: " << param->name() << std::endl;
+            LOG_TRACE(Cryo::LogComponent::AST, "Extracted parameter: {}", param->name());
         }
 
         // Create template info with both pointer and extracted metadata
@@ -84,8 +83,7 @@ namespace Cryo
             return;
         }
 
-        std::cout << "[TemplateRegistry] Registering enum template: " << base_name
-                  << " from module: " << module_namespace << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering enum template: {} from module: {}", base_name, module_namespace);
 
         // Extract generic parameter names to avoid pointer issues
         std::vector<std::string> param_names;
@@ -94,7 +92,7 @@ namespace Cryo
             if (param)
             {
                 param_names.push_back(param->name());
-                std::cout << "[TemplateRegistry] Extracted parameter: " << param->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "Extracted parameter: {}", param->name());
             }
         }
 
@@ -119,8 +117,7 @@ namespace Cryo
             return;
         }
 
-        std::cout << "[TemplateRegistry] Registering function template: " << base_name
-                  << " from module: " << module_namespace << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering function template: {} from module: {}", base_name, module_namespace);
 
         _templates[base_name] = std::move(TemplateInfo(template_node, module_namespace, source_file));
     }
@@ -139,8 +136,7 @@ namespace Cryo
             return;
         }
 
-        std::cout << "[TemplateRegistry] Registering trait template: " << base_name
-                  << " from module: " << module_namespace << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering trait template: {} from module: {}", base_name, module_namespace);
 
         // Extract generic parameter names to avoid pointer issues
         std::vector<std::string> param_names;
@@ -149,7 +145,7 @@ namespace Cryo
             if (param)
             {
                 param_names.push_back(param->name());
-                std::cout << "[TemplateRegistry] Extracted parameter: " << param->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "Extracted parameter: {}", param->name());
             }
         }
 
@@ -165,12 +161,11 @@ namespace Cryo
         auto it = _templates.find(base_name);
         if (it != _templates.end())
         {
-            std::cout << "[TemplateRegistry] Found template: " << base_name
-                      << " from module: " << it->second.module_namespace << std::endl;
+            LOG_TRACE(Cryo::LogComponent::AST, "Found template: {} from module: {}", base_name, it->second.module_namespace);
             return &it->second;
         }
 
-        std::cout << "[TemplateRegistry] Template not found: " << base_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Template not found: {}", base_name);
         return nullptr;
     }
 

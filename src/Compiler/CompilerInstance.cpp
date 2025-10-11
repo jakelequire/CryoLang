@@ -2,6 +2,7 @@
 #include "Codegen/TypeMapper.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Utils/file.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -163,13 +164,13 @@ namespace Cryo
             // Phase 6: Generate IR (for testing and integration)
             if (_debug_mode)
             {
-                std::cout << "Generating IR..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Generating IR...");
             }
 
             // Print AST if requested before IR generation
             if (_show_ast_before_ir)
             {
-                std::cout << "\nGenerated AST:" << std::endl;
+                LOG_INFO(Cryo::LogComponent::GENERAL, "Generated AST:");
                 dump_ast();
             }
 
@@ -182,7 +183,7 @@ namespace Cryo
 
             if (_debug_mode)
             {
-                std::cout << "=== Compilation Completed ===" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "=== Compilation Completed ===");
             }
 
             // Print any diagnostics that were collected
@@ -330,7 +331,7 @@ namespace Cryo
                 set_namespace_context(_parser->current_namespace());
                 if (_debug_mode)
                 {
-                    std::cout << "Parsed namespace: " << _parser->current_namespace() << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Parsed namespace: {}", _parser->current_namespace());
                 }
             }
 
@@ -344,13 +345,13 @@ namespace Cryo
                 _codegen->set_stdlib_compilation_mode(true);
                 if (_debug_mode)
                 {
-                    std::cout << "[DEBUG] Enabled stdlib compilation mode in CodeGenerator" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Enabled stdlib compilation mode in CodeGenerator");
                 }
             }
 
             if (_debug_mode)
             {
-                std::cout << "[DEBUG] Created CodeGenerator with module name: '" << namespace_for_module << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Created CodeGenerator with module name: '{}'", namespace_for_module);
             }
 
             // Register struct/class AST nodes with TypeMapper immediately after CodeGenerator creation
@@ -372,7 +373,7 @@ namespace Cryo
     {
         if (_debug_mode)
         {
-            std::cout << "[CompilerInstance] Starting analysis phase..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Starting analysis phase...");
         }
 
         if (!_ast_root)
@@ -386,49 +387,49 @@ namespace Cryo
         {
             if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Phase 0: Symbol table population..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase 0: Symbol table population...");
             }
             // Phase 0: Symbol table population (must happen before type checking)
             populate_symbol_table(_ast_root.get());
 
             if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Loading intrinsic symbols into type checker..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading intrinsic symbols into type checker...");
             }
             // Load only newly added intrinsic symbols into type checker
             _type_checker->load_intrinsic_symbols(*_symbol_table);
 
             if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Loading runtime symbols into type checker..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading runtime symbols into type checker...");
             }
             // Load runtime function symbols and make them available globally
             _type_checker->load_runtime_symbols(*_symbol_table);
 
             if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Loading user-defined symbols into type checker..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading user-defined symbols into type checker...");
             }
             // Load user-defined function symbols that were registered during Pass 1
             _type_checker->load_user_symbols(*_symbol_table);
 
             if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Processing imported modules for AST node updates..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing imported modules for AST node updates...");
             }
             // Process imported modules to update symbols with AST node references
             _type_checker->check_imported_modules(_module_loader->get_imported_asts());
 
             if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Phase 1: Type checking..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase 1: Type checking...");
             }
             // Phase 1: Type checking
             _type_checker->check_program(*_ast_root);
 
             if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Checking for type errors..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Checking for type errors...");
             }
             if (_type_checker->has_errors())
             {
@@ -462,10 +463,7 @@ namespace Cryo
 
                 if (_debug_mode)
                 {
-                    if (_debug_mode)
-                    {
-                        std::cout << "Type checking failed with " << _type_checker->error_count() << " errors." << std::endl;
-                    }
+                    LOG_ERROR(Cryo::LogComponent::GENERAL, "Type checking failed with {} errors", _type_checker->error_count());
                 }
                 return false;
             }
@@ -473,10 +471,7 @@ namespace Cryo
             // Phase 2: Monomorphization - Generate specialized versions of generic types
             if (_debug_mode)
             {
-                if (_debug_mode)
-                {
-                    std::cout << "Starting monomorphization pass..." << std::endl;
-                }
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Starting monomorphization pass...");
             }
 
             const auto &required_instantiations = _type_checker->get_required_instantiations();
@@ -492,20 +487,14 @@ namespace Cryo
 
                 if (_debug_mode)
                 {
-                    if (_debug_mode)
-                    {
-                        std::cout << "Monomorphization completed successfully." << std::endl;
-                    }
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Monomorphization completed successfully");
                 }
             }
             else
             {
                 if (_debug_mode)
                 {
-                    if (_debug_mode)
-                    {
-                        std::cout << "No generic instantiations required, skipping monomorphization." << std::endl;
-                    }
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "No generic instantiations required, skipping monomorphization");
                 }
             }
 
@@ -516,10 +505,7 @@ namespace Cryo
 
             if (_debug_mode)
             {
-                if (_debug_mode)
-                {
-                    std::cout << "Type checking completed successfully." << std::endl;
-                }
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Type checking completed successfully");
             }
 
             return true;
@@ -552,16 +538,16 @@ namespace Cryo
         try
         {
             // Set source file and namespace context before generating IR
-            std::cout << "[CompilerInstance] Setting source info for codegen..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Setting source info for codegen...");
             _codegen->set_source_info(_source_file, _current_namespace);
 
-            std::cout << "[CompilerInstance] Starting IR generation..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Starting IR generation...");
             bool success = _codegen->generate_ir(_ast_root.get());
-            std::cout << "[CompilerInstance] IR generation completed with result: " << (success ? "success" : "failure") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "IR generation completed with result: {}", (success ? "success" : "failure"));
 
             if (!success)
             {
-                std::cout << "[CompilerInstance] IR generation failed with error: " << _codegen->get_last_error() << std::endl;
+                LOG_ERROR(Cryo::LogComponent::GENERAL, "IR generation failed with error: {}", _codegen->get_last_error());
                 _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::CodeGen,
                                                   "Code generation failed: " + _codegen->get_last_error(),
                                                   SourceRange{}, _source_file);
@@ -609,12 +595,12 @@ namespace Cryo
                     _linker->add_object_file(runtime_path);
                     if (_debug_mode)
                     {
-                        std::cout << "[DEBUG] Added runtime.o for runtime linking: " << runtime_path << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added runtime.o for runtime linking: {}", runtime_path);
                     }
                 }
                 else
                 {
-                    std::cerr << "Warning: runtime.o not found at " << runtime_path << ", runtime functions may not link properly" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "runtime.o not found at {}, runtime functions may not link properly", runtime_path);
                 }
 
                 // Add libcryo.a to the linker
@@ -624,17 +610,17 @@ namespace Cryo
                     _linker->add_object_file(libcryo_path);
                     if (_debug_mode)
                     {
-                        std::cout << "[DEBUG] Added libcryo.a for standard library linking: " << libcryo_path << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added libcryo.a for standard library linking: {}", libcryo_path);
                     }
                 }
                 else
                 {
-                    std::cerr << "Warning: libcryo.a not found at " << libcryo_path << ", stdlib functions may not link properly" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "libcryo.a not found at {}, stdlib functions may not link properly", libcryo_path);
                 }
             }
             else if (_debug_mode)
             {
-                std::cout << "[DEBUG] Standard library linking disabled by --no-std flag" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Standard library linking disabled by --no-std flag");
             }
 
             // Get generated module and link
@@ -651,9 +637,9 @@ namespace Cryo
             if (!success)
             {
                 std::string linker_error = _linker->get_last_error();
-                std::cerr << "[DEBUG] Linker error string length: " << linker_error.length() << std::endl;
-                std::cerr << "[DEBUG] Linker error content: '" << linker_error << "'" << std::endl;
-                std::cerr << "[DEBUG] Full error message will be: 'Linking failed: " << linker_error << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Linker error string length: {}", linker_error.length());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Linker error content: '{}'", linker_error);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Full error message will be: 'Linking failed: {}'", linker_error);
 
                 _diagnostic_manager->report_error(DiagnosticID::Unknown, DiagnosticCategory::System,
                                                   "Linking failed: " + linker_error,
@@ -803,34 +789,34 @@ namespace Cryo
 
         // Two-pass approach for proper forward reference resolution:
         // Pass 1: Collect all declarations (functions, structs, enums, traits) first
-        std::cout << "[CompilerInstance] Pass 1: Collecting declarations..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pass 1: Collecting declarations...");
         collect_declarations_pass(node, _symbol_table.get(), "Global");
 
         // Pre-register functions in LLVM to prevent forward declaration conflicts
         if (_codegen)
         {
-            std::cout << "[CompilerInstance] Ensuring visitor is initialized for function pre-registration..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Ensuring visitor is initialized for function pre-registration...");
             if (_codegen->ensure_visitor_initialized())
             {
-                std::cout << "[CompilerInstance] Processing struct declarations before function pre-registration..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing struct declarations before function pre-registration...");
                 // First, process struct declarations to ensure TypeMapper has correct type information
                 process_struct_declarations_for_preregistration(node);
 
-                std::cout << "[CompilerInstance] Pre-registering functions in LLVM module..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registering functions in LLVM module...");
                 _codegen->get_visitor()->pre_register_functions_from_symbol_table();
             }
             else
             {
-                std::cout << "[WARNING] Failed to initialize CodegenVisitor for function pre-registration" << std::endl;
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to initialize CodegenVisitor for function pre-registration");
             }
         }
         else
         {
-            std::cout << "[WARNING] CodeGenerator not available for function pre-registration" << std::endl;
+            LOG_WARN(Cryo::LogComponent::GENERAL, "CodeGenerator not available for function pre-registration");
         }
 
         // Pass 2: Process function bodies and other code that can reference the symbols
-        std::cout << "[CompilerInstance] Pass 2: Processing function bodies and references..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pass 2: Processing function bodies and references...");
         populate_symbol_table_with_scope(node, _symbol_table.get(), "Global");
     }
 
@@ -842,7 +828,7 @@ namespace Cryo
         // Handle function declarations - only collect signature, not body
         if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(node))
         {
-            std::cout << "[CompilerInstance] Pass 1: Found function declaration: " << func_decl->name() << std::endl;
+            LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Found function declaration: {}", func_decl->name());
 
             // Create function type from return type and parameters
             std::vector<Type *> param_types;
@@ -855,12 +841,11 @@ namespace Cryo
 
             // Use resolved return type directly
             Type *return_type = func_decl->get_resolved_return_type();
-            
+
             // Handle functions that may not have resolved return types yet
             if (return_type == nullptr)
             {
-                std::cerr << "[CompilerInstance] Warning: Function '" << func_decl->name() 
-                          << "' has null return type, defaulting to void" << std::endl;
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Function '{}' has null return type, defaulting to void", func_decl->name());
                 return_type = _ast_context->types().get_void_type(); // Safe fallback
             }
 
@@ -875,19 +860,19 @@ namespace Cryo
                                           func_decl->location(), function_type, scope_name,
                                           func_decl->generic_parameters().empty() ? "" : enhanced_signature);
 
-            std::cout << "[CompilerInstance] Pass 1: Registered function: " << func_decl->name() << std::endl;
+            LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Registered function: {}", func_decl->name());
 
             // Register generic function templates if this function has generic parameters
             if (!func_decl->generic_parameters().empty())
             {
-                std::cout << "[CompilerInstance] Registering local generic function template: " << func_decl->name() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering local generic function template: {}", func_decl->name());
                 _template_registry->register_function_template(
                     func_decl->name(),
                     func_decl,
                     "Main", // Use "Main" as the module name for local templates
                     ""      // No source file path for main file templates
                 );
-                std::cout << "[CompilerInstance] Registered local generic function template: " << func_decl->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic function template: {}", func_decl->name());
             }
 
             // Do NOT process function body in this pass
@@ -906,12 +891,11 @@ namespace Cryo
 
             // Use resolved return type directly
             Type *return_type = intrinsic_decl->get_resolved_return_type();
-            
+
             // Handle intrinsics that may not have resolved return types yet
             if (return_type == nullptr)
             {
-                std::cerr << "[CompilerInstance] Warning: Intrinsic '" << intrinsic_decl->name() 
-                          << "' has null return type, defaulting to void" << std::endl;
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Intrinsic '{}' has null return type, defaulting to void", intrinsic_decl->name());
                 return_type = _ast_context->types().get_void_type(); // Safe fallback
             }
 
@@ -922,7 +906,7 @@ namespace Cryo
             current_scope->declare_symbol(intrinsic_decl->name(), SymbolKind::Intrinsic,
                                           intrinsic_decl->location(), function_type, scope_name);
 
-            std::cout << "[CompilerInstance] Registered intrinsic function '" << intrinsic_decl->name() << "' in symbol table" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered intrinsic function '{}' in symbol table", intrinsic_decl->name());
         }
         // Handle struct declarations
         else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
@@ -940,7 +924,7 @@ namespace Cryo
                 if (method)
                 {
                     std::string method_name = scope_name + "::" + struct_decl->name() + "::" + method->name();
-                    std::cout << "[CompilerInstance] Pass 1: Found struct method: " << method_name << std::endl;
+                    LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Found struct method: {}", method_name);
 
                     // Create function type for the method
                     std::vector<Type *> param_types;
@@ -951,7 +935,7 @@ namespace Cryo
                     }
 
                     Type *return_type = method->get_resolved_return_type();
-                    
+
                     // Handle constructors that may not have resolved return types yet
                     if (return_type == nullptr)
                     {
@@ -961,12 +945,11 @@ namespace Cryo
                         }
                         else
                         {
-                            std::cerr << "[CompilerInstance] Warning: Struct method '" << method_name 
-                                      << "' has null return type and is not a constructor" << std::endl;
+                            LOG_WARN(Cryo::LogComponent::GENERAL, "Struct method '{}' has null return type and is not a constructor", method_name);
                             return_type = _ast_context->types().get_void_type(); // Safe fallback
                         }
                     }
-                    
+
                     Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
@@ -978,14 +961,14 @@ namespace Cryo
             // Register generic struct templates if this struct has generic parameters
             if (!struct_decl->generic_parameters().empty())
             {
-                std::cout << "[CompilerInstance] Registering local generic struct template: " << struct_decl->name() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering local generic struct template: {}", struct_decl->name());
                 _template_registry->register_struct_template(
                     struct_decl->name(),
                     struct_decl,
                     "Main", // Use "Main" as the module name for local templates
                     ""      // No source file path for main file templates
                 );
-                std::cout << "[CompilerInstance] Registered local generic struct template: " << struct_decl->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic struct template: {}", struct_decl->name());
             }
         }
         // Handle class declarations
@@ -1004,7 +987,7 @@ namespace Cryo
                 if (method)
                 {
                     std::string method_name = scope_name + "::" + class_decl->name() + "::" + method->name();
-                    std::cout << "[CompilerInstance] Pass 1: Found class method: " << method_name << std::endl;
+                    LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Found class method: {}", method_name);
 
                     // Create function type for the method
                     std::vector<Type *> param_types;
@@ -1015,7 +998,7 @@ namespace Cryo
                     }
 
                     Type *return_type = method->get_resolved_return_type();
-                    
+
                     // Handle constructors that may not have resolved return types yet
                     if (return_type == nullptr)
                     {
@@ -1025,12 +1008,11 @@ namespace Cryo
                         }
                         else
                         {
-                            std::cerr << "[CompilerInstance] Warning: Method '" << method_name 
-                                      << "' has null return type and is not a constructor" << std::endl;
+                            LOG_WARN(Cryo::LogComponent::GENERAL, "Method '{}' has null return type and is not a constructor", method_name);
                             return_type = _ast_context->types().get_void_type(); // Safe fallback
                         }
                     }
-                    
+
                     Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
@@ -1042,14 +1024,14 @@ namespace Cryo
             // Register generic class templates if this class has generic parameters
             if (!class_decl->generic_parameters().empty())
             {
-                std::cout << "[CompilerInstance] Registering local generic class template: " << class_decl->name() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering local generic class template: {}", class_decl->name());
                 _template_registry->register_class_template(
                     class_decl->name(),
                     class_decl,
                     "Main", // Use "Main" as the module name for local templates
                     ""      // No source file path for main file templates
                 );
-                std::cout << "[CompilerInstance] Registered local generic class template: " << class_decl->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic class template: {}", class_decl->name());
             }
         }
         // Handle enum declarations
@@ -1081,14 +1063,14 @@ namespace Cryo
             // Register generic enum templates if this enum has generic parameters
             if (!enum_decl->generic_parameters().empty())
             {
-                std::cout << "[CompilerInstance] Registering local generic enum template: " << enum_decl->name() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering local generic enum template: {}", enum_decl->name());
                 _template_registry->register_enum_template(
                     enum_decl->name(),
                     enum_decl,
                     "Main", // Use "Main" as the module name for local templates
                     ""      // No source file path for main file templates
                 );
-                std::cout << "[CompilerInstance] Registered local generic enum template: " << enum_decl->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic enum template: {}", enum_decl->name());
             }
         }
         // Handle trait declarations
@@ -1101,20 +1083,20 @@ namespace Cryo
             // Register generic trait templates if this trait has generic parameters
             if (!trait_decl->generic_parameters().empty())
             {
-                std::cout << "[CompilerInstance] Registering local generic trait template: " << trait_decl->name() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering local generic trait template: {}", trait_decl->name());
                 _template_registry->register_trait_template(
                     trait_decl->name(),
                     trait_decl,
                     "Main", // Use "Main" as the module name for local templates
                     ""      // No source file path for main file templates
                 );
-                std::cout << "[CompilerInstance] Registered local generic trait template: " << trait_decl->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic trait template: {}", trait_decl->name());
             }
         }
         // Handle import declarations (process in first pass since they affect symbol resolution)
         else if (auto import_decl = dynamic_cast<ImportDeclarationNode *>(node))
         {
-            std::cout << "[CompilerInstance] Processing import: " << import_decl->path() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing import: {}", import_decl->path());
 
             // Use the member ModuleLoader instance
             _module_loader->set_stdlib_root("./stdlib");
@@ -1131,24 +1113,24 @@ namespace Cryo
                     if (!result.namespace_alias.empty())
                     {
                         // Single specific import treated as namespace alias
-                        std::cout << "[CompilerInstance] Processing namespace alias '" << result.namespace_alias
-                                  << "' for module '" << result.module_name << "' with " << result.symbol_map.size() << " symbols" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing namespace alias '{}' for module '{}' with {} symbols",
+                                  result.namespace_alias, result.module_name, result.symbol_map.size());
 
                         current_scope->register_namespace(result.namespace_alias, result.symbol_map);
                         _imported_namespaces.push_back(result.namespace_alias); // Track for enhanced resolution
-                        std::cout << "[CompilerInstance] Registered namespace alias '" << result.namespace_alias << "' with "
-                                  << result.symbol_map.size() << " symbols" << std::endl;
+                        LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered namespace alias '{}' with {} symbols",
+                                  result.namespace_alias, result.symbol_map.size());
                     }
                     else
                     {
                         // Multiple specific imports - add symbols directly to current scope
-                        std::cout << "[CompilerInstance] Processing specific symbol imports with " << result.symbol_map.size() << " symbols" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing specific symbol imports with {} symbols", result.symbol_map.size());
 
                         for (const auto &[symbol_name, symbol] : result.symbol_map)
                         {
                             // Register each symbol directly in the current scope
                             current_scope->declare_symbol(symbol_name, symbol.kind, symbol.declaration_location, symbol.data_type, scope_name);
-                            std::cout << "[CompilerInstance] Registered specific symbol: " << symbol_name << std::endl;
+                            LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered specific symbol: {}", symbol_name);
                         }
                     }
                 }
@@ -1161,18 +1143,18 @@ namespace Cryo
                     {
                         current_scope->register_namespace(namespace_name, result.symbol_map);
                         _imported_namespaces.push_back(namespace_name); // Track for enhanced resolution
-                        std::cout << "[CompilerInstance] Registered namespace '" << namespace_name << "' with "
-                                  << result.symbol_map.size() << " symbols" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered namespace '{}' with {} symbols",
+                                  namespace_name, result.symbol_map.size());
                     }
                     else
                     {
-                        std::cout << "[CompilerInstance] Warning: Import succeeded but no symbols found in " << import_decl->path() << std::endl;
+                        LOG_WARN(Cryo::LogComponent::GENERAL, "Import succeeded but no symbols found in {}", import_decl->path());
                     }
                 }
             }
             else
             {
-                std::cout << "[CompilerInstance] Failed to load import '" << import_decl->path() << "': " << result.error_message << std::endl;
+                LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to load import '{}': {}", import_decl->path(), result.error_message);
             }
         }
         // Handle variable declarations (collect them in first pass too)
@@ -1265,14 +1247,13 @@ namespace Cryo
 
             if (!success && _debug_mode)
             {
-                std::cout << "[CompilerInstance] Warning: Variable '" << var_decl->name()
-                          << "' already declared in scope '" << scope_name << "'" << std::endl;
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Variable '{}' already declared in scope '{}'",
+                         var_decl->name(), scope_name);
             }
             else if (_debug_mode)
             {
-                std::cout << "[CompilerInstance] Added variable '" << var_decl->name()
-                          << "' to scope '" << scope_name << "' with type '"
-                          << var_type->to_string() << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added variable '{}' to scope '{}' with type '{}'",
+                          var_decl->name(), scope_name, var_type->to_string());
             }
         }
         // Handle declaration statements (our wrapper)
@@ -1348,7 +1329,7 @@ namespace Cryo
         // Note: We don't pre-load stdlib symbols here anymore since they're loaded on-demand
         // through the import system. This allows for better modularity and avoids duplicate definitions.
 
-        std::cout << "Standard library initialized from libcryo" << std::endl;
+        LOG_INFO(Cryo::LogComponent::GENERAL, "Standard library initialized from libcryo");
     }
 
     void CompilerInstance::inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name)
@@ -1356,7 +1337,7 @@ namespace Cryo
         // Skip auto-import if we're in stdlib compilation mode to avoid circular dependencies
         if (_stdlib_compilation_mode)
         {
-            std::cout << "[CompilerInstance] Skipping auto-imports in stdlib compilation mode" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports in stdlib compilation mode");
             return;
         }
 
@@ -1365,11 +1346,11 @@ namespace Cryo
             _source_file.find("stdlib/core/types.cryo") != std::string::npos ||
             _source_file.find("runtime/runtime.cryo") != std::string::npos)
         {
-            std::cout << "[CompilerInstance] Skipping auto-imports when compiling core/types module" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports when compiling core/types module");
             return;
         }
 
-        std::cout << "[CompilerInstance] Injecting auto-import: core/types" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: core/types");
 
         // Use the member ModuleLoader instance
         _module_loader->set_stdlib_root("./stdlib");
@@ -1392,21 +1373,21 @@ namespace Cryo
             if (!result.symbol_map.empty())
             {
                 current_scope->register_namespace(result.module_name, result.symbol_map);
-                std::cout << "[CompilerInstance] Auto-imported core/types: registered namespace '" << result.module_name
-                          << "' with " << result.symbol_map.size() << " symbols" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported core/types: registered namespace '{}' with {} symbols",
+                          result.module_name, result.symbol_map.size());
             }
             else
             {
-                std::cout << "[CompilerInstance] Warning: Auto-import succeeded but no symbols found in core/types" << std::endl;
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in core/types");
             }
         }
         else
         {
-            std::cout << "[CompilerInstance] Warning: Failed to auto-import core/types: " << result.error_message << std::endl;
+            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import core/types: {}", result.error_message);
         }
 
         // Auto-import runtime functions
-        std::cout << "[CompilerInstance] Injecting auto-import: runtime/runtime" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: runtime/runtime");
 
         // Create a synthetic ImportDeclarationNode for runtime/runtime
         // This simulates: import <runtime/runtime>;
@@ -1425,17 +1406,17 @@ namespace Cryo
             if (!runtime_result.symbol_map.empty())
             {
                 current_scope->register_namespace(runtime_result.module_name, runtime_result.symbol_map);
-                std::cout << "[CompilerInstance] Auto-imported runtime: registered namespace '" << runtime_result.module_name
-                          << "' with " << runtime_result.symbol_map.size() << " symbols" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: registered namespace '{}' with {} symbols",
+                          runtime_result.module_name, runtime_result.symbol_map.size());
             }
             else
             {
-                std::cout << "[CompilerInstance] Warning: Auto-import succeeded but no symbols found in runtime" << std::endl;
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in runtime");
             }
         }
         else
         {
-            std::cout << "[CompilerInstance] Warning: Failed to auto-import runtime: " << runtime_result.error_message << std::endl;
+            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import runtime: {}", runtime_result.error_message);
         }
     }
 
@@ -1444,7 +1425,7 @@ namespace Cryo
         if (!node || !_codegen || !_codegen->get_visitor())
             return;
 
-        std::cout << "[CompilerInstance] Processing struct declarations for pre-registration..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing struct declarations for pre-registration...");
 
         // Process the AST to find and register struct declarations with the TypeMapper
         process_struct_declarations_recursive(node);
@@ -1460,30 +1441,30 @@ namespace Cryo
         // Ensure the visitor is initialized first
         if (!_codegen->ensure_visitor_initialized())
         {
-            std::cerr << "[CompilerInstance] Failed to initialize CodegenVisitor for AST node registration" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to initialize CodegenVisitor for AST node registration");
             return;
         }
 
         Codegen::CodegenVisitor *visitor = _codegen->get_visitor();
         if (!visitor)
         {
-            std::cerr << "[CompilerInstance] Failed to get CodegenVisitor for AST node registration" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to get CodegenVisitor for AST node registration");
             return;
         }
 
         Codegen::TypeMapper *type_mapper = visitor->get_type_mapper();
         if (!type_mapper)
         {
-            std::cerr << "[CompilerInstance] Failed to get TypeMapper for AST node registration" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to get TypeMapper for AST node registration");
             return;
         }
 
-        std::cout << "[CompilerInstance] Registering struct/class AST nodes with TypeMapper..." << std::endl;
-        
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering struct/class AST nodes with TypeMapper...");
+
         // Recursively find and register all struct/class declarations
         register_ast_nodes_recursive(_ast_root.get(), type_mapper);
-        
-        std::cout << "[CompilerInstance] Completed AST node registration with TypeMapper" << std::endl;
+
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Completed AST node registration with TypeMapper");
     }
 
     void CompilerInstance::register_ast_nodes_recursive(ASTNode *node, Codegen::TypeMapper *type_mapper)
@@ -1494,13 +1475,13 @@ namespace Cryo
         // Register struct declarations
         if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
         {
-            std::cout << "[CompilerInstance] Registering struct AST node: " << struct_decl->name() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering struct AST node: {}", struct_decl->name());
             type_mapper->register_struct_ast_node(struct_decl);
         }
-        // Register class declarations  
+        // Register class declarations
         else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(node))
         {
-            std::cout << "[CompilerInstance] Registering class AST node: " << class_decl->name() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering class AST node: {}", class_decl->name());
             type_mapper->register_class_ast_node(class_decl);
         }
         // Recurse into program nodes
@@ -1529,7 +1510,7 @@ namespace Cryo
         // If this is a struct declaration, process it
         if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
         {
-            std::cout << "[CompilerInstance] Pre-processing struct: " << struct_decl->name() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-processing struct: {}", struct_decl->name());
 
             // Visit the struct declaration to register it with TypeMapper
             struct_decl->accept(*_codegen->get_visitor());

@@ -385,41 +385,56 @@ namespace Cryo
 
     private:
         /**
-         * @brief Format message with arguments (simple implementation)
+         * @brief Format message with arguments - replaces {} placeholders
          */
         template <typename... Args>
         std::string format_message(const std::string &format, Args &&...args)
         {
-            // Simple implementation - no formatting for now
-            // Can be enhanced with std::format (C++20) or fmt library
             if constexpr (sizeof...(args) == 0)
             {
                 return format;
             }
             else
             {
-                return format_message_impl(format, std::forward<Args>(args)...);
+                return format_impl(format, std::forward<Args>(args)...);
             }
         }
 
-        // Implementation of variadic formatting
+        // Recursive formatter - processes one argument at a time
         template <typename T, typename... Rest>
-        std::string format_message_impl(const std::string &format, T &&first, Rest &&...rest)
+        std::string format_impl(const std::string &format, T &&first, Rest &&...rest)
         {
-            std::ostringstream oss;
-            oss << format << " ";
-            append_to_stream(oss, std::forward<T>(first));
-            if constexpr (sizeof...(rest) > 0)
-            {
-                ((append_to_stream(oss << " ", std::forward<Rest>(rest))), ...);
-            }
-            return oss.str();
-        }
+            std::ostringstream result;
+            size_t placeholder_pos = format.find("{}");
 
-        template <typename T>
-        void append_to_stream(std::ostream &os, T &&value)
-        {
-            os << std::forward<T>(value);
+            if (placeholder_pos != std::string::npos)
+            {
+                // Found a placeholder - replace it
+                result << format.substr(0, placeholder_pos); // Text before {}
+                result << std::forward<T>(first);            // Replace {} with argument
+
+                // Continue with remaining format and arguments
+                if constexpr (sizeof...(rest) > 0)
+                {
+                    result << format_impl(format.substr(placeholder_pos + 2), std::forward<Rest>(rest)...);
+                }
+                else
+                {
+                    // No more arguments, just add remaining format string
+                    result << format.substr(placeholder_pos + 2);
+                }
+            }
+            else
+            {
+                // No placeholder found - just append everything
+                result << format << " " << std::forward<T>(first);
+                if constexpr (sizeof...(rest) > 0)
+                {
+                    ((result << " " << std::forward<Rest>(rest)), ...);
+                }
+            }
+
+            return result.str();
         }
     };
 

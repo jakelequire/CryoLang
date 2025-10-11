@@ -1,4 +1,5 @@
 #include "AST/SymbolTable.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 #include <algorithm>
 #include <sstream>
@@ -84,8 +85,8 @@ namespace Cryo
                 std::string qualified_namespace = parent_namespace + "::" + namespace_name;
                 result = lookup_namespaced_symbol(qualified_namespace, symbol_name);
 
-                std::cout << "[DEBUG] Trying relative resolution: " << qualified_namespace << "::" << symbol_name
-                          << " (from context " << current_namespace << ")" << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "Trying relative resolution: {}::{} (from context {})",
+                          qualified_namespace, symbol_name, current_namespace);
 
                 if (result)
                     return result;
@@ -103,7 +104,7 @@ namespace Cryo
             auto symbol_it = symbols.find(symbol_name);
             if (symbol_it != symbols.end())
             {
-                std::cout << "[DEBUG] Found symbol '" << symbol_name << "' in namespace '" << namespace_name << "'" << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "Found symbol '{}' in namespace '{}'", symbol_name, namespace_name);
                 return const_cast<Symbol *>(&symbol_it->second);
             }
         }
@@ -130,7 +131,7 @@ namespace Cryo
             result = lookup_namespaced_symbol(namespace_name, symbol_name);
             if (result)
             {
-                std::cout << "[DEBUG] Found symbol '" << symbol_name << "' in imported namespace '" << namespace_name << "'" << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "Found symbol '{}' in imported namespace '{}'", symbol_name, namespace_name);
                 return result;
             }
         }
@@ -169,7 +170,7 @@ namespace Cryo
                             result = lookup_namespaced_symbol(imported_namespace, symbol_part);
                             if (result)
                             {
-                                std::cout << "[DEBUG] Expanded '" << qualified_name << "' to '" << imported_namespace << "::" << symbol_part << "'" << std::endl;
+                                LOG_TRACE(Cryo::LogComponent::AST, "Expanded '{}' to '{}::{}'", qualified_name, imported_namespace, symbol_part);
                                 return result;
                             }
                         }
@@ -184,7 +185,7 @@ namespace Cryo
     void SymbolTable::register_namespace(const std::string &namespace_name, const std::unordered_map<std::string, Symbol> &symbols)
     {
         namespaces_[namespace_name] = symbols;
-        std::cout << "[DEBUG] Registered namespace '" << namespace_name << "' with " << symbols.size() << " symbols" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registered namespace '{}' with {} symbols", namespace_name, symbols.size());
     }
 
     bool SymbolTable::has_namespace(const std::string &namespace_name) const
@@ -364,7 +365,7 @@ namespace Cryo
         Type *function_type = parse_function_signature(signature, type_context);
         if (!function_type)
         {
-            std::cout << "    ERROR: Failed to parse function signature for " << name << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "Failed to parse function signature for {}", name);
             return false;
         }
         // Create a dummy source location for built-ins
@@ -374,7 +375,7 @@ namespace Cryo
         bool result = declare_symbol(name, SymbolKind::Function, loc, function_type, namespace_scope);
         if (!result)
         {
-            std::cout << "    WARNING: Built-in function already declared: " << name << std::endl;
+            LOG_WARN(Cryo::LogComponent::AST, "Built-in function already declared: {}", name);
         }
         return result;
     }
