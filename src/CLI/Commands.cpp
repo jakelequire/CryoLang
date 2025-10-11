@@ -1,6 +1,7 @@
 #include "CLI/Commands.hpp"
 #include "CLI/CLI.hpp"
 #include "Compiler/CompilerInstance.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 #include <filesystem>
 #include <chrono>
@@ -95,6 +96,9 @@ namespace Cryo::CLI::Commands
         argument(CLIArgument("output", "Output file name", false).alias("o"));
         argument(CLIArgument("debug", "Enable debug output", false).flag().alias("d"));
         argument(CLIArgument("verbose", "Show verbose compilation output", false).flag().alias("v"));
+        argument(CLIArgument("trace", "Enable trace-level logging (most verbose)", false).flag());
+        argument(CLIArgument("log-file", "Write logs to specified file", false));
+        argument(CLIArgument("log-component", "Filter logs by component (e.g., CODEGEN, PARSER)", false));
         argument(CLIArgument("ast", "Display AST after compilation", false).flag());
         argument(CLIArgument("symbols", "Display symbol table after compilation", false).flag());
         argument(CLIArgument("types", "Display type table after compilation", false).flag());
@@ -118,6 +122,70 @@ namespace Cryo::CLI::Commands
     {
         bool verbose = args.get_flag("verbose");
         bool debug = args.get_flag("debug");
+        bool trace = args.get_flag("trace");
+        std::string log_file = args.get_arg("log-file");
+        std::string log_component_str = args.get_arg("log-component");
+
+        // Configure logger based on CLI flags
+        Cryo::LogLevel log_level = Cryo::LogLevel::NONE;
+        if (trace)
+        {
+            log_level = Cryo::LogLevel::TRACE;
+        }
+        else if (debug)
+        {
+            log_level = Cryo::LogLevel::DEBUG;
+        }
+        else if (verbose)
+        {
+            log_level = Cryo::LogLevel::INFO;
+        }
+
+        // Parse component filter if provided
+        Cryo::LogComponent log_component = Cryo::LogComponent::ALL;
+        if (!log_component_str.empty())
+        {
+            // Convert string to LogComponent enum
+            if (log_component_str == "CODEGEN")
+                log_component = Cryo::LogComponent::CODEGEN;
+            else if (log_component_str == "PARSER")
+                log_component = Cryo::LogComponent::PARSER;
+            else if (log_component_str == "LEXER")
+                log_component = Cryo::LogComponent::LEXER;
+            else if (log_component_str == "AST")
+                log_component = Cryo::LogComponent::AST;
+            else if (log_component_str == "TYPECHECKER")
+                log_component = Cryo::LogComponent::TYPECHECKER;
+            else if (log_component_str == "LINKER")
+                log_component = Cryo::LogComponent::LINKER;
+            else if (log_component_str == "OPTIMIZER")
+                log_component = Cryo::LogComponent::OPTIMIZER;
+            else if (log_component_str == "GENERAL")
+                log_component = Cryo::LogComponent::GENERAL;
+            // Add others as needed
+        }
+
+        // Reconfigure logger if any logging is enabled
+        if (log_level != Cryo::LogLevel::NONE)
+        {
+            Cryo::LoggerConfig config;
+            config.console_level = log_level;
+            config.file_level = log_level;
+            config.log_file_path = log_file; // Empty string = no file
+            config.enable_colors = true;
+            config.enable_timestamps = true;
+            config.enable_component_tags = true;
+
+            // Set component filter if specified (leave empty for ALL)
+            if (log_component != Cryo::LogComponent::ALL)
+            {
+                // Only enable the requested component
+                config.component_filters[log_component] = true;
+            }
+            // If ALL, leave component_filters empty (logs all components)
+
+            Cryo::Logger::instance().initialize(config);
+        }
 
         if (verbose)
         {
@@ -168,7 +236,7 @@ namespace Cryo::CLI::Commands
             {
                 std::cout << "\nSymbol Table:" << std::endl;
                 compiler->dump_symbol_table();
-                
+
                 std::cout << "\nType Table:" << std::endl;
                 compiler->dump_type_table();
             }
@@ -183,7 +251,7 @@ namespace Cryo::CLI::Commands
             if (args.get_flag("emit-llvm"))
             {
                 std::string output_path = args.output_file();
-                
+
                 // If no -o flag specified, use input file path with .bc extension
                 if (output_path.empty())
                 {
@@ -200,9 +268,9 @@ namespace Cryo::CLI::Commands
                     }
                 }
                 // If -o flag specified, use it as is (assume .bc extension already included or will be added)
-                
+
                 std::cout << "\nEmitting LLVM bitcode to: " << output_path << std::endl;
-                
+
                 if (compiler->codegen() && compiler->codegen()->emit_llvm_ir(output_path))
                 {
                     std::cout << "✓ LLVM bitcode emitted successfully: " << output_path << std::endl;

@@ -1,6 +1,7 @@
 #include "Codegen/TypeMapper.hpp"
 #include "AST/Type.hpp"
 #include "AST/TypeChecker.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 #include <sstream>
 
@@ -25,11 +26,11 @@ namespace Cryo::Codegen
 
     llvm::Type *TypeMapper::map_type(Cryo::Type *cryo_type)
     {
-        std::cout << "[DEBUG] TypeMapper::map_type() - ENTRY" << std::endl;
+        LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - ENTRY");
 
         if (!cryo_type)
         {
-            std::cout << "[DEBUG] TypeMapper::map_type() - null type passed!" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - null type passed!");
             report_error("Cannot map null type");
             return nullptr;
         }
@@ -39,28 +40,28 @@ namespace Cryo::Codegen
         TypeKind type_kind = TypeKind::Void;
 
         // Completely avoid virtual function calls on potentially corrupted Type objects
-        std::cout << "[DEBUG] TypeMapper::map_type() - ENTRY" << std::endl;
-        std::cout << "[DEBUG] TypeMapper::map_type() - avoiding name() call due to potential corruption" << std::endl;
-        std::cout << "[DEBUG] TypeMapper::map_type() - type pointer: " << cryo_type << std::endl;
+        LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - avoiding name() call due to potential corruption");
+        LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - type pointer: {}", (void *)cryo_type);
 
         try
         {
-            std::cout << "[DEBUG] TypeMapper::map_type() - about to call kind() method" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - about to call kind() method");
 
             if (cryo_type && cryo_type != nullptr)
             {
                 type_kind = cryo_type->kind();
-                std::cout << "[DEBUG] TypeMapper::map_type() - successfully got kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - successfully got kind: {} ({})",
+                          TypeKindToString(type_kind), static_cast<int>(type_kind));
             }
             else
             {
-                std::cout << "[DEBUG] TypeMapper::map_type() - null pointer detected" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - null pointer detected");
                 return nullptr;
             }
         }
         catch (...)
         {
-            std::cout << "[DEBUG] TypeMapper::map_type() - kind() failed, type is corrupted" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - kind() failed, type is corrupted");
             return nullptr;
         }
 
@@ -68,42 +69,42 @@ namespace Cryo::Codegen
         auto cache_it = _cryo_type_cache.find(cryo_type);
         if (cache_it != _cryo_type_cache.end())
         {
-            std::cout << "[DEBUG] TypeMapper::map_type() - found cached type for: <avoiding name() call>" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - found cached type");
             return cache_it->second;
         }
 
-        std::cout << "[DEBUG] TypeMapper::map_type() - about to call kind() method" << std::endl;
+        LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - about to call kind() method");
 
         // Add protective check to prevent pure virtual method crash
         try
         {
             // Avoid name() call completely due to corruption issues
-            std::cout << "[DEBUG] TypeMapper::map_type() - vtable test passed, avoiding name() call" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - vtable test passed, avoiding name() call");
 
             // Check for empty/invalid names which could indicate corruption
             if (type_name.empty())
             {
-                std::cout << "[ERROR] TypeMapper::map_type() - detected empty type name, possible corruption" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - detected empty type name, possible corruption");
                 // For empty names that might be int types, try to recover
                 try
                 {
                     auto kind_test = cryo_type->kind();
                     if (kind_test == TypeKind::Integer)
                     {
-                        std::cout << "[DEBUG] TypeMapper::map_type() - empty name but Integer kind, using default i32" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - empty name but Integer kind, using default i32");
                         return llvm::Type::getInt32Ty(_context_manager.get_context());
                     }
                 }
                 catch (...)
                 {
-                    std::cout << "[ERROR] TypeMapper::map_type() - cannot determine kind for empty name type" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - cannot determine kind for empty name type");
                     return nullptr;
                 }
             }
         }
         catch (...)
         {
-            std::cout << "[ERROR] TypeMapper::map_type() - corrupted type object detected!" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - corrupted type object detected!");
             report_error("Corrupted type object detected during type mapping");
             return nullptr;
         }
@@ -113,16 +114,17 @@ namespace Cryo::Codegen
         // Safely get the type kind with protection (already retrieved above)
         try
         {
-            std::cout << "[DEBUG] TypeMapper::map_type() - successfully got kind: " << TypeKindToString(type_kind) << " (" << static_cast<int>(type_kind) << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - successfully got kind: {} ({})",
+                      TypeKindToString(type_kind), static_cast<int>(type_kind));
         }
         catch (...)
         {
-            std::cout << "[ERROR] TypeMapper::map_type() - pure virtual method crash detected on kind()" << std::endl;
-            std::cout << "[DEBUG] TypeMapper::map_type() - avoiding virtual function calls, falling back to safe defaults" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - pure virtual method crash detected on kind()");
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - avoiding virtual function calls, falling back to safe defaults");
 
             // Cannot safely call any virtual functions on corrupted type object
             // Fall back to safe default type
-            std::cout << "[DEBUG] TypeMapper::map_type() - using safe fallback to i32 type" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_type() - using safe fallback to i32 type");
             return llvm::Type::getInt32Ty(_context_manager.get_context());
         }
 
@@ -174,7 +176,7 @@ namespace Cryo::Codegen
             break;
 
         case Cryo::TypeKind::Class:
-            std::cout << "[DEBUG] TypeMapper - mapping Class type: " << cryo_type->name() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper - mapping Class type: {}", cryo_type->name());
             llvm_type = map_class_type(static_cast<Cryo::ClassType *>(cryo_type));
             break;
 
@@ -217,7 +219,8 @@ namespace Cryo::Codegen
                 auto alias_type = dynamic_cast<Cryo::TypeAlias *>(cryo_type);
                 if (alias_type && alias_type->target_type())
                 {
-                    std::cout << "[DEBUG] TypeMapper - resolving TypeAlias '" << alias_type->name() << "' to target type: " << alias_type->target_type()->name() << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper - resolving TypeAlias '{}' to target type: {}",
+                              alias_type->name(), alias_type->target_type()->name());
                     return map_type(alias_type->target_type());
                 }
                 else
@@ -307,24 +310,24 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        std::cout << "[DEBUG] TypeMapper::map_integer_type() - starting, type pointer: " << int_type << std::endl;
+        LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - starting, type pointer: {}", (void *)int_type);
 
         // Test vtable validity before calling virtual methods
         // Comprehensive object validation
         try
         {
-            std::cout << "[DEBUG] TypeMapper::map_integer_type() - testing vtable before size_bytes()" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - testing vtable before size_bytes()");
             auto test_kind = int_type->kind();
-            std::cout << "[DEBUG] TypeMapper::map_integer_type() - vtable test passed, kind: " << TypeKindToString(test_kind) << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - vtable test passed, kind: {}", TypeKindToString(test_kind));
 
             // Additional validation - check if this is actually an IntegerType
-            std::cout << "[DEBUG] TypeMapper::map_integer_type() - testing integer_kind() method" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - testing integer_kind() method");
             auto int_kind = int_type->integer_kind();
-            std::cout << "[DEBUG] TypeMapper::map_integer_type() - integer_kind() test passed, int_kind: " << static_cast<int>(int_kind) << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - integer_kind() test passed, int_kind: {}", static_cast<int>(int_kind));
         }
         catch (...)
         {
-            std::cout << "[ERROR] TypeMapper::map_integer_type() - vtable corruption detected!" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - vtable corruption detected!");
             report_error("Corrupted IntegerType object in map_integer_type");
             return nullptr;
         }
@@ -335,32 +338,32 @@ namespace Cryo::Codegen
 
         try
         {
-            std::cout << "[DEBUG] TypeMapper::map_integer_type() - calling size_bytes()" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - calling size_bytes()");
 
             // Double-check the integer kind value before calling size_bytes
             auto int_kind_check = int_type->integer_kind();
-            std::cout << "[DEBUG] TypeMapper::map_integer_type() - final int_kind check: " << static_cast<int>(int_kind_check) << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - final int_kind check: {}", static_cast<int>(int_kind_check));
 
             // Special detection for problematic Int type (kind=10) from runtime.cryo
             if (int_kind_check == Cryo::IntegerKind::Int)
             {
-                std::cout << "[DEBUG] TypeMapper::map_integer_type() - detected problematic Int type, using fallback" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - detected problematic Int type, using fallback");
                 byte_size = 4;        // Default int size
                 is_signed_val = true; // int is signed
-                std::cout << "[DEBUG] TypeMapper::map_integer_type() - using fallback values: size=4, signed=true" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - using fallback values: size=4, signed=true");
             }
             else
             {
                 // CRITICAL FIX: Protect ALL size_bytes() calls, not just fallback
-                std::cout << "[DEBUG] TypeMapper::map_integer_type() - attempting size_bytes() for kind: " << static_cast<int>(int_kind_check) << std::endl;
+                LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - attempting size_bytes() for kind: {}", static_cast<int>(int_kind_check));
                 try
                 {
                     byte_size = int_type->size_bytes();
-                    std::cout << "[DEBUG] TypeMapper::map_integer_type() - size_bytes() succeeded, size: " << byte_size << std::endl;
+                    LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - size_bytes() succeeded, size: {}", byte_size);
                 }
                 catch (...)
                 {
-                    std::cout << "[ERROR] TypeMapper::map_integer_type() - size_bytes() crashed for kind " << static_cast<int>(int_kind_check) << ", using fallback" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - size_bytes() crashed for kind {}, using fallback", static_cast<int>(int_kind_check));
                     // Use fallback based on integer kind
                     switch (int_kind_check)
                     {
@@ -388,19 +391,19 @@ namespace Cryo::Codegen
                         byte_size = 16;
                         break;
                     }
-                    std::cout << "[DEBUG] TypeMapper::map_integer_type() - fallback size_bytes: " << byte_size << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - fallback size_bytes: {}", byte_size);
                 }
 
-                std::cout << "[DEBUG] TypeMapper::map_integer_type() - attempting is_signed() for kind: " << static_cast<int>(int_kind_check) << std::endl;
+                LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - attempting is_signed() for kind: {}", static_cast<int>(int_kind_check));
                 // Additional protection for is_signed() as well
                 try
                 {
                     is_signed_val = int_type->is_signed();
-                    std::cout << "[DEBUG] TypeMapper::map_integer_type() - is_signed() succeeded, signed: " << is_signed_val << std::endl;
+                    LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - is_signed() succeeded, signed: {}", is_signed_val);
                 }
                 catch (...)
                 {
-                    std::cout << "[ERROR] TypeMapper::map_integer_type() - is_signed() crashed for kind " << static_cast<int>(int_kind_check) << ", using fallback" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - is_signed() crashed for kind {}, using fallback", static_cast<int>(int_kind_check));
                     // Use fallback based on integer kind
                     switch (int_kind_check)
                     {
@@ -422,19 +425,19 @@ namespace Cryo::Codegen
                         is_signed_val = false;
                         break;
                     }
-                    std::cout << "[DEBUG] TypeMapper::map_integer_type() - fallback is_signed: " << is_signed_val << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - fallback is_signed: {}", is_signed_val);
                 }
             }
         }
         catch (...)
         {
-            std::cout << "[ERROR] TypeMapper::map_integer_type() - pure virtual method crash detected in virtual method calls!" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - pure virtual method crash detected in virtual method calls!");
             report_error("Pure virtual method crash in IntegerType virtual methods");
             return nullptr;
         }
 
         int bit_width = static_cast<int>(byte_size * 8);
-        std::cout << "[DEBUG] TypeMapper::map_integer_type() - calculated bit_width: " << bit_width << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_integer_type() - calculated bit_width: {}", bit_width);
 
         return get_integer_type(bit_width, is_signed_val);
     }
@@ -1690,9 +1693,9 @@ namespace Cryo::Codegen
             return _type_context->get_u32_type();
         if (type_name == "u64")
         {
-            std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - returning u64 integer type from get_u64_type()" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::lookup_type_by_name - returning u64 integer type from get_u64_type()");
             auto *result = _type_context->get_u64_type();
-            std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - u64 type kind: " << TypeKindToString(result->kind()) << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "TypeMapper::lookup_type_by_name - u64 type kind: {}", TypeKindToString(result->kind()));
             return result;
         }
 
@@ -1732,7 +1735,7 @@ namespace Cryo::Codegen
         Cryo::Type *struct_type = _type_context->get_struct_type(type_name);
         if (struct_type && struct_type->kind() != Cryo::TypeKind::Unknown)
         {
-            std::cout << "[DEBUG] TypeMapper::lookup_type_by_name - found struct type for: " << type_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::lookup_type_by_name - found struct type for: {}", type_name);
             return struct_type;
         }
 
