@@ -644,7 +644,7 @@ namespace Cryo
         auto it = _integer_types.find(key);
         if (it != _integer_types.end())
         {
-            LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - found cached type, pointer={}", static_cast<void*>(it->second.get()));
+            LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - found cached type, pointer={}", static_cast<void *>(it->second.get()));
             // Validate cached type before returning
             try
             {
@@ -678,7 +678,7 @@ namespace Cryo
 
         auto int_type = std::make_unique<IntegerType>(kind, is_signed);
         Type *result = int_type.get();
-        LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - created IntegerType, pointer={}", static_cast<void*>(result));
+        LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - created IntegerType, pointer={}", static_cast<void *>(result));
         LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - about to test kind() method on new type");
 
         // Test the new type before storing it
