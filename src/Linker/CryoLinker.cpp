@@ -1,4 +1,5 @@
 #include "Linker/CryoLinker.hpp"
+#include "Utils/Logger.hpp"
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Type.h>
 #include <llvm/Support/FileSystem.h>
@@ -213,19 +214,19 @@ namespace Cryo::Linker
 
     bool CryoLinker::generate_executable(llvm::Module *module, const std::string &output_path)
     {
-        std::cerr << "[DEBUG] CryoLinker::generate_executable called with output_path: " << output_path << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "CryoLinker::generate_executable called with output_path: {}", output_path);
 
         // Step 1: Generate object file from LLVM IR
         std::string temp_obj = output_path + ".o";
-        std::cerr << "[DEBUG] Generating object file: " << temp_obj << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "Generating object file: {}", temp_obj);
 
         if (!generate_object_file(module, temp_obj))
         {
-            std::cerr << "[DEBUG] generate_object_file failed!" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::LINKER, "generate_object_file failed!");
             return false;
         }
 
-        std::cerr << "[DEBUG] Object file generated successfully" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "Object file generated successfully");
 
         // Step 2: Use system linker to create executable with runtime
         std::vector<std::string> linker_args;
@@ -237,14 +238,14 @@ namespace Cryo::Linker
         for (const auto &obj_file : _object_files)
         {
             linker_args.push_back(obj_file);
-            std::cerr << "[DEBUG] Added object file: " << obj_file << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::LINKER, "Added object file: {}", obj_file);
         }
 
         // Add library paths
         for (const auto &lib_path : _library_paths)
         {
             linker_args.push_back("-L" + lib_path);
-            std::cerr << "[DEBUG] Added library path: -L" << lib_path << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::LINKER, "Added library path: -L{}", lib_path);
         }
 
         // Add libraries
@@ -259,32 +260,32 @@ namespace Cryo::Linker
             {
                 linker_args.push_back("-Wl,-Bdynamic");
             }
-            std::cerr << "[DEBUG] Added library: -l" << lib_name << (is_static ? " (static)" : " (dynamic)") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::LINKER, "Added library: -l{}{}", lib_name, (is_static ? " (static)" : " (dynamic)"));
         }
 
         // Add standard libraries
         linker_args.push_back("-lm");       // math library
         linker_args.push_back("-lpthread"); // pthread library
 
-// #if defined(_WIN32) || defined(_WIN64)
-//         // For Windows console applications, specify the console subsystem
-//         linker_args.push_back("-Wl,--subsystem,console");
-// #endif
+        // #if defined(_WIN32) || defined(_WIN64)
+        //         // For Windows console applications, specify the console subsystem
+        //         linker_args.push_back("-Wl,--subsystem,console");
+        // #endif
 
         // Add output specification
         linker_args.push_back("-o");
         linker_args.push_back(output_path);
 
-        std::cerr << "[DEBUG] About to call execute_linker_command with " << linker_args.size() << " args" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "About to call execute_linker_command with {} args", linker_args.size());
         for (size_t i = 0; i < linker_args.size(); ++i)
         {
-            std::cerr << "[DEBUG] linker_args[" << i << "] = '" << linker_args[i] << "'" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::LINKER, "linker_args[{}] = '{}'", i, linker_args[i]);
         }
 
         // Execute system linker
         bool success = execute_linker_command(linker_args);
 
-        std::cerr << "[DEBUG] execute_linker_command returned: " << (success ? "true" : "false") << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "execute_linker_command returned: {}", (success ? "true" : "false"));
 
         // Clean up temp object file
         std::filesystem::remove(temp_obj);
@@ -540,7 +541,7 @@ namespace Cryo::Linker
         }
 
         // Log the command for debugging
-        std::cerr << "[DEBUG] Executing linker command: " << cmd << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "Executing linker command: {}", cmd);
 
         // On Windows, redirect stderr to capture error output
 #if defined(_WIN32) || defined(_WIN64)
@@ -595,7 +596,7 @@ namespace Cryo::Linker
         // If there was output but success, log it as info
         if (!output.empty())
         {
-            std::cerr << "[INFO] Linker output: " << output << std::endl;
+            LOG_INFO(Cryo::LogComponent::LINKER, "Linker output: {}", output);
         }
 
         return true;

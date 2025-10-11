@@ -1,6 +1,7 @@
 #include "AST/Type.hpp"
 #include "AST/TemplateRegistry.hpp" // For TemplateRegistry in instantiate_generic
 #include "Lexer/lexer.hpp"          // For TokenKind enum
+#include "Utils/Logger.hpp"
 #include <sstream>
 #include <algorithm>
 #include <iostream>
@@ -430,7 +431,7 @@ namespace Cryo
                 oss << ", ";
 
             // Avoid virtual function calls on potentially corrupted parameter types
-            std::cerr << "[FunctionType] WARNING: Avoiding virtual function calls on parameter type at index " << i << " due to potential Type corruption, using 'void'" << std::endl;
+            LOG_WARN(Cryo::LogComponent::AST, "FunctionType: Avoiding virtual function calls on parameter type at index {} due to potential Type corruption, using 'void'", i);
             oss << "void";
         }
         if (_is_variadic)
@@ -443,7 +444,7 @@ namespace Cryo
         // Guard against null return type to prevent crashes
         if (_return_type == nullptr)
         {
-            std::cerr << "[FunctionType] ERROR: Attempted to build function name with null return type!" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "FunctionType: Attempted to build function name with null return type!");
             oss << ") -> <null>";
         }
         else
@@ -454,7 +455,7 @@ namespace Cryo
                 Type *raw_ptr = _return_type.get();
                 if (raw_ptr == nullptr)
                 {
-                    std::cerr << "[FunctionType] ERROR: shared_ptr is not null but get() returns null!" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::AST, "FunctionType: shared_ptr is not null but get() returns null!");
                     oss << ") -> <bad_ptr>";
                 }
                 else
@@ -464,7 +465,7 @@ namespace Cryo
                     void *vptr_test = static_cast<void *>(raw_ptr);
                     if (vptr_test == nullptr)
                     {
-                        std::cerr << "[FunctionType] ERROR: Object pointer cast failed!" << std::endl;
+                        LOG_ERROR(Cryo::LogComponent::AST, "FunctionType: Object pointer cast failed!");
                         oss << ") -> <cast_fail>";
                     }
                     else
@@ -476,7 +477,7 @@ namespace Cryo
 
                         // Skip all virtual function calls to avoid segfaults
                         // This is a temporary workaround until the root cause is fixed
-                        std::cerr << "[FunctionType] WARNING: Avoiding virtual function calls due to potential Type corruption, using 'void'" << std::endl;
+                        LOG_WARN(Cryo::LogComponent::AST, "FunctionType: Avoiding virtual function calls due to potential Type corruption, using 'void'");
 
                         oss << ") -> " << return_type_str;
                     }
@@ -484,7 +485,7 @@ namespace Cryo
             }
             catch (...)
             {
-                std::cerr << "[FunctionType] ERROR: Exception in return type handling! Using fallback." << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "FunctionType: Exception in return type handling! Using fallback.");
                 oss << ") -> <exception>";
             }
         }
@@ -623,13 +624,13 @@ namespace Cryo
 
     Type *TypeContext::get_integer_type(IntegerKind kind, bool is_signed)
     {
-        std::cout << "[DEBUG] TypeContext::get_integer_type() called with kind=" << IntegerKindToString(kind) << " is_signed=" << is_signed << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::get_integer_type() called with kind={} is_signed={}", IntegerKindToString(kind), is_signed);
 
         // Validate the IntegerKind input to prevent corruption
         int kind_int = static_cast<int>(kind);
         if (kind_int < 0 || kind_int > static_cast<int>(IntegerKind::UInt))
         {
-            std::cout << "[ERROR] TypeContext::get_integer_type() - invalid IntegerKind: " << kind_int << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - invalid IntegerKind: {}", kind_int);
             // Default to a safe integer type
             kind = IntegerKind::I32;
             kind_int = static_cast<int>(kind);
@@ -637,13 +638,13 @@ namespace Cryo
 
         // Create a hash key for the integer type
         int key = kind_int * 2 + (is_signed ? 0 : 1);
-        std::cout << "[DEBUG] TypeContext::get_integer_type() - calculated cache key=" << key << " (int_kind=" << IntegerKindToString(kind) << ", signed=" << is_signed << ")" << std::endl;
-        std::cout << "[DEBUG] TypeContext::get_integer_type() - current cache size=" << _integer_types.size() << std::endl;
+        LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - calculated cache key={} (int_kind={}, signed={})", key, IntegerKindToString(kind), is_signed);
+        LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - current cache size={}", _integer_types.size());
 
         auto it = _integer_types.find(key);
         if (it != _integer_types.end())
         {
-            std::cout << "[DEBUG] TypeContext::get_integer_type() - found cached type, pointer=" << it->second.get() << std::endl;
+            LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - found cached type, pointer={}", static_cast<void*>(it->second.get()));
             // Validate cached type before returning
             try
             {
@@ -654,55 +655,55 @@ namespace Cryo
                 }
                 else
                 {
-                    std::cout << "[ERROR] TypeContext::get_integer_type() - cached type is corrupted, recreating" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - cached type is corrupted, recreating");
                     _integer_types.erase(it);
                 }
             }
             catch (...)
             {
-                std::cout << "[ERROR] TypeContext::get_integer_type() - cached type validation failed, recreating" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - cached type validation failed, recreating");
                 _integer_types.erase(it);
             }
         }
 
         // Create new integer type with additional validation
-        std::cout << "[DEBUG] TypeContext::get_integer_type() - creating new IntegerType" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - creating new IntegerType");
 
         // Validate construction parameters one more time
         if (kind_int < 0 || kind_int > static_cast<int>(IntegerKind::UInt))
         {
-            std::cout << "[ERROR] TypeContext::get_integer_type() - refusing to create type with invalid kind" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - refusing to create type with invalid kind");
             return nullptr;
         }
 
         auto int_type = std::make_unique<IntegerType>(kind, is_signed);
         Type *result = int_type.get();
-        std::cout << "[DEBUG] TypeContext::get_integer_type() - created IntegerType, pointer=" << result << std::endl;
-        std::cout << "[DEBUG] TypeContext::get_integer_type() - about to test kind() method on new type" << std::endl;
+        LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - created IntegerType, pointer={}", static_cast<void*>(result));
+        LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - about to test kind() method on new type");
 
         // Test the new type before storing it
         try
         {
             auto test_kind = result->kind();
-            std::cout << "[DEBUG] TypeContext::get_integer_type() - kind() test passed, kind=" << TypeKindToString(test_kind) << " (" << static_cast<int>(test_kind) << ")" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - kind() test passed, kind={} ({})", TypeKindToString(test_kind), static_cast<int>(test_kind));
 
             // Additional validation - ensure the name was properly set
             auto test_name = result->name();
             if (test_name.empty())
             {
-                std::cout << "[ERROR] TypeContext::get_integer_type() - type name is empty, possible constructor issue" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - type name is empty, possible constructor issue");
                 return nullptr;
             }
-            std::cout << "[DEBUG] TypeContext::get_integer_type() - name validation passed: '" << test_name << "'" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - name validation passed: '{}'", test_name);
         }
         catch (...)
         {
-            std::cout << "[ERROR] TypeContext::get_integer_type() - type validation failed!" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - type validation failed!");
             return nullptr;
         }
 
         _integer_types[key] = std::move(int_type);
-        std::cout << "[DEBUG] TypeContext::get_integer_type() - stored in cache with key=" << key << ", cache size now=" << _integer_types.size() << std::endl;
+        LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_integer_type() - stored in cache with key={}, cache size now={}", key, _integer_types.size());
 
         return result;
     }
@@ -729,7 +730,7 @@ namespace Cryo
     {
         if (!element_type)
         {
-            std::cout << "[ERROR] TypeContext::create_array_type() - null element type" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::create_array_type() - null element type");
             return nullptr;
         }
 
@@ -745,7 +746,7 @@ namespace Cryo
         {
             if (existing_type->name() == array_key)
             {
-                std::cout << "[DEBUG] TypeContext::create_array_type() - found cached array type: " << array_key << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::create_array_type() - found cached array type: {}", array_key);
                 return existing_type.get();
             }
         }
@@ -762,7 +763,7 @@ namespace Cryo
         Type *result = array_type.get();
         _complex_types.push_back(std::move(array_type));
 
-        std::cout << "[DEBUG] TypeContext::create_array_type() - created new array type: " << array_key << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - created new array type: {}", array_key);
         return result;
     }
 
@@ -770,7 +771,7 @@ namespace Cryo
     {
         if (!pointee_type)
         {
-            std::cout << "[ERROR] TypeContext::create_pointer_type() - null pointee type" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::create_pointer_type() - null pointee type");
             return nullptr;
         }
 
@@ -782,7 +783,7 @@ namespace Cryo
         {
             if (existing_type->name() == pointer_key)
             {
-                std::cout << "[DEBUG] TypeContext::create_pointer_type() - found cached pointer type: " << pointer_key << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::create_pointer_type() - found cached pointer type: {}", pointer_key);
                 return existing_type.get();
             }
         }
@@ -799,7 +800,7 @@ namespace Cryo
         Type *result = pointer_type.get();
         _complex_types.push_back(std::move(pointer_type));
 
-        std::cout << "[DEBUG] TypeContext::create_pointer_type() - created new pointer type: " << pointer_key << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_pointer_type() - created new pointer type: {}", pointer_key);
         return result;
     }
 
@@ -1333,7 +1334,7 @@ namespace Cryo
         auto enum_it = _enum_types.find(normalized_type_str);
         if (enum_it != _enum_types.end())
         {
-            std::cout << "[DEBUG] parse_type_from_string: Found '" << normalized_type_str << "' in _enum_types" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::AST, "parse_type_from_string: Found '{}' in _enum_types", normalized_type_str);
             return enum_it->second.get();
         }
 
@@ -1584,8 +1585,7 @@ namespace Cryo
         Type *existing_enum = lookup_enum_type(name);
         if (existing_enum)
         {
-            std::cout << "[DEBUG] Attempted to create struct type for '" << name
-                      << "' but enum type already exists - returning enum type instead" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Attempted to create struct type for '{}' but enum type already exists - returning enum type instead", name);
             return existing_enum;
         }
 
@@ -1596,8 +1596,8 @@ namespace Cryo
             name == "f32" || name == "f64" || name == "float" || name == "double" ||
             name == "boolean" || name == "char" || name == "string" || name == "void")
         {
-            std::cout << "[DEBUG] Attempted to create struct type for built-in type name: " << name << std::endl;
-            std::cout << "[DEBUG] Returning unknown type instead of creating struct" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Attempted to create struct type for built-in type name: {}", name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Returning unknown type instead of creating struct");
             return get_unknown_type();
         }
 
@@ -1630,23 +1630,23 @@ namespace Cryo
 
     Type *TypeContext::get_class_type(const std::string &name)
     {
-        std::cout << "[DEBUG] TypeContext::get_class_type() called with name='" << name << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::get_class_type() called with name='{}'", name);
 
         auto it = _class_types.find(name);
         if (it != _class_types.end())
         {
-            std::cout << "[DEBUG] TypeContext::get_class_type() - found existing class type for '" << name << "'" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::get_class_type() - found existing class type for '{}'", name);
             return it->second.get();
         }
 
-        std::cout << "[DEBUG] TypeContext::get_class_type() - creating new class type for '" << name << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::get_class_type() - creating new class type for '{}'", name);
 
         // Create new class type
         auto class_type = std::make_unique<ClassType>(name);
         Type *result = class_type.get();
         _class_types[name] = std::move(class_type);
 
-        std::cout << "[DEBUG] TypeContext::get_class_type() - successfully created class type for '" << name << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::get_class_type() - successfully created class type for '{}'", name);
         return result;
     }
 
