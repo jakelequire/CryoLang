@@ -569,7 +569,7 @@ namespace Cryo::Codegen
 
         // Check if we already have this struct type in cache
         std::string struct_name = struct_type->name();
-        std::cout << "[TypeMapper] map_struct_type called for: " << struct_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "map_struct_type called for: {}", struct_name);
 
         // CRITICAL CHECK: Prevent mapping primitive types as structs
         if (struct_name == "u64" || struct_name == "i64" || struct_name == "u32" || struct_name == "i32" ||
@@ -578,7 +578,7 @@ namespace Cryo::Codegen
             struct_name == "int" || struct_name == "uint" || struct_name == "boolean" || struct_name == "char" ||
             struct_name == "string" || struct_name == "void")
         {
-            std::cout << "[ERROR] TypeMapper::map_struct_type - ATTEMPTED TO MAP PRIMITIVE TYPE AS STRUCT: " << struct_name << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct_type - ATTEMPTED TO MAP PRIMITIVE TYPE AS STRUCT: {}", struct_name);
             report_error("Attempted to map primitive type as struct: " + struct_name);
             return nullptr;
         }
@@ -587,7 +587,7 @@ namespace Cryo::Codegen
         llvm::Type *parameterized_result = try_handle_as_parameterized_type(struct_type);
         if (parameterized_result)
         {
-            std::cout << "[TypeMapper] Successfully handled as parameterized type: " << struct_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully handled as parameterized type: {}", struct_name);
             return parameterized_result;
         }
 
@@ -612,8 +612,8 @@ namespace Cryo::Codegen
                 auto class_it = _class_ast_nodes.find(monomorphized_name);
                 if (class_it != _class_ast_nodes.end())
                 {
-                    std::cout << "[TypeMapper] Redirecting parameterized struct '" << struct_name
-                              << "' to monomorphized class '" << monomorphized_name << "'" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Redirecting parameterized struct '{}' to monomorphized class '{}'",
+                              struct_name, monomorphized_name);
 
                     // Create a ClassType and delegate to map_class_type
                     auto class_type = std::make_unique<Cryo::ClassType>(monomorphized_name);
@@ -628,8 +628,7 @@ namespace Cryo::Codegen
             auto class_it = _class_ast_nodes.find(struct_name);
             if (class_it != _class_ast_nodes.end())
             {
-                std::cout << "[TypeMapper] Redirecting monomorphized struct '" << struct_name
-                          << "' to class handling" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Redirecting monomorphized struct '{}' to class handling", struct_name);
 
                 // Create a ClassType and delegate to map_class_type
                 auto class_type = std::make_unique<Cryo::ClassType>(struct_name);
@@ -656,13 +655,14 @@ namespace Cryo::Codegen
         if (ast_it != _struct_ast_nodes.end())
         {
             auto struct_node = ast_it->second;
-            std::cout << "[TypeMapper] Generating field types for struct: " << struct_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating field types for struct: {}", struct_name);
 
             for (const auto &field : struct_node->fields())
             {
                 if (field)
                 {
-                    std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << (field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown") << std::endl;
+                    LOG_TRACE(Cryo::LogComponent::CODEGEN, "Processing field: {} : {}",
+                              field->name(), (field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown"));
 
                     // Map field type using resolved Type* directly
                     if (_type_context)
@@ -674,25 +674,25 @@ namespace Cryo::Codegen
                             if (field_llvm_type)
                             {
                                 field_types.push_back(field_llvm_type);
-                                std::cout << "[TypeMapper] Mapped field '" << field->name() << "' to LLVM type" << std::endl;
+                                LOG_TRACE(Cryo::LogComponent::CODEGEN, "Mapped field '{}' to LLVM type", field->name());
                             }
                             else
                             {
-                                std::cerr << "[TypeMapper] Failed to map field type: " << field->type_annotation() << std::endl;
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to map field type: {}", field->type_annotation());
                                 // Use a placeholder pointer type for failed field mappings
                                 field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                             }
                         }
                         else
                         {
-                            std::cerr << "[TypeMapper] Failed to parse field type: " << field->type_annotation() << std::endl;
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to parse field type: {}", field->type_annotation());
                             // Use a placeholder pointer type for failed field parsing
                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                         }
                     }
                     else
                     {
-                        std::cerr << "[TypeMapper] No TypeContext available for field type mapping" << std::endl;
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "No TypeContext available for field type mapping");
                         // Use a placeholder pointer type when no TypeContext
                         field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                     }
@@ -728,20 +728,22 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    std::cout << "[TypeMapper] Trying monomorphized name: " << monomorphized_name << " for parameterized type: " << struct_name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying monomorphized name: {} for parameterized type: {}",
+                              monomorphized_name, struct_name);
 
                     // Check if the monomorphized version exists
                     auto mono_it = _struct_ast_nodes.find(monomorphized_name);
                     if (mono_it != _struct_ast_nodes.end())
                     {
-                        std::cout << "[TypeMapper] Found monomorphized struct: " << monomorphized_name << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found monomorphized struct: {}", monomorphized_name);
                         auto struct_node = mono_it->second;
 
                         for (const auto &field : struct_node->fields())
                         {
                             if (field)
                             {
-                                std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << (field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown") << std::endl;
+                                LOG_TRACE(Cryo::LogComponent::CODEGEN, "Processing field: {} : {}",
+                                          field->name(), (field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown"));
 
                                 // Map field type using resolved Type* directly
                                 if (_type_context)
@@ -753,23 +755,23 @@ namespace Cryo::Codegen
                                         if (field_llvm_type)
                                         {
                                             field_types.push_back(field_llvm_type);
-                                            std::cout << "[TypeMapper] Mapped field '" << field->name() << "' to LLVM type" << std::endl;
+                                            LOG_TRACE(Cryo::LogComponent::CODEGEN, "Mapped field '{}' to LLVM type", field->name());
                                         }
                                         else
                                         {
-                                            std::cerr << "[TypeMapper] Failed to map field type: " << field->type_annotation() << std::endl;
+                                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to map field type: {}", field->type_annotation());
                                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                         }
                                     }
                                     else
                                     {
-                                        std::cerr << "[TypeMapper] Failed to parse field type: " << field->type_annotation() << std::endl;
+                                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to parse field type: {}", field->type_annotation());
                                         field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                     }
                                 }
                                 else
                                 {
-                                    std::cerr << "[TypeMapper] No TypeContext available for field type mapping" << std::endl;
+                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "No TypeContext available for field type mapping");
                                     field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                 }
                             }
@@ -777,13 +779,13 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        std::cout << "[TypeMapper] Monomorphized struct not found: " << monomorphized_name << ", trying base template" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Monomorphized struct not found: {}, trying base template", monomorphized_name);
 
                         // If monomorphized version not found, try to use the base template to create it
                         auto base_it = _struct_ast_nodes.find(base_name);
                         if (base_it != _struct_ast_nodes.end())
                         {
-                            std::cout << "[TypeMapper] Found base template: " << base_name << ", creating fields with substituted types" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found base template: {}, creating fields with substituted types", base_name);
                             auto base_struct = base_it->second;
 
                             // Parse the type arguments for substitution
@@ -815,7 +817,8 @@ namespace Cryo::Codegen
                                     }
                                     // Add more substitution rules as needed for U, V, etc.
 
-                                    std::cout << "[TypeMapper] Processing substituted field: " << field->name() << " : " << field_type << std::endl;
+                                    LOG_TRACE(Cryo::LogComponent::CODEGEN, "Processing substituted field: {} : {}",
+                                              field->name(), field_type);
 
                                     // Map field type using TypeContext
                                     if (_type_context)
@@ -827,23 +830,23 @@ namespace Cryo::Codegen
                                             if (field_llvm_type)
                                             {
                                                 field_types.push_back(field_llvm_type);
-                                                std::cout << "[TypeMapper] Mapped substituted field '" << field->name() << "' to LLVM type" << std::endl;
+                                                LOG_TRACE(Cryo::LogComponent::CODEGEN, "Mapped substituted field '{}' to LLVM type", field->name());
                                             }
                                             else
                                             {
-                                                std::cerr << "[TypeMapper] Failed to map substituted field type: " << field_type << std::endl;
+                                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to map substituted field type: {}", field_type);
                                                 field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                             }
                                         }
                                         else
                                         {
-                                            std::cerr << "[TypeMapper] Failed to parse substituted field type: " << field_type << std::endl;
+                                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to parse substituted field type: {}", field_type);
                                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                         }
                                     }
                                     else
                                     {
-                                        std::cerr << "[TypeMapper] No TypeContext available for substituted field type mapping" << std::endl;
+                                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "No TypeContext available for substituted field type mapping");
                                         field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                     }
                                 }
@@ -851,7 +854,7 @@ namespace Cryo::Codegen
                         }
                         else
                         {
-                            std::cout << "[TypeMapper] Base template not found: " << base_name << ", falling back to enhanced enum system" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Base template not found: {}, falling back to enhanced enum system", base_name);
                         }
                     }
                 }
@@ -876,8 +879,8 @@ namespace Cryo::Codegen
                         resolved_struct_name = _type_context->resolve_parameterized_type_alias(base_name, type_args_str);
                         if (resolved_struct_name != struct_name)
                         {
-                            std::cout << "[TypeMapper] Resolved type alias '" << struct_name
-                                      << "' to '" << resolved_struct_name << "'" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved type alias '{}' to '{}'",
+                                      struct_name, resolved_struct_name);
                         }
                     }
 
@@ -926,7 +929,7 @@ namespace Cryo::Codegen
 
                     if (!enum_field_types.empty())
                     {
-                        std::cout << "[TypeMapper] Using enhanced enum system for parameterized type: " << struct_name << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using enhanced enum system for parameterized type: {}", struct_name);
 
                         // Map enum field types to LLVM types
                         for (const auto &field_type : enum_field_types)
@@ -940,12 +943,12 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        std::cout << "[TypeMapper] No enhanced enum layout found for: " << struct_name << ", creating empty struct" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No enhanced enum layout found for: {}, creating empty struct", struct_name);
                     }
                 }
                 else
                 {
-                    std::cout << "[TypeMapper] Malformed parameterized type: " << struct_name << ", creating empty struct" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::CODEGEN, "Malformed parameterized type: {}, creating empty struct", struct_name);
                 }
             }
             else
@@ -954,13 +957,13 @@ namespace Cryo::Codegen
                 auto class_it = _class_ast_nodes.find(struct_name);
                 if (class_it != _class_ast_nodes.end())
                 {
-                    std::cout << "[TypeMapper] Found class AST node for struct: " << struct_name << ", generating field types" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found class AST node for struct: {}, generating field types", struct_name);
                     auto class_node = class_it->second;
 
                     // CRITICAL FIX: Use safe index-based iteration instead of range-based to avoid iterator corruption
                     const auto &fields_vec = class_node->fields();
                     size_t num_fields = fields_vec.size();
-                    std::cout << "[TypeMapper] Class has " << num_fields << " fields" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class has {} fields", num_fields);
 
                     for (size_t i = 0; i < num_fields; ++i)
                     {
@@ -968,7 +971,7 @@ namespace Cryo::Codegen
                         const auto &field_ptr = fields_vec[i];
                         if (!field_ptr || field_ptr.get() == nullptr)
                         {
-                            std::cerr << "[TypeMapper] WARNING: Null field pointer at index " << i << " in class " << struct_name << std::endl;
+                            LOG_WARN(Cryo::LogComponent::CODEGEN, "Null field pointer at index {} in class {}", i, struct_name);
                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                             continue;
                         }
@@ -979,7 +982,7 @@ namespace Cryo::Codegen
                         // CRITICAL: Validate field pointer before any operations
                         if (!field)
                         {
-                            std::cerr << "[TypeMapper] ERROR: field pointer is null at index " << i << std::endl;
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Field pointer is null at index {}", i);
                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                             continue;
                         }
@@ -988,7 +991,7 @@ namespace Cryo::Codegen
                         try
                         {
                             std::string field_name = field->name();
-                            std::cout << "[TypeMapper] Processing class field[" << i << "]: " << field_name << std::endl;
+                            LOG_TRACE(Cryo::LogComponent::CODEGEN, "Processing class field[{}]: {}", i, field_name);
 
                             // Map field type using resolved Type* directly
                             if (_type_context)
@@ -1009,27 +1012,28 @@ namespace Cryo::Codegen
                                     }
                                     catch (...)
                                     {
-                                        std::cerr << "[TypeMapper] EXCEPTION: Type pointer is corrupt for field '" << field_name << "'" << std::endl;
+                                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "EXCEPTION: Type pointer is corrupt for field '{}'", field_name);
                                     }
 
-                                    std::cout << "[TypeMapper] Field '" << field_name << "' has resolved type: " << type_str << std::endl;
+                                    LOG_TRACE(Cryo::LogComponent::CODEGEN, "Field '{}' has resolved type: {}", field_name, type_str);
 
                                     llvm::Type *field_llvm_type = map_type(field_cryo_type);
                                     if (field_llvm_type)
                                     {
                                         field_types.push_back(field_llvm_type);
-                                        std::cout << "[TypeMapper] Mapped class field '" << field_name << "' to LLVM type" << std::endl;
+                                        LOG_TRACE(Cryo::LogComponent::CODEGEN, "Mapped class field '{}' to LLVM type", field_name);
                                     }
                                     else
                                     {
-                                        std::cerr << "[TypeMapper] Failed to map class field type: " << field->type_annotation() << std::endl;
+                                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to map class field type: {}", field->type_annotation());
                                         // Use a placeholder pointer type for failed field mappings
                                         field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                     }
                                 }
                                 else
                                 {
-                                    std::cerr << "[TypeMapper] Field '" << field_name << "' has NULL resolved type, annotation: " << field->type_annotation() << std::endl;
+                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Field '{}' has NULL resolved type, annotation: {}",
+                                              field_name, field->type_annotation());
 
                                     // CRITICAL FIX: Try to resolve the type manually if resolved type is null
                                     std::string type_annotation = field->type_annotation();
@@ -1037,22 +1041,22 @@ namespace Cryo::Codegen
 
                                     if (manually_resolved_type && manually_resolved_type->kind() != Cryo::TypeKind::Unknown)
                                     {
-                                        std::cout << "[TypeMapper] Manually resolved field type: " << type_annotation << std::endl;
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Manually resolved field type: {}", type_annotation);
                                         llvm::Type *field_llvm_type = map_type(manually_resolved_type);
                                         if (field_llvm_type)
                                         {
                                             field_types.push_back(field_llvm_type);
-                                            std::cout << "[TypeMapper] Successfully mapped manually resolved field '" << field_name << "'" << std::endl;
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully mapped manually resolved field '{}'", field_name);
                                         }
                                         else
                                         {
-                                            std::cerr << "[TypeMapper] Manual resolution succeeded but mapping failed for field: " << field_name << std::endl;
+                                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Manual resolution succeeded but mapping failed for field: {}", field_name);
                                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                         }
                                     }
                                     else
                                     {
-                                        std::cerr << "[TypeMapper] Manual resolution failed for field type: " << type_annotation << std::endl;
+                                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Manual resolution failed for field type: {}", type_annotation);
                                         // Use a placeholder pointer type for failed field parsing
                                         field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                                     }
@@ -1060,19 +1064,20 @@ namespace Cryo::Codegen
                             }
                             else
                             {
-                                std::cerr << "[TypeMapper] No TypeContext available for class field type mapping" << std::endl;
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "No TypeContext available for class field type mapping");
                                 // Use a placeholder pointer type when no TypeContext
                                 field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                             }
                         }
                         catch (const std::exception &e)
                         {
-                            std::cerr << "[TypeMapper] Exception while processing field " << i << " in class " << struct_name << ": " << e.what() << std::endl;
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception while processing field {} in class {}: {}",
+                                      i, struct_name, e.what());
                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                         }
                         catch (...)
                         {
-                            std::cerr << "[TypeMapper] Unknown exception while processing field " << i << " in class " << struct_name << std::endl;
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown exception while processing field {} in class {}", i, struct_name);
                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                         }
                     }
@@ -1082,7 +1087,7 @@ namespace Cryo::Codegen
                     // Check if this struct should actually be an enum before creating empty struct
                     if (_type_context && _type_context->lookup_enum_type(struct_name))
                     {
-                        std::cout << "[TypeMapper] Detected struct '" << struct_name << "' should be enum, redirecting to enum type mapping" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected struct '{}' should be enum, redirecting to enum type mapping", struct_name);
 
                         // Look up the actual enum type and redirect
                         auto enum_type = _type_context->lookup_enum_type(struct_name);
@@ -1097,7 +1102,7 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    std::cout << "[TypeMapper] No AST node found for struct: " << struct_name << ", creating empty struct" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No AST node found for struct: {}, creating empty struct", struct_name);
                 }
             }
         }
@@ -1105,7 +1110,7 @@ namespace Cryo::Codegen
         // Set the body of the struct
         llvm_struct->setBody(field_types);
 
-        std::cout << "[TypeMapper] Created struct type '" << struct_name << "' with " << field_types.size() << " fields" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created struct type '{}' with {} fields", struct_name, field_types.size());
 
         // Cache the created type for future lookups (use both Type*-based and string-based)
         register_type(struct_name, llvm_struct); // Legacy string-based caching
@@ -1145,13 +1150,14 @@ namespace Cryo::Codegen
         if (ast_it != _class_ast_nodes.end())
         {
             auto class_node = ast_it->second;
-            std::cout << "[TypeMapper] Generating field types for class: " << class_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating field types for class: {}", class_name);
 
             for (const auto &field : class_node->fields())
             {
                 if (field)
                 {
-                    std::cout << "[TypeMapper] Processing field: " << field->name() << " : " << field->type_annotation() << std::endl;
+                    LOG_TRACE(Cryo::LogComponent::CODEGEN, "Processing field: {} : {}",
+                              field->name(), field->type_annotation());
 
                     // Map field type using resolved type
                     if (_type_context)
@@ -1163,25 +1169,25 @@ namespace Cryo::Codegen
                             if (field_llvm_type)
                             {
                                 field_types.push_back(field_llvm_type);
-                                std::cout << "[TypeMapper] Mapped field '" << field->name() << "' to LLVM type" << std::endl;
+                                LOG_TRACE(Cryo::LogComponent::CODEGEN, "Mapped field '{}' to LLVM type", field->name());
                             }
                             else
                             {
-                                std::cerr << "[TypeMapper] Failed to map field type: " << field->type_annotation() << std::endl;
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to map field type: {}", field->type_annotation());
                                 // Use a placeholder pointer type for failed field mappings
                                 field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                             }
                         }
                         else
                         {
-                            std::cerr << "[TypeMapper] Failed to parse field type: " << field->type_annotation() << std::endl;
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to parse field type: {}", field->type_annotation());
                             // Use a placeholder pointer type for failed field parsing
                             field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                         }
                     }
                     else
                     {
-                        std::cerr << "[TypeMapper] No TypeContext available for field type mapping" << std::endl;
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "No TypeContext available for field type mapping");
                         // Use a placeholder pointer type when no TypeContext
                         field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
                     }
@@ -1190,7 +1196,7 @@ namespace Cryo::Codegen
         }
         else
         {
-            std::cout << "[TypeMapper] No AST node found for class: " << class_name << ", creating empty struct" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No AST node found for class: {}, creating empty struct", class_name);
         }
 
         // TODO: Add vtable pointer if the class has virtual methods
@@ -1202,7 +1208,7 @@ namespace Cryo::Codegen
         // Set the body of the class struct
         llvm_class->setBody(field_types);
 
-        std::cout << "[TypeMapper] Created class type '" << class_name << "' with " << field_types.size() << " fields" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created class type '{}' with {} fields", class_name, field_types.size());
 
         // Cache the created type for future lookups (use both Type*-based and string-based)
         register_type(class_name, llvm_class); // Legacy string-based caching
@@ -1248,7 +1254,7 @@ namespace Cryo::Codegen
         auto it = _struct_cache.find(instantiated_name);
         if (it != _struct_cache.end())
         {
-            std::cout << "[TypeMapper] Found cached parameterized type: " << instantiated_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found cached parameterized type: {}", instantiated_name);
             return it->second;
         }
 
@@ -1268,7 +1274,7 @@ namespace Cryo::Codegen
 
             if (!field_types.empty())
             {
-                std::cout << "[TypeMapper] Using enhanced enum system for parameterized type: " << instantiated_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using enhanced enum system for parameterized type: {}", instantiated_name);
 
                 // Map enum field types to LLVM types
                 std::vector<llvm::Type *> llvm_field_types;
@@ -1287,8 +1293,8 @@ namespace Cryo::Codegen
                     llvm::StructType *created_type = llvm::StructType::create(_context_manager.get_context(),
                                                                               llvm_field_types, instantiated_name);
                     _struct_cache[instantiated_name] = created_type;
-                    std::cout << "[TypeMapper] Created parameterized type '" << instantiated_name
-                              << "' with " << llvm_field_types.size() << " fields" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created parameterized type '{}' with {} fields",
+                              instantiated_name, llvm_field_types.size());
                     return created_type;
                 }
             }
@@ -1555,7 +1561,7 @@ namespace Cryo::Codegen
     {
         _has_errors = true;
         _last_error = message;
-        std::cerr << "[TypeMapper Error] " << message << std::endl;
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeMapper Error: {}", message);
     }
 
     //===================================================================
@@ -1817,10 +1823,11 @@ namespace Cryo::Codegen
         // Convert generic type name to instantiated name if needed
         std::string lookup_name = convert_generic_to_instantiated_name(type_name);
 
-        std::cout << "[TypeMapper] Looking up field '" << field_name << "' in type '" << type_name << "'" << std::endl;
+        LOG_TRACE(Cryo::LogComponent::CODEGEN, "Looking up field '{}' in type '{}'", field_name, type_name);
         if (lookup_name != type_name)
         {
-            std::cout << "[TypeMapper] Converted generic type '" << type_name << "' to instantiated name '" << lookup_name << "'" << std::endl;
+            LOG_TRACE(Cryo::LogComponent::CODEGEN, "Converted generic type '{}' to instantiated name '{}'",
+                      type_name, lookup_name);
         }
 
         // Check if we have AST information for this type
@@ -1834,7 +1841,8 @@ namespace Cryo::Codegen
             {
                 if (fields[i] && fields[i]->name() == field_name)
                 {
-                    std::cout << "[TypeMapper] Found field '" << field_name << "' at index " << i << " in class '" << lookup_name << "'" << std::endl;
+                    LOG_TRACE(Cryo::LogComponent::CODEGEN, "Found field '{}' at index {} in class '{}'",
+                              field_name, i, lookup_name);
                     return static_cast<int>(i);
                 }
             }
@@ -1850,13 +1858,15 @@ namespace Cryo::Codegen
             {
                 if (fields[i] && fields[i]->name() == field_name)
                 {
-                    std::cout << "[TypeMapper] Found field '" << field_name << "' at index " << i << " in struct '" << lookup_name << "'" << std::endl;
+                    LOG_TRACE(Cryo::LogComponent::CODEGEN, "Found field '{}' at index {} in struct '{}'",
+                              field_name, i, lookup_name);
                     return static_cast<int>(i);
                 }
             }
         }
 
-        std::cerr << "[TypeMapper] Field '" << field_name << "' not found in type '" << type_name << "' (lookup name: '" << lookup_name << "')" << std::endl;
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Field '{}' not found in type '{}' (lookup name: '{}')",
+                  field_name, type_name, lookup_name);
         return -1; // Field not found
     }
 
@@ -1868,22 +1878,23 @@ namespace Cryo::Codegen
     {
         if (!class_node)
         {
-            std::cerr << "[TypeMapper] Attempted to register null class node" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Attempted to register null class node");
             return;
         }
 
         std::string class_name = class_node->name();
         _class_ast_nodes[class_name] = class_node;
 
-        std::cout << "[TypeMapper] Registered AST node for class: " << class_name << std::endl;
-        std::cout << "[TypeMapper] Class has " << class_node->fields().size() << " fields" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered AST node for class: {}", class_name);
+        LOG_TRACE(Cryo::LogComponent::CODEGEN, "Class has {} fields", class_node->fields().size());
 
         // Debug: Print field names
         for (const auto &field : class_node->fields())
         {
             if (field)
             {
-                std::cout << "[TypeMapper]   Field: " << field->name() << " : " << field->type_annotation() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::CODEGEN, "  Field: {} : {}",
+                          field->name(), field->type_annotation());
             }
         }
     }
@@ -1892,22 +1903,23 @@ namespace Cryo::Codegen
     {
         if (!struct_node)
         {
-            std::cerr << "[TypeMapper] Attempted to register null struct node" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Attempted to register null struct node");
             return;
         }
 
         std::string struct_name = struct_node->name();
         _struct_ast_nodes[struct_name] = struct_node;
 
-        std::cout << "[TypeMapper] Registered AST node for struct: " << struct_name << std::endl;
-        std::cout << "[TypeMapper] Struct has " << struct_node->fields().size() << " fields" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered AST node for struct: {}", struct_name);
+        LOG_TRACE(Cryo::LogComponent::CODEGEN, "Struct has {} fields", struct_node->fields().size());
 
         // Debug: Print field names
         for (const auto &field : struct_node->fields())
         {
             if (field)
             {
-                std::cout << "[TypeMapper]   Field: " << field->name() << " : " << field->type_annotation() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::CODEGEN, "  Field: {} : {}",
+                          field->name(), field->type_annotation());
             }
         }
     }
