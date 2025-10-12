@@ -2,6 +2,7 @@
 #include "AST/TemplateRegistry.hpp"
 #include "AST/TypeChecker.hpp"
 #include "AST/ASTNode.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 #include <sstream>
 
@@ -15,21 +16,18 @@ namespace Cryo
         // Store TypeChecker reference for type resolution
         _type_checker = &type_checker;
 
-        std::cout << "[MonomorphizationPass] Starting monomorphization with "
-                  << required_instantiations.size() << " required instantiations" << std::endl;
+        LOG_INFO(Cryo::LogComponent::AST, "MonomorphizationPass: Starting monomorphization with {} required instantiations", required_instantiations.size());
 
         bool success = true;
 
         for (const auto &instantiation : required_instantiations)
         {
-            std::cout << "[MonomorphizationPass] Processing instantiation: "
-                      << instantiation.instantiated_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Processing instantiation: {}", instantiation.instantiated_name);
 
             // Check if we already generated this specialization
             if (_generated_specializations.find(instantiation.instantiated_name) != _generated_specializations.end())
             {
-                std::cout << "[MonomorphizationPass] Specialization already exists: "
-                          << instantiation.instantiated_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialization already exists: {}", instantiation.instantiated_name);
                 continue;
             }
 
@@ -37,8 +35,7 @@ namespace Cryo
             const auto *template_info = template_registry.find_template(instantiation.base_name);
             if (!template_info)
             {
-                std::cerr << "[MonomorphizationPass] ERROR: Cannot find generic template: "
-                          << instantiation.base_name << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Cannot find generic template: {}", instantiation.base_name);
                 success = false;
                 continue;
             }
@@ -48,8 +45,7 @@ namespace Cryo
             // Handle different template types
             if (template_info->class_template)
             {
-                std::cout << "[MonomorphizationPass] Specializing class template: "
-                          << instantiation.base_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing class template: {}", instantiation.base_name);
 
                 // Try to use the corrupted pointer first, fallback to metadata if it fails
                 try
@@ -57,7 +53,7 @@ namespace Cryo
                     if (template_info->class_template->generic_parameters().empty() ||
                         !template_info->class_template->generic_parameters()[0])
                     {
-                        std::cout << "[MonomorphizationPass] Template node corrupted, using metadata" << std::endl;
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, using metadata");
                         specialized_node = specialize_class_template_from_metadata(template_info->metadata, instantiation);
                     }
                     else
@@ -67,14 +63,13 @@ namespace Cryo
                 }
                 catch (...)
                 {
-                    std::cout << "[MonomorphizationPass] Template node access failed, using metadata" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed, using metadata");
                     specialized_node = specialize_class_template_from_metadata(template_info->metadata, instantiation);
                 }
             }
             else if (template_info->struct_template)
             {
-                std::cout << "[MonomorphizationPass] Specializing struct template: "
-                          << instantiation.base_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing struct template: {}", instantiation.base_name);
 
                 // Try to use the corrupted pointer first, fallback to metadata if it fails
                 try
@@ -82,7 +77,7 @@ namespace Cryo
                     if (template_info->struct_template->generic_parameters().empty() ||
                         !template_info->struct_template->generic_parameters()[0])
                     {
-                        std::cout << "[MonomorphizationPass] Template node corrupted, using metadata" << std::endl;
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, using metadata");
                         specialized_node = specialize_struct_template_from_metadata(template_info->metadata, instantiation);
                     }
                     else
@@ -92,14 +87,13 @@ namespace Cryo
                 }
                 catch (...)
                 {
-                    std::cout << "[MonomorphizationPass] Template node access failed, using metadata" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed, using metadata");
                     specialized_node = specialize_struct_template_from_metadata(template_info->metadata, instantiation);
                 }
             }
             else if (template_info->enum_template)
             {
-                std::cout << "[MonomorphizationPass] Specializing enum template: "
-                          << instantiation.base_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing enum template: {}", instantiation.base_name);
 
                 // Try to use the corrupted pointer first, fallback to metadata if it fails
                 try
@@ -107,7 +101,7 @@ namespace Cryo
                     if (template_info->enum_template->generic_parameters().empty() ||
                         !template_info->enum_template->generic_parameters()[0])
                     {
-                        std::cout << "[MonomorphizationPass] Template node corrupted, using metadata" << std::endl;
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, using metadata");
                         specialized_node = specialize_enum_template_from_metadata(template_info->metadata, instantiation);
                     }
                     else
@@ -117,44 +111,39 @@ namespace Cryo
                 }
                 catch (...)
                 {
-                    std::cout << "[MonomorphizationPass] Template node access failed, using metadata" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed, using metadata");
                     specialized_node = specialize_enum_template_from_metadata(template_info->metadata, instantiation);
                 }
             }
             else if (template_info->function_template)
             {
-                std::cout << "[MonomorphizationPass] Function template specialization not yet implemented: "
-                          << instantiation.base_name << std::endl;
+                LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Function template specialization not yet implemented: {}", instantiation.base_name);
                 // TODO: Implement function template specialization
                 success = false;
                 continue;
             }
             else if (template_info->trait_template)
             {
-                std::cout << "[MonomorphizationPass] Trait template found: "
-                          << instantiation.base_name << " - traits don't require concrete specialization" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Trait template found: {} - traits don't require concrete specialization", instantiation.base_name);
                 // Traits don't generate concrete instances, they're used for type checking
                 // Skip this instantiation as it doesn't need monomorphization
                 continue;
             }
             else
             {
-                std::cerr << "[MonomorphizationPass] ERROR: Template info contains no valid template: "
-                          << instantiation.base_name << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Template info contains no valid template: {}", instantiation.base_name);
                 success = false;
                 continue;
             }
             if (!specialized_node)
             {
-                std::cerr << "[MonomorphizationPass] ERROR: Failed to specialize template: "
-                          << instantiation.base_name << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Failed to specialize template: {}", instantiation.base_name);
                 success = false;
                 continue;
             }
 
             // Add specialized node to program
-            std::cout << "[MonomorphizationPass] Adding specialized declaration: "
-                      << instantiation.instantiated_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Adding specialized declaration: {}", instantiation.instantiated_name);
 
             // Store reference before moving
             _generated_specializations[instantiation.instantiated_name] = specialized_node.get();
@@ -163,8 +152,7 @@ namespace Cryo
             program.add_statement(std::move(specialized_node));
         }
 
-        std::cout << "[MonomorphizationPass] Monomorphization completed. Generated "
-                  << _generated_specializations.size() << " specializations" << std::endl;
+        LOG_INFO(Cryo::LogComponent::AST, "MonomorphizationPass: Monomorphization completed. Generated {} specializations", _generated_specializations.size());
 
         return success;
     }
@@ -173,8 +161,7 @@ namespace Cryo
         const ClassDeclarationNode &template_node,
         const GenericInstantiation &instantiation)
     {
-        std::cout << "[MonomorphizationPass] Specializing " << template_node.name()
-                  << " -> " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing {} -> {}", template_node.name(), instantiation.instantiated_name);
 
         // Create type substitution map (strings for backward compatibility)
         std::unordered_map<std::string, std::string> string_substitutions;
@@ -182,8 +169,7 @@ namespace Cryo
 
         if (generic_params.size() != instantiation.concrete_types.size())
         {
-            std::cerr << "[MonomorphizationPass] ERROR: Parameter count mismatch for "
-                      << template_node.name() << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter count mismatch for {}", template_node.name());
             return nullptr;
         }
 
@@ -192,8 +178,7 @@ namespace Cryo
             // Extract the parameter name from GenericParameterNode
             std::string param_name = generic_params[i]->name();
             string_substitutions[param_name] = instantiation.concrete_types[i];
-            std::cout << "[MonomorphizationPass] Substitution: " << param_name
-                      << " -> " << instantiation.concrete_types[i] << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substitution: {} -> {}", param_name, instantiation.concrete_types[i]);
         }
 
         // Convert to Type*-based substitutions for proper type system operations
@@ -205,7 +190,7 @@ namespace Cryo
             generate_mangled_name(instantiation.base_name, instantiation.concrete_types));
 
         // Deep copy fields with Type*-based substitution (no more string manipulation)
-        std::cout << "[MonomorphizationPass] Copying " << template_node.fields().size() << " fields from template" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Copying {} fields from template", template_node.fields().size());
         for (const auto &field : template_node.fields())
         {
             if (field)
@@ -222,13 +207,12 @@ namespace Cryo
                     field->visibility());
 
                 specialized->add_field(std::move(specialized_field));
-                std::cout << "[MonomorphizationPass] Added field: " << field->name()
-                          << " : " << (substituted_type ? substituted_type->to_string() : "unknown") << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added field: {} : {}", field->name(), (substituted_type ? substituted_type->to_string() : "unknown"));
             }
         }
 
         // Deep copy methods with Type*-based substitution (no more string manipulation)
-        std::cout << "[MonomorphizationPass] Copying " << template_node.methods().size() << " methods from template" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Copying {} methods from template", template_node.methods().size());
         for (const auto &method : template_node.methods())
         {
             if (method)
@@ -276,13 +260,11 @@ namespace Cryo
                 }
 
                 specialized->add_method(std::move(specialized_method));
-                std::cout << "[MonomorphizationPass] Added method: " << method->name()
-                          << " : " << (substituted_return_type ? substituted_return_type->to_string() : "unknown") << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added method: {} : {}", method->name(), (substituted_return_type ? substituted_return_type->to_string() : "unknown"));
             }
         }
 
-        std::cout << "[MonomorphizationPass] Generated specialized class: "
-                  << specialized->name() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Generated specialized class: {}", specialized->name());
 
         return specialized;
     }
@@ -291,8 +273,7 @@ namespace Cryo
         const StructDeclarationNode &template_node,
         const GenericInstantiation &instantiation)
     {
-        std::cout << "[MonomorphizationPass] Specializing struct " << template_node.name()
-                  << " -> " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing struct {} -> {}", template_node.name(), instantiation.instantiated_name);
 
         // Create type substitution map
         std::unordered_map<std::string, std::string> type_substitutions;
@@ -300,8 +281,7 @@ namespace Cryo
 
         if (generic_params.size() != instantiation.concrete_types.size())
         {
-            std::cerr << "[MonomorphizationPass] ERROR: Parameter count mismatch for "
-                      << template_node.name() << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter count mismatch for {}", template_node.name());
             return nullptr;
         }
 
@@ -310,8 +290,7 @@ namespace Cryo
             // Extract the parameter name from GenericParameterNode
             std::string param_name = generic_params[i]->name();
             type_substitutions[param_name] = instantiation.concrete_types[i];
-            std::cout << "[MonomorphizationPass] Substitution: " << param_name
-                      << " -> " << instantiation.concrete_types[i] << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substitution: {} -> {}", param_name, instantiation.concrete_types[i]);
         }
 
         // Convert to Type*-based substitutions for proper type system operations
@@ -323,7 +302,7 @@ namespace Cryo
             generate_mangled_name(instantiation.base_name, instantiation.concrete_types));
 
         // Copy and substitute fields from the template
-        std::cout << "[MonomorphizationPass] Copying " << template_node.fields().size() << " fields from template" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Copying {} fields from template", template_node.fields().size());
         for (const auto &field : template_node.fields())
         {
             if (field)
@@ -340,13 +319,12 @@ namespace Cryo
                     field->visibility());
 
                 specialized->add_field(std::move(specialized_field));
-                std::cout << "[MonomorphizationPass] Added field: " << field->name()
-                          << " : " << (substituted_type ? substituted_type->to_string() : "unknown") << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added field: {} : {}", field->name(), (substituted_type ? substituted_type->to_string() : "unknown"));
             }
         }
 
         // Copy methods with type substitution (just like class specialization)
-        std::cout << "[MonomorphizationPass] Copying " << template_node.methods().size() << " methods from template" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Copying {} methods from template", template_node.methods().size());
         for (const auto &method : template_node.methods())
         {
             if (method)
@@ -389,31 +367,26 @@ namespace Cryo
                 // Clone method body with type substitution
                 if (method->body())
                 {
-                    std::cout << "[MonomorphizationPass] Cloning method body with "
-                              << method->body()->statements().size() << " statements" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Cloning method body with {} statements", method->body()->statements().size());
                     auto cloned_body = clone_method_body_with_substitution(method->body(), type_substitutions);
                     if (cloned_body)
                     {
                         specialized_method->set_body(std::move(cloned_body));
-                        std::cout << "[MonomorphizationPass] Successfully cloned method body with "
-                                  << specialized_method->body()->statements().size() << " statements" << std::endl;
-                        std::cout << "[MonomorphizationPass] Copied method body for: " << method->name() << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Successfully cloned method body with {} statements", specialized_method->body()->statements().size());
+                        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Copied method body for: {}", method->name());
                     }
                     else
                     {
-                        std::cout << "[MonomorphizationPass] WARNING: Failed to clone method body for: " << method->name() << std::endl;
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Failed to clone method body for: {}", method->name());
                     }
                 }
 
                 specialized->add_method(std::move(specialized_method));
-                std::cout << "[MonomorphizationPass] Added method: " << method->name()
-                          << " -> " << substituted_return_type << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added method: {} -> {}", method->name(), substituted_return_type);
             }
         }
 
-        std::cout << "[MonomorphizationPass] Generated specialized struct: "
-                  << specialized->name() << " with " << specialized->fields().size()
-                  << " fields and " << specialized->methods().size() << " methods" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Generated specialized struct: {} with {} fields and {} methods", specialized->name(), specialized->fields().size(), specialized->methods().size());
 
         return specialized;
     }
@@ -422,23 +395,22 @@ namespace Cryo
         const EnumDeclarationNode &template_node,
         const GenericInstantiation &instantiation)
     {
-        std::cout << "[MonomorphizationPass] Specializing enum "
-                  << template_node.name() << " -> " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing enum {} -> {}", template_node.name(), instantiation.instantiated_name);
 
-        std::cout << "[MonomorphizationPass] Getting generic parameters..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Getting generic parameters...");
         const auto &generic_params = template_node.generic_parameters();
-        std::cout << "[MonomorphizationPass] Template has " << generic_params.size() << " generic parameters" << std::endl;
-        std::cout << "[MonomorphizationPass] Instantiation has " << instantiation.concrete_types.size() << " concrete types" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Template has {} generic parameters", generic_params.size());
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Instantiation has {} concrete types", instantiation.concrete_types.size());
 
         // Debug template node pointer and generic parameters
-        std::cout << "[DEBUG] MonomorphizationPass: template_node name: " << template_node.name() << std::endl;
+        LOG_TRACE(Cryo::LogComponent::AST, "MonomorphizationPass: template_node name: {}", template_node.name());
         for (size_t i = 0; i < generic_params.size(); ++i)
         {
             auto param_ptr = generic_params[i].get();
-            std::cout << "[DEBUG] MonomorphizationPass: generic_params[" << i << "] = " << param_ptr << std::endl;
+            LOG_TRACE(Cryo::LogComponent::AST, "MonomorphizationPass: generic_params[{}] = {}", i, (void*)param_ptr);
             if (param_ptr)
             {
-                std::cout << "[DEBUG] MonomorphizationPass: parameter name: " << param_ptr->name() << std::endl;
+                LOG_TRACE(Cryo::LogComponent::AST, "MonomorphizationPass: parameter name: {}", param_ptr->name());
             }
         }
 
