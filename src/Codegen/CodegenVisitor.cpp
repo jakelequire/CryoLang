@@ -6319,8 +6319,7 @@ namespace Cryo::Codegen
 
                         // Keep the original generic type name for method lookup
                         // The specialized methods are stored with the full generic name like "GenericStruct<int>::get_value"
-                        std::cout << "[CodegenVisitor] Using type name '" << type_name
-                                  << "' for method lookup" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using type name '{}' for method lookup", type_name);
                     }
                     else
                     {
@@ -6419,9 +6418,7 @@ namespace Cryo::Codegen
                         {
                             llvm::Function *method_func = method_it->second;
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found method: {}", method_name);
-                            std::cout << "[DEBUG] Method function type: ";
-                            method_func->getFunctionType()->print(llvm::errs());
-                            std::cout << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method function type: {} params", method_func->getFunctionType()->getNumParams());
 
                             // Prepare arguments: this pointer + method arguments
                             std::vector<llvm::Value *> args;
@@ -6461,13 +6458,13 @@ namespace Cryo::Codegen
                         }
                         else
                         {
-                            std::cout << "[CodegenVisitor] Method not found: " << method_name << " for type: " << base_type_name << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method not found: {} for type: {}", method_name, base_type_name);
 
                             // For primitive types, use the fully qualified method name instead of just the member name
                             // This allows linking with precompiled primitive methods in libcryo.a
                             if (is_primitive_type(base_type_name))
                             {
-                                std::cout << "[CodegenVisitor] Using qualified name for primitive method: " << method_name << std::endl;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using qualified name for primitive method: {}", method_name);
                                 function_name = method_name;          // Use string::length instead of just length
                                 resolved_function_name = method_name; // Also update the resolved name
                             }
@@ -6565,9 +6562,7 @@ namespace Cryo::Codegen
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found method for global variable: {}", method_name);
 
                                     // Debug: Print function signature
-                                    std::cout << "[DEBUG] Method function type: ";
-                                    method_func->getFunctionType()->print(llvm::outs());
-                                    std::cout << std::endl;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method function type: {} params", method_func->getFunctionType()->getNumParams());
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method has {} parameters", method_func->getFunctionType()->getNumParams());
 
                                     // Prepare arguments: this pointer + method arguments
@@ -6594,7 +6589,7 @@ namespace Cryo::Codegen
                                 }
                                 else
                                 {
-                                    std::cout << "[ERROR] Method not found for global variable: " << method_name << std::endl;
+                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Method not found for global variable: {}", method_name);
                                     // Fall through to extract function name
                                 }
                             }
@@ -6610,7 +6605,7 @@ namespace Cryo::Codegen
             {
                 // Handle nested member access like this.stats.record_allocation()
                 // We need to evaluate the nested access to get its type
-                std::cout << "[DEBUG] Found nested member access: object is also a MemberAccessNode" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found nested member access: object is also a MemberAccessNode");
 
                 // For nested member access, we need to get a pointer to pass as 'this'
                 // Example: this.stats.record_allocation()
@@ -6619,12 +6614,12 @@ namespace Cryo::Codegen
                 // Try to get the resolved type from TypeChecker first
                 Cryo::Type *nested_type = nested_member_access->get_resolved_type();
 
-                std::cout << "[DEBUG] Nested member access resolved type from TypeChecker: " << (nested_type ? nested_type->to_string() : "NULL") << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Nested member access resolved type from TypeChecker: {}", (nested_type ? nested_type->to_string() : "NULL"));
 
                 // If TypeChecker didn't resolve it, we'll manually determine the type
                 if (!nested_type)
                 {
-                    std::cout << "[DEBUG] Manually determining nested type from base object and field" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Manually determining nested type from base object and field");
 
                     // For nested access like this.stats, we need to:
                     // 1. Find the type of the base object (this)
@@ -6633,7 +6628,7 @@ namespace Cryo::Codegen
                     if (auto *base_identifier = dynamic_cast<IdentifierNode *>(nested_member_access->object()))
                     {
                         std::string base_name = base_identifier->name();
-                        std::cout << "[DEBUG] Base object name: '" << base_name << "'" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Base object name: '{}'", base_name);
 
                         // Look up the base object's type
                         auto base_type_it = _variable_types.find(base_name);
@@ -6641,7 +6636,7 @@ namespace Cryo::Codegen
                         {
                             Cryo::Type *base_type = base_type_it->second;
                             std::string base_type_name = base_type->to_string();
-                            std::cout << "[DEBUG] Base object type: '" << base_type_name << "'" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Base object type: '{}'", base_type_name);
 
                             // Strip pointer if present
                             if (!base_type_name.empty() && base_type_name.back() == '*')
@@ -6651,28 +6646,28 @@ namespace Cryo::Codegen
 
                             // Now look up the field type in the struct/class
                             std::string field_name = nested_member_access->member();
-                            std::cout << "[DEBUG] Looking up field '" << field_name << "' in type '" << base_type_name << "'" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up field '{}' in type '{}'", field_name, base_type_name);
 
                             // Look up the field in the symbol table
                             std::string qualified_field_name = base_type_name + "::" + field_name;
-                            std::cout << "[DEBUG] Trying qualified lookup: '" << qualified_field_name << "'" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying qualified lookup: '{}'", qualified_field_name);
 
                             auto field_symbol = _symbol_table.lookup_symbol(qualified_field_name);
                             if (field_symbol)
                             {
-                                std::cout << "[DEBUG] Found field symbol with kind: " << static_cast<int>(field_symbol->kind) << std::endl;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found field symbol with kind: {}", static_cast<int>(field_symbol->kind));
 
                                 // Get the field's type
                                 nested_type = field_symbol->data_type;
                                 if (nested_type)
                                 {
-                                    std::cout << "[DEBUG] Field type from symbol table: '" << nested_type->to_string() << "'" << std::endl;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Field type from symbol table: '{}'", nested_type->to_string());
                                 }
                             }
                             else
                             {
-                                std::cout << "[DEBUG] Field symbol not found in symbol table" << std::endl;
-                                std::cout << "[ERROR] TypeChecker should have resolved field type for '" << field_name << "' in '" << base_type_name << "'" << std::endl;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Field symbol not found in symbol table");
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "TypeChecker should have resolved field type for '{}' in '{}'", field_name, base_type_name);
                             }
                         }
                     }
@@ -6680,14 +6675,14 @@ namespace Cryo::Codegen
 
                 if (!nested_type)
                 {
-                    std::cout << "[DEBUG] Could not determine nested type, falling back to extraction" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Could not determine nested type, falling back to extraction");
                     function_name = extract_function_name_from_member_access(member_access);
                     resolved_function_name = function_name;
                 }
                 else if (nested_type)
                 {
                     std::string nested_type_name = nested_type->to_string();
-                    std::cout << "[DEBUG] Nested object type: '" << nested_type_name << "'" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Nested object type: '{}'", nested_type_name);
 
                     // Strip pointer asterisk if present
                     if (!nested_type_name.empty() && nested_type_name.back() == '*')
@@ -6706,13 +6701,13 @@ namespace Cryo::Codegen
                         method_name = nested_type_name + "::" + member_access->member();
                     }
 
-                    std::cout << "[DEBUG] Looking up nested method: '" << method_name << "'" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up nested method: '{}'", method_name);
                     auto method_it = _functions.find(method_name);
 
                     if (method_it != _functions.end())
                     {
                         llvm::Function *method_func = method_it->second;
-                        std::cout << "[DEBUG] Found nested method: " << method_name << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found nested method: {}", method_name);
 
                         // Now we need to generate a pointer to the nested object
                         // Visit the nested member access to generate both value and pointer
@@ -6726,14 +6721,14 @@ namespace Cryo::Codegen
                         {
                             // Fallback to the regular generated value (for backwards compatibility)
                             nested_object_ptr = get_generated_value(nested_member_access);
-                            std::cout << "[DEBUG] Using fallback generated value for nested object" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fallback generated value for nested object");
                         }
                         else
                         {
-                            std::cout << "[DEBUG] Using field pointer for nested object method call" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using field pointer for nested object method call");
                         }
 
-                        std::cout << "[DEBUG] Generated nested object pointer: " << (nested_object_ptr ? "SUCCESS" : "FAIL") << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated nested object pointer: {}", (nested_object_ptr ? "SUCCESS" : "FAIL"));
 
                         if (nested_object_ptr)
                         {
@@ -6756,27 +6751,27 @@ namespace Cryo::Codegen
                             }
 
                             // Call the method
-                            std::cout << "[DEBUG] Calling nested method with " << args.size() << " arguments" << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling nested method with {} arguments", args.size());
                             return builder.CreateCall(method_func, args);
                         }
                     }
                     else
                     {
-                        std::cout << "[ERROR] Method not found for nested object: " << method_name << std::endl;
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Method not found for nested object: {}", method_name);
                         // Fall through to extract function name
                     }
                 }
 
                 // If we couldn't resolve it, fall back to extraction
-                std::cout << "[ERROR] CRITICAL: Nested member access resolution failed completely!" << std::endl;
-                std::cout << "[ERROR] This will cause method calls to lose object context!" << std::endl;
-                std::cout << "[ERROR] Member access: " << member_access->member() << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Nested member access resolution failed completely!");
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "This will cause method calls to lose object context!");
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Member access: {}", member_access->member());
                 if (auto *nested_member_access = dynamic_cast<MemberAccessNode *>(member_access->object()))
                 {
-                    std::cout << "[ERROR] Nested member: " << nested_member_access->member() << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Nested member: {}", nested_member_access->member());
                     if (auto *base_identifier = dynamic_cast<IdentifierNode *>(nested_member_access->object()))
                     {
-                        std::cout << "[ERROR] Base identifier: " << base_identifier->name() << std::endl;
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Base identifier: {}", base_identifier->name());
                     }
                 }
 
@@ -6789,13 +6784,13 @@ namespace Cryo::Codegen
                 // Check if the object is a literal that needs primitive method handling
                 if (auto *literal_node = dynamic_cast<LiteralNode *>(member_access->object()))
                 {
-                    std::cout << "[DEBUG] Found literal node in member access, kind: " << static_cast<int>(literal_node->literal_kind()) << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found literal node in member access, kind: {}", static_cast<int>(literal_node->literal_kind()));
                     // Check if this is a string literal method call
                     if (literal_node->literal_kind() == TokenKind::TK_STRING_LITERAL)
                     {
                         // This is a string literal method call like "hello".length()
                         std::string method_name = "string::" + member_access->member();
-                        std::cout << "[CodegenVisitor] String literal method call: " << method_name << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "String literal method call: {}", method_name);
                         function_name = method_name;
                         resolved_function_name = method_name;
                     }
@@ -6835,7 +6830,7 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        std::cout << "[DEBUG] Processing function call: " << function_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing function call: {}", function_name);
 
         // Check if this is a template enum constructor (e.g., Result::Ok) that needs instantiation
         // This must happen early, before any forward declarations are created
@@ -6845,19 +6840,19 @@ namespace Cryo::Codegen
             std::string base_name = function_name.substr(0, early_scope_pos);
             std::string variant_name = function_name.substr(early_scope_pos + 2);
 
-            std::cout << "[CodegenVisitor] Early check: is " << function_name << " a template enum constructor? (base: " << base_name << ", variant: " << variant_name << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early check: is {} a template enum constructor? (base: {}, variant: {})", function_name, base_name, variant_name);
 
             // Check if base_name is a known template enum (like Result, Option)
             if (base_name == "Result" || base_name == "Option")
             {
-                std::cout << "[CodegenVisitor] Early detection: template enum constructor " << function_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early detection: template enum constructor {}", function_name);
 
                 // Try to find an existing instantiation that matches this call
                 std::string matching_instantiation;
-                std::cout << "[CodegenVisitor] Early: Looking for existing instantiations of " << base_name << " in _enum_variants:" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early: Looking for existing instantiations of {} in _enum_variants:", base_name);
                 for (const auto &[variant_key, variant_func] : _enum_variants)
                 {
-                    std::cout << "[CodegenVisitor] Early:   - Found variant: " << variant_key << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early:   - Found variant: {}", variant_key);
                     // Look for patterns like "Result<void*, AllocError>::Ok"
                     if (variant_key.find(base_name + "<") == 0 && variant_key.find("::" + variant_name) != std::string::npos)
                     {
@@ -6868,7 +6863,7 @@ namespace Cryo::Codegen
 
                 if (!matching_instantiation.empty())
                 {
-                    std::cout << "[CodegenVisitor] Early: Found matching instantiation: " << matching_instantiation << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early: Found matching instantiation: {}", matching_instantiation);
 
                     // Use the instantiated constructor
                     llvm::Value *constructor_func = _enum_variants[matching_instantiation];
@@ -6893,7 +6888,7 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    std::cout << "[CodegenVisitor] Early: No matching instantiation found for " << function_name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early: No matching instantiation found for {}", function_name);
 
                     // Prevent infinite recursion with a generation guard
                     static std::set<std::string> generating;
@@ -6901,11 +6896,11 @@ namespace Cryo::Codegen
 
                     if (generating.find(guard_key) != generating.end())
                     {
-                        std::cout << "[CodegenVisitor] Early: Already generating " << guard_key << ", avoiding recursion" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early: Already generating {}, avoiding recursion", guard_key);
                     }
                     else
                     {
-                        std::cout << "[CodegenVisitor] Early: Triggering enum constructor generation!" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early: Triggering enum constructor generation!");
                         generating.insert(guard_key);
 
                         // We need to infer the concrete instantiation from the current context
@@ -6913,7 +6908,7 @@ namespace Cryo::Codegen
                         if (_current_function && _current_function->ast_node)
                         {
                             std::string return_type_str = _current_function->ast_node->return_type_annotation();
-                            std::cout << "[CodegenVisitor] Current function return type: " << return_type_str << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current function return type: {}", return_type_str);
 
                             // If the return type looks like a parameterized enum (e.g., "AllocResult<void>"),
                             // extract the concrete type arguments and generate constructors
@@ -6954,7 +6949,7 @@ namespace Cryo::Codegen
                                             ensure_parameterized_enum_constructors(return_type_str, base_name, type_args);
                                         }
 
-                                        std::cout << "[CodegenVisitor] Generated constructors for " << return_type_str << std::endl;
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated constructors for {}", return_type_str);
 
                                         // Now try to find the constructor again
                                         std::string instantiated_name = (base_return_type == "AllocResult") ? "Result<void*, AllocError>" : return_type_str;
@@ -6962,7 +6957,7 @@ namespace Cryo::Codegen
                                         auto variant_it = _enum_variants.find(qualified_variant_name);
                                         if (variant_it != _enum_variants.end())
                                         {
-                                            std::cout << "[CodegenVisitor] Found generated constructor: " << qualified_variant_name << std::endl;
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found generated constructor: {}", qualified_variant_name);
                                             llvm::Function *llvm_function = llvm::dyn_cast<llvm::Function>(variant_it->second);
                                             if (llvm_function)
                                             {
@@ -6993,7 +6988,7 @@ namespace Cryo::Codegen
                         generating.erase(guard_key); // Always remove from guard
                     }
 
-                    std::cout << "[CodegenVisitor] Could not generate constructors, continuing with normal flow" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Could not generate constructors, continuing with normal flow");
                 }
             }
         }
@@ -7034,15 +7029,15 @@ namespace Cryo::Codegen
 
                     if (!type_args.empty())
                     {
-                        std::cout << "[CodegenVisitor] Detected parameterized enum constructor call: " << function_name << std::endl;
-                        std::cout << "[CodegenVisitor] Base: " << base_name << ", Variant: " << variant_part << ", Args: ";
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected parameterized enum constructor call: {}", function_name);
+                        std::string args_str = "";
                         for (size_t i = 0; i < type_args.size(); ++i)
                         {
                             if (i > 0)
-                                std::cout << ", ";
-                            std::cout << type_args[i];
+                                args_str += ", ";
+                            args_str += type_args[i];
                         }
-                        std::cout << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Base: {}, Variant: {}, Args: {}", base_name, variant_part, args_str);
 
                         // Ensure constructors are generated for this parameterized enum
                         ensure_parameterized_enum_constructors(type_part, base_name, type_args);
@@ -7073,9 +7068,8 @@ namespace Cryo::Codegen
                 // Verify the argument count matches the function signature
                 if (args.size() != llvm_function->arg_size())
                 {
-                    std::cout << "[ERROR] Argument count mismatch for " << function_name
-                              << ": expected " << llvm_function->arg_size()
-                              << ", got " << args.size() << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Argument count mismatch for {}: expected {}, got {}",
+                              function_name, llvm_function->arg_size(), args.size());
                     return nullptr;
                 }
 
@@ -7085,7 +7079,7 @@ namespace Cryo::Codegen
             }
         }
 
-        std::cout << "[DEBUG] About to check template enum constructor for: " << function_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to check template enum constructor for: {}", function_name);
 
         // Check if this is a template enum constructor (e.g., Result::Ok) that needs instantiation
         size_t template_scope_pos = function_name.find("::");
@@ -7094,22 +7088,22 @@ namespace Cryo::Codegen
             std::string base_name = function_name.substr(0, template_scope_pos);
             std::string variant_name = function_name.substr(template_scope_pos + 2);
 
-            std::cout << "[CodegenVisitor] Checking if " << function_name << " is a template enum constructor (base: " << base_name << ", variant: " << variant_name << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking if {} is a template enum constructor (base: {}, variant: {})", function_name, base_name, variant_name);
 
             // Check if base_name is a known template enum (like Result, Option)
             // We need to determine the instantiation context from the return type
             // For now, let's check for known template enums
             if (base_name == "Result" || base_name == "Option")
             {
-                std::cout << "[CodegenVisitor] Detected template enum constructor: " << function_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected template enum constructor: {}", function_name);
 
                 // Try to find an existing instantiation that matches this call
                 // Look for any instantiated enum that starts with the base name
                 std::string matching_instantiation;
-                std::cout << "[CodegenVisitor] Looking for existing instantiations of " << base_name << " in _enum_variants:" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for existing instantiations of {} in _enum_variants:", base_name);
                 for (const auto &[variant_key, variant_func] : _enum_variants)
                 {
-                    std::cout << "[CodegenVisitor]   - Found variant: " << variant_key << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - Found variant: {}", variant_key);
                     // Look for patterns like "Result<void*, AllocError>::Ok"
                     if (variant_key.find(base_name + "<") == 0 && variant_key.find("::" + variant_name) != std::string::npos)
                     {
@@ -7120,7 +7114,7 @@ namespace Cryo::Codegen
 
                 if (!matching_instantiation.empty())
                 {
-                    std::cout << "[CodegenVisitor] Found matching instantiation: " << matching_instantiation << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found matching instantiation: {}", matching_instantiation);
 
                     // Use the instantiated constructor
                     llvm::Value *constructor_func = _enum_variants[matching_instantiation];
@@ -7145,12 +7139,12 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    std::cout << "[CodegenVisitor] No matching instantiation found for " << function_name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No matching instantiation found for {}", function_name);
                 }
             }
             else
             {
-                std::cout << "[CodegenVisitor] " << base_name << " is not a known template enum" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "{} is not a known template enum", base_name);
             }
         }
 
@@ -7164,7 +7158,7 @@ namespace Cryo::Codegen
             std::string namespace_part = function_name.substr(0, scope_pos);
             std::string function_part = function_name.substr(scope_pos + 2);
 
-            std::cout << "[DEBUG] Checking namespace alias for: " << namespace_part << "::" << function_part << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking namespace alias for: {}::{}", namespace_part, function_part);
 
             // Check if the namespace part is an alias in our symbol table
             if (_symbol_table.has_namespace(namespace_part))
@@ -7175,8 +7169,8 @@ namespace Cryo::Codegen
                 {
                     // For namespace aliases, use just the function name for linking
                     resolved_function_name = function_part;
-                    std::cout << "[DEBUG] Resolved namespace alias " << namespace_part << "::" << function_part
-                              << " to function: " << resolved_function_name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved namespace alias {}::{} to function: {}",
+                              namespace_part, function_part, resolved_function_name);
                 }
             }
         }
@@ -7186,7 +7180,7 @@ namespace Cryo::Codegen
         if (func_it != _functions.end())
         {
             llvm::Function *known_function = func_it->second;
-            std::cout << "[DEBUG] Found function in symbol table: " << resolved_function_name << " -> " << known_function->getName().str() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function in symbol table: {} -> {}", resolved_function_name, known_function->getName().str());
 
             // Generate arguments for the function call
             std::vector<llvm::Value *> args;
@@ -7210,7 +7204,7 @@ namespace Cryo::Codegen
         if (runtime_func_it != _functions.end())
         {
             llvm::Function *runtime_function = runtime_func_it->second;
-            std::cout << "[DEBUG] Found runtime function: " << resolved_function_name << " -> " << runtime_function->getName().str() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found runtime function: {} -> {}", resolved_function_name, runtime_function->getName().str());
 
             // Generate arguments for the runtime function call
             std::vector<llvm::Value *> args;
@@ -7232,7 +7226,7 @@ namespace Cryo::Codegen
         Symbol *runtime_symbol = _symbol_table.lookup_namespaced_symbol("std::Runtime", resolved_function_name);
         if (runtime_symbol && runtime_symbol->kind == SymbolKind::Function)
         {
-            std::cout << "[DEBUG] Found runtime function in symbol table: " << resolved_function_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found runtime function in symbol table: {}", resolved_function_name);
 
             // Create a forward declaration for the runtime function
             llvm::Function *runtime_function = create_runtime_function_declaration(runtime_qualified_name, node);
@@ -7309,37 +7303,37 @@ namespace Cryo::Codegen
                             llvm::Type *element_type = _value_context->get_alloca_type(object_name);
                             llvm::Value *loaded_value = create_load(object_value, element_type, object_name + ".load");
                             args.push_back(loaded_value); // Load the actual value for primitive methods
-                            std::cout << "[CodegenVisitor] Added loaded 'this' value for primitive method: " << function_name << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added loaded 'this' value for primitive method: {}", function_name);
                         }
                         else
                         {
                             args.push_back(object_value); // Direct value (like function parameters)
-                            std::cout << "[CodegenVisitor] Added direct 'this' value for primitive method: " << function_name << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added direct 'this' value for primitive method: {}", function_name);
                         }
                     }
                 }
             }
             else if (auto *literal_node = dynamic_cast<LiteralNode *>(member_access->object()))
             {
-                std::cout << "[DEBUG] In argument generation - found literal node, kind: " << static_cast<int>(literal_node->literal_kind()) << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "In argument generation - found literal node, kind: {}", static_cast<int>(literal_node->literal_kind()));
                 // Handle literal method calls like "hello".length()
                 if (literal_node->literal_kind() == TokenKind::TK_STRING_LITERAL)
                 {
-                    std::cout << "[CodegenVisitor] Processing string literal method call" << std::endl;
-                    std::cout << "[DEBUG] About to call accept on literal node with value: " << literal_node->value() << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing string literal method call");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to call accept on literal node with value: {}", literal_node->value());
                     // Generate the string literal value and add it as 'this' pointer
                     literal_node->accept(*this);
-                    std::cout << "[DEBUG] Finished calling accept on literal node" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished calling accept on literal node");
                     llvm::Value *literal_value = get_generated_value(literal_node);
-                    std::cout << "[DEBUG] String literal value: " << (literal_value ? "valid" : "NULL") << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "String literal value: {}", (literal_value ? "valid" : "NULL"));
                     if (literal_value)
                     {
                         args.push_back(literal_value);
-                        std::cout << "[CodegenVisitor] Added string literal as 'this' value for primitive method: " << function_name << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added string literal as 'this' value for primitive method: {}", function_name);
                     }
                     else
                     {
-                        std::cout << "[ERROR] Failed to generate string literal value" << std::endl;
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to generate string literal value");
                     }
                 }
             }
@@ -7349,12 +7343,12 @@ namespace Cryo::Codegen
         for (size_t i = 0; i < node->arguments().size(); ++i)
         {
             const auto &arg = node->arguments()[i];
-            std::cout << "[DEBUG] Processing argument " << i << " of " << node->arguments().size() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing argument {} of {}", i, node->arguments().size());
 
             arg->accept(*this);
             llvm::Value *arg_value = get_current_value();
 
-            std::cout << "[DEBUG] Argument " << i << " value: " << (arg_value ? "valid" : "NULL") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Argument {} value: {}", i, (arg_value ? "valid" : "NULL"));
 
             if (arg_value)
             {
@@ -7362,180 +7356,181 @@ namespace Cryo::Codegen
                 if (arg_value->getType())
                 {
                     args.push_back(arg_value);
-                    std::cout << "[DEBUG] Successfully added argument " << i << " to call" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully added argument {} to call", i);
                 }
                 else
                 {
-                    std::cout << "[ERROR] Argument " << i << " has NULL type, skipping" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Argument {} has NULL type, skipping", i);
                     return nullptr;
                 }
             }
             else
             {
-                std::cout << "[ERROR] Failed to generate argument " << i << " for function call: " << function_name << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to generate argument {} for function call: {}", i, function_name);
                 return nullptr;
             }
         }
 
         // Create the function call
-        std::cout << "[DEBUG] About to create call. Function pointer: " << (function ? "valid" : "NULL") << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to create call. Function pointer: {}", (function ? "valid" : "NULL"));
         if (!function)
         {
-            std::cout << "[ERROR] Function pointer is NULL, cannot create call" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function pointer is NULL, cannot create call");
             return nullptr;
         }
 
-        std::cout << "[DEBUG] Function name: " << function->getName().str() << std::endl;
-        std::cout << "[DEBUG] Function type: " << (function->getFunctionType() ? "valid" : "NULL") << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function name: {}", function->getName().str());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function type: {}", (function->getFunctionType() ? "valid" : "NULL"));
 
         if (!function->getFunctionType())
         {
-            std::cout << "[ERROR] Function type is NULL, cannot create call" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function type is NULL, cannot create call");
             return nullptr;
         }
 
-        std::cout << "[DEBUG] Expected args: " << function->getFunctionType()->getNumParams() << ", provided: " << args.size() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Expected args: {}, provided: {}", function->getFunctionType()->getNumParams(), args.size());
 
         // Validate all arguments before creating the call
         for (size_t i = 0; i < args.size(); ++i)
         {
             if (!args[i])
             {
-                std::cout << "[ERROR] Argument " << i << " is NULL, cannot create call" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Argument {} is NULL, cannot create call", i);
                 return nullptr;
             }
             if (!args[i]->getType())
             {
-                std::cout << "[ERROR] Argument " << i << " has NULL type, cannot create call" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Argument {} has NULL type, cannot create call", i);
                 return nullptr;
             }
         }
 
-        std::cout << "[DEBUG] All arguments validated, creating call..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "All arguments validated, creating call...");
 
         // Add extensive debugging before CreateCall
-        std::cout << "[DEBUG] Builder basic block: " << (builder.GetInsertBlock() ? "valid" : "NULL") << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Builder basic block: {}", (builder.GetInsertBlock() ? "valid" : "NULL"));
         if (builder.GetInsertBlock())
         {
-            std::cout << "[DEBUG] Basic block parent: " << (builder.GetInsertBlock()->getParent() ? "valid" : "NULL") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Basic block parent: {}", (builder.GetInsertBlock()->getParent() ? "valid" : "NULL"));
         }
 
-        std::cout << "[DEBUG] Function details:" << std::endl;
-        std::cout << "[DEBUG]   Function name: " << function->getName().str() << std::endl;
-        std::cout << "[DEBUG]   Function address: " << function << std::endl;
-        std::cout << "[DEBUG]   Function type address: " << function->getFunctionType() << std::endl;
-        std::cout << "[DEBUG]   Function linkage: " << function->getLinkage() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function details:");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function name: {}", function->getName().str());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function address: {}", static_cast<void *>(function));
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function type address: {}", static_cast<void *>(function->getFunctionType()));
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function linkage: {}", function->getLinkage());
 
-        std::cout << "[DEBUG] Arguments details:" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Arguments details:");
         for (size_t i = 0; i < args.size(); ++i)
         {
-            std::cout << "[DEBUG]   Arg " << i << ": address=" << args[i] << ", type=" << args[i]->getType() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Arg {}: address={}, type={}", i, static_cast<void *>(args[i]), static_cast<void *>(args[i]->getType()));
             if (args[i]->getType())
             {
                 args[i]->getType()->print(llvm::errs());
-                std::cout << std::endl;
+                llvm::errs() << "\n";
             }
-        }
+            args[i]->getType()->print(llvm::errs());
+            llvm::errs() << "\n";
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to call CreateCall with {} arguments...", args.size());
 
-        std::cout << "[DEBUG] About to call CreateCall with " << args.size() << " arguments..." << std::endl;
-
-        // Add even more detailed debugging before CreateCall
-        try
-        {
-            std::cout << "[DEBUG] Verifying function before CreateCall..." << std::endl;
-
-            // Check if function is valid
-            if (!function)
+            // Add even more detailed debugging before CreateCall
+            try
             {
-                std::cout << "[ERROR] Function is null!" << std::endl;
-                return nullptr;
-            }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Verifying function before CreateCall...");
 
-            // Check function type
-            llvm::FunctionType *funcType = function->getFunctionType();
-            if (!funcType)
-            {
-                std::cout << "[ERROR] Function type is null!" << std::endl;
-                return nullptr;
-            }
-
-            std::cout << "[DEBUG] Function type params: " << funcType->getNumParams() << std::endl;
-            std::cout << "[DEBUG] Function is vararg: " << funcType->isVarArg() << std::endl;
-
-            // Verify module compatibility
-            llvm::Module *funcModule = function->getParent();
-            llvm::Module *currentModule = builder.GetInsertBlock()->getModule();
-            std::cout << "[DEBUG] Function module: " << (funcModule ? funcModule->getName().str() : "NULL") << std::endl;
-            std::cout << "[DEBUG] Current module: " << (currentModule ? currentModule->getName().str() : "NULL") << std::endl;
-
-            if (funcModule != currentModule)
-            {
-                std::cout << "[WARNING] Cross-module function call detected!" << std::endl;
-            }
-
-            // Detailed argument verification
-            for (size_t i = 0; i < args.size(); ++i)
-            {
-                std::cout << "[DEBUG] Arg " << i << " verification:" << std::endl;
-                if (!args[i])
+                // Check if function is valid
+                if (!function)
                 {
-                    std::cout << "[ERROR]   Argument is null!" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function is null!");
                     return nullptr;
                 }
 
-                llvm::Type *argType = args[i]->getType();
-                if (!argType)
+                // Check function type
+                llvm::FunctionType *funcType = function->getFunctionType();
+                if (!funcType)
                 {
-                    std::cout << "[ERROR]   Argument type is null!" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function type is null!");
                     return nullptr;
                 }
 
-                std::cout << "[DEBUG]   Argument value: " << args[i] << std::endl;
-                std::cout << "[DEBUG]   Argument type: " << argType << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function type params: {}", funcType->getNumParams());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function is vararg: {}", funcType->isVarArg());
 
-                if (i < funcType->getNumParams())
+                // Verify module compatibility
+                llvm::Module *funcModule = function->getParent();
+                llvm::Module *currentModule = builder.GetInsertBlock()->getModule();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function module: {}", (funcModule ? funcModule->getName().str() : "NULL"));
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current module: {}", (currentModule ? currentModule->getName().str() : "NULL"));
+
+                if (funcModule != currentModule)
                 {
-                    llvm::Type *expectedType = funcType->getParamType(i);
-                    std::cout << "[DEBUG]   Expected type: " << expectedType << std::endl;
-                    std::cout << "[DEBUG]   Types match: " << (argType == expectedType ? "YES" : "NO") << std::endl;
+                    LOG_WARN(Cryo::LogComponent::CODEGEN, "Cross-module function call detected!");
                 }
+
+                // Detailed argument verification
+                for (size_t i = 0; i < args.size(); ++i)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Arg {} verification:", i);
+                    if (!args[i])
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Argument is null!");
+                        return nullptr;
+                    }
+
+                    llvm::Type *argType = args[i]->getType();
+                    if (!argType)
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Argument type is null!");
+                        return nullptr;
+                    }
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Argument value: {}", (void *)args[i]);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Argument type: {}", (void *)argType);
+
+                    if (i < funcType->getNumParams())
+                    {
+                        llvm::Type *expectedType = funcType->getParamType(i);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Expected type: {}", (void *)expectedType);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Types match: {}", (argType == expectedType ? "YES" : "NO"));
+                    }
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "All pre-CreateCall checks passed, creating call...");
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function Name: {}", function->getName().str());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Number of Args: {}", args.size());
+                llvm::Value *call_result = builder.CreateCall(function, args);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CreateCall completed successfully!");
+
+                // Add debugging for the result
+                if (!call_result)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "CreateCall returned NULL!");
+                    return nullptr;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Call result: {}", (void *)call_result);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Call result type: {}", (void *)call_result->getType());
+
+                if (call_result->getType())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Result type verified, printing...");
+                    call_result->getType()->print(llvm::errs());
+                    llvm::errs() << "\n";
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to return call_result...");
+                return call_result;
             }
-
-            std::cout << "[DEBUG] All pre-CreateCall checks passed, creating call..." << std::endl;
-            std::cout << "[DEBUG] Function Name: " << function->getName().str() << std::endl;
-            std::cout << "[DEBUG] Number of Args: " << args.size() << std::endl;
-            llvm::Value *call_result = builder.CreateCall(function, args);
-            std::cout << "[DEBUG] CreateCall completed successfully!" << std::endl;
-
-            // Add debugging for the result
-            if (!call_result)
+            catch (const std::exception &e)
             {
-                std::cout << "[ERROR] CreateCall returned NULL!" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception during CreateCall: {}", e.what());
                 return nullptr;
             }
-
-            std::cout << "[DEBUG] Call result: " << call_result << std::endl;
-            std::cout << "[DEBUG] Call result type: " << call_result->getType() << std::endl;
-
-            if (call_result->getType())
+            catch (...)
             {
-                std::cout << "[DEBUG] Result type verified, printing..." << std::endl;
-                call_result->getType()->print(llvm::errs());
-                std::cout << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown exception during CreateCall!");
+                return nullptr;
             }
-
-            std::cout << "[DEBUG] About to return call_result..." << std::endl;
-            return call_result;
-        }
-        catch (const std::exception &e)
-        {
-            std::cout << "[ERROR] Exception during CreateCall: " << e.what() << std::endl;
-            return nullptr;
-        }
-        catch (...)
-        {
-            std::cout << "[ERROR] Unknown exception during CreateCall!" << std::endl;
-            return nullptr;
         }
     }
 
@@ -7543,12 +7538,12 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            std::cout << "[DEBUG] extract_function_name_from_member_access: node is null" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "extract_function_name_from_member_access: node is null");
             return "";
         }
 
         std::string member_name = node->member();
-        std::cout << "[DEBUG] extract_function_name_from_member_access: member name = '" << member_name << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "extract_function_name_from_member_access: member name = '{}'", member_name);
 
         // For Std::Runtime::print_int, we want "print_int"
         // This is a simplified extraction - just get the final member name
@@ -7582,23 +7577,23 @@ namespace Cryo::Codegen
         Symbol *symbol = nullptr;
 
         // Debug: show what symbols are available
-        std::cout << "[DEBUG] Symbol table lookup for: '" << c_name << "'" << std::endl;
-        std::cout << "[DEBUG] Scope context: '" << scope_name << "', Member: '" << symbol_name << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Symbol table lookup for: '{}'", c_name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Scope context: '{}', Member: '{}'", scope_name, symbol_name);
 
         // First try to find by the full name
         symbol = _symbol_table.lookup_symbol(c_name);
-        std::cout << "[DEBUG] Symbol lookup for '" << c_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Symbol lookup for '{}': {}", c_name, (symbol ? "FOUND" : "NOT FOUND"));
 
         // If not found, try to find by the member name
         if (!symbol)
         {
             symbol = _symbol_table.lookup_symbol(symbol_name);
-            std::cout << "[DEBUG] Symbol lookup for member name '" << symbol_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Symbol lookup for member name '{}': {}", symbol_name, (symbol ? "FOUND" : "NOT FOUND"));
 
             // Verify the scope matches if we found a symbol
             if (symbol && symbol->scope != scope_name)
             {
-                std::cout << "[DEBUG] Symbol found but scope mismatch: '" << symbol->scope << "' != '" << scope_name << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Symbol found but scope mismatch: '{}' != '{}'", symbol->scope, scope_name);
                 symbol = nullptr; // Wrong scope, keep looking
             }
         }
@@ -7606,15 +7601,15 @@ namespace Cryo::Codegen
         // Try namespaced lookup
         if (!symbol)
         {
-            std::cout << "[DEBUG] Trying namespaced lookup..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying namespaced lookup...");
             symbol = _symbol_table.lookup_namespaced_symbol(scope_name, symbol_name);
-            std::cout << "[DEBUG] Namespaced lookup for '" << scope_name << "::" << symbol_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Namespaced lookup for '{}::{}': {}", scope_name, symbol_name, (symbol ? "FOUND" : "NOT FOUND"));
         }
 
         // Try enhanced resolution with import shortcuts
         if (!symbol)
         {
-            std::cout << "[DEBUG] Trying enhanced import resolution..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying enhanced import resolution...");
             // Get all imported namespaces (for now we'll extract from the symbol table itself)
             std::vector<std::string> imported_namespaces;
 
@@ -7626,30 +7621,30 @@ namespace Cryo::Codegen
             // Add more namespace expansions as needed
 
             symbol = _symbol_table.lookup_qualified_symbol_with_import_shortcuts(c_name, imported_namespaces);
-            std::cout << "[DEBUG] Enhanced import resolution for '" << c_name << "': " << (symbol ? "FOUND" : "NOT FOUND") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Enhanced import resolution for '{}': {}", c_name, (symbol ? "FOUND" : "NOT FOUND"));
         }
 
         // Debug symbol properties if found
         if (symbol)
         {
-            std::cout << "[DEBUG] Symbol found! Kind: " << (int)symbol->kind << " (Function=" << (int)SymbolKind::Function << ")" << std::endl;
-            std::cout << "[DEBUG] Symbol data_type: " << (symbol->data_type ? "NOT NULL" : "NULL") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Symbol found! Kind: {} (Function={})", (int)symbol->kind, (int)SymbolKind::Function);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Symbol data_type: {}", (symbol->data_type ? "NOT NULL" : "NULL"));
             if (symbol->data_type)
             {
-                std::cout << "[DEBUG] Symbol data_type name: " << symbol->data_type->name() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Symbol data_type name: {}", symbol->data_type->name());
                 FunctionType *func_type = dynamic_cast<FunctionType *>(symbol->data_type);
-                std::cout << "[DEBUG] Dynamic cast to FunctionType: " << (func_type ? "SUCCESS" : "FAILED") << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Dynamic cast to FunctionType: {}", (func_type ? "SUCCESS" : "FAILED"));
             }
         }
 
         // If we found a function symbol, use its actual type information
         if (symbol && symbol->kind == SymbolKind::Function && symbol->data_type)
         {
-            std::cout << "[DEBUG] Found function symbol, checking data_type..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function symbol, checking data_type...");
             FunctionType *func_type = dynamic_cast<FunctionType *>(symbol->data_type);
             if (func_type)
             {
-                std::cout << "[DEBUG] Using symbol table function type for: " << c_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using symbol table function type for: {}", c_name);
 
                 // Convert Cryo types to LLVM types
                 std::vector<llvm::Type *> param_types;
@@ -7690,7 +7685,7 @@ namespace Cryo::Codegen
                 if (forward_decl)
                 {
                     _functions[c_name] = forward_decl;
-                    std::cout << "[DEBUG] Successfully created forward declaration using symbol table for: " << c_name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully created forward declaration using symbol table for: {}", c_name);
                     return forward_decl;
                 }
             }
@@ -7702,29 +7697,29 @@ namespace Cryo::Codegen
             auto functions_it = _functions.find(c_name);
             if (functions_it != _functions.end())
             {
-                std::cout << "[CodegenVisitor] Found pre-generated function: " << c_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found pre-generated function: {}", c_name);
                 llvm::Function *found_func = functions_it->second;
-                std::cout << "[DEBUG] Function name at find time: " << (found_func ? found_func->getName().str() : "NULL") << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function name at find time: {}", (found_func ? found_func->getName().str() : "NULL"));
 
                 // Check if the function has a valid name and parent
                 if (found_func && found_func->getParent())
                 {
                     std::string func_name = found_func->getName().str();
-                    std::cout << "[DEBUG] Function name retrieved: '" << func_name << "'" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function name retrieved: '{}'", func_name);
                     if (!func_name.empty())
                     {
                         return found_func; // Return the valid already-generated function
                     }
                     else
                     {
-                        std::cout << "[DEBUG] Function has no name, treating as corrupted" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function has no name, treating as corrupted");
                         // Remove the corrupted function from our map and fall through
                         _functions.erase(c_name);
                     }
                 }
                 else
                 {
-                    std::cout << "[DEBUG] Function is invalid (no parent), removing corrupted entry" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function is invalid (no parent), removing corrupted entry");
                     // Remove the corrupted function from our map and fall through to create forward declaration
                     _functions.erase(c_name);
                 }
@@ -7773,18 +7768,18 @@ namespace Cryo::Codegen
                 if (functions_it != _functions.end())
                 {
                     llvm::Function *found_func = functions_it->second;
-                    std::cout << "[CodegenVisitor] Found function in _functions map: " << search_name << " (searched for: " << c_name << ")" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function in _functions map: {} (searched for: {})", search_name, c_name);
 
                     // Check if function is valid (not orphaned)
                     if (found_func && found_func->getParent())
                     {
-                        std::cout << "[DEBUG] Function is valid and has parent module" << std::endl;
-                        std::cout << "[DEBUG] Function name at search variations find time: " << found_func->getName().str() << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function is valid and has parent module");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function name at search variations find time: {}", found_func->getName().str());
                         return found_func;
                     }
                     else
                     {
-                        std::cout << "[DEBUG] Function is orphaned (no parent module), removing corrupted entry" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function is orphaned (no parent module), removing corrupted entry");
                         // Remove the corrupted orphaned function from our map
                         _functions.erase(search_name);
                         // Fall through to create forward declaration below
@@ -7795,8 +7790,8 @@ namespace Cryo::Codegen
 
         // If we reach here, the function wasn't found anywhere
         // Create a forward declaration based on the call site
-        std::cout << "[DEBUG] Creating forward declaration for: " << c_name << std::endl;
-        std::cout << "[DEBUG] Current namespace context: " << _namespace_context << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating forward declaration for: {}", c_name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current namespace context: {}", _namespace_context);
 
         if (!call_node)
         {
@@ -7820,7 +7815,7 @@ namespace Cryo::Codegen
                     is_primitive_method_call = true;
                     // Add 'this' pointer parameter (string pointer for string methods)
                     param_types.push_back(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(_context_manager.get_context())));
-                    std::cout << "[DEBUG] Added 'this' pointer parameter to forward declaration for primitive method: " << c_name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added 'this' pointer parameter to forward declaration for primitive method: {}", c_name);
                 }
             }
         }
@@ -7847,37 +7842,37 @@ namespace Cryo::Codegen
         // Use FunctionRegistry to infer return type based on function metadata
         llvm::Type *return_type = _function_registry->get_function_return_type(c_name, _context_manager.get_context(), _namespace_context);
 
-        std::cout << "[DEBUG] FunctionRegistry return type for '" << c_name << "': " << return_type << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry return type for '{}': {}", c_name, (void *)return_type);
         if (return_type)
         {
             return_type->print(llvm::errs());
-            std::cout << std::endl;
+            llvm::errs() << "\n";
         }
 
         // TEMPORARY FIX: Override return type for known cross-module functions
         if (c_name == "std::String::_strlen")
         {
-            std::cout << "[DEBUG] Overriding return type for std::String::_strlen to u64" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::String::_strlen to u64");
             return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
         }
         else if (c_name == "std::Syscall::IO::write")
         {
-            std::cout << "[DEBUG] Overriding return type for std::Syscall::IO::write to i64" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::Syscall::IO::write to i64");
             return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
         }
         else if (c_name == "std::String::_int_to_string")
         {
-            std::cout << "[DEBUG] Overriding return type for std::String::_int_to_string to string" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::String::_int_to_string to string");
             return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
         }
         else if (c_name == "std::String::_float_to_string")
         {
-            std::cout << "[DEBUG] Overriding return type for std::String::_float_to_string to string" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::String::_float_to_string to string");
             return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
         }
         else if (c_name == "std::String::from_char")
         {
-            std::cout << "[DEBUG] Overriding return type for std::String::from_char to string" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::String::from_char to string");
             return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
         }
 
@@ -7888,7 +7883,7 @@ namespace Cryo::Codegen
         FunctionMetadata metadata = _function_registry->get_function_metadata(c_name, _namespace_context);
         std::string c_runtime_name = metadata.runtime_name.empty() ? c_name : metadata.runtime_name;
 
-        std::cout << "[DEBUG] FunctionRegistry provided runtime name for '" << c_name << "': '" << c_runtime_name << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry provided runtime name for '{}': '{}'", c_name, c_runtime_name);
 
         llvm::Function *forward_decl = llvm::Function::Create(
             func_type,
@@ -7905,7 +7900,7 @@ namespace Cryo::Codegen
         // Store the forward declaration for future use
         _functions[c_name] = forward_decl;
 
-        std::cout << "[DEBUG] Successfully created forward declaration for: " << c_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully created forward declaration for: {}", c_name);
         return forward_decl;
     }
     llvm::Value *Cryo::Codegen::CodegenVisitor::generate_array_access(Cryo::ArrayAccessNode *node) { return nullptr; }
@@ -7918,7 +7913,7 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         llvm::Function *function = builder.GetInsertBlock()->getParent();
 
-        std::cout << "[DEBUG] IF-STATEMENT ENTRY: Current block before anything: " << builder.GetInsertBlock()->getName().str() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT ENTRY: Current block before anything: {}", builder.GetInsertBlock()->getName().str());
 
         // Generate condition expression FIRST
         // (Don't create then/else/merge blocks yet - condition might create its own control flow)
@@ -7965,9 +7960,8 @@ namespace Cryo::Codegen
         // Branch based on condition FROM the block where condition was evaluated
         // CRITICAL: The condition_block might not have a terminator yet (e.g., land.end from short-circuit)
         // We MUST add the branch terminator now
-        std::cout << "[DEBUG] IF-STATEMENT: About to create branch from block: " << condition_block->getName().str()
-                  << " (ptr=" << (void *)condition_block << ")"
-                  << ", has terminator before branch: " << (condition_block->getTerminator() != nullptr) << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: About to create branch from block: {} (ptr={}), has terminator before branch: {}",
+                  condition_block->getName().str(), (void *)condition_block, (condition_block->getTerminator() != nullptr));
 
         // Check if condition_block already has a terminator (shouldn't happen, but be safe)
         if (condition_block->getTerminator())
@@ -7986,31 +7980,30 @@ namespace Cryo::Codegen
             builder.CreateCondBr(condition_val, then_block, merge_block);
         }
 
-        std::cout << "[DEBUG] IF-STATEMENT: After creating branch, block " << condition_block->getName().str()
-                  << " (ptr=" << (void *)condition_block << ")"
-                  << " has terminator: " << (condition_block->getTerminator() != nullptr) << std::endl;
-        std::cout << "[DEBUG] IF-STATEMENT: Branch target: then_block=" << then_block->getName().str()
-                  << " (ptr=" << (void *)then_block << ")" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: After creating branch, block {} (ptr={}) has terminator: {}",
+                  condition_block->getName().str(), (void *)condition_block, (condition_block->getTerminator() != nullptr));
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: Branch target: then_block={} (ptr={})",
+                  then_block->getName().str(), (void *)then_block);
 
         // Generate then block
         builder.SetInsertPoint(then_block);
-        std::cout << "[DEBUG] IF-STATEMENT: Generating then block, insert point: " << then_block->getName().str() << std::endl;
-        std::cout << "[DEBUG] IF-STATEMENT: then_block is empty: " << then_block->empty() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: Generating then block, insert point: {}", then_block->getName().str());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: then_block is empty: {}", then_block->empty());
         enter_scope(then_block);
         node->then_statement()->accept(*this);
         exit_scope();
-        std::cout << "[DEBUG] IF-STATEMENT: After then body generation, current block: " << builder.GetInsertBlock()->getName().str() << std::endl;
-        std::cout << "[DEBUG] IF-STATEMENT: then_block is empty: " << then_block->empty() << std::endl;
-        std::cout << "[DEBUG] IF-STATEMENT: then_block has terminator: " << (then_block->getTerminator() != nullptr) << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: After then body generation, current block: {}", builder.GetInsertBlock()->getName().str());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: then_block is empty: {}", then_block->empty());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: then_block has terminator: {}", (then_block->getTerminator() != nullptr));
 
         // Ensure the current block (which might not be then_block if the statement
         // contained nested control flow) ends with a branch to merge
         llvm::BasicBlock *currentBlock = builder.GetInsertBlock();
-        std::cout << "[DEBUG] IF-STATEMENT: Checking terminator for block: " << currentBlock->getName().str()
-                  << ", has terminator: " << (currentBlock->getTerminator() != nullptr) << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: Checking terminator for block: {}, has terminator: {}",
+                  currentBlock->getName().str(), (currentBlock->getTerminator() != nullptr));
         if (currentBlock && !currentBlock->getTerminator())
         {
-            std::cout << "[DEBUG] IF-STATEMENT: Adding branch to merge block from current block" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: Adding branch to merge block from current block");
             builder.CreateBr(merge_block);
         }
 
@@ -8019,7 +8012,7 @@ namespace Cryo::Codegen
         // then_block might have instructions but no terminator
         if (then_block && !then_block->getTerminator())
         {
-            std::cout << "[DEBUG] IF-STATEMENT: then_block lacks terminator, adding branch to merge" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: then_block lacks terminator, adding branch to merge");
             // Temporarily set insert point to then_block to add the terminator
             llvm::BasicBlock *saved_block = builder.GetInsertBlock();
             builder.SetInsertPoint(then_block);
@@ -8051,9 +8044,8 @@ namespace Cryo::Codegen
         // - merge_block should NOT have a terminator yet - it's where execution continues
         //   and subsequent statements will add to it
 
-        std::cout << "[DEBUG] IF-STATEMENT CLEANUP: then_block=" << then_block->getName().str()
-                  << ", has_term=" << (then_block->getTerminator() != nullptr)
-                  << ", is_empty=" << then_block->empty() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT CLEANUP: then_block={}, has_term={}, is_empty={}",
+                  then_block->getName().str(), (then_block->getTerminator() != nullptr), then_block->empty());
     }
     void CodegenVisitor::generate_while_loop(Cryo::WhileStatementNode *node)
     {
@@ -8411,7 +8403,7 @@ namespace Cryo::Codegen
             if (discriminant)
             {
                 actual_switch_value = discriminant;
-                std::cout << "[CodegenVisitor] DEBUG: Extracted enum discriminant for switch" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Extracted enum discriminant for switch");
             }
         }
 
@@ -8536,8 +8528,8 @@ namespace Cryo::Codegen
         auto &context = _context_manager.get_context();
 
         // Debug: Print the type information
-        std::cout << "[CodegenVisitor] DEBUG: enum_value type is pointer: " << enum_value->getType()->isPointerTy() << std::endl;
-        std::cout << "[CodegenVisitor] DEBUG: enum_value type is struct: " << enum_value->getType()->isStructTy() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "enum_value type is pointer: {}", enum_value->getType()->isPointerTy());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "enum_value type is struct: {}", enum_value->getType()->isStructTy());
 
         // Check if enum_value is a pointer or a value
         if (enum_value->getType()->isPointerTy())
@@ -8547,7 +8539,7 @@ namespace Cryo::Codegen
             // We need to access the first field (discriminant)
 
             // Try to get the pointed-to type first to understand what we're dealing with
-            std::cout << "[CodegenVisitor] DEBUG: enum_value type: " << enum_value->getType() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "enum_value type: {}", (void *)enum_value->getType());
 
             // For now, let's use a simpler approach - load the first 32 bits as discriminant
             // Cast to a byte pointer and load as i32
@@ -8566,34 +8558,34 @@ namespace Cryo::Codegen
                 i32_ptr,
                 "discriminant");
 
-            std::cout << "[CodegenVisitor] Extracted discriminant from enum pointer" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Extracted discriminant from enum pointer");
             return discriminant;
         }
         else
         {
-            std::cout << "[CodegenVisitor] DEBUG: Processing enum struct value" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing enum struct value");
 
             // Debug: Print the actual LLVM type
             std::string type_str;
             llvm::raw_string_ostream os(type_str);
             enum_value->getType()->print(os);
-            std::cout << "[CodegenVisitor] DEBUG: enum_value LLVM type: " << os.str() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "enum_value LLVM type: {}", os.str());
 
             // Check if it's actually a struct type
             if (!enum_value->getType()->isStructTy())
             {
-                std::cout << "[CodegenVisitor] ERROR: Expected struct type but got something else!" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Expected struct type but got something else!");
                 return nullptr;
             }
 
             llvm::StructType *struct_type = llvm::cast<llvm::StructType>(enum_value->getType());
-            std::cout << "[CodegenVisitor] DEBUG: Struct has " << struct_type->getNumElements() << " elements" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Struct has {} elements", struct_type->getNumElements());
 
             // Check if this is an empty struct (indicates enum wasn't properly constructed)
             if (struct_type->getNumElements() == 0)
             {
-                std::cout << "[CodegenVisitor] ERROR: Empty struct - enum type not properly constructed!" << std::endl;
-                std::cout << "[CodegenVisitor] ERROR: Expected tagged union with discriminant field" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Empty struct - enum type not properly constructed!");
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Expected tagged union with discriminant field");
                 // Return a default discriminant value to prevent crash
                 return llvm::ConstantInt::get(llvm::Type::getInt32Ty(_context_manager.get_context()), 0);
             }
@@ -8604,7 +8596,7 @@ namespace Cryo::Codegen
                 {0},
                 "discriminant");
 
-            std::cout << "[CodegenVisitor] Extracted discriminant from enum struct value" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Extracted discriminant from enum struct value");
             return discriminant;
         }
     }
@@ -8633,7 +8625,7 @@ namespace Cryo::Codegen
             if (variant_name == "Triangle")
                 return 2;
 
-            std::cout << "[CodegenVisitor] Pattern discriminant for " << full_name << " (unknown, defaulting to 0)" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pattern discriminant for {} (unknown, defaulting to 0)", full_name);
             return 0;
         }
 
@@ -8651,7 +8643,7 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        std::cout << "[CodegenVisitor] Generating match arm with pattern" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating match arm with pattern");
 
         // Extract pattern variables if this is an enum pattern with bindings
         if (auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(arm->pattern()))
@@ -8665,7 +8657,7 @@ namespace Cryo::Codegen
             arm->body()->accept(*this);
         }
 
-        std::cout << "[CodegenVisitor] Match arm generated" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Match arm generated");
     }
 
     void CodegenVisitor::extract_pattern_bindings(Cryo::EnumPatternNode *pattern, llvm::Value *enum_value)
@@ -8678,7 +8670,7 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        std::cout << "[CodegenVisitor] Extracting pattern bindings for " << pattern->variant_name() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Extracting pattern bindings for {}", pattern->variant_name());
 
         // Check if the enum type is properly constructed
         llvm::Type *enum_type = enum_value->getType();
@@ -8689,22 +8681,22 @@ namespace Cryo::Codegen
         {
             // We can't directly get the pointed-to type with opaque pointers
             // Instead, we'll check during the actual operation below
-            std::cout << "[CodegenVisitor] Enum value is pointer type (opaque pointer)" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Enum value is pointer type (opaque pointer)");
         }
         else if (enum_type->isStructTy())
         {
             auto struct_type = llvm::cast<llvm::StructType>(enum_type);
             if (struct_type->getNumElements() == 0)
             {
-                std::cout << "[CodegenVisitor] ERROR: Cannot extract pattern bindings - enum type is empty struct!" << std::endl;
-                std::cout << "[CodegenVisitor] Struct name: " << (struct_type->hasName() ? struct_type->getName().str() : "unnamed") << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Cannot extract pattern bindings - enum type is empty struct!");
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Struct name: {}", (struct_type->hasName() ? struct_type->getName().str() : "unnamed"));
                 is_empty_enum = true;
             }
         }
 
         if (is_empty_enum)
         {
-            std::cout << "[CodegenVisitor] Skipping pattern binding extraction for empty enum" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping pattern binding extraction for empty enum");
             return; // Early return to prevent LLVM assertion
         }
 
@@ -8714,7 +8706,7 @@ namespace Cryo::Codegen
 
         if (bindings.empty())
         {
-            std::cout << "[CodegenVisitor] No bindings to extract" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No bindings to extract");
             return;
         }
 
@@ -8806,7 +8798,7 @@ namespace Cryo::Codegen
             // Also register with value context so it can be found during identifier lookup
             _value_context->set_value(binding_name, binding_alloca, binding_alloca, llvm::Type::getFloatTy(context));
 
-            std::cout << "[CodegenVisitor] Created binding: " << binding_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created binding: {}", binding_name);
         }
     }
 
@@ -8925,10 +8917,10 @@ namespace Cryo::Codegen
     {
         try
         {
-            std::cout << "[DEBUG] enter_scope: this=" << this << ", _value_context=" << _value_context.get() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "enter_scope: this={}, _value_context={}", (void *)this, (void *)_value_context.get());
             if (!_value_context)
             {
-                std::cerr << "[ERROR] _value_context is null in enter_scope!" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "_value_context is null in enter_scope!");
                 return;
             }
             _value_context->enter_scope("scope");
@@ -9016,7 +9008,7 @@ namespace Cryo::Codegen
             return; // Already generated
         }
 
-        std::cout << "[CodegenVisitor] Generating variant constructors for parameterized enum: " << instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating variant constructors for parameterized enum: {}", instantiated_name);
 
         auto &llvm_context = _context_manager.get_context();
         auto *module = _context_manager.get_module();
@@ -9038,8 +9030,10 @@ namespace Cryo::Codegen
             {
                 function_return_type = _current_function->ast_node->return_type_annotation();
                 enum_type = _type_mapper->lookup_type(function_return_type);
-                std::cout << "[CodegenVisitor] Using function return type: " << function_return_type
-                          << " -> " << (enum_type ? enum_type->getStructName().str() : "null") << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Using function return type: {} -> {}",
+                          function_return_type,
+                          (enum_type ? enum_type->getStructName().str() : "null"));
             }
 
             if (!enum_type)
@@ -9104,9 +9098,9 @@ namespace Cryo::Codegen
 
                     // Let TypeMapper handle the creation and registration
                     enum_type = _type_mapper->map_type(parameterized_type.get());
-
-                    std::cout << "[CodegenVisitor] TypeMapper processed parameterized enum, got type: "
-                              << (enum_type ? enum_type->getStructName().str() : "null") << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "TypeMapper processed parameterized enum, got type: {}",
+                              (enum_type ? enum_type->getStructName().str() : "null"));
                 }
             }
         }
@@ -9128,13 +9122,20 @@ namespace Cryo::Codegen
 
         // Generate constructors for each variant of the base enum
         const auto &variants = enum_template->variants();
-        std::cout << "[CodegenVisitor] Base enum " << base_name << " has " << variants.size() << " variants" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Base enum {} has {} variants",
+                  base_name,
+                  variants.size());
 
         for (const auto &variant_name : variants)
         {
-            std::cout << "[CodegenVisitor] Processing variant: " << variant_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Processing variant: {}",
+                      variant_name);
             generate_parameterized_enum_variant_constructor(instantiated_name, variant_name, type_args, enum_type);
-            std::cout << "[CodegenVisitor] Completed variant: " << variant_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Completed variant: {}",
+                      variant_name);
         }
     }
 
@@ -9152,15 +9153,20 @@ namespace Cryo::Codegen
 
         if (!enum_template)
         {
-            std::cout << "[CodegenVisitor] Warning: No enum template found for " << base_enum_name << ", using fallback" << std::endl;
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "No enum template found for {}, using fallback",
+                     base_enum_name);
             return info; // Return empty info for unknown enums
         }
 
         // Get the actual variant list from the template
         const auto &variants = enum_template->variants();
 
-        std::cout << "[CodegenVisitor] Analyzing variant '" << variant_name << "' in enum '" << base_enum_name
-                  << "' with " << variants.size() << " total variants" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Analyzing variant '{}' in enum '{}' with {} total variants",
+                  variant_name,
+                  base_enum_name,
+                  variants.size());
 
         // Find the variant index and determine properties
         int variant_index = -1;
@@ -9175,7 +9181,10 @@ namespace Cryo::Codegen
 
         if (variant_index == -1)
         {
-            std::cout << "[CodegenVisitor] Warning: Variant '" << variant_name << "' not found in enum '" << base_enum_name << "'" << std::endl;
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Variant '{}' not found in enum '{}'",
+                     variant_name,
+                     base_enum_name);
             return info;
         }
 
@@ -9206,8 +9215,10 @@ namespace Cryo::Codegen
                 EnumDeclarationNode *enum_decl = template_info->enum_template;
                 const auto &ast_variants = enum_decl->variants();
 
-                std::cout << "[CodegenVisitor] Found AST template for " << base_enum_name
-                          << " with " << ast_variants.size() << " AST variants" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Found AST template for {} with {} AST variants",
+                          base_enum_name,
+                          ast_variants.size());
 
                 // Find the matching variant in the AST
                 if (variant_index < static_cast<int>(ast_variants.size()))
@@ -9254,9 +9265,11 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    std::cout << "[CodegenVisitor] AST-based analysis: variant '" << variant_name
-                              << "' has_data=" << info.has_associated_data
-                              << ", type_count=" << info.associated_types.size() << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "AST-based analysis: variant '{}' has_data={}, type_count={}",
+                              variant_name,
+                              info.has_associated_data,
+                              info.associated_types.size());
 
                     return info; // Return AST-based result
                 }
@@ -9264,7 +9277,8 @@ namespace Cryo::Codegen
         }
 
         // Fallback: if AST access fails, use generic position-based analysis
-        std::cout << "[CodegenVisitor] Template registry access failed, using fallback analysis" << std::endl;
+        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                 "Template registry access failed, using fallback analysis");
         if (variants.size() == 2)
         {
             // For two-variant enums, assume first variant may have data based on type args
@@ -9289,9 +9303,11 @@ namespace Cryo::Codegen
             }
         }
 
-        std::cout << "[CodegenVisitor] Variant analysis: has_data=" << info.has_associated_data
-                  << ", is_success=" << info.is_success_variant
-                  << ", type_count=" << info.associated_types.size() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Variant analysis: has_data={}, is_success={}, type_count={}",
+                  info.has_associated_data,
+                  info.is_success_variant,
+                  info.associated_types.size());
 
         return info;
     }
@@ -9301,14 +9317,16 @@ namespace Cryo::Codegen
                                                                          const std::vector<std::string> &type_args,
                                                                          llvm::Type *enum_type)
     {
-        std::cout << "[CodegenVisitor] Starting variant constructor generation for: " << variant_name
-                  << " of " << instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Starting variant constructor generation for: {} of {}",
+                  variant_name,
+                  instantiated_name);
 
         auto &llvm_context = _context_manager.get_context();
         auto *module = _context_manager.get_module();
         auto &builder = _context_manager.get_builder();
 
-        std::cout << "[CodegenVisitor] Got LLVM context and module" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got LLVM context and module");
 
         std::string constructor_name = instantiated_name + "::" + variant_name;
 
@@ -9401,7 +9419,9 @@ namespace Cryo::Codegen
         // Register the constructor
         register_enum_variant(instantiated_name, variant_name, constructor_func);
 
-        std::cout << "[CodegenVisitor] Generated parameterized enum constructor: " << constructor_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Generated parameterized enum constructor: {}",
+                  constructor_name);
     }
 
     llvm::Function *CodegenVisitor::generate_generic_constructor(const std::string &instantiated_type,
@@ -9409,7 +9429,9 @@ namespace Cryo::Codegen
                                                                  const std::vector<std::string> &type_args,
                                                                  llvm::Type *struct_type)
     {
-        std::cout << "[CodegenVisitor] Generating generic constructor for " << instantiated_type << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Generating generic constructor for {}",
+                  instantiated_type);
 
         auto &context = _context_manager.get_context();
         auto module = _context_manager.get_module();
@@ -9473,7 +9495,9 @@ namespace Cryo::Codegen
         llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr; // T mapped to concrete type (int)
         if (!param_type)
         {
-            std::cout << "[CodegenVisitor] Failed to map constructor parameter type: " << type_args[0] << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "Failed to map constructor parameter type: {}",
+                      type_args[0]);
             return nullptr;
         }
         param_types.push_back(param_type);
@@ -9515,7 +9539,9 @@ namespace Cryo::Codegen
             builder.SetInsertPoint(saved_block);
         }
 
-        std::cout << "[CodegenVisitor] Successfully generated generic constructor: " << func_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Successfully generated generic constructor: {}",
+                  func_name);
         return constructor_func;
     }
 
@@ -9524,7 +9550,9 @@ namespace Cryo::Codegen
                                                   const std::vector<std::string> &type_args,
                                                   llvm::Type *struct_type)
     {
-        std::cout << "[CodegenVisitor] Generating generic methods for " << instantiated_type << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Generating generic methods for {}",
+                  instantiated_type);
 
         auto &context = _context_manager.get_context();
         auto module = _context_manager.get_module();
@@ -9532,7 +9560,8 @@ namespace Cryo::Codegen
 
         if (!module || type_args.empty())
         {
-            std::cout << "[CodegenVisitor] Cannot generate generic methods - missing module or type args" << std::endl;
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Cannot generate generic methods - missing module or type args");
             return;
         }
 
@@ -9548,7 +9577,9 @@ namespace Cryo::Codegen
         // we'll implement a simpler approach: use the base type name to find
         // the template and generate basic method stubs
 
-        std::cout << "[CodegenVisitor] Looking for template struct: " << base_type << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Looking for template struct: {}",
+                  base_type);
 
         // Create type substitution map
         std::unordered_map<std::string, std::string> type_substitutions;
@@ -9557,11 +9588,15 @@ namespace Cryo::Codegen
         if (!type_args.empty())
         {
             type_substitutions["T"] = type_args[0];
-            std::cout << "[CodegenVisitor] Type substitution: T -> " << type_args[0] << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Type substitution: T -> {}",
+                      type_args[0]);
         }
         else
         {
-            std::cout << "[CodegenVisitor] Generic method generation not implemented for: " << base_type << std::endl;
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Generic method generation not implemented for: {}",
+                     base_type);
         }
     }
 
@@ -9570,7 +9605,9 @@ namespace Cryo::Codegen
                                                          llvm::Type *struct_type,
                                                          const std::unordered_map<std::string, std::string> &type_substitutions)
     {
-        std::cout << "[CodegenVisitor] Generating GenericStruct methods for " << instantiated_type << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Generating GenericStruct methods for {}",
+                  instantiated_type);
 
         auto &context = _context_manager.get_context();
         auto module = _context_manager.get_module();
@@ -9584,14 +9621,17 @@ namespace Cryo::Codegen
                                                    llvm::Type *struct_type,
                                                    const std::unordered_map<std::string, std::string> &type_substitutions)
     {
-        std::cout << "[CodegenVisitor] Generating get_value method for " << instantiated_type << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Generating get_value method for {}",
+                  instantiated_type);
 
         auto &context = _context_manager.get_context();
         auto module = _context_manager.get_module();
 
         if (type_args.empty())
         {
-            std::cout << "[CodegenVisitor] No type arguments for get_value method" << std::endl;
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "No type arguments for get_value method");
             return;
         }
 
@@ -9601,7 +9641,9 @@ namespace Cryo::Codegen
         // Check if this method is already generated
         if (_functions.find(method_name) != _functions.end())
         {
-            std::cout << "[CodegenVisitor] Method already exists: " << method_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Method already exists: {}",
+                      method_name);
             return;
         }
 
@@ -9623,7 +9665,9 @@ namespace Cryo::Codegen
         }
         else
         {
-            std::cout << "[CodegenVisitor] Unknown return type: " << return_type << ", defaulting to i32" << std::endl;
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Unknown return type: {}, defaulting to i32",
+                     return_type);
             llvm_return_type = llvm::Type::getInt32Ty(context);
         }
 
@@ -9642,22 +9686,27 @@ namespace Cryo::Codegen
         auto args = method->arg_begin();
         args->setName("this");
 
-        std::cout << "[CodegenVisitor] Created get_value method: " << method_name
-                  << " with return type: " << return_type << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Created get_value method: {} with return type: {}",
+                  method_name,
+                  return_type);
 
         // Generate method body
         generate_get_value_method_body(method, struct_type, type_substitutions);
 
         // Register the method
         _functions[method_name] = method;
-        std::cout << "[CodegenVisitor] Registered get_value method: " << method_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Registered get_value method: {}",
+                  method_name);
     }
 
     void CodegenVisitor::generate_get_value_method_body(llvm::Function *method,
                                                         llvm::Type *struct_type,
                                                         const std::unordered_map<std::string, std::string> &type_substitutions)
     {
-        std::cout << "[CodegenVisitor] Generating get_value method body" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Generating get_value method body");
 
         auto &context = _context_manager.get_context();
         auto &builder = _context_manager.get_builder();
@@ -9696,7 +9745,8 @@ namespace Cryo::Codegen
 
         if (!field_type)
         {
-            std::cout << "[CodegenVisitor] Could not determine field type, using i32" << std::endl;
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Could not determine field type, using i32");
             field_type = llvm::Type::getInt32Ty(context);
         }
 
@@ -9711,12 +9761,15 @@ namespace Cryo::Codegen
             builder.SetInsertPoint(saved_insert_block);
         }
 
-        std::cout << "[CodegenVisitor] Generated get_value method body successfully" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Generated get_value method body successfully");
     }
 
     llvm::Value *CodegenVisitor::generate_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name)
     {
-        std::cout << "[CodegenVisitor] Delegating intrinsic call to Intrinsics module: " << intrinsic_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Delegating intrinsic call to Intrinsics module: {}",
+                  intrinsic_name);
 
         // Generate arguments
         std::vector<llvm::Value *> args;
@@ -9940,7 +9993,9 @@ namespace Cryo::Codegen
                     type_arg.find('<') == std::string::npos)
                 {
                     param_type = _type_mapper->get_integer_type(32, true);
-                    std::cout << "[CodegenVisitor] Using i32 for enum type: " << type_arg << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Using i32 for enum type: {}",
+                              type_arg);
                 }
             }
         }
