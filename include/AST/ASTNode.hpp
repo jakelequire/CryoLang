@@ -97,54 +97,99 @@ namespace Cryo
         Unknown
     };
 
-    inline std::string NodeKindToString(NodeKind kind) {
+    inline std::string NodeKindToString(NodeKind kind)
+    {
         switch (kind)
         {
-        case NodeKind::Expression: return "Expression";
-        case NodeKind::Statement: return "Statement";
-        case NodeKind::Declaration: return "Declaration";
-        case NodeKind::Literal: return "Literal";
-        case NodeKind::Identifier: return "Identifier";
-        case NodeKind::BinaryExpression: return "BinaryExpression";
-        case NodeKind::UnaryExpression: return "UnaryExpression";
-        case NodeKind::TernaryExpression: return "TernaryExpression";
-        case NodeKind::CallExpression: return "CallExpression";
-        case NodeKind::NewExpression: return "NewExpression";
-        case NodeKind::SizeofExpression: return "SizeofExpression";
-        case NodeKind::StructLiteral: return "StructLiteral";
-        case NodeKind::ArrayLiteral: return "ArrayLiteral";
-        case NodeKind::ArrayAccess: return "ArrayAccess";
-        case NodeKind::MemberAccess: return "MemberAccess";
-        case NodeKind::ScopeResolution: return "ScopeResolution";
-        case NodeKind::BlockStatement: return "BlockStatement";
-        case NodeKind::ReturnStatement: return "ReturnStatement";
-        case NodeKind::IfStatement: return "IfStatement";
-        case NodeKind::WhileStatement: return "WhileStatement";
-        case NodeKind::ForStatement: return "ForStatement";
-        case NodeKind::MatchStatement: return "MatchStatement";
-        case NodeKind::SwitchStatement: return "SwitchStatement";
-        case NodeKind::CaseStatement: return "CaseStatement";
-        case NodeKind::BreakStatement: return "BreakStatement";
-        case NodeKind::ContinueStatement: return "ContinueStatement";
-        case NodeKind::ExpressionStatement: return "ExpressionStatement";
-        case NodeKind::DeclarationStatement: return "DeclarationStatement";
-        case NodeKind::VariableDeclaration: return "VariableDeclaration";
-        case NodeKind::FunctionDeclaration: return "FunctionDeclaration";
-        case NodeKind::IntrinsicDeclaration: return "IntrinsicDeclaration";
-        case NodeKind::ImportDeclaration: return "ImportDeclaration";
-        case NodeKind::StructDeclaration: return "StructDeclaration";
-        case NodeKind::ClassDeclaration: return "ClassDeclaration";
-        case NodeKind::EnumDeclaration: return "EnumDeclaration";
-        case NodeKind::TraitDeclaration: return "TraitDeclaration";
-        case NodeKind::TypeAliasDeclaration: return "TypeAliasDeclaration";
-        case NodeKind::ImplementationBlock: return "ImplementationBlock";
-        case NodeKind::ExternBlock: return "ExternBlock";
-        case NodeKind::Program: return "Program";
-        case NodeKind::MatchArm: return "MatchArm";
-        case NodeKind::Pattern: return "Pattern";
-        case NodeKind::EnumPattern: return "EnumPattern";
-        default: return "Unknown";
-    }
+        case NodeKind::Expression:
+            return "Expression";
+        case NodeKind::Statement:
+            return "Statement";
+        case NodeKind::Declaration:
+            return "Declaration";
+        case NodeKind::Literal:
+            return "Literal";
+        case NodeKind::Identifier:
+            return "Identifier";
+        case NodeKind::BinaryExpression:
+            return "BinaryExpression";
+        case NodeKind::UnaryExpression:
+            return "UnaryExpression";
+        case NodeKind::TernaryExpression:
+            return "TernaryExpression";
+        case NodeKind::CallExpression:
+            return "CallExpression";
+        case NodeKind::NewExpression:
+            return "NewExpression";
+        case NodeKind::SizeofExpression:
+            return "SizeofExpression";
+        case NodeKind::StructLiteral:
+            return "StructLiteral";
+        case NodeKind::ArrayLiteral:
+            return "ArrayLiteral";
+        case NodeKind::ArrayAccess:
+            return "ArrayAccess";
+        case NodeKind::MemberAccess:
+            return "MemberAccess";
+        case NodeKind::ScopeResolution:
+            return "ScopeResolution";
+        case NodeKind::BlockStatement:
+            return "BlockStatement";
+        case NodeKind::ReturnStatement:
+            return "ReturnStatement";
+        case NodeKind::IfStatement:
+            return "IfStatement";
+        case NodeKind::WhileStatement:
+            return "WhileStatement";
+        case NodeKind::ForStatement:
+            return "ForStatement";
+        case NodeKind::MatchStatement:
+            return "MatchStatement";
+        case NodeKind::SwitchStatement:
+            return "SwitchStatement";
+        case NodeKind::CaseStatement:
+            return "CaseStatement";
+        case NodeKind::BreakStatement:
+            return "BreakStatement";
+        case NodeKind::ContinueStatement:
+            return "ContinueStatement";
+        case NodeKind::ExpressionStatement:
+            return "ExpressionStatement";
+        case NodeKind::DeclarationStatement:
+            return "DeclarationStatement";
+        case NodeKind::VariableDeclaration:
+            return "VariableDeclaration";
+        case NodeKind::FunctionDeclaration:
+            return "FunctionDeclaration";
+        case NodeKind::IntrinsicDeclaration:
+            return "IntrinsicDeclaration";
+        case NodeKind::ImportDeclaration:
+            return "ImportDeclaration";
+        case NodeKind::StructDeclaration:
+            return "StructDeclaration";
+        case NodeKind::ClassDeclaration:
+            return "ClassDeclaration";
+        case NodeKind::EnumDeclaration:
+            return "EnumDeclaration";
+        case NodeKind::TraitDeclaration:
+            return "TraitDeclaration";
+        case NodeKind::TypeAliasDeclaration:
+            return "TypeAliasDeclaration";
+        case NodeKind::ImplementationBlock:
+            return "ImplementationBlock";
+        case NodeKind::ExternBlock:
+            return "ExternBlock";
+        case NodeKind::Program:
+            return "Program";
+        case NodeKind::MatchArm:
+            return "MatchArm";
+        case NodeKind::Pattern:
+            return "Pattern";
+        case NodeKind::EnumPattern:
+            return "EnumPattern";
+        default:
+            return "Unknown";
+        }
     }
 
     class ASTNode
@@ -182,13 +227,16 @@ namespace Cryo
 
         // DEPRECATED: String-based type operations - REMOVE THESE
         [[deprecated("Use set_resolved_type() instead - string operations being eliminated")]]
-        void set_type(const std::string &type) { 
+        void set_type(const std::string &type)
+        {
             // This should not be used - parser must resolve to Type* directly
         }
-        
+
         [[deprecated("Use get_resolved_type() instead - string operations being eliminated")]]
-        std::optional<std::string> type() const { 
-            if (_resolved_type) {
+        std::optional<std::string> type() const
+        {
+            if (_resolved_type)
+            {
                 return _resolved_type->to_string();
             }
             return std::nullopt;
@@ -790,37 +838,36 @@ namespace Cryo
         [[deprecated("Use get_resolved_return_type() instead - string operations being eliminated")]]
         const std::string return_type_annotation() const
         {
-            if (_resolved_return_type) {
+            if (_resolved_return_type)
+            {
                 // Apply defensive programming to avoid virtual function crashes
                 std::string type_str = "CORRUPTED_TYPE";
                 std::string type_name = "CORRUPTED_TYPE";
-                
-                try {
+
+                try
+                {
                     type_str = _resolved_return_type->to_string();
                     type_name = _resolved_return_type->name();
-                } catch (...) {
-                    std::cerr << "[ERROR] return_type_annotation: virtual function crash detected, using safe defaults" << std::endl;
+                }
+                catch (...)
+                {
                     type_str = "void";
                     type_name = "void";
                 }
-                
-                std::cerr << "[DEBUG] return_type_annotation: type_str='" << type_str << "', type_name='" << type_name << "'" << std::endl;
-                
+
                 // Safety check: if to_string() returns empty, fall back to the name
-                if (type_str.empty() && !type_name.empty()) {
-                    std::cerr << "[DEBUG] return_type_annotation: using type name '" << type_name << "'" << std::endl;
+                if (type_str.empty() && !type_name.empty())
+                {
                     return type_name;
                 }
                 // If both are empty, this means the type resolution failed during parsing
                 // Return a placeholder that the TypeChecker can properly resolve
-                if (type_str.empty()) {
-                    std::cerr << "[DEBUG] return_type_annotation: both empty, returning UNRESOLVED_TYPE" << std::endl;
+                if (type_str.empty())
+                {
                     return "UNRESOLVED_TYPE";
                 }
-                std::cerr << "[DEBUG] return_type_annotation: returning type_str '" << type_str << "'" << std::endl;
                 return type_str;
             }
-            std::cerr << "[DEBUG] return_type_annotation: no resolved type, returning void" << std::endl;
             return "void";
         }
         size_t parameter_count() const { return _parameters.size(); }
@@ -1271,14 +1318,14 @@ namespace Cryo
     private:
         std::string _alias_name;
         std::vector<std::string> _generic_params; // Generic parameters like <T, U>
-        
+
         // Core type system - NO STRING OPERATIONS
         Cryo::Type *_resolved_target_type = nullptr; // Primary target type storage
 
     public:
-        TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name, 
-                                Cryo::Type *target_type = nullptr, 
-                                std::vector<std::string> generic_params = {})
+        TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name,
+                                 Cryo::Type *target_type = nullptr,
+                                 std::vector<std::string> generic_params = {})
             : DeclarationNode(NodeKind::TypeAliasDeclaration, loc),
               _alias_name(std::move(alias_name)), _resolved_target_type(target_type),
               _generic_params(std::move(generic_params)) {}
@@ -1294,12 +1341,14 @@ namespace Cryo
 
         // DEPRECATED: String-based type operations - REMOVE THESE
         [[deprecated("Use get_resolved_target_type() instead - string operations being eliminated")]]
-        const std::string target_type() const { 
+        const std::string target_type() const
+        {
             return _resolved_target_type ? _resolved_target_type->to_string() : "unknown";
         }
-        
+
         [[deprecated("Use set_resolved_target_type() instead - string operations being eliminated")]]
-        void set_type(const std::string &type) { 
+        void set_type(const std::string &type)
+        {
             // This should not be used - parser must resolve to Type* directly
         }
 

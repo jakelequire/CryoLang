@@ -2,6 +2,7 @@
 #include "Parser/Parser.hpp"
 #include "Lexer/lexer.hpp"
 #include "Utils/file.hpp"
+#include "Utils/Logger.hpp"
 #include "AST/ASTContext.hpp"
 #include "AST/Type.hpp"
 
@@ -33,29 +34,30 @@ namespace Cryo
         std::string import_path = import_node.path();
         std::string resolved_path = resolve_import_path(import_path, import_node.import_type());
 
-        std::cout << "[DEBUG] ModuleLoader: Loading import '" << import_path
-                  << "' -> '" << resolved_path << "'" << std::endl;
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Loading import '{}' -> '{}'", import_path, resolved_path);
 
         // Check for specific vs wildcard import
         if (import_node.is_specific_import())
         {
-            std::cout << "[DEBUG] ModuleLoader: Processing specific import with symbols: ";
+            std::string symbols_list;
             for (const auto &symbol : import_node.specific_imports())
             {
-                std::cout << symbol << " ";
+                if (!symbols_list.empty())
+                    symbols_list += " ";
+                symbols_list += symbol;
             }
-            std::cout << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing specific import with symbols: {}", symbols_list);
         }
         else
         {
-            std::cout << "[DEBUG] ModuleLoader: Processing wildcard import" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing wildcard import");
         }
 
         // Check if already loaded
         auto cached = _loaded_modules.find(resolved_path);
         if (cached != _loaded_modules.end())
         {
-            std::cout << "[DEBUG] ModuleLoader: Using cached module" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using cached module");
 
             // Create a copy of the cached result to return
             ImportResult cached_result;
@@ -103,14 +105,13 @@ namespace Cryo
             // Otherwise, treat it as symbol imports
             if (import_node.specific_imports().size() == 1)
             {
-                std::cout << "[DEBUG] ModuleLoader: Treating single specific import as namespace alias: "
-                          << import_node.specific_imports()[0] << std::endl;
+                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Treating single specific import as namespace alias: {}", import_node.specific_imports()[0]);
                 // For namespace alias, we keep all symbols but set the alias
                 result.namespace_alias = import_node.specific_imports()[0];
             }
             else
             {
-                std::cout << "[DEBUG] ModuleLoader: Treating multiple specific imports as symbol imports" << std::endl;
+                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Treating multiple specific imports as symbol imports");
                 result = filter_specific_imports(std::move(result), import_node.specific_imports());
             }
         }
@@ -172,7 +173,7 @@ namespace Cryo
 
         try
         {
-            std::cout << "[DEBUG] ModuleLoader: Reading file " << file_path << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Reading file {}", file_path);
 
             // Create a File object from the path
             auto file = make_file_from_path(file_path);
@@ -183,19 +184,19 @@ namespace Cryo
                 return result;
             }
 
-            std::cout << "[DEBUG] ModuleLoader: Created File object for " << file_path << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created File object for {}", file_path);
 
             // Create lexer with the file
             auto lexer = std::make_unique<Lexer>(std::move(file));
-            std::cout << "[DEBUG] ModuleLoader: Created Lexer" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created Lexer");
 
             // Use the main ASTContext instead of creating a new one
             // This ensures all types use the same TypeContext and prevents corruption
-            std::cout << "[DEBUG] ModuleLoader: Using main ASTContext for type consistency" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using main ASTContext for type consistency");
 
             // Create parser with the lexer and main context
             Parser parser(std::move(lexer), _ast_context);
-            std::cout << "[DEBUG] ModuleLoader: Created Parser" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created Parser");
 
             // Parse the program
             auto ast = parser.parse_program();
@@ -207,7 +208,7 @@ namespace Cryo
                 return result;
             }
 
-            std::cout << "[DEBUG] ModuleLoader: Successfully parsed " << import_path << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Successfully parsed {}", import_path);
 
             // Extract module name from parser's namespace information
             result.module_name = parser.current_namespace();
@@ -218,7 +219,7 @@ namespace Cryo
                 result.module_name = path.stem().string();
             }
 
-            std::cout << "[DEBUG] ModuleLoader: Detected module namespace: " << result.module_name << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Detected module namespace: {}", result.module_name);
 
             // Do ALL processing on the original AST and keep it alive
             // 1. Register generic templates from the original AST
@@ -226,17 +227,17 @@ namespace Cryo
 
             // 2. Extract symbols from the original AST
             result.exported_symbols = extract_exported_symbols(*ast);
-            std::cout << "[DEBUG] ModuleLoader: Found " << result.exported_symbols.size() << " exported symbols" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Found {} exported symbols", result.exported_symbols.size());
 
             // 3. Create symbol map from the original AST
             result.symbol_map = create_symbol_map(*ast, result.module_name);
-            std::cout << "[DEBUG] ModuleLoader: Created symbol map with " << result.symbol_map.size() << " symbols" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created symbol map with {} symbols", result.symbol_map.size());
 
             // Keep the AST alive for template access by storing it
             // Note: Template registry has raw pointers to nodes in this AST
-            std::cout << "[DEBUG] ModuleLoader: Storing AST to keep template nodes alive" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Storing AST to keep template nodes alive");
             _imported_asts[result.module_name] = std::move(ast); // Move is necessary to transfer ownership
-            std::cout << "[DEBUG] ModuleLoader: Stored AST successfully. Map now has " << _imported_asts.size() << " entries" << std::endl;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Stored AST successfully. Map now has {} entries", _imported_asts.size());
 
             result.success = true;
             return result;
@@ -337,11 +338,11 @@ namespace Cryo
                         if (parameterized_enum)
                         {
                             enum_type = parameterized_enum.get();
-                            std::cout << "[DEBUG] ModuleLoader: Found parameterized enum template for " << enum_decl->name() << std::endl;
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Found parameterized enum template for {}", enum_decl->name());
                         }
                         else
                         {
-                            std::cout << "[DEBUG] ModuleLoader: No parameterized enum template found for " << enum_decl->name() << std::endl;
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: No parameterized enum template found for {}", enum_decl->name());
                         }
                     }
                     else
@@ -417,7 +418,7 @@ namespace Cryo
 
     ModuleLoader::ImportResult ModuleLoader::filter_specific_imports(ImportResult result, const std::vector<std::string> &specific_imports)
     {
-        std::cout << "[DEBUG] ModuleLoader: Filtering imports for specific symbols" << std::endl;
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Filtering imports for specific symbols");
 
         if (!result.success)
         {
@@ -436,14 +437,14 @@ namespace Cryo
             {
                 filtered_symbol_map[import_name] = symbol_it->second;
                 filtered_exported_symbols.push_back(import_name);
-                std::cout << "[DEBUG] ModuleLoader: Found and included symbol: " << import_name << std::endl;
+                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Found and included symbol: {}", import_name);
             }
             else
             {
                 // Symbol not found - this should be a compilation error
                 result.success = false;
                 result.error_message = "Symbol '" + import_name + "' not found in module '" + result.module_name + "'";
-                std::cout << "[DEBUG] ModuleLoader: Error - Symbol not found: " << import_name << std::endl;
+                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Error - Symbol not found: {}", import_name);
                 return result;
             }
         }
@@ -452,7 +453,7 @@ namespace Cryo
         result.symbol_map = std::move(filtered_symbol_map);
         result.exported_symbols = std::move(filtered_exported_symbols);
 
-        std::cout << "[DEBUG] ModuleLoader: Filtered to " << result.symbol_map.size() << " symbols" << std::endl;
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Filtered to {} symbols", result.symbol_map.size());
         return result;
     }
 
@@ -464,7 +465,7 @@ namespace Cryo
 
     void ModuleLoader::register_templates_from_ast(const ProgramNode &ast, const std::string &module_name)
     {
-        std::cout << "[DEBUG] ModuleLoader: Registering templates from module: " << module_name << std::endl;
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registering templates from module: {}", module_name);
 
         // Process all top-level declarations and register generic templates
         for (const auto &statement : ast.statements())
@@ -482,8 +483,7 @@ namespace Cryo
                             module_name,        // module_namespace
                             "imported_module"   // source_file (placeholder)
                         );
-                        std::cout << "[DEBUG] ModuleLoader: Registered generic class template: "
-                                  << class_decl->name() << " from module: " << module_name << std::endl;
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic class template: {} from module: {}", class_decl->name(), module_name);
                     }
                 }
                 else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
@@ -491,17 +491,16 @@ namespace Cryo
                     // Register generic enum templates
                     if (!enum_decl->generic_parameters().empty())
                     {
-                        std::cout << "[DEBUG] ModuleLoader: Before registration - enum " << enum_decl->name()
-                                  << " has " << enum_decl->generic_parameters().size() << " generic parameters" << std::endl;
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Before registration - enum {} has {} generic parameters", enum_decl->name(), enum_decl->generic_parameters().size());
 
                         // Debug first parameter
                         if (!enum_decl->generic_parameters().empty())
                         {
                             auto first_param = enum_decl->generic_parameters()[0].get();
-                            std::cout << "[DEBUG] ModuleLoader: First parameter pointer: " << first_param << std::endl;
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: First parameter pointer: {}", (void *)first_param);
                             if (first_param)
                             {
-                                std::cout << "[DEBUG] ModuleLoader: First parameter name: " << first_param->name() << std::endl;
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: First parameter name: {}", first_param->name());
                             }
                         }
 
@@ -511,8 +510,7 @@ namespace Cryo
                             module_name,       // module_namespace
                             "imported_module"  // source_file (placeholder)
                         );
-                        std::cout << "[DEBUG] ModuleLoader: Registered generic enum template: "
-                                  << enum_decl->name() << " from module: " << module_name << std::endl;
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic enum template: {} from module: {}", enum_decl->name(), module_name);
                     }
                 }
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
@@ -526,8 +524,7 @@ namespace Cryo
                             module_name,         // module_namespace
                             "imported_module"    // source_file (placeholder)
                         );
-                        std::cout << "[DEBUG] ModuleLoader: Registered generic struct template: "
-                                  << struct_decl->name() << " from module: " << module_name << std::endl;
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic struct template: {} from module: {}", struct_decl->name(), module_name);
                     }
                 }
                 else if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
@@ -541,8 +538,7 @@ namespace Cryo
                             module_name,       // module_namespace
                             "imported_module"  // source_file (placeholder)
                         );
-                        std::cout << "[DEBUG] ModuleLoader: Registered generic function template: "
-                                  << func_decl->name() << " from module: " << module_name << std::endl;
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic function template: {} from module: {}", func_decl->name(), module_name);
                     }
                 }
                 else if (auto trait_decl = dynamic_cast<TraitDeclarationNode *>(decl))
@@ -556,14 +552,13 @@ namespace Cryo
                             module_name,        // module_namespace
                             "imported_module"   // source_file (placeholder)
                         );
-                        std::cout << "[DEBUG] ModuleLoader: Registered generic trait template: "
-                                  << trait_decl->name() << " from module: " << module_name << std::endl;
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic trait template: {} from module: {}", trait_decl->name(), module_name);
                     }
                 }
             }
         }
 
-        std::cout << "[DEBUG] ModuleLoader: Finished registering templates from module: " << module_name << std::endl;
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Finished registering templates from module: {}", module_name);
     }
 
     const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &ModuleLoader::get_imported_asts() const

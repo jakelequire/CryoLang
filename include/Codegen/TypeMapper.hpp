@@ -361,7 +361,6 @@ namespace Cryo::Codegen
          */
         void clear_errors()
         {
-            std::cout << "[DEBUG] TypeMapper: Clearing errors (was: " << _has_errors << ")" << std::endl;
             _has_errors = false;
             _last_error.clear();
         }
