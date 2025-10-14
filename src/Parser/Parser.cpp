@@ -1,4 +1,5 @@
 #include "Parser/Parser.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 #include <cctype>
 
@@ -27,7 +28,7 @@ namespace Cryo
         else
         {
             // Fallback to old error system
-            std::cerr << "Parse Error: " << message << std::endl;
+            LOG_ERROR(LogComponent::PARSER, "Parse Error: {}", message);
         }
     }
 
@@ -40,7 +41,7 @@ namespace Cryo
         else
         {
             // Fallback to old warning system
-            std::cerr << "Parse Warning: " << message << std::endl;
+            LOG_WARN(LogComponent::PARSER, "Parse Warning: {}", message);
         }
     }
 
@@ -3009,8 +3010,7 @@ namespace Cryo
         if (enum_decl->generic_parameters().empty())
         {
             _context.types().get_enum_type(enum_name, variant_names, is_simple_enum);
-            std::cout << "[Parser] Registered enum type: " << enum_name
-                      << " (simple=" << is_simple_enum << ", variants=" << variant_names.size() << ")" << std::endl;
+            LOG_DEBUG(LogComponent::PARSER, "Registered enum type: {} (simple={}, variants={})", enum_name, is_simple_enum, variant_names.size());
         }
 
         return enum_decl;
@@ -3807,12 +3807,10 @@ namespace Cryo
         if (!parsed_type)
         {
             // Fallback to string-based parsing if token parsing fails
-            std::cout << "[DEBUG] Parser: Token-based parsing failed for '" << type_string
-                      << "' (collected " << collected_tokens.size() << " tokens), falling back to string parsing" << std::endl;
+            LOG_DEBUG(LogComponent::PARSER, "Token-based parsing failed for '{}' (collected {} tokens), falling back to string parsing", type_string, collected_tokens.size());
             if (!collected_tokens.empty())
             {
-                std::cout << "[DEBUG] First token: " << static_cast<int>(collected_tokens[0].kind())
-                          << " (" << std::string(collected_tokens[0].text()) << ")" << std::endl;
+                LOG_DEBUG(LogComponent::PARSER, "First token: {} ({})", static_cast<int>(collected_tokens[0].kind()), std::string(collected_tokens[0].text()));
             }
 
             // Trim whitespace
@@ -3882,7 +3880,7 @@ namespace Cryo
         // For unresolved types that might be enums or structs defined later in the file,
         // we'll return an unknown type and let the TypeChecker resolve it properly
         // when all types are available during type checking phase
-        std::cerr << "[Parser] DEBUG: Could not resolve '" << type_str << "' during parsing, deferring to type checker" << std::endl;
+        LOG_DEBUG(LogComponent::PARSER, "Could not resolve '{}' during parsing, deferring to type checker", type_str);
 
         // Return unknown type - the TypeChecker will attempt to resolve it again during type checking
         // when all enum and struct declarations have been processed
