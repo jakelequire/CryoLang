@@ -2,6 +2,7 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/TargetConfig.hpp"
 #include "AST/ASTNode.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 #include <memory>
 #include <system_error>
@@ -23,10 +24,10 @@ namespace Cryo::Codegen
         ASTContext &ast_context,
         SymbolTable &symbol_table,
         const std::string &namespace_name,
-        Cryo::DiagnosticManager* gdm) : _ast_context(ast_context), _symbol_table(symbol_table), _gdm(gdm),
-                                     _has_errors(false), _debug_enabled(false), _stdlib_compilation_mode(false), _optimization_level(2),
-                                     _functions_generated(0), _types_generated(0), _globals_generated(0),
-                                     _module_name(namespace_name.empty() ? "cryo_program" : namespace_name)
+        Cryo::DiagnosticManager *gdm) : _ast_context(ast_context), _symbol_table(symbol_table), _gdm(gdm),
+                                        _has_errors(false), _debug_enabled(false), _stdlib_compilation_mode(false), _optimization_level(2),
+                                        _functions_generated(0), _types_generated(0), _globals_generated(0),
+                                        _module_name(namespace_name.empty() ? "cryo_program" : namespace_name)
     {
         // Store the target config
         _target_config = std::move(target_config);
@@ -70,7 +71,7 @@ namespace Cryo::Codegen
                     *_context_manager,
                     _symbol_table,
                     _gdm);
-                    
+
                 // Apply stdlib compilation mode to the newly created visitor
                 if (_stdlib_compilation_mode)
                 {
@@ -125,7 +126,7 @@ namespace Cryo::Codegen
                 *_context_manager,
                 _symbol_table,
                 _gdm);
-                
+
             // Apply stdlib compilation mode to the newly created visitor
             if (_stdlib_compilation_mode)
             {
@@ -207,7 +208,7 @@ namespace Cryo::Codegen
         return true;
     }
 
-    void CodeGenerator::set_source_info(const std::string& source_file, const std::string& namespace_context)
+    void CodeGenerator::set_source_info(const std::string &source_file, const std::string &namespace_context)
     {
         if (_visitor)
         {
@@ -226,70 +227,75 @@ namespace Cryo::Codegen
 
     void CodeGenerator::refresh_module_name()
     {
-        if (!_module) 
+        if (!_module)
         {
-            std::cout << "[DEBUG] refresh_module_name: No module available" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "refresh_module_name: No module available");
             return;
         }
-        
-        if (_module_name.empty()) 
+
+        if (_module_name.empty())
         {
-            std::cout << "[DEBUG] refresh_module_name: No stored module name" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "refresh_module_name: No stored module name");
             return;
         }
-        
-        try {
+
+        try
+        {
             // Verify module is in a valid state first
-            if (!_module->getName().data()) 
+            if (!_module->getName().data())
             {
-                std::cout << "[DEBUG] refresh_module_name: Module name data is null, skipping refresh" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "refresh_module_name: Module name data is null, skipping refresh");
                 return;
             }
-            
+
             // Check if module name is corrupted
             std::string current_name = _module->getName().str();
-            if (current_name.empty() || current_name != _module_name) 
+            if (current_name.empty() || current_name != _module_name)
             {
-                std::cout << "[DEBUG] Refreshing module name from '" << current_name << "' to '" << _module_name << "'" << std::endl;
-                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Refreshing module name from '{}' to '{}'", current_name, _module_name);
+
                 // For modules with complex import graphs or large symbol tables, skip refresh to prevent corruption
-                if (_module_name.find("Intrinsics") != std::string::npos || 
+                if (_module_name.find("Intrinsics") != std::string::npos ||
                     _module_name.find("stdio") != std::string::npos ||
-                    current_name.empty()) 
+                    current_name.empty())
                 {
-                    std::cout << "[DEBUG] Skipping refresh for complex module '" << _module_name << "' to prevent memory corruption" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping refresh for complex module '{}' to prevent memory corruption", _module_name);
                     return;
                 }
-                
+
                 _module->setModuleIdentifier(_module_name);
-                
+
                 // Verify it worked
                 std::string new_name = _module->getName().str();
-                std::cout << "[DEBUG] Module name after refresh: '" << new_name << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Module name after refresh: '{}'", new_name);
             }
         }
-        catch (const std::bad_alloc& e) {
-            std::cout << "[WARNING] Memory allocation failed during module name refresh - skipping to prevent crash" << std::endl;
+        catch (const std::bad_alloc &e)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "Memory allocation failed during module name refresh - skipping to prevent crash");
             // Force early return to prevent further operations on potentially corrupted module
             return;
         }
-        catch (const std::exception& e) {
-            std::cout << "[WARNING] Failed to refresh module name: " << e.what() << " - attempting to continue" << std::endl;
+        catch (const std::exception &e)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to refresh module name: {} - attempting to continue", e.what());
         }
-        catch (...) {
-            std::cout << "[WARNING] Unknown error during module name refresh - attempting to continue" << std::endl;
+        catch (...)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "Unknown error during module name refresh - attempting to continue");
         }
     }
 
-    bool CodeGenerator::emit_llvm_ir(const std::string& output_path)
+    bool CodeGenerator::emit_llvm_ir(const std::string &output_path)
     {
         // MULTI-MODULE FIX: Use main module for emission, not active module
-        llvm::Module* target_module = _context_manager ? _context_manager->get_main_module() : nullptr;
-        if (!target_module) {
+        llvm::Module *target_module = _context_manager ? _context_manager->get_main_module() : nullptr;
+        if (!target_module)
+        {
             // Fallback to active module if no main module is set
             target_module = _module;
         }
-        
+
         if (!target_module)
         {
             report_error("No LLVM module available for IR emission");
@@ -300,11 +306,11 @@ namespace Cryo::Codegen
         {
             // Refresh module name before emission
             refresh_module_name();
-            
+
             // Generate binary bytecode (.bc) file
             std::error_code EC;
             llvm::raw_fd_ostream bc_output_stream(output_path, EC, llvm::sys::fs::OF_None);
-            
+
             if (EC)
             {
                 report_error("Failed to open file for bytecode emission: " + EC.message());
@@ -313,20 +319,20 @@ namespace Cryo::Codegen
 
             // Write binary bytecode
             llvm::WriteBitcodeToFile(*target_module, bc_output_stream);
-            
+
             bc_output_stream.flush();
-            
+
             if (bc_output_stream.has_error())
             {
                 report_error("Error during bytecode write");
                 return false;
             }
-            
+
             bc_output_stream.close();
 
             // Generate human-readable LLVM IR (.ll) file
             std::string ll_output_path = output_path;
-            
+
             // Replace .bc extension with .ll
             size_t pos = ll_output_path.find_last_of('.');
             if (pos != std::string::npos && ll_output_path.substr(pos) == ".bc")
@@ -341,7 +347,7 @@ namespace Cryo::Codegen
 
             std::error_code ll_EC;
             llvm::raw_fd_ostream ll_output_stream(ll_output_path, ll_EC, llvm::sys::fs::OF_None);
-            
+
             if (ll_EC)
             {
                 report_error("Failed to open file for LLVM IR emission: " + ll_EC.message());
@@ -350,25 +356,25 @@ namespace Cryo::Codegen
 
             // Write human-readable LLVM IR
             target_module->print(ll_output_stream, nullptr);
-            
+
             ll_output_stream.flush();
-            
+
             if (ll_output_stream.has_error())
             {
                 report_error("Error during LLVM IR write");
                 return false;
             }
-            
+
             ll_output_stream.close();
 
             return true;
         }
-        catch (const std::bad_alloc& e)
+        catch (const std::bad_alloc &e)
         {
             report_error("Failed to emit LLVM IR: memory allocation failed");
             return false;
         }
-        catch (const std::exception& e)
+        catch (const std::exception &e)
         {
             report_error("Failed to emit LLVM IR: " + std::string(e.what()));
             return false;
@@ -392,8 +398,8 @@ namespace Cryo::Codegen
         return std::make_unique<CodeGenerator>(std::move(target_config), ast_context, symbol_table, namespace_name, nullptr);
     }
 
-    std::unique_ptr<CodeGenerator> create_default_codegen(ASTContext &ast_context, SymbolTable &symbol_table, 
-                                                        const std::string &namespace_name, DiagnosticManager* gdm)
+    std::unique_ptr<CodeGenerator> create_default_codegen(ASTContext &ast_context, SymbolTable &symbol_table,
+                                                          const std::string &namespace_name, DiagnosticManager *gdm)
     {
         // Create a default target config
         auto target_config = std::make_unique<TargetConfig>();

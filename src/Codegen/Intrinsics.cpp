@@ -2,6 +2,7 @@
 #include "Codegen/LLVMContext.hpp"
 #include "AST/ASTNode.hpp"
 #include "GDM/GDM.hpp"
+#include "Utils/Logger.hpp"
 
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Constants.h>
@@ -13,16 +14,16 @@
 
 namespace Cryo::Codegen
 {
-    Intrinsics::Intrinsics(LLVMContextManager& context_manager, Cryo::DiagnosticManager* gdm)
+    Intrinsics::Intrinsics(LLVMContextManager &context_manager, Cryo::DiagnosticManager *gdm)
         : _context_manager(context_manager), _gdm(gdm), _has_errors(false)
     {
     }
 
-    llvm::Value* Intrinsics::generate_intrinsic_call(Cryo::CallExpressionNode* node,
-                                                    const std::string& intrinsic_name,
-                                                    const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_intrinsic_call(Cryo::CallExpressionNode *node,
+                                                     const std::string &intrinsic_name,
+                                                     const std::vector<llvm::Value *> &args)
     {
-        std::cout << "[Intrinsics] Generating intrinsic call: " << intrinsic_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating intrinsic call: {}", intrinsic_name);
 
         // Memory management intrinsics
         if (intrinsic_name == "__malloc__")
@@ -191,7 +192,7 @@ namespace Cryo::Codegen
     // Memory Management Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_malloc(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_malloc(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -199,27 +200,27 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
-        auto* module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
 
         // Create malloc function type: void* malloc(size_t size)
-        llvm::Type* size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::FunctionType* malloc_type = llvm::FunctionType::get(
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *malloc_type = llvm::FunctionType::get(
             void_ptr_type, {size_t_type}, false);
 
         // Get or create malloc function
-        llvm::Function* malloc_func = get_or_create_libc_function("malloc", malloc_type);
+        llvm::Function *malloc_func = get_or_create_libc_function("malloc", malloc_type);
 
         // Ensure size argument is size_t (i64)
-        llvm::Value* size_arg = ensure_type(args[0], size_t_type, "malloc.size");
+        llvm::Value *size_arg = ensure_type(args[0], size_t_type, "malloc.size");
 
         // Call malloc
         return builder.CreateCall(malloc_func, {size_arg}, "malloc.result");
     }
 
-    llvm::Value* Intrinsics::generate_free(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_free(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -227,20 +228,20 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create free function type: void free(void* ptr)
-        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type* void_type = llvm::Type::getVoidTy(context);
-        llvm::FunctionType* free_type = llvm::FunctionType::get(
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *void_type = llvm::Type::getVoidTy(context);
+        llvm::FunctionType *free_type = llvm::FunctionType::get(
             void_type, {void_ptr_type}, false);
 
         // Get or create free function
-        llvm::Function* free_func = get_or_create_libc_function("free", free_type);
+        llvm::Function *free_func = get_or_create_libc_function("free", free_type);
 
         // Ensure ptr argument is void*
-        llvm::Value* ptr_arg = args[0];
+        llvm::Value *ptr_arg = args[0];
         if (!ptr_arg->getType()->isPointerTy())
         {
             report_error("__free__ argument must be a pointer");
@@ -254,7 +255,7 @@ namespace Cryo::Codegen
         return llvm::Constant::getNullValue(llvm::Type::getInt32Ty(context));
     }
 
-    llvm::Value* Intrinsics::generate_realloc(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_realloc(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -262,21 +263,21 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create realloc function type: void* realloc(void* ptr, size_t size)
-        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type* size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::FunctionType* realloc_type = llvm::FunctionType::get(
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::FunctionType *realloc_type = llvm::FunctionType::get(
             void_ptr_type, {void_ptr_type, size_t_type}, false);
 
         // Get or create realloc function
-        llvm::Function* realloc_func = get_or_create_libc_function("realloc", realloc_type);
+        llvm::Function *realloc_func = get_or_create_libc_function("realloc", realloc_type);
 
         // Prepare arguments
-        llvm::Value* ptr_arg = args[0];
-        llvm::Value* size_arg = ensure_type(args[1], size_t_type, "realloc.size");
+        llvm::Value *ptr_arg = args[0];
+        llvm::Value *size_arg = ensure_type(args[1], size_t_type, "realloc.size");
 
         if (!ptr_arg->getType()->isPointerTy())
         {
@@ -288,7 +289,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(realloc_func, {ptr_arg, size_arg}, "realloc.result");
     }
 
-    llvm::Value* Intrinsics::generate_calloc(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_calloc(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -296,27 +297,27 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create calloc function type: void* calloc(size_t num, size_t size)
-        llvm::Type* size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::FunctionType* calloc_type = llvm::FunctionType::get(
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *calloc_type = llvm::FunctionType::get(
             void_ptr_type, {size_t_type, size_t_type}, false);
 
         // Get or create calloc function
-        llvm::Function* calloc_func = get_or_create_libc_function("calloc", calloc_type);
+        llvm::Function *calloc_func = get_or_create_libc_function("calloc", calloc_type);
 
         // Prepare arguments
-        llvm::Value* num_arg = ensure_type(args[0], size_t_type, "calloc.num");
-        llvm::Value* size_arg = ensure_type(args[1], size_t_type, "calloc.size");
+        llvm::Value *num_arg = ensure_type(args[0], size_t_type, "calloc.num");
+        llvm::Value *size_arg = ensure_type(args[1], size_t_type, "calloc.size");
 
         // Call calloc
         return builder.CreateCall(calloc_func, {num_arg, size_arg}, "calloc.result");
     }
 
-    llvm::Value* Intrinsics::generate_mmap(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_mmap(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -324,27 +325,27 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // For simplicity, we'll implement mmap as a malloc call
         // In a real implementation, you'd want actual mmap system call
-        llvm::Type* size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::FunctionType* malloc_type = llvm::FunctionType::get(
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *malloc_type = llvm::FunctionType::get(
             void_ptr_type, {size_t_type}, false);
 
         // Get or create malloc function
-        llvm::Function* malloc_func = get_or_create_libc_function("malloc", malloc_type);
+        llvm::Function *malloc_func = get_or_create_libc_function("malloc", malloc_type);
 
         // Ensure size argument is size_t (i64)
-        llvm::Value* size_arg = ensure_type(args[0], size_t_type, "mmap.size");
+        llvm::Value *size_arg = ensure_type(args[0], size_t_type, "mmap.size");
 
         // Call malloc (simplified mmap implementation)
         return builder.CreateCall(malloc_func, {size_arg}, "mmap.result");
     }
 
-    llvm::Value* Intrinsics::generate_munmap(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_munmap(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -352,21 +353,21 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // For simplicity, we'll implement munmap as a free call
         // In a real implementation, you'd want actual munmap system call
-        llvm::Type* void_type = llvm::Type::getVoidTy(context);
-        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::FunctionType* free_type = llvm::FunctionType::get(
+        llvm::Type *void_type = llvm::Type::getVoidTy(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *free_type = llvm::FunctionType::get(
             void_type, {void_ptr_type}, false);
 
         // Get or create free function
-        llvm::Function* free_func = get_or_create_libc_function("free", free_type);
+        llvm::Function *free_func = get_or_create_libc_function("free", free_type);
 
         // Only use the pointer argument (ignore size for simplified implementation)
-        llvm::Value* ptr_arg = args[0];
+        llvm::Value *ptr_arg = args[0];
         if (!ptr_arg->getType()->isPointerTy())
         {
             report_error("__munmap__ first argument must be a pointer");
@@ -375,7 +376,7 @@ namespace Cryo::Codegen
 
         // Call free (simplified munmap implementation)
         builder.CreateCall(free_func, {ptr_arg});
-        
+
         // munmap typically returns int (0 on success, -1 on error)
         // For simplicity, always return 0
         return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0);
@@ -385,7 +386,7 @@ namespace Cryo::Codegen
     // Memory Operations Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_memcpy(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_memcpy(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
         {
@@ -393,22 +394,22 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Use LLVM's builtin memcpy intrinsic
-        llvm::Function* memcpy_intrinsic = llvm::Intrinsic::getDeclaration(
-            _context_manager.get_module(), 
+        llvm::Function *memcpy_intrinsic = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(),
             llvm::Intrinsic::memcpy,
-            {llvm::PointerType::get(context, 0), 
-             llvm::PointerType::get(context, 0), 
+            {llvm::PointerType::get(context, 0),
+             llvm::PointerType::get(context, 0),
              llvm::Type::getInt64Ty(context)});
 
         // Prepare arguments
-        llvm::Value* dest = args[0];
-        llvm::Value* src = args[1];
-        llvm::Value* n = ensure_type(args[2], llvm::Type::getInt64Ty(context), "memcpy.n");
-        llvm::Value* is_volatile = llvm::ConstantInt::get(llvm::Type::getInt1Ty(context), 0);
+        llvm::Value *dest = args[0];
+        llvm::Value *src = args[1];
+        llvm::Value *n = ensure_type(args[2], llvm::Type::getInt64Ty(context), "memcpy.n");
+        llvm::Value *is_volatile = llvm::ConstantInt::get(llvm::Type::getInt1Ty(context), 0);
 
         if (!dest->getType()->isPointerTy() || !src->getType()->isPointerTy())
         {
@@ -423,7 +424,7 @@ namespace Cryo::Codegen
         return dest;
     }
 
-    llvm::Value* Intrinsics::generate_memset(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_memset(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
         {
@@ -431,21 +432,21 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Use LLVM's builtin memset intrinsic
-        llvm::Function* memset_intrinsic = llvm::Intrinsic::getDeclaration(
+        llvm::Function *memset_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::memset,
-            {llvm::PointerType::get(context, 0), 
+            {llvm::PointerType::get(context, 0),
              llvm::Type::getInt64Ty(context)});
 
         // Prepare arguments
-        llvm::Value* ptr = args[0];
-        llvm::Value* value = ensure_type(args[1], llvm::Type::getInt8Ty(context), "memset.val");
-        llvm::Value* n = ensure_type(args[2], llvm::Type::getInt64Ty(context), "memset.n");
-        llvm::Value* is_volatile = llvm::ConstantInt::get(llvm::Type::getInt1Ty(context), 0);
+        llvm::Value *ptr = args[0];
+        llvm::Value *value = ensure_type(args[1], llvm::Type::getInt8Ty(context), "memset.val");
+        llvm::Value *n = ensure_type(args[2], llvm::Type::getInt64Ty(context), "memset.n");
+        llvm::Value *is_volatile = llvm::ConstantInt::get(llvm::Type::getInt1Ty(context), 0);
 
         if (!ptr->getType()->isPointerTy())
         {
@@ -460,7 +461,7 @@ namespace Cryo::Codegen
         return ptr;
     }
 
-    llvm::Value* Intrinsics::generate_memcmp(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_memcmp(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
         {
@@ -468,23 +469,23 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create memcmp function type: int memcmp(const void* s1, const void* s2, size_t n)
-        llvm::Type* void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type* size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType* memcmp_type = llvm::FunctionType::get(
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *memcmp_type = llvm::FunctionType::get(
             int_type, {void_ptr_type, void_ptr_type, size_t_type}, false);
 
         // Get or create memcmp function
-        llvm::Function* memcmp_func = get_or_create_libc_function("memcmp", memcmp_type);
+        llvm::Function *memcmp_func = get_or_create_libc_function("memcmp", memcmp_type);
 
         // Prepare arguments
-        llvm::Value* ptr1 = args[0];
-        llvm::Value* ptr2 = args[1];
-        llvm::Value* n = ensure_type(args[2], size_t_type, "memcmp.n");
+        llvm::Value *ptr1 = args[0];
+        llvm::Value *ptr2 = args[1];
+        llvm::Value *n = ensure_type(args[2], size_t_type, "memcmp.n");
 
         if (!ptr1->getType()->isPointerTy() || !ptr2->getType()->isPointerTy())
         {
@@ -496,7 +497,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(memcmp_func, {ptr1, ptr2, n}, "memcmp.result");
     }
 
-    llvm::Value* Intrinsics::generate_memmove(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_memmove(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
         {
@@ -504,22 +505,22 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Use LLVM's builtin memmove intrinsic
-        llvm::Function* memmove_intrinsic = llvm::Intrinsic::getDeclaration(
+        llvm::Function *memmove_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::memmove,
-            {llvm::PointerType::get(context, 0), 
-             llvm::PointerType::get(context, 0), 
+            {llvm::PointerType::get(context, 0),
+             llvm::PointerType::get(context, 0),
              llvm::Type::getInt64Ty(context)});
 
         // Prepare arguments
-        llvm::Value* dest = args[0];
-        llvm::Value* src = args[1];
-        llvm::Value* n = ensure_type(args[2], llvm::Type::getInt64Ty(context), "memmove.n");
-        llvm::Value* is_volatile = llvm::ConstantInt::get(llvm::Type::getInt1Ty(context), 0);
+        llvm::Value *dest = args[0];
+        llvm::Value *src = args[1];
+        llvm::Value *n = ensure_type(args[2], llvm::Type::getInt64Ty(context), "memmove.n");
+        llvm::Value *is_volatile = llvm::ConstantInt::get(llvm::Type::getInt1Ty(context), 0);
 
         if (!dest->getType()->isPointerTy() || !src->getType()->isPointerTy())
         {
@@ -538,7 +539,7 @@ namespace Cryo::Codegen
     // Pointer Arithmetic Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_ptr_add(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_ptr_add(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -546,11 +547,11 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Value* ptr = args[0];
-        llvm::Value* offset = args[1];
+        llvm::Value *ptr = args[0];
+        llvm::Value *offset = args[1];
 
         if (!ptr->getType()->isPointerTy())
         {
@@ -559,25 +560,24 @@ namespace Cryo::Codegen
         }
 
         // Convert pointer to i8* for byte arithmetic
-        llvm::Type* i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
-        llvm::Value* byte_ptr = builder.CreateBitCast(ptr, i8_ptr_type, "ptr_as_bytes");
+        llvm::Type *i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Value *byte_ptr = builder.CreateBitCast(ptr, i8_ptr_type, "ptr_as_bytes");
 
         // Ensure offset is i64
-        llvm::Value* offset_i64 = ensure_type(offset, llvm::Type::getInt64Ty(context), "ptr_add.offset");
-        
+        llvm::Value *offset_i64 = ensure_type(offset, llvm::Type::getInt64Ty(context), "ptr_add.offset");
+
         // Use getelementptr for pointer arithmetic
-        llvm::Value* result_ptr = builder.CreateGEP(
+        llvm::Value *result_ptr = builder.CreateGEP(
             llvm::Type::getInt8Ty(context),
             byte_ptr,
             offset_i64,
-            "ptr_add_result"
-        );
+            "ptr_add_result");
 
         // Cast back to original pointer type
         return builder.CreateBitCast(result_ptr, ptr->getType(), "ptr_add_cast");
     }
 
-    llvm::Value* Intrinsics::generate_ptr_sub(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_ptr_sub(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -585,11 +585,11 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Value* ptr = args[0];
-        llvm::Value* offset = args[1];
+        llvm::Value *ptr = args[0];
+        llvm::Value *offset = args[1];
 
         if (!ptr->getType()->isPointerTy())
         {
@@ -598,26 +598,25 @@ namespace Cryo::Codegen
         }
 
         // Convert pointer to i8* for byte arithmetic
-        llvm::Type* i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
-        llvm::Value* byte_ptr = builder.CreateBitCast(ptr, i8_ptr_type, "ptr_as_bytes");
+        llvm::Type *i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Value *byte_ptr = builder.CreateBitCast(ptr, i8_ptr_type, "ptr_as_bytes");
 
         // Ensure offset is i64 and negate it
-        llvm::Value* offset_i64 = ensure_type(offset, llvm::Type::getInt64Ty(context), "ptr_sub.offset");
-        llvm::Value* neg_offset = builder.CreateNeg(offset_i64, "neg_offset");
-        
+        llvm::Value *offset_i64 = ensure_type(offset, llvm::Type::getInt64Ty(context), "ptr_sub.offset");
+        llvm::Value *neg_offset = builder.CreateNeg(offset_i64, "neg_offset");
+
         // Use getelementptr for pointer arithmetic
-        llvm::Value* result_ptr = builder.CreateGEP(
+        llvm::Value *result_ptr = builder.CreateGEP(
             llvm::Type::getInt8Ty(context),
             byte_ptr,
             neg_offset,
-            "ptr_sub_result"
-        );
+            "ptr_sub_result");
 
         // Cast back to original pointer type
         return builder.CreateBitCast(result_ptr, ptr->getType(), "ptr_sub_cast");
     }
 
-    llvm::Value* Intrinsics::generate_ptr_diff(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_ptr_diff(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -625,11 +624,11 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Value* ptr1 = args[0];
-        llvm::Value* ptr2 = args[1];
+        llvm::Value *ptr1 = args[0];
+        llvm::Value *ptr2 = args[1];
 
         if (!ptr1->getType()->isPointerTy() || !ptr2->getType()->isPointerTy())
         {
@@ -638,9 +637,9 @@ namespace Cryo::Codegen
         }
 
         // Convert pointers to integers for arithmetic
-        llvm::Type* int_ptr_type = llvm::Type::getIntNTy(context, 64);
-        llvm::Value* int_ptr1 = builder.CreatePtrToInt(ptr1, int_ptr_type, "ptr1_as_int");
-        llvm::Value* int_ptr2 = builder.CreatePtrToInt(ptr2, int_ptr_type, "ptr2_as_int");
+        llvm::Type *int_ptr_type = llvm::Type::getIntNTy(context, 64);
+        llvm::Value *int_ptr1 = builder.CreatePtrToInt(ptr1, int_ptr_type, "ptr1_as_int");
+        llvm::Value *int_ptr2 = builder.CreatePtrToInt(ptr2, int_ptr_type, "ptr2_as_int");
 
         // Calculate difference
         return builder.CreateSub(int_ptr1, int_ptr2, "ptr_diff_result");
@@ -650,7 +649,7 @@ namespace Cryo::Codegen
     // System Call Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_syscall_write(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_write(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
         {
@@ -658,15 +657,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, write syscall number is 1
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
 
         return create_syscall(syscall_num, args);
     }
 
-    llvm::Value* Intrinsics::generate_syscall_read(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_read(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
         {
@@ -674,15 +673,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, read syscall number is 0
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
 
         return create_syscall(syscall_num, args);
     }
 
-    llvm::Value* Intrinsics::generate_syscall_exit(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_exit(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -690,15 +689,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, exit syscall number is 60
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 60);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 60);
 
         return create_syscall(syscall_num, args);
     }
 
-    llvm::Value* Intrinsics::generate_syscall_open(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_open(const std::vector<llvm::Value *> &args)
     {
         if (args.size() < 2 || args.size() > 3)
         {
@@ -706,13 +705,13 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, open syscall number is 2
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2);
 
         // If mode is not provided, use default (0644)
-        std::vector<llvm::Value*> syscall_args = args;
+        std::vector<llvm::Value *> syscall_args = args;
         if (args.size() == 2)
         {
             syscall_args.push_back(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0644));
@@ -721,7 +720,7 @@ namespace Cryo::Codegen
         return create_syscall(syscall_num, syscall_args);
     }
 
-    llvm::Value* Intrinsics::generate_syscall_close(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_close(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -729,15 +728,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, close syscall number is 3
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 3);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 3);
 
         return create_syscall(syscall_num, args);
     }
 
-    llvm::Value* Intrinsics::generate_syscall_lseek(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_lseek(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
         {
@@ -745,15 +744,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, lseek syscall number is 8
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8);
 
         return create_syscall(syscall_num, args);
     }
 
-    llvm::Value* Intrinsics::generate_syscall_unlink(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_unlink(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -761,15 +760,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, unlink syscall number is 87
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 87);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 87);
 
         return create_syscall(syscall_num, args);
     }
 
-    llvm::Value* Intrinsics::generate_syscall_mkdir(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_mkdir(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -777,15 +776,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, mkdir syscall number is 83
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 83);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 83);
 
         return create_syscall(syscall_num, args);
     }
 
-    llvm::Value* Intrinsics::generate_syscall_rmdir(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_syscall_rmdir(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -793,10 +792,10 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, rmdir syscall number is 84
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 84);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 84);
 
         return create_syscall(syscall_num, args);
     }
@@ -805,7 +804,7 @@ namespace Cryo::Codegen
     // String Operations Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_strlen(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_strlen(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -813,19 +812,19 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create strlen function type: size_t strlen(const char* str)
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type* size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::FunctionType* strlen_type = llvm::FunctionType::get(
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::FunctionType *strlen_type = llvm::FunctionType::get(
             size_t_type, {char_ptr_type}, false);
 
         // Get or create strlen function
-        llvm::Function* strlen_func = get_or_create_libc_function("strlen", strlen_type);
+        llvm::Function *strlen_func = get_or_create_libc_function("strlen", strlen_type);
 
-        llvm::Value* str_arg = args[0];
+        llvm::Value *str_arg = args[0];
         if (!str_arg->getType()->isPointerTy())
         {
             report_error("__strlen__ argument must be a pointer");
@@ -836,7 +835,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(strlen_func, {str_arg}, "strlen.result");
     }
 
-    llvm::Value* Intrinsics::generate_strcmp(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_strcmp(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -844,20 +843,20 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create strcmp function type: int strcmp(const char* str1, const char* str2)
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType* strcmp_type = llvm::FunctionType::get(
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *strcmp_type = llvm::FunctionType::get(
             int_type, {char_ptr_type, char_ptr_type}, false);
 
         // Get or create strcmp function
-        llvm::Function* strcmp_func = get_or_create_libc_function("strcmp", strcmp_type);
+        llvm::Function *strcmp_func = get_or_create_libc_function("strcmp", strcmp_type);
 
-        llvm::Value* str1_arg = args[0];
-        llvm::Value* str2_arg = args[1];
+        llvm::Value *str1_arg = args[0];
+        llvm::Value *str2_arg = args[1];
 
         if (!str1_arg->getType()->isPointerTy() || !str2_arg->getType()->isPointerTy())
         {
@@ -869,7 +868,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(strcmp_func, {str1_arg, str2_arg}, "strcmp.result");
     }
 
-    llvm::Value* Intrinsics::generate_strcpy(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_strcpy(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -877,19 +876,19 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create strcpy function type: char* strcpy(char* dest, const char* src)
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::FunctionType* strcpy_type = llvm::FunctionType::get(
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *strcpy_type = llvm::FunctionType::get(
             char_ptr_type, {char_ptr_type, char_ptr_type}, false);
 
         // Get or create strcpy function
-        llvm::Function* strcpy_func = get_or_create_libc_function("strcpy", strcpy_type);
+        llvm::Function *strcpy_func = get_or_create_libc_function("strcpy", strcpy_type);
 
-        llvm::Value* dest_arg = args[0];
-        llvm::Value* src_arg = args[1];
+        llvm::Value *dest_arg = args[0];
+        llvm::Value *src_arg = args[1];
 
         if (!dest_arg->getType()->isPointerTy() || !src_arg->getType()->isPointerTy())
         {
@@ -901,7 +900,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(strcpy_func, {dest_arg, src_arg}, "strcpy.result");
     }
 
-    llvm::Value* Intrinsics::generate_strcat(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_strcat(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -909,19 +908,19 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create strcat function type: char* strcat(char* dest, const char* src)
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::FunctionType* strcat_type = llvm::FunctionType::get(
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *strcat_type = llvm::FunctionType::get(
             char_ptr_type, {char_ptr_type, char_ptr_type}, false);
 
         // Get or create strcat function
-        llvm::Function* strcat_func = get_or_create_libc_function("strcat", strcat_type);
+        llvm::Function *strcat_func = get_or_create_libc_function("strcat", strcat_type);
 
-        llvm::Value* dest_arg = args[0];
-        llvm::Value* src_arg = args[1];
+        llvm::Value *dest_arg = args[0];
+        llvm::Value *src_arg = args[1];
 
         if (!dest_arg->getType()->isPointerTy() || !src_arg->getType()->isPointerTy())
         {
@@ -937,7 +936,7 @@ namespace Cryo::Codegen
     // I/O Operations Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_printf(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_printf(const std::vector<llvm::Value *> &args)
     {
         if (args.empty())
         {
@@ -945,18 +944,18 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
-        auto* module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
 
         // Create printf function type: int printf(const char* format, ...)
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType* printf_type = llvm::FunctionType::get(
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *printf_type = llvm::FunctionType::get(
             int_type, {char_ptr_type}, true); // variadic
 
         // Get or create the real printf function
-        llvm::Function* real_printf_func = get_or_create_libc_function("printf", printf_type);
+        llvm::Function *real_printf_func = get_or_create_libc_function("printf", printf_type);
 
         // Ensure format argument is a pointer
         if (!args[0]->getType()->isPointerTy())
@@ -969,7 +968,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(real_printf_func, args, "printf.result");
     }
 
-    llvm::Value* Intrinsics::generate_sprintf(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_sprintf(const std::vector<llvm::Value *> &args)
     {
         if (args.size() < 2)
         {
@@ -977,17 +976,17 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create sprintf function type: int sprintf(char* buffer, const char* format, ...)
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType* sprintf_type = llvm::FunctionType::get(
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *sprintf_type = llvm::FunctionType::get(
             int_type, {char_ptr_type, char_ptr_type}, true); // variadic
 
         // Get or create sprintf function
-        llvm::Function* sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
+        llvm::Function *sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
 
         // Ensure first two arguments are pointers
         if (!args[0]->getType()->isPointerTy() || !args[1]->getType()->isPointerTy())
@@ -1000,7 +999,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(sprintf_func, args, "sprintf.result");
     }
 
-    llvm::Value* Intrinsics::generate_fprintf(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_fprintf(const std::vector<llvm::Value *> &args)
     {
         if (args.size() < 2)
         {
@@ -1008,18 +1007,18 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create fprintf function type: int fprintf(FILE* stream, const char* format, ...)
-        llvm::Type* file_ptr_type = llvm::PointerType::get(context, 0); // FILE*
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType* fprintf_type = llvm::FunctionType::get(
+        llvm::Type *file_ptr_type = llvm::PointerType::get(context, 0); // FILE*
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *fprintf_type = llvm::FunctionType::get(
             int_type, {file_ptr_type, char_ptr_type}, true); // variadic
 
         // Get or create fprintf function
-        llvm::Function* fprintf_func = get_or_create_libc_function("fprintf", fprintf_type);
+        llvm::Function *fprintf_func = get_or_create_libc_function("fprintf", fprintf_type);
 
         // Ensure first two arguments are pointers
         if (!args[0]->getType()->isPointerTy() || !args[1]->getType()->isPointerTy())
@@ -1032,11 +1031,11 @@ namespace Cryo::Codegen
         return builder.CreateCall(fprintf_func, args, "fprintf.result");
     }
 
-    llvm::Value* Intrinsics::generate_panic(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_panic(const std::vector<llvm::Value *> &args)
     {
         // __panic__ can be called with 0 args (just panic) or 1 arg (panic with message)
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         if (args.size() > 1)
         {
@@ -1047,13 +1046,13 @@ namespace Cryo::Codegen
         if (!args.empty())
         {
             // If message provided, print it first
-            llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-            llvm::Type* int_type = llvm::Type::getInt32Ty(context);
-            llvm::FunctionType* printf_type = llvm::FunctionType::get(
+            llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+            llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+            llvm::FunctionType *printf_type = llvm::FunctionType::get(
                 int_type, {char_ptr_type}, true); // variadic
 
-            llvm::Function* printf_func = get_or_create_libc_function("printf", printf_type);
-            
+            llvm::Function *printf_func = get_or_create_libc_function("printf", printf_type);
+
             if (args[0]->getType()->isPointerTy())
             {
                 // Print the panic message
@@ -1062,9 +1061,9 @@ namespace Cryo::Codegen
         }
 
         // Exit with status code 1 (indicating error)
-        llvm::Value* exit_code = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
-        std::vector<llvm::Value*> exit_args = {exit_code};
-        
+        llvm::Value *exit_code = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
+        std::vector<llvm::Value *> exit_args = {exit_code};
+
         return generate_syscall_exit(exit_args);
     }
 
@@ -1072,7 +1071,7 @@ namespace Cryo::Codegen
     // String Conversion Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_float32_to_string(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_float32_to_string(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -1080,12 +1079,12 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
-        llvm::Module* module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Module *module = _context_manager.get_module();
 
         // Check that argument is a float32 type
-        llvm::Value* float_arg = args[0];
+        llvm::Value *float_arg = args[0];
         if (!float_arg->getType()->isFloatTy())
         {
             report_error("__float32_to_string__ argument must be a f32 type");
@@ -1093,35 +1092,35 @@ namespace Cryo::Codegen
         }
 
         // Allocate buffer for the string (enough for most float representations)
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Constant* buffer_size = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 64);
-        
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Constant *buffer_size = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 64);
+
         // Create malloc call for buffer
-        llvm::Function* malloc_func = get_or_create_libc_function("malloc", 
-            llvm::FunctionType::get(char_ptr_type, {llvm::Type::getInt64Ty(context)}, false));
-        
-        llvm::Value* buffer_size_64 = builder.CreateZExt(buffer_size, llvm::Type::getInt64Ty(context));
-        llvm::Value* buffer = builder.CreateCall(malloc_func, {buffer_size_64}, "float32_str_buffer");
+        llvm::Function *malloc_func = get_or_create_libc_function("malloc",
+                                                                  llvm::FunctionType::get(char_ptr_type, {llvm::Type::getInt64Ty(context)}, false));
+
+        llvm::Value *buffer_size_64 = builder.CreateZExt(buffer_size, llvm::Type::getInt64Ty(context));
+        llvm::Value *buffer = builder.CreateCall(malloc_func, {buffer_size_64}, "float32_str_buffer");
 
         // Create sprintf call: sprintf(buffer, "%.6f", float_value)
-        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType* sprintf_type = llvm::FunctionType::get(
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *sprintf_type = llvm::FunctionType::get(
             int_type, {char_ptr_type, char_ptr_type}, true); // variadic
 
-        llvm::Function* sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
+        llvm::Function *sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
 
         // Create format string "%.6f" as a global constant
         std::string format_str = "%.6f";
-        llvm::Constant* format_const = llvm::ConstantDataArray::getString(context, format_str, true);
-        llvm::GlobalVariable* format_global = new llvm::GlobalVariable(
+        llvm::Constant *format_const = llvm::ConstantDataArray::getString(context, format_str, true);
+        llvm::GlobalVariable *format_global = new llvm::GlobalVariable(
             *module, format_const->getType(), true, llvm::GlobalValue::PrivateLinkage,
             format_const, "float32_format_str");
-        
+
         // Get pointer to the format string
-        llvm::Value* format_ptr = builder.CreatePointerCast(format_global, char_ptr_type);
+        llvm::Value *format_ptr = builder.CreatePointerCast(format_global, char_ptr_type);
 
         // Convert float32 to double (sprintf %f expects double)
-        llvm::Value* double_arg = builder.CreateFPExt(float_arg, llvm::Type::getDoubleTy(context), "f32_to_double");
+        llvm::Value *double_arg = builder.CreateFPExt(float_arg, llvm::Type::getDoubleTy(context), "f32_to_double");
 
         // Call sprintf(buffer, "%.6f", double_value)
         builder.CreateCall(sprintf_func, {buffer, format_ptr, double_arg}, "sprintf.f32.result");
@@ -1130,7 +1129,7 @@ namespace Cryo::Codegen
         return buffer;
     }
 
-    llvm::Value* Intrinsics::generate_float64_to_string(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_float64_to_string(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -1138,12 +1137,12 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
-        llvm::Module* module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Module *module = _context_manager.get_module();
 
         // Check that argument is a float64 type
-        llvm::Value* float_arg = args[0];
+        llvm::Value *float_arg = args[0];
         if (!float_arg->getType()->isDoubleTy())
         {
             report_error("__float64_to_string__ argument must be a f64 type");
@@ -1151,32 +1150,32 @@ namespace Cryo::Codegen
         }
 
         // Allocate buffer for the string (enough for most float representations)
-        llvm::Type* char_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Constant* buffer_size = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 64);
-        
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Constant *buffer_size = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 64);
+
         // Create malloc call for buffer
-        llvm::Function* malloc_func = get_or_create_libc_function("malloc", 
-            llvm::FunctionType::get(char_ptr_type, {llvm::Type::getInt64Ty(context)}, false));
-        
-        llvm::Value* buffer_size_64 = builder.CreateZExt(buffer_size, llvm::Type::getInt64Ty(context));
-        llvm::Value* buffer = builder.CreateCall(malloc_func, {buffer_size_64}, "float64_str_buffer");
+        llvm::Function *malloc_func = get_or_create_libc_function("malloc",
+                                                                  llvm::FunctionType::get(char_ptr_type, {llvm::Type::getInt64Ty(context)}, false));
+
+        llvm::Value *buffer_size_64 = builder.CreateZExt(buffer_size, llvm::Type::getInt64Ty(context));
+        llvm::Value *buffer = builder.CreateCall(malloc_func, {buffer_size_64}, "float64_str_buffer");
 
         // Create sprintf call: sprintf(buffer, "%.6f", double_value)
-        llvm::Type* int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType* sprintf_type = llvm::FunctionType::get(
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *sprintf_type = llvm::FunctionType::get(
             int_type, {char_ptr_type, char_ptr_type}, true); // variadic
 
-        llvm::Function* sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
+        llvm::Function *sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
 
         // Create format string "%.15g" for better double precision
         std::string format_str = "%.15g";
-        llvm::Constant* format_const = llvm::ConstantDataArray::getString(context, format_str, true);
-        llvm::GlobalVariable* format_global = new llvm::GlobalVariable(
+        llvm::Constant *format_const = llvm::ConstantDataArray::getString(context, format_str, true);
+        llvm::GlobalVariable *format_global = new llvm::GlobalVariable(
             *module, format_const->getType(), true, llvm::GlobalValue::PrivateLinkage,
             format_const, "float64_format_str");
-        
+
         // Get pointer to the format string
-        llvm::Value* format_ptr = builder.CreatePointerCast(format_global, char_ptr_type);
+        llvm::Value *format_ptr = builder.CreatePointerCast(format_global, char_ptr_type);
 
         // double is already the right type for sprintf %g
         // Call sprintf(buffer, "%.15g", double_value)
@@ -1190,7 +1189,7 @@ namespace Cryo::Codegen
     // Math Operations Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_sqrt(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_sqrt(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -1198,14 +1197,14 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Value* arg = args[0];
-        llvm::Type* arg_type = arg->getType();
+        llvm::Value *arg = args[0];
+        llvm::Type *arg_type = arg->getType();
 
         // Use LLVM sqrt intrinsic
-        llvm::Function* sqrt_intrinsic = llvm::Intrinsic::getDeclaration(
+        llvm::Function *sqrt_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::sqrt,
             arg_type);
@@ -1213,7 +1212,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(sqrt_intrinsic, {arg}, "sqrt.result");
     }
 
-    llvm::Value* Intrinsics::generate_pow(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_pow(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 2)
         {
@@ -1221,14 +1220,14 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Value* base = args[0];
-        llvm::Value* exp = args[1];
+        llvm::Value *base = args[0];
+        llvm::Value *exp = args[1];
 
         // Use LLVM pow intrinsic
-        llvm::Function* pow_intrinsic = llvm::Intrinsic::getDeclaration(
+        llvm::Function *pow_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::pow,
             base->getType());
@@ -1236,7 +1235,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(pow_intrinsic, {base, exp}, "pow.result");
     }
 
-    llvm::Value* Intrinsics::generate_sin(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_sin(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -1244,12 +1243,12 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
+        auto &builder = _context_manager.get_builder();
 
-        llvm::Value* arg = args[0];
+        llvm::Value *arg = args[0];
 
         // Use LLVM sin intrinsic
-        llvm::Function* sin_intrinsic = llvm::Intrinsic::getDeclaration(
+        llvm::Function *sin_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::sin,
             arg->getType());
@@ -1257,7 +1256,7 @@ namespace Cryo::Codegen
         return builder.CreateCall(sin_intrinsic, {arg}, "sin.result");
     }
 
-    llvm::Value* Intrinsics::generate_cos(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_cos(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
         {
@@ -1265,12 +1264,12 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
+        auto &builder = _context_manager.get_builder();
 
-        llvm::Value* arg = args[0];
+        llvm::Value *arg = args[0];
 
         // Use LLVM cos intrinsic
-        llvm::Function* cos_intrinsic = llvm::Intrinsic::getDeclaration(
+        llvm::Function *cos_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::cos,
             arg->getType());
@@ -1282,7 +1281,7 @@ namespace Cryo::Codegen
     // Process Management Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_getpid(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_getpid(const std::vector<llvm::Value *> &args)
     {
         if (!args.empty())
         {
@@ -1290,15 +1289,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, getpid syscall number is 39
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 39);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 39);
 
         return create_syscall(syscall_num, {});
     }
 
-    llvm::Value* Intrinsics::generate_fork(const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::generate_fork(const std::vector<llvm::Value *> &args)
     {
         if (!args.empty())
         {
@@ -1306,10 +1305,10 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& context = _context_manager.get_context();
+        auto &context = _context_manager.get_context();
 
         // On Linux x86_64, fork syscall number is 57
-        llvm::Value* syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 57);
+        llvm::Value *syscall_num = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 57);
 
         return create_syscall(syscall_num, {});
     }
@@ -1318,44 +1317,44 @@ namespace Cryo::Codegen
     // Helper Methods
     // ========================================
 
-    void Intrinsics::report_error(const std::string& message)
+    void Intrinsics::report_error(const std::string &message)
     {
         _has_errors = true;
         _last_error = message;
         std::cerr << "[Intrinsics] Error: " << message << std::endl;
     }
 
-    void Intrinsics::report_unimplemented_intrinsic(const std::string& intrinsic_name, Cryo::CallExpressionNode* node)
+    void Intrinsics::report_unimplemented_intrinsic(const std::string &intrinsic_name, Cryo::CallExpressionNode *node)
     {
         _has_errors = true;
         _last_error = "Unimplemented intrinsic: " + intrinsic_name;
-        
+
         // Report to GDM if available
         if (_gdm)
         {
             std::string message = "Intrinsic function '" + intrinsic_name + "' is called but not implemented";
-            
+
             // Try to get source location if node is available
             if (node && node->location().line() > 0)
             {
                 // Convert from lexer SourceLocation to GDM SourceRange
-                const auto& loc = node->location();
-                Cryo::SourceRange range(loc);  // Use explicit constructor
-                
-                _gdm->report_error(Cryo::DiagnosticID::UnimplementedIntrinsic, 
-                                 Cryo::DiagnosticCategory::CodeGen,
-                                 range, "<source_file>", message);
+                const auto &loc = node->location();
+                Cryo::SourceRange range(loc); // Use explicit constructor
+
+                _gdm->report_error(Cryo::DiagnosticID::UnimplementedIntrinsic,
+                                   Cryo::DiagnosticCategory::CodeGen,
+                                   range, "<source_file>", message);
             }
             else
             {
                 // Fallback: report without location
-                Cryo::SourceRange dummy_range;  // Default constructed range
+                Cryo::SourceRange dummy_range; // Default constructed range
                 _gdm->report_error(Cryo::DiagnosticID::UnimplementedIntrinsic,
-                                 Cryo::DiagnosticCategory::CodeGen,
-                                 message, dummy_range, "<unknown>");
+                                   Cryo::DiagnosticCategory::CodeGen,
+                                   message, dummy_range, "<unknown>");
             }
         }
-        
+
         // Still output to stderr as backup
         std::cerr << "[Intrinsics] Error: " << _last_error << std::endl;
     }
@@ -1366,15 +1365,15 @@ namespace Cryo::Codegen
         _last_error.clear();
     }
 
-    llvm::Value* Intrinsics::create_syscall(llvm::Value* syscall_num, const std::vector<llvm::Value*>& args)
+    llvm::Value *Intrinsics::create_syscall(llvm::Value *syscall_num, const std::vector<llvm::Value *> &args)
     {
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
         // Create syscall inline assembly based on number of arguments
         std::string asm_template;
         std::string constraints;
-        std::vector<llvm::Value*> asm_args;
+        std::vector<llvm::Value *> asm_args;
 
         // Add syscall number as first argument
         asm_args.push_back(syscall_num);
@@ -1424,35 +1423,35 @@ namespace Cryo::Codegen
         }
 
         // Create function type for inline assembly
-        std::vector<llvm::Type*> param_types;
-        for (auto* arg : asm_args)
+        std::vector<llvm::Type *> param_types;
+        for (auto *arg : asm_args)
         {
             param_types.push_back(arg->getType());
         }
 
-        llvm::FunctionType* syscall_type = llvm::FunctionType::get(
+        llvm::FunctionType *syscall_type = llvm::FunctionType::get(
             llvm::Type::getInt64Ty(context), param_types, false);
 
         // Create inline assembly
-        llvm::InlineAsm* syscall_asm = llvm::InlineAsm::get(
+        llvm::InlineAsm *syscall_asm = llvm::InlineAsm::get(
             syscall_type,
             asm_template,
             constraints,
-            true,  // Has side effects
-            false  // No align stack
+            true, // Has side effects
+            false // No align stack
         );
 
         // Call the inline assembly
         return builder.CreateCall(syscall_asm, asm_args, "syscall.result");
     }
 
-    llvm::Value* Intrinsics::ensure_type(llvm::Value* value, llvm::Type* target_type, const std::string& name)
+    llvm::Value *Intrinsics::ensure_type(llvm::Value *value, llvm::Type *target_type, const std::string &name)
     {
         if (!value || !target_type)
             return value;
 
-        auto& builder = _context_manager.get_builder();
-        llvm::Type* current_type = value->getType();
+        auto &builder = _context_manager.get_builder();
+        llvm::Type *current_type = value->getType();
 
         if (current_type == target_type)
             return value;
@@ -1491,10 +1490,10 @@ namespace Cryo::Codegen
         return value;
     }
 
-    llvm::Function* Intrinsics::get_or_create_libc_function(const std::string& name, llvm::FunctionType* type)
+    llvm::Function *Intrinsics::get_or_create_libc_function(const std::string &name, llvm::FunctionType *type)
     {
-        auto* module = _context_manager.get_module();
-        llvm::Function* func = module->getFunction(name);
+        auto *module = _context_manager.get_module();
+        llvm::Function *func = module->getFunction(name);
 
         if (!func)
         {
@@ -1503,8 +1502,7 @@ namespace Cryo::Codegen
                 type,
                 llvm::Function::ExternalLinkage,
                 name,
-                module
-            );
+                module);
         }
 
         return func;
@@ -1514,8 +1512,8 @@ namespace Cryo::Codegen
     // Type Conversion Intrinsics
     // ========================================
 
-    llvm::Value* Intrinsics::generate_integer_extension(const std::vector<llvm::Value*>& args,
-                                                       unsigned source_bits, unsigned target_bits, bool is_signed)
+    llvm::Value *Intrinsics::generate_integer_extension(const std::vector<llvm::Value *> &args,
+                                                        unsigned source_bits, unsigned target_bits, bool is_signed)
     {
         if (args.size() != 1)
         {
@@ -1523,11 +1521,11 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Type* target_type = llvm::Type::getIntNTy(context, target_bits);
-        
+        llvm::Type *target_type = llvm::Type::getIntNTy(context, target_bits);
+
         if (is_signed)
         {
             return builder.CreateSExt(args[0], target_type, "sext");
@@ -1538,8 +1536,8 @@ namespace Cryo::Codegen
         }
     }
 
-    llvm::Value* Intrinsics::generate_integer_truncation(const std::vector<llvm::Value*>& args,
-                                                        unsigned source_bits, unsigned target_bits)
+    llvm::Value *Intrinsics::generate_integer_truncation(const std::vector<llvm::Value *> &args,
+                                                         unsigned source_bits, unsigned target_bits)
     {
         if (args.size() != 1)
         {
@@ -1547,14 +1545,14 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Type* target_type = llvm::Type::getIntNTy(context, target_bits);
+        llvm::Type *target_type = llvm::Type::getIntNTy(context, target_bits);
         return builder.CreateTrunc(args[0], target_type, "trunc");
     }
 
-    llvm::Value* Intrinsics::generate_sign_conversion(const std::vector<llvm::Value*>& args, unsigned bit_width)
+    llvm::Value *Intrinsics::generate_sign_conversion(const std::vector<llvm::Value *> &args, unsigned bit_width)
     {
         if (args.size() != 1)
         {
@@ -1567,9 +1565,9 @@ namespace Cryo::Codegen
         return args[0];
     }
 
-    llvm::Value* Intrinsics::generate_checked_conversion(const std::vector<llvm::Value*>& args,
-                                                        unsigned source_bits, unsigned target_bits,
-                                                        bool source_signed, bool target_signed)
+    llvm::Value *Intrinsics::generate_checked_conversion(const std::vector<llvm::Value *> &args,
+                                                         unsigned source_bits, unsigned target_bits,
+                                                         bool source_signed, bool target_signed)
     {
         if (args.size() != 1)
         {
@@ -1577,22 +1575,22 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        auto& builder = _context_manager.get_builder();
-        auto& context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Value* source_val = args[0];
-        llvm::Type* target_type = llvm::Type::getIntNTy(context, target_bits);
+        llvm::Value *source_val = args[0];
+        llvm::Type *target_type = llvm::Type::getIntNTy(context, target_bits);
 
         // Create bounds for overflow checking
-        llvm::Value* min_val = nullptr;
-        llvm::Value* max_val = nullptr;
+        llvm::Value *min_val = nullptr;
+        llvm::Value *max_val = nullptr;
 
         if (target_signed)
         {
             // For signed target: -2^(n-1) to 2^(n-1)-1
             int64_t max_signed = (1LL << (target_bits - 1)) - 1;
             int64_t min_signed = -(1LL << (target_bits - 1));
-            
+
             max_val = llvm::ConstantInt::get(source_val->getType(), max_signed, true);
             min_val = llvm::ConstantInt::get(source_val->getType(), min_signed, true);
         }
@@ -1600,18 +1598,18 @@ namespace Cryo::Codegen
         {
             // For unsigned target: 0 to 2^n-1
             uint64_t max_unsigned = (target_bits == 64) ? UINT64_MAX : (1ULL << target_bits) - 1;
-            
+
             max_val = llvm::ConstantInt::get(source_val->getType(), max_unsigned, false);
             min_val = llvm::ConstantInt::get(source_val->getType(), 0, false);
         }
 
         // Create overflow checks
-        llvm::Value* too_large = builder.CreateICmpSGT(source_val, max_val, "too_large");
-        llvm::Value* too_small = builder.CreateICmpSLT(source_val, min_val, "too_small");
-        llvm::Value* overflow = builder.CreateOr(too_large, too_small, "overflow");
+        llvm::Value *too_large = builder.CreateICmpSGT(source_val, max_val, "too_large");
+        llvm::Value *too_small = builder.CreateICmpSLT(source_val, min_val, "too_small");
+        llvm::Value *overflow = builder.CreateOr(too_large, too_small, "overflow");
 
         // Create the actual conversion
-        llvm::Value* converted;
+        llvm::Value *converted;
         if (target_bits < source_bits)
         {
             converted = builder.CreateTrunc(source_val, target_type, "trunc_conv");
@@ -1632,13 +1630,13 @@ namespace Cryo::Codegen
         // For checked conversions, we need to return an optional type
         // This is simplified - in a full implementation you'd create an optional struct
         // For now, return null on overflow, the converted value otherwise
-        llvm::Type* result_type = llvm::PointerType::get(target_type, 0);
-        llvm::Value* null_ptr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(result_type));
-        
+        llvm::Type *result_type = llvm::PointerType::get(target_type, 0);
+        llvm::Value *null_ptr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(result_type));
+
         // Allocate space for the result
-        llvm::Value* result_ptr = builder.CreateAlloca(target_type, nullptr, "result");
+        llvm::Value *result_ptr = builder.CreateAlloca(target_type, nullptr, "result");
         builder.CreateStore(converted, result_ptr);
-        
+
         // Return null on overflow, pointer to result otherwise
         return builder.CreateSelect(overflow, null_ptr, result_ptr, "checked_result");
     }
