@@ -1668,15 +1668,13 @@ namespace Cryo
 
     Type *TypeContext::get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple)
     {
-        std::cout << "[DEBUG] TypeContext::get_enum_type called with name=" << name
-                  << " is_simple=" << is_simple << std::endl;
-        std::cout << "[DEBUG] Call stack trace (simplified): TypeContext::get_enum_type" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::get_enum_type called with name={} is_simple={}", name, is_simple);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Call stack trace (simplified): TypeContext::get_enum_type");
 
         auto it = _enum_types.find(name);
         if (it != _enum_types.end())
         {
-            std::cout << "[DEBUG] Found existing enum type for " << name
-                      << " existing is_simple=" << it->second->is_simple_enum() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found existing enum type for {} existing is_simple={}", name, it->second->is_simple_enum());
             return it->second.get();
         }
 
@@ -1685,15 +1683,14 @@ namespace Cryo
         auto struct_it = _struct_types.find(name);
         if (struct_it != _struct_types.end())
         {
-            std::cout << "[DEBUG] Removing conflicting struct type '" << name
-                      << "' to make way for enum type" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Removing conflicting struct type '{}' to make way for enum type", name);
             _struct_types.erase(struct_it);
         }
 
         // Create new enum type
-        std::cout << "[DEBUG] Creating new EnumType with is_simple=" << is_simple << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Creating new EnumType with is_simple={}", is_simple);
         auto enum_type = std::make_unique<EnumType>(name, std::move(variants), is_simple);
-        std::cout << "[DEBUG] Created EnumType, result is_simple_enum()=" << enum_type->is_simple_enum() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Created EnumType, result is_simple_enum()={}", enum_type->is_simple_enum());
         Type *result = enum_type.get();
         _enum_types[name] = std::move(enum_type);
 
@@ -1702,17 +1699,16 @@ namespace Cryo
 
     Type *TypeContext::lookup_enum_type(const std::string &name)
     {
-        std::cout << "[DEBUG] TypeContext::lookup_enum_type called with name=" << name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::lookup_enum_type called with name={}", name);
 
         auto it = _enum_types.find(name);
         if (it != _enum_types.end())
         {
-            std::cout << "[DEBUG] Found existing enum type for " << name
-                      << " is_simple=" << it->second->is_simple_enum() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found existing enum type for {} is_simple={}", name, it->second->is_simple_enum());
             return it->second.get();
         }
 
-        std::cout << "[DEBUG] No existing enum type found for " << name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "No existing enum type found for {}", name);
         return nullptr;
     }
 
