@@ -1,6 +1,7 @@
 #include "AST/TypeChecker.hpp"
 #include "AST/SymbolTable.hpp"
 #include "Lexer/lexer.hpp"
+#include "Utils/Logger.hpp"
 #include <sstream>
 #include <algorithm>
 #include <unordered_set>
@@ -623,15 +624,14 @@ namespace Cryo
                                             const std::vector<std::string> &parameters,
                                             SourceLocation location)
     {
-        std::cout << "[DEBUG] TypeChecker: Entering generic context for '" << type_name
-                  << "' with parameters: ";
+        std::string params_str;
         for (size_t i = 0; i < parameters.size(); ++i)
         {
-            std::cout << parameters[i];
+            params_str += parameters[i];
             if (i < parameters.size() - 1)
-                std::cout << ", ";
+                params_str += ", ";
         }
-        std::cout << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Entering generic context for '{}' with parameters: {}", type_name, params_str);
 
         _generic_context_stack.emplace_back(type_name, parameters, location);
     }
@@ -641,8 +641,7 @@ namespace Cryo
         if (!_generic_context_stack.empty())
         {
             const auto &context = _generic_context_stack.back();
-            std::cout << "[DEBUG] TypeChecker: Exiting generic context for '"
-                      << context.type_name << "'" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Exiting generic context for '{}'", context.type_name);
             _generic_context_stack.pop_back();
         }
     }
@@ -772,20 +771,19 @@ namespace Cryo
 
     Type *TypeChecker::resolve_type_with_generic_context(const std::string &type_string)
     {
-        std::cout << "[DEBUG] TypeChecker::resolve_type_with_generic_context: '" << type_string << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "resolve_type_with_generic_context: '{}'", type_string);
 
         // First check if this is a generic parameter
         if (is_generic_parameter(type_string))
         {
-            std::cout << "[DEBUG] TypeChecker: '" << type_string
-                      << "' is a generic parameter, creating generic type" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "'{}' is a generic parameter, creating generic type", type_string);
             return _type_context.get_generic_type(type_string);
         }
 
         // Check for tuple types first (before checking for generic syntax)
         if (type_string.front() == '(' && type_string.back() == ')')
         {
-            std::cout << "[DEBUG] TypeChecker: '" << type_string << "' is a tuple type, creating proper TupleType" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "'{}' is a tuple type, creating proper TupleType", type_string);
 
             // Parse tuple element types from "(type1, type2, type3)" syntax
             std::string inner = type_string.substr(1, type_string.length() - 2); // Remove parentheses
@@ -834,7 +832,7 @@ namespace Cryo
                     }
                     else
                     {
-                        std::cout << "[ERROR] Failed to resolve tuple element type: " << trimmed << std::endl;
+                        LOG_ERROR(Cryo::LogComponent::AST, "Failed to resolve tuple element type: {}", trimmed);
                         return nullptr;
                     }
                 }
@@ -850,13 +848,13 @@ namespace Cryo
         {
             clean_type_string = type_string.substr(1);
             is_reference = true;
-            std::cout << "[DEBUG] TypeChecker: Stripped reference prefix, checking template for: '" << clean_type_string << "'" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Stripped reference prefix, checking template for: '{}'", clean_type_string);
         }
 
         // Check for parameterized types like ptr<T>, Option<T>, Iterator<T>
         if (clean_type_string.find('<') != std::string::npos)
         {
-            std::cout << "[DEBUG] TypeChecker: Found generic type syntax in '" << clean_type_string << "'" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type syntax in '{}'", clean_type_string);
 
             // Parse the base type and type arguments
             size_t open_bracket = clean_type_string.find('<');
@@ -874,19 +872,19 @@ namespace Cryo
                 type_args_str.erase(0, type_args_str.find_first_not_of(" \t"));
                 type_args_str.erase(type_args_str.find_last_not_of(" \t") + 1);
 
-                std::cout << "[DEBUG] TypeChecker: base_type='" << base_type << "', type_args='" << type_args_str << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "base_type='{}', type_args='{}'", base_type, type_args_str);
 
                 // Check if base_type is a type alias first
-                std::cout << "[DEBUG] TypeChecker: Looking for type alias '" << base_type << "' in symbol table..." << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Looking for type alias '{}' in symbol table...", base_type);
                 TypedSymbol *alias_symbol = _symbol_table->lookup_symbol(base_type);
-                std::cout << "[DEBUG] TypeChecker: Symbol lookup result: " << (alias_symbol ? "found" : "not found") << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Symbol lookup result: {}", (alias_symbol ? "found" : "not found"));
                 if (alias_symbol && alias_symbol->type)
                 {
-                    std::cout << "[DEBUG] TypeChecker: Symbol type kind: " << static_cast<int>(alias_symbol->type->kind()) << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Symbol type kind: {}", static_cast<int>(alias_symbol->type->kind()));
                 }
                 if (alias_symbol && alias_symbol->type && alias_symbol->type->kind() == TypeKind::TypeAlias)
                 {
-                    std::cout << "[DEBUG] TypeChecker: Found type alias '" << base_type << "', expanding..." << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found type alias '{}', expanding...", base_type);
                     // For type aliases like AllocResult<T> = Result<T*, AllocError>
                     // We need to expand AllocResult<void> to Result<void*, AllocError>
 
@@ -894,13 +892,13 @@ namespace Cryo
                     if (auto alias_type = dynamic_cast<TypeAlias *>(alias_symbol->type))
                     {
                         std::string target_type_str = alias_type->target_type()->to_string();
-                        std::cout << "[DEBUG] TypeChecker: Alias target type: '" << target_type_str << "'" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Alias target type: '{}'", target_type_str);
 
                         // For now, expand manually for AllocResult
                         if (base_type == "AllocResult" && type_args_str == "void")
                         {
                             std::string expanded_type = "Result<void*, AllocError>";
-                            std::cout << "[DEBUG] TypeChecker: Expanding " << clean_type_string << " to " << expanded_type << std::endl;
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Expanding {} to {}", clean_type_string, expanded_type);
                             return resolve_type_with_generic_context(expanded_type);
                         }
                     }
@@ -909,13 +907,11 @@ namespace Cryo
                 // Check if any type arguments are generic parameters
                 bool has_generic_args = is_generic_parameter(type_args_str);
 
-                std::cout << "[DEBUG] TypeChecker: has_generic_args=" << has_generic_args
-                          << ", is_in_generic_context=" << is_in_generic_context() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "has_generic_args={}, is_in_generic_context={}", has_generic_args, is_in_generic_context());
 
                 if (has_generic_args)
                 {
-                    std::cout << "[DEBUG] TypeChecker: '" << type_string
-                              << "' contains generic parameters, deferring resolution" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "'{}' contains generic parameters, deferring resolution", type_string);
                     // For template definitions with generic parameters, we don't create concrete types yet
                     return _type_context.get_generic_type(type_string);
                 }
@@ -925,14 +921,15 @@ namespace Cryo
                     // This prevents tracking during template definition parsing
                     std::vector<std::string> concrete_types = parse_template_arguments(type_args_str);
 
-                    std::cout << "[DEBUG] TypeChecker: Tracking concrete instantiation: " << clean_type_string
-                              << " (base: " << base_type << ", args: " << type_args_str << ")" << std::endl;
-                    std::cout << "[DEBUG] TypeChecker: Parsed " << concrete_types.size() << " concrete types:";
-                    for (const auto &type : concrete_types)
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Tracking concrete instantiation: {} (base: {}, args: {})", clean_type_string, base_type, type_args_str);
+                    
+                    std::string types_str;
+                    for (size_t i = 0; i < concrete_types.size(); ++i)
                     {
-                        std::cout << " '" << type << "'";
+                        types_str += "'" + concrete_types[i] + "'";
+                        if (i < concrete_types.size() - 1) types_str += " ";
                     }
-                    std::cout << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Parsed {} concrete types: {}", concrete_types.size(), types_str);
 
                     // Track the base template (without &), but record the clean type name for instantiation
                     track_instantiation(base_type, concrete_types, clean_type_string, SourceLocation{});
@@ -941,7 +938,7 @@ namespace Cryo
         }
 
         // Fall back to direct type lookups without string parsing
-        std::cout << "[DEBUG] TypeChecker: Attempting direct type lookup for '" << type_string << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Attempting direct type lookup for '{}'", type_string);
 
         // Try primitive types
         if (type_string == "void")
@@ -989,10 +986,10 @@ namespace Cryo
             return struct_type;
 
         Type *class_type = _type_context.get_class_type(type_string);
-        std::cout << "[DEBUG] TypeChecker: get_class_type returned: " << (class_type ? "valid pointer" : "nullptr") << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
         if (class_type)
         {
-            std::cout << "[DEBUG] TypeChecker: class_type name='" << class_type->name() << "', kind=" << static_cast<int>(class_type->kind()) << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "class_type name='{}', kind={}", class_type->name(), static_cast<int>(class_type->kind()));
             return class_type;
         }
 
@@ -1009,7 +1006,7 @@ namespace Cryo
             return generic_type;
 
         // Try TypeContext's token-based type parsing as fallback
-        std::cout << "[DEBUG] TypeChecker: Not found in main symbols, checking TypeContext token-based parsing..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Not found in main symbols, checking TypeContext token-based parsing...");
 
         // Create a lexer from the type string for token-based parsing
         Lexer type_lexer(type_string);
@@ -1017,24 +1014,22 @@ namespace Cryo
         Type *parsed_type = _type_context.parse_type_from_tokens(type_lexer);
         if (parsed_type && parsed_type->kind() != TypeKind::Unknown)
         {
-            std::cout << "[DEBUG] TypeChecker: Successfully parsed '" << type_string
-                      << "' via TypeContext (token-based parsing)" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Successfully parsed '{}' via TypeContext (token-based parsing)", type_string);
             return parsed_type;
         }
 
         // Check namespaces
-        std::cout << "[DEBUG] TypeChecker: Not found in main symbols, checking namespaces..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Not found in main symbols, checking namespaces...");
 
         // Final fallback - use symbol table to search any namespace
         TypedSymbol *symbol = _symbol_table->lookup_symbol_in_any_namespace(type_string);
         if (symbol && symbol->type)
         {
-            std::cout << "[DEBUG] TypeChecker: Found '" << type_string
-                      << "' in namespaces" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found '{}' in namespaces", type_string);
             return symbol->type;
         }
 
-        std::cout << "[ERROR] TypeChecker: Failed to resolve type '" << type_string << "' - type not found" << std::endl;
+        LOG_ERROR(Cryo::LogComponent::AST, "Failed to resolve type '{}' - type not found", type_string);
         return nullptr;
     }
 
@@ -1044,33 +1039,33 @@ namespace Cryo
 
     Type *TypeChecker::resolve_type_from_tokens(Lexer &lexer)
     {
-        std::cout << "[DEBUG] TypeChecker: Using token-based type resolution" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Using token-based type resolution");
 
         // Delegate to TypeContext's token-based parsing
         Type *parsed_type = _type_context.parse_type_from_tokens(lexer);
         if (parsed_type)
         {
-            std::cout << "[DEBUG] TypeChecker: Successfully resolved type via tokens" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved type via tokens");
             return parsed_type;
         }
 
-        std::cout << "[DEBUG] TypeChecker: Token-based parsing failed" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Token-based parsing failed");
         return nullptr;
     }
 
     Type *TypeChecker::resolve_type_from_token_stream(const std::vector<Token> &tokens, size_t &index)
     {
-        std::cout << "[DEBUG] TypeChecker: Using token stream type resolution" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Using token stream type resolution");
 
         // Delegate to TypeContext's token stream parsing
         Type *parsed_type = _type_context.parse_type_from_token_stream(tokens, index);
         if (parsed_type)
         {
-            std::cout << "[DEBUG] TypeChecker: Successfully resolved type via token stream" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved type via token stream");
             return parsed_type;
         }
 
-        std::cout << "[DEBUG] TypeChecker: Token stream parsing failed" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Token stream parsing failed");
         return nullptr;
     }
 
@@ -1092,8 +1087,7 @@ namespace Cryo
             }
         }
 
-        std::cout << "[DEBUG] TypeChecker: Tracking instantiation '" << instantiated_name
-                  << "' (base: " << base_name << ")" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Tracking instantiation '{}' (base: {})", instantiated_name, base_name);
 
         _required_instantiations.emplace_back(base_name, concrete_types, instantiated_name, location);
     }
@@ -1108,8 +1102,8 @@ namespace Cryo
         // Store reference to main symbol table for scope lookups
         _main_symbol_table = &main_symbol_table;
 
-        std::cout << "Loading builtin symbols into TypeChecker..." << std::endl;
-        std::cout << "Main symbol table has " << main_symbol_table.get_symbols().size() << " symbols" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Loading builtin symbols into TypeChecker...");
+        LOG_DEBUG(Cryo::LogComponent::AST, "Main symbol table has {} symbols", main_symbol_table.get_symbols().size());
 
         // Copy all built-in function symbols from main symbol table
         int copied_count = 0;
@@ -1121,12 +1115,12 @@ namespace Cryo
                 copied_count++;
             }
         }
-        std::cout << "Copied " << copied_count << " builtin functions to TypeChecker symbol table" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} builtin functions to TypeChecker symbol table", copied_count);
     }
 
     void TypeChecker::load_intrinsic_symbols(const SymbolTable &main_symbol_table)
     {
-        std::cout << "Loading intrinsic symbols into TypeChecker..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Loading intrinsic symbols into TypeChecker...");
 
         // Copy only intrinsic symbols from main symbol table
         int copied_count = 0;
@@ -1136,15 +1130,15 @@ namespace Cryo
             {
                 _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
                 copied_count++;
-                std::cout << "Loaded intrinsic: " << name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Loaded intrinsic: {}", name);
             }
         }
-        std::cout << "Copied " << copied_count << " intrinsic symbols to TypeChecker symbol table" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} intrinsic symbols to TypeChecker symbol table", copied_count);
     }
 
     void TypeChecker::load_user_symbols(const SymbolTable &main_symbol_table)
     {
-        std::cout << "Loading user-defined symbols into TypeChecker..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Loading user-defined symbols into TypeChecker...");
 
         // Copy user-defined function symbols from main symbol table
         int copied_count = 0;
@@ -1154,21 +1148,21 @@ namespace Cryo
             {
                 _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
                 copied_count++;
-                std::cout << "Loaded user function: " << name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Loaded user function: {}", name);
             }
         }
-        std::cout << "Copied " << copied_count << " user symbols to TypeChecker symbol table" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} user symbols to TypeChecker symbol table", copied_count);
     }
 
     void TypeChecker::load_runtime_symbols(const SymbolTable &main_symbol_table)
     {
-        std::cout << "Loading runtime symbols into TypeChecker..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Loading runtime symbols into TypeChecker...");
 
         // Debug: Show all symbols in the main symbol table
-        std::cout << "DEBUG: Main symbol table contains " << main_symbol_table.get_symbols().size() << " symbols:" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Main symbol table contains {} symbols:", main_symbol_table.get_symbols().size());
         for (const auto &[name, symbol] : main_symbol_table.get_symbols())
         {
-            std::cout << "  - " << name << " (kind: " << static_cast<int>(symbol.kind) << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "  - {} (kind: {})", name, static_cast<int>(symbol.kind));
         }
 
         // Access runtime symbols from the std::Runtime namespace
@@ -1179,7 +1173,7 @@ namespace Cryo
         if (runtime_ns_it != namespaces.end())
         {
             const auto &runtime_symbols = runtime_ns_it->second;
-            std::cout << "DEBUG: Found std::Runtime namespace with " << runtime_symbols.size() << " symbols" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found std::Runtime namespace with {} symbols", runtime_symbols.size());
 
             // Only load symbols that have valid type information to avoid crashes
             for (const auto &[name, symbol] : runtime_symbols)
@@ -1189,30 +1183,30 @@ namespace Cryo
                     // Register the function globally without namespace qualification
                     _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
                     copied_count++;
-                    std::cout << "Loaded runtime function globally: " << name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Loaded runtime function globally: {}", name);
                 }
                 else if (symbol.kind == SymbolKind::Function)
                 {
-                    std::cout << "DEBUG: Skipping runtime function '" << name << "' - no type information (will be resolved via namespace during function calls)" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Skipping runtime function '{}' - no type information (will be resolved via namespace during function calls)", name);
                 }
             }
         }
         else
         {
-            std::cout << "DEBUG: std::Runtime namespace not found" << std::endl;
-            std::cout << "Available namespaces:" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "std::Runtime namespace not found");
+            LOG_DEBUG(Cryo::LogComponent::AST, "Available namespaces:");
             for (const auto &[ns_name, symbols] : namespaces)
             {
-                std::cout << "  - " << ns_name << " (" << symbols.size() << " symbols)" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "  - {} ({} symbols)", ns_name, symbols.size());
             }
         }
 
-        std::cout << "Copied " << copied_count << " runtime symbols to TypeChecker symbol table" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} runtime symbols to TypeChecker symbol table", copied_count);
 
         // Note: Runtime functions without type information will be resolved via namespace lookup
         // during function call analysis. This is actually the preferred approach since it allows
         // the type system to resolve the correct function signature at call sites.
-        std::cout << "NOTE: Runtime functions will be resolved via std::Runtime namespace during function calls" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "NOTE: Runtime functions will be resolved via std::Runtime namespace during function calls");
     }
 
     void TypeChecker::register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names)
@@ -1246,19 +1240,19 @@ namespace Cryo
 
     void TypeChecker::check_imported_modules(const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &imported_asts)
     {
-        std::cout << "[DEBUG] TypeChecker: Processing " << imported_asts.size() << " imported modules for AST node updates" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing {} imported modules for AST node updates", imported_asts.size());
         auto all_symbols = _symbol_table->get_symbols();
 
         for (const auto &[module_name, ast] : imported_asts)
         {
             if (!ast)
             {
-                std::cout << "[DEBUG] TypeChecker: Skipping null AST for module: " << module_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Skipping null AST for module: {}", module_name);
                 continue;
             }
 
-            std::cout << "[DEBUG] TypeChecker: Processing imported module: " << module_name << std::endl;
-            std::cout << "[DEBUG] TypeChecker: Module has " << ast->statements().size() << " statements" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Processing imported module: {}", module_name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Module has {} statements", ast->statements().size());
 
             // Visit all top-level declarations in the imported module
             // This will update existing symbols with their AST node references
@@ -1267,7 +1261,7 @@ namespace Cryo
             {
                 if (stmt)
                 {
-                    std::cout << "[DEBUG] TypeChecker: Processing statement " << (++stmt_count) << " in module " << module_name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Processing statement {} in module {}", (++stmt_count), module_name);
 
                     // Debug: What kind of statement is this?
                     const char *node_type = "unknown";
@@ -1469,29 +1463,29 @@ namespace Cryo
         TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(func_name);
         if (!existing_symbol)
         {
-            std::cout << "[DEBUG] Not found in main symbols, checking namespaces..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Not found in main symbols, checking namespaces...");
             TypedSymbol *ns_symbol = _symbol_table->lookup_symbol_in_any_namespace(func_name);
             if (ns_symbol)
             {
-                std::cout << "[DEBUG] Found '" << func_name << "' in namespaces!" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found '{}' in namespaces!", func_name);
                 existing_symbol = ns_symbol; // Use the namespaced symbol
             }
         }
         if (existing_symbol)
         {
             // Function already exists (likely from load_user_symbols), verify type compatibility
-            std::cout << "[DEBUG] Function '" << func_name << "' already exists" << std::endl;
-            std::cout << "[DEBUG] Existing type: " << (existing_symbol->type ? existing_symbol->type->to_string() : "null") << std::endl;
-            std::cout << "[DEBUG] New type: " << (func_type ? func_type->to_string() : "null") << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Function '{}' already exists", func_name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Existing type: {}", (existing_symbol->type ? existing_symbol->type->to_string() : "null"));
+            LOG_DEBUG(Cryo::LogComponent::AST, "New type: {}", (func_type ? func_type->to_string() : "null"));
             if (existing_symbol->type != func_type)
             {
-                std::cout << "[DEBUG] Types don't match - checking type equality more deeply" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Types don't match - checking type equality more deeply");
                 // Types might be functionally equivalent but different objects
                 // For now, allow redefinition if it's the same function
-                std::cout << "[DEBUG] Allowing redefinition for now" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing redefinition for now");
             }
             // Function exists with compatible type - update with AST node reference for LSP
-            std::cout << "[DEBUG] Updating existing function '" << func_name << "' with AST node reference" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Updating existing function '{}' with AST node reference", func_name);
             existing_symbol->function_node = &node;
         }
         else
@@ -1754,7 +1748,7 @@ namespace Cryo
             {
                 node.set_type(_current_struct_type->to_string());
                 node.set_resolved_type(_current_struct_type); // CRITICAL: Set resolved type for 'this'
-                std::cout << "[TypeChecker] Set 'this' type to: " << _current_struct_type->to_string() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Set 'this' type to: {}", _current_struct_type->to_string());
             }
             else
             {
@@ -2364,7 +2358,7 @@ namespace Cryo
 
     void TypeChecker::visit(MemberAccessNode &node)
     {
-        std::cout << "[TypeChecker] Visiting MemberAccessNode: member='" << node.member() << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Visiting MemberAccessNode: member='{}'", node.member());
 
         // Visit the object expression first
         if (node.object())
@@ -2377,11 +2371,11 @@ namespace Cryo
                                       ? node.object()->type().value()
                                       : "unknown";
 
-        std::cout << "[TypeChecker] Member '" << node.member() << "' - object_type: '" << object_type << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Member '{}' - object_type: '{}'", node.member(), object_type);
 
         if (object_type == "unknown")
         {
-            std::cout << "[TypeChecker] Object type is unknown, cannot resolve member access" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Object type is unknown, cannot resolve member access");
             node.set_type("unknown");
             return;
         }
@@ -2467,11 +2461,11 @@ namespace Cryo
         }
 
         // Look up field in struct field map
-        std::cout << "[TypeChecker] Looking up field '" << member_name << "' in struct '" << lookup_type << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in struct '{}'", member_name, lookup_type);
         auto struct_it = _struct_fields.find(lookup_type);
         if (struct_it != _struct_fields.end())
         {
-            std::cout << "[TypeChecker] Found struct '" << lookup_type << "' in _struct_fields with " << struct_it->second.size() << " fields" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found struct '{}' in _struct_fields with {} fields", lookup_type, struct_it->second.size());
             auto field_it = struct_it->second.find(member_name);
             if (field_it != struct_it->second.end())
             {
@@ -2482,18 +2476,17 @@ namespace Cryo
 
                 // CRITICAL: Store the resolved Type* so Codegen can access it
                 node.set_resolved_type(field_it->second);
-                std::cout << "[TypeChecker] Set resolved type for member '" << member_name
-                          << "' of '" << lookup_type << "' to: " << field_it->second->to_string() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Set resolved type for member '{}' of '{}' to: {}", member_name, lookup_type, field_it->second->to_string());
                 return;
             }
             else
             {
-                std::cout << "[TypeChecker] Field '" << member_name << "' NOT found in struct '" << lookup_type << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Field '{}' NOT found in struct '{}'", member_name, lookup_type);
             }
         }
         else
         {
-            std::cout << "[TypeChecker] Struct '" << lookup_type << "' NOT found in _struct_fields map" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_fields map", lookup_type);
         }
 
         // Look up method in struct method map
@@ -2526,8 +2519,7 @@ namespace Cryo
 
         // Check for private methods within the same class/struct context
         // Look in the private method registry
-        std::cout << "[DEBUG] Looking up private method '" << member_name
-                  << "' in lookup_type '" << lookup_type << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Looking up private method '{}' in lookup_type '{}'", member_name, lookup_type);
 
         // First check if we're in a class context and the lookup_type matches current class
         if (!_current_struct_name.empty() && lookup_type == _current_struct_name)
@@ -2538,7 +2530,7 @@ namespace Cryo
                 auto private_method_it = private_method_struct_it->second.find(member_name);
                 if (private_method_it != private_method_struct_it->second.end())
                 {
-                    std::cout << "[DEBUG] Found private method '" << member_name << "' in current class '" << lookup_type << "'" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' in current class '{}'", member_name, lookup_type);
                     Type *method_type = private_method_it->second;
                     if (method_type->kind() == TypeKind::Function)
                     {
@@ -2561,7 +2553,7 @@ namespace Cryo
 
             // If not found in registered methods, check if we're currently processing the class definition
             // In this case, allow the private method call to proceed with hardcoded signatures
-            std::cout << "[DEBUG] Allowing private method '" << member_name << "' in current class context '" << lookup_type << "'" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing private method '{}' in current class context '{}'", member_name, lookup_type);
 
             // Provide correct signatures for known private methods
             if (member_name == "align_size" && lookup_type == "HeapManager")
@@ -2586,11 +2578,11 @@ namespace Cryo
         auto private_method_struct_it = _private_struct_methods.find(lookup_type);
         if (private_method_struct_it != _private_struct_methods.end())
         {
-            std::cout << "[DEBUG] Found private methods for type '" << lookup_type << "'" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found private methods for type '{}'", lookup_type);
             auto private_method_it = private_method_struct_it->second.find(member_name);
             if (private_method_it != private_method_struct_it->second.end())
             {
-                std::cout << "[DEBUG] Found private method '" << member_name << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}'", member_name);
                 Type *method_type = private_method_it->second;
                 if (method_type->kind() == TypeKind::Function)
                 {
@@ -2611,12 +2603,12 @@ namespace Cryo
             }
             else
             {
-                std::cout << "[DEBUG] Private method '" << member_name << "' not found in type '" << lookup_type << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Private method '{}' not found in type '{}'", member_name, lookup_type);
             }
         }
         else
         {
-            std::cout << "[DEBUG] No private methods found for type '" << lookup_type << "'" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "No private methods found for type '{}'", lookup_type);
         }
 
         // For primitive types, also check if there are functions available in global scope
@@ -2679,19 +2671,19 @@ namespace Cryo
         {
             if (member_name == "size")
             {
-                std::cout << "[DEBUG] Found template method 'size' in Array<T>" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found template method 'size' in Array<T>");
                 node.set_type("u64");
                 return;
             }
             else if (member_name == "push")
             {
-                std::cout << "[DEBUG] Found template method 'push' in Array<T>" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found template method 'push' in Array<T>");
                 node.set_type("void");
                 return;
             }
             else if (member_name == "get")
             {
-                std::cout << "[DEBUG] Found template method 'get' in Array<T>" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found template method 'get' in Array<T>");
                 // Extract the element type from Array<T>
                 size_t start = object_type.find('<');
                 size_t end = object_type.find('>');
@@ -2842,15 +2834,16 @@ namespace Cryo
 
             // For other static methods, use unknown type for now
             node.set_type("unknown");
-            // std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
-            // << " -> unknown (trait bounds: ";
+            
+            // Build trait bounds list for logging
+            std::string trait_bounds;
             for (size_t i = 0; i < trait_names.size(); ++i)
             {
                 if (i > 0)
-                    std::cout << ", ";
-                std::cout << trait_names[i];
+                    trait_bounds += ", ";
+                trait_bounds += trait_names[i];
             }
-            std::cout << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Resolved generic static method: {}::{} -> unknown (trait bounds: {})", scope_name, member_name, trait_bounds);
             return;
         }
 
@@ -2864,7 +2857,7 @@ namespace Cryo
         }
 
         // Look up the scope type (should be an enum type)
-        std::cout << "[DEBUG] Looking up scope symbol '" << base_scope_name << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Looking up scope symbol '{}'", base_scope_name);
 
         // Check if it's a generic type pattern like Option<T>
         TypedSymbol *scope_symbol = nullptr;
@@ -2885,7 +2878,7 @@ namespace Cryo
                 Symbol *main_symbol = _main_symbol_table->lookup_symbol(base_scope_name);
                 if (main_symbol && main_symbol->data_type)
                 {
-                    std::cout << "[DEBUG] Found generic type '" << base_scope_name << "' in main symbol table" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' in main symbol table", base_scope_name);
                     // For enum types, allow the scope resolution to proceed
                     return; // Found the type, proceed with resolution
                 }
@@ -2894,7 +2887,7 @@ namespace Cryo
                 main_symbol = _main_symbol_table->lookup_symbol_in_any_namespace(base_scope_name);
                 if (main_symbol && main_symbol->data_type)
                 {
-                    std::cout << "[DEBUG] Found generic type '" << base_scope_name << "' in main symbol table namespace" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' in main symbol table namespace", base_scope_name);
                     return; // Found the type, proceed with resolution
                 }
             }
@@ -2905,7 +2898,7 @@ namespace Cryo
                 ParameterizedType *template_type = _type_registry->get_template(base_scope_name);
                 if (template_type)
                 {
-                    std::cout << "[DEBUG] Found generic type '" << base_scope_name << "' in type registry" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' in type registry", base_scope_name);
                     return; // Found the type, proceed with resolution
                 }
             }
@@ -2914,7 +2907,7 @@ namespace Cryo
             // For common types like Option, Result etc, allow them to be resolved
             if (!scope_symbol && (base_scope_name == "Option" || base_scope_name == "Result" || base_scope_name == "Array"))
             {
-                std::cout << "[DEBUG] Allowing forward reference for common generic type '" << base_scope_name << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing forward reference for common generic type '{}'", base_scope_name);
                 return; // Allow the scope resolution to proceed
             }
         }
@@ -2934,7 +2927,7 @@ namespace Cryo
                 ParameterizedType *template_type = _type_registry->get_template(base_scope_name);
                 if (template_type)
                 {
-                    std::cout << "[DEBUG] Found generic type '" << base_scope_name << "' in type registry (non-generic case)" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' in type registry (non-generic case)", base_scope_name);
                     return; // Found the type, proceed with resolution
                 }
             }
@@ -2942,7 +2935,7 @@ namespace Cryo
 
         if (!scope_symbol)
         {
-            std::cout << "[DEBUG] Scope symbol '" << base_scope_name << "' not found" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Scope symbol '{}' not found", base_scope_name);
             std::string qualified_name = scope_name + "::" + member_name;
             report_undefined_symbol(node.location(), qualified_name);
             node.set_type(_type_context.get_unknown_type()->to_string());
@@ -3250,15 +3243,18 @@ namespace Cryo
         {
             // For now, create a type alias that represents the generic template
             // In a full implementation, we'd need proper template system with type parameter substitution
-            // std::cout << "[DEBUG] Generic type alias: " << alias_name << "<";
+            // LOG_DEBUG(Cryo::LogComponent::AST, "Generic type alias: {} = {}", alias_name, node.target_type());
             const auto &params = node.generic_params();
+            
+            // Build parameter list for logging
+            std::string param_list;
             for (size_t i = 0; i < params.size(); ++i)
             {
                 if (i > 0)
-                    std::cout << ", ";
-                std::cout << params[i];
+                    param_list += ", ";
+                param_list += params[i];
             }
-            std::cout << "> = " << node.target_type() << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Generic type alias: {}<{}> = {}", alias_name, param_list, node.target_type());
 
             // Create a generic type alias - we'll use the full signature as the alias name for now
             std::string full_signature = alias_name + "<";
@@ -3605,8 +3601,7 @@ namespace Cryo
             }
             catch (...)
             {
-                std::cerr << "[TypeChecker] ERROR: Corrupt type pointer for field '" << field_name
-                          << "', attempting to re-resolve from annotation" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "ERROR: Corrupt type pointer for field '{}', attempting to re-resolve from annotation", field_name);
                 field_type = nullptr; // Mark as needing resolution
             }
         }
@@ -3615,23 +3610,20 @@ namespace Cryo
         if (!field_type || field_type->kind() == TypeKind::Unknown || field_type_str.empty())
         {
             std::string type_annotation = node.type_annotation();
-            std::cout << "[TypeChecker] Re-resolving field '" << field_name
-                      << "' type from annotation: " << type_annotation << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Re-resolving field '{}' type from annotation: {}", field_name, type_annotation);
 
             field_type = resolve_type_with_generic_context(type_annotation);
             if (field_type && field_type->kind() != TypeKind::Unknown)
             {
                 node.set_resolved_type(field_type);
                 field_type_str = field_type->name();
-                std::cout << "[TypeChecker] Successfully re-resolved field type to: " << field_type_str << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Successfully re-resolved field type to: {}", field_type_str);
             }
         }
 
         // Debug: Check generic context state when processing struct fields
-        std::cout << "[DEBUG] Processing struct field '" << field_name
-                  << "' with resolved type: " << field_type_str
-                  << ", is_in_generic_context: " << is_in_generic_context()
-                  << ", generic_context_stack_size: " << _generic_context_stack.size() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing struct field '{}' with resolved type: {}, is_in_generic_context: {}, generic_context_stack_size: {}", 
+                  field_name, field_type_str, is_in_generic_context(), _generic_context_stack.size());
 
         if (field_type && field_type->kind() != TypeKind::Unknown)
         {
@@ -3778,8 +3770,7 @@ namespace Cryo
                 // Register in appropriate registry based on visibility
                 if (node.visibility() == Visibility::Private)
                 {
-                    std::cout << "[DEBUG] Registering private method '" << method_name
-                              << "' for struct '" << _current_struct_name << "'" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
                     _private_struct_methods[_current_struct_name][method_name] = func_type;
                 }
                 else
@@ -3950,31 +3941,31 @@ namespace Cryo
             // Check if RHS is void*
             if (rhs_str == "void*")
             {
-                std::cout << "[TypeChecker] Allowing implicit conversion from void* to " << lhs_str << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from void* to {}", lhs_str);
                 return true;
             }
         }
 
         if (rhs_type->kind() == TypeKind::Pointer && lhs_type->kind() == TypeKind::Pointer)
         {
-            std::cout << "[TypeChecker] Both types are pointers, checking for void* conversion" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Both types are pointers, checking for void* conversion");
             auto rhs_ptr = static_cast<PointerType *>(rhs_type);
             auto lhs_ptr = static_cast<PointerType *>(lhs_type);
 
             // Check if RHS is void* (void pointer can convert to any pointer)
             auto rhs_pointee = rhs_ptr->pointee_type();
-            std::cout << "[TypeChecker] RHS pointee type: " << (rhs_pointee ? rhs_pointee->to_string() : "NULL")
-                      << " (kind=" << (rhs_pointee ? std::to_string(static_cast<int>(rhs_pointee->kind())) : "N/A") << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "RHS pointee type: {} (kind={})", 
+                      (rhs_pointee ? rhs_pointee->to_string() : "NULL"),
+                      (rhs_pointee ? std::to_string(static_cast<int>(rhs_pointee->kind())) : "N/A"));
 
             if (rhs_pointee && rhs_pointee->kind() == TypeKind::Void)
             {
-                std::cout << "[TypeChecker] Allowing implicit conversion from void* to "
-                          << lhs_type->to_string() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from void* to {}", lhs_type->to_string());
                 return true;
             }
             else
             {
-                std::cout << "[TypeChecker] RHS is not void*, cannot do implicit conversion" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "RHS is not void*, cannot do implicit conversion");
             }
         }
 

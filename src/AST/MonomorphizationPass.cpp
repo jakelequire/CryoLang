@@ -417,57 +417,54 @@ namespace Cryo
         // Validate parameter count
         if (generic_params.size() != instantiation.concrete_types.size())
         {
-            std::cerr << "[MonomorphizationPass] ERROR: Parameter count mismatch for "
-                      << template_node.name() << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter count mismatch for {}", template_node.name());
             return nullptr;
         }
 
-        std::cout << "[MonomorphizationPass] Creating type substitutions map..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating type substitutions map...");
         // Create type substitutions map
         std::unordered_map<std::string, std::string> type_substitutions;
         for (size_t i = 0; i < generic_params.size(); ++i)
         {
-            std::cout << "[MonomorphizationPass] Processing parameter " << i << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Processing parameter {}", i);
 
             if (!generic_params[i])
             {
-                std::cerr << "[MonomorphizationPass] ERROR: Generic parameter " << i << " is null!" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Generic parameter {} is null!", i);
                 return nullptr;
             }
 
-            std::cout << "[MonomorphizationPass] Getting parameter name..." << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Getting parameter name...");
             std::string param_name = generic_params[i]->name();
-            std::cout << "[MonomorphizationPass] Parameter name: " << param_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter name: {}", param_name);
 
             if (i >= instantiation.concrete_types.size())
             {
-                std::cerr << "[MonomorphizationPass] ERROR: Not enough concrete types for parameter " << i << std::endl;
+                LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Not enough concrete types for parameter {}", i);
                 return nullptr;
             }
 
             type_substitutions[param_name] = instantiation.concrete_types[i];
-            std::cout << "[MonomorphizationPass] Substitution: " << param_name
-                      << " -> " << instantiation.concrete_types[i] << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substitution: {} -> {}", param_name, instantiation.concrete_types[i]);
         }
 
         // Clone the template node
         // Note: This is a simplified clone - in practice you'd need a deep copy visitor
-        std::cout << "[MonomorphizationPass] About to create specialized enum..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: About to create specialized enum...");
 
         std::string mangled_name = generate_mangled_name(instantiation.base_name, instantiation.concrete_types);
-        std::cout << "[MonomorphizationPass] Generated mangled name: " << mangled_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Generated mangled name: {}", mangled_name);
 
         auto specialized = std::make_unique<EnumDeclarationNode>(
             template_node.location(),
             mangled_name);
 
-        std::cout << "[MonomorphizationPass] Created EnumDeclarationNode successfully" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Created EnumDeclarationNode successfully");
 
         // TODO: Implement deep copying of the enum body with type substitution
         // This would involve copying all enum variants with substituted types
 
-        std::cout << "[MonomorphizationPass] Generated specialized enum: "
-                  << specialized->name() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Generated specialized enum: {}", specialized->name());
 
         return specialized;
     }
@@ -477,16 +474,14 @@ namespace Cryo
         const FunctionDeclarationNode& template_node,
         const GenericInstantiation& instantiation)
     {
-        std::cout << "[MonomorphizationPass] Specializing function "
-                  << template_node.name() << " -> " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing function {} -> {}", template_node.name(), instantiation.instantiated_name);
 
         const auto& generic_params = template_node.generic_parameters();
 
         // Validate parameter count
         if (generic_params.size() != instantiation.concrete_types.size())
         {
-            std::cerr << "[MonomorphizationPass] ERROR: Parameter count mismatch for "
-                      << template_node.name() << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter count mismatch for {}", template_node.name());
             return nullptr;
         }
 
@@ -496,8 +491,7 @@ namespace Cryo
         {
             std::string param_name = generic_params[i]->name();
             type_substitutions[param_name] = instantiation.concrete_types[i];
-            std::cout << "[MonomorphizationPass] Substitution: " << param_name
-                      << " -> " << instantiation.concrete_types[i] << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substitution: {} -> {}", param_name, instantiation.concrete_types[i]);
         }
 
         // Clone the template node
@@ -515,8 +509,7 @@ namespace Cryo
         // 2. Copying return type with substitution
         // 3. Copying function body with substituted types
 
-        std::cout << "[MonomorphizationPass] Generated specialized function: "
-                  << specialized->name() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Generated specialized function: {}", specialized->name());
 
         return specialized;
     }
@@ -530,7 +523,7 @@ namespace Cryo
         // This would involve visiting all nodes and replacing type references
 
         // For now, this is a placeholder
-        std::cout << "[MonomorphizationPass] TODO: Implement type substitution for node" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: TODO: Implement type substitution for node");
     }
 
     std::string MonomorphizationPass::substitute_type_in_string(
@@ -546,8 +539,7 @@ namespace Cryo
             if (result == array_pattern)
             {
                 result = concrete_type + "[]";
-                std::cout << "[MonomorphizationPass] Array type substitution: "
-                          << array_pattern << " -> " << result << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Array type substitution: {} -> {}", array_pattern, result);
                 return result;
             }
         }
@@ -563,8 +555,7 @@ namespace Cryo
             {
                 result.replace(pos, search_pattern.length(), replacement);
                 pos += replacement.length();
-                std::cout << "[MonomorphizationPass] Parameterized type substitution: "
-                          << generic_param << " -> " << concrete_type << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Parameterized type substitution: {} -> {}", generic_param, concrete_type);
             }
         }
 
@@ -574,8 +565,7 @@ namespace Cryo
             if (result == generic_param)
             {
                 result = concrete_type;
-                std::cout << "[MonomorphizationPass] Simple type substitution: "
-                          << generic_param << " -> " << concrete_type << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Simple type substitution: {} -> {}", generic_param, concrete_type);
                 break;
             }
         }
@@ -587,19 +577,16 @@ namespace Cryo
         const TemplateRegistry::TemplateMetadata &metadata,
         const GenericInstantiation &instantiation)
     {
-        std::cout << "[MonomorphizationPass] Specializing enum from metadata: "
-                  << metadata.name << " -> " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing enum from metadata: {} -> {}", metadata.name, instantiation.instantiated_name);
 
         // Validate parameter count using metadata
         if (metadata.generic_parameter_names.size() != instantiation.concrete_types.size())
         {
-            std::cerr << "[MonomorphizationPass] ERROR: Parameter count mismatch for "
-                      << metadata.name << " (metadata: " << metadata.generic_parameter_names.size()
-                      << ", instantiation: " << instantiation.concrete_types.size() << ")" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter count mismatch for {} (metadata: {}, instantiation: {})", metadata.name, metadata.generic_parameter_names.size(), instantiation.concrete_types.size());
             return nullptr;
         }
 
-        std::cout << "[MonomorphizationPass] Creating type substitutions map from metadata..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating type substitutions map from metadata...");
         // Create type substitutions map using metadata
         std::unordered_map<std::string, std::string> type_substitutions;
         for (size_t i = 0; i < metadata.generic_parameter_names.size(); ++i)
@@ -608,18 +595,17 @@ namespace Cryo
             const std::string &concrete_type = instantiation.concrete_types[i];
 
             type_substitutions[param_name] = concrete_type;
-            std::cout << "[MonomorphizationPass] Substitution: " << param_name
-                      << " -> " << concrete_type << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substitution: {} -> {}", param_name, concrete_type);
         }
 
         // Create a basic specialized enum (for now, just a stub)
         // TODO: Implement full enum specialization with variants
-        std::cout << "[MonomorphizationPass] Creating specialized enum: " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating specialized enum: {}", instantiation.instantiated_name);
 
         auto specialized = std::make_unique<EnumDeclarationNode>(
             SourceLocation{}, instantiation.instantiated_name);
 
-        std::cout << "[MonomorphizationPass] Specialized enum created successfully" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialized enum created successfully");
         return specialized;
     }
 
@@ -627,36 +613,32 @@ namespace Cryo
         const TemplateRegistry::TemplateMetadata &metadata,
         const GenericInstantiation &instantiation)
     {
-        std::cout << "[MonomorphizationPass] Specializing class from metadata: "
-                  << metadata.name << " -> " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing class from metadata: {} -> {}", metadata.name, instantiation.instantiated_name);
 
         // Validate parameter count
         if (metadata.generic_parameter_names.size() != instantiation.concrete_types.size())
         {
-            std::cerr << "[MonomorphizationPass] ERROR: Parameter count mismatch for "
-                      << metadata.name << ". Expected " << metadata.generic_parameter_names.size()
-                      << ", got " << instantiation.concrete_types.size() << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter count mismatch for {}. Expected {}, got {}", metadata.name, metadata.generic_parameter_names.size(), instantiation.concrete_types.size());
             return nullptr;
         }
 
         // Create type substitutions map from metadata
-        std::cout << "[MonomorphizationPass] Creating type substitutions map from metadata..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating type substitutions map from metadata...");
         std::unordered_map<std::string, std::string> type_substitutions;
         for (size_t i = 0; i < metadata.generic_parameter_names.size(); ++i)
         {
             type_substitutions[metadata.generic_parameter_names[i]] = instantiation.concrete_types[i];
-            std::cout << "[MonomorphizationPass] Substitution: "
-                      << metadata.generic_parameter_names[i] << " -> " << instantiation.concrete_types[i] << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substitution: {} -> {}", metadata.generic_parameter_names[i], instantiation.concrete_types[i]);
         }
 
         // Create a basic specialized class (for now, just a stub)
         // TODO: Implement full class specialization with fields and methods
-        std::cout << "[MonomorphizationPass] Creating specialized class: " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating specialized class: {}", instantiation.instantiated_name);
 
         auto specialized = std::make_unique<ClassDeclarationNode>(
             SourceLocation{}, instantiation.instantiated_name);
 
-        std::cout << "[MonomorphizationPass] Specialized class created successfully" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialized class created successfully");
         return specialized;
     }
 
@@ -664,36 +646,32 @@ namespace Cryo
         const TemplateRegistry::TemplateMetadata &metadata,
         const GenericInstantiation &instantiation)
     {
-        std::cout << "[MonomorphizationPass] Specializing struct from metadata: "
-                  << metadata.name << " -> " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing struct from metadata: {} -> {}", metadata.name, instantiation.instantiated_name);
 
         // Validate parameter count
         if (metadata.generic_parameter_names.size() != instantiation.concrete_types.size())
         {
-            std::cerr << "[MonomorphizationPass] ERROR: Parameter count mismatch for "
-                      << metadata.name << ". Expected " << metadata.generic_parameter_names.size()
-                      << ", got " << instantiation.concrete_types.size() << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter count mismatch for {}. Expected {}, got {}", metadata.name, metadata.generic_parameter_names.size(), instantiation.concrete_types.size());
             return nullptr;
         }
 
         // Create type substitutions map from metadata
-        std::cout << "[MonomorphizationPass] Creating type substitutions map from metadata..." << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating type substitutions map from metadata...");
         std::unordered_map<std::string, std::string> type_substitutions;
         for (size_t i = 0; i < metadata.generic_parameter_names.size(); ++i)
         {
             type_substitutions[metadata.generic_parameter_names[i]] = instantiation.concrete_types[i];
-            std::cout << "[MonomorphizationPass] Substitution: "
-                      << metadata.generic_parameter_names[i] << " -> " << instantiation.concrete_types[i] << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substitution: {} -> {}", metadata.generic_parameter_names[i], instantiation.concrete_types[i]);
         }
 
         // Create a basic specialized struct (for now, just a stub)
         // TODO: Implement full struct specialization with fields and methods
-        std::cout << "[MonomorphizationPass] Creating specialized struct: " << instantiation.instantiated_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating specialized struct: {}", instantiation.instantiated_name);
 
         auto specialized = std::make_unique<StructDeclarationNode>(
             SourceLocation{}, instantiation.instantiated_name);
 
-        std::cout << "[MonomorphizationPass] Specialized struct created successfully" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialized struct created successfully");
         return specialized;
     }
 
@@ -722,8 +700,7 @@ namespace Cryo
             return nullptr;
         }
 
-        std::cout << "[MonomorphizationPass] Cloning method body with "
-                  << original_body->statements().size() << " statements" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Cloning method body with {} statements", original_body->statements().size());
 
         // Create a new block statement
         auto cloned_body = std::make_unique<BlockStatementNode>(original_body->location());
@@ -740,13 +717,12 @@ namespace Cryo
                 }
                 else
                 {
-                    std::cout << "[MonomorphizationPass] WARNING: Failed to clone statement in method body" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Failed to clone statement in method body");
                 }
             }
         }
 
-        std::cout << "[MonomorphizationPass] Successfully cloned method body with "
-                  << cloned_body->statements().size() << " statements" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Successfully cloned method body with {} statements", cloned_body->statements().size());
 
         return cloned_body;
     }
@@ -856,8 +832,7 @@ namespace Cryo
 
         // Add more statement types as needed
         default:
-            std::cout << "[MonomorphizationPass] WARNING: Unsupported statement type for cloning: "
-                      << static_cast<int>(original_statement->kind()) << std::endl;
+            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Unsupported statement type for cloning: {}", static_cast<int>(original_statement->kind()));
             break;
         }
 
@@ -1006,8 +981,7 @@ namespace Cryo
 
         // Add more expression types as needed (simplified for now)
         default:
-            std::cout << "[MonomorphizationPass] WARNING: Unsupported expression type for cloning: "
-                      << static_cast<int>(original_expr->kind()) << std::endl;
+            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Unsupported expression type for cloning: {}", static_cast<int>(original_expr->kind()));
             // For unsupported expressions, return a simple identifier as fallback
             return std::make_unique<IdentifierNode>(
                 NodeKind::Identifier,
@@ -1025,7 +999,7 @@ namespace Cryo
 
         if (!_type_checker)
         {
-            std::cerr << "[MonomorphizationPass] ERROR: TypeChecker not available for type resolution" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: TypeChecker not available for type resolution");
             return type_substitutions;
         }
 
@@ -1051,8 +1025,7 @@ namespace Cryo
                 {
                     // Access through TypeChecker is preferred, but as fallback create basic type
                     // Note: This needs to be improved to use proper TypeContext access
-                    std::cerr << "[MonomorphizationPass] WARNING: Using fallback type resolution for: "
-                              << type_string << std::endl;
+                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Using fallback type resolution for: {}", type_string);
                 }
 
                 if (resolved_type)
@@ -1064,8 +1037,7 @@ namespace Cryo
                 }
                 else
                 {
-                    std::cerr << "[MonomorphizationPass] WARNING: Could not resolve type '"
-                              << type_string << "' for parameter '" << param_name << "'" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Could not resolve type '{}' for parameter '{}'", type_string, param_name);
                 }
             }
         }
