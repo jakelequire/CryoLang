@@ -2,6 +2,7 @@
 #include "AST/SymbolTable.hpp"
 #include "AST/Type.hpp"
 #include "AST/TypeChecker.hpp"
+#include "Utils/Logger.hpp"
 
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -166,8 +167,8 @@ namespace Cryo::Codegen
                 metadata.namespace_scope = symbol->scope;
                 metadata.is_variadic = false; // TODO: Add variadic info to FunctionType if needed
 
-                std::cout << "[FunctionRegistry] Classified '" << function_name
-                          << "' from symbol table as category " << static_cast<int>(metadata.category) << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' from symbol table as category {}",
+                          function_name, static_cast<int>(metadata.category));
 
                 return metadata;
             }
@@ -201,8 +202,8 @@ namespace Cryo::Codegen
             if (last_scope != std::string::npos)
             {
                 runtime_name = function_name.substr(last_scope + 2);
-                std::cout << "[FunctionRegistry] Extracted runtime name '" << runtime_name
-                          << "' from qualified name '" << function_name << "'" << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Extracted runtime name '{}' from qualified name '{}'",
+                          runtime_name, function_name);
             }
         }
 
@@ -257,10 +258,8 @@ namespace Cryo::Codegen
         metadata.runtime_name = runtime_name;
         metadata.namespace_scope = resolved_namespace;
 
-        std::cout << "[FunctionRegistry] Classified '" << function_name
-                  << "' from namespace '" << resolved_namespace
-                  << "' as category " << static_cast<int>(metadata.category)
-                  << " with runtime name '" << runtime_name << "'" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' from namespace '{}' as category {} with runtime name '{}'",
+                  function_name, resolved_namespace, static_cast<int>(metadata.category), runtime_name);
 
         return metadata;
     }
@@ -279,8 +278,7 @@ namespace Cryo::Codegen
             metadata.runtime_name = function_name;
             metadata.namespace_scope = "intrinsic";
 
-            std::cout << "[FunctionRegistry] Classified '" << function_name
-                      << "' as intrinsic function" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' as intrinsic function", function_name);
 
             return metadata;
         }
@@ -303,21 +301,20 @@ namespace Cryo::Codegen
         std::string enum_name = function_name.substr(0, scope_pos);
         std::string variant_name = function_name.substr(scope_pos + 2);
 
-        std::cout << "[FunctionRegistry] Checking enum constructor: " << enum_name
-                  << "::" << variant_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking enum constructor: {}::{}", enum_name, variant_name);
 
         // Look up the enum type in the type context
         Cryo::Type *enum_type = _type_context.lookup_enum_type(enum_name);
         if (!enum_type)
         {
-            std::cout << "[FunctionRegistry] No enum type found for: " << enum_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No enum type found for: {}", enum_name);
             return metadata; // Not an enum
         }
 
         Cryo::EnumType *cryo_enum_type = dynamic_cast<Cryo::EnumType *>(enum_type);
         if (!cryo_enum_type)
         {
-            std::cout << "[FunctionRegistry] Type is not an enum: " << enum_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type is not an enum: {}", enum_name);
             return metadata; // Not a valid enum type
         }
 
@@ -327,12 +324,11 @@ namespace Cryo::Codegen
 
         if (!variant_found)
         {
-            std::cout << "[FunctionRegistry] Variant " << variant_name
-                      << " not found in enum " << enum_name << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Variant {} not found in enum {}", variant_name, enum_name);
             return metadata; // Variant doesn't exist
         }
 
-        std::cout << "[FunctionRegistry] Detected enum constructor: " << function_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected enum constructor: {}", function_name);
 
         // This is an enum constructor
         metadata.category = FunctionCategory::StructFunction;

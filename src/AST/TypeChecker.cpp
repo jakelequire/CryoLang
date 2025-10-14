@@ -922,12 +922,13 @@ namespace Cryo
                     std::vector<std::string> concrete_types = parse_template_arguments(type_args_str);
 
                     LOG_DEBUG(Cryo::LogComponent::AST, "Tracking concrete instantiation: {} (base: {}, args: {})", clean_type_string, base_type, type_args_str);
-                    
+
                     std::string types_str;
                     for (size_t i = 0; i < concrete_types.size(); ++i)
                     {
                         types_str += "'" + concrete_types[i] + "'";
-                        if (i < concrete_types.size() - 1) types_str += " ";
+                        if (i < concrete_types.size() - 1)
+                            types_str += " ";
                     }
                     LOG_DEBUG(Cryo::LogComponent::AST, "Parsed {} concrete types: {}", concrete_types.size(), types_str);
 
@@ -2732,9 +2733,8 @@ namespace Cryo
                         type_name = "function"; // Or we could try to infer from the AST
                     }
                     node.set_type(type_name);
-                    // std::cout << "[DEBUG] Resolved namespace symbol: " << scope_name << "::" << member_name
-                    // << " with generic type: " << type_name
-                    // << " (context: " << _current_namespace << ")" << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Resolved namespace symbol: {}::{} with generic type: {} (context: {})",
+                              scope_name, member_name, type_name, _current_namespace);
                 }
                 return;
             }
@@ -2761,8 +2761,7 @@ namespace Cryo
                     if (member_name == "write" && class_name == "IO")
                     {
                         node.set_type("i64"); // write returns i64
-                        // std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
-                        // << " -> i64" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved static method: {}::{} -> i64", scope_name, member_name);
                         return;
                     }
                     else if (member_name == "read" && class_name == "IO")
@@ -2780,22 +2779,20 @@ namespace Cryo
                     else if (member_name == "close" && class_name == "IO")
                     {
                         node.set_type("int"); // close returns int
-                        // std::cout << "[DEBUG] Resolved static method: " << scope_name << "::" << member_name
-                        // << " -> int" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved static method: {}::{} -> int", scope_name, member_name);
                         return;
                     }
                     else
                     {
                         // Generic static method - assume it exists
                         node.set_type("unknown");
-                        // std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
-                        // << " -> unknown" << std::endl;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved generic static method: {}::{} -> unknown", scope_name, member_name);
                         return;
                     }
                 }
                 else
                 {
-                    // std::cout << "[DEBUG] Class " << class_name << " not found in namespace " << namespace_part << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Class {} not found in namespace {}", class_name, namespace_part);
                 }
             }
         }
@@ -2827,14 +2824,13 @@ namespace Cryo
             if (member_name == "get_default")
             {
                 node.set_type(scope_name); // Return type is T
-                // std::cout << "[DEBUG] Resolved generic static method: " << scope_name << "::" << member_name
-                // << " -> " << scope_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved generic static method: {}::{} -> {}", scope_name, member_name, scope_name);
                 return;
             }
 
             // For other static methods, use unknown type for now
             node.set_type("unknown");
-            
+
             // Build trait bounds list for logging
             std::string trait_bounds;
             for (size_t i = 0; i < trait_names.size(); ++i)
@@ -3245,7 +3241,7 @@ namespace Cryo
             // In a full implementation, we'd need proper template system with type parameter substitution
             // LOG_DEBUG(Cryo::LogComponent::AST, "Generic type alias: {} = {}", alias_name, node.target_type());
             const auto &params = node.generic_params();
-            
+
             // Build parameter list for logging
             std::string param_list;
             for (size_t i = 0; i < params.size(); ++i)
@@ -3622,7 +3618,7 @@ namespace Cryo
         }
 
         // Debug: Check generic context state when processing struct fields
-        LOG_DEBUG(Cryo::LogComponent::AST, "Processing struct field '{}' with resolved type: {}, is_in_generic_context: {}, generic_context_stack_size: {}", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing struct field '{}' with resolved type: {}, is_in_generic_context: {}, generic_context_stack_size: {}",
                   field_name, field_type_str, is_in_generic_context(), _generic_context_stack.size());
 
         if (field_type && field_type->kind() != TypeKind::Unknown)
@@ -3954,7 +3950,7 @@ namespace Cryo
 
             // Check if RHS is void* (void pointer can convert to any pointer)
             auto rhs_pointee = rhs_ptr->pointee_type();
-            LOG_DEBUG(Cryo::LogComponent::AST, "RHS pointee type: {} (kind={})", 
+            LOG_DEBUG(Cryo::LogComponent::AST, "RHS pointee type: {} (kind={})",
                       (rhs_pointee ? rhs_pointee->to_string() : "NULL"),
                       (rhs_pointee ? std::to_string(static_cast<int>(rhs_pointee->kind())) : "N/A"));
 
