@@ -869,14 +869,15 @@ namespace Cryo::CLI::Commands
 
         // Enable standard library linking by default
         compiler->set_stdlib_linking(true);
-        
+
         // Use auto-detection to find stdlib location
         if (!compiler->module_loader()->auto_detect_stdlib_root())
         {
             std::cerr << "Warning: Could not auto-detect stdlib location, using fallback path" << std::endl;
         }
-        
-        compiler->module_loader()->set_current_file(std::filesystem::absolute(main_file).string());        if (verbose)
+
+        compiler->module_loader()->set_current_file(std::filesystem::absolute(main_file).string());
+        if (verbose)
         {
             std::cout << "Compiling " << main_file << " -> " << output_path << std::endl;
         }
