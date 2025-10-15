@@ -515,6 +515,7 @@ namespace Cryo::CLI
         cli->register_command<Commands::ASTCommand>();
         cli->register_command<Commands::InitCommand>();
         cli->register_command<Commands::BuildCommand>();
+        cli->register_command<Commands::RunCommand>();
 
         return cli;
     }

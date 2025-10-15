@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CLI.hpp"
+#include "ConfigParser.hpp"
 #include "Compiler/CompilerInstance.hpp"
 
 namespace Cryo::CLI::Commands
@@ -156,7 +157,6 @@ namespace Cryo::CLI::Commands
 
     private:
         int create_project(const std::string &project_name, const ParsedArgs &args);
-        bool create_cryoconfig_file(const std::string &project_name);
         bool create_main_cryo_file();
         bool create_directory_structure();
     };
@@ -177,8 +177,24 @@ namespace Cryo::CLI::Commands
     private:
         int build_project(const ParsedArgs &args);
         bool find_cryoconfig_file(std::string &config_path);
-        bool parse_cryoconfig(const std::string &config_path, std::string &exe_name, std::string &main_file);
+        bool parse_cryoconfig(const std::string &config_path, CryoConfig &config);
         bool ensure_build_directory();
+    };
+
+    // ================================================================
+    // Run Command
+    // ================================================================
+
+    class RunCommand : public Command
+    {
+    public:
+        RunCommand();
+        int execute(const ParsedArgs &args) override;
+
+    private:
+        int run_project(const ParsedArgs &args);
+        bool find_cryoconfig_file(std::string &config_path);
+        bool parse_cryoconfig(const std::string &config_path, CryoConfig &config);
     };
 
 } // namespace Cryo::CLI::Commands

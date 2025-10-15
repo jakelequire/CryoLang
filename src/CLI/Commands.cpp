@@ -1,5 +1,6 @@
 #include "CLI/Commands.hpp"
 #include "CLI/CLI.hpp"
+#include "CLI/ConfigParser.hpp"
 #include "Compiler/CompilerInstance.hpp"
 #include "Utils/Logger.hpp"
 #include <iostream>
@@ -679,7 +680,7 @@ namespace Cryo::CLI::Commands
         }
 
         // Create cryoconfig file
-        if (!create_cryoconfig_file(project_name))
+        if (!ConfigParser::create_config(project_name, "cryoconfig"))
         {
             std::cerr << "Error: Failed to create cryoconfig file" << std::endl;
             return 1;
@@ -698,40 +699,6 @@ namespace Cryo::CLI::Commands
         std::cout << "\nTo build your project, run: cryo build" << std::endl;
 
         return 0;
-    }
-
-    bool InitCommand::create_cryoconfig_file(const std::string &project_name)
-    {
-        try
-        {
-            std::ofstream config_file("cryoconfig");
-            if (!config_file.is_open())
-            {
-                return false;
-            }
-
-            config_file << "# Cryo Project Configuration\n";
-            config_file << "# This file defines the build configuration for your Cryo project\n\n";
-            config_file << "project_name = \"" << project_name << "\"\n";
-            config_file << "main_file = \"src/main.cryo\"\n";
-            config_file << "output_dir = \"build\"\n";
-            config_file << "target_type = \"executable\"\n\n";
-            config_file << "# Compiler options\n";
-            config_file << "[compiler]\n";
-            config_file << "debug = false\n";
-            config_file << "optimize = true\n";
-            config_file << "emit_llvm = false\n\n";
-            config_file << "# Dependencies (future feature)\n";
-            config_file << "[dependencies]\n";
-            config_file << "# Add dependencies here\n";
-
-            config_file.close();
-            return true;
-        }
-        catch (...)
-        {
-            return false;
-        }
     }
 
     bool InitCommand::create_main_cryo_file()
@@ -787,6 +754,7 @@ namespace Cryo::CLI::Commands
         argument(CLIArgument("release", "Build in release mode (optimized)", false).flag().alias("r"));
         argument(CLIArgument("verbose", "Show verbose build output", false).flag().alias("v"));
         argument(CLIArgument("clean", "Clean build artifacts before building", false).flag().alias("c"));
+        argument(CLIArgument("emit-llvm", "Emit LLVM IR files (.ll and .bc) to build directory", false).flag());
     }
 
     int BuildCommand::execute(const ParsedArgs &args)
@@ -816,17 +784,33 @@ namespace Cryo::CLI::Commands
         }
 
         // Parse cryoconfig
-        std::string exe_name, main_file;
-        if (!parse_cryoconfig(config_path, exe_name, main_file))
+        CryoConfig config;
+        if (!parse_cryoconfig(config_path, config))
         {
             std::cerr << "Error: Failed to parse cryoconfig file" << std::endl;
             return 1;
         }
 
+        // Set default main file if not specified
+        std::string main_file = "src/main.cryo";
+        std::string exe_name = config.project_name.empty() ? "app" : config.project_name;
+
         if (verbose)
         {
             std::cout << "Project name: " << exe_name << std::endl;
             std::cout << "Main file: " << main_file << std::endl;
+            std::cout << "Output directory: " << config.output_dir << std::endl;
+            std::cout << "Debug mode: " << (config.debug ? "enabled" : "disabled") << std::endl;
+            std::cout << "Optimization: " << (config.optimize ? "enabled" : "disabled") << std::endl;
+            if (!config.args.empty())
+            {
+                std::cout << "Compiler args: ";
+                for (const auto &arg : config.args)
+                {
+                    std::cout << arg << " ";
+                }
+                std::cout << std::endl;
+            }
         }
 
         // Check if main file exists
@@ -837,35 +821,45 @@ namespace Cryo::CLI::Commands
         }
 
         // Ensure build directory exists
-        if (!ensure_build_directory())
+        if (!std::filesystem::exists(config.output_dir))
         {
-            std::cerr << "Error: Failed to create build directory" << std::endl;
-            return 1;
-        }
-
-        // Clean if requested
-        if (clean && std::filesystem::exists("build"))
-        {
-            if (verbose)
-            {
-                std::cout << "Cleaning build directory..." << std::endl;
-            }
             try
             {
-                std::filesystem::remove_all("build");
-                std::filesystem::create_directories("build");
+                std::filesystem::create_directories(config.output_dir);
             }
             catch (...)
             {
-                std::cerr << "Warning: Failed to clean build directory" << std::endl;
+                std::cerr << "Error: Failed to create output directory: " << config.output_dir << std::endl;
+                return 1;
+            }
+        }
+
+        // Clean if requested
+        if (clean && std::filesystem::exists(config.output_dir))
+        {
+            if (verbose)
+            {
+                std::cout << "Cleaning " << config.output_dir << " directory..." << std::endl;
+            }
+            try
+            {
+                std::filesystem::remove_all(config.output_dir);
+                std::filesystem::create_directories(config.output_dir);
+            }
+            catch (...)
+            {
+                std::cerr << "Warning: Failed to clean " << config.output_dir << " directory" << std::endl;
             }
         }
 
         // Build the project using the compiler
-        std::string output_path = "build/" + exe_name;
+        std::string output_path = config.output_dir + "/" + exe_name;
 
         auto compiler = Cryo::create_compiler_instance();
-        compiler->set_debug_mode(debug);
+
+        // Use config settings for debug mode (but allow CLI override)
+        bool use_debug = debug || config.debug;
+        compiler->set_debug_mode(use_debug);
 
         // Enable standard library linking by default
         compiler->set_stdlib_linking(true);
@@ -889,6 +883,52 @@ namespace Cryo::CLI::Commands
             std::cerr << "❌ Compilation failed!" << std::endl;
             compiler->print_diagnostics();
             return 1;
+        }
+
+        // Handle --emit-llvm flag from CLI args or config file
+        bool emit_llvm = args.get_flag("emit-llvm");
+
+        // Check if --emit-llvm is specified in config args
+        if (!emit_llvm)
+        {
+            for (const auto &arg : config.args)
+            {
+                if (arg == "--emit-llvm")
+                {
+                    emit_llvm = true;
+                    break;
+                }
+            }
+        }
+
+        if (emit_llvm)
+        {
+            std::string bc_path = config.output_dir + "/" + exe_name + ".bc";
+
+            if (verbose)
+            {
+                std::cout << "Emitting LLVM IR files to " << config.output_dir << " directory..." << std::endl;
+            }
+
+            if (compiler->codegen() && compiler->codegen()->emit_llvm_ir(bc_path))
+            {
+                std::cout << "✓ LLVM bitcode emitted: " << bc_path << std::endl;
+
+                // The .ll file is automatically generated by emit_llvm_ir
+                std::string ll_path = config.output_dir + "/" + exe_name + ".ll";
+                if (std::filesystem::exists(ll_path))
+                {
+                    std::cout << "✓ LLVM IR text emitted: " << ll_path << std::endl;
+                }
+            }
+            else
+            {
+                std::cerr << "❌ Failed to emit LLVM IR files" << std::endl;
+                if (compiler->codegen())
+                {
+                    std::cerr << "Error: " << compiler->codegen()->get_last_error() << std::endl;
+                }
+            }
         }
 
         // Generate executable
@@ -920,60 +960,9 @@ namespace Cryo::CLI::Commands
         return false;
     }
 
-    bool BuildCommand::parse_cryoconfig(const std::string &config_path, std::string &exe_name, std::string &main_file)
+    bool BuildCommand::parse_cryoconfig(const std::string &config_path, CryoConfig &config)
     {
-        try
-        {
-            std::ifstream config_file(config_path);
-            if (!config_file.is_open())
-            {
-                return false;
-            }
-
-            std::string line;
-            exe_name = "app";            // default
-            main_file = "src/main.cryo"; // default
-
-            while (std::getline(config_file, line))
-            {
-                // Skip comments and empty lines
-                if (line.empty() || line[0] == '#' || line[0] == '[')
-                {
-                    continue;
-                }
-
-                // Simple key = value parsing
-                size_t eq_pos = line.find('=');
-                if (eq_pos != std::string::npos)
-                {
-                    std::string key = line.substr(0, eq_pos);
-                    std::string value = line.substr(eq_pos + 1);
-
-                    // Trim whitespace and quotes
-                    key.erase(0, key.find_first_not_of(" \t"));
-                    key.erase(key.find_last_not_of(" \t") + 1);
-
-                    value.erase(0, value.find_first_not_of(" \t\""));
-                    value.erase(value.find_last_not_of(" \t\"") + 1);
-
-                    if (key == "project_name")
-                    {
-                        exe_name = value;
-                    }
-                    else if (key == "main_file")
-                    {
-                        main_file = value;
-                    }
-                }
-            }
-
-            config_file.close();
-            return true;
-        }
-        catch (...)
-        {
-            return false;
-        }
+        return ConfigParser::parse_config(config_path, config);
     }
 
     bool BuildCommand::ensure_build_directory()
@@ -987,6 +976,107 @@ namespace Cryo::CLI::Commands
         {
             return false;
         }
+    }
+
+    // ================================================================
+    // Run Command
+    // ================================================================
+
+    RunCommand::RunCommand()
+        : Command("run", "Run a built Cryo project")
+    {
+        usage("[options]");
+        argument(CLIArgument("verbose", "Show verbose run output", false).flag().alias("v"));
+        argument(CLIArgument("args", "Arguments to pass to the executable", false));
+    }
+
+    int RunCommand::execute(const ParsedArgs &args)
+    {
+        std::cout << "Running Cryo project..." << std::endl;
+
+        return run_project(args);
+    }
+
+    int RunCommand::run_project(const ParsedArgs &args)
+    {
+        bool verbose = args.get_flag("verbose");
+        std::string exe_args = args.get_arg("args");
+
+        // Find cryoconfig file
+        std::string config_path;
+        if (!find_cryoconfig_file(config_path))
+        {
+            std::cerr << "Error: No cryoconfig file found. Run 'cryo init' to create a new project." << std::endl;
+            return 1;
+        }
+
+        if (verbose)
+        {
+            std::cout << "Found cryoconfig: " << config_path << std::endl;
+        }
+
+        // Parse cryoconfig
+        CryoConfig config;
+        if (!parse_cryoconfig(config_path, config))
+        {
+            std::cerr << "Error: Failed to parse cryoconfig file" << std::endl;
+            return 1;
+        }
+
+        std::string exe_name = config.project_name.empty() ? "app" : config.project_name;
+
+        if (verbose)
+        {
+            std::cout << "Project name: " << exe_name << std::endl;
+            std::cout << "Output directory: " << config.output_dir << std::endl;
+        }
+
+        // Check if executable exists
+        std::string exe_path = config.output_dir + "/" + exe_name;
+        if (!std::filesystem::exists(exe_path))
+        {
+            std::cerr << "Error: Executable '" << exe_path << "' not found. Run 'cryo build' first." << std::endl;
+            return 1;
+        }
+
+        // Run the executable
+        std::string command = "./" + exe_path;
+        if (!exe_args.empty())
+        {
+            command += " " + exe_args;
+        }
+
+        if (verbose)
+        {
+            std::cout << "Executing: " << command << std::endl;
+        }
+
+        int result = std::system(command.c_str());
+
+        if (verbose)
+        {
+            std::cout << "Process exited with code: " << result << std::endl;
+        }
+
+        return result;
+    }
+
+    bool RunCommand::find_cryoconfig_file(std::string &config_path)
+    {
+        // Look for cryoconfig in current directory
+        if (std::filesystem::exists("cryoconfig"))
+        {
+            config_path = "cryoconfig";
+            return true;
+        }
+
+        // Could extend this to search parent directories in the future
+        return false;
+    }
+
+    bool RunCommand::parse_cryoconfig(const std::string &config_path, CryoConfig &config)
+    {
+        return ConfigParser::parse_config(config_path, config);
     }
 
 } // namespace Cryo::CLI::Commands
