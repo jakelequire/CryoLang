@@ -41,9 +41,12 @@ namespace Cryo
         SymbolTable &_symbol_table;                                    // Reference to main symbol table
         TemplateRegistry &_template_registry;                          // Reference to template registry for cross-module templates
         ASTContext &_ast_context;                                      // Reference to main AST context for type consistency
-        
+
         // Storage for imported ASTs to keep them alive for template registration
         std::unordered_map<std::string, std::unique_ptr<ProgramNode>> _imported_asts;
+
+        // Static storage for global executable path
+        static std::string _global_executable_path;
 
     public:
         explicit ModuleLoader(SymbolTable &symbol_table, TemplateRegistry &template_registry, ASTContext &ast_context);
@@ -54,6 +57,26 @@ namespace Cryo
          * @param stdlib_root Path to the standard library directory
          */
         void set_stdlib_root(const std::string &stdlib_root);
+
+        /**
+         * @brief Auto-detect and set the standard library root directory
+         * @param executable_path Path to the cryo executable (from argv[0])
+         * @return True if stdlib was found and set, false otherwise
+         */
+        bool auto_detect_stdlib_root(const std::string &executable_path = "");
+
+        /**
+         * @brief Set the global executable path for stdlib auto-detection
+         * @param executable_path Path to the cryo executable (from argv[0])
+         */
+        static void set_global_executable_path(const std::string &executable_path);
+
+        /**
+         * @brief Find the standard library directory dynamically
+         * @param executable_path Path to the cryo executable (from argv[0])
+         * @return Path to stdlib directory, or empty string if not found
+         */
+        static std::string find_stdlib_directory(const std::string &executable_path = "");
 
         /**
          * @brief Set the current file directory for relative imports
@@ -85,7 +108,7 @@ namespace Cryo
          * @brief Get all imported AST nodes for additional processing
          * @return Map of module names to their parsed AST nodes
          */
-        const std::unordered_map<std::string, std::unique_ptr<ProgramNode>>& get_imported_asts() const;
+        const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &get_imported_asts() const;
 
     private:
         /**

@@ -634,4 +634,358 @@ namespace Cryo::CLI::Commands
                   << std::endl;
     }
 
+    // ================================================================
+    // Init Command
+    // ================================================================
+
+    InitCommand::InitCommand()
+        : Command("init", "Initialize a new Cryo project")
+    {
+        usage("[project_name]");
+        argument(CLIArgument("project_name", "Name of the project to create", false));
+        argument(CLIArgument("force", "Overwrite existing files if they exist", false).flag().alias("f"));
+    }
+
+    int InitCommand::execute(const ParsedArgs &args)
+    {
+        std::string project_name = "hello_world";
+
+        if (args.positional_count() > 0)
+        {
+            project_name = args.positional()[0];
+        }
+
+        std::cout << "Initializing Cryo project: " << project_name << std::endl;
+
+        return create_project(project_name, args);
+    }
+
+    int InitCommand::create_project(const std::string &project_name, const ParsedArgs &args)
+    {
+        bool force = args.get_flag("force");
+
+        // Check if cryoconfig already exists
+        if (!force && std::filesystem::exists("cryoconfig"))
+        {
+            std::cerr << "Error: cryoconfig already exists. Use --force to overwrite." << std::endl;
+            return 1;
+        }
+
+        // Create directory structure
+        if (!create_directory_structure())
+        {
+            std::cerr << "Error: Failed to create directory structure" << std::endl;
+            return 1;
+        }
+
+        // Create cryoconfig file
+        if (!create_cryoconfig_file(project_name))
+        {
+            std::cerr << "Error: Failed to create cryoconfig file" << std::endl;
+            return 1;
+        }
+
+        // Create main.cryo file
+        if (!create_main_cryo_file())
+        {
+            std::cerr << "Error: Failed to create src/main.cryo file" << std::endl;
+            return 1;
+        }
+
+        std::cout << "✓ Project '" << project_name << "' initialized successfully!" << std::endl;
+        std::cout << "  - Created cryoconfig" << std::endl;
+        std::cout << "  - Created src/main.cryo" << std::endl;
+        std::cout << "\nTo build your project, run: cryo build" << std::endl;
+
+        return 0;
+    }
+
+    bool InitCommand::create_cryoconfig_file(const std::string &project_name)
+    {
+        try
+        {
+            std::ofstream config_file("cryoconfig");
+            if (!config_file.is_open())
+            {
+                return false;
+            }
+
+            config_file << "# Cryo Project Configuration\n";
+            config_file << "# This file defines the build configuration for your Cryo project\n\n";
+            config_file << "project_name = \"" << project_name << "\"\n";
+            config_file << "main_file = \"src/main.cryo\"\n";
+            config_file << "output_dir = \"build\"\n";
+            config_file << "target_type = \"executable\"\n\n";
+            config_file << "# Compiler options\n";
+            config_file << "[compiler]\n";
+            config_file << "debug = false\n";
+            config_file << "optimize = true\n";
+            config_file << "emit_llvm = false\n\n";
+            config_file << "# Dependencies (future feature)\n";
+            config_file << "[dependencies]\n";
+            config_file << "# Add dependencies here\n";
+
+            config_file.close();
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool InitCommand::create_main_cryo_file()
+    {
+        try
+        {
+            std::ofstream main_file("src/main.cryo");
+            if (!main_file.is_open())
+            {
+                return false;
+            }
+
+            main_file << "namespace Main;\n\n";
+            main_file << "import IO from <io/stdio>\n\n";
+            main_file << "\n";
+            main_file << "function main() -> int {\n";
+            main_file << "    IO::println(\"Hello, world!\");\n";
+            main_file << "    return 0;\n";
+            main_file << "}\n";
+
+            main_file.close();
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool InitCommand::create_directory_structure()
+    {
+        try
+        {
+            // Create src directory
+            std::filesystem::create_directories("src");
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    // ================================================================
+    // Build Command
+    // ================================================================
+
+    BuildCommand::BuildCommand()
+        : Command("build", "Build a Cryo project")
+    {
+        usage("[options]");
+        argument(CLIArgument("debug", "Build in debug mode", false).flag().alias("d"));
+        argument(CLIArgument("release", "Build in release mode (optimized)", false).flag().alias("r"));
+        argument(CLIArgument("verbose", "Show verbose build output", false).flag().alias("v"));
+        argument(CLIArgument("clean", "Clean build artifacts before building", false).flag().alias("c"));
+    }
+
+    int BuildCommand::execute(const ParsedArgs &args)
+    {
+        std::cout << "Building Cryo project..." << std::endl;
+
+        return build_project(args);
+    }
+
+    int BuildCommand::build_project(const ParsedArgs &args)
+    {
+        bool verbose = args.get_flag("verbose");
+        bool debug = args.get_flag("debug");
+        bool clean = args.get_flag("clean");
+
+        // Find cryoconfig file
+        std::string config_path;
+        if (!find_cryoconfig_file(config_path))
+        {
+            std::cerr << "Error: No cryoconfig file found. Run 'cryo init' to create a new project." << std::endl;
+            return 1;
+        }
+
+        if (verbose)
+        {
+            std::cout << "Found cryoconfig: " << config_path << std::endl;
+        }
+
+        // Parse cryoconfig
+        std::string exe_name, main_file;
+        if (!parse_cryoconfig(config_path, exe_name, main_file))
+        {
+            std::cerr << "Error: Failed to parse cryoconfig file" << std::endl;
+            return 1;
+        }
+
+        if (verbose)
+        {
+            std::cout << "Project name: " << exe_name << std::endl;
+            std::cout << "Main file: " << main_file << std::endl;
+        }
+
+        // Check if main file exists
+        if (!std::filesystem::exists(main_file))
+        {
+            std::cerr << "Error: Main file '" << main_file << "' not found" << std::endl;
+            return 1;
+        }
+
+        // Ensure build directory exists
+        if (!ensure_build_directory())
+        {
+            std::cerr << "Error: Failed to create build directory" << std::endl;
+            return 1;
+        }
+
+        // Clean if requested
+        if (clean && std::filesystem::exists("build"))
+        {
+            if (verbose)
+            {
+                std::cout << "Cleaning build directory..." << std::endl;
+            }
+            try
+            {
+                std::filesystem::remove_all("build");
+                std::filesystem::create_directories("build");
+            }
+            catch (...)
+            {
+                std::cerr << "Warning: Failed to clean build directory" << std::endl;
+            }
+        }
+
+        // Build the project using the compiler
+        std::string output_path = "build/" + exe_name;
+
+        auto compiler = Cryo::create_compiler_instance();
+        compiler->set_debug_mode(debug);
+
+        // Enable standard library linking by default
+        compiler->set_stdlib_linking(true);
+        
+        // Use auto-detection to find stdlib location
+        if (!compiler->module_loader()->auto_detect_stdlib_root())
+        {
+            std::cerr << "Warning: Could not auto-detect stdlib location, using fallback path" << std::endl;
+        }
+        
+        compiler->module_loader()->set_current_file(std::filesystem::absolute(main_file).string());        if (verbose)
+        {
+            std::cout << "Compiling " << main_file << " -> " << output_path << std::endl;
+        }
+
+        bool compilation_success = compiler->compile_file(main_file);
+
+        if (!compilation_success)
+        {
+            std::cerr << "❌ Compilation failed!" << std::endl;
+            compiler->print_diagnostics();
+            return 1;
+        }
+
+        // Generate executable
+        auto target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
+
+        if (compiler->generate_output(output_path, target))
+        {
+            std::cout << "✓ Build successful: " << output_path << std::endl;
+            return 0;
+        }
+        else
+        {
+            std::cerr << "❌ Build failed during linking!" << std::endl;
+            compiler->print_diagnostics();
+            return 1;
+        }
+    }
+
+    bool BuildCommand::find_cryoconfig_file(std::string &config_path)
+    {
+        // Look for cryoconfig in current directory
+        if (std::filesystem::exists("cryoconfig"))
+        {
+            config_path = "cryoconfig";
+            return true;
+        }
+
+        // Could extend this to search parent directories in the future
+        return false;
+    }
+
+    bool BuildCommand::parse_cryoconfig(const std::string &config_path, std::string &exe_name, std::string &main_file)
+    {
+        try
+        {
+            std::ifstream config_file(config_path);
+            if (!config_file.is_open())
+            {
+                return false;
+            }
+
+            std::string line;
+            exe_name = "app";            // default
+            main_file = "src/main.cryo"; // default
+
+            while (std::getline(config_file, line))
+            {
+                // Skip comments and empty lines
+                if (line.empty() || line[0] == '#' || line[0] == '[')
+                {
+                    continue;
+                }
+
+                // Simple key = value parsing
+                size_t eq_pos = line.find('=');
+                if (eq_pos != std::string::npos)
+                {
+                    std::string key = line.substr(0, eq_pos);
+                    std::string value = line.substr(eq_pos + 1);
+
+                    // Trim whitespace and quotes
+                    key.erase(0, key.find_first_not_of(" \t"));
+                    key.erase(key.find_last_not_of(" \t") + 1);
+
+                    value.erase(0, value.find_first_not_of(" \t\""));
+                    value.erase(value.find_last_not_of(" \t\"") + 1);
+
+                    if (key == "project_name")
+                    {
+                        exe_name = value;
+                    }
+                    else if (key == "main_file")
+                    {
+                        main_file = value;
+                    }
+                }
+            }
+
+            config_file.close();
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool BuildCommand::ensure_build_directory()
+    {
+        try
+        {
+            std::filesystem::create_directories("build");
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
 } // namespace Cryo::CLI::Commands

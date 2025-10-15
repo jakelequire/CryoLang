@@ -141,4 +141,44 @@ namespace Cryo::CLI::Commands
         void print_build_info();
     };
 
+    // ================================================================
+    // Init Command
+    // ================================================================
+
+    /**
+     * @brief Initialize a new Cryo project
+     */
+    class InitCommand : public Command
+    {
+    public:
+        InitCommand();
+        int execute(const ParsedArgs &args) override;
+
+    private:
+        int create_project(const std::string &project_name, const ParsedArgs &args);
+        bool create_cryoconfig_file(const std::string &project_name);
+        bool create_main_cryo_file();
+        bool create_directory_structure();
+    };
+
+    // ================================================================
+    // Build Command
+    // ================================================================
+
+    /**
+     * @brief Build a Cryo project
+     */
+    class BuildCommand : public Command
+    {
+    public:
+        BuildCommand();
+        int execute(const ParsedArgs &args) override;
+
+    private:
+        int build_project(const ParsedArgs &args);
+        bool find_cryoconfig_file(std::string &config_path);
+        bool parse_cryoconfig(const std::string &config_path, std::string &exe_name, std::string &main_file);
+        bool ensure_build_directory();
+    };
+
 } // namespace Cryo::CLI::Commands
