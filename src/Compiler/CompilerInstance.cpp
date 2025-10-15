@@ -588,8 +588,11 @@ namespace Cryo
             // Configure linker with runtime and stdlib if linking is enabled
             if (_stdlib_linking_enabled)
             {
+                // Find runtime files using dynamic resolution
+                std::string bin_dir = find_bin_directory();
+
                 // Add runtime first (contains true main function)
-                std::string runtime_path = "./bin/stdlib/runtime.o";
+                std::string runtime_path = bin_dir + "/stdlib/runtime.o";
                 if (std::filesystem::exists(runtime_path))
                 {
                     _linker->add_object_file(runtime_path);
@@ -604,7 +607,7 @@ namespace Cryo
                 }
 
                 // Add libcryo.a to the linker
-                std::string libcryo_path = "./bin/stdlib/libcryo.a";
+                std::string libcryo_path = bin_dir + "/stdlib/libcryo.a";
                 if (std::filesystem::exists(libcryo_path))
                 {
                     _linker->add_object_file(libcryo_path);
@@ -1545,6 +1548,24 @@ namespace Cryo
         // but for now, we're mainly interested in top-level struct declarations
     }
 
+    std::string CompilerInstance::find_bin_directory() const
+    {
+        // Use the same approach as ModuleLoader to find the stdlib directory
+        std::string stdlib_dir = Cryo::ModuleLoader::find_stdlib_directory();
+        if (!stdlib_dir.empty())
+        {
+            // Convert stdlib path to bin path
+            // stdlib_dir is something like "/workspaces/CryoLang/stdlib"
+            // We need "/workspaces/CryoLang/bin"
+            std::filesystem::path stdlib_path(stdlib_dir);
+            std::filesystem::path cryo_root = stdlib_path.parent_path(); // Go up to CryoLang root
+            std::filesystem::path bin_path = cryo_root / "bin";
+            return bin_path.string();
+        }
+
+        // Fallback to relative path
+        return "./bin";
+    }
     std::unique_ptr<CompilerInstance> create_compiler_instance()
     {
         return std::make_unique<CompilerInstance>();

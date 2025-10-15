@@ -21,9 +21,15 @@
 namespace Cryo
 {
     // Forward declarations
-    namespace Codegen { class CodegenVisitor; }
-    namespace Codegen { class TypeMapper; }
-    
+    namespace Codegen
+    {
+        class CodegenVisitor;
+    }
+    namespace Codegen
+    {
+        class TypeMapper;
+    }
+
     /**
      * @brief Central orchestration class for the Cryo compiler
      *
@@ -76,7 +82,7 @@ namespace Cryo
         // Main compilation phases
         bool compile_file(const std::string &source_file);
         bool parse_source(const std::string &source_code);
-        
+
         // LSP-specific frontend-only compilation (no codegen)
         bool compile_frontend_only(const std::string &source_file);
 
@@ -141,6 +147,9 @@ namespace Cryo
         void process_struct_declarations_recursive(ASTNode *node);
         std::string build_function_signature(FunctionDeclarationNode *func_decl);
         void inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name); // Auto-import core types
+
+        // Dynamic path resolution
+        std::string find_bin_directory() const;
     };
 
     /**
