@@ -12,6 +12,9 @@
 
 namespace Cryo
 {
+    // Static variable definition
+    std::string ModuleLoader::_global_executable_path;
+
     ModuleLoader::ModuleLoader(SymbolTable &symbol_table, TemplateRegistry &template_registry, ASTContext &ast_context)
         : _symbol_table(symbol_table), _template_registry(template_registry), _ast_context(ast_context)
     {
@@ -19,9 +22,124 @@ namespace Cryo
         _stdlib_root = "./stdlib";
     }
 
+    void ModuleLoader::set_global_executable_path(const std::string &executable_path)
+    {
+        _global_executable_path = executable_path;
+    }
+
     void ModuleLoader::set_stdlib_root(const std::string &stdlib_root)
     {
         _stdlib_root = stdlib_root;
+    }
+
+    bool ModuleLoader::auto_detect_stdlib_root(const std::string &executable_path)
+    {
+        // Use provided path or global path
+        std::string exe_path = executable_path.empty() ? _global_executable_path : executable_path;
+        std::string stdlib_path = find_stdlib_directory(exe_path);
+        if (!stdlib_path.empty())
+        {
+            set_stdlib_root(stdlib_path);
+            return true;
+        }
+        return false;
+    }
+
+    std::string ModuleLoader::find_stdlib_directory(const std::string &executable_path)
+    {
+        std::vector<std::string> search_paths;
+
+        // If executable path is provided, search relative to it
+        if (!executable_path.empty())
+        {
+            try
+            {
+                // Get the directory containing the executable
+                std::filesystem::path exe_path = std::filesystem::absolute(executable_path);
+                std::filesystem::path exe_dir = exe_path.parent_path();
+
+                // Common relative locations from binary directory:
+                // 1. ../stdlib (development setup: bin/cryo, stdlib/)
+                // 2. ./stdlib (alternative setup: cryo and stdlib/ in same dir)
+                // 3. ../lib/cryo/stdlib (system install: /usr/bin/cryo, /usr/lib/cryo/stdlib)
+                // 4. ../../stdlib (nested build setup: build/debug/bin/cryo, stdlib/)
+                search_paths.push_back((exe_dir / "../stdlib").string());
+                search_paths.push_back((exe_dir / "./stdlib").string());
+                search_paths.push_back((exe_dir / "../lib/cryo/stdlib").string());
+                search_paths.push_back((exe_dir / "../../stdlib").string());
+            }
+            catch (const std::exception &)
+            {
+                // If path operations fail, continue with fallback paths
+            }
+        }
+
+        // Get current working directory for relative fallbacks
+        try
+        {
+            std::filesystem::path cwd = std::filesystem::current_path();
+
+            // Common development and project patterns:
+            search_paths.push_back((cwd / "stdlib").string());       // ./stdlib
+            search_paths.push_back((cwd / "../stdlib").string());    // ../stdlib (for project dirs)
+            search_paths.push_back((cwd / "../../stdlib").string()); // ../../stdlib (for nested dirs)
+        }
+        catch (const std::exception &)
+        {
+            // If current_path fails, add basic fallbacks
+            search_paths.push_back("./stdlib");
+            search_paths.push_back("../stdlib");
+        }
+
+        // System-wide installation paths
+        search_paths.push_back("/usr/local/lib/cryo/stdlib"); // Unix/Linux standard
+        search_paths.push_back("/usr/lib/cryo/stdlib");       // Unix/Linux alternative
+        search_paths.push_back("/opt/cryo/stdlib");           // Unix/Linux /opt
+
+        // Windows system paths (if we're on Windows)
+#ifdef _WIN32
+        search_paths.push_back("C:/Program Files/Cryo/stdlib");
+        search_paths.push_back("C:/Program Files (x86)/Cryo/stdlib");
+
+        // Also check Windows environment variables
+        const char *programfiles = getenv("PROGRAMFILES");
+        const char *programfiles_x86 = getenv("PROGRAMFILES(X86)");
+        if (programfiles)
+        {
+            search_paths.push_back(std::string(programfiles) + "/Cryo/stdlib");
+        }
+        if (programfiles_x86)
+        {
+            search_paths.push_back(std::string(programfiles_x86) + "/Cryo/stdlib");
+        }
+#endif
+
+        // Search for a stdlib directory with core files
+        for (const auto &path : search_paths)
+        {
+            try
+            {
+                std::filesystem::path stdlib_path = std::filesystem::absolute(path);
+
+                // Check if this looks like a valid stdlib directory
+                // by looking for key files that should exist
+                std::filesystem::path core_types = stdlib_path / "core" / "types.cryo";
+                std::filesystem::path io_stdio = stdlib_path / "io" / "stdio.cryo";
+
+                if (std::filesystem::exists(core_types) && std::filesystem::exists(io_stdio))
+                {
+                    return stdlib_path.string();
+                }
+            }
+            catch (const std::exception &)
+            {
+                // Skip invalid paths
+                continue;
+            }
+        }
+
+        // If nothing found, return empty string
+        return "";
     }
 
     void ModuleLoader::set_current_file(const std::string &current_file_path)

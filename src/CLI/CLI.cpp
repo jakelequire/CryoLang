@@ -359,7 +359,7 @@ namespace Cryo::CLI
         }
 
         bool compilation_success = compiler->compile_file(file_path);
-        
+
         if (compilation_success)
         {
             std::cout << "\nCompilation successful!" << std::endl;
@@ -371,7 +371,7 @@ namespace Cryo::CLI
 
         // Show outputs based on requested flags - regardless of compilation success
         // This is useful for debugging, especially when IR generation fails
-        
+
         if (args.show_symbols() && compilation_success)
         {
             std::cout << "\nSymbol Table:" << std::endl;
@@ -397,7 +397,7 @@ namespace Cryo::CLI
             if (args.get_flag("emit-llvm"))
             {
                 std::string output_path = args.output_file();
-                
+
                 // If no -o flag specified, use input file path with .bc extension
                 if (output_path.empty())
                 {
@@ -413,15 +413,15 @@ namespace Cryo::CLI
                         output_path += ".bc";
                     }
                 }
-                // If -o flag specified, use it as is (assume .bc extension already included or will be added)
-                
-                // Normalize path separators for Windows
-                #ifdef _WIN32
+// If -o flag specified, use it as is (assume .bc extension already included or will be added)
+
+// Normalize path separators for Windows
+#ifdef _WIN32
                 std::replace(output_path.begin(), output_path.end(), '/', '\\');
-                #endif
-                
+#endif
+
                 std::cout << "\nEmitting LLVM bitcode to: " << output_path << std::endl;
-                
+
                 if (compiler->codegen() && compiler->codegen()->emit_llvm_ir(output_path))
                 {
                     std::cout << "✓ LLVM bitcode emitted successfully: " << output_path << std::endl;
@@ -510,14 +510,11 @@ namespace Cryo::CLI
         cli->set_description("A modern systems programming language with safety and performance.");
 
         // Register commands (will be implemented in Commands.cpp)
-        cli->register_command<Commands::HelpCommand>(cli.get());
         cli->register_command<Commands::VersionCommand>();
-        cli->register_command<Commands::CompileCommand>();
         cli->register_command<Commands::CheckCommand>();
         cli->register_command<Commands::ASTCommand>();
-        cli->register_command<Commands::TokensCommand>();
-        cli->register_command<Commands::SymbolsCommand>();
-        cli->register_command<Commands::InfoCommand>();
+        cli->register_command<Commands::InitCommand>();
+        cli->register_command<Commands::BuildCommand>();
 
         return cli;
     }

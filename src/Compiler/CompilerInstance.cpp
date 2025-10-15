@@ -1099,7 +1099,12 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing import: {}", import_decl->path());
 
             // Use the member ModuleLoader instance
-            _module_loader->set_stdlib_root("./stdlib");
+            // Auto-detect stdlib root instead of using hardcoded path
+            if (!_module_loader->auto_detect_stdlib_root())
+            {
+                // Fallback to relative path if auto-detection fails
+                _module_loader->set_stdlib_root("./stdlib");
+            }
             _module_loader->set_current_file(_source_file);
 
             // Load the import
@@ -1353,7 +1358,12 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: core/types");
 
         // Use the member ModuleLoader instance
-        _module_loader->set_stdlib_root("./stdlib");
+        // Auto-detect stdlib root instead of using hardcoded path
+        if (!_module_loader->auto_detect_stdlib_root())
+        {
+            // Fallback to relative path if auto-detection fails
+            _module_loader->set_stdlib_root("./stdlib");
+        }
         _module_loader->set_current_file(_source_file);
 
         // Create a synthetic ImportDeclarationNode for core/types
