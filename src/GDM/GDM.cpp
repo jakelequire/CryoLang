@@ -431,6 +431,75 @@ namespace Cryo
         return _error_count < _max_errors;
     }
 
+    void DiagnosticManager::report_type_mismatch(const SourceRange &range, const std::string &filename,
+                                                 const std::string &expected_type, const std::string &actual_type,
+                                                 const std::string &context)
+    {
+        std::string message = "Type mismatch";
+        if (!context.empty())
+        {
+            message += " in " + context;
+        }
+        message += ": expected '{}', but got '{}'";
+        
+        report_error(DiagnosticID::TypeMismatch, DiagnosticCategory::Semantic, range, filename, 
+                     message, expected_type, actual_type);
+    }
+
+    void DiagnosticManager::report_undefined_symbol(const SourceRange &range, const std::string &filename,
+                                                     const std::string &symbol_name, const std::string &context)
+    {
+        std::string message = "Undefined symbol '{}'";
+        if (!context.empty())
+        {
+            message += " in " + context;
+        }
+        
+        report_error(DiagnosticID::UndefinedVariable, DiagnosticCategory::Semantic, range, filename,
+                     message, symbol_name);
+    }
+
+    void DiagnosticManager::report_redefined_symbol(const SourceRange &range, const std::string &filename,
+                                                     const std::string &symbol_name, const SourceRange &previous_location)
+    {
+        auto diagnostic = Diagnostic(DiagnosticID::RedefinedSymbol, DiagnosticSeverity::Error, 
+                                   DiagnosticCategory::Semantic,
+                                   "Redefinition of symbol '" + symbol_name + "'", range, filename);
+        
+        diagnostic.add_note("Previous definition was here at line " + 
+                           std::to_string(previous_location.start.line()) + 
+                           ", column " + std::to_string(previous_location.start.column()));
+        
+        report(diagnostic);
+    }
+
+    void DiagnosticManager::report_invalid_operation(const SourceRange &range, const std::string &filename,
+                                                      const std::string &operation, const std::string &type,
+                                                      const std::string &context)
+    {
+        std::string message = "Invalid operation '{}' for type '{}'";
+        if (!context.empty())
+        {
+            message += " in " + context;
+        }
+        
+        report_error(DiagnosticID::InvalidOperator, DiagnosticCategory::Semantic, range, filename,
+                     message, operation, type);
+    }
+
+    void DiagnosticManager::report_argument_mismatch(const SourceRange &range, const std::string &filename,
+                                                      const std::string &function_name, size_t expected_count,
+                                                      size_t actual_count)
+    {
+        DiagnosticID id = (actual_count > expected_count) ? DiagnosticID::TooManyArguments : DiagnosticID::TooFewArguments;
+        
+        std::string message = "Function '{}' expects {} argument{}, but {} {} provided";
+        
+        report_error(id, DiagnosticCategory::Semantic, range, filename,
+                     message, function_name, expected_count, (expected_count == 1 ? "" : "s"),
+                     actual_count, (actual_count == 1 ? "was" : "were"));
+    }
+
     void DiagnosticManager::update_statistics(DiagnosticSeverity severity)
     {
         switch (severity)
