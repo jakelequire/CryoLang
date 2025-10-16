@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
+#include <cctype>
 
 namespace Cryo
 {
@@ -158,24 +159,21 @@ namespace Cryo
     {
         std::ostringstream oss;
 
-        // File and location info
-        if (!diagnostic.filename().empty())
-        {
-            oss << diagnostic.filename() << ":";
-        }
-
-        if (diagnostic.range().is_valid())
-        {
-            oss << diagnostic.range().start.line() << ":" << diagnostic.range().start.column() << ": ";
-        }
-
-        // Severity and message
+        // Severity and message (Rust-like format: "error[E0308]: type mismatch")
         if (_use_colors)
         {
             oss << get_color_code(diagnostic.severity());
         }
 
-        oss << format_severity(diagnostic.severity()) << ": " << diagnostic.message();
+        oss << format_severity(diagnostic.severity());
+
+        // Add diagnostic code if we have a specific ID
+        if (diagnostic.id() != DiagnosticID::Unknown)
+        {
+            oss << "[" << get_diagnostic_code(diagnostic.id()) << "]";
+        }
+
+        oss << ": " << diagnostic.message();
 
         if (_use_colors)
         {
@@ -183,6 +181,23 @@ namespace Cryo
         }
 
         oss << "\n";
+
+        // Location info (Rust format: " --> filename:line:column")
+        if (!diagnostic.filename().empty() && diagnostic.range().is_valid())
+        {
+            if (_use_colors)
+            {
+                oss << "\033[1;34m"; // Bright blue
+            }
+            oss << " --> " << diagnostic.filename() << ":"
+                << diagnostic.range().start.line() << ":"
+                << diagnostic.range().start.column();
+            if (_use_colors)
+            {
+                oss << get_reset_color();
+            }
+            oss << "\n";
+        }
 
         // Source context
         if (_show_source_context && !diagnostic.filename().empty())
@@ -197,13 +212,31 @@ namespace Cryo
         // Notes
         for (const auto &note : diagnostic.notes())
         {
-            oss << "note: " << note << "\n";
+            if (_use_colors)
+            {
+                oss << "\033[1;36m"; // Bright cyan for notes
+            }
+            oss << "note: " << note;
+            if (_use_colors)
+            {
+                oss << get_reset_color();
+            }
+            oss << "\n";
         }
 
         // Fix-it hints
         for (const auto &fix_it : diagnostic.fix_it_hints())
         {
-            oss << "fix-it: replace with '" << fix_it.second << "'\n";
+            if (_use_colors)
+            {
+                oss << "\033[1;32m"; // Bright green for suggestions
+            }
+            oss << "help: try `" << fix_it.second << "`";
+            if (_use_colors)
+            {
+                oss << get_reset_color();
+            }
+            oss << "\n";
         }
 
         return oss.str();
@@ -241,18 +274,52 @@ namespace Cryo
         std::ostringstream oss;
         size_t line_number = diagnostic.range().start.line();
 
-        // Get the source line
-        std::string source_line = _source_manager.get_source_line(diagnostic.filename(), line_number);
-        if (source_line.empty())
+        // Get source context around the error line
+        std::vector<std::string> context_lines = _source_manager.get_source_context(
+            diagnostic.filename(), line_number, _context_lines);
+
+        if (context_lines.empty())
         {
-            return "";
+            // Fallback to single line
+            std::string source_line = _source_manager.get_source_line(diagnostic.filename(), line_number);
+            if (source_line.empty())
+            {
+                return "";
+            }
+
+            // Show just the error line with better formatting
+            oss << "   |\n";
+            oss << std::setw(3) << line_number << " | " << source_line << "\n";
+            oss << format_caret_line(diagnostic, source_line) << "\n";
+            return oss.str();
         }
 
-        // Show the source line with line number
-        oss << std::setw(5) << line_number << " | " << source_line << "\n";
+        // Calculate the starting line number for context
+        size_t start_line = (line_number > _context_lines) ? (line_number - _context_lines) : 1;
 
-        // Show caret line pointing to the error location
-        oss << format_caret_line(diagnostic, source_line) << "\n";
+        // Add a blank separator line
+        oss << "   |\n";
+
+        // Show context lines
+        for (size_t i = 0; i < context_lines.size(); ++i)
+        {
+            size_t current_line = start_line + i;
+
+            if (current_line == line_number)
+            {
+                // This is the error line - highlight it
+                oss << std::setw(3) << current_line << " | " << context_lines[i] << "\n";
+                oss << format_caret_line(diagnostic, context_lines[i]) << "\n";
+            }
+            else
+            {
+                // Context line
+                oss << std::setw(3) << current_line << " | " << context_lines[i] << "\n";
+            }
+        }
+
+        // Add closing separator line
+        oss << "   |\n";
 
         return oss.str();
     }
@@ -260,32 +327,79 @@ namespace Cryo
     std::string DiagnosticFormatter::format_caret_line(const Diagnostic &diagnostic, const std::string &source_line) const
     {
         std::ostringstream oss;
-        oss << "      | "; // Align with line number
+
+        // Match the line number prefix format exactly: "   | "
+        oss << "   | ";
 
         size_t column = diagnostic.range().start.column();
         size_t range_length = diagnostic.range().length();
 
-        // Add spaces up to the error column
-        for (size_t i = 1; i < column && i <= source_line.length(); ++i)
+        // Convert 1-based column to 0-based, with bounds checking
+        size_t caret_position = 0;
+        if (column > 0)
         {
-            oss << (source_line[i - 1] == '\t' ? '\t' : ' ');
+            caret_position = column - 1;
         }
 
-        // Add caret(s) for the error range
+        // Clamp caret position to within the source line
+        if (caret_position >= source_line.length())
+        {
+            caret_position = source_line.length() > 0 ? source_line.length() - 1 : 0;
+        }
+
+        // Add spaces up to the caret position, handling tabs properly
+        size_t visual_position = 0;
+        for (size_t i = 0; i < caret_position && i < source_line.length(); ++i)
+        {
+            if (source_line[i] == '\t')
+            {
+                // Tab expands to reach next tab stop (usually 8 characters)
+                size_t next_tab_stop = ((visual_position / 8) + 1) * 8;
+                while (visual_position < next_tab_stop)
+                {
+                    oss << ' ';
+                    visual_position++;
+                }
+            }
+            else
+            {
+                oss << ' ';
+                visual_position++;
+            }
+        }
+
+        // Add highlighting for the error range
         if (_use_colors)
         {
             oss << get_color_code(diagnostic.severity());
         }
 
-        oss << "^";
-        for (size_t i = 1; i < range_length; ++i)
+        // For single character errors or single-point ranges, use ^
+        // For multi-character ranges, use ^ followed by ~~~~~
+        if (range_length <= 1 || diagnostic.range().is_single_location())
         {
-            oss << "~";
+            oss << "^";
         }
-
+        else
+        {
+            oss << "^";
+            // Add tildes for the rest of the range, but limit to reasonable length
+            size_t tilde_count = std::min(range_length - 1, static_cast<size_t>(10)); // Max 10 tildes
+            for (size_t i = 0; i < tilde_count; ++i)
+            {
+                oss << "~";
+            }
+        }
         if (_use_colors)
         {
             oss << get_reset_color();
+        }
+
+        // Add helpful context message for certain error types
+        std::string context_message = get_error_context_message(diagnostic);
+        if (!context_message.empty())
+        {
+            oss << " " << context_message;
         }
 
         return oss.str();
@@ -316,6 +430,122 @@ namespace Cryo
     std::string DiagnosticFormatter::get_reset_color() const
     {
         return _use_colors ? "\033[0m" : "";
+    }
+
+    std::string DiagnosticFormatter::get_error_context_message(const Diagnostic &diagnostic) const
+    {
+        // Provide additional context for specific error types
+        switch (diagnostic.id())
+        {
+        case DiagnosticID::TypeMismatch:
+        case DiagnosticID::TypeMismatchAssignment:
+            return "type mismatch";
+        case DiagnosticID::UndefinedVariable:
+            return "not found in this scope";
+        case DiagnosticID::UndefinedFunction:
+            return "function not found";
+        case DiagnosticID::InvalidOperator:
+            return "invalid operation";
+        case DiagnosticID::TooManyArguments:
+            return "too many arguments";
+        case DiagnosticID::TooFewArguments:
+            return "not enough arguments";
+        case DiagnosticID::RedefinedSymbol:
+            return "already defined";
+        case DiagnosticID::InvalidMemberAccess:
+            return "member not found";
+        default:
+            return "";
+        }
+    }
+
+    std::string DiagnosticFormatter::get_diagnostic_code(DiagnosticID id) const
+    {
+        // Map diagnostic IDs to Rust-like error codes
+        switch (id)
+        {
+        // Type-related errors (E03xx series)
+        case DiagnosticID::TypeMismatch:
+        case DiagnosticID::TypeMismatchAssignment:
+            return "E0308";
+        case DiagnosticID::TypeMismatchArgument:
+            return "E0308";
+        case DiagnosticID::TypeMismatchReturn:
+            return "E0308";
+        case DiagnosticID::TypeMismatchBinaryOp:
+            return "E0369";
+        case DiagnosticID::TypeMismatchUnaryOp:
+            return "E0600";
+        case DiagnosticID::IncompatibleTypes:
+            return "E0308";
+        case DiagnosticID::InvalidCast:
+            return "E0606";
+
+        // Resolution errors (E04xx series)
+        case DiagnosticID::UndefinedVariable:
+            return "E0425";
+        case DiagnosticID::UndefinedFunction:
+            return "E0425";
+        case DiagnosticID::UndefinedType:
+            return "E0412";
+        case DiagnosticID::UndefinedMember:
+            return "E0609";
+        case DiagnosticID::InvalidMemberAccess:
+            return "E0609";
+
+        // Redefinition errors (E04xx series)
+        case DiagnosticID::RedefinedSymbol:
+        case DiagnosticID::RedefinedFunction:
+        case DiagnosticID::RedefinedType:
+            return "E0428";
+
+        // Function call errors (E05xx series)
+        case DiagnosticID::TooManyArguments:
+            return "E0061";
+        case DiagnosticID::TooFewArguments:
+            return "E0061";
+        case DiagnosticID::ArgumentCountMismatch:
+            return "E0061";
+        case DiagnosticID::InvalidFunctionCall:
+            return "E0618";
+        case DiagnosticID::NonCallableType:
+            return "E0618";
+
+        // Syntax errors (E02xx series)
+        case DiagnosticID::ExpectedToken:
+        case DiagnosticID::UnexpectedToken:
+            return "E0277";
+        case DiagnosticID::ExpectedExpression:
+        case DiagnosticID::ExpectedStatement:
+            return "E0277";
+        case DiagnosticID::InvalidSyntax:
+            return "E0277";
+
+        // Lexer errors (E01xx series)
+        case DiagnosticID::UnexpectedCharacter:
+        case DiagnosticID::UnterminatedString:
+        case DiagnosticID::InvalidNumber:
+            return "E0277";
+
+        // Assignment/mutability errors (E03xx series)
+        case DiagnosticID::InvalidAssignment:
+        case DiagnosticID::ImmutableAssignment:
+        case DiagnosticID::ConstViolation:
+            return "E0384";
+
+        // Array/indexing errors (E05xx series)
+        case DiagnosticID::InvalidArrayAccess:
+            return "E0608";
+
+        // Misc errors
+        case DiagnosticID::VoidValueUsed:
+            return "E0605";
+        case DiagnosticID::UninitializedVariable:
+            return "E0381";
+
+        default:
+            return "E0000"; // Generic error code
+        }
     }
 
     // ================================================================
@@ -441,60 +671,60 @@ namespace Cryo
             message += " in " + context;
         }
         message += ": expected '{}', but got '{}'";
-        
-        report_error(DiagnosticID::TypeMismatch, DiagnosticCategory::Semantic, range, filename, 
+
+        report_error(DiagnosticID::TypeMismatch, DiagnosticCategory::Semantic, range, filename,
                      message, expected_type, actual_type);
     }
 
     void DiagnosticManager::report_undefined_symbol(const SourceRange &range, const std::string &filename,
-                                                     const std::string &symbol_name, const std::string &context)
+                                                    const std::string &symbol_name, const std::string &context)
     {
         std::string message = "Undefined symbol '{}'";
         if (!context.empty())
         {
             message += " in " + context;
         }
-        
+
         report_error(DiagnosticID::UndefinedVariable, DiagnosticCategory::Semantic, range, filename,
                      message, symbol_name);
     }
 
     void DiagnosticManager::report_redefined_symbol(const SourceRange &range, const std::string &filename,
-                                                     const std::string &symbol_name, const SourceRange &previous_location)
+                                                    const std::string &symbol_name, const SourceRange &previous_location)
     {
-        auto diagnostic = Diagnostic(DiagnosticID::RedefinedSymbol, DiagnosticSeverity::Error, 
-                                   DiagnosticCategory::Semantic,
-                                   "Redefinition of symbol '" + symbol_name + "'", range, filename);
-        
-        diagnostic.add_note("Previous definition was here at line " + 
-                           std::to_string(previous_location.start.line()) + 
-                           ", column " + std::to_string(previous_location.start.column()));
-        
+        auto diagnostic = Diagnostic(DiagnosticID::RedefinedSymbol, DiagnosticSeverity::Error,
+                                     DiagnosticCategory::Semantic,
+                                     "Redefinition of symbol '" + symbol_name + "'", range, filename);
+
+        diagnostic.add_note("Previous definition was here at line " +
+                            std::to_string(previous_location.start.line()) +
+                            ", column " + std::to_string(previous_location.start.column()));
+
         report(diagnostic);
     }
 
     void DiagnosticManager::report_invalid_operation(const SourceRange &range, const std::string &filename,
-                                                      const std::string &operation, const std::string &type,
-                                                      const std::string &context)
+                                                     const std::string &operation, const std::string &type,
+                                                     const std::string &context)
     {
         std::string message = "Invalid operation '{}' for type '{}'";
         if (!context.empty())
         {
             message += " in " + context;
         }
-        
+
         report_error(DiagnosticID::InvalidOperator, DiagnosticCategory::Semantic, range, filename,
                      message, operation, type);
     }
 
     void DiagnosticManager::report_argument_mismatch(const SourceRange &range, const std::string &filename,
-                                                      const std::string &function_name, size_t expected_count,
-                                                      size_t actual_count)
+                                                     const std::string &function_name, size_t expected_count,
+                                                     size_t actual_count)
     {
         DiagnosticID id = (actual_count > expected_count) ? DiagnosticID::TooManyArguments : DiagnosticID::TooFewArguments;
-        
+
         std::string message = "Function '{}' expects {} argument{}, but {} {} provided";
-        
+
         report_error(id, DiagnosticCategory::Semantic, range, filename,
                      message, function_name, expected_count, (expected_count == 1 ? "" : "s"),
                      actual_count, (actual_count == 1 ? "was" : "were"));

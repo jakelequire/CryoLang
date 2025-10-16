@@ -266,6 +266,8 @@ namespace Cryo
         std::string format_caret_line(const Diagnostic &diagnostic, const std::string &source_line) const;
         std::string get_color_code(DiagnosticSeverity severity) const;
         std::string get_reset_color() const;
+        std::string get_error_context_message(const Diagnostic &diagnostic) const;
+        std::string get_diagnostic_code(DiagnosticID id) const;
     };
 
     // ================================================================
@@ -330,16 +332,16 @@ namespace Cryo
         void report_type_mismatch(const SourceRange &range, const std::string &filename,
                                   const std::string &expected_type, const std::string &actual_type,
                                   const std::string &context = "");
-        
+
         void report_undefined_symbol(const SourceRange &range, const std::string &filename,
-                                      const std::string &symbol_name, const std::string &context = "");
-        
+                                     const std::string &symbol_name, const std::string &context = "");
+
         void report_redefined_symbol(const SourceRange &range, const std::string &filename,
-                                      const std::string &symbol_name, const SourceRange &previous_location);
+                                     const std::string &symbol_name, const SourceRange &previous_location);
 
         void report_invalid_operation(const SourceRange &range, const std::string &filename,
-                                       const std::string &operation, const std::string &type,
-                                       const std::string &context = "");
+                                      const std::string &operation, const std::string &type,
+                                      const std::string &context = "");
 
         void report_argument_mismatch(const SourceRange &range, const std::string &filename,
                                       const std::string &function_name, size_t expected_count,
