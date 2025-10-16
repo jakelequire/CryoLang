@@ -232,7 +232,7 @@ namespace Cryo
 
         // Enhanced type resolution that considers generic context
         Type *resolve_type_with_generic_context(const std::string &type_string);
-        
+
         // NEW: Token-based type resolution (preferred)
         Type *resolve_type_from_tokens(Lexer &lexer);
         Type *resolve_type_from_token_stream(const std::vector<Token> &tokens, size_t &index);
@@ -277,7 +277,7 @@ namespace Cryo
         void check_program(ProgramNode &program);
 
         // Additional method to visit imported modules for complete symbol information
-        void check_imported_modules(const std::unordered_map<std::string, std::unique_ptr<ProgramNode>>& imported_asts);
+        void check_imported_modules(const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &imported_asts);
 
         // Set current namespace context (called by compiler)
         void set_current_namespace(const std::string &namespace_name) { _current_namespace = namespace_name; }
@@ -297,7 +297,7 @@ namespace Cryo
         // Symbol table access for LSP
         TypedSymbol *lookup_symbol(const std::string &name) { return _symbol_table->lookup_symbol(name); }
         TypedSymbol *lookup_symbol_in_any_namespace(const std::string &symbol_name) { return _symbol_table->lookup_symbol_in_any_namespace(symbol_name); }
-        
+
         // Symbol table access for LSP
         TypedSymbol *lookup_symbol(const std::string &name) const { return _symbol_table->lookup_symbol(name); }
 

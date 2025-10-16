@@ -1234,15 +1234,16 @@ namespace Cryo
         // Traverse the AST to discover generic type definitions
         for (const auto &stmt : program.statements())
         {
-            if (!stmt) continue;
+            if (!stmt)
+                continue;
 
             // Check for struct declarations with generic parameters
-            if (auto struct_decl = dynamic_cast<StructDeclarationNode*>(stmt.get()))
+            if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
             {
                 discover_generic_type_from_struct(*struct_decl);
             }
             // Check for class declarations with generic parameters
-            else if (auto class_decl = dynamic_cast<ClassDeclarationNode*>(stmt.get()))
+            else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(stmt.get()))
             {
                 discover_generic_type_from_class(*class_decl);
             }
@@ -1261,13 +1262,13 @@ namespace Cryo
                     param_names.push_back(param->name());
                 }
             }
-            
+
             if (!param_names.empty())
             {
                 register_generic_type(struct_node.name(), param_names);
-                LOG_DEBUG(Cryo::LogComponent::TYPECHECKER, 
-                         "Discovered generic struct '{}' with {} parameter(s)", 
-                         struct_node.name(), param_names.size());
+                LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                          "Discovered generic struct '{}' with {} parameter(s)",
+                          struct_node.name(), param_names.size());
             }
         }
     }
@@ -1284,13 +1285,13 @@ namespace Cryo
                     param_names.push_back(param->name());
                 }
             }
-            
+
             if (!param_names.empty())
             {
                 register_generic_type(class_node.name(), param_names);
-                LOG_DEBUG(Cryo::LogComponent::TYPECHECKER, 
-                         "Discovered generic class '{}' with {} parameter(s)", 
-                         class_node.name(), param_names.size());
+                LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                          "Discovered generic class '{}' with {} parameter(s)",
+                          class_node.name(), param_names.size());
             }
         }
     }
@@ -1684,7 +1685,7 @@ namespace Cryo
             {
                 Type *cond_type = node.condition()->get_resolved_type();
 
-                if (!is_boolean_context_valid(cond_type))
+                if (!is_boolean_context_valid(cond_type) && cond_type->kind() != TypeKind::Unknown)
                 {
                     report_type_mismatch(node.location(), _type_context.get_boolean_type(),
                                          cond_type, "if condition");
@@ -1715,7 +1716,7 @@ namespace Cryo
             {
                 Type *cond_type = node.condition()->get_resolved_type();
 
-                if (!is_boolean_context_valid(cond_type))
+                if (!is_boolean_context_valid(cond_type) && cond_type->kind() != TypeKind::Unknown)
                 {
                     report_type_mismatch(node.location(), _type_context.get_boolean_type(),
                                          cond_type, "while condition");
@@ -1823,8 +1824,10 @@ namespace Cryo
             // TODO: Add proper implementation block context checking
             if (_current_struct_type)
             {
-                node.set_resolved_type(_current_struct_type);
-                LOG_DEBUG(Cryo::LogComponent::AST, "Set 'this' type to: {}", _current_struct_type->to_string());
+                // 'this' should be a pointer to the current struct type, not the struct type itself
+                Type *this_ptr_type = _type_context.create_pointer_type(_current_struct_type);
+                node.set_resolved_type(this_ptr_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Set 'this' type to: {}", this_ptr_type->to_string());
             }
             else
             {
@@ -1906,8 +1909,8 @@ namespace Cryo
                 if (op == TokenKind::TK_EQUAL || op == TokenKind::TK_PLUSEQUAL || op == TokenKind::TK_MINUSEQUAL ||
                     op == TokenKind::TK_STAREQUAL || op == TokenKind::TK_SLASHEQUAL)
                 {
-                    // For assignment, check if right is assignable to left
-                    if (!left_type->is_assignable_from(*right_type))
+                    // For assignment, check if right is assignable to left using enhanced compatibility check
+                    if (!check_assignment_compatibility(left_type, right_type, node.location()))
                     {
                         report_error(TypeError::ErrorKind::InvalidAssignment, node.location(),
                                      "Type mismatch in assignment: cannot assign " +
@@ -1978,7 +1981,35 @@ namespace Cryo
                              op == TokenKind::TK_L_ANGLE || op == TokenKind::TK_R_ANGLE ||
                              op == TokenKind::TK_LESSEQUAL || op == TokenKind::TK_GREATEREQUAL)
                     {
-                        if (left_type->is_assignable_from(*right_type) || right_type->is_assignable_from(*left_type))
+                        // Special handling for null comparisons with nullable types (pointers, optionals, etc.)
+                        bool is_null_comparison = false;
+                        if ((left_type->kind() == TypeKind::Null && right_type->is_nullable()) ||
+                            (right_type->kind() == TypeKind::Null && left_type->is_nullable()))
+                        {
+                            is_null_comparison = true;
+                        }
+
+                        // Fallback: string-based null comparison check for migration issues
+                        std::string left_str = left_type->to_string();
+                        std::string right_str = right_type->to_string();
+
+                        if ((left_str == "null" && right_str.find("*") != std::string::npos) ||
+                            (right_str == "null" && left_str.find("*") != std::string::npos))
+                        {
+                            is_null_comparison = true;
+                        }
+
+                        // Special handling for mixed integer type comparisons
+                        bool is_mixed_integer_comparison = false;
+                        if (left_type->is_integral() && right_type->is_integral())
+                        {
+                            is_mixed_integer_comparison = true;
+                        }
+
+                        if (is_null_comparison ||
+                            is_mixed_integer_comparison ||
+                            left_type->is_assignable_from(*right_type) ||
+                            right_type->is_assignable_from(*left_type))
                         {
                             result_type = _type_context.get_boolean_type();
                         }
@@ -2055,7 +2086,7 @@ namespace Cryo
                 }
                 else if (op == TokenKind::TK_EXCLAIM) // Logical NOT
                 {
-                    if (is_boolean_context_valid(operand_type))
+                    if (is_boolean_context_valid(operand_type) || operand_type->kind() == TypeKind::Unknown)
                     {
                         node.set_resolved_type(_type_context.get_boolean_type());
                     }
@@ -2127,6 +2158,49 @@ namespace Cryo
             }
         }
 
+        // Special handling for primitive type constructors (e.g., u64(0), i32(42))
+        if (node.callee() && node.callee()->kind() == NodeKind::Identifier)
+        {
+            auto identifier = dynamic_cast<IdentifierNode *>(node.callee());
+            if (identifier)
+            {
+                const std::string &callee_name = identifier->name();
+
+                if (is_primitive_integer_type(callee_name) || callee_name == "f32" || callee_name == "f64" || callee_name == "float")
+                {
+                    // This is a primitive type constructor call like u64(0)
+                    Type *target_type = lookup_type_by_name(callee_name);
+                    if (target_type)
+                    {
+                        // Validate that we have exactly one argument for primitive type constructors
+                        if (arg_types.size() != 1)
+                        {
+                            report_error(TypeError::ErrorKind::TooManyArguments, node.location(),
+                                         "Primitive type constructor requires exactly one argument");
+                            node.set_resolved_type(_type_context.get_unknown_type());
+                            return;
+                        }
+
+                        // Check if the argument can be converted to the target type
+                        Type *arg_type = arg_types[0];
+                        if (arg_type->is_numeric() || arg_type->kind() == TypeKind::Boolean)
+                        {
+                            // Allow numeric conversions and boolean to integer conversions
+                            node.set_resolved_type(target_type);
+                            return;
+                        }
+                        else
+                        {
+                            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                                         "Cannot convert " + arg_type->to_string() + " to " + callee_name);
+                            node.set_resolved_type(_type_context.get_unknown_type());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Check if callee is callable
         if (node.callee() && node.callee()->has_resolved_type())
         {
@@ -2183,7 +2257,7 @@ namespace Cryo
             {
                 // This is a function type - extract return type
                 FunctionType *func_type = static_cast<FunctionType *>(callee_type);
-                
+
                 // Check function call compatibility
                 if (check_function_call_compatibility(func_type, arg_types, node.location()))
                 {
@@ -2517,7 +2591,7 @@ namespace Cryo
                 // Found the field - substitute generic type parameters if needed
                 std::string field_type = field_it->second->to_string();
                 std::string resolved_type = substitute_generic_type(field_type, effective_type, lookup_type);
-                
+
                 // CRITICAL: Store the resolved Type* so Codegen can access it
                 node.set_resolved_type(field_it->second);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Set resolved type for member '{}' of '{}' to: {}", member_name, lookup_type, field_it->second->to_string());
@@ -3968,23 +4042,62 @@ namespace Cryo
         if (!lhs_type || !rhs_type)
             return false;
 
-        // Special case: void* can be implicitly converted to any pointer type
-        // NOTE: Due to type system issues, pointer types may report kind=Struct but have "*" in their name
+        // Early string-based compatibility checks for migration issues
         std::string lhs_str = lhs_type->to_string();
         std::string rhs_str = rhs_type->to_string();
-        bool lhs_looks_like_pointer = (!lhs_str.empty() && lhs_str.back() == '*');
-        bool rhs_looks_like_pointer = (!rhs_str.empty() && rhs_str.back() == '*');
 
-        if (rhs_looks_like_pointer && lhs_looks_like_pointer)
+        LOG_DEBUG(Cryo::LogComponent::AST, "Assignment compatibility check: {} = {} (TypeKinds: {} vs {})",
+                  lhs_str, rhs_str,
+                  std::to_string(static_cast<int>(lhs_type->kind())),
+                  std::to_string(static_cast<int>(rhs_type->kind())));
+
+        // Check if both are pointer types of the same base type (HeapBlock* = HeapBlock*)
+        if (lhs_str.find("*") != std::string::npos && rhs_str.find("*") != std::string::npos)
         {
-            // Check if RHS is void*
-            if (rhs_str == "void*")
+            // Extract base types
+            std::string lhs_base = lhs_str.substr(0, lhs_str.find("*"));
+            std::string rhs_base = rhs_str.substr(0, rhs_str.find("*"));
+
+            LOG_DEBUG(Cryo::LogComponent::AST, "Checking pointer assignment: {} = {} (bases: '{}' vs '{}')", lhs_str, rhs_str, lhs_base, rhs_base);
+
+            if (lhs_base == rhs_base)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from void* to {}", lhs_str);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing assignment between same pointer types: {} = {}", lhs_str, rhs_str);
                 return true;
             }
         }
 
+        // Check float-to-float assignments (string fallback for migration issues)
+        if ((lhs_str == "f64" && (rhs_str == "float" || rhs_str == "f32" || rhs_str == "f64")) ||
+            (lhs_str == "f32" && (rhs_str == "float" || rhs_str == "f32" || rhs_str == "f64")) ||
+            (lhs_str == "float" && (rhs_str == "f64" || rhs_str == "f32" || rhs_str == "float")))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing float assignment: {} = {} (string fallback)", lhs_str, rhs_str);
+            return true;
+        }
+
+        // Check if RHS is void* and LHS is any pointer type
+        if (rhs_str == "void*" && lhs_str.find("*") != std::string::npos)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from void* to {} (string fallback)", lhs_str);
+            return true;
+        }
+
+        // Special case: null can be assigned to any nullable type (pointers, optionals, etc.)
+        if (rhs_type->kind() == TypeKind::Null && lhs_type->is_nullable())
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing null assignment to nullable type {}", lhs_type->to_string());
+            return true;
+        }
+
+        // Special case: Also check string-based null detection as fallback for migration issues
+        if (rhs_type->to_string() == "null" && (lhs_type->is_nullable() || lhs_type->to_string().find("*") != std::string::npos))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing null assignment to pointer type {} (string fallback)", lhs_type->to_string());
+            return true;
+        }
+
+        // Special case: void* can be implicitly converted to any pointer type
         if (rhs_type->kind() == TypeKind::Pointer && lhs_type->kind() == TypeKind::Pointer)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Both types are pointers, checking for void* conversion");
@@ -4069,7 +4182,8 @@ namespace Cryo
         // Check for float-to-int and int-to-float conversions
         if (!is_assignable &&
             ((lhs_type->is_integral() && rhs_type->kind() == TypeKind::Float) ||
-             (lhs_type->kind() == TypeKind::Float && rhs_type->is_integral())))
+             (lhs_type->kind() == TypeKind::Float && rhs_type->is_integral()) ||
+             (lhs_type->kind() == TypeKind::Float && rhs_type->kind() == TypeKind::Float)))
         {
             // Allow float-to-int and int-to-float conversions with warnings
             if (lhs_type->is_integral() && rhs_type->kind() == TypeKind::Float)
@@ -4090,6 +4204,25 @@ namespace Cryo
                         TypeWarning::WarningKind::PotentialDataLoss, loc,
                         "Converting large integer to float may lose precision",
                         rhs_type, lhs_type);
+                }
+                return true;
+            }
+            else if (lhs_type->kind() == TypeKind::Float && rhs_type->kind() == TypeKind::Float)
+            {
+                // float to float conversion - allow different precision levels
+                // Check if we need to cast default float (0.0) to f64
+                if (auto lhs_float = dynamic_cast<FloatType *>(lhs_type))
+                {
+                    if (auto rhs_float = dynamic_cast<FloatType *>(rhs_type))
+                    {
+                        // Allow default float literals to be assigned to f64
+                        if ((lhs_float->float_kind() == FloatKind::F64 && rhs_float->float_kind() == FloatKind::Float) ||
+                            (lhs_float->float_kind() == FloatKind::Float && rhs_float->float_kind() == FloatKind::F64) ||
+                            (lhs_float->float_kind() == rhs_float->float_kind()))
+                        {
+                            return true;
+                        }
+                    }
                 }
                 return true;
             }
@@ -4200,9 +4333,9 @@ namespace Cryo
     {
         std::string expected_type = expected ? expected->to_string() : "unknown";
         std::string actual_type = actual ? actual->to_string() : "unknown";
-        
+
         std::string message = "Type mismatch in " + context + "\n" +
-                             "Cannot assign '" + actual_type + "' to '" + expected_type + "'";
+                              "Cannot assign '" + actual_type + "' to '" + expected_type + "'";
         _errors.emplace_back(TypeError::ErrorKind::TypeMismatch, loc, message, expected, actual);
     }
 

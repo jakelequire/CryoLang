@@ -3,6 +3,7 @@
 #include "Compiler/CompilerInstance.hpp"
 #include "Linker/CryoLinker.hpp"
 #include "Utils/OS.hpp"
+#include "Utils/Logger.hpp"
 #include <iostream>
 #include <algorithm>
 #include <sstream>
@@ -81,7 +82,9 @@ namespace Cryo::CLI
                     args.set_arg(key, value);
                 }
                 // Handle special compilation flags that expect values
-                else if ((flag_name == "o" || flag_name == "output") && i + 1 < argc && !is_flag(argv[i + 1]))
+                else if ((flag_name == "o" || flag_name == "output" ||
+                          flag_name == "log-file" || flag_name == "log-component") &&
+                         i + 1 < argc && !is_flag(argv[i + 1]))
                 {
                     args.set_arg(flag_name, argv[++i]);
                 }
@@ -94,7 +97,10 @@ namespace Cryo::CLI
                          flag_name == "analyze" ||
                          flag_name == "help" || flag_name == "h" ||
                          flag_name == "version" || flag_name == "v" ||
-                         flag_name == "no-std" || flag_name == "stdlib-mode")
+                         flag_name == "no-std" || flag_name == "stdlib-mode" ||
+                         flag_name == "debug" || flag_name == "d" ||
+                         flag_name == "verbose" ||
+                         flag_name == "trace")
                 {
                     args.set_flag(flag_name, true);
                 }
@@ -290,6 +296,11 @@ namespace Cryo::CLI
         std::cout << "\nGlobal options:\n";
         std::cout << "  --help, -h                 Show this help message\n";
         std::cout << "  --version, -v              Show version information\n";
+        std::cout << "  --debug, -d                Enable debug-level logging\n";
+        std::cout << "  --verbose                  Enable info-level logging\n";
+        std::cout << "  --trace                    Enable trace-level logging (most verbose)\n";
+        std::cout << "  --log-file <file>          Write logs to specified file\n";
+        std::cout << "  --log-component <comp>     Filter logs by component (e.g., AST, CODEGEN)\n";
         std::cout << "\nUse 'cryo help <command>' for more information about a specific command.\n";
     }
 
@@ -336,8 +347,84 @@ namespace Cryo::CLI
         }
         std::cout << std::endl;
 
+        // Setup logging based on CLI flags (same as CompileCommand)
+        bool verbose = args.get_flag("verbose");
+        bool debug = args.get_flag("debug");
+        bool trace = args.get_flag("trace");
+        std::string log_file = args.get_arg("log-file");
+        std::string log_component_str = args.get_arg("log-component");
+
+        // Debug: Print what flags we detected
+        if (debug || verbose || trace)
+        {
+            std::cout << "[DEBUG] Logging flags detected: debug=" << debug
+                      << ", verbose=" << verbose << ", trace=" << trace << std::endl;
+        }
+
+        // Configure logger based on CLI flags
+        Cryo::LogLevel log_level = Cryo::LogLevel::NONE;
+        if (trace)
+        {
+            log_level = Cryo::LogLevel::TRACE;
+        }
+        else if (debug)
+        {
+            log_level = Cryo::LogLevel::DEBUG;
+        }
+        else if (verbose)
+        {
+            log_level = Cryo::LogLevel::INFO;
+        }
+
+        Cryo::LogComponent log_component = Cryo::LogComponent::ALL;
+        if (!log_component_str.empty())
+        {
+            // Convert string to LogComponent enum
+            if (log_component_str == "CODEGEN")
+                log_component = Cryo::LogComponent::CODEGEN;
+            else if (log_component_str == "PARSER")
+                log_component = Cryo::LogComponent::PARSER;
+            else if (log_component_str == "LEXER")
+                log_component = Cryo::LogComponent::LEXER;
+            else if (log_component_str == "AST")
+                log_component = Cryo::LogComponent::AST;
+            else if (log_component_str == "TYPECHECKER")
+                log_component = Cryo::LogComponent::TYPECHECKER;
+            else if (log_component_str == "LINKER")
+                log_component = Cryo::LogComponent::LINKER;
+            else if (log_component_str == "OPTIMIZER")
+                log_component = Cryo::LogComponent::OPTIMIZER;
+            else if (log_component_str == "GENERAL")
+                log_component = Cryo::LogComponent::GENERAL;
+        }
+
+        // Reconfigure logger if any logging is enabled
+        if (log_level != Cryo::LogLevel::NONE)
+        {
+            Cryo::LoggerConfig config;
+            config.console_level = log_level;
+            config.file_level = log_level;
+            config.log_file_path = log_file; // Empty string = no file
+            config.enable_colors = true;
+            config.enable_timestamps = true;
+            config.enable_component_tags = true;
+
+            // Set component filter if specified (leave empty for ALL)
+            if (log_component != Cryo::LogComponent::ALL)
+            {
+                // Only enable the requested component
+                config.component_filters[log_component] = true;
+            }
+            // If ALL, leave component_filters empty (logs all components)
+
+            Cryo::Logger::instance().initialize(config);
+
+            // Test that logging is working
+            LOG_DEBUG(Cryo::LogComponent::CLI, "Debug logging enabled successfully!");
+        }
+
         auto compiler = Cryo::create_compiler_instance();
-        compiler->set_debug_mode(true);
+        compiler->set_debug_mode(debug || verbose || trace);
 
         // Set AST printing flag if requested
         if (args.show_ast())
@@ -414,7 +501,7 @@ namespace Cryo::CLI
                         output_path += ".bc";
                     }
                 }
-// If -o flag specified, use it as is (assume .bc extension already included or will be added)
+                // If -o flag specified, use it as is (assume .bc extension already included or will be added)
 
                 // Normalize path separators for current platform
                 output_path = Cryo::Utils::OS::instance().normalize_path(output_path);

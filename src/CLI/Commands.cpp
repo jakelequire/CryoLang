@@ -118,6 +118,13 @@ namespace Cryo::CLI::Commands
         std::string log_file = args.get_arg("log-file");
         std::string log_component_str = args.get_arg("log-component");
 
+        // Debug: Print what flags we detected
+        if (debug || verbose || trace)
+        {
+            std::cout << "[DEBUG] Logging flags detected: debug=" << debug
+                      << ", verbose=" << verbose << ", trace=" << trace << std::endl;
+        }
+
         // Configure logger based on CLI flags
         Cryo::LogLevel log_level = Cryo::LogLevel::NONE;
         if (trace)
@@ -177,6 +184,9 @@ namespace Cryo::CLI::Commands
             // If ALL, leave component_filters empty (logs all components)
 
             Cryo::Logger::instance().initialize(config);
+
+            // Test that logging is working
+            LOG_DEBUG(Cryo::LogComponent::CLI, "Debug logging enabled successfully!");
         }
 
         if (verbose)
@@ -696,7 +706,7 @@ namespace Cryo::CLI::Commands
         try
         {
             // Create src directory using OS utility
-            auto& os = Cryo::Utils::OS::instance();
+            auto &os = Cryo::Utils::OS::instance();
             os.create_directories("src");
             return true;
         }
@@ -785,7 +795,7 @@ namespace Cryo::CLI::Commands
         }
 
         // Ensure build directory exists
-        auto& os = Cryo::Utils::OS::instance();
+        auto &os = Cryo::Utils::OS::instance();
         if (!os.path_exists(config.output_dir))
         {
             try
@@ -935,7 +945,7 @@ namespace Cryo::CLI::Commands
     {
         try
         {
-            auto& os = Cryo::Utils::OS::instance();
+            auto &os = Cryo::Utils::OS::instance();
             os.create_directories("build");
             return true;
         }
@@ -999,7 +1009,7 @@ namespace Cryo::CLI::Commands
         }
 
         // Check if executable exists
-        auto& os = Cryo::Utils::OS::instance();
+        auto &os = Cryo::Utils::OS::instance();
         std::string exe_name_with_ext = os.make_executable_name(exe_name);
         std::string exe_path = os.join_path(config.output_dir, exe_name_with_ext);
         if (!os.path_exists(exe_path))
