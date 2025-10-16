@@ -2,6 +2,7 @@
 #include "Transport.hpp"
 #include "TcpTransport.hpp"
 #include "Logger.hpp"
+#include "Utils/OS.hpp"
 #include <iostream>
 #include <memory>
 #include <filesystem>
@@ -9,65 +10,24 @@
 
 using namespace Cryo::LSP;
 
-std::string find_log_directory()
-{
-    // Try to find the CryoLang project root and create a logs directory
-    std::vector<std::string> possible_roots = {
-        // Current working directory + logs
-        (std::filesystem::current_path() / "logs").string(),
-        // Parent directories (look for CryoLang project structure)
-        (std::filesystem::current_path().parent_path() / "logs").string(),
-        (std::filesystem::current_path().parent_path().parent_path() / "logs").string(),
-        (std::filesystem::current_path().parent_path().parent_path().parent_path() / "logs").string()};
-
-    // Add some common workspace locations
-#ifdef _WIN32
-    possible_roots.push_back("C:\\Programming\\apps\\CryoLang\\logs");
-#else
-    // Common Linux dev container paths
-    possible_roots.push_back("/workspaces/CryoLang/logs");
-
-    // Check if HOME is set and add some common paths
-    const char *home = std::getenv("HOME");
-    if (home)
-    {
-        possible_roots.push_back(std::string(home) + "/CryoLang/logs");
-        possible_roots.push_back(std::string(home) + "/workspace/CryoLang/logs");
-    }
-#endif
-
-    // Try each path and use the first one where we can create/access the logs directory
-    for (const auto &log_path : possible_roots)
-    {
-        try
-        {
-            std::filesystem::create_directories(log_path);
-            if (std::filesystem::exists(log_path) && std::filesystem::is_directory(log_path))
-            {
-                return log_path;
-            }
-        }
-        catch (...)
-        {
-            // Continue to next option
-        }
-    }
-
-    // Fallback to current directory
-    return std::filesystem::current_path().string() + "/logs";
-}
-
 int main(int argc, char *argv[])
 {
     try
     {
+        // Initialize OS utility first
+        if (!Cryo::Utils::OS::initialize(argc > 0 ? argv[0] : ""))
+        {
+            std::cerr << "Fatal error: Failed to initialize OS utility for LSP" << std::endl;
+            return 1;
+        }
+
         // Initialize logger with cross-platform log file path
         Logger &logger = Logger::instance();
         // Debug logging disabled to reduce log spam
 
-        // Find appropriate log directory and create log file path
-        std::string log_dir = find_log_directory();
-        std::string log_file = (std::filesystem::path(log_dir) / "cryo-lsp.log").string();
+        // Get logs directory from OS utility
+        auto& os = Cryo::Utils::OS::instance();
+        std::string log_file = os.join_path(os.get_logs_directory(), "cryo-lsp.log");
 
         logger.set_file_output(log_file); // Write to log file
         logger.set_console_output(false); // Disable console output (interferes with LSP stdio)
@@ -78,7 +38,7 @@ int main(int argc, char *argv[])
         for (int i = 0; i < argc; i++) {
             logger.info("LSP", "  arg[" + std::to_string(i) + "]: " + std::string(argv[i]));
         }
-        logger.info("LSP", "Working directory: " + std::filesystem::current_path().string());
+        logger.info("LSP", "Working directory: " + os.get_working_directory());
         logger.info("LSP", "Waiting for VS Code initialize request...");
 
         // Debug: Create a file to prove the server process actually started

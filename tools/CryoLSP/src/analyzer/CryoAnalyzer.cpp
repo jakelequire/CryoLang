@@ -1,5 +1,6 @@
 #include "../../include/analyzer/CryoAnalyzer.hpp"
 #include "../../include/Logger.hpp"
+#include "Utils/OS.hpp"
 
 #include <fstream>
 #include <sstream>
@@ -162,28 +163,24 @@ namespace CryoLSP
                 return true; // Return true to allow basic hover to work
             }
 
-            // Create a temporary file in the system temp directory
+            // Create a temporary file using OS utility
+            auto& os = Cryo::Utils::OS::instance();
+            
+            // Get temp directory with fallbacks
             std::string temp_dir;
-            const char *temp_env = std::getenv("TMPDIR"); // Linux/macOS
-            if (!temp_env)
+            if (os.is_windows()) 
             {
-                temp_env = std::getenv("TEMP"); // Windows
+                temp_dir = os.get_env_or_default("TEMP", 
+                          os.get_env_or_default("TMP", "."));
             }
-            if (!temp_env)
+            else 
             {
-                temp_env = std::getenv("TMP"); // Windows fallback
-            }
-            if (temp_env)
-            {
-                temp_dir = std::string(temp_env);
-            }
-            else
-            {
-                temp_dir = "/tmp"; // Linux/macOS fallback, or "." for current dir
+                temp_dir = os.get_env_or_default("TMPDIR", "/tmp");
             }
 
             // Create a unique temporary filename using proper path separator
-            std::string temp_file = temp_dir + "/cryo_lsp_" + std::to_string(std::hash<std::string>{}(file_path)) + ".cryo";
+            std::string filename = "cryo_lsp_" + std::to_string(std::hash<std::string>{}(file_path)) + ".cryo";
+            std::string temp_file = os.join_path(temp_dir, filename);
 
             std::ofstream temp_out(temp_file);
             if (!temp_out)
@@ -1706,19 +1703,20 @@ namespace CryoLSP
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count();
 
+            auto& os = Cryo::Utils::OS::instance();
             std::string temp_dir;
-            const char *temp_env = std::getenv("TEMP");
-            if (temp_env)
+            if (os.is_windows()) 
             {
-                temp_dir = std::string(temp_env);
+                temp_dir = os.get_env_or_default("TEMP", ".");
             }
-            else
+            else 
             {
-                temp_dir = "/tmp";
+                temp_dir = os.get_env_or_default("TMPDIR", "/tmp");
             }
 
-            std::string temp_file = temp_dir + "/cryo_lsp_retry_" + std::to_string(timestamp) + "_" +
-                                    std::to_string(std::hash<std::string>{}(file_path)) + ".cryo";
+            std::string filename = "cryo_lsp_retry_" + std::to_string(timestamp) + "_" +
+                                 std::to_string(std::hash<std::string>{}(file_path)) + ".cryo";
+            std::string temp_file = os.join_path(temp_dir, filename);
 
             std::ofstream temp_out(temp_file);
             if (!temp_out)

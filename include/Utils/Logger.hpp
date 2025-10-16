@@ -226,6 +226,14 @@ namespace Cryo
         void initialize(const LoggerConfig &config);
 
         /**
+         * @brief Create a default logger configuration
+         * 
+         * Creates a configuration with logging disabled by default (NONE level).
+         * This configuration is designed to be overridden by CLI flags.
+         */
+        static LoggerConfig create_default_config();
+
+        /**
          * @brief Set console log level
          */
         void set_console_level(LogLevel level) { _config.console_level = level; }
