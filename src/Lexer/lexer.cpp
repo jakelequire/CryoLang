@@ -1,5 +1,5 @@
 #include "Lexer/lexer.hpp"
-#include "Utils/file.hpp"
+#include "Utils/File.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>

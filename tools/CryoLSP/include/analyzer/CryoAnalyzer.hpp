@@ -11,7 +11,7 @@
 #include "AST/TypeChecker.hpp"
 #include "Parser/Parser.hpp"
 #include "Lexer/lexer.hpp"
-#include "Utils/file.hpp"
+#include "Utils/File.hpp"
 #include "GDM/GDM.hpp" // For diagnostic support
 
 #include <string>

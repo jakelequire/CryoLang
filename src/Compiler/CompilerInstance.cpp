@@ -1,7 +1,7 @@
 #include "Compiler/CompilerInstance.hpp"
 #include "Codegen/TypeMapper.hpp"
 #include "Codegen/CodegenVisitor.hpp"
-#include "Utils/file.hpp"
+#include "Utils/File.hpp"
 #include "Utils/Logger.hpp"
 #include <iostream>
 #include <fstream>

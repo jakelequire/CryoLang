@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Lexer/lexer.hpp"
-#include "Utils/file.hpp"
+#include "Utils/File.hpp"
 #include <memory>
 #include <string>
 #include <vector>

@@ -12,7 +12,7 @@
 #include "GDM/GDM.hpp"
 #include "Codegen/CodeGenerator.hpp"
 #include "Linker/CryoLinker.hpp"
-#include "Utils/file.hpp"
+#include "Utils/File.hpp"
 #include "Utils/ModuleLoader.hpp"
 #include <memory>
 #include <string>

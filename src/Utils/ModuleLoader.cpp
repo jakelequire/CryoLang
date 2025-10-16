@@ -1,7 +1,7 @@
 #include "Utils/ModuleLoader.hpp"
 #include "Parser/Parser.hpp"
 #include "Lexer/lexer.hpp"
-#include "Utils/file.hpp"
+#include "Utils/File.hpp"
 #include "Utils/Logger.hpp"
 #include "Utils/OS.hpp"
 #include "AST/ASTContext.hpp"
