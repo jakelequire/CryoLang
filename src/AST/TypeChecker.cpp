@@ -1,5 +1,6 @@
 #include "AST/TypeChecker.hpp"
 #include "AST/SymbolTable.hpp"
+#include "GDM/GDM.hpp"
 #include "Lexer/lexer.hpp"
 #include "Utils/Logger.hpp"
 #include <sstream>
@@ -605,15 +606,23 @@ namespace Cryo
     //===----------------------------------------------------------------------===//
 
     TypeChecker::TypeChecker(TypeContext &type_ctx)
-        : _type_context(type_ctx)
+        : _type_context(type_ctx), _diagnostic_manager(nullptr)
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
         _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
 
-        // Register common generic types
-        register_generic_type("Array", {"T"});
-        register_generic_type("Option", {"T"});
-        register_generic_type("Result", {"T", "E"});
+        // Generic types will be discovered dynamically from standard library parsing
+        // No hardcoded type registrations here
+    }
+
+    TypeChecker::TypeChecker(TypeContext &type_ctx, DiagnosticManager *diagnostic_manager, const std::string &source_file)
+        : _type_context(type_ctx), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
+    {
+        _symbol_table = std::make_unique<TypedSymbolTable>();
+        _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
+
+        // Generic types will be discovered dynamically from standard library parsing
+        // No hardcoded type registrations here
     }
 
     //===----------------------------------------------------------------------===//
@@ -1220,6 +1229,72 @@ namespace Cryo
         return _type_registry->parse_and_instantiate(type_string);
     }
 
+    void TypeChecker::discover_generic_types_from_ast(ProgramNode &program)
+    {
+        // Traverse the AST to discover generic type definitions
+        for (const auto &stmt : program.statements())
+        {
+            if (!stmt) continue;
+
+            // Check for struct declarations with generic parameters
+            if (auto struct_decl = dynamic_cast<StructDeclarationNode*>(stmt.get()))
+            {
+                discover_generic_type_from_struct(*struct_decl);
+            }
+            // Check for class declarations with generic parameters
+            else if (auto class_decl = dynamic_cast<ClassDeclarationNode*>(stmt.get()))
+            {
+                discover_generic_type_from_class(*class_decl);
+            }
+        }
+    }
+
+    void TypeChecker::discover_generic_type_from_struct(StructDeclarationNode &struct_node)
+    {
+        if (!struct_node.generic_parameters().empty())
+        {
+            std::vector<std::string> param_names;
+            for (const auto &param : struct_node.generic_parameters())
+            {
+                if (param)
+                {
+                    param_names.push_back(param->name());
+                }
+            }
+            
+            if (!param_names.empty())
+            {
+                register_generic_type(struct_node.name(), param_names);
+                LOG_DEBUG(Cryo::LogComponent::TYPECHECKER, 
+                         "Discovered generic struct '{}' with {} parameter(s)", 
+                         struct_node.name(), param_names.size());
+            }
+        }
+    }
+
+    void TypeChecker::discover_generic_type_from_class(ClassDeclarationNode &class_node)
+    {
+        if (!class_node.generic_parameters().empty())
+        {
+            std::vector<std::string> param_names;
+            for (const auto &param : class_node.generic_parameters())
+            {
+                if (param)
+                {
+                    param_names.push_back(param->name());
+                }
+            }
+            
+            if (!param_names.empty())
+            {
+                register_generic_type(class_node.name(), param_names);
+                LOG_DEBUG(Cryo::LogComponent::TYPECHECKER, 
+                         "Discovered generic class '{}' with {} parameter(s)", 
+                         class_node.name(), param_names.size());
+            }
+        }
+    }
+
     void TypeChecker::check_program(ProgramNode &program)
     {
         // Clear any previous state
@@ -1228,6 +1303,9 @@ namespace Cryo
         _current_function_return_type = nullptr;
         _in_function = false;
         _in_loop = false;
+
+        // First pass: Discover generic types from the AST
+        discover_generic_types_from_ast(program);
 
         // Visit all top-level declarations and statements
         for (const auto &stmt : program.statements())
@@ -1369,9 +1447,7 @@ namespace Cryo
         {
             // Visit the initializer to determine its type
             node.initializer()->accept(*this);
-            inferred_type = node.initializer()->type().has_value()
-                                ? resolve_type_with_generic_context(node.initializer()->type().value())
-                                : nullptr;
+            inferred_type = node.initializer()->get_resolved_type();
         }
 
         // Determine final type
@@ -1732,7 +1808,7 @@ namespace Cryo
         Type *literal_type = infer_literal_type(node);
         if (literal_type)
         {
-            node.set_type(literal_type->to_string());
+            node.set_resolved_type(literal_type);
         }
     }
 
@@ -1747,14 +1823,13 @@ namespace Cryo
             // TODO: Add proper implementation block context checking
             if (_current_struct_type)
             {
-                node.set_type(_current_struct_type->to_string());
-                node.set_resolved_type(_current_struct_type); // CRITICAL: Set resolved type for 'this'
+                node.set_resolved_type(_current_struct_type);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Set 'this' type to: {}", _current_struct_type->to_string());
             }
             else
             {
                 report_undefined_symbol(node.location(), name);
-                node.set_type(_type_context.get_unknown_type()->to_string());
+                node.set_resolved_type(_type_context.get_unknown_type());
             }
             return;
         }
@@ -1763,9 +1838,9 @@ namespace Cryo
         if (is_primitive_integer_type(name))
         {
             // Primitive type constructors are functions that take one argument and return the target type
-            // e.g., i64 is a function (T) -> i64 where T is any integer type
-            std::string function_type = "(any) -> " + name;
-            node.set_type(function_type);
+            // For now, we'll set this to unknown type since we need a proper function type
+            // TODO: Create proper function types for primitive constructors
+            node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
@@ -1779,37 +1854,19 @@ namespace Cryo
                 Symbol *runtime_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context("std::Runtime", name, _current_namespace);
                 if (runtime_symbol)
                 {
-                    // Found runtime function - create a basic function type signature
-                    if (runtime_symbol->kind == SymbolKind::Function)
-                    {
-                        // For runtime functions without type info, provide a more reasonable signature
-                        // Most runtime functions like cryo_alloc return pointers
-                        std::string function_type;
-                        if (name == "cryo_alloc")
-                        {
-                            function_type = "(u64) -> void*";
-                        }
-                        else if (name == "cryo_free")
-                        {
-                            function_type = "(void*) -> void";
-                        }
-                        else
-                        {
-                            // Generic fallback for other runtime functions
-                            function_type = "(...) -> void";
-                        }
-                        node.set_type(function_type);
-                        return;
-                    }
+                    // Found runtime function - for now set to unknown type
+                    // TODO: Create proper function types for runtime functions
+                    node.set_resolved_type(_type_context.get_unknown_type());
+                    return;
                 }
             }
 
             report_undefined_symbol(node.location(), name);
-            node.set_type(_type_context.get_unknown_type()->to_string());
+            node.set_resolved_type(_type_context.get_unknown_type());
         }
         else
         {
-            node.set_type(symbol->type->to_string());
+            node.set_resolved_type(symbol->type);
         }
     }
 
@@ -1857,7 +1914,7 @@ namespace Cryo
                                          right_type->name() + " to " + left_type->name());
                     }
                     // Assignment result has the type of the left operand
-                    node.set_type(left_type->name());
+                    node.set_resolved_type(left_type);
                 }
                 else
                 {
@@ -1935,7 +1992,7 @@ namespace Cryo
 
                     if (result_type)
                     {
-                        node.set_type(result_type->name());
+                        node.set_resolved_type(result_type);
                     }
                 }
             }
@@ -1961,7 +2018,7 @@ namespace Cryo
                 {
                     // Create a pointer type to the operand type
                     Type *pointer_type = _type_context.create_pointer_type(operand_type);
-                    node.set_type(pointer_type->to_string());
+                    node.set_resolved_type(pointer_type);
                 }
                 else if (op == TokenKind::TK_STAR) // Dereference operator (*)
                 {
@@ -1970,13 +2027,13 @@ namespace Cryo
                     {
                         // Get the pointee type
                         auto *ptr_type = static_cast<PointerType *>(operand_type);
-                        node.set_type(ptr_type->pointee_type()->to_string());
+                        node.set_resolved_type(ptr_type->pointee_type().get());
                     }
                     else if (operand_type->kind() == TypeKind::Reference)
                     {
                         // Get the referent type
                         auto *ref_type = static_cast<ReferenceType *>(operand_type);
-                        node.set_type(ref_type->referent_type()->to_string());
+                        node.set_resolved_type(ref_type->referent_type().get());
                     }
                     else
                     {
@@ -1988,7 +2045,7 @@ namespace Cryo
                 {
                     if (is_numeric_type(operand_type))
                     {
-                        node.set_type(operand_type->to_string());
+                        node.set_resolved_type(operand_type);
                     }
                     else
                     {
@@ -2000,7 +2057,7 @@ namespace Cryo
                 {
                     if (is_boolean_context_valid(operand_type))
                     {
-                        node.set_type(_type_context.get_boolean_type()->to_string());
+                        node.set_resolved_type(_type_context.get_boolean_type());
                     }
                     else
                     {
@@ -2013,7 +2070,7 @@ namespace Cryo
                     if (is_numeric_type(operand_type))
                     {
                         // For both prefix and postfix increment, the result type is the same as operand type
-                        node.set_type(operand_type->to_string());
+                        node.set_resolved_type(operand_type);
                     }
                     else
                     {
@@ -2026,7 +2083,7 @@ namespace Cryo
                     if (is_numeric_type(operand_type))
                     {
                         // For both prefix and postfix decrement, the result type is the same as operand type
-                        node.set_type(operand_type->to_string());
+                        node.set_resolved_type(operand_type);
                     }
                     else
                     {
@@ -2071,26 +2128,26 @@ namespace Cryo
         }
 
         // Check if callee is callable
-        if (node.callee() && node.callee()->type().has_value())
+        if (node.callee() && node.callee()->has_resolved_type())
         {
+            // Get the callee's resolved type directly
+            Type *callee_type = node.callee()->get_resolved_type();
+
             // Special handling for ScopeResolution callees
             if (node.callee()->kind() == NodeKind::ScopeResolution)
             {
-                std::string callee_type_str = node.callee()->type().value();
-
-                // Check if this is a function signature (contains "->")
-                if (callee_type_str.find(" -> ") != std::string::npos)
+                // For scope resolution, we may need special handling
+                // For now, if it's a function type, extract return type
+                if (callee_type && callee_type->kind() == TypeKind::Function)
                 {
-                    // This is a function call - extract the return type
-                    size_t arrow_pos = callee_type_str.find(" -> ");
-                    std::string return_type_str = callee_type_str.substr(arrow_pos + 4);
-                    node.set_type(return_type_str);
+                    FunctionType *func_type = static_cast<FunctionType *>(callee_type);
+                    node.set_resolved_type(func_type->return_type().get());
                     return;
                 }
                 else
                 {
-                    // This is likely an enum constructor - use the original logic
-                    node.set_type(callee_type_str);
+                    // This is likely an enum constructor or other type
+                    node.set_resolved_type(callee_type ? callee_type : _type_context.get_unknown_type());
                     return;
                 }
             }
@@ -2098,68 +2155,55 @@ namespace Cryo
             // Special handling for method calls (MemberAccess as callee)
             if (node.callee()->kind() == NodeKind::MemberAccess)
             {
-                // For method calls, the MemberAccess contains the full function signature
-                std::string method_signature = node.callee()->type().value();
-
-                // Check if this is a function signature that needs return type extraction
-                size_t arrow_pos = method_signature.find(" -> ");
-                if (arrow_pos != std::string::npos)
+                // For method calls, check if this is a function type
+                if (callee_type && callee_type->kind() == TypeKind::Function)
                 {
-                    // Extract return type from function signature like "(u64, u64) -> u64"
-                    std::string return_type_str = method_signature.substr(arrow_pos + 4);
-                    node.set_type(return_type_str);
+                    FunctionType *func_type = static_cast<FunctionType *>(callee_type);
+                    node.set_resolved_type(func_type->return_type().get());
                 }
                 else
                 {
-                    // For legacy compatibility, treat as direct return type
-                    node.set_type(method_signature);
+                    // For non-function types, use the type directly
+                    node.set_resolved_type(callee_type ? callee_type : _type_context.get_unknown_type());
                 }
                 return;
             }
-
-            // Get the callee's resolved type directly
-            Type *callee_type = node.callee()->get_resolved_type();
 
             // If callee type is not resolved, fall back to unknown
             if (!callee_type)
             {
                 report_error(TypeError::ErrorKind::NonCallableType, node.location(),
                              "Cannot determine type of expression being called");
-                node.set_type(_type_context.get_unknown_type()->to_string());
+                node.set_resolved_type(_type_context.get_unknown_type());
                 return;
             }
 
-            // Skip reparsing for function types - the type was already correctly computed
+            // Check if this is a function type
             if (callee_type->kind() == TypeKind::Function)
             {
                 // This is a function type - extract return type
                 FunctionType *func_type = static_cast<FunctionType *>(callee_type);
-                node.set_type(func_type->return_type()->to_string());
+                
+                // Check function call compatibility
+                if (check_function_call_compatibility(func_type, arg_types, node.location()))
+                {
+                    node.set_resolved_type(func_type->return_type().get());
+                }
+                else
+                {
+                    node.set_resolved_type(_type_context.get_unknown_type());
+                }
                 return;
             }
 
-            if (callee_type->kind() != TypeKind::Function)
-            {
-                report_error(TypeError::ErrorKind::NonCallableType, node.location(),
-                             "Expression is not callable");
-                node.set_type(_type_context.get_unknown_type()->to_string());
-                return;
-            }
-
-            // Check function call compatibility
-            FunctionType *func_type = static_cast<FunctionType *>(callee_type);
-            if (check_function_call_compatibility(func_type, arg_types, node.location()))
-            {
-                node.set_type(func_type->return_type()->to_string());
-            }
-            else
-            {
-                node.set_type(_type_context.get_unknown_type()->to_string());
-            }
+            // Not callable
+            report_error(TypeError::ErrorKind::NonCallableType, node.location(),
+                         "Expression is not callable");
+            node.set_resolved_type(_type_context.get_unknown_type());
         }
         else
         {
-            node.set_type(_type_context.get_unknown_type()->to_string());
+            node.set_resolved_type(_type_context.get_unknown_type());
         }
     }
 
@@ -2402,18 +2446,18 @@ namespace Cryo
         {
             if (member_name == "length")
             {
-                node.set_type("u64");
+                node.set_resolved_type(_type_context.get_u64_type());
                 return;
             }
             else if (member_name == "size")
             {
-                node.set_type("u64");
+                node.set_resolved_type(_type_context.get_u64_type());
                 return;
             }
             // For now, only support built-in array properties
             report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
                          "Unknown array property '" + member_name + "' for type '" + effective_type + "'");
-            node.set_type("unknown");
+            node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
@@ -2444,7 +2488,7 @@ namespace Cryo
             std::string display_type = is_pointer_access ? object_type + " (dereferenced from pointer)" : object_type;
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
                          "Cannot access member of non-struct/class type: " + display_type);
-            node.set_type("unknown");
+            node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
@@ -2473,8 +2517,7 @@ namespace Cryo
                 // Found the field - substitute generic type parameters if needed
                 std::string field_type = field_it->second->to_string();
                 std::string resolved_type = substitute_generic_type(field_type, effective_type, lookup_type);
-                node.set_type(resolved_type);
-
+                
                 // CRITICAL: Store the resolved Type* so Codegen can access it
                 node.set_resolved_type(field_it->second);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Set resolved type for member '{}' of '{}' to: {}", member_name, lookup_type, field_it->second->to_string());
@@ -4155,7 +4198,11 @@ namespace Cryo
 
     void TypeChecker::report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context)
     {
-        std::string message = "Type mismatch in " + context;
+        std::string expected_type = expected ? expected->to_string() : "unknown";
+        std::string actual_type = actual ? actual->to_string() : "unknown";
+        
+        std::string message = "Type mismatch in " + context + "\n" +
+                             "Cannot assign '" + actual_type + "' to '" + expected_type + "'";
         _errors.emplace_back(TypeError::ErrorKind::TypeMismatch, loc, message, expected, actual);
     }
 

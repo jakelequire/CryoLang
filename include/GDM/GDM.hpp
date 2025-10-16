@@ -50,6 +50,8 @@ namespace Cryo
         UnterminatedString,
         InvalidNumber,
         InvalidEscapeSequence,
+        InvalidCharacterLiteral,
+        InvalidStringEscape,
 
         // Parser diagnostics
         ExpectedToken,
@@ -58,22 +60,79 @@ namespace Cryo
         ExpectedStatement,
         ExpectedType,
         ExpectedIdentifier,
+        ExpectedOperator,
+        ExpectedSemicolon,
+        ExpectedClosingParen,
+        ExpectedClosingBrace,
+        ExpectedClosingBracket,
+        MismatchedDelimiters,
+        InvalidSyntax,
 
-        // Semantic diagnostics
+        // Semantic/Type diagnostics
         UndefinedVariable,
         UndefinedFunction,
+        UndefinedType,
+        UndefinedMember,
         TypeMismatch,
+        TypeMismatchAssignment,
+        TypeMismatchArgument,
+        TypeMismatchReturn,
+        TypeMismatchBinaryOp,
+        TypeMismatchUnaryOp,
         RedefinedSymbol,
+        RedefinedFunction,
+        RedefinedType,
         InvalidCast,
         InvalidOperator,
+        InvalidMemberAccess,
+        InvalidArrayAccess,
+        InvalidFunctionCall,
+        InvalidConstructorCall,
+        InvalidAssignment,
+        IncompatibleTypes,
+        IncompleteType,
+        VoidValueUsed,
+        NonCallableType,
+        TooManyArguments,
+        TooFewArguments,
+        ArgumentCountMismatch,
+        ConstViolation,
+        ImmutableAssignment,
+        UninitializedVariable,
+        UnreachableCode,
+        CircularDependency,
+
+        // Generic instantiation diagnostics
+        GenericInstantiationFailed,
+        GenericTypeResolutionFailed,
+        GenericParameterMismatch,
+        InvalidGenericConstraint,
+
+        // Class/Struct diagnostics
+        StructMemberNotFound,
+        ClassMemberNotFound,
+        ConstructorNotFound,
+        PrivateMemberAccess,
+        AbstractMethodCall,
 
         // System diagnostics
         FileNotFound,
         FileReadError,
+        FileWriteError,
         OutOfMemory,
+        InternalError,
 
         // CodeGen diagnostics
         UnimplementedIntrinsic,
+        CodeGenFailed,
+        LLVMError,
+        InvalidLLVMType,
+        InvalidLLVMValue,
+
+        // Linker diagnostics
+        LinkError,
+        UndefinedSymbol,
+        DuplicateSymbol,
 
         // Generic
         Unknown
@@ -263,6 +322,29 @@ namespace Cryo
         void report_warning(DiagnosticID id, DiagnosticCategory category, const SourceRange &range,
                             const std::string &filename, const std::string &format, Args &&...args);
 
+        template <typename... Args>
+        void report_note(DiagnosticID id, DiagnosticCategory category, const SourceRange &range,
+                         const std::string &filename, const std::string &format, Args &&...args);
+
+        // Type-specific error reporting
+        void report_type_mismatch(const SourceRange &range, const std::string &filename,
+                                  const std::string &expected_type, const std::string &actual_type,
+                                  const std::string &context = "");
+        
+        void report_undefined_symbol(const SourceRange &range, const std::string &filename,
+                                      const std::string &symbol_name, const std::string &context = "");
+        
+        void report_redefined_symbol(const SourceRange &range, const std::string &filename,
+                                      const std::string &symbol_name, const SourceRange &previous_location);
+
+        void report_invalid_operation(const SourceRange &range, const std::string &filename,
+                                       const std::string &operation, const std::string &type,
+                                       const std::string &context = "");
+
+        void report_argument_mismatch(const SourceRange &range, const std::string &filename,
+                                      const std::string &function_name, size_t expected_count,
+                                      size_t actual_count);
+
         // Access diagnostics
         const std::vector<Diagnostic> &diagnostics() const { return _diagnostics; }
         bool has_errors() const { return _error_count > 0; }
@@ -300,6 +382,36 @@ namespace Cryo
     // Template implementations
     // ================================================================
 
+    // Helper for variadic template message formatting
+    template <typename T>
+    void format_impl(std::ostream &os, const std::string &format, T &&value)
+    {
+        auto pos = format.find("{}");
+        if (pos != std::string::npos)
+        {
+            os << format.substr(0, pos) << value << format.substr(pos + 2);
+        }
+        else
+        {
+            os << format;
+        }
+    }
+
+    template <typename T, typename... Args>
+    void format_impl(std::ostream &os, const std::string &format, T &&value, Args &&...args)
+    {
+        auto pos = format.find("{}");
+        if (pos != std::string::npos)
+        {
+            os << format.substr(0, pos) << value;
+            format_impl(os, format.substr(pos + 2), std::forward<Args>(args)...);
+        }
+        else
+        {
+            os << format;
+        }
+    }
+
     template <typename... Args>
     void DiagnosticManager::report_error(DiagnosticID id, DiagnosticCategory category,
                                          const SourceRange &range, const std::string &filename,
@@ -319,12 +431,27 @@ namespace Cryo
     }
 
     template <typename... Args>
+    void DiagnosticManager::report_note(DiagnosticID id, DiagnosticCategory category,
+                                        const SourceRange &range, const std::string &filename,
+                                        const std::string &format, Args &&...args)
+    {
+        std::string message = format_message(format, std::forward<Args>(args)...);
+        report_note(id, category, message, range, filename);
+    }
+
+    template <typename... Args>
     std::string DiagnosticManager::format_message(const std::string &format, Args &&...args) const
     {
-        std::ostringstream oss;
-        // Simple format string implementation - you might want to use a more sophisticated one
-        oss << format; // This is simplified - in a real implementation you'd handle format specifiers
-        return oss.str();
+        if constexpr (sizeof...(args) == 0)
+        {
+            return format;
+        }
+        else
+        {
+            std::ostringstream oss;
+            format_impl(oss, format, std::forward<Args>(args)...);
+            return oss.str();
+        }
     }
 
     // ================================================================

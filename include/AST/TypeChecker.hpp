@@ -4,6 +4,7 @@
 #include "AST/ASTVisitor.hpp"
 #include "AST/ASTContext.hpp"
 #include "AST/GenericInstantiation.hpp"
+#include "AST/SymbolTable.hpp"
 #include "Lexer/lexer.hpp"
 #include <vector>
 #include <string>
@@ -15,6 +16,7 @@ namespace Cryo
     // Forward declarations
     class TypeContext;
     class SymbolTable;
+    class DiagnosticManager;
 
     // Type checking error representation
     struct TypeError
@@ -244,8 +246,13 @@ namespace Cryo
         // Reference to main symbol table (for scope resolution lookups)
         const SymbolTable *_main_symbol_table = nullptr;
 
+        // Diagnostic manager for error reporting (optional)
+        DiagnosticManager *_diagnostic_manager = nullptr;
+        std::string _source_file; // Current source file being checked
+
     public:
         TypeChecker(TypeContext &type_ctx);
+        TypeChecker(TypeContext &type_ctx, DiagnosticManager *diagnostic_manager, const std::string &source_file = "");
         ~TypeChecker() = default;
 
         // Load built-in functions from main SymbolTable
@@ -257,6 +264,11 @@ namespace Cryo
         // Generic type management
         void register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names);
         ParameterizedType *resolve_generic_type(const std::string &type_string);
+
+        // Dynamic generic type discovery from AST nodes
+        void discover_generic_types_from_ast(ProgramNode &program);
+        void discover_generic_type_from_struct(StructDeclarationNode &struct_node);
+        void discover_generic_type_from_class(ClassDeclarationNode &class_node);
 
         // Generic instantiation tracking - public access for monomorphization
         const std::vector<GenericInstantiation> &get_required_instantiations() const;
