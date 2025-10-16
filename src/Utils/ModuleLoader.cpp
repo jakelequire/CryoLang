@@ -3,6 +3,7 @@
 #include "Lexer/lexer.hpp"
 #include "Utils/file.hpp"
 #include "Utils/Logger.hpp"
+#include "Utils/OS.hpp"
 #include "AST/ASTContext.hpp"
 #include "AST/Type.hpp"
 
@@ -54,19 +55,19 @@ namespace Cryo
         {
             try
             {
-                // Get the directory containing the executable
-                std::filesystem::path exe_path = std::filesystem::absolute(executable_path);
-                std::filesystem::path exe_dir = exe_path.parent_path();
+                // Get the directory containing the executable using OS utility
+                auto& os = Cryo::Utils::OS::instance();
+                std::string exe_dir = std::filesystem::path(os.absolute_path(executable_path)).parent_path().string();
 
                 // Common relative locations from binary directory:
                 // 1. ../stdlib (development setup: bin/cryo, stdlib/)
                 // 2. ./stdlib (alternative setup: cryo and stdlib/ in same dir)
                 // 3. ../lib/cryo/stdlib (system install: /usr/bin/cryo, /usr/lib/cryo/stdlib)
                 // 4. ../../stdlib (nested build setup: build/debug/bin/cryo, stdlib/)
-                search_paths.push_back((exe_dir / "../stdlib").string());
-                search_paths.push_back((exe_dir / "./stdlib").string());
-                search_paths.push_back((exe_dir / "../lib/cryo/stdlib").string());
-                search_paths.push_back((exe_dir / "../../stdlib").string());
+                search_paths.push_back(os.join_path(exe_dir, "../stdlib"));
+                search_paths.push_back(os.join_path(exe_dir, "./stdlib"));
+                search_paths.push_back(os.join_path(exe_dir, "../lib/cryo/stdlib"));
+                search_paths.push_back(os.join_path(exe_dir, "../../stdlib"));
             }
             catch (const std::exception &)
             {
@@ -77,12 +78,13 @@ namespace Cryo
         // Get current working directory for relative fallbacks
         try
         {
-            std::filesystem::path cwd = std::filesystem::current_path();
+            auto& os = Cryo::Utils::OS::instance();
+            std::string cwd = os.get_working_directory();
 
             // Common development and project patterns:
-            search_paths.push_back((cwd / "stdlib").string());       // ./stdlib
-            search_paths.push_back((cwd / "../stdlib").string());    // ../stdlib (for project dirs)
-            search_paths.push_back((cwd / "../../stdlib").string()); // ../../stdlib (for nested dirs)
+            search_paths.push_back(os.join_path(cwd, "stdlib"));       // ./stdlib
+            search_paths.push_back(os.join_path(cwd, "../stdlib"));    // ../stdlib (for project dirs)
+            search_paths.push_back(os.join_path(cwd, "../../stdlib")); // ../../stdlib (for nested dirs)
         }
         catch (const std::exception &)
         {
@@ -97,22 +99,25 @@ namespace Cryo
         search_paths.push_back("/opt/cryo/stdlib");           // Unix/Linux /opt
 
         // Windows system paths (if we're on Windows)
-#ifdef _WIN32
-        search_paths.push_back("C:/Program Files/Cryo/stdlib");
-        search_paths.push_back("C:/Program Files (x86)/Cryo/stdlib");
+        // Platform-specific search paths
+        auto& os = Cryo::Utils::OS::instance();
+        if (os.is_windows()) 
+        {
+            search_paths.push_back("C:/Program Files/Cryo/stdlib");
+            search_paths.push_back("C:/Program Files (x86)/Cryo/stdlib");
 
-        // Also check Windows environment variables
-        const char *programfiles = getenv("PROGRAMFILES");
-        const char *programfiles_x86 = getenv("PROGRAMFILES(X86)");
-        if (programfiles)
-        {
-            search_paths.push_back(std::string(programfiles) + "/Cryo/stdlib");
+            // Also check Windows environment variables
+            std::string programfiles = os.get_env_or_default("PROGRAMFILES", "");
+            std::string programfiles_x86 = os.get_env_or_default("PROGRAMFILES(X86)", "");
+            if (!programfiles.empty())
+            {
+                search_paths.push_back(os.join_path(programfiles, "Cryo/stdlib"));
+            }
+            if (!programfiles_x86.empty())
+            {
+                search_paths.push_back(os.join_path(programfiles_x86, "Cryo/stdlib"));
+            }
         }
-        if (programfiles_x86)
-        {
-            search_paths.push_back(std::string(programfiles_x86) + "/Cryo/stdlib");
-        }
-#endif
 
         // Search for a stdlib directory with core files
         for (const auto &path : search_paths)
@@ -251,23 +256,20 @@ namespace Cryo
 
     std::string ModuleLoader::resolve_import_path(const std::string &import_path, ImportDeclarationNode::ImportType import_type)
     {
+        auto& os = Cryo::Utils::OS::instance();
+        
         if (import_type == ImportDeclarationNode::ImportType::Relative)
         {
             // Relative import: resolve relative to current file's directory
-            std::filesystem::path current_dir(_current_file_dir);
-            std::filesystem::path relative_path(import_path);
-            std::filesystem::path resolved = current_dir / relative_path;
-
-            return std::filesystem::absolute(resolved).string();
+            std::string resolved = os.join_path(_current_file_dir, import_path);
+            return os.absolute_path(resolved);
         }
         else // Absolute (stdlib)
         {
             // Absolute import: resolve relative to stdlib root with .cryo extension
-            std::filesystem::path stdlib_root(_stdlib_root);
-            std::filesystem::path import_file(import_path + ".cryo");
-            std::filesystem::path resolved = stdlib_root / import_file;
-
-            return std::filesystem::absolute(resolved).string();
+            std::string import_file = import_path + ".cryo";
+            std::string resolved = os.join_path(_stdlib_root, import_file);
+            return os.absolute_path(resolved);
         }
     }
 

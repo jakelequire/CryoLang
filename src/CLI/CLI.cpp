@@ -2,6 +2,7 @@
 #include "CLI/Commands.hpp"
 #include "Compiler/CompilerInstance.hpp"
 #include "Linker/CryoLinker.hpp"
+#include "Utils/OS.hpp"
 #include <iostream>
 #include <algorithm>
 #include <sstream>
@@ -415,10 +416,8 @@ namespace Cryo::CLI
                 }
 // If -o flag specified, use it as is (assume .bc extension already included or will be added)
 
-// Normalize path separators for Windows
-#ifdef _WIN32
-                std::replace(output_path.begin(), output_path.end(), '/', '\\');
-#endif
+                // Normalize path separators for current platform
+                output_path = Cryo::Utils::OS::instance().normalize_path(output_path);
 
                 std::cout << "\nEmitting LLVM bitcode to: " << output_path << std::endl;
 

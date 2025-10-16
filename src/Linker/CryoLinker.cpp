@@ -1,5 +1,6 @@
 #include "Linker/CryoLinker.hpp"
 #include "Utils/Logger.hpp"
+#include "Utils/OS.hpp"
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Type.h>
 #include <llvm/Support/FileSystem.h>
@@ -373,22 +374,12 @@ namespace Cryo::Linker
 
     std::string CryoLinker::get_library_extension(bool is_shared) const
     {
-#if defined(_WIN32) || defined(_WIN64)
-        return is_shared ? ".dll" : ".lib";
-#elif defined(__APPLE__)
-        return is_shared ? ".dylib" : ".a";
-#else
-        return is_shared ? ".so" : ".a";
-#endif
+        return Cryo::Utils::OS::instance().get_library_extension(is_shared);
     }
 
     std::string CryoLinker::get_executable_extension()
     {
-#if defined(_WIN32) || defined(_WIN64)
-        return ".exe";
-#else
-        return "";
-#endif
+        return Cryo::Utils::OS::instance().get_executable_extension();
     }
 
     //===================================================================
@@ -645,12 +636,13 @@ namespace Cryo::Linker
         std::string full_name = lib_name + extension;
 
         // Check runtime paths
+        auto& os = Cryo::Utils::OS::instance();
         for (const auto &path : _runtime_paths)
         {
-            std::filesystem::path lib_path = std::filesystem::path(path) / full_name;
-            if (std::filesystem::exists(lib_path))
+            std::string lib_path = os.join_path(path, full_name);
+            if (os.path_exists(lib_path))
             {
-                return lib_path.string();
+                return lib_path;
             }
         }
 
@@ -658,10 +650,10 @@ namespace Cryo::Linker
         auto default_paths = get_default_runtime_paths();
         for (const auto &path : default_paths)
         {
-            std::filesystem::path lib_path = std::filesystem::path(path) / full_name;
-            if (std::filesystem::exists(lib_path))
+            std::string lib_path = os.join_path(path, full_name);
+            if (os.path_exists(lib_path))
             {
-                return lib_path.string();
+                return lib_path;
             }
         }
 
@@ -729,37 +721,36 @@ namespace Cryo::Linker
 
     bool runtime_library_exists(const std::string &path, const std::string &library_name)
     {
-        std::filesystem::path lib_path = std::filesystem::path(path) / ("lib" + library_name + ".a");
-        if (std::filesystem::exists(lib_path))
+        auto& os = Cryo::Utils::OS::instance();
+        
+        // Check standard Unix library formats (static and shared)
+        std::string static_lib = os.join_path(path, "lib" + library_name + os.get_library_extension(false));
+        if (os.path_exists(static_lib))
         {
             return true;
         }
 
-        lib_path = std::filesystem::path(path) / ("lib" + library_name + ".so");
-        if (std::filesystem::exists(lib_path))
+        std::string shared_lib = os.join_path(path, "lib" + library_name + os.get_library_extension(true));
+        if (os.path_exists(shared_lib))
         {
             return true;
         }
 
-#if defined(_WIN32) || defined(_WIN64)
-        lib_path = std::filesystem::path(path) / (library_name + ".lib");
-        if (std::filesystem::exists(lib_path))
+        // Check Windows-specific formats (without "lib" prefix)
+        if (os.is_windows()) 
         {
-            return true;
-        }
+            std::string win_static = os.join_path(path, library_name + ".lib");
+            if (os.path_exists(win_static))
+            {
+                return true;
+            }
 
-        lib_path = std::filesystem::path(path) / (library_name + ".dll");
-        if (std::filesystem::exists(lib_path))
-        {
-            return true;
+            std::string win_shared = os.join_path(path, library_name + ".dll");
+            if (os.path_exists(win_shared))
+            {
+                return true;
+            }
         }
-#elif defined(__APPLE__)
-        lib_path = std::filesystem::path(path) / ("lib" + library_name + ".dylib");
-        if (std::filesystem::exists(lib_path))
-        {
-            return true;
-        }
-#endif
 
         return false;
     }
