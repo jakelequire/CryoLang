@@ -1458,7 +1458,9 @@ namespace Cryo
             // Both declared and inferred - check compatibility
             if (!check_assignment_compatibility(declared_type, inferred_type, node.location()))
             {
-                report_type_mismatch(node.location(), declared_type, inferred_type,
+                // Use the initializer's location for better error highlighting
+                SourceLocation error_loc = node.initializer() ? node.initializer()->location() : node.location();
+                report_type_mismatch(error_loc, declared_type, inferred_type,
                                      "variable initialization");
                 final_type = declared_type; // Use declared type for error recovery
             }
