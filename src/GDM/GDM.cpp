@@ -332,41 +332,50 @@ namespace Cryo
         oss << "   | ";
 
         size_t column = diagnostic.range().start.column();
-        size_t range_length = diagnostic.range().length();
 
-        // Convert 1-based column to 0-based, with bounds checking
-        size_t caret_position = 0;
-        if (column > 0)
-        {
-            caret_position = column - 1;
-        }
+        // Since the lexer now properly tracks visual column positions (including tab expansion),
+        // we can trust the column position directly. Convert to 0-based for positioning.
+        size_t visual_position = (column > 0) ? column - 1 : 0;
 
-        // Clamp caret position to within the source line
-        if (caret_position >= source_line.length())
+        // For specific error types, try to find the actual token and adjust position
+        size_t adjusted_position = visual_position;
+        
+        // Handle string literal errors
+        if (diagnostic.message().find("string") != std::string::npos || 
+            diagnostic.message().find("String") != std::string::npos)
         {
-            caret_position = source_line.length() > 0 ? source_line.length() - 1 : 0;
-        }
-
-        // Add spaces up to the caret position, handling tabs properly
-        size_t visual_position = 0;
-        for (size_t i = 0; i < caret_position && i < source_line.length(); ++i)
-        {
-            if (source_line[i] == '\t')
+            // Search forward from the error position to find the string literal
+            // This handles cases where the error location points to the assignment operator
+            // but we want to highlight the actual string being assigned
+            for (size_t i = visual_position; i < source_line.length(); ++i)
             {
-                // Tab expands to reach next tab stop (usually 8 characters)
-                size_t next_tab_stop = ((visual_position / 8) + 1) * 8;
-                while (visual_position < next_tab_stop)
+                if (source_line[i] == '"' || source_line[i] == '\'')
                 {
-                    oss << ' ';
-                    visual_position++;
+                    adjusted_position = i;
+                    break;
+                }
+                // Stop searching after reasonable distance or if we hit end of statement
+                if (i - visual_position > 10 || source_line[i] == ';')
+                {
+                    break;
                 }
             }
-            else
-            {
-                oss << ' ';
-                visual_position++;
-            }
         }
+        // Handle namespace-specific errors - just highlight the word "namespace"
+        else if (diagnostic.message().find("namespace") != std::string::npos)
+        {
+            // For namespace errors, we usually want to highlight just the "namespace" keyword
+            // The position should already be correct, no adjustment needed
+        }
+
+        // Add spaces up to the caret position
+        for (size_t i = 0; i < adjusted_position; ++i)
+        {
+            oss << ' ';
+        }
+
+        // Determine the appropriate length to highlight based on the token at this position
+        size_t highlight_length = determine_token_length(source_line, adjusted_position, diagnostic);
 
         // Add highlighting for the error range
         if (_use_colors)
@@ -374,17 +383,17 @@ namespace Cryo
             oss << get_color_code(diagnostic.severity());
         }
 
-        // For single character errors or single-point ranges, use ^
-        // For multi-character ranges, use ^ followed by ~~~~~
-        if (range_length <= 1 || diagnostic.range().is_single_location())
+        // For single character errors, use ^
+        // For multi-character tokens, use ^ followed by ~~~~~
+        if (highlight_length <= 1)
         {
             oss << "^";
         }
         else
         {
             oss << "^";
-            // Add tildes for the rest of the range, but limit to reasonable length
-            size_t tilde_count = std::min(range_length - 1, static_cast<size_t>(10)); // Max 10 tildes
+            // Add tildes for the rest of the token, but limit to reasonable length
+            size_t tilde_count = std::min(highlight_length - 1, static_cast<size_t>(20)); // Max 20 tildes
             for (size_t i = 0; i < tilde_count; ++i)
             {
                 oss << "~";
@@ -403,6 +412,104 @@ namespace Cryo
         }
 
         return oss.str();
+    }
+
+    size_t DiagnosticFormatter::determine_token_length(const std::string &source_line, size_t position, const Diagnostic &diagnostic) const
+    {
+        // If we already have a multi-character range from the diagnostic system, use it
+        if (!diagnostic.range().is_single_location())
+        {
+            return diagnostic.range().length();
+        }
+
+        // Check if position is valid
+        if (position >= source_line.length())
+        {
+            return 1;
+        }
+
+        // Note: The position parameter here should already be the adjusted position from format_caret_line
+
+        // Get the character at the error position
+        char ch = source_line[position];
+
+        // For string literals at the exact position, find the matching quote
+        if (ch == '"' || ch == '\'')
+        {
+            char quote_char = ch;
+            size_t length = 1; // Start with opening quote
+
+            for (size_t i = position + 1; i < source_line.length(); ++i)
+            {
+                length++;
+                if (source_line[i] == quote_char && (i == 0 || source_line[i - 1] != '\\'))
+                {
+                    break; // Found closing quote
+                }
+            }
+            return length;
+        }
+
+        // For numbers, find the complete number
+        if (std::isdigit(ch) || ch == '.' || ch == '-')
+        {
+            size_t start = position;
+            size_t end = position;
+
+            // Find start of number (handle negative numbers)
+            while (start > 0 && (std::isdigit(source_line[start - 1]) || source_line[start - 1] == '.' ||
+                                 (start == position && source_line[start - 1] == '-')))
+            {
+                start--;
+            }
+
+            // Find end of number
+            while (end < source_line.length() && (std::isdigit(source_line[end]) || source_line[end] == '.'))
+            {
+                end++;
+            }
+
+            return end - start;
+        }
+
+        // For identifiers/keywords, find the complete word
+        if (std::isalpha(ch) || ch == '_')
+        {
+            size_t start = position;
+            size_t end = position;
+
+            // Find start of identifier
+            while (start > 0 && (std::isalnum(source_line[start - 1]) || source_line[start - 1] == '_'))
+            {
+                start--;
+            }
+
+            // Find end of identifier
+            while (end < source_line.length() && (std::isalnum(source_line[end]) || source_line[end] == '_'))
+            {
+                end++;
+            }
+
+            size_t length = end - start;
+            // Limit extremely long identifiers to reasonable length for display
+            return std::min(length, static_cast<size_t>(15));
+        }
+
+        // For operators and single characters, use appropriate length
+        if (position + 1 < source_line.length())
+        {
+            // Check for multi-character operators
+            std::string two_char = source_line.substr(position, 2);
+            if (two_char == "==" || two_char == "!=" || two_char == "<=" || two_char == ">=" ||
+                two_char == "&&" || two_char == "||" || two_char == "++" || two_char == "--" ||
+                two_char == "+=" || two_char == "-=" || two_char == "*=" || two_char == "/=")
+            {
+                return 2;
+            }
+        }
+
+        // Default to single character
+        return 1;
     }
 
     std::string DiagnosticFormatter::get_color_code(DiagnosticSeverity severity) const

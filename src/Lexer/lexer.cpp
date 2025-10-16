@@ -160,7 +160,7 @@ namespace Cryo
         {"new", TokenKind::TK_KW_NEW},
         {"delete", TokenKind::TK_KW_DELETE},
         {"with", TokenKind::TK_KW_WITH},
-        {"where", TokenKind::TK_KW_WHERE}};   // Where clause for trait bounds
+        {"where", TokenKind::TK_KW_WHERE}}; // Where clause for trait bounds
 
     TokenKind Lexer::lookup_keyword(std::string_view text)
     {
@@ -178,6 +178,22 @@ namespace Cryo
     void SourceLocation::increment(size_t count)
     {
         _column += count;
+    }
+
+    void SourceLocation::increment_for_char(char c)
+    {
+        if (c == '\t')
+        {
+            // Tab expands to next tab stop (typically 8-character boundaries)
+            // Formula: next_tab_stop = ((current_column - 1) / 8 + 1) * 8 + 1
+            size_t current_0_based = _column - 1; // Convert to 0-based
+            size_t next_tab_stop = ((current_0_based / 8) + 1) * 8;
+            _column = next_tab_stop + 1; // Convert back to 1-based
+        }
+        else
+        {
+            _column++;
+        }
     }
 
     void SourceLocation::newline()
@@ -275,7 +291,7 @@ namespace Cryo
         }
     }
 
-    Lexer::Lexer(const std::string& content)
+    Lexer::Lexer(const std::string &content)
         : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), _token_count(0)
     {
         // Set up buffer pointers to reference the spot content
@@ -489,7 +505,7 @@ namespace Cryo
             {
                 advance();
             }
-            
+
             // Validate that this is a valid type suffix
             std::string_view suffix(suffix_start, _current - suffix_start);
             if (suffix == "u8" || suffix == "u16" || suffix == "u32" || suffix == "u64" ||
@@ -630,13 +646,13 @@ namespace Cryo
             doc_token_kind = TokenKind::TK_DOC_COMMENT_LINE;
             advance(); // consume second '/'
             advance(); // consume third '/'
-            
+
             // Skip optional space after ///
             if (peek() == ' ')
             {
                 advance();
             }
-            
+
             while (!at_end() && peek() != '\n')
             {
                 advance();
@@ -648,7 +664,7 @@ namespace Cryo
             doc_token_kind = TokenKind::TK_DOC_COMMENT_BLOCK;
             advance(); // consume '*'
             advance(); // consume second '*'
-            
+
             // Skip optional space or newline after /**
             if (peek() == ' ' || peek() == '\n')
             {
@@ -919,15 +935,16 @@ namespace Cryo
     {
         while (!at_end() && is_whitespace(peek()))
         {
-            if (peek() == '\n')
+            char c = peek();
+            if (c == '\n')
             {
-                _current_location.newline();
+                _current++;                  // Advance pointer manually
+                _current_location.newline(); // Handle newline properly
             }
             else
             {
-                _current_location.increment();
+                advance(); // This will properly handle tabs and other whitespace
             }
-            advance();
         }
     }
 
@@ -938,7 +955,10 @@ namespace Cryo
 
         char c = *_current;
         _current++;
-        _current_location.increment();
+
+        // Use proper tab-aware column tracking
+        _current_location.increment_for_char(c);
+
         return c;
     }
 
