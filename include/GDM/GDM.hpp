@@ -264,6 +264,7 @@ namespace Cryo
         std::string format_severity(DiagnosticSeverity severity) const;
         std::string format_source_context(const Diagnostic &diagnostic) const;
         std::string format_caret_line(const Diagnostic &diagnostic, const std::string &source_line) const;
+        size_t determine_token_length(const std::string &source_line, size_t position, const Diagnostic &diagnostic) const;
         std::string get_color_code(DiagnosticSeverity severity) const;
         std::string get_reset_color() const;
         std::string get_error_context_message(const Diagnostic &diagnostic) const;

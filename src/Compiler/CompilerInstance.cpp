@@ -457,24 +457,8 @@ namespace Cryo
                     }
 
                     // Create better ranges for specific error types
-                    SourceRange range;
-                    if (type_error.kind == TypeError::ErrorKind::TypeMismatch &&
-                        type_error.message.find("Cannot assign 'string' to") != std::string::npos)
-                    {
-                        // For string literal type mismatches, estimate a better range
-                        // Assume the string is something like "text" and adjust positioning
-                        SourceLocation start_loc = type_error.location;
-                        // Try to position at beginning of string literal by moving back
-                        size_t adjusted_column = start_loc.column() > 5 ? start_loc.column() - 5 : 1;
-                        SourceLocation adjusted_start(start_loc.line(), adjusted_column);
-                        SourceLocation adjusted_end(start_loc.line(), start_loc.column() + 2);
-                        range = SourceRange(adjusted_start, adjusted_end);
-                    }
-                    else
-                    {
-                        // Default single-point range
-                        range = SourceRange(type_error.location);
-                    }
+                    // For now, use single-position ranges - the diagnostic formatter will handle the display
+                    SourceRange range = SourceRange(type_error.location);
                     _diagnostic_manager->report_error(diag_id, DiagnosticCategory::Semantic,
                                                       type_error.message, range, _source_file);
                 }
