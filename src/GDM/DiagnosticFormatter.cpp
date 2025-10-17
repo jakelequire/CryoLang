@@ -364,20 +364,9 @@ namespace Cryo
             }
         }
         
-        // Add inline labels right after the underline for primary spans
-        for (const auto& span : sorted_spans) {
-            if (span.is_primary() && span.label().has_value() && span.start().line() == line_number) {
-                size_t end_col = (span.end().line() == line_number) ? span.end().column() - 1 : source_line.length() - 1;
-                end_col = std::min(end_col, source_line.length() - 1);
-                
-                // Add inline label after the span
-                if (end_col < colored_underline.length()) {
-                    colored_underline += " " + span.label().value();
-                    break; // Only show one inline label per line
-                }
-            }
-        }
-
+        // Skip inline labels here - they're handled by render_span_labels which properly colors them
+        // This prevents duplicate white text
+        
         return colored_underline;
     }
 

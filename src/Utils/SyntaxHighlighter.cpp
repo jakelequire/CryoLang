@@ -309,8 +309,8 @@ namespace Cryo
             // Scope resolution
             "::",
             
-            // Other operators
-            "?", ":", "."
+            // Other operators and punctuation
+            "?", ":", ".", ";"
         };
         
         // Cryo literals and constants
@@ -330,9 +330,9 @@ namespace Cryo
             {TokenType::String, ColorCodes::YELLOW},          // String literals (light orange)
             {TokenType::Number, ColorCodes::CYAN},            // Numeric literals
             {TokenType::Comment, ColorCodes::GREY},           // Comments
-            {TokenType::Operator, ColorCodes::RED},           // Operators
+            {TokenType::Operator, ColorCodes::MAGENTA},       // Operators (bright magenta)
             {TokenType::Identifier, ColorCodes::WHITE},       // Variable names
-            {TokenType::Punctuation, ColorCodes::WHITE},      // Brackets, semicolons
+            {TokenType::Punctuation, ColorCodes::MAGENTA},    // Brackets, semicolons (bright magenta)
             {TokenType::Function, ColorCodes::BRIGHT_CYAN},   // Function names
             {TokenType::Variable, ColorCodes::WHITE},         // Variables
             {TokenType::Constant, ColorCodes::BRIGHT_YELLOW}, // Constants like true, false, null
