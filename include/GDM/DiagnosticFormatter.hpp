@@ -110,6 +110,11 @@ namespace Cryo
         std::string read_line_from_file(const std::string& filename, size_t line_number) const;
         size_t get_file_line_count(const std::string& filename) const;
 
+        // Enhanced inline label generation
+        std::string generate_enhanced_inline_label(ErrorCode error_code, const std::string& message) const;
+        std::string extract_type_mismatch_label(const std::string& message) const;
+        std::string generate_generic_label(const std::string& message) const;
+
         // Smart context determination
         std::pair<size_t, size_t> calculate_optimal_context(const MultiSpan& spans) const;
         
