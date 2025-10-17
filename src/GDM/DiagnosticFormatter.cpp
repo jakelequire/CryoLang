@@ -1,4 +1,4 @@
-#include "GDM/AdvancedDiagnosticFormatter.hpp"
+#include "GDM/DiagnosticFormatter.hpp"
 #include "Utils/Logger.hpp"
 #include <sstream>
 #include <fstream>
@@ -8,7 +8,7 @@
 
 namespace Cryo
 {
-    AdvancedDiagnosticFormatter::AdvancedDiagnosticFormatter(const SourceManager* source_manager,
+    DiagnosticFormatter::DiagnosticFormatter(const SourceManager* source_manager,
                                                              bool use_colors, 
                                                              bool use_unicode,
                                                              size_t terminal_width)
@@ -35,7 +35,7 @@ namespace Cryo
         */
     }
 
-    std::string AdvancedDiagnosticFormatter::format_diagnostic(const Diagnostic& diagnostic)
+    std::string DiagnosticFormatter::format_diagnostic(const Diagnostic& diagnostic)
     {
         // Convert diagnostic to MultiSpan for enhanced formatting
         MultiSpan spans;
@@ -54,7 +54,7 @@ namespace Cryo
         return format_enhanced_diagnostic(diagnostic, spans, suggestions);
     }
 
-    std::string AdvancedDiagnosticFormatter::format_enhanced_diagnostic(
+    std::string DiagnosticFormatter::format_enhanced_diagnostic(
         const Diagnostic& diagnostic,
         const MultiSpan& spans,
         const std::vector<CodeSuggestion>& suggestions)
@@ -92,8 +92,8 @@ namespace Cryo
         return output.str();
     }
 
-    AdvancedDiagnosticFormatter::SourceSnippet 
-    AdvancedDiagnosticFormatter::extract_source_snippet(const MultiSpan& spans, size_t context_lines) const
+    DiagnosticFormatter::SourceSnippet 
+    DiagnosticFormatter::extract_source_snippet(const MultiSpan& spans, size_t context_lines) const
     {
         SourceSnippet snippet;
         if (spans.is_empty() || !_source_manager) {
@@ -149,7 +149,7 @@ namespace Cryo
         return snippet;
     }
 
-    std::string AdvancedDiagnosticFormatter::render_source_snippet(const SourceSnippet& snippet) const
+    std::string DiagnosticFormatter::render_source_snippet(const SourceSnippet& snippet) const
     {
         if (snippet.lines.empty()) {
             return "";
@@ -192,7 +192,7 @@ namespace Cryo
         return output.str();
     }
 
-    std::string AdvancedDiagnosticFormatter::create_underline_for_line(
+    std::string DiagnosticFormatter::create_underline_for_line(
         const std::string& source_line,
         const std::vector<SourceSpan>& spans_on_line,
         size_t line_number) const
@@ -252,7 +252,7 @@ namespace Cryo
         return colored_underline;
     }
 
-    std::string AdvancedDiagnosticFormatter::render_span_labels(
+    std::string DiagnosticFormatter::render_span_labels(
         const std::vector<SourceSpan>& spans,
         size_t line_number,
         const std::string& source_line) const
@@ -292,7 +292,7 @@ namespace Cryo
         return output.str();
     }
 
-    std::string AdvancedDiagnosticFormatter::format_suggestions(
+    std::string DiagnosticFormatter::format_suggestions(
         const std::vector<CodeSuggestion>& suggestions) const
     {
         if (suggestions.empty()) {
@@ -308,7 +308,7 @@ namespace Cryo
         return output.str();
     }
 
-    std::string AdvancedDiagnosticFormatter::format_single_suggestion(
+    std::string DiagnosticFormatter::format_single_suggestion(
         const CodeSuggestion& suggestion) const
     {
         std::ostringstream output;
@@ -352,7 +352,7 @@ namespace Cryo
     }
 
     // Utility methods implementation
-    std::string AdvancedDiagnosticFormatter::colorize(const std::string& text, const std::string& color) const
+    std::string DiagnosticFormatter::colorize(const std::string& text, const std::string& color) const
     {
         if (!_style.use_colors) {
             return text;
@@ -360,7 +360,7 @@ namespace Cryo
         return color + text + _style.reset;
     }
 
-    std::string AdvancedDiagnosticFormatter::format_severity(DiagnosticSeverity severity) const
+    std::string DiagnosticFormatter::format_severity(DiagnosticSeverity severity) const
     {
         switch (severity) {
             case DiagnosticSeverity::Error:
@@ -376,7 +376,7 @@ namespace Cryo
         }
     }
 
-    std::string AdvancedDiagnosticFormatter::format_line_number(size_t line_num, size_t width, bool show_line) const
+    std::string DiagnosticFormatter::format_line_number(size_t line_num, size_t width, bool show_line) const
     {
         if (!show_line) {
             return std::string(width, ' ');
@@ -387,7 +387,7 @@ namespace Cryo
         return colorize(oss.str(), _style.line_number_color);
     }
 
-    std::vector<SourceSpan> AdvancedDiagnosticFormatter::get_spans_on_line(
+    std::vector<SourceSpan> DiagnosticFormatter::get_spans_on_line(
         const std::vector<SourceSpan>& spans, 
         size_t line_number) const
     {
@@ -402,7 +402,7 @@ namespace Cryo
         return result;
     }
 
-    size_t AdvancedDiagnosticFormatter::calculate_line_number_width(const SourceSnippet& snippet) const
+    size_t DiagnosticFormatter::calculate_line_number_width(const SourceSnippet& snippet) const
     {
         if (snippet.lines.empty()) {
             return 1;
@@ -412,12 +412,12 @@ namespace Cryo
         return std::to_string(max_line).length();
     }
 
-    std::string AdvancedDiagnosticFormatter::repeat_char(char c, size_t count) const
+    std::string DiagnosticFormatter::repeat_char(char c, size_t count) const
     {
         return std::string(count, c);
     }
 
-    std::string AdvancedDiagnosticFormatter::read_line_from_file(const std::string& filename, size_t line_number) const
+    std::string DiagnosticFormatter::read_line_from_file(const std::string& filename, size_t line_number) const
     {
         std::ifstream file(filename);
         if (!file.is_open()) {
@@ -437,7 +437,7 @@ namespace Cryo
         return "";
     }
 
-    size_t AdvancedDiagnosticFormatter::get_file_line_count(const std::string& filename) const
+    size_t DiagnosticFormatter::get_file_line_count(const std::string& filename) const
     {
         std::ifstream file(filename);
         if (!file.is_open()) {

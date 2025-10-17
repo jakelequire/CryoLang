@@ -14,7 +14,7 @@ namespace Cryo
     // Advanced Terminal Formatting for Rust-like Error Output
     // ================================================================
 
-    class AdvancedDiagnosticFormatter
+    class DiagnosticFormatter
     {
     public:
         struct FormatStyle
@@ -57,7 +57,7 @@ namespace Cryo
         const SourceManager* _source_manager;
 
     public:
-        AdvancedDiagnosticFormatter(const SourceManager* source_manager,
+        DiagnosticFormatter(const SourceManager* source_manager,
                                     bool use_colors = true, 
                                     bool use_unicode = true,
                                     size_t terminal_width = 80);
@@ -99,9 +99,9 @@ namespace Cryo
         std::string format_severity(DiagnosticSeverity severity) const;
         std::string format_line_number(size_t line_num, size_t width, bool show_line = true) const;
         
+        // Helper methods for source management
         std::vector<SourceSpan> get_spans_on_line(const std::vector<SourceSpan>& spans, 
-                                                   size_t line_number) const;
-        
+                                                  size_t line_number) const;
         size_t calculate_line_number_width(const SourceSnippet& snippet) const;
         std::string repeat_char(char c, size_t count) const;
         std::string create_margin(size_t line_number_width) const;
@@ -170,7 +170,7 @@ namespace Cryo
             const std::string& expected_type,
             const std::string& actual_type,
             const std::vector<CodeSuggestion>& suggestions,
-            const AdvancedDiagnosticFormatter& formatter
+            const DiagnosticFormatter& formatter
         );
 
         // Render undefined variable diagnostics with "did you mean" suggestions
@@ -178,7 +178,7 @@ namespace Cryo
             const SourceSpan& error_span,
             const std::string& variable_name,
             const std::vector<std::string>& similar_variables,
-            const AdvancedDiagnosticFormatter& formatter
+            const DiagnosticFormatter& formatter
         );
 
         // Render syntax error diagnostics with context-aware suggestions
@@ -187,7 +187,7 @@ namespace Cryo
             const std::string& expected_token,
             const std::string& actual_token,
             const std::vector<CodeSuggestion>& suggestions,
-            const AdvancedDiagnosticFormatter& formatter
+            const DiagnosticFormatter& formatter
         );
     };
 
