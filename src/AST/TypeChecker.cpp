@@ -947,6 +947,26 @@ namespace Cryo
             }
         }
 
+        // Check for array types (type[]) - handle this before falling back to TypeContext
+        if (type_string.length() > 2 && type_string.substr(type_string.length() - 2) == "[]")
+        {
+            std::string element_type_str = type_string.substr(0, type_string.length() - 2);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found array type '{}', resolving element type '{}'", type_string, element_type_str);
+            
+            // Recursively resolve the element type with generic context
+            Type *element_type = resolve_type_with_generic_context(element_type_str);
+            if (element_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved element type '{}' as {}", element_type_str, TypeKindToString(element_type->kind()));
+                return _type_context.create_array_type(element_type);
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::AST, "Failed to resolve array element type '{}'", element_type_str);
+                return nullptr;
+            }
+        }
+
         // Fall back to direct type lookups without string parsing
         LOG_DEBUG(Cryo::LogComponent::AST, "Attempting direct type lookup for '{}'", type_string);
 
@@ -1323,6 +1343,9 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "Processing {} imported modules for AST node updates", imported_asts.size());
         auto all_symbols = _symbol_table->get_symbols();
 
+        // Store the original source file to restore later
+        std::string original_source_file = _source_file;
+
         for (const auto &[module_name, ast] : imported_asts)
         {
             if (!ast)
@@ -1333,6 +1356,16 @@ namespace Cryo
 
             LOG_DEBUG(Cryo::LogComponent::AST, "Processing imported module: {}", module_name);
             LOG_DEBUG(Cryo::LogComponent::AST, "Module has {} statements", ast->statements().size());
+
+            // Set the source file context to this imported module for proper error attribution
+            // This is particularly important for stdlib modules to avoid attributing errors to user code
+            std::string module_file = module_name + ".cryo"; // Simple mapping for now
+            if (module_name.find("/") != std::string::npos) {
+                // For stdlib paths like "core/types", construct the stdlib path
+                module_file = "stdlib/" + module_name + ".cryo";
+            }
+            _source_file = module_file;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Set source context to: {}", _source_file);
 
             // Visit all top-level declarations in the imported module
             // This will update existing symbols with their AST node references
@@ -1410,6 +1443,10 @@ namespace Cryo
                 }
             }
         }
+
+        // Restore the original source file context
+        _source_file = original_source_file;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Restored source context to: {}", _source_file);
     }
 
     //===----------------------------------------------------------------------===//

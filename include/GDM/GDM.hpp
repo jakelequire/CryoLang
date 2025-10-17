@@ -18,6 +18,7 @@ namespace Cryo
     class File;
     class SourceManager;
     class DiagnosticManager;
+    class AdvancedDiagnosticFormatter;
 
     // ================================================================
     // Diagnostic Severity Levels
@@ -476,6 +477,7 @@ namespace Cryo
     private:
         SourceManager _source_manager;
         DiagnosticFormatter _formatter;
+        std::unique_ptr<AdvancedDiagnosticFormatter> _advanced_formatter;
         std::vector<Diagnostic> _diagnostics;
 
         // Statistics
@@ -487,10 +489,19 @@ namespace Cryo
         bool _errors_as_warnings;
         bool _warnings_as_errors;
         size_t _max_errors;
+        bool _use_advanced_formatting;
 
     public:
         DiagnosticManager();
-        ~DiagnosticManager() = default;
+        ~DiagnosticManager(); // Custom destructor needed for unique_ptr with incomplete type
+        
+        // Delete copy constructor and assignment operator
+        DiagnosticManager(const DiagnosticManager&) = delete;
+        DiagnosticManager& operator=(const DiagnosticManager&) = delete;
+        
+        // Allow move constructor and assignment
+        DiagnosticManager(DiagnosticManager&&) = default;
+        DiagnosticManager& operator=(DiagnosticManager&&) = default;
 
         // File management delegation
         void add_source_file(const std::string &filename, std::shared_ptr<File> file);
@@ -566,13 +577,30 @@ namespace Cryo
         Diagnostic& create_error(ErrorCode error_code, const SourceRange& range, const std::string& filename);
         Diagnostic& create_warning(ErrorCode error_code, const SourceRange& range, const std::string& filename);
         Diagnostic& create_note(ErrorCode error_code, const SourceRange& range, const std::string& filename);
+        
+        // Advanced multi-span diagnostic builders
+        Diagnostic& create_error(ErrorCode error_code, const std::string& message);
+        Diagnostic& create_warning(ErrorCode error_code, const std::string& message);
+        Diagnostic& create_note(ErrorCode error_code, const std::string& message);
+        
         void emit(const Diagnostic& diagnostic);
+
+        // Enhanced type mismatch with sophisticated spans and suggestions
+        void report_enhanced_type_mismatch(const SourceSpan& value_span,
+                                           const SourceSpan& type_annotation_span,
+                                           const std::string& expected_type,
+                                           const std::string& actual_type,
+                                           const std::string& filename);
 
         // Configuration
         void set_errors_as_warnings(bool enable) { _errors_as_warnings = enable; }
         void set_warnings_as_errors(bool enable) { _warnings_as_errors = enable; }
         void set_max_errors(size_t max_errors) { _max_errors = max_errors; }
         void set_formatter_options(bool use_colors, bool show_source_context, size_t context_lines = 2);
+        
+        // Advanced formatting control
+        void enable_advanced_formatting(bool enable = true);
+        void set_advanced_formatter_options(bool use_colors, bool use_unicode, size_t terminal_width = 80);
 
         // State management
         void clear();

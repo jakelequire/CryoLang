@@ -14,7 +14,42 @@ namespace Cryo
 
     bool Type::equals(const Type &other) const
     {
-        return _kind == other._kind && _name == other._name;
+        // Exact match check
+        if (_kind == other._kind && _name == other._name)
+            return true;
+
+        // Special case: Generic and Parameterized types with the same name should be considered equal
+        // This handles cases where T (Generic) should equal T (Parameterized)
+        if ((_kind == TypeKind::Generic || _kind == TypeKind::Parameterized) &&
+            (other._kind == TypeKind::Generic || other._kind == TypeKind::Parameterized) &&
+            _name == other._name)
+        {
+            std::cerr << "[DEBUG] Allowing generic type equality: " << _name 
+                      << " (" << TypeKindToString(_kind) << ") == " << other._name 
+                      << " (" << TypeKindToString(other._kind) << ")" << std::endl;
+            return true;
+        }
+
+        // Special case: Generic types vs Struct types with the same name should be considered equal
+        // This handles cases where T (Generic) should equal T (Struct) representing the same generic parameter
+        if (((_kind == TypeKind::Generic && other._kind == TypeKind::Struct) ||
+             (_kind == TypeKind::Struct && other._kind == TypeKind::Generic)) &&
+            _name == other._name)
+        {
+            std::cerr << "[DEBUG] Allowing generic-struct type equality: " << _name 
+                      << " (" << TypeKindToString(_kind) << ") == " << other._name 
+                      << " (" << TypeKindToString(other._kind) << ")" << std::endl;
+            return true;
+        }
+
+        // Debug logging for failed type equality involving T
+        if (_name == "T" || other._name == "T") {
+            std::cerr << "[DEBUG] Type::equals failed for generic types: " << _name 
+                      << " (" << TypeKindToString(_kind) << ") vs " << other._name 
+                      << " (" << TypeKindToString(other._kind) << ")" << std::endl;
+        }
+        
+        return false;
     }
 
     bool Type::is_assignable_from(const Type &other) const
@@ -22,6 +57,15 @@ namespace Cryo
         // Same type is always assignable
         if (equals(other))
             return true;
+
+        // Special case: Generic type parameters with the same name should be compatible
+        // This handles cases where T (Generic) should be assignable from T (Parameterized) or vice versa
+        if ((_kind == TypeKind::Generic || _kind == TypeKind::Parameterized) &&
+            (other._kind == TypeKind::Generic || other._kind == TypeKind::Parameterized) &&
+            _name == other._name)
+        {
+            return true;
+        }
 
         // Unknown type is assignable from anything (for error recovery)
         if (_kind == TypeKind::Unknown || other._kind == TypeKind::Unknown)
@@ -330,6 +374,28 @@ namespace Cryo
         const auto &other_array = static_cast<const ArrayType &>(other);
         return _element_type->equals(*other_array._element_type) &&
                _size == other_array._size;
+    }
+
+    bool ArrayType::is_assignable_from(const Type &other) const
+    {
+        // First check base implementation (handles same type, unknown type, etc.)
+        if (Type::is_assignable_from(other))
+            return true;
+
+        // Array types are assignable if their element types are assignable and sizes match
+        if (other.kind() == TypeKind::Array)
+        {
+            const auto &other_array = static_cast<const ArrayType &>(other);
+            
+            // Size must match (both dynamic or both same fixed size)
+            if (_size != other_array._size)
+                return false;
+            
+            // Element types must be assignable
+            return _element_type->is_assignable_from(*other_array._element_type);
+        }
+
+        return false;
     }
 
     //===----------------------------------------------------------------------===//

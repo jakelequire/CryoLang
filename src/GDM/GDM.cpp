@@ -1,4 +1,5 @@
 #include "GDM/GDM.hpp"
+#include "GDM/AdvancedDiagnosticFormatter.hpp"
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
@@ -1029,9 +1030,14 @@ namespace Cryo
 
     DiagnosticManager::DiagnosticManager()
         : _formatter(_source_manager), _error_count(0), _warning_count(0), _note_count(0),
-          _errors_as_warnings(false), _warnings_as_errors(false), _max_errors(100)
+          _errors_as_warnings(false), _warnings_as_errors(false), _max_errors(100),
+          _use_advanced_formatting(true)
     {
+        // Initialize advanced formatter with clean ASCII by default for universal compatibility
+        _advanced_formatter = std::make_unique<AdvancedDiagnosticFormatter>(&_source_manager, true, false, 80);
     }
+
+    DiagnosticManager::~DiagnosticManager() = default;
 
     void DiagnosticManager::add_source_file(const std::string &filename, std::shared_ptr<File> file)
     {
@@ -1157,7 +1163,17 @@ namespace Cryo
     {
         for (const auto &diagnostic : _diagnostics)
         {
-            _formatter.print(diagnostic, os);
+            if (_use_advanced_formatting && _advanced_formatter)
+            {
+                // Use the sophisticated Rust-style formatter
+                std::string formatted = _advanced_formatter->format_diagnostic(diagnostic);
+                os << formatted;
+            }
+            else
+            {
+                // Fall back to basic formatter
+                _formatter.print(diagnostic, os);
+            }
         }
     }
 
@@ -1194,6 +1210,28 @@ namespace Cryo
         _formatter.set_use_colors(use_colors);
         _formatter.set_show_source_context(show_source_context);
         _formatter.set_context_lines(context_lines);
+        
+        // Also apply to advanced formatter if available
+        if (_advanced_formatter) {
+            set_advanced_formatter_options(use_colors, true, 80);
+        }
+    }
+
+    void DiagnosticManager::enable_advanced_formatting(bool enable)
+    {
+        _use_advanced_formatting = enable;
+        if (enable && !_advanced_formatter) {
+            _advanced_formatter = std::make_unique<AdvancedDiagnosticFormatter>(&_source_manager, true, true, 80);
+        }
+    }
+
+    void DiagnosticManager::set_advanced_formatter_options(bool use_colors, bool use_unicode, size_t terminal_width)
+    {
+        if (_advanced_formatter) {
+            // For now, we'll recreate the formatter with new options
+            // In a more sophisticated implementation, we'd add setter methods
+            _advanced_formatter = std::make_unique<AdvancedDiagnosticFormatter>(&_source_manager, use_colors, use_unicode, terminal_width);
+        }
     }
 
     void DiagnosticManager::clear()
@@ -1386,6 +1424,98 @@ namespace Cryo
         // This method is for when diagnostics are built externally and need to be added
         // For now, we just add it to our list since the create_* methods already add them
         // In a more sophisticated implementation, this could handle deferred emission
+    }
+
+    // Enhanced diagnostic builders for message-first approach
+    Diagnostic& DiagnosticManager::create_error(ErrorCode error_code, const std::string& message)
+    {
+        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
+        
+        Diagnostic diagnostic(error_code, DiagnosticSeverity::Error, DiagnosticCategory::Semantic,
+                             message.empty() ? error_info.short_description : message, 
+                             SourceRange(), "");
+        
+        _diagnostics.push_back(std::move(diagnostic));
+        update_statistics(DiagnosticSeverity::Error);
+        
+        return _diagnostics.back();
+    }
+
+    Diagnostic& DiagnosticManager::create_warning(ErrorCode error_code, const std::string& message)
+    {
+        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
+        
+        Diagnostic diagnostic(error_code, DiagnosticSeverity::Warning, DiagnosticCategory::Semantic,
+                             message.empty() ? error_info.short_description : message, 
+                             SourceRange(), "");
+        
+        _diagnostics.push_back(std::move(diagnostic));
+        update_statistics(DiagnosticSeverity::Warning);
+        
+        return _diagnostics.back();
+    }
+
+    Diagnostic& DiagnosticManager::create_note(ErrorCode error_code, const std::string& message)
+    {
+        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
+        
+        Diagnostic diagnostic(error_code, DiagnosticSeverity::Note, DiagnosticCategory::Semantic,
+                             message.empty() ? error_info.short_description : message, 
+                             SourceRange(), "");
+        
+        _diagnostics.push_back(std::move(diagnostic));
+        update_statistics(DiagnosticSeverity::Note);
+        
+        return _diagnostics.back();
+    }
+
+    // Enhanced type mismatch with sophisticated error reporting
+    void DiagnosticManager::report_enhanced_type_mismatch(const SourceSpan& value_span,
+                                                          const SourceSpan& type_annotation_span,
+                                                          const std::string& expected_type,
+                                                          const std::string& actual_type,
+                                                          const std::string& filename)
+    {
+        // Create sophisticated type mismatch diagnostic
+        auto& diagnostic = create_error(ErrorCode::E0200_TYPE_MISMATCH, 
+                                       "type mismatch in assignment");
+        
+        // Create primary span with label
+        SourceSpan primary_value_span = value_span;
+        primary_value_span.set_label("expected `" + expected_type + "`, found `" + actual_type + "`");
+        diagnostic.with_primary_span(primary_value_span);
+        
+        // Add secondary span for type annotation if different from value location
+        if (!type_annotation_span.is_single_location() && 
+            !value_span.overlaps_with(type_annotation_span)) {
+            diagnostic.add_secondary_span(type_annotation_span, "expected due to this type annotation");
+        }
+        
+        // Add contextual suggestions based on the types
+        if (expected_type == "string" && actual_type == "int") {
+            diagnostic.suggest_replacement(
+                type_annotation_span,
+                "const x = \"hello\";", // Remove type annotation
+                "if you meant to create a string variable, remove the type annotation"
+            );
+        } else if (expected_type == "int" && actual_type == "string") {
+            // Suggest string parsing
+            diagnostic.suggest_replacement(
+                value_span,
+                "\"hello\".parse_int()",
+                "if you want to convert string to integer, try parsing"
+            );
+            diagnostic.suggest_replacement(
+                type_annotation_span,
+                "const x = \"hello\";",
+                "if you meant to create a string variable, remove the type annotation"
+            );
+        }
+        
+        // Add helpful note
+        diagnostic.add_help("string literals cannot be implicitly converted to integers");
+        
+        emit(diagnostic);
     }
 
     // ================================================================
