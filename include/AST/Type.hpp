@@ -435,6 +435,7 @@ namespace Cryo
         std::string to_string() const override;
 
         bool equals(const Type &other) const override;
+        bool is_assignable_from(const Type &other) const override;
     };
 
     // Reference type
