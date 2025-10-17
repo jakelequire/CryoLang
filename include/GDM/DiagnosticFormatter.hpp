@@ -2,6 +2,7 @@
 
 #include "GDM/GDM.hpp"
 #include "Utils/File.hpp"
+#include "Utils/SyntaxHighlighter.hpp"
 #include <string>
 #include <vector>
 #include <sstream>
@@ -55,6 +56,7 @@ namespace Cryo
         FormatStyle _style;
         size_t _terminal_width;
         const SourceManager* _source_manager;
+        SyntaxHighlighter _syntax_highlighter;
 
     public:
         DiagnosticFormatter(const SourceManager* source_manager,
