@@ -1341,16 +1341,14 @@ namespace Cryo::Codegen
                 const auto &loc = node->location();
                 Cryo::SourceRange range(loc); // Use explicit constructor
 
-                _gdm->report_error(Cryo::DiagnosticID::UnimplementedIntrinsic,
-                                   Cryo::DiagnosticCategory::CodeGen,
-                                   range, "<source_file>", message);
+                _gdm->report_error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC,
+                                   message, range, "<source_file>");
             }
             else
             {
                 // Fallback: report without location
                 Cryo::SourceRange dummy_range; // Default constructed range
-                _gdm->report_error(Cryo::DiagnosticID::UnimplementedIntrinsic,
-                                   Cryo::DiagnosticCategory::CodeGen,
+                _gdm->report_error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC,
                                    message, dummy_range, "<unknown>");
             }
         }

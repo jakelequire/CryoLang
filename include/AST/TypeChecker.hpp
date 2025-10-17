@@ -282,6 +282,9 @@ namespace Cryo
         // Set current namespace context (called by compiler)
         void set_current_namespace(const std::string &namespace_name) { _current_namespace = namespace_name; }
 
+        // Set source file for error reporting
+        void set_source_file(const std::string &source_file) { _source_file = source_file; }
+
         // Error and warning handling
         const std::vector<TypeError> &errors() const { return _errors; }
         bool has_errors() const { return !_errors.empty(); }

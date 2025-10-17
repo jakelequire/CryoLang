@@ -2,6 +2,7 @@
 
 #include "Lexer/lexer.hpp"
 #include "Utils/File.hpp"
+#include "GDM/ErrorCodes.hpp"
 #include <memory>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <ostream>
 #include <iostream>
 #include <sstream>
+#include <variant>
 
 namespace Cryo
 {
@@ -42,100 +44,25 @@ namespace Cryo
         System    // System/IO errors
     };
 
-    // Specific diagnostic IDs for precise error identification
-    enum class DiagnosticID
+    // ================================================================
+    // Suggestion System for Advanced Diagnostics
+    // ================================================================
+
+    enum class SuggestionApplicability
     {
-        // Lexer diagnostics
-        UnexpectedCharacter,
-        UnterminatedString,
-        InvalidNumber,
-        InvalidEscapeSequence,
-        InvalidCharacterLiteral,
-        InvalidStringEscape,
+        MachineApplicable,    // Can be applied automatically by tools
+        MaybeIncorrect,       // Probably correct, but may need user review
+        HasPlaceholders,      // Contains placeholder text that needs user input
+        Unspecified           // Unknown applicability
+    };
 
-        // Parser diagnostics
-        ExpectedToken,
-        UnexpectedToken,
-        ExpectedExpression,
-        ExpectedStatement,
-        ExpectedType,
-        ExpectedIdentifier,
-        ExpectedOperator,
-        ExpectedSemicolon,
-        ExpectedClosingParen,
-        ExpectedClosingBrace,
-        ExpectedClosingBracket,
-        MismatchedDelimiters,
-        InvalidSyntax,
-
-        // Semantic/Type diagnostics
-        UndefinedVariable,
-        UndefinedFunction,
-        UndefinedType,
-        UndefinedMember,
-        TypeMismatch,
-        TypeMismatchAssignment,
-        TypeMismatchArgument,
-        TypeMismatchReturn,
-        TypeMismatchBinaryOp,
-        TypeMismatchUnaryOp,
-        RedefinedSymbol,
-        RedefinedFunction,
-        RedefinedType,
-        InvalidCast,
-        InvalidOperator,
-        InvalidMemberAccess,
-        InvalidArrayAccess,
-        InvalidFunctionCall,
-        InvalidConstructorCall,
-        InvalidAssignment,
-        IncompatibleTypes,
-        IncompleteType,
-        VoidValueUsed,
-        NonCallableType,
-        TooManyArguments,
-        TooFewArguments,
-        ArgumentCountMismatch,
-        ConstViolation,
-        ImmutableAssignment,
-        UninitializedVariable,
-        UnreachableCode,
-        CircularDependency,
-
-        // Generic instantiation diagnostics
-        GenericInstantiationFailed,
-        GenericTypeResolutionFailed,
-        GenericParameterMismatch,
-        InvalidGenericConstraint,
-
-        // Class/Struct diagnostics
-        StructMemberNotFound,
-        ClassMemberNotFound,
-        ConstructorNotFound,
-        PrivateMemberAccess,
-        AbstractMethodCall,
-
-        // System diagnostics
-        FileNotFound,
-        FileReadError,
-        FileWriteError,
-        OutOfMemory,
-        InternalError,
-
-        // CodeGen diagnostics
-        UnimplementedIntrinsic,
-        CodeGenFailed,
-        LLVMError,
-        InvalidLLVMType,
-        InvalidLLVMValue,
-
-        // Linker diagnostics
-        LinkError,
-        UndefinedSymbol,
-        DuplicateSymbol,
-
-        // Generic
-        Unknown
+    enum class SuggestionStyle
+    {
+        ShowCode,            // Show the suggestion with code
+        HideCodeInline,      // Show as inline help text
+        HideCodeAlways,      // Never show code, only description
+        ShowAlways,          // Always show, even if verbose
+        ToolOnly             // Only for tools, not human-readable output
     };
 
     // ================================================================
@@ -161,13 +88,210 @@ namespace Cryo
     };
 
     // ================================================================
+    // Enhanced Source Span for sophisticated error reporting
+    // ================================================================
+
+    class SourceSpan
+    {
+    private:
+        SourceLocation _start;
+        SourceLocation _end;
+        std::string _filename;
+        bool _is_primary;
+        std::optional<std::string> _label;
+
+    public:
+        SourceSpan() = default;
+        SourceSpan(const SourceLocation& start, const SourceLocation& end, 
+                   const std::string& filename = "", bool is_primary = true)
+            : _start(start), _end(end), _filename(filename), _is_primary(is_primary) {}
+
+        // Single character span
+        explicit SourceSpan(const SourceLocation& loc, const std::string& filename = "", 
+                           bool is_primary = true)
+            : _start(loc), _end(loc), _filename(filename), _is_primary(is_primary) {}
+
+        // Convert from existing SourceRange
+        SourceSpan(const SourceRange& range, const std::string& filename = "", 
+                   bool is_primary = true)
+            : _start(range.start), _end(range.end), _filename(filename), _is_primary(is_primary) {}
+
+        // Getters
+        const SourceLocation& start() const { return _start; }
+        const SourceLocation& end() const { return _end; }
+        const std::string& filename() const { return _filename; }
+        bool is_primary() const { return _is_primary; }
+        const std::optional<std::string>& label() const { return _label; }
+
+        // Setters
+        void set_primary(bool primary) { _is_primary = primary; }
+        void set_label(const std::string& label) { _label = label; }
+        void set_filename(const std::string& filename) { _filename = filename; }
+
+        // Utility methods
+        bool is_valid() const { return _start.line() > 0 && _start.column() > 0; }
+        bool is_single_location() const { return _start == _end; }
+        bool spans_multiple_lines() const { return _start.line() != _end.line(); }
+        size_t length() const;
+        
+        std::vector<size_t> affected_lines() const;
+        bool overlaps_with(const SourceSpan& other) const;
+
+        // Convert to legacy SourceRange for compatibility
+        SourceRange to_source_range() const { return SourceRange(_start, _end); }
+
+        // Static utility methods
+        static SourceSpan merge(const std::vector<SourceSpan>& spans);
+        static SourceSpan from_to(const SourceSpan& from, const SourceSpan& to);
+    };
+
+    // ================================================================
+    // Multi-Span support for complex diagnostics
+    // ================================================================
+
+    class MultiSpan
+    {
+    private:
+        std::vector<SourceSpan> _primary_spans;
+        std::vector<SourceSpan> _secondary_spans;
+
+    public:
+        MultiSpan() = default;
+        explicit MultiSpan(const SourceSpan& primary_span);
+        explicit MultiSpan(const SourceRange& range, const std::string& filename = "");
+
+        // Primary span management
+        void add_primary_span(const SourceSpan& span);
+        void add_primary_span(const SourceLocation& start, const SourceLocation& end, 
+                              const std::string& filename = "");
+        const std::vector<SourceSpan>& primary_spans() const { return _primary_spans; }
+
+        // Secondary span management  
+        void add_secondary_span(const SourceSpan& span);
+        void add_secondary_span(const SourceLocation& start, const SourceLocation& end,
+                                const std::string& filename = "", const std::string& label = "");
+        const std::vector<SourceSpan>& secondary_spans() const { return _secondary_spans; }
+
+        // Convenience methods
+        void add_span_label(const SourceSpan& span, const std::string& label);
+        void add_span_label(const SourceLocation& start, const SourceLocation& end,
+                            const std::string& label, const std::string& filename = "");
+
+        // Utility methods
+        bool is_empty() const { return _primary_spans.empty() && _secondary_spans.empty(); }
+        bool has_primary_spans() const { return !_primary_spans.empty(); }
+        SourceSpan primary_span() const; // Returns first primary span
+        std::vector<SourceSpan> all_spans() const; // All spans combined
+        std::vector<std::string> affected_files() const;
+
+        // Legacy compatibility
+        SourceRange to_source_range() const;
+    };
+
+    // ================================================================
+    // Advanced Code Suggestion System
+    // ================================================================
+
+    class CodeSuggestion
+    {
+    public:
+        // Single-span suggestion for simple replacements
+        struct SimpleSuggestion
+        {
+            SourceSpan span;
+            std::string replacement;
+            
+            SimpleSuggestion(const SourceSpan& span, const std::string& replacement)
+                : span(span), replacement(replacement) {}
+        };
+
+        // Multi-part suggestion for complex edits
+        struct MultipartSuggestion
+        {
+            std::vector<std::pair<SourceSpan, std::string>> parts;
+            
+            void add_part(const SourceSpan& span, const std::string& replacement) {
+                parts.emplace_back(span, replacement);
+            }
+        };
+
+    private:
+        std::string _message;
+        SuggestionApplicability _applicability;
+        SuggestionStyle _style;
+        std::variant<SimpleSuggestion, MultipartSuggestion> _suggestion_data;
+
+    public:
+        // Constructors
+        CodeSuggestion(const std::string& message, 
+                      const SourceSpan& span, 
+                      const std::string& replacement,
+                      SuggestionApplicability applicability = SuggestionApplicability::MaybeIncorrect,
+                      SuggestionStyle style = SuggestionStyle::ShowCode)
+            : _message(message), _applicability(applicability), _style(style),
+              _suggestion_data(SimpleSuggestion(span, replacement)) {}
+
+        CodeSuggestion(const std::string& message,
+                      const std::vector<std::pair<SourceSpan, std::string>>& parts,
+                      SuggestionApplicability applicability = SuggestionApplicability::MaybeIncorrect,
+                      SuggestionStyle style = SuggestionStyle::ShowCode)
+            : _message(message), _applicability(applicability), _style(style),
+              _suggestion_data(MultipartSuggestion{})
+        {
+            MultipartSuggestion& multipart = std::get<MultipartSuggestion>(_suggestion_data);
+            for (const auto& part : parts) {
+                multipart.add_part(part.first, part.second);
+            }
+        }
+
+        // Getters
+        const std::string& message() const { return _message; }
+        SuggestionApplicability applicability() const { return _applicability; }
+        SuggestionStyle style() const { return _style; }
+        
+        bool is_simple() const { 
+            return std::holds_alternative<SimpleSuggestion>(_suggestion_data); 
+        }
+        
+        bool is_multipart() const { 
+            return std::holds_alternative<MultipartSuggestion>(_suggestion_data); 
+        }
+
+        const SimpleSuggestion& simple() const {
+            return std::get<SimpleSuggestion>(_suggestion_data);
+        }
+
+        const MultipartSuggestion& multipart() const {
+            return std::get<MultipartSuggestion>(_suggestion_data);
+        }
+
+        // Utility methods
+        std::vector<SourceSpan> affected_spans() const;
+        bool should_show_code() const;
+        bool is_machine_applicable() const { 
+            return _applicability == SuggestionApplicability::MachineApplicable; 
+        }
+
+        // Builder pattern methods
+        CodeSuggestion& with_applicability(SuggestionApplicability applicability) {
+            _applicability = applicability;
+            return *this;
+        }
+
+        CodeSuggestion& with_style(SuggestionStyle style) {
+            _style = style;
+            return *this;
+        }
+    };
+
+    // ================================================================
     // Individual Diagnostic
     // ================================================================
 
     class Diagnostic
     {
     private:
-        DiagnosticID _id;
+        ErrorCode _error_code;
         DiagnosticSeverity _severity;
         DiagnosticCategory _category;
         std::string _message;
@@ -175,14 +299,22 @@ namespace Cryo
         std::string _filename;
         std::vector<std::string> _notes;
         std::vector<std::pair<SourceRange, std::string>> _fix_it_hints;
+        std::string _suggestion; // Enhanced suggestion based on error code
+        std::string _explanation; // Detailed explanation of the error
+        
+        // Enhanced span and suggestion system
+        MultiSpan _multi_span;
+        std::vector<CodeSuggestion> _code_suggestions;
+        std::vector<std::string> _help_messages;
 
     public:
-        Diagnostic(DiagnosticID id, DiagnosticSeverity severity, DiagnosticCategory category,
+        // Primary constructor with error codes
+        Diagnostic(ErrorCode error_code, DiagnosticSeverity severity, DiagnosticCategory category,
                    const std::string &message, const SourceRange &range,
                    const std::string &filename = "");
 
         // Getters
-        DiagnosticID id() const { return _id; }
+        ErrorCode error_code() const { return _error_code; }
         DiagnosticSeverity severity() const { return _severity; }
         DiagnosticCategory category() const { return _category; }
         const std::string &message() const { return _message; }
@@ -190,10 +322,31 @@ namespace Cryo
         const std::string &filename() const { return _filename; }
         const std::vector<std::string> &notes() const { return _notes; }
         const std::vector<std::pair<SourceRange, std::string>> &fix_it_hints() const { return _fix_it_hints; }
+        const std::string &suggestion() const { return _suggestion; }
+        const std::string &explanation() const { return _explanation; }
+
+        // Enhanced span and suggestion system accessors
+        const MultiSpan& multi_span() const { return _multi_span; }
+        const std::vector<CodeSuggestion>& code_suggestions() const { return _code_suggestions; }
+        const std::vector<std::string>& help_messages() const { return _help_messages; }
 
         // Builders for chaining
         Diagnostic &add_note(const std::string &note);
         Diagnostic &add_fix_it(const SourceRange &range, const std::string &replacement);
+        
+        // Enhanced suggestion builders
+        Diagnostic& with_primary_span(const SourceSpan& span);
+        Diagnostic& add_secondary_span(const SourceSpan& span, const std::string& label = "");
+        Diagnostic& add_suggestion(const CodeSuggestion& suggestion);
+        Diagnostic& add_help(const std::string& help_message);
+        
+        // Convenience suggestion builders
+        Diagnostic& suggest_replacement(const SourceSpan& span, const std::string& replacement,
+                                      const std::string& message = "try this",
+                                      SuggestionApplicability applicability = SuggestionApplicability::MaybeIncorrect);
+        
+        Diagnostic& suggest_insertion(const SourceLocation& location, const std::string& insertion,
+                                    const std::string& message = "try adding this");
 
         // Severity checks
         bool is_note() const { return _severity == DiagnosticSeverity::Note; }
@@ -208,6 +361,19 @@ namespace Cryo
 
     class SourceManager
     {
+    public:
+        // Enhanced context structure for sophisticated error display
+        struct SourceSnippet
+        {
+            std::vector<std::string> lines;
+            size_t start_line_number;
+            std::vector<SourceSpan> highlighted_spans;
+            size_t max_line_number_width;
+            std::string filename;
+            
+            SourceSnippet() : start_line_number(1), max_line_number_width(0) {}
+        };
+
     private:
         std::unordered_map<std::string, std::shared_ptr<File>> _files;
         mutable std::unordered_map<std::string, std::vector<std::string>> _file_lines;
@@ -221,16 +387,47 @@ namespace Cryo
         std::shared_ptr<File> get_file(const std::string &filename) const;
         bool has_file(const std::string &filename) const;
 
-        // Source line access
+        // Basic source line access (legacy compatibility)
         std::string get_source_line(const std::string &filename, size_t line_number) const;
         std::vector<std::string> get_source_context(const std::string &filename,
                                                     size_t center_line, size_t context_lines = 2) const;
 
-        // Utility
+        // Enhanced context extraction for sophisticated diagnostics
+        SourceSnippet extract_snippet(const SourceSpan& span, size_t context_lines = 2) const;
+        SourceSnippet extract_snippet(const MultiSpan& multi_span, size_t context_lines = 2) const;
+        
+        // Smart context - automatically determine optimal context based on span complexity
+        SourceSnippet extract_smart_context(const SourceSpan& span) const;
+        SourceSnippet extract_smart_context(const MultiSpan& multi_span) const;
+
+        // Multi-file snippet extraction for spans across multiple files
+        std::vector<SourceSnippet> extract_multi_file_snippets(const MultiSpan& multi_span, 
+                                                               size_t context_lines = 2) const;
+
+        // Utility methods for enhanced source management
         bool is_valid_location(const std::string &filename, const SourceLocation &loc) const;
+        bool is_valid_span(const SourceSpan& span) const;
+        size_t get_line_count(const std::string& filename) const;
+        std::string get_line_text(const std::string& filename, size_t line_number) const;
+        
+        // Calculate optimal line number width for formatting
+        size_t calculate_line_number_width(size_t max_line_number) const;
+        
+        // Span utilities
+        std::vector<SourceSpan> get_spans_on_line(const std::vector<SourceSpan>& spans, 
+                                                  size_t line_number) const;
 
     private:
         void ensure_file_lines_cached(const std::string &filename) const;
+        
+        // Helper methods for enhanced context extraction
+        std::pair<size_t, size_t> calculate_context_range(const SourceSpan& span, 
+                                                          size_t context_lines,
+                                                          size_t file_line_count) const;
+        
+        std::pair<size_t, size_t> calculate_multi_span_range(const std::vector<SourceSpan>& spans,
+                                                             size_t context_lines,
+                                                             size_t file_line_count) const;
     };
 
     // ================================================================
@@ -268,7 +465,6 @@ namespace Cryo
         std::string get_color_code(DiagnosticSeverity severity) const;
         std::string get_reset_color() const;
         std::string get_error_context_message(const Diagnostic &diagnostic) const;
-        std::string get_diagnostic_code(DiagnosticID id) const;
     };
 
     // ================================================================
@@ -302,34 +498,24 @@ namespace Cryo
         const SourceManager &source_manager() const { return _source_manager; }
 
         // Main diagnostic interface
-        void report(DiagnosticID id, DiagnosticSeverity severity, DiagnosticCategory category,
+        void report(ErrorCode error_code, const std::string &message, const SourceRange &range,
+                    const std::string &filename = "");
+        
+        void report(ErrorCode error_code, DiagnosticSeverity severity, DiagnosticCategory category,
                     const std::string &message, const SourceRange &range,
                     const std::string &filename = "");
 
         void report(const Diagnostic &diagnostic);
 
-        // Convenience methods for common diagnostic types
-        void report_error(DiagnosticID id, DiagnosticCategory category, const std::string &message,
+        // Convenience methods with error codes
+        void report_error(ErrorCode error_code, const std::string &message,
                           const SourceRange &range, const std::string &filename = "");
-        void report_warning(DiagnosticID id, DiagnosticCategory category, const std::string &message,
+        void report_warning(ErrorCode error_code, const std::string &message,
                             const SourceRange &range, const std::string &filename = "");
-        void report_note(DiagnosticID id, DiagnosticCategory category, const std::string &message,
+        void report_note(ErrorCode error_code, const std::string &message,
                          const SourceRange &range, const std::string &filename = "");
 
-        // Template methods for formatted messages
-        template <typename... Args>
-        void report_error(DiagnosticID id, DiagnosticCategory category, const SourceRange &range,
-                          const std::string &filename, const std::string &format, Args &&...args);
-
-        template <typename... Args>
-        void report_warning(DiagnosticID id, DiagnosticCategory category, const SourceRange &range,
-                            const std::string &filename, const std::string &format, Args &&...args);
-
-        template <typename... Args>
-        void report_note(DiagnosticID id, DiagnosticCategory category, const SourceRange &range,
-                         const std::string &filename, const std::string &format, Args &&...args);
-
-        // Type-specific error reporting
+        // Enhanced type-specific error reporting
         void report_type_mismatch(const SourceRange &range, const std::string &filename,
                                   const std::string &expected_type, const std::string &actual_type,
                                   const std::string &context = "");
@@ -348,6 +534,19 @@ namespace Cryo
                                       const std::string &function_name, size_t expected_count,
                                       size_t actual_count);
 
+        // Enhanced error reporting with automatic error detection
+        void report_invalid_dereference(const SourceRange &range, const std::string &filename,
+                                        const std::string &type_name);
+
+        void report_invalid_address_of(const SourceRange &range, const std::string &filename,
+                                       const std::string &expression);
+
+        void report_undefined_field(const SourceRange &range, const std::string &filename,
+                                    const std::string &field_name, const std::string &type_name);
+
+        void report_non_callable_type(const SourceRange &range, const std::string &filename,
+                                      const std::string &type_name);
+
         // Access diagnostics
         const std::vector<Diagnostic> &diagnostics() const { return _diagnostics; }
         bool has_errors() const { return _error_count > 0; }
@@ -362,6 +561,12 @@ namespace Cryo
         // Output
         void print_all(std::ostream &os = std::cerr) const;
         void print_summary(std::ostream &os = std::cerr) const;
+
+        // Enhanced diagnostic builder
+        Diagnostic& create_error(ErrorCode error_code, const SourceRange& range, const std::string& filename);
+        Diagnostic& create_warning(ErrorCode error_code, const SourceRange& range, const std::string& filename);
+        Diagnostic& create_note(ErrorCode error_code, const SourceRange& range, const std::string& filename);
+        void emit(const Diagnostic& diagnostic);
 
         // Configuration
         void set_errors_as_warnings(bool enable) { _errors_as_warnings = enable; }
@@ -413,33 +618,6 @@ namespace Cryo
         {
             os << format;
         }
-    }
-
-    template <typename... Args>
-    void DiagnosticManager::report_error(DiagnosticID id, DiagnosticCategory category,
-                                         const SourceRange &range, const std::string &filename,
-                                         const std::string &format, Args &&...args)
-    {
-        std::string message = format_message(format, std::forward<Args>(args)...);
-        report_error(id, category, message, range, filename);
-    }
-
-    template <typename... Args>
-    void DiagnosticManager::report_warning(DiagnosticID id, DiagnosticCategory category,
-                                           const SourceRange &range, const std::string &filename,
-                                           const std::string &format, Args &&...args)
-    {
-        std::string message = format_message(format, std::forward<Args>(args)...);
-        report_warning(id, category, message, range, filename);
-    }
-
-    template <typename... Args>
-    void DiagnosticManager::report_note(DiagnosticID id, DiagnosticCategory category,
-                                        const SourceRange &range, const std::string &filename,
-                                        const std::string &format, Args &&...args)
-    {
-        std::string message = format_message(format, std::forward<Args>(args)...);
-        report_note(id, category, message, range, filename);
     }
 
     template <typename... Args>

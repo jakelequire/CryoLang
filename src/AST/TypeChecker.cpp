@@ -2070,8 +2070,13 @@ namespace Cryo
                     }
                     else
                     {
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                     "Cannot dereference non-pointer/reference type: " + operand_type->to_string());
+                        if (_diagnostic_manager) {
+                            SourceRange range(node.location());
+                            _diagnostic_manager->report_invalid_dereference(range, _source_file, operand_type->to_string());
+                        } else {
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Cannot dereference non-pointer/reference type: " + operand_type->to_string());
+                        }
                     }
                 }
                 else if (op == TokenKind::TK_MINUS) // Unary minus
@@ -2273,8 +2278,13 @@ namespace Cryo
             }
 
             // Not callable
-            report_error(TypeError::ErrorKind::NonCallableType, node.location(),
-                         "Expression is not callable");
+            if (_diagnostic_manager) {
+                SourceRange range(node.location());
+                _diagnostic_manager->report_non_callable_type(range, _source_file, callee_type ? callee_type->to_string() : "unknown");
+            } else {
+                report_error(TypeError::ErrorKind::NonCallableType, node.location(),
+                             "Expression is not callable");
+            }
             node.set_resolved_type(_type_context.get_unknown_type());
         }
         else
@@ -2820,8 +2830,13 @@ namespace Cryo
         }
 
         // Field or method not found in struct
-        report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                     "Unknown member '" + member_name + "' in type '" + object_type + "'");
+        if (_diagnostic_manager) {
+            SourceRange range(node.location());
+            _diagnostic_manager->report_undefined_field(range, _source_file, member_name, object_type);
+        } else {
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                         "Unknown member '" + member_name + "' in type '" + object_type + "'");
+        }
         node.set_type("unknown");
     }
 
@@ -4317,7 +4332,59 @@ namespace Cryo
 
     void TypeChecker::report_error(TypeError::ErrorKind kind, SourceLocation loc, const std::string &message)
     {
-        _errors.emplace_back(kind, loc, message);
+        // If we have a diagnostic manager, use it with enhanced error reporting
+        if (_diagnostic_manager) {
+            ErrorCode error_code = ErrorCode::E0805_INTERNAL_ERROR;
+            
+            // Map TypeError::ErrorKind to ErrorCode for enhanced reporting
+            switch (kind) {
+                case TypeError::ErrorKind::TypeMismatch:
+                    error_code = ErrorCode::E0200_TYPE_MISMATCH;
+                    break;
+                case TypeError::ErrorKind::UndefinedVariable:
+                    error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
+                    break;
+                case TypeError::ErrorKind::UndefinedFunction:
+                    error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
+                    break;
+                case TypeError::ErrorKind::RedefinedSymbol:
+                    error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
+                    break;
+                case TypeError::ErrorKind::InvalidOperation:
+                    error_code = ErrorCode::E0209_INVALID_OPERATION;
+                    break;
+                case TypeError::ErrorKind::InvalidAssignment:
+                    error_code = ErrorCode::E0210_INVALID_ASSIGNMENT;
+                    break;
+                case TypeError::ErrorKind::InvalidCast:
+                    error_code = ErrorCode::E0208_INVALID_CAST;
+                    break;
+                case TypeError::ErrorKind::IncompatibleTypes:
+                    error_code = ErrorCode::E0211_INCOMPATIBLE_TYPES;
+                    break;
+                case TypeError::ErrorKind::TooManyArguments:
+                    error_code = ErrorCode::E0215_TOO_MANY_ARGS;
+                    break;
+                case TypeError::ErrorKind::TooFewArguments:
+                    error_code = ErrorCode::E0216_TOO_FEW_ARGS;
+                    break;
+                case TypeError::ErrorKind::NonCallableType:
+                    error_code = ErrorCode::E0213_NON_CALLABLE;
+                    break;
+                case TypeError::ErrorKind::VoidValueUsage:
+                    error_code = ErrorCode::E0212_VOID_VALUE_USED;
+                    break;
+                default:
+                    error_code = ErrorCode::E0805_INTERNAL_ERROR;
+                    break;
+            }
+            
+            SourceRange range(loc);
+            _diagnostic_manager->report_error(error_code, message, range, _source_file);
+        } else {
+            // Fallback to old behavior if no diagnostic manager
+            _errors.emplace_back(kind, loc, message);
+        }
     }
 
     void TypeChecker::report_warning(TypeWarning::WarningKind kind, SourceLocation loc, const std::string &message)
@@ -4333,12 +4400,55 @@ namespace Cryo
 
     void TypeChecker::report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context)
     {
-        std::string expected_type = expected ? expected->to_string() : "unknown";
-        std::string actual_type = actual ? actual->to_string() : "unknown";
+        if (_diagnostic_manager) {
+            // Use enhanced diagnostic system with sophisticated suggestions
+            std::string expected_type = expected ? expected->to_string() : "unknown";
+            std::string actual_type = actual ? actual->to_string() : "unknown";
+            
+            SourceRange range(loc);
+            SourceSpan primary_span(loc, loc, _source_file, true);
+            
+            // Create enhanced diagnostic with suggestions
+            auto diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, 
+                                                               range, _source_file)
+                .with_primary_span(primary_span)
+                .add_help("Ensure the types are compatible or add an explicit cast if appropriate.");
+            
+            // Add type-specific suggestions
+            if (context == "variable initialization") {
+                if (expected_type == "int" && actual_type == "string") {
+                    // String to int conversion suggestion
+                    diagnostic.suggest_replacement(primary_span, 
+                                                 "parseInt(" + actual_type + ")", 
+                                                 "try converting the string to an integer",
+                                                 SuggestionApplicability::MaybeIncorrect);
+                } else if (expected_type == "string" && actual_type == "int") {
+                    // Int to string conversion suggestion  
+                    diagnostic.suggest_replacement(primary_span,
+                                                 "toString(" + actual_type + ")",
+                                                 "try converting the integer to a string",
+                                                 SuggestionApplicability::MaybeIncorrect);
+                } else {
+                    // Generic type cast suggestion
+                    diagnostic.suggest_replacement(primary_span,
+                                                 "(" + expected_type + ") <value>",
+                                                 "try an explicit cast",
+                                                 SuggestionApplicability::HasPlaceholders);
+                }
+                
+                diagnostic.add_help("Consider changing the variable type if " + actual_type + " is the intended type.");
+            }
+            
+            _diagnostic_manager->emit(diagnostic);
+        } else {
+            // Fallback to old behavior
+            std::string expected_type = expected ? expected->to_string() : "unknown";
+            std::string actual_type = actual ? actual->to_string() : "unknown";
 
-        std::string message = "Type mismatch in " + context + "\n" +
-                              "Cannot assign '" + actual_type + "' to '" + expected_type + "'";
-        _errors.emplace_back(TypeError::ErrorKind::TypeMismatch, loc, message, expected, actual);
+            std::string message = "Type mismatch in " + context + "\n" +
+                                  "Cannot assign '" + actual_type + "' to '" + expected_type + "'";
+            _errors.emplace_back(TypeError::ErrorKind::TypeMismatch, loc, message, expected, actual);
+        }
     }
 
     void TypeChecker::report_undefined_symbol(SourceLocation loc, const std::string &symbol_name)

@@ -68,8 +68,16 @@ namespace Cryo
 
     private:
         // Diagnostic reporting
-        void report_error(DiagnosticID id, const std::string &message, SourceRange range = SourceRange{});
-        void report_warning(DiagnosticID id, const std::string &message, SourceRange range = SourceRange{});
+        void report_error(ErrorCode error_code, const std::string &message, SourceRange range = SourceRange{});
+        void report_warning(ErrorCode error_code, const std::string &message, SourceRange range = SourceRange{});
+        
+        // Enhanced diagnostic reporting
+        void report_enhanced_token_error(TokenKind expected, const std::string &context_message);
+        ErrorCode get_token_error_code(TokenKind expected);
+        std::string get_token_name(TokenKind kind);
+        void add_token_mismatch_suggestions(Diagnostic& diagnostic, TokenKind expected, TokenKind actual, const std::string& context);
+        void add_context_spans(Diagnostic& diagnostic, TokenKind expected);
+        void add_generic_parsing_suggestions(Diagnostic& diagnostic, const std::string& message);
 
         // Token management
         void advance();
