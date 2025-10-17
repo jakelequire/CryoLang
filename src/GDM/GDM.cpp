@@ -1,5 +1,5 @@
 #include "GDM/GDM.hpp"
-#include "GDM/AdvancedDiagnosticFormatter.hpp"
+#include "GDM/DiagnosticFormatter.hpp"
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
@@ -616,425 +616,23 @@ namespace Cryo
     }
 
     // ================================================================
-    // DiagnosticFormatter Implementation
+    // DiagnosticManager Implementation
     // ================================================================
 
-    DiagnosticFormatter::DiagnosticFormatter(const SourceManager &source_manager,
-                                             bool use_colors, bool show_source_context, size_t context_lines)
-        : _source_manager(source_manager), _use_colors(use_colors),
-          _show_source_context(show_source_context), _context_lines(context_lines)
-    {
-    }
 
-    std::string DiagnosticFormatter::format(const Diagnostic &diagnostic) const
-    {
-        std::ostringstream oss;
-
-        // Severity and message (enhanced format: "error[E0308]: type mismatch")
-        if (_use_colors)
-        {
-            oss << get_color_code(diagnostic.severity());
-        }
-
-        oss << format_severity(diagnostic.severity());
-
-        // Enhanced error code display
-        ErrorCode error_code = diagnostic.error_code();
-        if (error_code != ErrorCode::E0805_INTERNAL_ERROR)
-        {
-            ErrorRegistry::initialize();
-            oss << "[" << ErrorRegistry::format_error_code(error_code) << "]";
-        }
-
-        oss << ": " << diagnostic.message();
-
-        if (_use_colors)
-        {
-            oss << get_reset_color();
-        }
-
-        oss << "\n";
-
-        // Location info (Rust format: " --> filename:line:column")
-        if (!diagnostic.filename().empty() && diagnostic.range().is_valid())
-        {
-            if (_use_colors)
-            {
-                oss << "\033[1;34m"; // Bright blue
-            }
-            oss << " --> " << diagnostic.filename() << ":"
-                << diagnostic.range().start.line() << ":"
-                << diagnostic.range().start.column();
-            if (_use_colors)
-            {
-                oss << get_reset_color();
-            }
-            oss << "\n";
-        }
-
-        // Source context
-        if (_show_source_context && !diagnostic.filename().empty())
-        {
-            std::string context = format_source_context(diagnostic);
-            if (!context.empty())
-            {
-                oss << context;
-            }
-        }
-
-        // Notes
-        for (const auto &note : diagnostic.notes())
-        {
-            if (_use_colors)
-            {
-                oss << "\033[1;36m"; // Bright cyan for notes
-            }
-            oss << "note: " << note;
-            if (_use_colors)
-            {
-                oss << get_reset_color();
-            }
-            oss << "\n";
-        }
-
-        // Fix-it hints
-        for (const auto &fix_it : diagnostic.fix_it_hints())
-        {
-            if (_use_colors)
-            {
-                oss << "\033[1;32m"; // Bright green for suggestions
-            }
-            oss << "help: try `" << fix_it.second << "`";
-            if (_use_colors)
-            {
-                oss << get_reset_color();
-            }
-            oss << "\n";
-        }
-
-        return oss.str();
-    }
-
-    void DiagnosticFormatter::print(const Diagnostic &diagnostic, std::ostream &os) const
-    {
-        os << format(diagnostic);
-    }
-
-    std::string DiagnosticFormatter::format_severity(DiagnosticSeverity severity) const
-    {
-        switch (severity)
-        {
-        case DiagnosticSeverity::Note:
-            return "note";
-        case DiagnosticSeverity::Warning:
-            return "warning";
-        case DiagnosticSeverity::Error:
-            return "error";
-        case DiagnosticSeverity::Fatal:
-            return "fatal error";
-        default:
-            return "unknown";
-        }
-    }
-
-    std::string DiagnosticFormatter::format_source_context(const Diagnostic &diagnostic) const
-    {
-        if (!diagnostic.range().is_valid())
-        {
-            return "";
-        }
-
-        std::ostringstream oss;
-        size_t line_number = diagnostic.range().start.line();
-
-        // Get source context around the error line
-        std::vector<std::string> context_lines = _source_manager.get_source_context(
-            diagnostic.filename(), line_number, _context_lines);
-
-        if (context_lines.empty())
-        {
-            // Fallback to single line
-            std::string source_line = _source_manager.get_source_line(diagnostic.filename(), line_number);
-            if (source_line.empty())
-            {
-                return "";
-            }
-
-            // Show just the error line with better formatting
-            oss << "   |\n";
-            oss << std::setw(3) << line_number << " | " << source_line << "\n";
-            oss << format_caret_line(diagnostic, source_line) << "\n";
-            return oss.str();
-        }
-
-        // Calculate the starting line number for context
-        size_t start_line = (line_number > _context_lines) ? (line_number - _context_lines) : 1;
-
-        // Add a blank separator line
-        oss << "   |\n";
-
-        // Show context lines
-        for (size_t i = 0; i < context_lines.size(); ++i)
-        {
-            size_t current_line = start_line + i;
-
-            if (current_line == line_number)
-            {
-                // This is the error line - highlight it
-                oss << std::setw(3) << current_line << " | " << context_lines[i] << "\n";
-                oss << format_caret_line(diagnostic, context_lines[i]) << "\n";
-            }
-            else
-            {
-                // Context line
-                oss << std::setw(3) << current_line << " | " << context_lines[i] << "\n";
-            }
-        }
-
-        // Add closing separator line
-        oss << "   |\n";
-
-        return oss.str();
-    }
-
-    std::string DiagnosticFormatter::format_caret_line(const Diagnostic &diagnostic, const std::string &source_line) const
-    {
-        std::ostringstream oss;
-
-        // Match the line number prefix format exactly: "   | "
-        oss << "   | ";
-
-        size_t column = diagnostic.range().start.column();
-
-        // Since the lexer now properly tracks visual column positions (including tab expansion),
-        // we can trust the column position directly. Convert to 0-based for positioning.
-        size_t visual_position = (column > 0) ? column - 1 : 0;
-
-        // For specific error types, try to find the actual token and adjust position
-        size_t adjusted_position = visual_position;
-        
-        // Handle string literal errors
-        if (diagnostic.message().find("string") != std::string::npos || 
-            diagnostic.message().find("String") != std::string::npos)
-        {
-            // Search forward from the error position to find the string literal
-            // This handles cases where the error location points to the assignment operator
-            // but we want to highlight the actual string being assigned
-            for (size_t i = visual_position; i < source_line.length(); ++i)
-            {
-                if (source_line[i] == '"' || source_line[i] == '\'')
-                {
-                    adjusted_position = i;
-                    break;
-                }
-                // Stop searching after reasonable distance or if we hit end of statement
-                if (i - visual_position > 10 || source_line[i] == ';')
-                {
-                    break;
-                }
-            }
-        }
-        // Handle namespace-specific errors - just highlight the word "namespace"
-        else if (diagnostic.message().find("namespace") != std::string::npos)
-        {
-            // For namespace errors, we usually want to highlight just the "namespace" keyword
-            // The position should already be correct, no adjustment needed
-        }
-
-        // Add spaces up to the caret position
-        for (size_t i = 0; i < adjusted_position; ++i)
-        {
-            oss << ' ';
-        }
-
-        // Determine the appropriate length to highlight based on the token at this position
-        size_t highlight_length = determine_token_length(source_line, adjusted_position, diagnostic);
-
-        // Add highlighting for the error range
-        if (_use_colors)
-        {
-            oss << get_color_code(diagnostic.severity());
-        }
-
-        // For single character errors, use ^
-        // For multi-character tokens, use ^ followed by ~~~~~
-        if (highlight_length <= 1)
-        {
-            oss << "^";
-        }
-        else
-        {
-            oss << "^";
-            // Add tildes for the rest of the token, but limit to reasonable length
-            size_t tilde_count = std::min(highlight_length - 1, static_cast<size_t>(20)); // Max 20 tildes
-            for (size_t i = 0; i < tilde_count; ++i)
-            {
-                oss << "~";
-            }
-        }
-        if (_use_colors)
-        {
-            oss << get_reset_color();
-        }
-
-        // Add helpful context message for certain error types
-        std::string context_message = get_error_context_message(diagnostic);
-        if (!context_message.empty())
-        {
-            oss << " " << context_message;
-        }
-
-        return oss.str();
-    }
-
-    size_t DiagnosticFormatter::determine_token_length(const std::string &source_line, size_t position, const Diagnostic &diagnostic) const
-    {
-        // If we already have a multi-character range from the diagnostic system, use it
-        if (!diagnostic.range().is_single_location())
-        {
-            return diagnostic.range().length();
-        }
-
-        // Check if position is valid
-        if (position >= source_line.length())
-        {
-            return 1;
-        }
-
-        // Note: The position parameter here should already be the adjusted position from format_caret_line
-
-        // Get the character at the error position
-        char ch = source_line[position];
-
-        // For string literals at the exact position, find the matching quote
-        if (ch == '"' || ch == '\'')
-        {
-            char quote_char = ch;
-            size_t length = 1; // Start with opening quote
-
-            for (size_t i = position + 1; i < source_line.length(); ++i)
-            {
-                length++;
-                if (source_line[i] == quote_char && (i == 0 || source_line[i - 1] != '\\'))
-                {
-                    break; // Found closing quote
-                }
-            }
-            return length;
-        }
-
-        // For numbers, find the complete number
-        if (std::isdigit(ch) || ch == '.' || ch == '-')
-        {
-            size_t start = position;
-            size_t end = position;
-
-            // Find start of number (handle negative numbers)
-            while (start > 0 && (std::isdigit(source_line[start - 1]) || source_line[start - 1] == '.' ||
-                                 (start == position && source_line[start - 1] == '-')))
-            {
-                start--;
-            }
-
-            // Find end of number
-            while (end < source_line.length() && (std::isdigit(source_line[end]) || source_line[end] == '.'))
-            {
-                end++;
-            }
-
-            return end - start;
-        }
-
-        // For identifiers/keywords, find the complete word
-        if (std::isalpha(ch) || ch == '_')
-        {
-            size_t start = position;
-            size_t end = position;
-
-            // Find start of identifier
-            while (start > 0 && (std::isalnum(source_line[start - 1]) || source_line[start - 1] == '_'))
-            {
-                start--;
-            }
-
-            // Find end of identifier
-            while (end < source_line.length() && (std::isalnum(source_line[end]) || source_line[end] == '_'))
-            {
-                end++;
-            }
-
-            size_t length = end - start;
-            // Limit extremely long identifiers to reasonable length for display
-            return std::min(length, static_cast<size_t>(15));
-        }
-
-        // For operators and single characters, use appropriate length
-        if (position + 1 < source_line.length())
-        {
-            // Check for multi-character operators
-            std::string two_char = source_line.substr(position, 2);
-            if (two_char == "==" || two_char == "!=" || two_char == "<=" || two_char == ">=" ||
-                two_char == "&&" || two_char == "||" || two_char == "++" || two_char == "--" ||
-                two_char == "+=" || two_char == "-=" || two_char == "*=" || two_char == "/=")
-            {
-                return 2;
-            }
-        }
-
-        // Default to single character
-        return 1;
-    }
-
-    std::string DiagnosticFormatter::get_color_code(DiagnosticSeverity severity) const
-    {
-        if (!_use_colors)
-        {
-            return "";
-        }
-
-        switch (severity)
-        {
-        case DiagnosticSeverity::Note:
-            return "\033[1;36m"; // Bright cyan
-        case DiagnosticSeverity::Warning:
-            return "\033[1;33m"; // Bright yellow
-        case DiagnosticSeverity::Error:
-            return "\033[1;31m"; // Bright red
-        case DiagnosticSeverity::Fatal:
-            return "\033[1;35m"; // Bright magenta
-        default:
-            return "";
-        }
-    }
-
-    std::string DiagnosticFormatter::get_reset_color() const
-    {
-        return _use_colors ? "\033[0m" : "";
-    }
-
-    std::string DiagnosticFormatter::get_error_context_message(const Diagnostic &diagnostic) const
-    {
-        // The new ErrorCode system provides rich error information through the ErrorRegistry
-        // Context is now provided via the diagnostic's suggestion and explanation
-        if (!diagnostic.suggestion().empty()) {
-            return "help: " + diagnostic.suggestion();
-        }
-        return "";
-    }
-
-
-
+    // ================================================================
+    // Enhanced diagnostic reporting with error codes
+    // ================================================================
     // ================================================================
     // DiagnosticManager Implementation
     // ================================================================
 
     DiagnosticManager::DiagnosticManager()
-        : _formatter(_source_manager), _error_count(0), _warning_count(0), _note_count(0),
-          _errors_as_warnings(false), _warnings_as_errors(false), _max_errors(100),
-          _use_advanced_formatting(true)
+        : _error_count(0), _warning_count(0), _note_count(0),
+          _errors_as_warnings(false), _warnings_as_errors(false), _max_errors(100)
     {
         // Initialize advanced formatter with clean ASCII by default for universal compatibility
-        _advanced_formatter = std::make_unique<AdvancedDiagnosticFormatter>(&_source_manager, true, false, 80);
+        _formatter = std::make_unique<DiagnosticFormatter>(&_source_manager, true, false, 80);
     }
 
     DiagnosticManager::~DiagnosticManager() = default;
@@ -1052,7 +650,8 @@ namespace Cryo
         // Print immediately in debug mode or for fatal errors
         if (diagnostic.is_fatal())
         {
-            _formatter.print(diagnostic, std::cerr);
+            std::string formatted = _formatter->format_diagnostic(diagnostic);
+            std::cerr << formatted;
         }
     }
 
@@ -1163,16 +762,11 @@ namespace Cryo
     {
         for (const auto &diagnostic : _diagnostics)
         {
-            if (_use_advanced_formatting && _advanced_formatter)
+            // Always use the sophisticated Rust-style formatter
+            if (_formatter)
             {
-                // Use the sophisticated Rust-style formatter
-                std::string formatted = _advanced_formatter->format_diagnostic(diagnostic);
+                std::string formatted = _formatter->format_diagnostic(diagnostic);
                 os << formatted;
-            }
-            else
-            {
-                // Fall back to basic formatter
-                _formatter.print(diagnostic, os);
             }
         }
     }
@@ -1205,33 +799,10 @@ namespace Cryo
         os << ".\n";
     }
 
-    void DiagnosticManager::set_formatter_options(bool use_colors, bool show_source_context, size_t context_lines)
+    void DiagnosticManager::set_formatter_options(bool use_colors, bool use_unicode, size_t terminal_width)
     {
-        _formatter.set_use_colors(use_colors);
-        _formatter.set_show_source_context(show_source_context);
-        _formatter.set_context_lines(context_lines);
-        
-        // Also apply to advanced formatter if available
-        if (_advanced_formatter) {
-            set_advanced_formatter_options(use_colors, true, 80);
-        }
-    }
-
-    void DiagnosticManager::enable_advanced_formatting(bool enable)
-    {
-        _use_advanced_formatting = enable;
-        if (enable && !_advanced_formatter) {
-            _advanced_formatter = std::make_unique<AdvancedDiagnosticFormatter>(&_source_manager, true, true, 80);
-        }
-    }
-
-    void DiagnosticManager::set_advanced_formatter_options(bool use_colors, bool use_unicode, size_t terminal_width)
-    {
-        if (_advanced_formatter) {
-            // For now, we'll recreate the formatter with new options
-            // In a more sophisticated implementation, we'd add setter methods
-            _advanced_formatter = std::make_unique<AdvancedDiagnosticFormatter>(&_source_manager, use_colors, use_unicode, terminal_width);
-        }
+        // Recreate the formatter with new options
+        _formatter = std::make_unique<DiagnosticFormatter>(&_source_manager, use_colors, use_unicode, terminal_width);
     }
 
     void DiagnosticManager::clear()

@@ -18,7 +18,7 @@ namespace Cryo
     class File;
     class SourceManager;
     class DiagnosticManager;
-    class AdvancedDiagnosticFormatter;
+    class DiagnosticFormatter;
 
     // ================================================================
     // Diagnostic Severity Levels
@@ -432,43 +432,6 @@ namespace Cryo
     };
 
     // ================================================================
-    // Diagnostic Formatter
-    // ================================================================
-
-    class DiagnosticFormatter
-    {
-    private:
-        const SourceManager &_source_manager;
-        bool _use_colors;
-        bool _show_source_context;
-        size_t _context_lines;
-
-    public:
-        DiagnosticFormatter(const SourceManager &source_manager,
-                            bool use_colors = true,
-                            bool show_source_context = true,
-                            size_t context_lines = 2);
-
-        // Format a single diagnostic
-        std::string format(const Diagnostic &diagnostic) const;
-        void print(const Diagnostic &diagnostic, std::ostream &os) const;
-
-        // Configuration
-        void set_use_colors(bool use_colors) { _use_colors = use_colors; }
-        void set_show_source_context(bool show_context) { _show_source_context = show_context; }
-        void set_context_lines(size_t lines) { _context_lines = lines; }
-
-    private:
-        std::string format_severity(DiagnosticSeverity severity) const;
-        std::string format_source_context(const Diagnostic &diagnostic) const;
-        std::string format_caret_line(const Diagnostic &diagnostic, const std::string &source_line) const;
-        size_t determine_token_length(const std::string &source_line, size_t position, const Diagnostic &diagnostic) const;
-        std::string get_color_code(DiagnosticSeverity severity) const;
-        std::string get_reset_color() const;
-        std::string get_error_context_message(const Diagnostic &diagnostic) const;
-    };
-
-    // ================================================================
     // Global Diagnostic Manager (GDM)
     // ================================================================
 
@@ -476,8 +439,7 @@ namespace Cryo
     {
     private:
         SourceManager _source_manager;
-        DiagnosticFormatter _formatter;
-        std::unique_ptr<AdvancedDiagnosticFormatter> _advanced_formatter;
+        std::unique_ptr<DiagnosticFormatter> _formatter;
         std::vector<Diagnostic> _diagnostics;
 
         // Statistics
@@ -489,7 +451,6 @@ namespace Cryo
         bool _errors_as_warnings;
         bool _warnings_as_errors;
         size_t _max_errors;
-        bool _use_advanced_formatting;
 
     public:
         DiagnosticManager();
@@ -596,11 +557,7 @@ namespace Cryo
         void set_errors_as_warnings(bool enable) { _errors_as_warnings = enable; }
         void set_warnings_as_errors(bool enable) { _warnings_as_errors = enable; }
         void set_max_errors(size_t max_errors) { _max_errors = max_errors; }
-        void set_formatter_options(bool use_colors, bool show_source_context, size_t context_lines = 2);
-        
-        // Advanced formatting control
-        void enable_advanced_formatting(bool enable = true);
-        void set_advanced_formatter_options(bool use_colors, bool use_unicode, size_t terminal_width = 80);
+        void set_formatter_options(bool use_colors, bool use_unicode, size_t terminal_width = 80);
 
         // State management
         void clear();
