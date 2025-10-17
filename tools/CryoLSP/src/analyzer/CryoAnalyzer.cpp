@@ -2920,25 +2920,25 @@ namespace CryoLSP
 
         lsp_diag.source = "cryo-lsp";
 
-        // Convert diagnostic ID to code
-        switch (diagnostic.id())
+        // Convert error code to code string
+        switch (diagnostic.error_code())
         {
-        case Cryo::DiagnosticID::UndefinedVariable:
+        case Cryo::ErrorCode::E0201_UNDEFINED_VARIABLE:
             lsp_diag.code = "undefined_variable";
             break;
-        case Cryo::DiagnosticID::UndefinedFunction:
+        case Cryo::ErrorCode::E0202_UNDEFINED_FUNCTION:
             lsp_diag.code = "undefined_function";
             break;
-        case Cryo::DiagnosticID::TypeMismatch:
+        case Cryo::ErrorCode::E0200_TYPE_MISMATCH:
             lsp_diag.code = "type_mismatch";
             break;
-        case Cryo::DiagnosticID::RedefinedSymbol:
+        case Cryo::ErrorCode::E0205_REDEFINED_SYMBOL:
             lsp_diag.code = "redefined_symbol";
             break;
-        case Cryo::DiagnosticID::ExpectedToken:
+        case Cryo::ErrorCode::E0100_EXPECTED_TOKEN:
             lsp_diag.code = "expected_token";
             break;
-        case Cryo::DiagnosticID::UnexpectedToken:
+        case Cryo::ErrorCode::E0101_UNEXPECTED_TOKEN:
             lsp_diag.code = "unexpected_token";
             break;
         default:

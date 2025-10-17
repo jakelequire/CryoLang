@@ -1,5 +1,6 @@
 #include "Lexer/lexer.hpp"
 #include "Utils/File.hpp"
+#include "GDM/GDM.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -267,7 +268,34 @@ namespace Cryo
     // ================================================================
 
     Lexer::Lexer(std::unique_ptr<File> file)
-        : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), _token_count(0)
+        : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), 
+          _token_count(0), _diagnostic_manager(nullptr)
+    {
+
+        if (!_file || !_file->is_loaded())
+        {
+            if (_file)
+            {
+                _file->load();
+            }
+        }
+
+        if (_file && _file->is_loaded())
+        {
+            _buffer = _file->view();
+            _buffer_start = _buffer.data();
+            _buffer_end = _buffer_start + _buffer.size();
+            _current = _buffer_start;
+        }
+        else
+        {
+            _buffer_start = _buffer_end = _current = nullptr;
+        }
+    }
+
+    Lexer::Lexer(std::unique_ptr<File> file, DiagnosticManager* diagnostic_manager, const std::string& source_file)
+        : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), 
+          _token_count(0), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
 
         if (!_file || !_file->is_loaded())
@@ -292,7 +320,19 @@ namespace Cryo
     }
 
     Lexer::Lexer(const std::string &content)
-        : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), _token_count(0)
+        : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), 
+          _token_count(0), _diagnostic_manager(nullptr)
+    {
+        // Set up buffer pointers to reference the spot content
+        _buffer = std::string_view(_spot_content);
+        _buffer_start = _buffer.data();
+        _buffer_end = _buffer_start + _buffer.size();
+        _current = _buffer_start;
+    }
+
+    Lexer::Lexer(const std::string &content, DiagnosticManager* diagnostic_manager, const std::string& source_file)
+        : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), 
+          _token_count(0), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
         // Set up buffer pointers to reference the spot content
         _buffer = std::string_view(_spot_content);
@@ -432,6 +472,10 @@ namespace Cryo
             return make_token(punct_kind, token_start);
         }
 
+        if (_diagnostic_manager)
+        {
+            report_lexer_error("unexpected character", _current_location);
+        }
         return make_error_token("Unexpected character");
     }
 
@@ -551,6 +595,10 @@ namespace Cryo
 
         if (at_end())
         {
+            if (_diagnostic_manager)
+            {
+                report_lexer_error("unterminated string literal", _current_location);
+            }
             return make_error_token("Unterminated string literal");
         }
 
@@ -568,6 +616,10 @@ namespace Cryo
 
         if (at_end())
         {
+            if (_diagnostic_manager)
+            {
+                report_lexer_error("unterminated character literal", _current_location);
+            }
             return make_error_token("Unterminated character literal");
         }
 
@@ -584,6 +636,10 @@ namespace Cryo
 
         if (at_end() || peek() != '\'')
         {
+            if (_diagnostic_manager)
+            {
+                report_lexer_error("unterminated character literal", _current_location);
+            }
             return make_error_token("Unterminated character literal");
         }
 
@@ -1063,6 +1119,22 @@ namespace Cryo
             return nullptr;
         }
         return std::make_unique<Lexer>(std::move(file));
+    }
+
+    // ================================================================
+    // Enhanced Error Reporting Methods
+    // ================================================================
+
+    void Lexer::report_lexer_error(const std::string& message, const SourceLocation& location)
+    {
+        if (!_diagnostic_manager)
+        {
+            return;
+        }
+        
+        // Use basic error reporting for now to avoid circular dependencies
+        SourceRange range(location, location);
+        _diagnostic_manager->report_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, message, range, _source_file);
     }
 
 } // namespace Cryo

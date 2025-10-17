@@ -16,6 +16,9 @@ namespace Cryo
     class Token;
     class SourceLocation;
     class Lexer;
+    class DiagnosticManager;
+    class Diagnostic;
+    enum class ErrorCode : uint32_t;
 
     // ================================================================
     // Token Kind Enumeration
@@ -133,15 +136,21 @@ namespace Cryo
         // Peek token state
         std::optional<Token> _peeked_token;
 
+        // Diagnostic reporting
+        DiagnosticManager* _diagnostic_manager;
+        std::string _source_file;
+
         // Static keyword lookup table
         static const std::unordered_map<std::string_view, TokenKind> _keywords;
 
     public:
         // Constructors
         explicit Lexer(std::unique_ptr<File> file);
+        Lexer(std::unique_ptr<File> file, DiagnosticManager* diagnostic_manager, const std::string& source_file);
 
         // Constructor for spot lexing from string content
         explicit Lexer(const std::string &content);
+        Lexer(const std::string &content, DiagnosticManager* diagnostic_manager, const std::string& source_file);
 
         // Destructor
         ~Lexer() = default;
@@ -187,6 +196,9 @@ namespace Cryo
         bool at_end() const;
         Token make_token(TokenKind kind, const char *start) const;
         Token make_error_token(const std::string &message) const;
+        
+        // Enhanced error reporting
+        void report_lexer_error(const std::string& message, const SourceLocation& location);
 
         // Character classification
         static bool is_alpha(char c);
