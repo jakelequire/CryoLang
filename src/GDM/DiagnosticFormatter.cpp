@@ -12,10 +12,14 @@ namespace Cryo
                                                              bool use_colors, 
                                                              bool use_unicode,
                                                              size_t terminal_width)
-        : _source_manager(source_manager), _terminal_width(terminal_width)
+        : _source_manager(source_manager), _terminal_width(terminal_width), _syntax_highlighter()
     {
         _style.use_colors = use_colors;
         _style.use_unicode = use_unicode;
+        
+        // Configure syntax highlighter
+        _syntax_highlighter.set_color_output(use_colors);
+        _syntax_highlighter.set_default_language("cryo");
         
         // Use clean ASCII by default for universal compatibility
         _style.arrow = "-->";
@@ -37,18 +41,116 @@ namespace Cryo
 
     std::string DiagnosticFormatter::format_diagnostic(const Diagnostic& diagnostic)
     {
-        // Convert diagnostic to MultiSpan for enhanced formatting
-        MultiSpan spans;
-        auto range = diagnostic.range();
-        if (range.is_valid()) {
-            SourceSpan span(SourceLocation(range.start.line(), range.start.column()),
-                           SourceLocation(range.end.line(), range.end.column()),
+        // Use existing multi-span from diagnostic if available, otherwise create from legacy range
+        MultiSpan spans = diagnostic.multi_span();
+        
+        // If no multi-span data, convert legacy range to multi-span
+        if (spans.is_empty() && diagnostic.range().is_valid()) {
+            auto start_line = diagnostic.range().start.line();
+            auto start_col = diagnostic.range().start.column();
+            auto end_line = diagnostic.range().end.line();
+            auto end_col = diagnostic.range().end.column();
+            
+            // Enhanced span width calculation for better multi-character underlining
+            if (start_line == end_line && start_col == end_col) {
+                // Try to intelligently determine span width by analyzing the source
+                if (_source_manager) {
+                    std::string line = _source_manager->get_source_line(diagnostic.filename(), start_line);
+                    if (!line.empty()) {
+                        if (start_col > 0 && start_col <= line.length()) {
+                            // Calculate token width by finding word boundaries
+                            size_t col_idx = start_col - 1;  // Convert to 0-based indexing
+                            size_t token_start = col_idx;
+                            size_t token_end = col_idx;
+                            
+                            // Find start of token (scan backwards)
+                            while (token_start > 0 && 
+                                   (std::isalnum(line[token_start - 1]) || line[token_start - 1] == '_' || 
+                                    line[token_start - 1] == '"' || line[token_start - 1] == '\'' ||
+                                    line[token_start - 1] == '.')) {
+                                token_start--;
+                            }
+                            
+                            // Find end of token (scan forwards)  
+                            while (token_end < line.length() - 1 &&
+                                   (std::isalnum(line[token_end + 1]) || line[token_end + 1] == '_' ||
+                                    line[token_end + 1] == '"' || line[token_end + 1] == '\'' ||
+                                    line[token_end + 1] == '.')) {
+                                token_end++;
+                            }
+                            
+                            // For string literals, extend to closing quote
+                            if (line[token_start] == '"') {
+                                while (token_end < line.length() - 1 && line[token_end + 1] != '"') {
+                                    token_end++;
+                                }
+                                if (token_end < line.length() - 1 && line[token_end + 1] == '"') {
+                                    token_end++; // Include closing quote
+                                }
+                            }
+                            
+                            // Set end column to highlight entire token (convert back to 1-based)
+                            end_col = token_end + 1;
+                            
+                            // Minimum span width of 1 character for visibility
+                            if (end_col <= start_col) {
+                                end_col = start_col + 1;
+                            }
+                        } else {
+                            // Fallback for out-of-bounds positions
+                            end_col = start_col + 1;
+                        }
+                    } else {
+                        // Fallback when source not available
+                        end_col = start_col + 1;
+                    }
+                } else {
+                    // Fallback when source manager not available
+                    std::string msg = diagnostic.message();
+                    if (msg.find("string") != std::string::npos && msg.find("int") != std::string::npos) {
+                        end_col = start_col + 5; // Type mismatch guess
+                    } else if (msg.find("expression") != std::string::npos) {
+                        end_col = start_col + 1; // Missing expression
+                    } else {
+                        end_col = start_col + 3; // Default small token
+                    }
+                }
+            }
+            
+            SourceSpan span(SourceLocation(start_line, start_col),
+                           SourceLocation(end_line, end_col),
                            diagnostic.filename(), true);
+            
+            // Add contextual inline labels based on error type and message
+            std::string msg = diagnostic.message();
+            std::string inline_label;
+            
+            if (msg.find("type mismatch") != std::string::npos) {
+                inline_label = "type mismatch";
+            } else if (msg.find("Cannot dereference") != std::string::npos) {
+                inline_label = "cannot dereference non-pointer";
+            } else if (msg.find("No field") != std::string::npos) {
+                inline_label = "field does not exist";
+            } else if (msg.find("Type mismatch in arithmetic") != std::string::npos) {
+                inline_label = "incompatible types";
+            } else if (msg.find("Expected expression") != std::string::npos) {
+                inline_label = "Expected expression";
+            } else {
+                // Generic label based on error message
+                if (!msg.empty()) {
+                    inline_label = msg.substr(0, std::min(msg.length(), size_t(30))); // Truncate long messages
+                }
+            }
+            
+            if (!inline_label.empty()) {
+                span.set_label(inline_label);
+            }
+            
             spans.add_primary_span(span);
         }
         
-        // Extract any suggestions from the diagnostic (empty for now)
-        std::vector<CodeSuggestion> suggestions;
+        // Use existing suggestions from diagnostic
+        const auto& suggestions = diagnostic.code_suggestions();
         
         // Use the enhanced formatter for sophisticated Rust-style output
         return format_enhanced_diagnostic(diagnostic, spans, suggestions);
@@ -61,7 +163,7 @@ namespace Cryo
     {
         std::ostringstream output;
 
-        // Header line with error code and message
+        // Header line with error code and message - ensure proper newline
         output << format_severity(diagnostic.severity()) 
                << "[E" << std::setfill('0') << std::setw(4) << static_cast<int>(diagnostic.error_code()) << "]: "
                << diagnostic.message() << "\n";
@@ -84,10 +186,18 @@ namespace Cryo
             output << format_suggestions(suggestions);
         }
 
+        // Help messages from diagnostic
+        for (const auto& help_msg : diagnostic.help_messages()) {
+            output << "\n" << colorize("help", _style.help_color) << ": " << help_msg;
+        }
+
         // Notes from original diagnostic
         for (const auto& note : diagnostic.notes()) {
             output << "\n" << colorize("note", _style.note_color) << ": " << note;
         }
+
+        // Add visual separator line between error segments
+        output << "\n" << colorize("+!+=========================================================================================+!+", "\x1b[90m") << "\n";
 
         return output.str();
     }
@@ -100,52 +210,54 @@ namespace Cryo
             return snippet;
         }
 
-        auto primary = spans.primary_span();
-        snippet.filename = primary.filename();
+        // Use the SourceManager's sophisticated extract_snippet method
+        auto source_snippet = _source_manager->extract_snippet(spans, context_lines);
+        
+        // Convert SourceManager::SourceSnippet to DiagnosticFormatter::SourceSnippet
+        snippet.filename = source_snippet.filename;
+        snippet.lines = source_snippet.lines;
+        snippet.start_line_number = source_snippet.start_line_number;
+        snippet.highlighted_spans = source_snippet.highlighted_spans;
+        snippet.max_line_number_width = source_snippet.max_line_number_width;
 
-        // Calculate line range
-        size_t min_line = primary.start().line();
-        size_t max_line = primary.end().line();
-
-        // Extend for all spans
-        for (const auto& span : spans.all_spans()) {
-            min_line = std::min(min_line, span.start().line());
-            max_line = std::max(max_line, span.end().line());
-        }
-
-        // Add context
-        size_t start_line = (min_line > context_lines) ? min_line - context_lines : 1;
-        size_t end_line = max_line + context_lines;
-
-        snippet.start_line_number = start_line;
-        snippet.highlighted_spans = spans.all_spans();
-
-        // Extract actual source lines from the source manager
-        for (size_t line_num = start_line; line_num <= end_line; ++line_num) {
-            std::string line;
-            if (_source_manager && _source_manager->has_file(snippet.filename)) {
-                // Get the actual source line from the source manager
-                line = _source_manager->get_source_line(snippet.filename, line_num);
-            } else {
-                // Fallback: try to read directly from file
-                line = read_line_from_file(snippet.filename, line_num);
-            }
+        // If SourceManager couldn't extract lines, fall back to direct file reading
+        if (snippet.lines.empty()) {
+            auto primary = spans.primary_span();
             
-            // If we couldn't get the line, provide better context
-            if (line.empty()) {
-                // Check if the line number is beyond the file's end
-                size_t total_lines = get_file_line_count(snippet.filename);
-                if (line_num > total_lines) {
-                    line = "    <line " + std::to_string(line_num) + " beyond end of file (max: " + std::to_string(total_lines) + ")>";
-                } else {
-                    line = "    <source line not available>";
+            // Calculate line range manually as fallback
+            size_t min_line = primary.start().line();
+            size_t max_line = primary.end().line();
+
+            for (const auto& span : spans.all_spans()) {
+                min_line = std::min(min_line, span.start().line());
+                max_line = std::max(max_line, span.end().line());
+            }
+
+            size_t start_line = (min_line > context_lines) ? min_line - context_lines : 1;
+            size_t end_line = max_line + context_lines;
+
+            snippet.start_line_number = start_line;
+            snippet.filename = primary.filename();
+            snippet.highlighted_spans = spans.all_spans();
+
+            // Fallback: read directly from file
+            for (size_t line_num = start_line; line_num <= end_line; ++line_num) {
+                std::string line = read_line_from_file(snippet.filename, line_num);
+                
+                if (line.empty()) {
+                    size_t total_lines = get_file_line_count(snippet.filename);
+                    if (line_num > total_lines) {
+                        line = "    <line " + std::to_string(line_num) + " beyond end of file (max: " + std::to_string(total_lines) + ")>";
+                    } else {
+                        line = "    <source line not available>";
+                    }
                 }
+                snippet.lines.push_back(line);
             }
             
-            snippet.lines.push_back(line);
+            snippet.max_line_number_width = calculate_line_number_width(snippet);
         }
 
-        snippet.max_line_number_width = calculate_line_number_width(snippet);
         return snippet;
     }
 
@@ -168,9 +280,12 @@ namespace Cryo
             // Get spans that affect this line
             auto spans_on_line = get_spans_on_line(snippet.highlighted_spans, line_number);
 
-            // Render the source line
+            // Apply syntax highlighting to the source line
+            std::string highlighted_line = _syntax_highlighter.apply_syntax_highlighting(line);
+
+            // Render the source line with syntax highlighting
             output << format_line_number(line_number, line_width) << " " 
-                   << _style.vertical_bar << " " << line << "\n";
+                   << _style.vertical_bar << " " << highlighted_line << "\n";
 
             // Render underlines and labels if there are spans on this line
             if (!spans_on_line.empty()) {
@@ -237,7 +352,7 @@ namespace Cryo
             }
         }
 
-        // Apply colors to create the final underline
+        // Apply colors and add inline labels for Rust-style output
         std::string colored_underline;
         for (size_t i = 0; i < underline.length(); ++i) {
             if (underline[i] == '^') {
@@ -246,6 +361,20 @@ namespace Cryo
                 colored_underline += colorize(std::string(1, underline[i]), _style.secondary_span_color);
             } else {
                 colored_underline += underline[i];
+            }
+        }
+        
+        // Add inline labels right after the underline for primary spans
+        for (const auto& span : sorted_spans) {
+            if (span.is_primary() && span.label().has_value() && span.start().line() == line_number) {
+                size_t end_col = (span.end().line() == line_number) ? span.end().column() - 1 : source_line.length() - 1;
+                end_col = std::min(end_col, source_line.length() - 1);
+                
+                // Add inline label after the span
+                if (end_col < colored_underline.length()) {
+                    colored_underline += " " + span.label().value();
+                    break; // Only show one inline label per line
+                }
             }
         }
 

@@ -368,7 +368,8 @@ namespace Cryo
         }
 
         std::vector<std::string> lines;
-        std::istringstream content_stream(std::string(file->content()));
+        std::string file_content = std::string(file->content());
+        std::istringstream content_stream(file_content);
         std::string line;
 
         while (std::getline(content_stream, line))

@@ -6188,7 +6188,8 @@ namespace Cryo::Codegen
             }
             else
             {
-                std::cerr << "[ERROR] Address-of operator (&) can only be applied to variables" << std::endl;
+                // Report through GDM system instead of direct stderr
+                report_error("Address-of operator (&) can only be applied to variables", node);
                 return nullptr;
             }
         }
@@ -6197,7 +6198,8 @@ namespace Cryo::Codegen
             // Dereference operator: load value from pointer/reference
             if (!operandValue->getType()->isPointerTy())
             {
-                std::cerr << "[ERROR] Dereference operator (*) can only be applied to pointer types" << std::endl;
+                // Report through GDM system instead of direct stderr  
+                report_error("Dereference operator (*) can only be applied to pointer types", node);
                 return nullptr;
             }
 
