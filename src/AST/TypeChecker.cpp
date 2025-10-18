@@ -620,9 +620,10 @@ namespace Cryo
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
         _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
-        
+
         // Initialize diagnostic builder if we have a diagnostic manager
-        if (_diagnostic_manager) {
+        if (_diagnostic_manager)
+        {
             _diagnostic_builder = std::make_unique<TypeCheckerDiagnosticBuilder>(_diagnostic_manager, _source_file);
         }
 
@@ -957,7 +958,7 @@ namespace Cryo
         {
             std::string element_type_str = type_string.substr(0, type_string.length() - 2);
             LOG_DEBUG(Cryo::LogComponent::AST, "Found array type '{}', resolving element type '{}'", type_string, element_type_str);
-            
+
             // Recursively resolve the element type with generic context
             Type *element_type = resolve_type_with_generic_context(element_type_str);
             if (element_type)
@@ -974,6 +975,23 @@ namespace Cryo
 
         // Fall back to direct type lookups without string parsing
         LOG_DEBUG(Cryo::LogComponent::AST, "Attempting direct type lookup for '{}'", type_string);
+
+        // IMPORTANT: Try token-based parsing FIRST before direct type lookups
+        // This ensures pointer syntax like "HeapBlock*" gets parsed correctly
+        // instead of being treated as struct type names
+        LOG_DEBUG(Cryo::LogComponent::AST, "Trying TypeContext token-based parsing first...");
+        Lexer type_lexer(type_string);
+        Type *parsed_type = _type_context.parse_type_from_tokens(type_lexer);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Token parsing result for '{}': {} (kind={})",
+                  type_string,
+                  parsed_type ? parsed_type->name() : "null",
+                  parsed_type ? static_cast<int>(parsed_type->kind()) : -1);
+
+        if (parsed_type && parsed_type->kind() != TypeKind::Unknown)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Successfully parsed '{}' via TypeContext (token-based parsing)", type_string);
+            return parsed_type;
+        }
 
         // Try primitive types
         if (type_string == "void")
@@ -1015,53 +1033,35 @@ namespace Cryo
         if (type_string == "float")
             return _type_context.get_default_float_type();
 
-        // Try user-defined types
-        Type *struct_type = _type_context.get_struct_type(type_string);
-        if (struct_type)
-            return struct_type;
-
-        Type *class_type = _type_context.get_class_type(type_string);
-        LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
-        if (class_type)
+        // Try user-defined types ONLY for simple type names (no special syntax)
+        if (type_string.find('*') == std::string::npos &&
+            type_string.find('<') == std::string::npos &&
+            type_string.find('[') == std::string::npos &&
+            type_string.find('&') == std::string::npos)
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "class_type name='{}', kind={}", class_type->name(), static_cast<int>(class_type->kind()));
-            return class_type;
-        }
+            Type *struct_type = _type_context.get_struct_type(type_string);
+            if (struct_type)
+                return struct_type;
 
-        Type *trait_type = _type_context.get_trait_type(type_string);
-        if (trait_type)
-            return trait_type;
+            Type *class_type = _type_context.get_class_type(type_string);
+            LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
+            if (class_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "class_type name='{}', kind={}", class_type->name(), static_cast<int>(class_type->kind()));
+                return class_type;
+            }
 
-        Type *enum_type = _type_context.lookup_enum_type(type_string);
-        if (enum_type)
-            return enum_type;
+            Type *trait_type = _type_context.get_trait_type(type_string);
+            if (trait_type)
+                return trait_type;
 
-        Type *generic_type = _type_context.get_generic_type(type_string);
-        if (generic_type)
-            return generic_type;
+            Type *enum_type = _type_context.lookup_enum_type(type_string);
+            if (enum_type)
+                return enum_type;
 
-        // Try TypeContext's token-based type parsing as fallback
-        LOG_DEBUG(Cryo::LogComponent::AST, "Not found in main symbols, checking TypeContext token-based parsing...");
-
-        // Create a lexer from the type string for token-based parsing
-        Lexer type_lexer(type_string);
-
-        Type *parsed_type = _type_context.parse_type_from_tokens(type_lexer);
-        if (parsed_type && parsed_type->kind() != TypeKind::Unknown)
-        {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Successfully parsed '{}' via TypeContext (token-based parsing)", type_string);
-            return parsed_type;
-        }
-
-        // Check namespaces
-        LOG_DEBUG(Cryo::LogComponent::AST, "Not found in main symbols, checking namespaces...");
-
-        // Final fallback - use symbol table to search any namespace
-        TypedSymbol *symbol = _symbol_table->lookup_symbol_in_any_namespace(type_string);
-        if (symbol && symbol->type)
-        {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found '{}' in namespaces", type_string);
-            return symbol->type;
+            Type *generic_type = _type_context.get_generic_type(type_string);
+            if (generic_type)
+                return generic_type;
         }
 
         LOG_ERROR(Cryo::LogComponent::AST, "Failed to resolve type '{}' - type not found", type_string);
@@ -1365,7 +1365,8 @@ namespace Cryo
             // Set the source file context to this imported module for proper error attribution
             // This is particularly important for stdlib modules to avoid attributing errors to user code
             std::string module_file = module_name + ".cryo"; // Simple mapping for now
-            if (module_name.find("/") != std::string::npos) {
+            if (module_name.find("/") != std::string::npos)
+            {
                 // For stdlib paths like "core/types", construct the stdlib path
                 module_file = "stdlib/" + module_name + ".cryo";
             }
@@ -1484,6 +1485,21 @@ namespace Cryo
         if (!node.type_annotation().empty() && node.type_annotation() != "auto")
         {
             declared_type = resolve_type_with_generic_context(node.type_annotation());
+
+            // Debug: Track malformed pointer types at declaration time
+            if (declared_type && node.type_annotation().find("*") != std::string::npos)
+            {
+                if (declared_type->kind() == TypeKind::Struct)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MALFORMED TYPE DETECTED: Variable '{}' with annotation '{}' resolved to struct type '{}' (kind={}) instead of pointer type",
+                              var_name, node.type_annotation(), declared_type->name(), static_cast<int>(declared_type->kind()));
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "CORRECT TYPE: Variable '{}' with annotation '{}' resolved to type '{}' (kind={})",
+                              var_name, node.type_annotation(), declared_type->name(), static_cast<int>(declared_type->kind()));
+                }
+            }
         }
 
         if (node.initializer())
@@ -1530,6 +1546,27 @@ namespace Cryo
         if (!declare_variable(var_name, final_type, node.location(), node.is_mutable()))
         {
             report_redefined_symbol(node.location(), var_name);
+        }
+
+        // If we're in a struct/class context, also register this as a field
+        if (!_current_struct_name.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Field registration check for '{}': current_struct='{}', final_type={}, kind={}",
+                      var_name, _current_struct_name,
+                      final_type ? final_type->name() : "null",
+                      final_type ? static_cast<int>(final_type->kind()) : -1);
+
+            if (final_type && final_type->kind() != TypeKind::Unknown)
+            {
+                _struct_fields[_current_struct_name][var_name] = final_type;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Registered field '{}' of type '{}' in struct/class '{}'",
+                          var_name, final_type->name(), _current_struct_name);
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "SKIPPED field registration for '{}': {}",
+                          var_name, final_type ? "TypeKind::Unknown" : "null type");
+            }
         }
     }
 
@@ -1578,9 +1615,12 @@ namespace Cryo
             }
         }
 
-        // Create function type
+        // Create function type - check if this is a variadic function
+        bool is_variadic = node.is_variadic();
         FunctionType *func_type = static_cast<FunctionType *>(
-            _type_context.create_function_type(return_type, param_types));
+            _type_context.create_function_type(return_type, param_types, is_variadic));
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "Created function type for '{}' - is_variadic: {}", func_name, is_variadic);
 
         TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(func_name);
         if (!existing_symbol)
@@ -2112,12 +2152,17 @@ namespace Cryo
                     }
                     else
                     {
-                        if (_diagnostic_builder) {
+                        if (_diagnostic_builder)
+                        {
                             _diagnostic_builder->create_invalid_dereference_error(operand_type, node.location());
-                        } else if (_diagnostic_manager) {
+                        }
+                        else if (_diagnostic_manager)
+                        {
                             SourceRange range(node.location());
                             _diagnostic_manager->report_invalid_dereference(range, _source_file, operand_type->to_string());
-                        } else {
+                        }
+                        else
+                        {
                             report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
                                          "Cannot dereference non-pointer/reference type: " + operand_type->to_string());
                         }
@@ -2322,10 +2367,13 @@ namespace Cryo
             }
 
             // Not callable
-            if (_diagnostic_manager) {
+            if (_diagnostic_manager)
+            {
                 SourceRange range(node.location());
                 _diagnostic_manager->report_non_callable_type(range, _source_file, callee_type ? callee_type->to_string() : "unknown");
-            } else {
+            }
+            else
+            {
                 report_error(TypeError::ErrorKind::NonCallableType, node.location(),
                              "Expression is not callable");
             }
@@ -2541,17 +2589,45 @@ namespace Cryo
             node.object()->accept(*this);
         }
 
-        // Get the type of the object being accessed
-        std::string object_type = node.object() && node.object()->type().has_value()
-                                      ? node.object()->type().value()
-                                      : "unknown";
-
-        LOG_DEBUG(Cryo::LogComponent::AST, "Member '{}' - object_type: '{}'", node.member(), object_type);
-
-        if (object_type == "unknown")
+        // Get the Type* of the object being accessed
+        Type *object_type = nullptr;
+        if (node.object())
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Object type is unknown, cannot resolve member access");
-            node.set_type("unknown");
+            if (node.object()->has_resolved_type())
+            {
+                // Use the resolved type for proper chaining of member access
+                object_type = node.object()->get_resolved_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "Member '{}' - using resolved type: {}", node.member(),
+                          object_type ? object_type->name() : "null");
+
+                // DEBUG: Track problematic HeapBlock* types
+                if (object_type && object_type->name().find("HeapBlock") != std::string::npos && object_type->kind() == TypeKind::Struct)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "PROBLEM DETECTED: HeapBlock* type with wrong TypeKind::Struct (10) instead of TypeKind::Pointer (7)");
+                }
+            }
+            else if (node.object()->type().has_value())
+            {
+                // Fallback to lookup by string name (only for initial resolution)
+                std::string type_name = node.object()->type().value();
+                object_type = lookup_type_by_name(type_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Member '{}' - looked up type '{}': {}",
+                          node.member(), type_name, object_type ? object_type->name() : "null");
+
+                // DEBUG: Track problematic HeapBlock* types
+                if (object_type && object_type->name().find("HeapBlock") != std::string::npos && object_type->kind() == TypeKind::Struct)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "PROBLEM DETECTED VIA LOOKUP: HeapBlock* type with wrong TypeKind::Struct (10) from lookup_type_by_name('{}') instead of TypeKind::Pointer (7)", type_name);
+                }
+            }
+        }
+
+        if (!object_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Object type is null, cannot resolve member access");
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                         "Cannot resolve type for member access");
+            node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
@@ -2559,339 +2635,194 @@ namespace Cryo
         std::string member_name = node.member();
 
         // Handle pointer types - automatically dereference for member access
-        std::string effective_type = object_type;
+        Type *effective_type = object_type;
         bool is_pointer_access = false;
-        if (object_type.back() == '*' && object_type.length() > 1)
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "Object type name: '{}', kind: {}, checking if pointer",
+                  object_type->name(), static_cast<int>(object_type->kind()));
+
+        if (object_type->name().find("HeapBlock") != std::string::npos)
         {
-            // This is a pointer type, extract the pointee type
-            effective_type = object_type.substr(0, object_type.length() - 1);
+            LOG_DEBUG(Cryo::LogComponent::AST, "HEAPBLOCK DEBUG: type='{}', kind={} (7=Pointer, 10=Struct, 4=Class)",
+                      object_type->name(), static_cast<int>(object_type->kind()));
+        }
+
+        if (object_type->kind() == TypeKind::Pointer)
+        {
+            // This is a pointer type, get the pointee type
+            const PointerType *ptr_type = static_cast<const PointerType *>(object_type);
+            effective_type = ptr_type->pointee_type().get();
             is_pointer_access = true;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Dereferencing pointer type to access member '{}' on type '{}'",
+                      member_name, effective_type->name());
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Object type '{}' is not a pointer, kind: {}",
+                      object_type->name(), static_cast<int>(object_type->kind()));
         }
 
-        // Check if this is an array type (ends with [])
-        bool is_array_type = (effective_type.find("[]") != std::string::npos);
-
-        // Handle built-in array properties
-        if (is_array_type)
+        // Handle array types
+        if (effective_type->kind() == TypeKind::Array)
         {
-            if (member_name == "length")
+            if (member_name == "length" || member_name == "size")
             {
                 node.set_resolved_type(_type_context.get_u64_type());
                 return;
             }
-            else if (member_name == "size")
-            {
-                node.set_resolved_type(_type_context.get_u64_type());
-                return;
-            }
-            // For now, only support built-in array properties
             report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                         "Unknown array property '" + member_name + "' for type '" + effective_type + "'");
+                         "Unknown array property '" + member_name + "' for array type");
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
-        // For generic types, extract the base type name for field/method lookup
-        std::string lookup_type = effective_type;
-        size_t generic_pos = effective_type.find('<');
-        if (generic_pos != std::string::npos)
+        // For non-struct/class types, reject member access
+        if (effective_type->kind() != TypeKind::Struct &&
+            effective_type->kind() != TypeKind::Class &&
+            effective_type->kind() != TypeKind::Generic)
         {
-            lookup_type = effective_type.substr(0, generic_pos);
-        }
-
-        // Look up the type by name to get struct/class information
-        Type *struct_type = lookup_variable_type(lookup_type);
-        bool is_primitive_type = (lookup_type == "string" || lookup_type == "int" || lookup_type == "i8" ||
-                                  lookup_type == "i16" || lookup_type == "i32" || lookup_type == "i64" ||
-                                  lookup_type == "uint" || lookup_type == "u8" || lookup_type == "u16" ||
-                                  lookup_type == "u32" || lookup_type == "u64" || lookup_type == "float" ||
-                                  lookup_type == "f32" || lookup_type == "f64" || lookup_type == "double" ||
-                                  lookup_type == "boolean" || lookup_type == "char" ||
-                                  lookup_type == "void");
-
-        // Check if this is a generic type (contains '<' and '>')
-        bool is_generic_type = (effective_type.find('<') != std::string::npos &&
-                                effective_type.find('>') != std::string::npos);
-
-        if (!struct_type && !is_primitive_type && !is_generic_type)
-        {
-            std::string display_type = is_pointer_access ? object_type + " (dereferenced from pointer)" : object_type;
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Cannot access member of non-struct/class type: " + display_type);
+                         "Cannot access member of non-struct/class type: " + effective_type->name());
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
-        // For non-primitive types, verify it's a struct/class/generic type
-        if (struct_type && !is_primitive_type &&
-            struct_type->kind() != TypeKind::Struct &&
-            struct_type->kind() != TypeKind::Class &&
-            struct_type->kind() != TypeKind::Generic)
-        {
-            std::string display_type = is_pointer_access ? object_type + " (dereferenced from pointer)" : object_type;
-            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Cannot access member of non-struct/class type: " + display_type);
-            node.set_type("unknown");
-            return;
-        }
-
-        // Look up field in struct field map
-        LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in struct '{}'", member_name, lookup_type);
-        auto struct_it = _struct_fields.find(lookup_type);
+        // Look up field in struct field map using the type name
+        std::string lookup_type_name = effective_type->name();
+        LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in struct '{}'", member_name, lookup_type_name);
+        auto struct_it = _struct_fields.find(lookup_type_name);
         if (struct_it != _struct_fields.end())
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found struct '{}' in _struct_fields with {} fields", lookup_type, struct_it->second.size());
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found struct '{}' in _struct_fields with {} fields", lookup_type_name, struct_it->second.size());
             auto field_it = struct_it->second.find(member_name);
             if (field_it != struct_it->second.end())
             {
-                // Found the field - substitute generic type parameters if needed
-                std::string field_type = field_it->second->to_string();
-                std::string resolved_type = substitute_generic_type(field_type, effective_type, lookup_type);
-
-                // CRITICAL: Store the resolved Type* so Codegen can access it
+                // Found the field - store the resolved Type*
                 node.set_resolved_type(field_it->second);
-                LOG_DEBUG(Cryo::LogComponent::AST, "Set resolved type for member '{}' of '{}' to: {}", member_name, lookup_type, field_it->second->to_string());
+                LOG_DEBUG(Cryo::LogComponent::AST, "Set resolved type for member '{}' of '{}' to: {}", member_name, lookup_type_name, field_it->second->name());
                 return;
             }
             else
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Field '{}' NOT found in struct '{}'", member_name, lookup_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Field '{}' NOT found in struct '{}'", member_name, lookup_type_name);
             }
         }
         else
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_fields map", lookup_type);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_fields map", lookup_type_name);
         }
 
         // Look up method in struct method map
-        auto method_struct_it = _struct_methods.find(lookup_type);
+        auto method_struct_it = _struct_methods.find(lookup_type_name);
         if (method_struct_it != _struct_methods.end())
         {
             auto method_it = method_struct_it->second.find(member_name);
             if (method_it != method_struct_it->second.end())
             {
-                // Found the method - get the function type
-                Type *method_type = method_it->second;
-                if (method_type->kind() == TypeKind::Function)
-                {
-                    // For method access, set the full function signature for CallExpression handling
-                    std::string method_signature = method_type->to_string();
-                    std::string resolved_signature = substitute_generic_type(method_signature, effective_type, lookup_type);
-                    node.set_type(resolved_signature);
-                    return;
-                }
-                else
-                {
-                    // Fallback for non-function types (legacy compatibility)
-                    std::string method_return_type = method_type->to_string();
-                    std::string resolved_type = substitute_generic_type(method_return_type, effective_type, lookup_type);
-                    node.set_type(resolved_type);
-                    return;
-                }
+                // Found the method - store the resolved Type*
+                node.set_resolved_type(method_it->second);
+                return;
             }
         }
 
         // Check for private methods within the same class/struct context
-        // Look in the private method registry
-        LOG_DEBUG(Cryo::LogComponent::AST, "Looking up private method '{}' in lookup_type '{}'", member_name, lookup_type);
-
-        // First check if we're in a class context and the lookup_type matches current class
-        if (!_current_struct_name.empty() && lookup_type == _current_struct_name)
+        if (!_current_struct_name.empty() && lookup_type_name == _current_struct_name)
         {
-            auto private_method_struct_it = _private_struct_methods.find(lookup_type);
+            auto private_method_struct_it = _private_struct_methods.find(lookup_type_name);
             if (private_method_struct_it != _private_struct_methods.end())
             {
                 auto private_method_it = private_method_struct_it->second.find(member_name);
                 if (private_method_it != private_method_struct_it->second.end())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' in current class '{}'", member_name, lookup_type);
-                    Type *method_type = private_method_it->second;
-                    if (method_type->kind() == TypeKind::Function)
-                    {
-                        // For method access, set the full function signature for CallExpression handling
-                        std::string method_signature = method_type->to_string();
-                        std::string resolved_signature = substitute_generic_type(method_signature, object_type, lookup_type);
-                        node.set_type(resolved_signature);
-                        return;
-                    }
-                    else
-                    {
-                        // Fallback for non-function types (legacy compatibility)
-                        std::string method_return_type = method_type->to_string();
-                        std::string resolved_type = substitute_generic_type(method_return_type, object_type, lookup_type);
-                        node.set_type(resolved_type);
-                        return;
-                    }
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' in current class '{}'", member_name, lookup_type_name);
+                    node.set_resolved_type(private_method_it->second);
+                    return;
                 }
             }
 
-            // If not found in registered methods, check if we're currently processing the class definition
-            // In this case, allow the private method call to proceed with hardcoded signatures
-            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing private method '{}' in current class context '{}'", member_name, lookup_type);
-
-            // Provide correct signatures for known private methods
-            if (member_name == "align_size" && lookup_type == "HeapManager")
+            // Hardcoded signatures for known private methods during class definition
+            if (member_name == "align_size" && lookup_type_name == "HeapManager")
             {
-                node.set_type("(u64, u64) -> u64");
+                std::vector<Type *> params = {_type_context.get_u64_type(), _type_context.get_u64_type()};
+                node.set_resolved_type(_type_context.create_function_type(_type_context.get_u64_type(), params));
+                return;
             }
-            else if (member_name == "get_block_from_ptr" && lookup_type == "HeapManager")
+            else if (member_name == "get_block_from_ptr" && lookup_type_name == "HeapManager")
             {
-                node.set_type("(void*) -> HeapBlock*");
+                Type *void_ptr_type = _type_context.create_pointer_type(_type_context.get_void_type());
+                Type *heap_block_type = lookup_variable_type("HeapBlock");
+                if (heap_block_type)
+                {
+                    Type *heap_block_ptr_type = _type_context.create_pointer_type(heap_block_type);
+                    std::vector<Type *> params = {void_ptr_type};
+                    node.set_resolved_type(_type_context.create_function_type(heap_block_ptr_type, params));
+                    return;
+                }
             }
-            else if (member_name == "coalesce_block" && lookup_type == "HeapManager")
+            else if (member_name == "coalesce_block" && lookup_type_name == "HeapManager")
             {
-                node.set_type("(HeapBlock*) -> void");
+                Type *heap_block_type = lookup_variable_type("HeapBlock");
+                if (heap_block_type)
+                {
+                    Type *heap_block_ptr_type = _type_context.create_pointer_type(heap_block_type);
+                    std::vector<Type *> params = {heap_block_ptr_type};
+                    node.set_resolved_type(_type_context.create_function_type(_type_context.get_void_type(), params));
+                    return;
+                }
             }
             else
             {
-                node.set_type("() -> void"); // Default function signature for unknown private methods
+                std::vector<Type *> params = {};
+                node.set_resolved_type(_type_context.create_function_type(_type_context.get_void_type(), params));
+                return;
             }
-            return;
         }
 
-        auto private_method_struct_it = _private_struct_methods.find(lookup_type);
+        // Check for other private methods
+        auto private_method_struct_it = _private_struct_methods.find(lookup_type_name);
         if (private_method_struct_it != _private_struct_methods.end())
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found private methods for type '{}'", lookup_type);
             auto private_method_it = private_method_struct_it->second.find(member_name);
             if (private_method_it != private_method_struct_it->second.end())
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}'", member_name);
-                Type *method_type = private_method_it->second;
-                if (method_type->kind() == TypeKind::Function)
-                {
-                    // For method access, set the full function signature for CallExpression handling
-                    std::string method_signature = method_type->to_string();
-                    std::string resolved_signature = substitute_generic_type(method_signature, object_type, lookup_type);
-                    node.set_type(resolved_signature);
-                    return;
-                }
-                else
-                {
-                    // Fallback for non-function types (legacy compatibility)
-                    std::string method_return_type = method_type->to_string();
-                    std::string resolved_type = substitute_generic_type(method_return_type, object_type, lookup_type);
-                    node.set_type(resolved_type);
-                    return;
-                }
-            }
-            else
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Private method '{}' not found in type '{}'", member_name, lookup_type);
-            }
-        }
-        else
-        {
-            LOG_DEBUG(Cryo::LogComponent::AST, "No private methods found for type '{}'", lookup_type);
-        }
-
-        // For primitive types, also check if there are functions available in global scope
-        // that might be primitive method implementations from imported modules
-        if (is_primitive_type)
-        {
-            // First, try to find if we have the primitive type methods imported from stdlib
-            // Check if we have core::Types imported (which would contain primitive implementations)
-            if (_main_symbol_table)
-            {
-                // Look through all registered namespaces for potential primitive method implementations
-                std::string primitive_method_name = lookup_type + "::" + member_name;
-
-                // Also try checking if the method exists as a global function (for compatibility)
-                auto symbol = _main_symbol_table->lookup_symbol(member_name);
-                if (symbol && symbol->kind == SymbolKind::Function)
-                {
-                    // Found a function with the right name - assume it's the primitive method
-                    // For primitive methods, we'll set appropriate return types
-                    if (member_name == "length")
-                    {
-                        node.set_type("u64");
-                        return;
-                    }
-                    else if (member_name == "char_at")
-                    {
-                        node.set_type("char");
-                        return;
-                    }
-                    else
-                    {
-                        node.set_type("unknown"); // Fallback for other methods
-                        return;
-                    }
-                }
-
-                // If we have imported core/types (which contains primitive implementations),
-                // assume primitive methods are available
-                if (_main_symbol_table->has_namespace("std::core::Types") && lookup_type == "string")
-                {
-                    // We have core/types imported and this is a string method call
-                    // Assume common primitive methods are available
-                    if (member_name == "length")
-                    {
-                        node.set_type("u64");
-                        return;
-                    }
-                    else if (member_name == "char_at")
-                    {
-                        node.set_type("char");
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Check for methods in registered class templates
-        // For now, hardcode known template methods - TODO: make this dynamic
-        if (lookup_type == "Array" && is_generic_type)
-        {
-            if (member_name == "size")
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found template method 'size' in Array<T>");
-                node.set_type("u64");
-                return;
-            }
-            else if (member_name == "push")
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found template method 'push' in Array<T>");
-                node.set_type("void");
-                return;
-            }
-            else if (member_name == "get")
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found template method 'get' in Array<T>");
-                // Extract the element type from Array<T>
-                size_t start = object_type.find('<');
-                size_t end = object_type.find('>');
-                if (start != std::string::npos && end != std::string::npos && end > start)
-                {
-                    std::string element_type = object_type.substr(start + 1, end - start - 1);
-                    std::string option_type = "Option<" + element_type + ">";
-                    node.set_type(option_type);
-                    return;
-                }
-                node.set_type("Option<unknown>");
+                node.set_resolved_type(private_method_it->second);
                 return;
             }
         }
 
-        // Field or method not found in struct
-        if (_diagnostic_builder) {
-            // Get the type object for enhanced diagnostics
-            Type* type_obj = lookup_variable_type(object_type);
-            if (type_obj) {
-                _diagnostic_builder->create_invalid_member_access_error(member_name, type_obj, node.location());
-            } else {
-                // Fallback if we can't get the Type object
-                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                             "Unknown member '" + member_name + "' in type '" + object_type + "'");
+        // Handle built-in type methods (string, primitive types, etc.)
+        if (effective_type->is_primitive())
+        {
+            // Check for string methods
+            if (effective_type->name() == "string")
+            {
+                if (member_name == "length" || member_name == "size")
+                {
+                    node.set_resolved_type(_type_context.get_u64_type());
+                    return;
+                }
             }
-        } else if (_diagnostic_manager) {
-            SourceRange range(node.location());
-            _diagnostic_manager->report_undefined_field(range, _source_file, member_name, object_type);
-        } else {
-            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                         "Unknown member '" + member_name + "' in type '" + object_type + "'");
+
+            // For other primitive types, we can add support for methods as needed
+            // For now, reject member access on primitive types
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                         "Cannot access member '" + member_name + "' of primitive type '" + effective_type->name() + "'");
+            node.set_resolved_type(_type_context.get_unknown_type());
+            return;
         }
-        node.set_type("unknown");
+
+        // If we get here, the member was not found
+        LOG_DEBUG(Cryo::LogComponent::AST, "MEMBER ACCESS FAILED: member='{}', object_type='{}' (kind={}), effective_type='{}' (kind={})",
+                  member_name,
+                  object_type ? object_type->name() : "null",
+                  object_type ? static_cast<int>(object_type->kind()) : -1,
+                  effective_type ? effective_type->name() : "null",
+                  effective_type ? static_cast<int>(effective_type->kind()) : -1);
+
+        std::string error_msg = "Unknown struct type or field in member access: " + member_name + " (type: " + effective_type->name() + ")";
+        report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), error_msg);
+        node.set_resolved_type(_type_context.get_unknown_type());
     }
 
     void TypeChecker::visit(ScopeResolutionNode &node)
@@ -3817,7 +3748,14 @@ namespace Cryo
             // Store field information for later member access resolution
             if (!_current_struct_name.empty())
             {
+                LOG_DEBUG(Cryo::LogComponent::AST, "StructField registration check for '{}': current_struct='{}', field_type={}, kind={}",
+                          field_name, _current_struct_name,
+                          field_type ? field_type->name() : "null",
+                          field_type ? static_cast<int>(field_type->kind()) : -1);
+
                 _struct_fields[_current_struct_name][field_name] = field_type;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Registered struct field '{}' of type '{}' in struct/class '{}'",
+                          field_name, field_type->name(), _current_struct_name);
             }
 
             node.set_type(field_type_str);
@@ -4351,23 +4289,55 @@ namespace Cryo
 
         const auto &param_types = func_type->parameter_types();
 
-        // Check argument count
-        if (arg_types.size() < param_types.size())
+        // For variadic functions, we need at least the required (non-variadic) parameters
+        size_t required_params = param_types.size();
+        if (func_type->is_variadic() && required_params > 0)
         {
-            report_error(TypeError::ErrorKind::TooFewArguments, loc,
-                         "Too few arguments in function call");
+            // For variadic functions, the last parameter represents the variadic part
+            // So we need at least (param_types.size() - 1) arguments for the fixed parameters
+            // But we allow equal to param_types.size() for the case where there's one variadic arg
+            required_params = param_types.size() - 1;
+        }
+
+        // Check minimum argument count
+        if (arg_types.size() < required_params)
+        {
+            if (_diagnostic_manager)
+            {
+                SourceRange range(loc);
+                _diagnostic_manager->report_argument_mismatch(range, _source_file,
+                                                              "function", required_params, arg_types.size());
+            }
+            else
+            {
+                report_error(TypeError::ErrorKind::TooFewArguments, loc,
+                             "Too few arguments in function call: expected at least " +
+                                 std::to_string(required_params) + ", got " + std::to_string(arg_types.size()));
+            }
             return false;
         }
 
+        // Check maximum argument count for non-variadic functions
         if (arg_types.size() > param_types.size() && !func_type->is_variadic())
         {
-            report_error(TypeError::ErrorKind::TooManyArguments, loc,
-                         "Too many arguments in function call");
+            if (_diagnostic_manager)
+            {
+                SourceRange range(loc);
+                _diagnostic_manager->report_argument_mismatch(range, _source_file,
+                                                              "function", param_types.size(), arg_types.size());
+            }
+            else
+            {
+                report_error(TypeError::ErrorKind::TooManyArguments, loc,
+                             "Too many arguments in function call: expected " +
+                                 std::to_string(param_types.size()) + ", got " + std::to_string(arg_types.size()));
+            }
             return false;
         }
 
-        // Check argument types
-        for (size_t i = 0; i < param_types.size(); ++i)
+        // Check argument types for the fixed parameters
+        size_t fixed_params = func_type->is_variadic() ? param_types.size() - 1 : param_types.size();
+        for (size_t i = 0; i < fixed_params && i < arg_types.size(); ++i)
         {
             if (!check_assignment_compatibility(param_types[i].get(), arg_types[i], loc))
             {
@@ -4376,6 +4346,9 @@ namespace Cryo
                 return false;
             }
         }
+
+        // For variadic functions, the remaining arguments are not type-checked against specific parameter types
+        // They will be handled at the call site (usually by the runtime or specific intrinsic handling)
 
         return true;
     }
@@ -4387,55 +4360,59 @@ namespace Cryo
     void TypeChecker::report_error(TypeError::ErrorKind kind, SourceLocation loc, const std::string &message)
     {
         // If we have a diagnostic manager, use it with enhanced error reporting
-        if (_diagnostic_manager) {
+        if (_diagnostic_manager)
+        {
             ErrorCode error_code = ErrorCode::E0805_INTERNAL_ERROR;
-            
+
             // Map TypeError::ErrorKind to ErrorCode for enhanced reporting
-            switch (kind) {
-                case TypeError::ErrorKind::TypeMismatch:
-                    error_code = ErrorCode::E0200_TYPE_MISMATCH;
-                    break;
-                case TypeError::ErrorKind::UndefinedVariable:
-                    error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
-                    break;
-                case TypeError::ErrorKind::UndefinedFunction:
-                    error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
-                    break;
-                case TypeError::ErrorKind::RedefinedSymbol:
-                    error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
-                    break;
-                case TypeError::ErrorKind::InvalidOperation:
-                    error_code = ErrorCode::E0209_INVALID_OPERATION;
-                    break;
-                case TypeError::ErrorKind::InvalidAssignment:
-                    error_code = ErrorCode::E0210_INVALID_ASSIGNMENT;
-                    break;
-                case TypeError::ErrorKind::InvalidCast:
-                    error_code = ErrorCode::E0208_INVALID_CAST;
-                    break;
-                case TypeError::ErrorKind::IncompatibleTypes:
-                    error_code = ErrorCode::E0211_INCOMPATIBLE_TYPES;
-                    break;
-                case TypeError::ErrorKind::TooManyArguments:
-                    error_code = ErrorCode::E0215_TOO_MANY_ARGS;
-                    break;
-                case TypeError::ErrorKind::TooFewArguments:
-                    error_code = ErrorCode::E0216_TOO_FEW_ARGS;
-                    break;
-                case TypeError::ErrorKind::NonCallableType:
-                    error_code = ErrorCode::E0213_NON_CALLABLE;
-                    break;
-                case TypeError::ErrorKind::VoidValueUsage:
-                    error_code = ErrorCode::E0212_VOID_VALUE_USED;
-                    break;
-                default:
-                    error_code = ErrorCode::E0805_INTERNAL_ERROR;
-                    break;
+            switch (kind)
+            {
+            case TypeError::ErrorKind::TypeMismatch:
+                error_code = ErrorCode::E0200_TYPE_MISMATCH;
+                break;
+            case TypeError::ErrorKind::UndefinedVariable:
+                error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
+                break;
+            case TypeError::ErrorKind::UndefinedFunction:
+                error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
+                break;
+            case TypeError::ErrorKind::RedefinedSymbol:
+                error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
+                break;
+            case TypeError::ErrorKind::InvalidOperation:
+                error_code = ErrorCode::E0209_INVALID_OPERATION;
+                break;
+            case TypeError::ErrorKind::InvalidAssignment:
+                error_code = ErrorCode::E0210_INVALID_ASSIGNMENT;
+                break;
+            case TypeError::ErrorKind::InvalidCast:
+                error_code = ErrorCode::E0208_INVALID_CAST;
+                break;
+            case TypeError::ErrorKind::IncompatibleTypes:
+                error_code = ErrorCode::E0211_INCOMPATIBLE_TYPES;
+                break;
+            case TypeError::ErrorKind::TooManyArguments:
+                error_code = ErrorCode::E0215_TOO_MANY_ARGS;
+                break;
+            case TypeError::ErrorKind::TooFewArguments:
+                error_code = ErrorCode::E0216_TOO_FEW_ARGS;
+                break;
+            case TypeError::ErrorKind::NonCallableType:
+                error_code = ErrorCode::E0213_NON_CALLABLE;
+                break;
+            case TypeError::ErrorKind::VoidValueUsage:
+                error_code = ErrorCode::E0212_VOID_VALUE_USED;
+                break;
+            default:
+                error_code = ErrorCode::E0805_INTERNAL_ERROR;
+                break;
             }
-            
+
             SourceRange range(loc);
             _diagnostic_manager->report_error(error_code, message, range, _source_file);
-        } else {
+        }
+        else
+        {
             // Fallback to old behavior if no diagnostic manager
             _errors.emplace_back(kind, loc, message);
         }
@@ -4454,121 +4431,155 @@ namespace Cryo
 
     void TypeChecker::report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context)
     {
-        if (_diagnostic_manager) {
+        if (_diagnostic_manager)
+        {
             // ENHANCED: Create sophisticated multi-span diagnostics like Rust
             SourceRange range(loc);
-            
+
             // Get the actual type name for error reporting and fallback estimation
             std::string actual_name = actual ? actual->to_string() : "unknown";
-            
+
             // Get the actual source text to determine accurate token length
             size_t token_width = 1;
-            
+
             // Try to get the actual source line and extract the token at the location
-            try {
-                const SourceManager& source_mgr = _diagnostic_manager->source_manager();
+            try
+            {
+                const SourceManager &source_mgr = _diagnostic_manager->source_manager();
                 std::string source_line = source_mgr.get_line_text(_source_file, loc.line());
-                
-                if (!source_line.empty() && loc.column() <= source_line.length()) {
+
+                if (!source_line.empty() && loc.column() <= source_line.length())
+                {
                     size_t start_col = loc.column() - 1; // Convert to 0-based indexing
-                    
+
                     // Find the end of the token at this position
-                    if (start_col < source_line.length()) {
+                    if (start_col < source_line.length())
+                    {
                         char start_char = source_line[start_col];
                         size_t end_col = start_col;
-                        
-                        if (start_char == '"') {
+
+                        if (start_char == '"')
+                        {
                             // String literal - find closing quote
                             end_col = start_col + 1;
-                            while (end_col < source_line.length() && source_line[end_col] != '"') {
-                                if (source_line[end_col] == '\\' && end_col + 1 < source_line.length()) {
+                            while (end_col < source_line.length() && source_line[end_col] != '"')
+                            {
+                                if (source_line[end_col] == '\\' && end_col + 1 < source_line.length())
+                                {
                                     end_col += 2; // Skip escaped character
-                                } else {
+                                }
+                                else
+                                {
                                     end_col++;
                                 }
                             }
-                            if (end_col < source_line.length()) end_col++; // Include closing quote
-                        } else if (std::isalnum(start_char) || start_char == '_') {
+                            if (end_col < source_line.length())
+                                end_col++; // Include closing quote
+                        }
+                        else if (std::isalnum(start_char) || start_char == '_')
+                        {
                             // Identifier or number - continue until non-alphanumeric
-                            while (end_col < source_line.length() && 
-                                   (std::isalnum(source_line[end_col]) || source_line[end_col] == '_' || source_line[end_col] == '.')) {
+                            while (end_col < source_line.length() &&
+                                   (std::isalnum(source_line[end_col]) || source_line[end_col] == '_' || source_line[end_col] == '.'))
+                            {
                                 end_col++;
                             }
-                        } else {
+                        }
+                        else
+                        {
                             // Single character token
                             end_col = start_col + 1;
                         }
-                        
+
                         token_width = end_col - start_col;
                     }
                 }
-            } catch (...) {
+            }
+            catch (...)
+            {
                 // Fall back to simple estimation if source reading fails
-                if (actual_name == "string") {
+                if (actual_name == "string")
+                {
                     token_width = 8; // Approximate for string literal
-                } else if (actual_name == "int" || actual_name == "float") {
+                }
+                else if (actual_name == "int" || actual_name == "float")
+                {
                     token_width = 3; // Approximate for numeric literals
-                } else if (actual_name == "boolean") {
+                }
+                else if (actual_name == "boolean")
+                {
                     token_width = 4; // "true" or "false"
-                } else if (actual_name.find("Config") != std::string::npos) {
+                }
+                else if (actual_name.find("Config") != std::string::npos)
+                {
                     token_width = 6; // "config"
-                } else {
+                }
+                else
+                {
                     token_width = std::max(static_cast<size_t>(3), actual_name.length());
                 }
             }
-            
+
             // Ensure minimum width of 1
             token_width = std::max(static_cast<size_t>(1), token_width);
-            
+
             // Create primary span with accurate width for proper underlining
             SourceLocation end_loc(loc.line(), loc.column() + token_width - 1);
             SourceSpan value_span(loc, end_loc, _source_file, true);
-            
+
             // Generate sophisticated inline labels
             std::string expected_name = expected ? expected->to_string() : "unknown";
-            
+
             std::string inline_label = "expected `" + expected_name + "`, found `" + actual_name + "`";
             value_span.set_label(inline_label);
-            
+
             // Create enhanced diagnostic with proper message
             std::string message = "type mismatch in " + context;
-            auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, message);
-            
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, message);
+
             // Add primary span (the problematic value)
             diagnostic.with_primary_span(value_span);
-            
+
             // For variable declarations, create a better secondary span for type annotation
-            if (context == "variable initialization") {
+            if (context == "variable initialization")
+            {
                 // For now, skip the secondary span since we don't have accurate parser info
                 // The primary span with the clear error message is sufficient
                 // TODO: Add proper type annotation span tracking in the parser
             }
-            
+
             // Add context-aware suggestions based on the types
-            if (expected_name == "int" && actual_name == "string") {
+            if (expected_name == "int" && actual_name == "string")
+            {
                 diagnostic.add_help("if you meant to create a string variable, remove the type annotation");
                 diagnostic.add_help("if you want to convert string to integer, try parsing");
                 diagnostic.add_help("string literals cannot be implicitly converted to integers");
             }
-            else if (expected_name == "string" && actual_name == "int") {
+            else if (expected_name == "string" && actual_name == "int")
+            {
                 diagnostic.add_help("try `value.to_string()` to convert the integer");
                 diagnostic.add_help("use string interpolation: `\"${value}\"`");
             }
-            else if (expected_name == "boolean" && (actual_name == "int" || actual_name == "float")) {
+            else if (expected_name == "boolean" && (actual_name == "int" || actual_name == "float"))
+            {
                 diagnostic.add_help("use comparison operators like `value != 0` or `value > 0`");
                 diagnostic.add_help("numeric types don't implicitly convert to boolean in Cryo");
             }
-            else if (expected_name.find("*") != std::string::npos && actual_name.find("*") == std::string::npos) {
+            else if (expected_name.find("*") != std::string::npos && actual_name.find("*") == std::string::npos)
+            {
                 diagnostic.add_help("use address-of operator `&` to get a pointer");
                 diagnostic.add_help("pointer and value types are not directly compatible");
             }
-            else if (expected_name.find("*") == std::string::npos && actual_name.find("*") != std::string::npos) {
+            else if (expected_name.find("*") == std::string::npos && actual_name.find("*") != std::string::npos)
+            {
                 diagnostic.add_help("use dereference operator `*` to get the value");
                 diagnostic.add_help("use address-of (&) or dereference (*) operators as appropriate");
             }
-            
+
             _diagnostic_manager->emit(std::move(diagnostic));
-        } else {
+        }
+        else
+        {
             // Fallback to old behavior
             std::string expected_type = expected ? expected->to_string() : "unknown";
             std::string actual_type = actual ? actual->to_string() : "unknown";
@@ -4688,6 +4699,21 @@ namespace Cryo
         }
 
         // Look up user-defined types (struct, class, enum)
+        // First try as class type
+        Type *class_type = _type_context.get_class_type(type_name);
+        if (class_type && class_type->kind() != TypeKind::Unknown)
+        {
+            return class_type;
+        }
+
+        // Then try as struct type
+        Type *struct_type = _type_context.get_struct_type(type_name);
+        if (struct_type && struct_type->kind() != TypeKind::Unknown)
+        {
+            return struct_type;
+        }
+
+        // Fall back to symbol table lookup for backwards compatibility
         Type *user_type = lookup_variable_type(type_name);
         if (user_type)
         {

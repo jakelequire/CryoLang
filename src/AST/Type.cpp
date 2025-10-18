@@ -24,8 +24,8 @@ namespace Cryo
             (other._kind == TypeKind::Generic || other._kind == TypeKind::Parameterized) &&
             _name == other._name)
         {
-            std::cerr << "[DEBUG] Allowing generic type equality: " << _name 
-                      << " (" << TypeKindToString(_kind) << ") == " << other._name 
+            std::cerr << "[DEBUG] Allowing generic type equality: " << _name
+                      << " (" << TypeKindToString(_kind) << ") == " << other._name
                       << " (" << TypeKindToString(other._kind) << ")" << std::endl;
             return true;
         }
@@ -36,19 +36,20 @@ namespace Cryo
              (_kind == TypeKind::Struct && other._kind == TypeKind::Generic)) &&
             _name == other._name)
         {
-            std::cerr << "[DEBUG] Allowing generic-struct type equality: " << _name 
-                      << " (" << TypeKindToString(_kind) << ") == " << other._name 
+            std::cerr << "[DEBUG] Allowing generic-struct type equality: " << _name
+                      << " (" << TypeKindToString(_kind) << ") == " << other._name
                       << " (" << TypeKindToString(other._kind) << ")" << std::endl;
             return true;
         }
 
         // Debug logging for failed type equality involving T
-        if (_name == "T" || other._name == "T") {
-            std::cerr << "[DEBUG] Type::equals failed for generic types: " << _name 
-                      << " (" << TypeKindToString(_kind) << ") vs " << other._name 
+        if (_name == "T" || other._name == "T")
+        {
+            std::cerr << "[DEBUG] Type::equals failed for generic types: " << _name
+                      << " (" << TypeKindToString(_kind) << ") vs " << other._name
                       << " (" << TypeKindToString(other._kind) << ")" << std::endl;
         }
-        
+
         return false;
     }
 
@@ -386,11 +387,11 @@ namespace Cryo
         if (other.kind() == TypeKind::Array)
         {
             const auto &other_array = static_cast<const ArrayType &>(other);
-            
+
             // Size must match (both dynamic or both same fixed size)
             if (_size != other_array._size)
                 return false;
-            
+
             // Element types must be assignable
             return _element_type->is_assignable_from(*other_array._element_type);
         }
@@ -1081,6 +1082,23 @@ namespace Cryo
             return nullptr;
 
         const Token &current_token = tokens[index];
+
+        // Handle reference types first (&Type)
+        if (current_token.kind() == TokenKind::TK_AMP)
+        {
+            ++index; // consume '&'
+
+            // Parse the referent type
+            Type *referent_type = parse_type_from_token_stream(tokens, index);
+            if (referent_type)
+            {
+                return create_reference_type(referent_type);
+            }
+            else
+            {
+                return nullptr; // Failed to parse referent type
+            }
+        }
 
         // Try primitive types first
         Type *primitive_type = parse_primitive_type_from_token(current_token.kind());
