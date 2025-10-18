@@ -45,8 +45,12 @@ namespace Cryo
         // Use existing multi-span from diagnostic if available, otherwise create from legacy range
         MultiSpan spans = diagnostic.multi_span();
         
+        // FIXED: Validate source range before processing and handle invalid ranges gracefully
+        bool has_valid_range = diagnostic.range().is_valid() && 
+                              is_valid_source_range(diagnostic.range(), diagnostic.filename());
+        
         // If no multi-span data, convert legacy range to multi-span
-        if (spans.is_empty() && diagnostic.range().is_valid()) {
+        if (spans.is_empty() && has_valid_range) {
             auto start_line = diagnostic.range().start.line();
             auto start_col = diagnostic.range().start.column();
             auto end_line = diagnostic.range().end.line();
@@ -130,6 +134,13 @@ namespace Cryo
             }
             
             spans.add_primary_span(span);
+        } else if (spans.is_empty()) {
+            // Handle invalid or missing source range by creating a minimal diagnostic
+            // that doesn't reference source lines
+            SourceSpan fallback_span(SourceLocation(1, 1), SourceLocation(1, 1), 
+                                   diagnostic.filename().empty() ? "<unknown>" : diagnostic.filename(), true);
+            fallback_span.set_label("error location unavailable");
+            spans.add_primary_span(fallback_span);
         }
         
         // Use existing suggestions from diagnostic
@@ -154,14 +165,27 @@ namespace Cryo
         // Location line  
         if (!spans.is_empty()) {
             auto primary = spans.primary_span();
-            output << "  " << _style.arrow << " " << primary.filename()
-                   << ":" << primary.start().line() << ":" << primary.start().column() << "\n";
+            
+            // FIXED: Don't show location line for invalid ranges (like :1:1 with empty filename)
+            if (is_valid_source_range(SourceRange(primary.start(), primary.end()), primary.filename()) &&
+                !primary.filename().empty()) {
+                output << "  " << _style.arrow << " " << primary.filename()
+                       << ":" << primary.start().line() << ":" << primary.start().column() << "\n";
+            }
         }
 
         // Source snippet with highlighting
         if (!spans.is_empty()) {
-            auto snippet = extract_source_snippet(spans);
-            output << render_source_snippet(snippet);
+            auto primary = spans.primary_span();
+            
+            // FIXED: Only show source snippet for valid ranges with actual files
+            if (is_valid_source_range(SourceRange(primary.start(), primary.end()), primary.filename()) &&
+                !primary.filename().empty()) {
+                auto snippet = extract_source_snippet(spans);
+                if (!snippet.lines.empty()) {
+                    output << render_source_snippet(snippet);
+                }
+            }
         }
 
         // Suggestions
@@ -204,20 +228,34 @@ namespace Cryo
         snippet.max_line_number_width = source_snippet.max_line_number_width;
 
         // If SourceManager couldn't extract lines, fall back to direct file reading
-        if (snippet.lines.empty()) {
+        if (snippet.lines.empty() && !spans.is_empty()) {
             auto primary = spans.primary_span();
+            
+            // FIXED: Validate the primary span before attempting to read lines
+            if (!is_valid_source_range(SourceRange(primary.start(), primary.end()), primary.filename())) {
+                // Return empty snippet for invalid ranges to avoid "beyond end of file" errors
+                return snippet;
+            }
             
             // Calculate line range manually as fallback
             size_t min_line = primary.start().line();
             size_t max_line = primary.end().line();
 
             for (const auto& span : spans.all_spans()) {
-                min_line = std::min(min_line, span.start().line());
-                max_line = std::max(max_line, span.end().line());
+                if (is_valid_source_range(SourceRange(span.start(), span.end()), span.filename())) {
+                    min_line = std::min(min_line, span.start().line());
+                    max_line = std::max(max_line, span.end().line());
+                }
             }
 
             size_t start_line = (min_line > context_lines) ? min_line - context_lines : 1;
             size_t end_line = max_line + context_lines;
+            
+            // ADDED: Bound the end_line to the actual file length
+            size_t file_line_count = get_file_line_count(primary.filename());
+            if (file_line_count > 0) {
+                end_line = std::min(end_line, file_line_count);
+            }
 
             snippet.start_line_number = start_line;
             snippet.filename = primary.filename();
@@ -228,14 +266,24 @@ namespace Cryo
                 std::string line = read_line_from_file(snippet.filename, line_num);
                 
                 if (line.empty()) {
+                    // FIXED: Only add "beyond end of file" message if we're actually beyond the file
+                    // and don't include these placeholder lines in the snippet
                     size_t total_lines = get_file_line_count(snippet.filename);
-                    if (line_num > total_lines) {
-                        line = "    <line " + std::to_string(line_num) + " beyond end of file (max: " + std::to_string(total_lines) + ")>";
-                    } else {
+                    if (line_num > total_lines && total_lines > 0) {
+                        // Skip lines beyond the file instead of showing placeholder text
+                        break;
+                    } else if (total_lines > 0) {
+                        // Line exists but couldn't be read - show a different message
                         line = "    <source line not available>";
+                    } else {
+                        // File has no lines or couldn't be read
+                        break;
                     }
                 }
-                snippet.lines.push_back(line);
+                
+                if (!line.empty()) {
+                    snippet.lines.push_back(line);
+                }
             }
             
             snippet.max_line_number_width = calculate_line_number_width(snippet);
@@ -314,28 +362,29 @@ namespace Cryo
             size_t end_col = (span.end().line() == line_number) ? span.end().column() - 1 : source_line.length() - 1;
             
             // Clamp to line bounds
-            start_col = std::min(start_col, source_line.length() - 1);
-            end_col = std::min(end_col, source_line.length() - 1);
+            start_col = std::min(start_col, source_line.length() > 0 ? source_line.length() - 1 : 0);
+            end_col = std::min(end_col, source_line.length() > 0 ? source_line.length() - 1 : 0);
+            
+            // Ensure we have at least one character to underline
+            if (end_col < start_col) {
+                end_col = start_col;
+            }
             
             // Choose underline character and pattern based on span type
             if (span.is_primary()) {
                 // Primary spans get ^^^^^^^ pattern
-                for (size_t col = start_col; col <= end_col; ++col) {
-                    if (col < underline.length()) {
-                        underline[col] = '^';
-                    }
+                for (size_t col = start_col; col <= end_col && col < underline.length(); ++col) {
+                    underline[col] = '^';
                 }
             } else {
                 // Secondary spans get --- pattern  
-                for (size_t col = start_col; col <= end_col; ++col) {
-                    if (col < underline.length()) {
-                        underline[col] = '-';
-                    }
+                for (size_t col = start_col; col <= end_col && col < underline.length(); ++col) {
+                    underline[col] = '-';
                 }
             }
         }
 
-        // Apply colors and add inline labels for Rust-style output
+        // Apply colors
         std::string colored_underline;
         for (size_t i = 0; i < underline.length(); ++i) {
             if (underline[i] == '^') {
@@ -347,9 +396,6 @@ namespace Cryo
             }
         }
         
-        // Skip inline labels here - they're handled by render_span_labels which properly colors them
-        // This prevents duplicate white text
-        
         return colored_underline;
     }
 
@@ -358,39 +404,43 @@ namespace Cryo
         size_t line_number,
         const std::string& source_line) const
     {
-        std::ostringstream output;
-        
-        for (const auto& span : spans) {
-            if (span.label().has_value() && span.start().line() == line_number) {
-                size_t col = span.start().column() - 1;
-                if (col < source_line.length()) {
-                    // Create spacing to align with the span start
-                    std::string spacing(col, ' ');
-                    std::string color = span.is_primary() ? _style.primary_span_color : _style.secondary_span_color;
-                    
-                    // Add the vertical connection line
-                    output << spacing << colorize(_style.vertical_bar, color) << "\n";
-                    
-                    // Add the label text
-                    output << spacing << colorize(span.label().value(), color);
-                    
-                    // If this is not the last span with a label, add a newline
-                    bool has_more_labels = false;
-                    for (const auto& other_span : spans) {
-                        if (&other_span != &span && other_span.label().has_value() && 
-                            other_span.start().line() == line_number) {
-                            has_more_labels = true;
-                            break;
-                        }
-                    }
-                    if (has_more_labels) {
-                        output << "\n";
-                    }
-                }
-            }
+        if (spans.empty()) {
+            return "";
         }
         
-        return output.str();
+        std::ostringstream output;
+        bool has_labels = false;
+        
+        // ENHANCED: Create simple, clean inline labels with proper alignment
+        for (const auto& span : spans) {
+            if (!span.label().has_value() || span.start().line() != line_number) {
+                continue;
+            }
+            
+            has_labels = true;
+            size_t span_start = span.start().column() - 1; // Convert to 0-based
+            
+            // Clamp to source line bounds
+            span_start = std::min(span_start, source_line.length() > 0 ? source_line.length() - 1 : 0);
+            
+            std::string color = span.is_primary() ? _style.primary_span_color : _style.secondary_span_color;
+            
+            // Create spacing to align with the span position
+            // No need for gutter calculation here - the labels are rendered inline after the gutter
+            std::string spacing(span_start, ' ');
+            
+            // Add the label directly under the span
+            output << spacing << colorize("|", color) << "\n";
+            output << spacing << colorize(span.label().value(), color) << "\n";
+        }
+        
+        // Remove the trailing newline if we added labels
+        std::string result = output.str();
+        if (has_labels && !result.empty() && result.back() == '\n') {
+            result.pop_back();
+        }
+        
+        return result;
     }
 
     std::string DiagnosticFormatter::format_suggestions(
@@ -626,7 +676,7 @@ namespace Cryo
             "int", "i32", "i64", "u32", "u64",
             "float", "f32", "f64", "double",
             "string", "str", "char",
-            "boolean", "bool",
+            "boolean",
             "void", "null"
         };
         
@@ -722,6 +772,35 @@ namespace Cryo
         std::transform(label.begin(), label.end(), label.begin(), ::tolower);
         
         return label;
+    }
+
+    bool DiagnosticFormatter::is_valid_source_range(const SourceRange& range, const std::string& filename) const
+    {
+        // Check if range has valid line and column numbers
+        if (range.start.line() == 0 || range.start.column() == 0 || 
+            range.end.line() == 0 || range.end.column() == 0) {
+            return false;
+        }
+        
+        // If we have a source manager, validate against actual file content
+        if (_source_manager && !filename.empty()) {
+            size_t file_line_count = get_file_line_count(filename);
+            
+            // Check if the range is within the bounds of the actual file
+            if (range.start.line() > file_line_count || range.end.line() > file_line_count) {
+                return false;
+            }
+            
+            // Additional validation: check if columns are reasonable
+            if (range.start.line() <= file_line_count) {
+                std::string line = read_line_from_file(filename, range.start.line());
+                if (!line.empty() && range.start.column() > line.length() + 1) {
+                    return false;
+                }
+            }
+        }
+        
+        return true;
     }
 
 } // namespace Cryo

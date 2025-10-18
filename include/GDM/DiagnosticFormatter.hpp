@@ -119,6 +119,9 @@ namespace Cryo
         // Smart context determination
         std::pair<size_t, size_t> calculate_optimal_context(const MultiSpan& spans) const;
         
+        // ADDED: Source range validation for preventing "beyond end of file" errors
+        bool is_valid_source_range(const SourceRange& range, const std::string& filename) const;
+        
         // Multi-span relationship rendering
         struct SpanLayout
         {

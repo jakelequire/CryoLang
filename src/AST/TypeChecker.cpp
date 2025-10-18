@@ -4438,25 +4438,116 @@ namespace Cryo
     void TypeChecker::report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context)
     {
         if (_diagnostic_manager) {
-            // NEW: Use structured approach - no more string parsing!
+            // ENHANCED: Create sophisticated multi-span diagnostics like Rust
             SourceRange range(loc);
-            SourceSpan value_span(loc, loc, _source_file, true);
             
-            // Create structured type mismatch context
-            TypeMismatchContext type_context(expected, actual, context);
+            // Get the actual type name for error reporting and fallback estimation
+            std::string actual_name = actual ? actual->to_string() : "unknown";
             
-            // Create diagnostic payload with structured data
-            auto payload = DiagnosticPayload::create_type_mismatch(type_context);
+            // Get the actual source text to determine accurate token length
+            size_t token_width = 1;
+            
+            // Try to get the actual source line and extract the token at the location
+            try {
+                const SourceManager& source_mgr = _diagnostic_manager->source_manager();
+                std::string source_line = source_mgr.get_line_text(_source_file, loc.line());
+                
+                if (!source_line.empty() && loc.column() <= source_line.length()) {
+                    size_t start_col = loc.column() - 1; // Convert to 0-based indexing
+                    
+                    // Find the end of the token at this position
+                    if (start_col < source_line.length()) {
+                        char start_char = source_line[start_col];
+                        size_t end_col = start_col;
+                        
+                        if (start_char == '"') {
+                            // String literal - find closing quote
+                            end_col = start_col + 1;
+                            while (end_col < source_line.length() && source_line[end_col] != '"') {
+                                if (source_line[end_col] == '\\' && end_col + 1 < source_line.length()) {
+                                    end_col += 2; // Skip escaped character
+                                } else {
+                                    end_col++;
+                                }
+                            }
+                            if (end_col < source_line.length()) end_col++; // Include closing quote
+                        } else if (std::isalnum(start_char) || start_char == '_') {
+                            // Identifier or number - continue until non-alphanumeric
+                            while (end_col < source_line.length() && 
+                                   (std::isalnum(source_line[end_col]) || source_line[end_col] == '_' || source_line[end_col] == '.')) {
+                                end_col++;
+                            }
+                        } else {
+                            // Single character token
+                            end_col = start_col + 1;
+                        }
+                        
+                        token_width = end_col - start_col;
+                    }
+                }
+            } catch (...) {
+                // Fall back to simple estimation if source reading fails
+                if (actual_name == "string") {
+                    token_width = 8; // Approximate for string literal
+                } else if (actual_name == "int" || actual_name == "float") {
+                    token_width = 3; // Approximate for numeric literals
+                } else if (actual_name == "boolean") {
+                    token_width = 4; // "true" or "false"
+                } else if (actual_name.find("Config") != std::string::npos) {
+                    token_width = 6; // "config"
+                } else {
+                    token_width = std::max(static_cast<size_t>(3), actual_name.length());
+                }
+            }
+            
+            // Ensure minimum width of 1
+            token_width = std::max(static_cast<size_t>(1), token_width);
+            
+            // Create primary span with accurate width for proper underlining
+            SourceLocation end_loc(loc.line(), loc.column() + token_width - 1);
+            SourceSpan value_span(loc, end_loc, _source_file, true);
+            
+            // Generate sophisticated inline labels
+            std::string expected_name = expected ? expected->to_string() : "unknown";
+            
+            std::string inline_label = "expected `" + expected_name + "`, found `" + actual_name + "`";
+            value_span.set_label(inline_label);
             
             // Create enhanced diagnostic with proper message
             std::string message = "type mismatch in " + context;
-            auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, message)
-                .with_primary_span(value_span)
-                .with_payload(std::move(payload));
+            auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, message);
             
-            // Add dynamic help messages generated from structured context
-            for (const auto& help_msg : type_context.generate_help_messages()) {
-                diagnostic.add_help(help_msg);
+            // Add primary span (the problematic value)
+            diagnostic.with_primary_span(value_span);
+            
+            // For variable declarations, create a better secondary span for type annotation
+            if (context == "variable initialization") {
+                // For now, skip the secondary span since we don't have accurate parser info
+                // The primary span with the clear error message is sufficient
+                // TODO: Add proper type annotation span tracking in the parser
+            }
+            
+            // Add context-aware suggestions based on the types
+            if (expected_name == "int" && actual_name == "string") {
+                diagnostic.add_help("if you meant to create a string variable, remove the type annotation");
+                diagnostic.add_help("if you want to convert string to integer, try parsing");
+                diagnostic.add_help("string literals cannot be implicitly converted to integers");
+            }
+            else if (expected_name == "string" && actual_name == "int") {
+                diagnostic.add_help("try `value.to_string()` to convert the integer");
+                diagnostic.add_help("use string interpolation: `\"${value}\"`");
+            }
+            else if (expected_name == "boolean" && (actual_name == "int" || actual_name == "float")) {
+                diagnostic.add_help("use comparison operators like `value != 0` or `value > 0`");
+                diagnostic.add_help("numeric types don't implicitly convert to boolean in Cryo");
+            }
+            else if (expected_name.find("*") != std::string::npos && actual_name.find("*") == std::string::npos) {
+                diagnostic.add_help("use address-of operator `&` to get a pointer");
+                diagnostic.add_help("pointer and value types are not directly compatible");
+            }
+            else if (expected_name.find("*") == std::string::npos && actual_name.find("*") != std::string::npos) {
+                diagnostic.add_help("use dereference operator `*` to get the value");
+                diagnostic.add_help("use address-of (&) or dereference (*) operators as appropriate");
             }
             
             _diagnostic_manager->emit(std::move(diagnostic));
