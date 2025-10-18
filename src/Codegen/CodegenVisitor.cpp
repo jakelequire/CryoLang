@@ -24,6 +24,8 @@ namespace Cryo::Codegen
                                    Cryo::DiagnosticManager *gdm)
         : _context_manager(context_manager),
           _symbol_table(symbol_table),
+          _diagnostic_manager(gdm),
+          _diagnostic_builder(gdm ? std::make_unique<CodegenDiagnosticBuilder>(gdm, "") : nullptr),
           _value_context(std::make_unique<ValueContext>()),
           _type_mapper(std::make_unique<TypeMapper>(context_manager, symbol_table.get_type_context())),
           _intrinsics(std::make_unique<Intrinsics>(context_manager, gdm)),
@@ -73,6 +75,11 @@ namespace Cryo::Codegen
     {
         _source_file = source_file;
         _namespace_context = namespace_context;
+        
+        // Recreate diagnostic builder with new source file context
+        if (_diagnostic_manager) {
+            _diagnostic_builder = std::make_unique<CodegenDiagnosticBuilder>(_diagnostic_manager, source_file);
+        }
     }
 
     //===================================================================
@@ -985,7 +992,7 @@ namespace Cryo::Codegen
         llvm::Type *class_type = _type_mapper->map_class_type(cryo_class_type);
         if (!class_type)
         {
-            std::cerr << "[CodegenVisitor] Failed to map class type for " << node.name() << std::endl;
+            report_error("Failed to map class type for " + node.name(), &node);
             register_value(&node, nullptr);
             return;
         }
@@ -3458,7 +3465,13 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member access resolution failed: struct_type={}, field_index={}, type_name='{}', member_name='{}', current_struct_type='{}'",
                       (struct_type ? "found" : "null"), field_index, type_name, member_name, current_struct_type);
 
-            report_error("Unknown struct type or field in member access: " + member_name + " (type: " + type_name + ")", &node);
+            // Use specialized field access error for better diagnostics
+            if (_diagnostic_builder && !type_name.empty()) {
+                _diagnostic_builder->create_field_access_error(member_name, type_name, &node);
+            } else {
+                // Fallback for cases where we don't have type information
+                report_error("Unknown struct type or field in member access: " + member_name + " (type: " + type_name + ")", &node);
+            }
             register_value(&node, nullptr);
             return;
         }
@@ -3807,17 +3820,33 @@ namespace Cryo::Codegen
         _has_errors = true;
         _last_error = message;
         _errors.push_back(message);
-        std::cerr << "Codegen Error: " << message << std::endl;
+        
+        if (_diagnostic_builder) {
+            _diagnostic_builder->create_llvm_error(message, nullptr);
+        } else {
+            // Fallback to direct output if no diagnostic manager available
+            std::cerr << "Codegen Error: " << message << std::endl;
+        }
     }
 
     void CodegenVisitor::report_error(const std::string &message, Cryo::ASTNode *node)
     {
-        std::string full_message = message;
-        if (node)
-        {
-            full_message += " (node kind: " + std::to_string(static_cast<int>(node->kind())) + ")";
+        _has_errors = true;
+        _last_error = message;
+        _errors.push_back(message);
+        
+        if (_diagnostic_builder && node) {
+            _diagnostic_builder->create_llvm_error(message, node);
+        } else if (_diagnostic_builder) {
+            _diagnostic_builder->create_llvm_error(message, nullptr);
+        } else {
+            // Fallback to direct output if no diagnostic manager available
+            std::string full_message = message;
+            if (node) {
+                full_message += " (node kind: " + std::to_string(static_cast<int>(node->kind())) + ")";
+            }
+            std::cerr << "Codegen Error: " << full_message << std::endl;
         }
-        report_error(full_message);
     }
 
     //===================================================================
@@ -6188,8 +6217,25 @@ namespace Cryo::Codegen
             }
             else
             {
-                // Report through GDM system instead of direct stderr
-                report_error("Address-of operator (&) can only be applied to variables", node);
+                // Try to get type information for better error reporting
+                std::string type_name = "expression";
+                if (auto *identNode = dynamic_cast<Cryo::IdentifierNode *>(operand)) {
+                    std::string varName = identNode->name();
+                    auto cryo_type_it = _variable_types.find(varName);
+                    if (cryo_type_it != _variable_types.end() && cryo_type_it->second) {
+                        type_name = cryo_type_it->second->to_string();
+                    }
+                } else {
+                    // For non-identifier expressions, indicate it's an expression result
+                    type_name = "expression result";
+                }
+                
+                // Use specialized diagnostic for address-of errors
+                if (_diagnostic_builder) {
+                    _diagnostic_builder->create_invalid_address_of_error(type_name, "only variables can have their address taken", node);
+                } else {
+                    report_error("Address-of operator (&) can only be applied to variables", node);
+                }
                 return nullptr;
             }
         }
@@ -6198,8 +6244,32 @@ namespace Cryo::Codegen
             // Dereference operator: load value from pointer/reference
             if (!operandValue->getType()->isPointerTy())
             {
-                // Report through GDM system instead of direct stderr  
-                report_error("Dereference operator (*) can only be applied to pointer types", node);
+                // Try to get a more meaningful type name for the error
+                std::string type_name = "unknown";
+                if (auto *identNode = dynamic_cast<Cryo::IdentifierNode *>(node->operand())) {
+                    std::string varName = identNode->name();
+                    auto cryo_type_it = _variable_types.find(varName);
+                    if (cryo_type_it != _variable_types.end() && cryo_type_it->second) {
+                        type_name = cryo_type_it->second->to_string();
+                    } else {
+                        // Fallback to basic LLVM type info
+                        llvm::Type *llvm_type = operandValue->getType();
+                        if (llvm_type->isIntegerTy()) {
+                            type_name = "int";
+                        } else if (llvm_type->isFloatingPointTy()) {
+                            type_name = "float";
+                        } else if (llvm_type->isStructTy()) {
+                            type_name = "struct";
+                        }
+                    }
+                }
+                
+                // Use specialized diagnostic for dereference errors
+                if (_diagnostic_builder) {
+                    _diagnostic_builder->create_invalid_dereference_error(type_name, node);
+                } else {
+                    report_error("Dereference operator (*) can only be applied to pointer types", node);
+                }
                 return nullptr;
             }
 

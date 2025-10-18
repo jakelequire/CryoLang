@@ -5,6 +5,7 @@
 #include "AST/ASTContext.hpp"
 #include "AST/GenericInstantiation.hpp"
 #include "AST/SymbolTable.hpp"
+#include "GDM/DiagnosticBuilders.hpp"
 #include "Lexer/lexer.hpp"
 #include <vector>
 #include <string>
@@ -249,6 +250,9 @@ namespace Cryo
         // Diagnostic manager for error reporting (optional)
         DiagnosticManager *_diagnostic_manager = nullptr;
         std::string _source_file; // Current source file being checked
+        
+        // Diagnostic builder for enhanced error reporting
+        std::unique_ptr<TypeCheckerDiagnosticBuilder> _diagnostic_builder;
 
     public:
         TypeChecker(TypeContext &type_ctx);

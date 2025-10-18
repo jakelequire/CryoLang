@@ -620,6 +620,11 @@ namespace Cryo
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
         _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
+        
+        // Initialize diagnostic builder if we have a diagnostic manager
+        if (_diagnostic_manager) {
+            _diagnostic_builder = std::make_unique<TypeCheckerDiagnosticBuilder>(_diagnostic_manager, _source_file);
+        }
 
         // Generic types will be discovered dynamically from standard library parsing
         // No hardcoded type registrations here
@@ -2107,7 +2112,9 @@ namespace Cryo
                     }
                     else
                     {
-                        if (_diagnostic_manager) {
+                        if (_diagnostic_builder) {
+                            _diagnostic_builder->create_invalid_dereference_error(operand_type, node.location());
+                        } else if (_diagnostic_manager) {
                             SourceRange range(node.location());
                             _diagnostic_manager->report_invalid_dereference(range, _source_file, operand_type->to_string());
                         } else {
@@ -2867,7 +2874,17 @@ namespace Cryo
         }
 
         // Field or method not found in struct
-        if (_diagnostic_manager) {
+        if (_diagnostic_builder) {
+            // Get the type object for enhanced diagnostics
+            Type* type_obj = lookup_variable_type(object_type);
+            if (type_obj) {
+                _diagnostic_builder->create_invalid_member_access_error(member_name, type_obj, node.location());
+            } else {
+                // Fallback if we can't get the Type object
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                             "Unknown member '" + member_name + "' in type '" + object_type + "'");
+            }
+        } else if (_diagnostic_manager) {
             SourceRange range(node.location());
             _diagnostic_manager->report_undefined_field(range, _source_file, member_name, object_type);
         } else {
