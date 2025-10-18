@@ -9,6 +9,7 @@
 #include "Codegen/Intrinsics.hpp"
 #include "Codegen/FunctionRegistry.hpp"
 #include "Utils/ModuleLoader.hpp"
+#include "GDM/DiagnosticBuilders.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>
@@ -257,6 +258,8 @@ namespace Cryo::Codegen
 
         LLVMContextManager &_context_manager;
         Cryo::SymbolTable &_symbol_table;
+        Cryo::DiagnosticManager *_diagnostic_manager;
+        std::unique_ptr<CodegenDiagnosticBuilder> _diagnostic_builder;
 
         std::unique_ptr<ValueContext> _value_context;
         std::unique_ptr<TypeMapper> _type_mapper;
