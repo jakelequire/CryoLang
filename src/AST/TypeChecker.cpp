@@ -4438,45 +4438,28 @@ namespace Cryo
     void TypeChecker::report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context)
     {
         if (_diagnostic_manager) {
-            // Use enhanced diagnostic system with sophisticated suggestions
-            std::string expected_type = expected ? expected->to_string() : "unknown";
-            std::string actual_type = actual ? actual->to_string() : "unknown";
-            
+            // NEW: Use structured approach - no more string parsing!
             SourceRange range(loc);
-            SourceSpan primary_span(loc, loc, _source_file, true);
+            SourceSpan value_span(loc, loc, _source_file, true);
             
-            // Create enhanced diagnostic with suggestions
-            auto diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, 
-                                                               range, _source_file)
-                .with_primary_span(primary_span)
-                .add_help("Ensure the types are compatible or add an explicit cast if appropriate.");
+            // Create structured type mismatch context
+            TypeMismatchContext type_context(expected, actual, context);
             
-            // Add type-specific suggestions
-            if (context == "variable initialization") {
-                if (expected_type == "int" && actual_type == "string") {
-                    // String to int conversion suggestion
-                    diagnostic.suggest_replacement(primary_span, 
-                                                 "parseInt(" + actual_type + ")", 
-                                                 "try converting the string to an integer",
-                                                 SuggestionApplicability::MaybeIncorrect);
-                } else if (expected_type == "string" && actual_type == "int") {
-                    // Int to string conversion suggestion  
-                    diagnostic.suggest_replacement(primary_span,
-                                                 "toString(" + actual_type + ")",
-                                                 "try converting the integer to a string",
-                                                 SuggestionApplicability::MaybeIncorrect);
-                } else {
-                    // Generic type cast suggestion
-                    diagnostic.suggest_replacement(primary_span,
-                                                 "(" + expected_type + ") <value>",
-                                                 "try an explicit cast",
-                                                 SuggestionApplicability::HasPlaceholders);
-                }
-                
-                diagnostic.add_help("Consider changing the variable type if " + actual_type + " is the intended type.");
+            // Create diagnostic payload with structured data
+            auto payload = DiagnosticPayload::create_type_mismatch(type_context);
+            
+            // Create enhanced diagnostic with proper message
+            std::string message = "type mismatch in " + context;
+            auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, message)
+                .with_primary_span(value_span)
+                .with_payload(std::move(payload));
+            
+            // Add dynamic help messages generated from structured context
+            for (const auto& help_msg : type_context.generate_help_messages()) {
+                diagnostic.add_help(help_msg);
             }
             
-            _diagnostic_manager->emit(diagnostic);
+            _diagnostic_manager->emit(std::move(diagnostic));
         } else {
             // Fallback to old behavior
             std::string expected_type = expected ? expected->to_string() : "unknown";

@@ -79,7 +79,7 @@ namespace Cryo
         // Add secondary spans for context if helpful
         add_context_spans(diagnostic, expected);
         
-        _diagnostic_manager->emit(diagnostic);
+        _diagnostic_manager->emit(std::move(diagnostic));
     }
 
     ErrorCode Parser::get_token_error_code(TokenKind expected)
@@ -367,7 +367,7 @@ namespace Cryo
             // Add contextual suggestions for common parsing errors
             add_generic_parsing_suggestions(diagnostic, message);
             
-            _diagnostic_manager->emit(diagnostic);
+            _diagnostic_manager->emit(std::move(diagnostic));
         }
         else
         {
