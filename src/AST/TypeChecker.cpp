@@ -2165,7 +2165,7 @@ namespace Cryo
                         else if (_diagnostic_manager)
                         {
                             SourceRange range(node.location());
-                            _diagnostic_manager->report_invalid_dereference(range, _source_file, operand_type->to_string());
+                            _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, range, _source_file);
                         }
                         else
                         {
@@ -2376,7 +2376,7 @@ namespace Cryo
             if (_diagnostic_manager)
             {
                 SourceRange range(node.location());
-                _diagnostic_manager->report_non_callable_type(range, _source_file, callee_type ? callee_type->to_string() : "unknown");
+                _diagnostic_manager->create_error(ErrorCode::E0213_NON_CALLABLE, range, _source_file);
             }
             else
             {
@@ -4309,8 +4309,7 @@ namespace Cryo
             if (_diagnostic_manager)
             {
                 SourceRange range(loc);
-                _diagnostic_manager->report_argument_mismatch(range, _source_file,
-                                                              "function", required_params, arg_types.size());
+                _diagnostic_manager->create_error(ErrorCode::E0216_TOO_FEW_ARGS, range, _source_file);
             }
             else
             {
@@ -4327,8 +4326,7 @@ namespace Cryo
             if (_diagnostic_manager)
             {
                 SourceRange range(loc);
-                _diagnostic_manager->report_argument_mismatch(range, _source_file,
-                                                              "function", param_types.size(), arg_types.size());
+                _diagnostic_manager->create_error(ErrorCode::E0215_TOO_MANY_ARGS, range, _source_file);
             }
             else
             {
@@ -4413,7 +4411,7 @@ namespace Cryo
             }
 
             SourceRange range(loc);
-            _diagnostic_manager->report_error(error_code, message, range, _source_file);
+            _diagnostic_manager->create_error(error_code, range, _source_file);
         }
         else
         {
@@ -4539,10 +4537,10 @@ namespace Cryo
 
             // Create enhanced diagnostic with proper message
             std::string message = "type mismatch in " + context;
-            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, message);
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, value_span.to_source_range(), _source_file);
 
             // Add primary span (the problematic value)
-            diagnostic.with_primary_span(value_span);
+            // No need for with_primary_span since it's already set in create_error
 
             // For variable declarations, create a better secondary span for type annotation
             if (context == "variable initialization")
@@ -4580,7 +4578,7 @@ namespace Cryo
                 diagnostic.add_help("use address-of (&) or dereference (*) operators as appropriate");
             }
 
-            _diagnostic_manager->emit(std::move(diagnostic));
+            // Diagnostic is automatically stored by create_error, no emit() needed
         }
         else
         {

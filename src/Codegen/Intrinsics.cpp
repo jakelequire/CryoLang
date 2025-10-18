@@ -1321,6 +1321,13 @@ namespace Cryo::Codegen
     {
         _has_errors = true;
         _last_error = message;
+        
+        // Report to GDM if available
+        if (_gdm) {
+            Cryo::SourceRange dummy_range; // Default constructed range
+            _gdm->create_error(Cryo::ErrorCode::E0600_CODEGEN_FAILED, dummy_range, "<intrinsics>");
+        }
+        
         std::cerr << "[Intrinsics] Error: " << message << std::endl;
     }
 
@@ -1341,15 +1348,15 @@ namespace Cryo::Codegen
                 const auto &loc = node->location();
                 Cryo::SourceRange range(loc); // Use explicit constructor
 
-                _gdm->report_error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC,
-                                   message, range, "<source_file>");
+                _gdm->create_error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC,
+                                   range, "<source_file>");
             }
             else
             {
                 // Fallback: report without location
                 Cryo::SourceRange dummy_range; // Default constructed range
-                _gdm->report_error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC,
-                                   message, dummy_range, "<unknown>");
+                _gdm->create_error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC,
+                                   dummy_range, "<unknown>");
             }
         }
 

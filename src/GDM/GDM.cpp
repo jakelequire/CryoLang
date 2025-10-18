@@ -1,5 +1,6 @@
 #include "GDM/GDM.hpp"
 #include "GDM/DiagnosticFormatter.hpp"
+#include "GDM/ErrorAnalysis.hpp"
 #include "AST/Type.hpp"
 #include <algorithm>
 #include <iomanip>
@@ -48,26 +49,26 @@ namespace Cryo
         return lines;
     }
 
-    bool SourceSpan::overlaps_with(const SourceSpan& other) const
+    bool SourceSpan::overlaps_with(const SourceSpan &other) const
     {
         // Different files don't overlap
         if (_filename != other._filename)
             return false;
 
         // Check if spans overlap
-        return !(_end.line() < other._start.line() || 
+        return !(_end.line() < other._start.line() ||
                  _start.line() > other._end.line() ||
                  (_start.line() == other._end.line() && _start.column() > other._end.column()) ||
                  (_end.line() == other._start.line() && _end.column() < other._start.column()));
     }
 
-    SourceSpan SourceSpan::merge(const std::vector<SourceSpan>& spans)
+    SourceSpan SourceSpan::merge(const std::vector<SourceSpan> &spans)
     {
         if (spans.empty())
             return SourceSpan();
 
         SourceSpan result = spans[0];
-        for (const auto& span : spans)
+        for (const auto &span : spans)
         {
             if (span._start.line() < result._start.line() ||
                 (span._start.line() == result._start.line() && span._start.column() < result._start.column()))
@@ -83,7 +84,7 @@ namespace Cryo
         return result;
     }
 
-    SourceSpan SourceSpan::from_to(const SourceSpan& from, const SourceSpan& to)
+    SourceSpan SourceSpan::from_to(const SourceSpan &from, const SourceSpan &to)
     {
         return SourceSpan(from._start, to._end, from._filename, true);
     }
@@ -92,36 +93,36 @@ namespace Cryo
     // MultiSpan Implementation
     // ================================================================
 
-    MultiSpan::MultiSpan(const SourceSpan& primary_span)
+    MultiSpan::MultiSpan(const SourceSpan &primary_span)
     {
         _primary_spans.push_back(primary_span);
     }
 
-    MultiSpan::MultiSpan(const SourceRange& range, const std::string& filename)
+    MultiSpan::MultiSpan(const SourceRange &range, const std::string &filename)
     {
         _primary_spans.emplace_back(range, filename);
     }
 
-    void MultiSpan::add_primary_span(const SourceSpan& span)
+    void MultiSpan::add_primary_span(const SourceSpan &span)
     {
         _primary_spans.push_back(span);
     }
 
-    void MultiSpan::add_primary_span(const SourceLocation& start, const SourceLocation& end, 
-                                     const std::string& filename)
+    void MultiSpan::add_primary_span(const SourceLocation &start, const SourceLocation &end,
+                                     const std::string &filename)
     {
         _primary_spans.emplace_back(start, end, filename, true);
     }
 
-    void MultiSpan::add_secondary_span(const SourceSpan& span)
+    void MultiSpan::add_secondary_span(const SourceSpan &span)
     {
         SourceSpan secondary_span = span;
         secondary_span.set_primary(false);
         _secondary_spans.push_back(secondary_span);
     }
 
-    void MultiSpan::add_secondary_span(const SourceLocation& start, const SourceLocation& end,
-                                       const std::string& filename, const std::string& label)
+    void MultiSpan::add_secondary_span(const SourceLocation &start, const SourceLocation &end,
+                                       const std::string &filename, const std::string &label)
     {
         SourceSpan span(start, end, filename, false);
         if (!label.empty())
@@ -131,7 +132,7 @@ namespace Cryo
         _secondary_spans.push_back(span);
     }
 
-    void MultiSpan::add_span_label(const SourceSpan& span, const std::string& label)
+    void MultiSpan::add_span_label(const SourceSpan &span, const std::string &label)
     {
         SourceSpan labeled_span = span;
         labeled_span.set_label(label);
@@ -139,8 +140,8 @@ namespace Cryo
         _secondary_spans.push_back(labeled_span);
     }
 
-    void MultiSpan::add_span_label(const SourceLocation& start, const SourceLocation& end,
-                                   const std::string& label, const std::string& filename)
+    void MultiSpan::add_span_label(const SourceLocation &start, const SourceLocation &end,
+                                   const std::string &label, const std::string &filename)
     {
         SourceSpan span(start, end, filename, false);
         span.set_label(label);
@@ -163,9 +164,9 @@ namespace Cryo
     std::vector<std::string> MultiSpan::affected_files() const
     {
         std::vector<std::string> files;
-        for (const auto& span : all_spans())
+        for (const auto &span : all_spans())
         {
-            if (!span.filename().empty() && 
+            if (!span.filename().empty() &&
                 std::find(files.begin(), files.end(), span.filename()) == files.end())
             {
                 files.push_back(span.filename());
@@ -188,22 +189,26 @@ namespace Cryo
     std::vector<SourceSpan> CodeSuggestion::affected_spans() const
     {
         std::vector<SourceSpan> spans;
-        
-        if (is_simple()) {
+
+        if (is_simple())
+        {
             spans.push_back(simple().span);
-        } else if (is_multipart()) {
-            const auto& parts = multipart().parts;
-            for (const auto& part : parts) {
+        }
+        else if (is_multipart())
+        {
+            const auto &parts = multipart().parts;
+            for (const auto &part : parts)
+            {
                 spans.push_back(part.first);
             }
         }
-        
+
         return spans;
     }
 
     bool CodeSuggestion::should_show_code() const
     {
-        return _style == SuggestionStyle::ShowCode || 
+        return _style == SuggestionStyle::ShowCode ||
                _style == SuggestionStyle::ShowAlways;
     }
 
@@ -214,14 +219,20 @@ namespace Cryo
     Diagnostic::Diagnostic(ErrorCode error_code, DiagnosticSeverity severity, DiagnosticCategory category,
                            const std::string &message, const SourceRange &range,
                            const std::string &filename)
-        : _error_code(error_code), _severity(severity), _category(category), 
+        : _error_code(error_code), _severity(severity), _category(category),
           _message(message), _range(range), _filename(filename)
     {
         // Initialize enhanced error information from error code
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(_error_code);
+        const ErrorInfo &error_info = ErrorRegistry::get_error_info(_error_code);
         _suggestion = error_info.suggestion;
         _explanation = error_info.explanation;
     }
+
+    Diagnostic::~Diagnostic() = default;
+
+    Diagnostic::Diagnostic(Diagnostic &&other) noexcept = default;
+
+    Diagnostic &Diagnostic::operator=(Diagnostic &&other) noexcept = default;
 
     Diagnostic &Diagnostic::add_note(const std::string &note)
     {
@@ -236,43 +247,46 @@ namespace Cryo
     }
 
     // Enhanced suggestion system implementations
-    Diagnostic& Diagnostic::with_primary_span(const SourceSpan& span)
+    Diagnostic &Diagnostic::with_primary_span(const SourceSpan &span)
     {
         _multi_span.add_primary_span(span);
         return *this;
     }
 
-    Diagnostic& Diagnostic::add_secondary_span(const SourceSpan& span, const std::string& label)
+    Diagnostic &Diagnostic::add_secondary_span(const SourceSpan &span, const std::string &label)
     {
-        if (label.empty()) {
+        if (label.empty())
+        {
             _multi_span.add_secondary_span(span);
-        } else {
+        }
+        else
+        {
             _multi_span.add_secondary_span(span.start(), span.end(), span.filename(), label);
         }
         return *this;
     }
 
-    Diagnostic& Diagnostic::add_suggestion(const CodeSuggestion& suggestion)
+    Diagnostic &Diagnostic::add_suggestion(const CodeSuggestion &suggestion)
     {
         _code_suggestions.push_back(suggestion);
         return *this;
     }
 
-    Diagnostic& Diagnostic::add_help(const std::string& help_message)
+    Diagnostic &Diagnostic::add_help(const std::string &help_message)
     {
         _help_messages.push_back(help_message);
         return *this;
     }
 
-    Diagnostic& Diagnostic::suggest_replacement(const SourceSpan& span, const std::string& replacement,
-                                              const std::string& message, SuggestionApplicability applicability)
+    Diagnostic &Diagnostic::suggest_replacement(const SourceSpan &span, const std::string &replacement,
+                                                const std::string &message, SuggestionApplicability applicability)
     {
         _code_suggestions.emplace_back(message, span, replacement, applicability);
         return *this;
     }
 
-    Diagnostic& Diagnostic::suggest_insertion(const SourceLocation& location, const std::string& insertion,
-                                            const std::string& message)
+    Diagnostic &Diagnostic::suggest_insertion(const SourceLocation &location, const std::string &insertion,
+                                              const std::string &message)
     {
         // Create a zero-length span at the insertion point
         SourceSpan span(location, location);
@@ -385,11 +399,11 @@ namespace Cryo
     // Enhanced SourceManager Implementation
     // ================================================================
 
-    SourceManager::SourceSnippet SourceManager::extract_snippet(const SourceSpan& span, size_t context_lines) const
+    SourceManager::SourceSnippet SourceManager::extract_snippet(const SourceSpan &span, size_t context_lines) const
     {
         SourceSnippet snippet;
         snippet.filename = span.filename();
-        
+
         if (!is_valid_span(span))
         {
             return snippet;
@@ -402,7 +416,7 @@ namespace Cryo
             return snippet;
         }
 
-        const auto& file_lines = file_lines_it->second;
+        const auto &file_lines = file_lines_it->second;
         auto [start_line, end_line] = calculate_context_range(span, context_lines, file_lines.size());
 
         snippet.start_line_number = start_line;
@@ -417,10 +431,10 @@ namespace Cryo
         return snippet;
     }
 
-    SourceManager::SourceSnippet SourceManager::extract_snippet(const MultiSpan& multi_span, size_t context_lines) const
+    SourceManager::SourceSnippet SourceManager::extract_snippet(const MultiSpan &multi_span, size_t context_lines) const
     {
         SourceSnippet snippet;
-        
+
         if (multi_span.is_empty())
         {
             return snippet;
@@ -430,7 +444,7 @@ namespace Cryo
         // TODO: Extend for multi-file spans
         auto primary_span = multi_span.primary_span();
         snippet.filename = primary_span.filename();
-        
+
         if (!is_valid_span(primary_span))
         {
             return snippet;
@@ -443,12 +457,12 @@ namespace Cryo
             return snippet;
         }
 
-        const auto& file_lines = file_lines_it->second;
+        const auto &file_lines = file_lines_it->second;
         auto all_spans = multi_span.all_spans();
-        
+
         // Filter spans for this file only
         std::vector<SourceSpan> file_spans;
-        for (const auto& span : all_spans)
+        for (const auto &span : all_spans)
         {
             if (span.filename() == primary_span.filename())
             {
@@ -470,11 +484,11 @@ namespace Cryo
         return snippet;
     }
 
-    SourceManager::SourceSnippet SourceManager::extract_smart_context(const SourceSpan& span) const
+    SourceManager::SourceSnippet SourceManager::extract_smart_context(const SourceSpan &span) const
     {
         // Smart context: adjust context lines based on span characteristics
         size_t context_lines = 2;
-        
+
         if (span.spans_multiple_lines())
         {
             context_lines = 1; // Less context for multi-line spans
@@ -487,11 +501,11 @@ namespace Cryo
         return extract_snippet(span, context_lines);
     }
 
-    SourceManager::SourceSnippet SourceManager::extract_smart_context(const MultiSpan& multi_span) const
+    SourceManager::SourceSnippet SourceManager::extract_smart_context(const MultiSpan &multi_span) const
     {
         // Smart context for multi-spans
         size_t context_lines = 2;
-        
+
         auto all_spans = multi_span.all_spans();
         if (all_spans.size() > 3)
         {
@@ -502,16 +516,16 @@ namespace Cryo
     }
 
     std::vector<SourceManager::SourceSnippet> SourceManager::extract_multi_file_snippets(
-        const MultiSpan& multi_span, size_t context_lines) const
+        const MultiSpan &multi_span, size_t context_lines) const
     {
         std::vector<SourceSnippet> snippets;
         auto affected_files = multi_span.affected_files();
 
-        for (const auto& filename : affected_files)
+        for (const auto &filename : affected_files)
         {
             // Create a temporary MultiSpan with only spans from this file
             MultiSpan file_spans;
-            for (const auto& span : multi_span.all_spans())
+            for (const auto &span : multi_span.all_spans())
             {
                 if (span.filename() == filename)
                 {
@@ -535,29 +549,30 @@ namespace Cryo
         return snippets;
     }
 
-    bool SourceManager::is_valid_span(const SourceSpan& span) const
+    bool SourceManager::is_valid_span(const SourceSpan &span) const
     {
-        return !span.filename().empty() && 
+        return !span.filename().empty() &&
                is_valid_location(span.filename(), span.start()) &&
                is_valid_location(span.filename(), span.end());
     }
 
-    size_t SourceManager::get_line_count(const std::string& filename) const
+    size_t SourceManager::get_line_count(const std::string &filename) const
     {
         ensure_file_lines_cached(filename);
         auto it = _file_lines.find(filename);
         return (it != _file_lines.end()) ? it->second.size() : 0;
     }
 
-    std::string SourceManager::get_line_text(const std::string& filename, size_t line_number) const
+    std::string SourceManager::get_line_text(const std::string &filename, size_t line_number) const
     {
         return get_source_line(filename, line_number);
     }
 
     size_t SourceManager::calculate_line_number_width(size_t max_line_number) const
     {
-        if (max_line_number == 0) return 1;
-        
+        if (max_line_number == 0)
+            return 1;
+
         size_t width = 0;
         while (max_line_number > 0)
         {
@@ -567,11 +582,11 @@ namespace Cryo
         return width;
     }
 
-    std::vector<SourceSpan> SourceManager::get_spans_on_line(const std::vector<SourceSpan>& spans, 
+    std::vector<SourceSpan> SourceManager::get_spans_on_line(const std::vector<SourceSpan> &spans,
                                                              size_t line_number) const
     {
         std::vector<SourceSpan> spans_on_line;
-        for (const auto& span : spans)
+        for (const auto &span : spans)
         {
             auto affected_lines = span.affected_lines();
             if (std::find(affected_lines.begin(), affected_lines.end(), line_number) != affected_lines.end())
@@ -582,18 +597,17 @@ namespace Cryo
         return spans_on_line;
     }
 
-    std::pair<size_t, size_t> SourceManager::calculate_context_range(const SourceSpan& span, 
+    std::pair<size_t, size_t> SourceManager::calculate_context_range(const SourceSpan &span,
                                                                      size_t context_lines,
                                                                      size_t file_line_count) const
     {
-        size_t start_line = (span.start().line() > context_lines) ? 
-                           span.start().line() - context_lines : 1;
+        size_t start_line = (span.start().line() > context_lines) ? span.start().line() - context_lines : 1;
         size_t end_line = std::min(span.end().line() + context_lines, file_line_count);
-        
+
         return {start_line, end_line};
     }
 
-    std::pair<size_t, size_t> SourceManager::calculate_multi_span_range(const std::vector<SourceSpan>& spans,
+    std::pair<size_t, size_t> SourceManager::calculate_multi_span_range(const std::vector<SourceSpan> &spans,
                                                                         size_t context_lines,
                                                                         size_t file_line_count) const
     {
@@ -605,7 +619,7 @@ namespace Cryo
         size_t min_line = spans[0].start().line();
         size_t max_line = spans[0].end().line();
 
-        for (const auto& span : spans)
+        for (const auto &span : spans)
         {
             min_line = std::min(min_line, span.start().line());
             max_line = std::max(max_line, span.end().line());
@@ -621,128 +635,199 @@ namespace Cryo
     // DiagnosticManager Implementation
     // ================================================================
 
-
     // ================================================================
-    // TypeMismatchContext Implementation
+    // BasicTypeMismatchContext Implementation
     // ================================================================
 
-    std::string TypeMismatchContext::generate_inline_label() const
+    std::string BasicTypeMismatchContext::generate_inline_label() const
     {
-        if (!expected_type || !actual_type) {
+        if (!expected_type || !actual_type)
+        {
             return "type mismatch";
         }
-        
+
         std::string expected_str = expected_type->to_string();
         std::string actual_str = actual_type->to_string();
-        
+
         return "expected `" + expected_str + "`, found `" + actual_str + "`";
     }
 
-    std::vector<std::string> TypeMismatchContext::generate_help_messages() const
+    std::vector<std::string> BasicTypeMismatchContext::generate_help_messages() const
     {
         std::vector<std::string> help_messages;
-        
-        if (!expected_type || !actual_type) {
+
+        if (!expected_type || !actual_type)
+        {
             help_messages.push_back("ensure the types are compatible or add an explicit cast if appropriate");
             return help_messages;
         }
-        
+
         std::string expected_str = expected_type->to_string();
         std::string actual_str = actual_type->to_string();
-        
+
         // Context-specific suggestions based on type combination
-        if (context_description.find("assignment") != std::string::npos || 
-            context_description.find("initialization") != std::string::npos) {
-            
-            if (expected_str == "int" && actual_str == "string") {
+        if (context_description.find("assignment") != std::string::npos ||
+            context_description.find("initialization") != std::string::npos)
+        {
+
+            if (expected_str == "int" && actual_str == "string")
+            {
                 help_messages.push_back("if you want to convert string to integer, try parsing");
                 help_messages.push_back("if you meant to create a string variable, remove the type annotation");
                 help_messages.push_back("string literals cannot be implicitly converted to integers");
-            } else if (expected_str == "string" && actual_str == "int") {
+            }
+            else if (expected_str == "string" && actual_str == "int")
+            {
                 help_messages.push_back("if you want to convert integer to string, use toString()");
                 help_messages.push_back("if you meant to create an integer variable, change the type annotation");
-            } else if (expected_str == "boolean" && actual_str == "int") {
+            }
+            else if (expected_str == "boolean" && actual_str == "int")
+            {
                 help_messages.push_back("boolean and integer types are not compatible");
                 help_messages.push_back("use explicit comparison like `value != 0` to convert to boolean");
-            } else if (expected_str == "float" && actual_str == "int") {
+            }
+            else if (expected_str == "float" && actual_str == "int")
+            {
                 help_messages.push_back("consider using explicit cast or change variable type to int");
-            } else if (expected_str.find("*") != std::string::npos || actual_str.find("*") != std::string::npos) {
+            }
+            else if (expected_str.find("*") != std::string::npos || actual_str.find("*") != std::string::npos)
+            {
                 help_messages.push_back("pointer and value types are not directly compatible");
                 help_messages.push_back("use address-of (&) or dereference (*) operators as appropriate");
-            } else {
+            }
+            else
+            {
                 help_messages.push_back("ensure the types are compatible or add an explicit cast if appropriate");
             }
-        } else if (context_description.find("arithmetic") != std::string::npos) {
+        }
+        else if (context_description.find("arithmetic") != std::string::npos)
+        {
             help_messages.push_back("arithmetic operations require compatible types");
             help_messages.push_back("consider converting one operand to match the other's type");
-        } else if (context_description.find("function") != std::string::npos) {
+        }
+        else if (context_description.find("function") != std::string::npos)
+        {
             help_messages.push_back("function argument type must match parameter type");
             help_messages.push_back("check the function signature or convert the argument");
-        } else {
+        }
+        else
+        {
             help_messages.push_back("ensure the types are compatible or add an explicit cast if appropriate");
         }
-        
+
         return help_messages;
     }
 
-    bool TypeMismatchContext::can_suggest_parsing() const
+    bool BasicTypeMismatchContext::can_suggest_parsing() const
     {
-        if (!expected_type || !actual_type) return false;
+        if (!expected_type || !actual_type)
+            return false;
         return (expected_type->to_string() == "int" && actual_type->to_string() == "string");
     }
 
-    bool TypeMismatchContext::can_suggest_cast() const
+    bool BasicTypeMismatchContext::can_suggest_cast() const
     {
-        if (!expected_type || !actual_type) return false;
+        if (!expected_type || !actual_type)
+            return false;
         // Most type mismatches can potentially be resolved with casts
         return true;
     }
 
-    bool TypeMismatchContext::are_related_types() const
+    bool BasicTypeMismatchContext::are_related_types() const
     {
-        if (!expected_type || !actual_type) return false;
-        
+        if (!expected_type || !actual_type)
+            return false;
+
         std::string expected_str = expected_type->to_string();
         std::string actual_str = actual_type->to_string();
-        
+
         // Check for related numeric types
         std::vector<std::string> numeric_types = {"int", "i32", "i64", "u32", "u64", "float", "f32", "f64", "double"};
         bool expected_numeric = std::find(numeric_types.begin(), numeric_types.end(), expected_str) != numeric_types.end();
         bool actual_numeric = std::find(numeric_types.begin(), numeric_types.end(), actual_str) != numeric_types.end();
-        
+
         return expected_numeric && actual_numeric;
     }
 
-    // ================================================================
-    // DiagnosticPayload Implementation
-    // ================================================================
-
-    DiagnosticPayload DiagnosticPayload::create_type_mismatch(const TypeMismatchContext& context)
+    std::string BasicTypeMismatchContext::generate_primary_message() const
     {
-        DiagnosticPayload payload;
-        payload._kind = PayloadKind::TypeMismatch;
-        
-        // Create a copy of the context on the heap
-        TypeMismatchContext* heap_context = new TypeMismatchContext(context);
-        payload._data = std::unique_ptr<void, void(*)(void*)>(
-            heap_context, 
-            [](void* ptr) { delete static_cast<TypeMismatchContext*>(ptr); }
-        );
-        
-        return payload;
+        if (!expected_type || !actual_type)
+        {
+            return "type mismatch in " + context_description;
+        }
+
+        return "type mismatch in " + context_description + ": expected `" +
+               expected_type->to_string() + "`, found `" + actual_type->to_string() + "`";
     }
 
-    const TypeMismatchContext* DiagnosticPayload::get_type_mismatch() const
+    std::vector<std::string> BasicTypeMismatchContext::generate_suggestions() const
     {
-        if (_kind != PayloadKind::TypeMismatch) return nullptr;
-        return static_cast<const TypeMismatchContext*>(_data.get());
+        std::vector<std::string> suggestions;
+
+        if (!expected_type || !actual_type)
+        {
+            return suggestions;
+        }
+
+        std::string expected_name = expected_type->to_string();
+        std::string actual_name = actual_type->to_string();
+
+        // Basic conversion suggestions
+        if (expected_name == "int" && actual_name == "string")
+        {
+            suggestions.push_back("try parsing with `int.parse(value)`");
+            suggestions.push_back("if you meant to create a string variable, remove the type annotation");
+        }
+        else if (expected_name == "string" && actual_name == "int")
+        {
+            suggestions.push_back("try `value.to_string()` to convert the integer");
+            suggestions.push_back("use string interpolation: `\"${value}\"`");
+        }
+        else if (expected_name == "boolean" && (actual_name == "int" || actual_name == "float"))
+        {
+            suggestions.push_back("use comparison operators like `value != 0` or `value > 0`");
+        }
+        else if (expected_name.find("*") != std::string::npos && actual_name.find("*") == std::string::npos)
+        {
+            suggestions.push_back("use address-of operator `&` to get a pointer");
+        }
+        else if (expected_name.find("*") == std::string::npos && actual_name.find("*") != std::string::npos)
+        {
+            suggestions.push_back("use dereference operator `*` to get the value");
+        }
+
+        return suggestions;
+    }
+
+    std::vector<CodeSuggestion> BasicTypeMismatchContext::generate_code_suggestions(const SourceSpan &span) const
+    {
+        std::vector<CodeSuggestion> suggestions;
+
+        if (!expected_type || !actual_type)
+        {
+            return suggestions;
+        }
+
+        std::string expected_name = expected_type->to_string();
+        std::string actual_name = actual_type->to_string();
+
+        if (expected_name == "int" && actual_name == "string")
+        {
+            suggestions.emplace_back(
+                "parse the string to integer",
+                span,
+                "int.parse(/* value */)",
+                SuggestionApplicability::MaybeIncorrect);
+        }
+
+        return suggestions;
     }
 
     // ================================================================
     // Diagnostic Implementation Extensions
     // ================================================================
 
-    Diagnostic& Diagnostic::with_payload(DiagnosticPayload&& payload)
+    Diagnostic &Diagnostic::with_payload(std::unique_ptr<DiagnosticPayload> payload)
     {
         _payload = std::move(payload);
         return *this;
@@ -783,107 +868,97 @@ namespace Cryo
         }
     }
 
-
-
     // ================================================================
-    // Enhanced diagnostic reporting with error codes
+    // UNIFIED ERROR REPORTING IMPLEMENTATION
     // ================================================================
 
-    void DiagnosticManager::report(ErrorCode error_code, const std::string &message, const SourceRange &range,
-                                   const std::string &filename)
+    /**
+     * @brief Determine category from ErrorCode automatically
+     */
+    DiagnosticCategory DiagnosticManager::determine_category_from_error_code(ErrorCode error_code) const
     {
-        // Determine severity and category from error code
-        ErrorRegistry::initialize();
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
-        
-        DiagnosticSeverity severity = error_info.is_warning ? DiagnosticSeverity::Warning : DiagnosticSeverity::Error;
-        
-        // Determine category based on error code range
-        DiagnosticCategory category = DiagnosticCategory::System;
         uint32_t code_num = static_cast<uint32_t>(error_code);
-        
-        if (code_num < 100) category = DiagnosticCategory::Lexer;
-        else if (code_num < 200) category = DiagnosticCategory::Parser;
-        else if (code_num < 600) category = DiagnosticCategory::Semantic;
-        else if (code_num < 700) category = DiagnosticCategory::CodeGen;
-        else category = DiagnosticCategory::System;
-        
-        report(error_code, severity, category, message, range, filename);
+
+        if (code_num < 100)
+            return DiagnosticCategory::Lexer;
+        else if (code_num < 200)
+            return DiagnosticCategory::Parser;
+        else if (code_num < 600)
+            return DiagnosticCategory::Semantic;
+        else if (code_num < 700)
+            return DiagnosticCategory::CodeGen;
+        else
+            return DiagnosticCategory::System;
     }
-    
-    void DiagnosticManager::report(ErrorCode error_code, DiagnosticSeverity severity, DiagnosticCategory category,
-                                   const std::string &message, const SourceRange &range,
-                                   const std::string &filename)
+
+    /**
+     * @brief Determine severity from ErrorCode automatically
+     */
+    DiagnosticSeverity DiagnosticManager::determine_severity_from_error_code(ErrorCode error_code) const
     {
         ErrorRegistry::initialize();
-        
-        // Create enhanced diagnostic with error code
-        Diagnostic diagnostic(error_code, severity, category, message, range, filename);
-        
-        // Auto-add helpful suggestions and explanations based on error code
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
-        if (!error_info.explanation.empty()) {
+        const ErrorInfo &error_info = ErrorRegistry::get_error_info(error_code);
+        return error_info.is_warning ? DiagnosticSeverity::Warning : DiagnosticSeverity::Error;
+    }
+
+    Diagnostic &DiagnosticManager::create_diagnostic(ErrorCode error_code,
+                                                     const SourceRange &range,
+                                                     const std::string &filename,
+                                                     const std::string &message,
+                                                     const std::any &context)
+    {
+        ErrorRegistry::initialize();
+        const ErrorInfo &error_info = ErrorRegistry::get_error_info(error_code);
+
+        // Determine category and severity automatically from ErrorCode
+        DiagnosticCategory category = determine_category_from_error_code(error_code);
+        DiagnosticSeverity severity = determine_severity_from_error_code(error_code);
+
+        // Use custom message or default from ErrorInfo
+        std::string final_message = message.empty() ? error_info.short_description : message;
+
+        // Create diagnostic
+        Diagnostic diagnostic(error_code, severity, category, final_message, range, filename);
+
+        // Auto-add explanations and suggestions from ErrorInfo
+        if (!error_info.explanation.empty())
+        {
             diagnostic.add_note(error_info.explanation);
         }
-        if (!error_info.suggestion.empty()) {
+        if (!error_info.suggestion.empty())
+        {
             diagnostic.add_note("Help: " + error_info.suggestion);
         }
-        
-        report(std::move(diagnostic));
-    }
 
-    void DiagnosticManager::report_error(ErrorCode error_code, const std::string &message,
-                                         const SourceRange &range, const std::string &filename)
-    {
-        ErrorRegistry::initialize();
-        
-        // Determine category based on error code
-        DiagnosticCategory category = DiagnosticCategory::System;
-        uint32_t code_num = static_cast<uint32_t>(error_code);
-        
-        if (code_num < 100) category = DiagnosticCategory::Lexer;
-        else if (code_num < 200) category = DiagnosticCategory::Parser;
-        else if (code_num < 600) category = DiagnosticCategory::Semantic;
-        else if (code_num < 700) category = DiagnosticCategory::CodeGen;
-        
-        report(error_code, DiagnosticSeverity::Error, category, message, range, filename);
-    }
-
-    void DiagnosticManager::report_warning(ErrorCode error_code, const std::string &message,
-                                           const SourceRange &range, const std::string &filename)
-    {
-        ErrorRegistry::initialize();
-        
-        // Determine category based on error code
-        DiagnosticCategory category = DiagnosticCategory::System;
-        uint32_t code_num = static_cast<uint32_t>(error_code);
-        
-        if (code_num >= 10000) { // Warning code
-            code_num -= 10000;
-            if (code_num < 100) category = DiagnosticCategory::Lexer;
-            else if (code_num < 200) category = DiagnosticCategory::Parser;
-            else if (code_num < 600) category = DiagnosticCategory::Semantic;
-            else if (code_num < 700) category = DiagnosticCategory::CodeGen;
+        // Create appropriate payload based on ErrorCode
+        if (DiagnosticPayload::is_type_mismatch_error(error_code) ||
+            DiagnosticPayload::is_undefined_symbol_error(error_code) ||
+            DiagnosticPayload::is_invalid_operation_error(error_code) ||
+            DiagnosticPayload::is_argument_mismatch_error(error_code))
+        {
+            auto payload = DiagnosticPayload::create_from_error_code(error_code, context);
+            diagnostic.with_payload(std::make_unique<DiagnosticPayload>(std::move(payload)));
         }
-        
-        report(error_code, DiagnosticSeverity::Warning, category, message, range, filename);
+
+        _diagnostics.push_back(std::move(diagnostic));
+        update_statistics(severity);
+
+        return _diagnostics.back();
     }
 
-    void DiagnosticManager::report_note(ErrorCode error_code, const std::string &message,
-                                        const SourceRange &range, const std::string &filename)
+    Diagnostic &DiagnosticManager::create_error(ErrorCode error_code,
+                                                const SourceRange &range,
+                                                const std::string &filename)
     {
-        ErrorRegistry::initialize();
-        
-        // Determine category based on error code
-        DiagnosticCategory category = DiagnosticCategory::System;
-        uint32_t code_num = static_cast<uint32_t>(error_code);
-        
-        if (code_num < 100) category = DiagnosticCategory::Lexer;
-        else if (code_num < 200) category = DiagnosticCategory::Parser;
-        else if (code_num < 600) category = DiagnosticCategory::Semantic;
-        else if (code_num < 700) category = DiagnosticCategory::CodeGen;
-        
-        report(error_code, DiagnosticSeverity::Note, category, message, range, filename);
+        return create_diagnostic(error_code, range, filename);
+    }
+
+    Diagnostic &DiagnosticManager::create_error(ErrorCode error_code,
+                                                const SourceRange &range,
+                                                const std::string &filename,
+                                                const std::string &custom_message)
+    {
+        return create_diagnostic(error_code, range, filename, custom_message);
     }
 
     void DiagnosticManager::print_all(std::ostream &os) const
@@ -946,74 +1021,6 @@ namespace Cryo
         return _error_count < _max_errors;
     }
 
-    void DiagnosticManager::report_type_mismatch(const SourceRange &range, const std::string &filename,
-                                                 const std::string &expected_type, const std::string &actual_type,
-                                                 const std::string &context)
-    {
-        std::string message = "Type mismatch";
-        if (!context.empty())
-        {
-            message += " in " + context;
-        }
-        message += ": expected '{}', but got '{}'";
-
-        report_error(ErrorCode::E0200_TYPE_MISMATCH,
-                     message + ": expected '" + expected_type + "', but got '" + actual_type + "'",
-                     range, filename);
-    }
-
-    void DiagnosticManager::report_undefined_symbol(const SourceRange &range, const std::string &filename,
-                                                    const std::string &symbol_name, const std::string &context)
-    {
-        std::string message = "Undefined symbol '" + symbol_name + "'";
-        if (!context.empty())
-        {
-            message += " in " + context;
-        }
-
-        report_error(ErrorCode::E0201_UNDEFINED_VARIABLE, message, range, filename);
-    }
-
-    void DiagnosticManager::report_redefined_symbol(const SourceRange &range, const std::string &filename,
-                                                    const std::string &symbol_name, const SourceRange &previous_location)
-    {
-        auto diagnostic = Diagnostic(ErrorCode::E0205_REDEFINED_SYMBOL, DiagnosticSeverity::Error,
-                                     DiagnosticCategory::Semantic,
-                                     "Redefinition of symbol '" + symbol_name + "'", range, filename);
-
-        diagnostic.add_note("Previous definition was here at line " +
-                            std::to_string(previous_location.start.line()) +
-                            ", column " + std::to_string(previous_location.start.column()));
-
-        report(std::move(diagnostic));
-    }
-
-    void DiagnosticManager::report_invalid_operation(const SourceRange &range, const std::string &filename,
-                                                     const std::string &operation, const std::string &type,
-                                                     const std::string &context)
-    {
-        std::string message = "Invalid operation '" + operation + "' for type '" + type + "'";
-        if (!context.empty())
-        {
-            message += " in " + context;
-        }
-
-        report_error(ErrorCode::E0209_INVALID_OPERATION, message, range, filename);
-    }
-
-    void DiagnosticManager::report_argument_mismatch(const SourceRange &range, const std::string &filename,
-                                                     const std::string &function_name, size_t expected_count,
-                                                     size_t actual_count)
-    {
-        ErrorCode error_code = (actual_count > expected_count) ? ErrorCode::E0215_TOO_MANY_ARGS : ErrorCode::E0216_TOO_FEW_ARGS;
-
-        std::string message = "Function '" + function_name + "' expects " + std::to_string(expected_count) + 
-                              " argument" + (expected_count == 1 ? "" : "s") + ", but " + std::to_string(actual_count) + 
-                              " " + (actual_count == 1 ? "was" : "were") + " provided";
-
-        report_error(error_code, message, range, filename);
-    }
-
     void DiagnosticManager::update_statistics(DiagnosticSeverity severity)
     {
         switch (severity)
@@ -1044,182 +1051,6 @@ namespace Cryo
         }
 
         return original_severity;
-    }
-
-    // ================================================================
-    // Enhanced specific error reporting methods
-    // ================================================================
-
-    void DiagnosticManager::report_invalid_dereference(const SourceRange &range, const std::string &filename,
-                                                       const std::string &type_name)
-    {
-        std::string message = "Cannot dereference value of type '" + type_name + "'";
-        report_error(ErrorCode::E0222_INVALID_DEREF, message, range, filename);
-    }
-
-    void DiagnosticManager::report_invalid_address_of(const SourceRange &range, const std::string &filename,
-                                                      const std::string &expression)
-    {
-        std::string message = "Cannot take address of " + expression;
-        report_error(ErrorCode::E0223_INVALID_ADDRESS_OF, message, range, filename);
-    }
-
-    void DiagnosticManager::report_undefined_field(const SourceRange &range, const std::string &filename,
-                                                   const std::string &field_name, const std::string &type_name)
-    {
-        std::string message = "No field '" + field_name + "' on type '" + type_name + "'";
-        report_error(ErrorCode::E0204_UNDEFINED_FIELD, message, range, filename);
-    }
-
-    void DiagnosticManager::report_non_callable_type(const SourceRange &range, const std::string &filename,
-                                                     const std::string &type_name)
-    {
-        std::string message = "Cannot call value of type '" + type_name + "'";
-        report_error(ErrorCode::E0213_NON_CALLABLE, message, range, filename);
-    }
-
-    // Enhanced diagnostic builder methods
-    Diagnostic& DiagnosticManager::create_error(ErrorCode error_code, const SourceRange& range, const std::string& filename)
-    {
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
-        
-        Diagnostic diagnostic(error_code, DiagnosticSeverity::Error, DiagnosticCategory::Semantic,
-                             error_info.short_description, range, filename);
-        
-        _diagnostics.push_back(std::move(diagnostic));
-        update_statistics(DiagnosticSeverity::Error);
-        
-        return _diagnostics.back();
-    }
-
-    Diagnostic& DiagnosticManager::create_warning(ErrorCode error_code, const SourceRange& range, const std::string& filename)
-    {
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
-        
-        Diagnostic diagnostic(error_code, DiagnosticSeverity::Warning, DiagnosticCategory::Semantic,
-                             error_info.short_description, range, filename);
-        
-        _diagnostics.push_back(std::move(diagnostic));
-        update_statistics(DiagnosticSeverity::Warning);
-        
-        return _diagnostics.back();
-    }
-
-    Diagnostic& DiagnosticManager::create_note(ErrorCode error_code, const SourceRange& range, const std::string& filename)
-    {
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
-        
-        Diagnostic diagnostic(error_code, DiagnosticSeverity::Note, DiagnosticCategory::Semantic,
-                             error_info.short_description, range, filename);
-        
-        _diagnostics.push_back(std::move(diagnostic));
-        update_statistics(DiagnosticSeverity::Note);
-        
-        return _diagnostics.back();
-    }
-
-    void DiagnosticManager::emit(Diagnostic diagnostic)
-    {
-        // This method is for when diagnostics are built externally and need to be added
-        _diagnostics.emplace_back(std::move(diagnostic));
-        update_statistics(_diagnostics.back().severity());
-
-        // Print immediately in debug mode or for fatal errors
-        if (_diagnostics.back().is_fatal()) {
-            print_all();
-        }
-    }
-
-    // Enhanced diagnostic builders for message-first approach
-    Diagnostic& DiagnosticManager::create_error(ErrorCode error_code, const std::string& message)
-    {
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
-        
-        Diagnostic diagnostic(error_code, DiagnosticSeverity::Error, DiagnosticCategory::Semantic,
-                             message.empty() ? error_info.short_description : message, 
-                             SourceRange(), "");
-        
-        _diagnostics.push_back(std::move(diagnostic));
-        update_statistics(DiagnosticSeverity::Error);
-        
-        return _diagnostics.back();
-    }
-
-    Diagnostic& DiagnosticManager::create_warning(ErrorCode error_code, const std::string& message)
-    {
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
-        
-        Diagnostic diagnostic(error_code, DiagnosticSeverity::Warning, DiagnosticCategory::Semantic,
-                             message.empty() ? error_info.short_description : message, 
-                             SourceRange(), "");
-        
-        _diagnostics.push_back(std::move(diagnostic));
-        update_statistics(DiagnosticSeverity::Warning);
-        
-        return _diagnostics.back();
-    }
-
-    Diagnostic& DiagnosticManager::create_note(ErrorCode error_code, const std::string& message)
-    {
-        const ErrorInfo& error_info = ErrorRegistry::get_error_info(error_code);
-        
-        Diagnostic diagnostic(error_code, DiagnosticSeverity::Note, DiagnosticCategory::Semantic,
-                             message.empty() ? error_info.short_description : message, 
-                             SourceRange(), "");
-        
-        _diagnostics.push_back(std::move(diagnostic));
-        update_statistics(DiagnosticSeverity::Note);
-        
-        return _diagnostics.back();
-    }
-
-    // Enhanced type mismatch with sophisticated error reporting
-    void DiagnosticManager::report_enhanced_type_mismatch(const SourceSpan& value_span,
-                                                          const SourceSpan& type_annotation_span,
-                                                          const std::string& expected_type,
-                                                          const std::string& actual_type,
-                                                          const std::string& filename)
-    {
-        // Create sophisticated type mismatch diagnostic
-        auto& diagnostic = create_error(ErrorCode::E0200_TYPE_MISMATCH, 
-                                       "type mismatch in assignment");
-        
-        // Create primary span with label
-        SourceSpan primary_value_span = value_span;
-        primary_value_span.set_label("expected `" + expected_type + "`, found `" + actual_type + "`");
-        diagnostic.with_primary_span(primary_value_span);
-        
-        // Add secondary span for type annotation if different from value location
-        if (!type_annotation_span.is_single_location() && 
-            !value_span.overlaps_with(type_annotation_span)) {
-            diagnostic.add_secondary_span(type_annotation_span, "expected due to this type annotation");
-        }
-        
-        // Add contextual suggestions based on the types
-        if (expected_type == "string" && actual_type == "int") {
-            diagnostic.suggest_replacement(
-                type_annotation_span,
-                "const x = \"hello\";", // Remove type annotation
-                "if you meant to create a string variable, remove the type annotation"
-            );
-        } else if (expected_type == "int" && actual_type == "string") {
-            // Suggest string parsing
-            diagnostic.suggest_replacement(
-                value_span,
-                "\"hello\".parse_int()",
-                "if you want to convert string to integer, try parsing"
-            );
-            diagnostic.suggest_replacement(
-                type_annotation_span,
-                "const x = \"hello\";",
-                "if you meant to create a string variable, remove the type annotation"
-            );
-        }
-        
-        // Add helpful note
-        diagnostic.add_help("string literals cannot be implicitly converted to integers");
-        
-        // Note: diagnostic is already added to the list by create_error, no need to emit again
     }
 
     // ================================================================

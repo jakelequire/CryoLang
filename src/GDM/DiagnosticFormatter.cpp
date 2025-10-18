@@ -1,4 +1,5 @@
 #include "GDM/DiagnosticFormatter.hpp"
+#include "GDM/ErrorAnalysis.hpp"
 #include "Utils/Logger.hpp"
 #include <sstream>
 #include <fstream>
@@ -638,8 +639,8 @@ namespace Cryo
     std::string DiagnosticFormatter::generate_structured_inline_label(const Diagnostic& diagnostic) const
     {
         // Check if we have structured payload data
-        if (diagnostic.payload().has_type_mismatch()) {
-            const auto* type_context = diagnostic.payload().get_type_mismatch();
+        if (diagnostic.has_payload() && diagnostic.payload()->has_type_mismatch()) {
+            const auto* type_context = diagnostic.payload()->get_type_mismatch();
             if (type_context) {
                 return type_context->generate_inline_label();
             }

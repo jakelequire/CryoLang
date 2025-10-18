@@ -150,7 +150,7 @@ namespace Cryo
             }
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0601_LLVM_ERROR, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0601_LLVM_ERROR, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         // Provide more helpful notes instead of generic LLVM references
@@ -181,7 +181,7 @@ namespace Cryo
             message += ": " + reason;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0602_INVALID_LLVM_TYPE, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0602_INVALID_LLVM_TYPE, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("Type mapping converts Cryo types to LLVM representations");
@@ -202,7 +202,7 @@ namespace Cryo
             message += " in " + context;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0603_INVALID_LLVM_VALUE, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0603_INVALID_LLVM_VALUE, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("Value generation creates LLVM instructions for expressions");
@@ -232,8 +232,7 @@ namespace Cryo
             error_code = ErrorCode::E0402_INVALID_RETURN;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(error_code, message);
-        diagnostic.with_primary_span(span);
+        auto& diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
         
         if (statement_type == "break" || statement_type == "continue") {
             diagnostic.add_help("use " + statement_type + " only inside loops or switch statements");
@@ -253,7 +252,7 @@ namespace Cryo
         
         std::string message = "undefined " + symbol_type + " '" + symbol_name + "'";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0701_UNDEFINED_SYMBOL_LINK, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0701_UNDEFINED_SYMBOL_LINK, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("Symbol not found during code generation phase");
@@ -270,7 +269,7 @@ namespace Cryo
         
         std::string message = "failed to allocate " + allocation_type;
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0600_CODEGEN_FAILED, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0600_CODEGEN_FAILED, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("Memory allocation failed during code generation");
@@ -291,7 +290,7 @@ namespace Cryo
             message += ": " + issue;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0600_CODEGEN_FAILED, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0600_CODEGEN_FAILED, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("Function signature must be consistent between declaration and definition");
@@ -312,7 +311,7 @@ namespace Cryo
             message += ": " + details;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0224_INVALID_INDEX, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0224_INVALID_INDEX, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("Array operations require valid indices and compatible types");
@@ -339,7 +338,7 @@ namespace Cryo
         
         std::string message = "No field '" + field_name + "' on type '" + type_name + "'";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("This field does not exist in the struct or class.");
@@ -356,7 +355,7 @@ namespace Cryo
         
         std::string message = "Cannot dereference value of type '" + type_name + "'";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("Cannot dereference a non-pointer type.");
@@ -383,7 +382,7 @@ namespace Cryo
             message += ": " + context;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0223_INVALID_ADDRESS_OF, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0223_INVALID_ADDRESS_OF, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("The address-of operator requires an lvalue (variable or field).");
@@ -420,7 +419,7 @@ namespace Cryo
             message += " in " + context;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0101_UNEXPECTED_TOKEN, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0101_UNEXPECTED_TOKEN, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         add_common_help(diagnostic, ErrorCode::E0101_UNEXPECTED_TOKEN);
@@ -470,8 +469,7 @@ namespace Cryo
             message += " in " + context;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(error_code, message);
-        diagnostic.with_primary_span(span);
+        auto& diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
         
         add_common_help(diagnostic, error_code);
         
@@ -495,8 +493,7 @@ namespace Cryo
             default: error_code = ErrorCode::E0110_MISMATCHED_DELIMITERS; break;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(error_code, message);
-        diagnostic.with_primary_span(span);
+        auto& diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
         
         // Add secondary span for opening delimiter if available
         if (opening_location.line() > 0 && opening_location.column() > 0) {
@@ -521,7 +518,7 @@ namespace Cryo
             message += " in " + context;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0102_EXPECTED_EXPRESSION, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0102_EXPECTED_EXPRESSION, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_help("provide a valid expression (variable, literal, function call, etc.)");
@@ -547,7 +544,7 @@ namespace Cryo
         }
         message += "'";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_help("remove the invalid character or check for encoding issues");
@@ -561,8 +558,7 @@ namespace Cryo
         span.set_label("unterminated string literal");
         
         auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0002_UNTERMINATED_STRING,
-                                                           "unterminated string literal");
-        diagnostic.with_primary_span(span);
+                                                           span.to_source_range(), _source_file);
         
         diagnostic.add_help("add a closing quote (\") to terminate the string");
         
@@ -579,7 +575,7 @@ namespace Cryo
         message += escape_char;
         message += "'";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0005_INVALID_ESCAPE, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0005_INVALID_ESCAPE, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_help("use valid escape sequences like \\n, \\t, \\r, \\\\, or \\\"");
@@ -606,7 +602,7 @@ namespace Cryo
         std::string message = "type mismatch in assignment: expected `" + expected_name + 
                              "`, found `" + actual_name + "`";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         // Add type-specific suggestions using ErrorAnalysis
@@ -636,7 +632,7 @@ namespace Cryo
         
         std::string message = "cannot apply " + operation + " to `" + left_name + "` and `" + right_name + "`";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0209_INVALID_OPERATION, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0209_INVALID_OPERATION, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_help("ensure both operands have compatible types");
@@ -665,8 +661,7 @@ namespace Cryo
                              (expected_args != 1 ? "s" : "") + ", found " + 
                              std::to_string(actual_args);
         
-        auto& diagnostic = _diagnostic_manager->create_error(error_code, message);
-        diagnostic.with_primary_span(span);
+        auto& diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
         
         if (actual_args > expected_args) {
             diagnostic.add_help("remove extra arguments from the function call");
@@ -694,8 +689,7 @@ namespace Cryo
             error_code = ErrorCode::E0203_UNDEFINED_TYPE;
         }
         
-        auto& diagnostic = _diagnostic_manager->create_error(error_code, message);
-        diagnostic.with_primary_span(span);
+        auto& diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
         
         // Add suggestions if available
         for (const auto& suggestion : suggestions) {
@@ -717,7 +711,7 @@ namespace Cryo
         
         std::string message = "Cannot dereference value of type '" + type_name + "'";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("Cannot dereference a non-pointer type.");
@@ -737,7 +731,7 @@ namespace Cryo
         
         std::string message = "No field '" + member_name + "' on type '" + type_name + "'";
         
-        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, message);
+        auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
         
         diagnostic.add_note("This field does not exist in the struct or class.");

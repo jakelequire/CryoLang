@@ -24,9 +24,9 @@ namespace Cryo
             (other._kind == TypeKind::Generic || other._kind == TypeKind::Parameterized) &&
             _name == other._name)
         {
-            std::cerr << "[DEBUG] Allowing generic type equality: " << _name
-                      << " (" << TypeKindToString(_kind) << ") == " << other._name
-                      << " (" << TypeKindToString(other._kind) << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Allowing generic type equality: {} ({} ) == {} ({})",
+                      _name, TypeKindToString(_kind),
+                      other._name, TypeKindToString(other._kind));
             return true;
         }
 
@@ -36,18 +36,17 @@ namespace Cryo
              (_kind == TypeKind::Struct && other._kind == TypeKind::Generic)) &&
             _name == other._name)
         {
-            std::cerr << "[DEBUG] Allowing generic-struct type equality: " << _name
-                      << " (" << TypeKindToString(_kind) << ") == " << other._name
-                      << " (" << TypeKindToString(other._kind) << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Allowing generic-struct type equality for type: ({} == {})",
+                      TypeKindToString(_kind), TypeKindToString(other._kind));
             return true;
         }
 
         // Debug logging for failed type equality involving T
         if (_name == "T" || other._name == "T")
         {
-            std::cerr << "[DEBUG] Type::equals failed for generic types: " << _name
-                      << " (" << TypeKindToString(_kind) << ") vs " << other._name
-                      << " (" << TypeKindToString(other._kind) << ")" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Type equality check failed between types: {} ({}) and {} ({})",
+                      _name, TypeKindToString(_kind),
+                      other._name, TypeKindToString(other._kind));
         }
 
         return false;
