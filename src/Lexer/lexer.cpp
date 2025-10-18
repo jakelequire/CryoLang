@@ -1134,7 +1134,7 @@ namespace Cryo
         
         // Use basic error reporting for now to avoid circular dependencies
         SourceRange range(location, location);
-        _diagnostic_manager->report_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, message, range, _source_file);
+        _diagnostic_manager->create_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, range, _source_file);
     }
 
 } // namespace Cryo

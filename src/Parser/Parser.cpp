@@ -25,7 +25,7 @@ namespace Cryo
     {
         if (_diagnostic_manager)
         {
-            _diagnostic_manager->report_error(error_code, message, range, _source_file);
+            _diagnostic_manager->create_error(error_code, range, _source_file);
         }
         else
         {
@@ -38,7 +38,7 @@ namespace Cryo
     {
         if (_diagnostic_manager)
         {
-            _diagnostic_manager->report_warning(error_code, message, range, _source_file);
+            _diagnostic_manager->create_error(error_code, range, _source_file); // Note: warnings are handled by ErrorCode automatically
         }
         else
         {
@@ -79,7 +79,7 @@ namespace Cryo
         // Add secondary spans for context if helpful
         add_context_spans(diagnostic, expected);
         
-        _diagnostic_manager->emit(std::move(diagnostic));
+        // Note: Diagnostic is automatically stored by create_error
     }
 
     ErrorCode Parser::get_token_error_code(TokenKind expected)
@@ -367,7 +367,7 @@ namespace Cryo
             // Add contextual suggestions for common parsing errors
             add_generic_parsing_suggestions(diagnostic, message);
             
-            _diagnostic_manager->emit(std::move(diagnostic));
+            // Note: Diagnostic is automatically stored by create_error
         }
         else
         {

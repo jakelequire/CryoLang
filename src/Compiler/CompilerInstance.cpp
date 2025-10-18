@@ -88,16 +88,14 @@ namespace Cryo
         auto file = make_file_from_path(source_file);
         if (!file)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0800_FILE_NOT_FOUND,
-                                              "Failed to create file object for: " + source_file,
+            _diagnostic_manager->create_error(ErrorCode::E0800_FILE_NOT_FOUND,
                                               SourceRange{}, source_file);
             return false;
         }
 
         if (!file->load())
         {
-            _diagnostic_manager->report_error(ErrorCode::E0801_FILE_READ_ERROR,
-                                              "Failed to load source file: " + source_file,
+            _diagnostic_manager->create_error(ErrorCode::E0801_FILE_READ_ERROR,
                                               SourceRange{}, source_file);
             return false;
         }
@@ -111,9 +109,7 @@ namespace Cryo
         auto file = make_file_from_string("source", source_code);
         if (!file)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              "Failed to create in-memory file",
-                                              SourceRange{}, "source");
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, "source");
             return false;
         }
 
@@ -144,16 +140,14 @@ namespace Cryo
             // Phase 3: Parse the program
             if (!parse())
             {
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "Parsing failed", SourceRange{}, file_path);
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
                 return false;
             }
 
             // Phase 4: Basic validation
             if (!_ast_root)
             {
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "No AST generated", SourceRange{}, file_path);
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
                 return false;
             }
 
@@ -161,8 +155,8 @@ namespace Cryo
             if (!analyze())
             {
                 std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "Analysis failed in namespace '" + namespace_name + "'", SourceRange{}, file_path);
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
+                                                  SourceRange{}, file_path);
                 return false;
             }
 
@@ -181,8 +175,7 @@ namespace Cryo
 
             if (!generate_ir())
             {
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "IR generation failed", SourceRange{}, file_path);
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
                 return false;
             }
 
@@ -198,8 +191,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              std::string("Compilation exception: ") + e.what(),
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                               SourceRange{}, _source_file);
             return false;
         }
@@ -213,16 +205,14 @@ namespace Cryo
         auto file = make_file_from_path(source_file);
         if (!file)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0800_FILE_NOT_FOUND,
-                                              "Failed to create file object for: " + source_file,
+            _diagnostic_manager->create_error(ErrorCode::E0800_FILE_NOT_FOUND,
                                               SourceRange{}, source_file);
             return false;
         }
 
         if (!file->load())
         {
-            _diagnostic_manager->report_error(ErrorCode::E0801_FILE_READ_ERROR,
-                                              "Failed to load source file: " + source_file,
+            _diagnostic_manager->create_error(ErrorCode::E0801_FILE_READ_ERROR,
                                               SourceRange{}, source_file);
             return false;
         }
@@ -249,16 +239,14 @@ namespace Cryo
             // Phase 3: Parse the program
             if (!parse())
             {
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "Parsing failed", SourceRange{}, file_path);
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
                 return false;
             }
 
             // Phase 4: Basic validation
             if (!_ast_root)
             {
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "No AST generated", SourceRange{}, file_path);
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
                 return false;
             }
 
@@ -266,8 +254,8 @@ namespace Cryo
             if (!analyze())
             {
                 std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "Analysis failed in namespace '" + namespace_name + "'", SourceRange{}, file_path);
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
+                                                  SourceRange{}, file_path);
                 // For LSP, we continue even if analysis fails partially
                 // This allows hover to work even with some compilation errors
             }
@@ -279,8 +267,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              std::string("Frontend compilation exception: ") + e.what(),
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                               SourceRange{}, _source_file);
             return false;
         }
@@ -290,16 +277,14 @@ namespace Cryo
     {
         if (_source_file.empty())
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              "No source file specified", SourceRange{}, "");
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, "");
             return false;
         }
 
         auto file = make_file_from_path(_source_file);
         if (!file || !file->load())
         {
-            _diagnostic_manager->report_error(ErrorCode::E0801_FILE_READ_ERROR,
-                                              "Failed to load source file", SourceRange{}, _source_file);
+            _diagnostic_manager->create_error(ErrorCode::E0801_FILE_READ_ERROR, SourceRange{}, _source_file);
             return false;
         }
 
@@ -310,8 +295,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              std::string("Lexer error: ") + e.what(),
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                               SourceRange{}, _source_file);
             return false;
         }
@@ -321,8 +305,7 @@ namespace Cryo
     {
         if (!_parser)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              "Parser not initialized", SourceRange{}, _source_file);
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
             return false;
         }
 
@@ -367,8 +350,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              std::string("Parser error: ") + e.what(),
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                               SourceRange{}, _source_file);
             return false;
         }
@@ -383,8 +365,7 @@ namespace Cryo
 
         if (!_ast_root)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              "No AST available for analysis", SourceRange{}, _source_file);
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
             return false;
         }
 
@@ -464,8 +445,8 @@ namespace Cryo
                     // Create better ranges for specific error types
                     // For now, use single-position ranges - the diagnostic formatter will handle the display
                     SourceRange range = SourceRange(type_error.location);
-                    _diagnostic_manager->report_error(error_code,
-                                                      type_error.message, range, _source_file);
+                    _diagnostic_manager->create_error(error_code,
+                                                      range, _source_file);
                 }
 
                 if (_debug_mode)
@@ -487,8 +468,7 @@ namespace Cryo
                 bool monomorphization_success = _monomorphization_pass->monomorphize(*_ast_root, required_instantiations, *_template_registry, *_type_checker);
                 if (!monomorphization_success)
                 {
-                    _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                      "Monomorphization failed", SourceRange{}, _source_file);
+                    _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
                     return false;
                 }
 
@@ -519,8 +499,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              std::string("Analysis error: ") + e.what(),
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                               SourceRange{}, _source_file);
             return false;
         }
@@ -530,15 +509,13 @@ namespace Cryo
     {
         if (!_ast_root)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              "No AST available for code generation", SourceRange{}, _source_file);
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
             return false;
         }
 
         if (!_codegen)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              "CodeGenerator not initialized", SourceRange{}, _source_file);
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
             return false;
         }
 
@@ -555,8 +532,7 @@ namespace Cryo
             if (!success)
             {
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "IR generation failed with error: {}", _codegen->get_last_error());
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "Code generation failed: " + _codegen->get_last_error(),
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                                   SourceRange{}, _source_file);
             }
 
@@ -564,8 +540,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              std::string("Code generation exception: ") + e.what(),
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                               SourceRange{}, _source_file);
             return false;
         }
@@ -585,8 +560,7 @@ namespace Cryo
 
         if (!_linker)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              "Linker not initialized", SourceRange{}, _source_file);
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
             return false;
         }
 
@@ -637,8 +611,7 @@ namespace Cryo
             llvm::Module *module = _codegen->get_module();
             if (!module)
             {
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "No LLVM module generated", SourceRange{}, _source_file);
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
                 return false;
             }
 
@@ -651,8 +624,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Linker error content: '{}'", linker_error);
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Full error message will be: 'Linking failed: {}'", linker_error);
 
-                _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                                  "Linking failed: " + linker_error,
+                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                                   SourceRange{}, _source_file);
             }
 
@@ -660,8 +632,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->report_error(ErrorCode::E0000_UNKNOWN,
-                                              std::string("Linking exception: ") + e.what(),
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
                                               SourceRange{}, _source_file);
             return false;
         }
