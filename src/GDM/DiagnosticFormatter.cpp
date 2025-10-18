@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <cmath>
+#include <regex>
 
 namespace Cryo
 {
@@ -121,9 +122,8 @@ namespace Cryo
                            SourceLocation(end_line, end_col),
                            diagnostic.filename(), true);
             
-            // Generate enhanced Rust-style inline labels based on error type and message
-            std::string msg = diagnostic.message();
-            std::string inline_label = generate_enhanced_inline_label(diagnostic.error_code(), msg);
+            // Generate enhanced Rust-style inline labels - NEW: Use structured data first
+            std::string inline_label = generate_structured_inline_label(diagnostic);
             
             if (!inline_label.empty()) {
                 span.set_label(inline_label);
@@ -556,7 +556,9 @@ namespace Cryo
 
     std::string DiagnosticFormatter::generate_enhanced_inline_label(ErrorCode error_code, const std::string& message) const
     {
-        // Generate enhanced Rust-style inline labels based on error code and message
+        // This method is being deprecated in favor of structured data approach
+        // For backward compatibility, still handle string-based approach for now
+        
         switch (error_code) {
             case ErrorCode::E0200_TYPE_MISMATCH: // Type mismatch
                 return extract_type_mismatch_label(message);
@@ -582,20 +584,128 @@ namespace Cryo
         }
     }
 
+    // NEW: Generate inline label from structured diagnostic data
+    std::string DiagnosticFormatter::generate_structured_inline_label(const Diagnostic& diagnostic) const
+    {
+        // Check if we have structured payload data
+        if (diagnostic.payload().has_type_mismatch()) {
+            const auto* type_context = diagnostic.payload().get_type_mismatch();
+            if (type_context) {
+                return type_context->generate_inline_label();
+            }
+        }
+        
+        // Fall back to error code + message parsing
+        return generate_enhanced_inline_label(diagnostic.error_code(), diagnostic.message());
+    }
+
     std::string DiagnosticFormatter::extract_type_mismatch_label(const std::string& message) const
     {
-        // Try to extract "expected X, found Y" from type mismatch messages
-        // Look for patterns like "int = string" or similar type mismatches
+        // Enhanced type mismatch label extraction with sophisticated parsing
         
-        // For now, provide a generic type mismatch message
-        // TODO: Parse the actual types from the error message for more precise labels
-        if (message.find("string") != std::string::npos && message.find("int") != std::string::npos) {
-            return "expected `int`, found `string`";
-        } else if (message.find("boolean") != std::string::npos && message.find("int") != std::string::npos) {
-            return "expected `int`, found `boolean`";
-        } else {
-            return "type mismatch";
+        // Pattern 1: "Cannot assign 'ActualType' to 'ExpectedType'"
+        std::regex assign_pattern(R"(Cannot assign '([^']+)' to '([^']+)')");
+        std::smatch match;
+        
+        if (std::regex_search(message, match, assign_pattern)) {
+            std::string actual_type = match[1].str();
+            std::string expected_type = match[2].str();
+            return "expected `" + expected_type + "`, found `" + actual_type + "`";
         }
+        
+        // Pattern 2: "Type mismatch in X: ExpectedType and ActualType"
+        std::regex operation_pattern(R"(Type mismatch in [^:]+: ([^\s]+) and ([^\s]+))");
+        if (std::regex_search(message, match, operation_pattern)) {
+            std::string expected_type = match[1].str();
+            std::string actual_type = match[2].str();
+            return "expected `" + expected_type + "`, found `" + actual_type + "`";
+        }
+        
+        // Pattern 3: Look for explicit type names in various formats
+        std::vector<std::string> common_types = {
+            "int", "i32", "i64", "u32", "u64",
+            "float", "f32", "f64", "double",
+            "string", "str", "char",
+            "boolean", "bool",
+            "void", "null"
+        };
+        
+        std::string found_expected, found_actual;
+        
+        // Try to extract types from common patterns
+        for (const auto& type : common_types) {
+            // Look for patterns like "expected int" or "int expected"
+            std::string expected_pattern = R"(\bexpected\s+)" + type + R"(\b)";
+            std::string found_pattern = R"(\bfound\s+)" + type + R"(\b)";
+            std::string to_pattern = R"(\bto\s+)" + type + R"(\b)";
+            std::string from_pattern = R"(\bfrom\s+)" + type + R"(\b)";
+            
+            std::regex expected_regex(expected_pattern, std::regex_constants::icase);
+            std::regex found_regex(found_pattern, std::regex_constants::icase);
+            std::regex to_regex(to_pattern, std::regex_constants::icase);
+            std::regex from_regex(from_pattern, std::regex_constants::icase);
+            
+            if (std::regex_search(message, expected_regex) || std::regex_search(message, to_regex)) {
+                found_expected = type;
+            }
+            if (std::regex_search(message, found_regex) || std::regex_search(message, from_regex)) {
+                found_actual = type;
+            }
+        }
+        
+        if (!found_expected.empty() && !found_actual.empty()) {
+            return "expected `" + found_expected + "`, found `" + found_actual + "`";
+        }
+        
+        // Pattern 4: Simple heuristic based on common type words
+        bool has_string = message.find("string") != std::string::npos;
+        bool has_int = message.find("int") != std::string::npos;
+        bool has_bool = message.find("bool") != std::string::npos || message.find("boolean") != std::string::npos;
+        bool has_float = message.find("float") != std::string::npos || message.find("double") != std::string::npos;
+        
+        // Common type mismatch scenarios
+        if (has_string && has_int) {
+            // Determine which is expected vs found based on context
+            if (message.find("assign") != std::string::npos) {
+                // In assignment context, usually "cannot assign X to Y" means Y is expected
+                if (message.find("string") < message.find("int")) {
+                    return "expected `int`, found `string`";
+                } else {
+                    return "expected `string`, found `int`";
+                }
+            } else {
+                return "expected `int`, found `string`"; // Common default
+            }
+        } else if (has_bool && has_int) {
+            return "expected `int`, found `boolean`";
+        } else if (has_float && has_int) {
+            if (message.find("float") < message.find("int")) {
+                return "expected `int`, found `float`";
+            } else {
+                return "expected `float`, found `int`";
+            }
+        } else if (has_string && has_bool) {
+            return "expected `boolean`, found `string`";
+        }
+        
+        // Fallback: Extract first two potential type words
+        std::regex type_word_pattern(R"(\b(int|i32|i64|u32|u64|float|f32|f64|double|string|str|char|boolean|bool|void|null)\b)");
+        std::vector<std::string> found_types;
+        std::sregex_iterator iter(message.begin(), message.end(), type_word_pattern);
+        std::sregex_iterator end;
+        
+        for (; iter != end && found_types.size() < 2; ++iter) {
+            found_types.push_back(iter->str());
+        }
+        
+        if (found_types.size() >= 2) {
+            return "expected `" + found_types[1] + "`, found `" + found_types[0] + "`";
+        } else if (found_types.size() == 1) {
+            return "type mismatch involving `" + found_types[0] + "`";
+        }
+        
+        // Ultimate fallback
+        return "type mismatch";
     }
 
     std::string DiagnosticFormatter::generate_generic_label(const std::string& message) const

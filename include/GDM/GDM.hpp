@@ -286,6 +286,85 @@ namespace Cryo
     };
 
     // ================================================================
+    // Structured Type Information for Dynamic Error Reporting
+    // ================================================================
+
+    // Forward declaration for Type
+    class Type;
+
+    // Structured type mismatch context - eliminates need for string parsing
+    struct TypeMismatchContext
+    {
+        const Type* expected_type;
+        const Type* actual_type;
+        std::string context_description; // "variable initialization", "assignment", etc.
+        
+        TypeMismatchContext(const Type* expected, const Type* actual, const std::string& context = "")
+            : expected_type(expected), actual_type(actual), context_description(context) {}
+            
+        // Generate the "expected X, found Y" label dynamically
+        std::string generate_inline_label() const;
+        
+        // Generate context-appropriate help messages
+        std::vector<std::string> generate_help_messages() const;
+        
+        // Check if types are compatible for specific conversions
+        bool can_suggest_parsing() const;
+        bool can_suggest_cast() const;
+        bool are_related_types() const;
+    };
+
+    // Enhanced diagnostic payload that can carry structured data
+    class DiagnosticPayload
+    {
+    public:
+        enum class PayloadKind 
+        {
+            None,
+            TypeMismatch,
+            UndefinedSymbol,
+            Redefinition,
+            ArgumentMismatch
+        };
+        
+    private:
+        PayloadKind _kind;
+        std::unique_ptr<void, void(*)(void*)> _data;
+        
+    public:
+        DiagnosticPayload() : _kind(PayloadKind::None), _data(nullptr, [](void*){}) {}
+        
+        // Move constructor
+        DiagnosticPayload(DiagnosticPayload&& other) noexcept 
+            : _kind(other._kind), _data(std::move(other._data)) {
+            other._kind = PayloadKind::None;
+        }
+        
+        // Move assignment
+        DiagnosticPayload& operator=(DiagnosticPayload&& other) noexcept {
+            if (this != &other) {
+                _kind = other._kind;
+                _data = std::move(other._data);
+                other._kind = PayloadKind::None;
+            }
+            return *this;
+        }
+        
+        // Delete copy constructor and assignment (non-copyable)
+        DiagnosticPayload(const DiagnosticPayload&) = delete;
+        DiagnosticPayload& operator=(const DiagnosticPayload&) = delete;
+        
+        // Type-safe payload creation
+        static DiagnosticPayload create_type_mismatch(const TypeMismatchContext& context);
+        
+        // Type-safe payload access
+        bool has_type_mismatch() const { return _kind == PayloadKind::TypeMismatch; }
+        const TypeMismatchContext* get_type_mismatch() const;
+        
+        PayloadKind kind() const { return _kind; }
+    };
+
+    // ================================================================
     // Individual Diagnostic
     // ================================================================
 
@@ -307,12 +386,25 @@ namespace Cryo
         MultiSpan _multi_span;
         std::vector<CodeSuggestion> _code_suggestions;
         std::vector<std::string> _help_messages;
+        
+        // Structured diagnostic payload for dynamic error generation
+        DiagnosticPayload _payload;
 
     public:
         // Primary constructor with error codes
         Diagnostic(ErrorCode error_code, DiagnosticSeverity severity, DiagnosticCategory category,
                    const std::string &message, const SourceRange &range,
                    const std::string &filename = "");
+        
+        // Move constructor
+        Diagnostic(Diagnostic&& other) noexcept = default;
+        
+        // Move assignment
+        Diagnostic& operator=(Diagnostic&& other) noexcept = default;
+        
+        // Delete copy constructor and assignment for now (we can add them later if needed)
+        Diagnostic(const Diagnostic&) = delete;
+        Diagnostic& operator=(const Diagnostic&) = delete;
 
         // Getters
         ErrorCode error_code() const { return _error_code; }
@@ -330,6 +422,9 @@ namespace Cryo
         const MultiSpan& multi_span() const { return _multi_span; }
         const std::vector<CodeSuggestion>& code_suggestions() const { return _code_suggestions; }
         const std::vector<std::string>& help_messages() const { return _help_messages; }
+        
+        // Structured payload accessor
+        const DiagnosticPayload& payload() const { return _payload; }
 
         // Builders for chaining
         Diagnostic &add_note(const std::string &note);
@@ -348,6 +443,9 @@ namespace Cryo
         
         Diagnostic& suggest_insertion(const SourceLocation& location, const std::string& insertion,
                                     const std::string& message = "try adding this");
+
+        // Structured payload builder
+        Diagnostic& with_payload(DiagnosticPayload&& payload);
 
         // Severity checks
         bool is_note() const { return _severity == DiagnosticSeverity::Note; }
@@ -477,7 +575,7 @@ namespace Cryo
                     const std::string &message, const SourceRange &range,
                     const std::string &filename = "");
 
-        void report(const Diagnostic &diagnostic);
+        void report(Diagnostic diagnostic);
 
         // Convenience methods with error codes
         void report_error(ErrorCode error_code, const std::string &message,
@@ -544,7 +642,7 @@ namespace Cryo
         Diagnostic& create_warning(ErrorCode error_code, const std::string& message);
         Diagnostic& create_note(ErrorCode error_code, const std::string& message);
         
-        void emit(const Diagnostic& diagnostic);
+        void emit(Diagnostic diagnostic);
 
         // Enhanced type mismatch with sophisticated spans and suggestions
         void report_enhanced_type_mismatch(const SourceSpan& value_span,

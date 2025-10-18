@@ -1,5 +1,6 @@
 #include "GDM/GDM.hpp"
 #include "GDM/DiagnosticFormatter.hpp"
+#include "AST/Type.hpp"
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
@@ -622,6 +623,132 @@ namespace Cryo
 
 
     // ================================================================
+    // TypeMismatchContext Implementation
+    // ================================================================
+
+    std::string TypeMismatchContext::generate_inline_label() const
+    {
+        if (!expected_type || !actual_type) {
+            return "type mismatch";
+        }
+        
+        std::string expected_str = expected_type->to_string();
+        std::string actual_str = actual_type->to_string();
+        
+        return "expected `" + expected_str + "`, found `" + actual_str + "`";
+    }
+
+    std::vector<std::string> TypeMismatchContext::generate_help_messages() const
+    {
+        std::vector<std::string> help_messages;
+        
+        if (!expected_type || !actual_type) {
+            help_messages.push_back("ensure the types are compatible or add an explicit cast if appropriate");
+            return help_messages;
+        }
+        
+        std::string expected_str = expected_type->to_string();
+        std::string actual_str = actual_type->to_string();
+        
+        // Context-specific suggestions based on type combination
+        if (context_description.find("assignment") != std::string::npos || 
+            context_description.find("initialization") != std::string::npos) {
+            
+            if (expected_str == "int" && actual_str == "string") {
+                help_messages.push_back("if you want to convert string to integer, try parsing");
+                help_messages.push_back("if you meant to create a string variable, remove the type annotation");
+                help_messages.push_back("string literals cannot be implicitly converted to integers");
+            } else if (expected_str == "string" && actual_str == "int") {
+                help_messages.push_back("if you want to convert integer to string, use toString()");
+                help_messages.push_back("if you meant to create an integer variable, change the type annotation");
+            } else if (expected_str == "boolean" && actual_str == "int") {
+                help_messages.push_back("boolean and integer types are not compatible");
+                help_messages.push_back("use explicit comparison like `value != 0` to convert to boolean");
+            } else if (expected_str == "float" && actual_str == "int") {
+                help_messages.push_back("consider using explicit cast or change variable type to int");
+            } else if (expected_str.find("*") != std::string::npos || actual_str.find("*") != std::string::npos) {
+                help_messages.push_back("pointer and value types are not directly compatible");
+                help_messages.push_back("use address-of (&) or dereference (*) operators as appropriate");
+            } else {
+                help_messages.push_back("ensure the types are compatible or add an explicit cast if appropriate");
+            }
+        } else if (context_description.find("arithmetic") != std::string::npos) {
+            help_messages.push_back("arithmetic operations require compatible types");
+            help_messages.push_back("consider converting one operand to match the other's type");
+        } else if (context_description.find("function") != std::string::npos) {
+            help_messages.push_back("function argument type must match parameter type");
+            help_messages.push_back("check the function signature or convert the argument");
+        } else {
+            help_messages.push_back("ensure the types are compatible or add an explicit cast if appropriate");
+        }
+        
+        return help_messages;
+    }
+
+    bool TypeMismatchContext::can_suggest_parsing() const
+    {
+        if (!expected_type || !actual_type) return false;
+        return (expected_type->to_string() == "int" && actual_type->to_string() == "string");
+    }
+
+    bool TypeMismatchContext::can_suggest_cast() const
+    {
+        if (!expected_type || !actual_type) return false;
+        // Most type mismatches can potentially be resolved with casts
+        return true;
+    }
+
+    bool TypeMismatchContext::are_related_types() const
+    {
+        if (!expected_type || !actual_type) return false;
+        
+        std::string expected_str = expected_type->to_string();
+        std::string actual_str = actual_type->to_string();
+        
+        // Check for related numeric types
+        std::vector<std::string> numeric_types = {"int", "i32", "i64", "u32", "u64", "float", "f32", "f64", "double"};
+        bool expected_numeric = std::find(numeric_types.begin(), numeric_types.end(), expected_str) != numeric_types.end();
+        bool actual_numeric = std::find(numeric_types.begin(), numeric_types.end(), actual_str) != numeric_types.end();
+        
+        return expected_numeric && actual_numeric;
+    }
+
+    // ================================================================
+    // DiagnosticPayload Implementation
+    // ================================================================
+
+    DiagnosticPayload DiagnosticPayload::create_type_mismatch(const TypeMismatchContext& context)
+    {
+        DiagnosticPayload payload;
+        payload._kind = PayloadKind::TypeMismatch;
+        
+        // Create a copy of the context on the heap
+        TypeMismatchContext* heap_context = new TypeMismatchContext(context);
+        payload._data = std::unique_ptr<void, void(*)(void*)>(
+            heap_context, 
+            [](void* ptr) { delete static_cast<TypeMismatchContext*>(ptr); }
+        );
+        
+        return payload;
+    }
+
+    const TypeMismatchContext* DiagnosticPayload::get_type_mismatch() const
+    {
+        if (_kind != PayloadKind::TypeMismatch) return nullptr;
+        return static_cast<const TypeMismatchContext*>(_data.get());
+    }
+
+    // ================================================================
+    // Diagnostic Implementation Extensions
+    // ================================================================
+
+    Diagnostic& Diagnostic::with_payload(DiagnosticPayload&& payload)
+    {
+        _payload = std::move(payload);
+        return *this;
+    }
+
+    // ================================================================
     // Enhanced diagnostic reporting with error codes
     // ================================================================
     // ================================================================
@@ -643,9 +770,9 @@ namespace Cryo
         _source_manager.add_file(filename, file);
     }
 
-    void DiagnosticManager::report(const Diagnostic &diagnostic)
+    void DiagnosticManager::report(Diagnostic diagnostic)
     {
-        _diagnostics.push_back(diagnostic);
+        _diagnostics.emplace_back(std::move(diagnostic));
         update_statistics(diagnostic.severity());
 
         // Print immediately in debug mode or for fatal errors
@@ -702,7 +829,7 @@ namespace Cryo
             diagnostic.add_note("Help: " + error_info.suggestion);
         }
         
-        report(diagnostic);
+        report(std::move(diagnostic));
     }
 
     void DiagnosticManager::report_error(ErrorCode error_code, const std::string &message,
@@ -858,7 +985,7 @@ namespace Cryo
                             std::to_string(previous_location.start.line()) +
                             ", column " + std::to_string(previous_location.start.column()));
 
-        report(diagnostic);
+        report(std::move(diagnostic));
     }
 
     void DiagnosticManager::report_invalid_operation(const SourceRange &range, const std::string &filename,
@@ -991,11 +1118,16 @@ namespace Cryo
         return _diagnostics.back();
     }
 
-    void DiagnosticManager::emit(const Diagnostic& diagnostic)
+    void DiagnosticManager::emit(Diagnostic diagnostic)
     {
         // This method is for when diagnostics are built externally and need to be added
-        // For now, we just add it to our list since the create_* methods already add them
-        // In a more sophisticated implementation, this could handle deferred emission
+        _diagnostics.emplace_back(std::move(diagnostic));
+        update_statistics(_diagnostics.back().severity());
+
+        // Print immediately in debug mode or for fatal errors
+        if (_diagnostics.back().is_fatal()) {
+            print_all();
+        }
     }
 
     // Enhanced diagnostic builders for message-first approach
@@ -1087,7 +1219,7 @@ namespace Cryo
         // Add helpful note
         diagnostic.add_help("string literals cannot be implicitly converted to integers");
         
-        emit(diagnostic);
+        // Note: diagnostic is already added to the list by create_error, no need to emit again
     }
 
     // ================================================================
