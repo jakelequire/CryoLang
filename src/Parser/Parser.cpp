@@ -58,27 +58,27 @@ namespace Cryo
 
         // Create sophisticated diagnostic with contextual suggestions
         SourceRange range(_current_token.location(), _current_token.location());
-        
+
         // Determine specific error code based on expected token
         ErrorCode error_code = get_token_error_code(expected);
-        
-        auto& diagnostic = _diagnostic_manager->create_error(error_code, range, _source_file);
-        
+
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, range, _source_file);
+
         // Add primary span with clear description
         std::string expected_name = get_token_name(expected);
         std::string actual_name = get_token_name(_current_token.kind());
-        
+
         std::string primary_message = "expected `" + expected_name + "`, found `" + actual_name + "`";
         SourceSpan primary_span(range.start, range.end, _source_file, true);
         primary_span.set_label(primary_message);
         diagnostic.with_primary_span(primary_span);
-        
+
         // Add contextual help based on the specific token mismatch
         add_token_mismatch_suggestions(diagnostic, expected, _current_token.kind(), context_message);
-        
+
         // Add secondary spans for context if helpful
         add_context_spans(diagnostic, expected);
-        
+
         // Note: Diagnostic is automatically stored by create_error
     }
 
@@ -86,21 +86,21 @@ namespace Cryo
     {
         switch (expected)
         {
-            case TokenKind::TK_SEMICOLON:
-                return ErrorCode::E0106_EXPECTED_SEMICOLON;
-            case TokenKind::TK_L_PAREN:
-            case TokenKind::TK_R_PAREN:
-                return ErrorCode::E0107_EXPECTED_PAREN;
-            case TokenKind::TK_L_BRACE:
-            case TokenKind::TK_R_BRACE:
-                return ErrorCode::E0108_EXPECTED_BRACE;
-            case TokenKind::TK_L_SQUARE:
-            case TokenKind::TK_R_SQUARE:
-                return ErrorCode::E0109_EXPECTED_BRACKET;
-            case TokenKind::TK_IDENTIFIER:
-                return ErrorCode::E0105_EXPECTED_IDENTIFIER;
-            default:
-                return ErrorCode::E0100_EXPECTED_TOKEN;
+        case TokenKind::TK_SEMICOLON:
+            return ErrorCode::E0106_EXPECTED_SEMICOLON;
+        case TokenKind::TK_L_PAREN:
+        case TokenKind::TK_R_PAREN:
+            return ErrorCode::E0107_EXPECTED_PAREN;
+        case TokenKind::TK_L_BRACE:
+        case TokenKind::TK_R_BRACE:
+            return ErrorCode::E0108_EXPECTED_BRACE;
+        case TokenKind::TK_L_SQUARE:
+        case TokenKind::TK_R_SQUARE:
+            return ErrorCode::E0109_EXPECTED_BRACKET;
+        case TokenKind::TK_IDENTIFIER:
+            return ErrorCode::E0105_EXPECTED_IDENTIFIER;
+        default:
+            return ErrorCode::E0100_EXPECTED_TOKEN;
         }
     }
 
@@ -108,102 +108,120 @@ namespace Cryo
     {
         switch (kind)
         {
-            case TokenKind::TK_SEMICOLON: return ";";
-            case TokenKind::TK_L_PAREN: return "(";
-            case TokenKind::TK_R_PAREN: return ")";
-            case TokenKind::TK_L_BRACE: return "{";
-            case TokenKind::TK_R_BRACE: return "}";
-            case TokenKind::TK_L_SQUARE: return "[";
-            case TokenKind::TK_R_SQUARE: return "]";
-            case TokenKind::TK_IDENTIFIER: return "identifier";
-            case TokenKind::TK_EOF: return "end of file";
-            case TokenKind::TK_ERROR: return "error";
-            case TokenKind::TK_KW_FUNCTION: return "function";
-            case TokenKind::TK_KW_CONST: return "const";
-            case TokenKind::TK_KW_MUT: return "mut";
-            case TokenKind::TK_KW_IF: return "if";
-            case TokenKind::TK_KW_ELSE: return "else";
-            case TokenKind::TK_KW_WHILE: return "while";
-            case TokenKind::TK_KW_FOR: return "for";
-            case TokenKind::TK_KW_RETURN: return "return";
-            case TokenKind::TK_COLON: return ":";
-            case TokenKind::TK_COMMA: return ",";
-            case TokenKind::TK_PERIOD: return ".";
-            case TokenKind::TK_ARROW: return "->";
-            default:
-                if (_current_token.text().empty())
-                    return "unknown";
-                return std::string(_current_token.text());
+        case TokenKind::TK_SEMICOLON:
+            return ";";
+        case TokenKind::TK_L_PAREN:
+            return "(";
+        case TokenKind::TK_R_PAREN:
+            return ")";
+        case TokenKind::TK_L_BRACE:
+            return "{";
+        case TokenKind::TK_R_BRACE:
+            return "}";
+        case TokenKind::TK_L_SQUARE:
+            return "[";
+        case TokenKind::TK_R_SQUARE:
+            return "]";
+        case TokenKind::TK_IDENTIFIER:
+            return "identifier";
+        case TokenKind::TK_EOF:
+            return "end of file";
+        case TokenKind::TK_ERROR:
+            return "error";
+        case TokenKind::TK_KW_FUNCTION:
+            return "function";
+        case TokenKind::TK_KW_CONST:
+            return "const";
+        case TokenKind::TK_KW_MUT:
+            return "mut";
+        case TokenKind::TK_KW_IF:
+            return "if";
+        case TokenKind::TK_KW_ELSE:
+            return "else";
+        case TokenKind::TK_KW_WHILE:
+            return "while";
+        case TokenKind::TK_KW_FOR:
+            return "for";
+        case TokenKind::TK_KW_RETURN:
+            return "return";
+        case TokenKind::TK_COLON:
+            return ":";
+        case TokenKind::TK_COMMA:
+            return ",";
+        case TokenKind::TK_PERIOD:
+            return ".";
+        case TokenKind::TK_ARROW:
+            return "->";
+        default:
+            if (_current_token.text().empty())
+                return "unknown";
+            return std::string(_current_token.text());
         }
     }
 
-    void Parser::add_token_mismatch_suggestions(Diagnostic& diagnostic, TokenKind expected, TokenKind actual, const std::string& context)
+    void Parser::add_token_mismatch_suggestions(Diagnostic &diagnostic, TokenKind expected, TokenKind actual, const std::string &context)
     {
         SourceRange current_range(_current_token.location(), _current_token.location());
-        
+
         switch (expected)
         {
-            case TokenKind::TK_SEMICOLON:
+        case TokenKind::TK_SEMICOLON:
+            diagnostic.add_suggestion(CodeSuggestion(
+                "add a semicolon",
+                SourceSpan(current_range, _source_file),
+                ";",
+                SuggestionApplicability::MachineApplicable,
+                SuggestionStyle::ShowCode));
+            diagnostic.add_note("statements must be terminated with a semicolon");
+            break;
+
+        case TokenKind::TK_R_PAREN:
+            if (actual == TokenKind::TK_COMMA)
+            {
                 diagnostic.add_suggestion(CodeSuggestion(
-                    "add a semicolon",
+                    "replace comma with closing parenthesis",
                     SourceSpan(current_range, _source_file),
-                    ";",
-                    SuggestionApplicability::MachineApplicable,
-                    SuggestionStyle::ShowCode
-                ));
-                diagnostic.add_note("statements must be terminated with a semicolon");
-                break;
-                
-            case TokenKind::TK_R_PAREN:
-                if (actual == TokenKind::TK_COMMA)
-                {
-                    diagnostic.add_suggestion(CodeSuggestion(
-                        "replace comma with closing parenthesis",
-                        SourceSpan(current_range, _source_file),
-                        ")",
-                        SuggestionApplicability::MaybeIncorrect,
-                        SuggestionStyle::ShowCode
-                    ));
-                    diagnostic.add_note("function parameter lists must be closed with `)`");
-                }
-                else
-                {
-                    diagnostic.add_suggestion(CodeSuggestion(
-                        "add closing parenthesis",
-                        SourceSpan(current_range, _source_file),
-                        ")",
-                        SuggestionApplicability::MachineApplicable,
-                        SuggestionStyle::ShowCode
-                    ));
-                    diagnostic.add_note("opened parenthesis must be closed");
-                }
-                break;
-                
-            case TokenKind::TK_R_BRACE:
+                    ")",
+                    SuggestionApplicability::MaybeIncorrect,
+                    SuggestionStyle::ShowCode));
+                diagnostic.add_note("function parameter lists must be closed with `)`");
+            }
+            else
+            {
                 diagnostic.add_suggestion(CodeSuggestion(
-                    "add closing brace",
+                    "add closing parenthesis",
                     SourceSpan(current_range, _source_file),
-                    "}",
+                    ")",
                     SuggestionApplicability::MachineApplicable,
-                    SuggestionStyle::ShowCode
-                ));
-                diagnostic.add_note("code blocks must be closed with `}`");
-                break;
-                
-            case TokenKind::TK_IDENTIFIER:
-                if (actual == TokenKind::TK_KW_FUNCTION || actual == TokenKind::TK_KW_CONST)
-                {
-                    diagnostic.add_note("expected an identifier (variable or function name) here");
-                    diagnostic.add_note("help: identifiers must start with a letter or underscore");
-                }
-                break;
-                
-            default:
-                // Generic suggestion
-                diagnostic.add_note("help: check the syntax and ensure proper token placement");
-                break;
+                    SuggestionStyle::ShowCode));
+                diagnostic.add_note("opened parenthesis must be closed");
+            }
+            break;
+
+        case TokenKind::TK_R_BRACE:
+            diagnostic.add_suggestion(CodeSuggestion(
+                "add closing brace",
+                SourceSpan(current_range, _source_file),
+                "}",
+                SuggestionApplicability::MachineApplicable,
+                SuggestionStyle::ShowCode));
+            diagnostic.add_note("code blocks must be closed with `}`");
+            break;
+
+        case TokenKind::TK_IDENTIFIER:
+            if (actual == TokenKind::TK_KW_FUNCTION || actual == TokenKind::TK_KW_CONST)
+            {
+                diagnostic.add_note("expected an identifier (variable or function name) here");
+                diagnostic.add_note("help: identifiers must start with a letter or underscore");
+            }
+            break;
+
+        default:
+            // Generic suggestion
+            diagnostic.add_note("help: check the syntax and ensure proper token placement");
+            break;
         }
-        
+
         // Add context-specific help
         if (!context.empty() && context != get_token_name(expected))
         {
@@ -211,7 +229,7 @@ namespace Cryo
         }
     }
 
-    void Parser::add_context_spans(Diagnostic& diagnostic, TokenKind expected)
+    void Parser::add_context_spans(Diagnostic &diagnostic, TokenKind expected)
     {
         // For closing delimiters, try to find the matching opening delimiter
         if (expected == TokenKind::TK_R_PAREN || expected == TokenKind::TK_R_BRACE || expected == TokenKind::TK_R_SQUARE)
@@ -358,15 +376,15 @@ namespace Cryo
         {
             // Use enhanced error reporting
             SourceRange range(_current_token.location(), _current_token.location());
-            
-            auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0111_INVALID_SYNTAX, range, _source_file);
+
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0111_INVALID_SYNTAX, range, _source_file);
             SourceSpan primary_span(range.start, range.end, _source_file, true);
             primary_span.set_label(message);
             diagnostic.with_primary_span(primary_span);
-            
+
             // Add contextual suggestions for common parsing errors
             add_generic_parsing_suggestions(diagnostic, message);
-            
+
             // Note: Diagnostic is automatically stored by create_error
         }
         else
@@ -384,11 +402,11 @@ namespace Cryo
         throw ParseError(message, _current_token.location());
     }
 
-    void Parser::add_generic_parsing_suggestions(Diagnostic& diagnostic, const std::string& message)
+    void Parser::add_generic_parsing_suggestions(Diagnostic &diagnostic, const std::string &message)
     {
         std::string lower_message = message;
         std::transform(lower_message.begin(), lower_message.end(), lower_message.begin(), ::tolower);
-        
+
         if (lower_message.find("expression") != std::string::npos)
         {
             diagnostic.add_note("help: expressions include variables, function calls, literals, and operators");

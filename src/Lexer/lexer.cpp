@@ -268,7 +268,7 @@ namespace Cryo
     // ================================================================
 
     Lexer::Lexer(std::unique_ptr<File> file)
-        : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), 
+        : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR),
           _token_count(0), _diagnostic_manager(nullptr)
     {
 
@@ -293,8 +293,8 @@ namespace Cryo
         }
     }
 
-    Lexer::Lexer(std::unique_ptr<File> file, DiagnosticManager* diagnostic_manager, const std::string& source_file)
-        : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), 
+    Lexer::Lexer(std::unique_ptr<File> file, DiagnosticManager *diagnostic_manager, const std::string &source_file)
+        : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR),
           _token_count(0), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
 
@@ -320,7 +320,7 @@ namespace Cryo
     }
 
     Lexer::Lexer(const std::string &content)
-        : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), 
+        : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR),
           _token_count(0), _diagnostic_manager(nullptr)
     {
         // Set up buffer pointers to reference the spot content
@@ -330,8 +330,8 @@ namespace Cryo
         _current = _buffer_start;
     }
 
-    Lexer::Lexer(const std::string &content, DiagnosticManager* diagnostic_manager, const std::string& source_file)
-        : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR), 
+    Lexer::Lexer(const std::string &content, DiagnosticManager *diagnostic_manager, const std::string &source_file)
+        : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR),
           _token_count(0), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
         // Set up buffer pointers to reference the spot content
@@ -1125,13 +1125,13 @@ namespace Cryo
     // Enhanced Error Reporting Methods
     // ================================================================
 
-    void Lexer::report_lexer_error(const std::string& message, const SourceLocation& location)
+    void Lexer::report_lexer_error(const std::string &message, const SourceLocation &location)
     {
         if (!_diagnostic_manager)
         {
             return;
         }
-        
+
         // Use basic error reporting for now to avoid circular dependencies
         SourceRange range(location, location);
         _diagnostic_manager->create_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, range, _source_file);

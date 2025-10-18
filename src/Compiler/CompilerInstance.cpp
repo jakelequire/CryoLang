@@ -78,9 +78,10 @@ namespace Cryo
     bool CompilerInstance::compile_file(const std::string &source_file)
     {
         set_source_file(source_file);
-        
+
         // Update TypeChecker with source file information
-        if (_type_checker) {
+        if (_type_checker)
+        {
             _type_checker->set_source_file(source_file);
         }
 
