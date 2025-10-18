@@ -1549,7 +1549,8 @@ namespace Cryo
         }
 
         // If we're in a struct/class context, also register this as a field
-        if (!_current_struct_name.empty())
+        // BUT NOT if we're currently parsing function parameters (inside a function)
+        if (!_current_struct_name.empty() && !_in_function)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Field registration check for '{}': current_struct='{}', final_type={}, kind={}",
                       var_name, _current_struct_name,
@@ -1567,6 +1568,11 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "SKIPPED field registration for '{}': {}",
                           var_name, final_type ? "TypeKind::Unknown" : "null type");
             }
+        }
+        else if (!_current_struct_name.empty() && _in_function)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "SKIPPED field registration for '{}': function parameter in struct '{}' (in_function={})",
+                      var_name, _current_struct_name, _in_function);
         }
     }
 
@@ -2599,12 +2605,6 @@ namespace Cryo
                 object_type = node.object()->get_resolved_type();
                 LOG_DEBUG(Cryo::LogComponent::AST, "Member '{}' - using resolved type: {}", node.member(),
                           object_type ? object_type->name() : "null");
-
-                // DEBUG: Track problematic HeapBlock* types
-                if (object_type && object_type->name().find("HeapBlock") != std::string::npos && object_type->kind() == TypeKind::Struct)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "PROBLEM DETECTED: HeapBlock* type with wrong TypeKind::Struct (10) instead of TypeKind::Pointer (7)");
-                }
             }
             else if (node.object()->type().has_value())
             {
@@ -2613,12 +2613,6 @@ namespace Cryo
                 object_type = lookup_type_by_name(type_name);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Member '{}' - looked up type '{}': {}",
                           node.member(), type_name, object_type ? object_type->name() : "null");
-
-                // DEBUG: Track problematic HeapBlock* types
-                if (object_type && object_type->name().find("HeapBlock") != std::string::npos && object_type->kind() == TypeKind::Struct)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "PROBLEM DETECTED VIA LOOKUP: HeapBlock* type with wrong TypeKind::Struct (10) from lookup_type_by_name('{}') instead of TypeKind::Pointer (7)", type_name);
-                }
             }
         }
 
@@ -2676,9 +2670,10 @@ namespace Cryo
             return;
         }
 
-        // For non-struct/class types, reject member access
+        // For non-struct/class/enum types, reject member access
         if (effective_type->kind() != TypeKind::Struct &&
             effective_type->kind() != TypeKind::Class &&
+            effective_type->kind() != TypeKind::Enum &&
             effective_type->kind() != TypeKind::Generic)
         {
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
@@ -2699,7 +2694,6 @@ namespace Cryo
             {
                 // Found the field - store the resolved Type*
                 node.set_resolved_type(field_it->second);
-                LOG_DEBUG(Cryo::LogComponent::AST, "Set resolved type for member '{}' of '{}' to: {}", member_name, lookup_type_name, field_it->second->name());
                 return;
             }
             else
@@ -2804,12 +2798,21 @@ namespace Cryo
                 }
             }
 
-            // For other primitive types, we can add support for methods as needed
-            // For now, reject member access on primitive types
-            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Cannot access member '" + member_name + "' of primitive type '" + effective_type->name() + "'");
-            node.set_resolved_type(_type_context.get_unknown_type());
-            return;
+            // Allow method access on enum types even though they're considered primitive
+            if (effective_type->kind() == TypeKind::Enum)
+            {
+                // Continue to method lookup for enum types
+                // Don't return here, let it fall through to method lookup
+            }
+            else
+            {
+                // For other primitive types, we can add support for methods as needed
+                // For now, reject member access on non-enum primitive types
+                report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                             "Cannot access member '" + member_name + "' of primitive type '" + effective_type->name() + "'");
+                node.set_resolved_type(_type_context.get_unknown_type());
+                return;
+            }
         }
 
         // If we get here, the member was not found
@@ -2820,7 +2823,8 @@ namespace Cryo
                   effective_type ? effective_type->name() : "null",
                   effective_type ? static_cast<int>(effective_type->kind()) : -1);
 
-        std::string error_msg = "Unknown struct type or field in member access: " + member_name + " (type: " + effective_type->name() + ")";
+        std::string error_msg = "Unknown struct type or field in member access: " + member_name + " (type: " +
+                                (effective_type ? effective_type->name() : "null") + ")";
         report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), error_msg);
         node.set_resolved_type(_type_context.get_unknown_type());
     }
