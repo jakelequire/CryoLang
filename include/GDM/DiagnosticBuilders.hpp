@@ -226,6 +226,24 @@ namespace Cryo
         // Constraint and validation errors
         Diagnostic& create_constraint_violation_error(const std::string& constraint,
                                                      Type* type, SourceLocation location);
+
+        // Additional methods for TypeError migration
+        Diagnostic& create_invalid_operation_error(const std::string& operation,
+                                                  Type* left_type, Type* right_type, 
+                                                  SourceLocation location);
+        
+        Diagnostic& create_non_callable_error(Type* type, SourceLocation location);
+        
+        Diagnostic& create_too_many_args_error(const std::string& function_name,
+                                              size_t expected, size_t actual,
+                                              SourceLocation location);
+        
+        Diagnostic& create_undefined_variable_error(const std::string& symbol_name,
+                                                   const std::string& context_description,
+                                                   SourceLocation location);
+        
+        Diagnostic& create_invalid_assignment_error(Type* target_type, Type* value_type,
+                                                   SourceLocation location);
     };
 
     /**

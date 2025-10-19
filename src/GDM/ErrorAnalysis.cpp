@@ -697,7 +697,12 @@ namespace Cryo
                code == ErrorCode::E0210_INVALID_ASSIGNMENT ||
                code == ErrorCode::E0222_INVALID_DEREF ||
                code == ErrorCode::E0223_INVALID_ADDRESS_OF ||
-               code == ErrorCode::E0224_INVALID_INDEX;
+               code == ErrorCode::E0224_INVALID_INDEX ||
+               code == ErrorCode::E0229_INVALID_BINARY_OP ||
+               code == ErrorCode::E0230_INVALID_UNARY_OP ||
+               code == ErrorCode::E0231_NON_CALLABLE_TYPE ||
+               code == ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET ||
+               code == ErrorCode::E0233_UNDEFINED_SYMBOL;
     }
 
     bool DiagnosticPayload::is_argument_mismatch_error(ErrorCode code)

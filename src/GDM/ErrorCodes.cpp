@@ -42,6 +42,17 @@ namespace Cryo
         return "E" + std::to_string(code_num).insert(0, 4 - std::to_string(code_num).length(), '0');
     }
 
+    std::string ErrorRegistry::error_code_to_string(ErrorCode code)
+    {
+        switch (code)
+        {
+            #define X(name, value) case ErrorCode::name: return #name;
+            ERROR_CODE_LIST(X)
+            #undef X
+            default: return "UNKNOWN_ERROR_CODE";
+        }
+    }
+
     bool ErrorRegistry::is_warning(ErrorCode code)
     {
         return static_cast<uint32_t>(code) >= 10000;

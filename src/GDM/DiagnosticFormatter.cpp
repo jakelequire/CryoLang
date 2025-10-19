@@ -1,5 +1,6 @@
 #include "GDM/DiagnosticFormatter.hpp"
 #include "GDM/ErrorAnalysis.hpp"
+#include "GDM/ErrorCodes.hpp"
 #include "Utils/Logger.hpp"
 #include <sstream>
 #include <fstream>
@@ -160,7 +161,7 @@ namespace Cryo
 
         // Header line with error code and message - ensure proper newline
         output << format_severity(diagnostic.severity()) 
-               << "[E" << std::setfill('0') << std::setw(4) << static_cast<int>(diagnostic.error_code()) << "]: "
+               << "[" << colorize(ErrorRegistry::error_code_to_string(diagnostic.error_code()), _style.error_code_color) << "]: "
                << diagnostic.message() << "\n";
 
         // Location line  
@@ -194,15 +195,19 @@ namespace Cryo
             output << format_suggestions(suggestions);
         }
 
-        // Help messages from diagnostic
+        // Help messages from diagnostic - TEMPORARILY DISABLED
+        /*
         for (const auto& help_msg : diagnostic.help_messages()) {
             output << "\n" << colorize("help", _style.help_color) << ": " << help_msg;
         }
+        */
 
-        // Notes from original diagnostic
+        // Notes from original diagnostic - TEMPORARILY DISABLED
+        /*
         for (const auto& note : diagnostic.notes()) {
             output << "\n" << colorize("note", _style.note_color) << ": " << note;
         }
+        */
 
         // Add visual separator line between error segments
         output << "\n" << colorize("+!+=========================================================================================+!+", "\x1b[90m") << "\n";
