@@ -3859,7 +3859,7 @@ namespace Cryo::Codegen
 
         if (_diagnostic_builder)
         {
-            _diagnostic_builder->create_llvm_error(message, nullptr);
+            _diagnostic_builder->create_llvm_error("code generation", nullptr, message);
         }
         else
         {
@@ -3876,11 +3876,11 @@ namespace Cryo::Codegen
 
         if (_diagnostic_builder && node)
         {
-            _diagnostic_builder->create_llvm_error(message, node);
+            _diagnostic_builder->create_llvm_error("code generation", node, message);
         }
         else if (_diagnostic_builder)
         {
-            _diagnostic_builder->create_llvm_error(message, nullptr);
+            _diagnostic_builder->create_llvm_error("code generation", nullptr, message);
         }
         else
         {

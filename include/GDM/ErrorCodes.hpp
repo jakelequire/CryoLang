@@ -6,7 +6,14 @@
 
 namespace Cryo
 {
-    // X-Macro pattern for error codes - define once, use everywhere
+    // Cryo Error Codes. Format: E#### where #### is a zero-padded number with the following ranges:
+    //   E0000-E0099:   Lexical Analysis Errors
+    //   E0100-E0199:   Syntax Errors
+    //   E0200-E0399:   Type Checking Errors
+    //   E0400-E0599:   Control Flow Errors
+    //   E0600-E0799:   Code Generation Errors
+    //   E0800-E0999:   System/IO Errors
+    //   W0001-W0999:   Warnings
     #define ERROR_CODE_LIST(X) \
         /* General Errors */ \
         X(E0000_UNKNOWN, 0) \

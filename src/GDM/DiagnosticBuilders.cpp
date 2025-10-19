@@ -601,6 +601,94 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &ParserDiagnosticBuilder::create_mismatched_delimiter_error(char found, char expected,
+                                                                          SourceLocation location,
+                                                                          SourceLocation opening_location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label(std::string("found '") + found + "', expected '" + expected + "'");
+
+        std::string message = "mismatched delimiter: found '" + std::string(1, found) + 
+                             "', expected '" + std::string(1, expected) + "'";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0110_MISMATCHED_DELIMITERS, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        // Add secondary span for opening delimiter if available
+        if (opening_location.line() > 0) {
+            SourceSpan opening_span(opening_location, opening_location, _source_file, false);
+            opening_span.set_label("opening delimiter here");
+            diagnostic.add_secondary_span(opening_span);
+        }
+
+        diagnostic.add_help("check that all opening delimiters have matching closing delimiters");
+
+        return diagnostic;
+    }
+
+    Diagnostic &ParserDiagnosticBuilder::create_invalid_syntax_error(SourceLocation location,
+                                                                    const std::string& construct,
+                                                                    const std::string& suggestion)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid syntax");
+
+        std::string message = "invalid syntax";
+        if (!construct.empty()) {
+            message += " in " + construct;
+        }
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0111_INVALID_SYNTAX, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        if (!suggestion.empty()) {
+            diagnostic.add_help(suggestion);
+        } else {
+            diagnostic.add_help("check the syntax against the language specification");
+        }
+
+        return diagnostic;
+    }
+
+    Diagnostic &ParserDiagnosticBuilder::create_invalid_declaration_error(const std::string& declaration_type,
+                                                                         SourceLocation location,
+                                                                         const std::string& issue)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid " + declaration_type + " declaration");
+
+        std::string message = "invalid " + declaration_type + " declaration";
+        if (!issue.empty()) {
+            message += ": " + issue;
+        }
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0111_INVALID_SYNTAX, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("ensure the " + declaration_type + " declaration follows proper syntax");
+
+        return diagnostic;
+    }
+
+    Diagnostic &ParserDiagnosticBuilder::create_invalid_pattern_error(SourceLocation location,
+                                                                     const std::string& pattern_context)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid pattern");
+
+        std::string message = "invalid pattern";
+        if (!pattern_context.empty()) {
+            message += " in " + pattern_context;
+        }
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0113_INVALID_PATTERN, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("ensure the pattern syntax is correct for this context");
+
+        return diagnostic;
+    }
+
     //===================================================================
     // LexerDiagnosticBuilder Implementation
     //===================================================================
@@ -657,6 +745,126 @@ namespace Cryo
         diagnostic.with_primary_span(span);
 
         diagnostic.add_help("use valid escape sequences like \\n, \\t, \\r, \\\\, or \\\"");
+
+        return diagnostic;
+    }
+
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_unicode_error(SourceLocation location,
+                                                                    const std::string& sequence)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid unicode sequence");
+
+        std::string message = "invalid unicode sequence";
+        if (!sequence.empty()) {
+            message += ": '" + sequence + "'";
+        }
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0006_INVALID_UNICODE, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("use valid unicode escape sequences like \\u0041 or \\U00000041");
+
+        return diagnostic;
+    }
+
+    Diagnostic &LexerDiagnosticBuilder::create_unterminated_char_error(SourceLocation start_location)
+    {
+        SourceSpan span(start_location, start_location, _source_file, true);
+        span.set_label("unterminated character literal");
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0003_UNTERMINATED_CHAR,
+                                                             span.to_source_range(), _source_file);
+
+        diagnostic.add_help("add a closing single quote (') to terminate the character literal");
+
+        return diagnostic;
+    }
+
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_number_error(const std::string& number_text,
+                                                                   SourceLocation location,
+                                                                   const std::string& reason)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid number format");
+
+        std::string message = "invalid number format: '" + number_text + "'";
+        if (!reason.empty()) {
+            message += " (" + reason + ")";
+        }
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0004_INVALID_NUMBER, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("ensure the number follows valid syntax (e.g., 123, 3.14, 0x1A, 0b1010)");
+
+        return diagnostic;
+    }
+
+    Diagnostic &LexerDiagnosticBuilder::create_number_overflow_error(const std::string& number_text,
+                                                                    SourceLocation location,
+                                                                    const std::string& number_type)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("number overflow");
+
+        std::string message = "number too large: '" + number_text + "'";
+        if (!number_type.empty()) {
+            message += " for type " + number_type;
+        }
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0010_NUMBER_TOO_LARGE, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("use a smaller number or a larger numeric type");
+
+        return diagnostic;
+    }
+
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_hex_error(const std::string& hex_text,
+                                                                SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid hexadecimal number");
+
+        std::string message = "invalid hexadecimal number: '" + hex_text + "'";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0007_INVALID_HEX, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("hexadecimal numbers must contain only digits 0-9 and letters A-F (e.g., 0x1A2B)");
+
+        return diagnostic;
+    }
+
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_binary_error(const std::string& binary_text,
+                                                                   SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid binary number");
+
+        std::string message = "invalid binary number: '" + binary_text + "'";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0008_INVALID_BINARY, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("binary numbers must contain only digits 0 and 1 (e.g., 0b1010)");
+
+        return diagnostic;
+    }
+
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_octal_error(const std::string& octal_text,
+                                                                  SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid octal number");
+
+        std::string message = "invalid octal number: '" + octal_text + "'";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0009_INVALID_OCTAL, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("octal numbers must contain only digits 0-7 (e.g., 0o123)");
 
         return diagnostic;
     }

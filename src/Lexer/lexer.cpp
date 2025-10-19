@@ -1,6 +1,7 @@
 #include "Lexer/lexer.hpp"
 #include "Utils/File.hpp"
 #include "GDM/GDM.hpp"
+#include "GDM/DiagnosticBuilders.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -498,47 +499,129 @@ namespace Cryo
     {
         const char *start = _current - 1;
 
-        // Handle hex numbers
-        if (*(_current - 1) == '0' && !at_end() && (peek() == 'x' || peek() == 'X'))
+        // Handle special number formats (hex, binary, octal) - but only if we have '0' followed by a format specifier
+        if (*(_current - 1) == '0' && !at_end())
         {
-            advance(); // consume 'x' or 'X'
-            while (!at_end() && is_hex_digit(peek()))
+            char prefix = peek();
+            if (prefix == 'x' || prefix == 'X')
+            {
+                // Hexadecimal
+                advance(); // consume 'x' or 'X'
+                const char *hex_start = _current;
+                
+                while (!at_end() && is_hex_digit(peek()))
+                {
+                    advance();
+                }
+                
+                // Check if we actually consumed any hex digits
+                if (_current == hex_start)
+                {
+                    if (_diagnostic_manager)
+                    {
+                        LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
+                        std::string hex_text(start, _current - start);
+                        builder.create_invalid_hex_error(hex_text, _current_location);
+                    }
+                    return make_error_token("Invalid hexadecimal number");
+                }
+                
+                // Skip decimal and exponent parsing for hex numbers
+                goto handle_suffixes;
+            }
+            else if (prefix == 'b' || prefix == 'B')
+            {
+                // Binary
+                advance(); // consume 'b' or 'B'
+                const char *bin_start = _current;
+                
+                while (!at_end() && (peek() == '0' || peek() == '1'))
+                {
+                    advance();
+                }
+                
+                // Check if we actually consumed any binary digits
+                if (_current == bin_start)
+                {
+                    if (_diagnostic_manager)
+                    {
+                        LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
+                        std::string bin_text(start, _current - start);
+                        builder.create_invalid_binary_error(bin_text, _current_location);
+                    }
+                    return make_error_token("Invalid binary number");
+                }
+                
+                // Skip decimal and exponent parsing for binary numbers
+                goto handle_suffixes;
+            }
+            else if (prefix == 'o' || prefix == 'O')
+            {
+                // Octal
+                advance(); // consume 'o' or 'O'
+                const char *oct_start = _current;
+                
+                while (!at_end() && peek() >= '0' && peek() <= '7')
+                {
+                    advance();
+                }
+                
+                // Check if we actually consumed any octal digits
+                if (_current == oct_start)
+                {
+                    if (_diagnostic_manager)
+                    {
+                        LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
+                        std::string oct_text(start, _current - start);
+                        builder.create_invalid_octal_error(oct_text, _current_location);
+                    }
+                    return make_error_token("Invalid octal number");
+                }
+                
+                // Skip decimal and exponent parsing for octal numbers
+                goto handle_suffixes;
+            }
+        }
+
+        // Regular decimal number - consume remaining digits (for all numbers, including those starting with 0)
+        while (!at_end() && is_digit(peek()))
+        {
+            advance();
+        }
+
+        // Decimal point - check if we have a decimal number like 1.23 or 0.5
+        if (!at_end() && peek() == '.')
+        {
+            // Look ahead to see if there's a digit after the decimal point
+            if ((_current + 1) < _buffer_end)
+            {
+                char next_char = *(_current + 1);
+                if (is_digit(next_char))
+                {
+                    advance(); // consume '.'
+                    while (!at_end() && is_digit(peek()))
+                    {
+                        advance();
+                    }
+                }
+            }
+        }
+
+        // Exponent
+        if (!at_end() && (peek() == 'e' || peek() == 'E'))
+        {
+            advance();
+            if (!at_end() && (peek() == '+' || peek() == '-'))
             {
                 advance();
             }
-        }
-        else
-        {
-            // Regular decimal number
             while (!at_end() && is_digit(peek()))
             {
                 advance();
             }
-
-            // Decimal point
-            if (!at_end() && peek() == '.' && _current + 1 < _buffer_end && is_digit(*(_current + 1)))
-            {
-                advance(); // consume '.'
-                while (!at_end() && is_digit(peek()))
-                {
-                    advance();
-                }
-            }
-
-            // Exponent
-            if (!at_end() && (peek() == 'e' || peek() == 'E'))
-            {
-                advance();
-                if (!at_end() && (peek() == '+' || peek() == '-'))
-                {
-                    advance();
-                }
-                while (!at_end() && is_digit(peek()))
-                {
-                    advance();
-                }
-            }
         }
+
+    handle_suffixes:
 
         // Handle type suffixes like u64, i32, f32, etc.
         if (!at_end() && is_alpha(peek()))
@@ -1132,9 +1215,30 @@ namespace Cryo
             return;
         }
 
-        // Use basic error reporting for now to avoid circular dependencies
-        SourceRange range(location, location);
-        _diagnostic_manager->create_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, range, _source_file);
+        // Create enhanced lexer diagnostic builder
+        LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
+        
+        // Use appropriate diagnostic method based on message content
+        if (message.find("unexpected character") != std::string::npos)
+        {
+            // Extract character from current position if possible
+            char character = (_current > _buffer_start) ? *(_current - 1) : '?';
+            builder.create_unexpected_character_error(character, location);
+        }
+        else if (message.find("unterminated string") != std::string::npos)
+        {
+            builder.create_unterminated_string_error(location);
+        }
+        else if (message.find("unterminated character") != std::string::npos)
+        {
+            builder.create_unterminated_char_error(location);
+        }
+        else
+        {
+            // Fall back to basic error reporting for unrecognized messages
+            SourceRange range(location, location);
+            _diagnostic_manager->create_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, range, _source_file);
+        }
     }
 
 } // namespace Cryo
