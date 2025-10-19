@@ -482,8 +482,9 @@ namespace Cryo
                 }
                 else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(decl))
                 {
-                    // Create intrinsic symbol
-                    Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_decl->location(), nullptr, module_name);
+                    // Create intrinsic symbol with proper type information (same as regular functions)
+                    Type *intrinsic_type = create_function_type_from_declaration(intrinsic_decl, type_context);
+                    Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_decl->location(), intrinsic_type, module_name);
                     symbol_map[intrinsic_decl->name()] = symbol;
                 }
             }
@@ -528,6 +529,45 @@ namespace Cryo
                 const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
                 std::cerr << "Warning: Failed to get resolved type for parameter '" << param->name()
                           << "' (type: " << param_type_str << ") in function '" << func_decl->name() << "'" << std::endl;
+                return nullptr;
+            }
+        }
+
+        // Create FunctionType
+        return type_context->create_function_type(return_type, parameter_types);
+    }
+
+    Type *ModuleLoader::create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context)
+    {
+        if (!intrinsic_decl || !type_context)
+        {
+            return nullptr;
+        }
+
+        // Get return type
+        Type *return_type = nullptr;
+        return_type = intrinsic_decl->get_resolved_return_type();
+        const std::string &return_type_str = return_type ? return_type->to_string() : "void";
+        if (!return_type || return_type_str == "void")
+        {
+            // Default to void for intrinsics without explicit return type or explicit void
+            return_type = type_context->get_void_type();
+        }
+
+        // Get parameter types
+        std::vector<Type *> parameter_types;
+        for (const auto &param : intrinsic_decl->parameters())
+        {
+            Type *param_type = param->get_resolved_type();
+            if (param_type)
+            {
+                parameter_types.push_back(param_type);
+            }
+            else
+            {
+                const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
+                std::cerr << "Warning: Failed to get resolved type for parameter '" << param->name()
+                          << "' (type: " << param_type_str << ") in intrinsic '" << intrinsic_decl->name() << "'" << std::endl;
                 return nullptr;
             }
         }
