@@ -1,6 +1,7 @@
 #include "Parser/Parser.hpp"
 #include "Utils/Logger.hpp"
 #include "GDM/GDM.hpp"
+#include "GDM/DiagnosticBuilders.hpp"
 #include <iostream>
 #include <cctype>
 #include <algorithm>
@@ -8,7 +9,7 @@
 namespace Cryo
 {
     Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context)
-        : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(nullptr)
+        : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(nullptr), _diagnostic_builder(nullptr)
     {
         // Initialize by getting the first token
         advance();
@@ -17,6 +18,11 @@ namespace Cryo
     Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file)
         : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
+        // Initialize diagnostic builder if diagnostic manager is available
+        if (_diagnostic_manager) {
+            _diagnostic_builder = std::make_unique<ParserDiagnosticBuilder>(_diagnostic_manager, std::string(_source_file));
+        }
+        
         // Initialize by getting the first token
         advance();
     }
@@ -49,37 +55,43 @@ namespace Cryo
 
     void Parser::report_enhanced_token_error(TokenKind expected, const std::string &context_message)
     {
-        if (!_diagnostic_manager)
+        if (!_diagnostic_manager || !_diagnostic_builder)
         {
             // Fallback to basic error reporting
             error(context_message);
             return;
         }
 
-        // Create sophisticated diagnostic with contextual suggestions
-        SourceRange range(_current_token.location(), _current_token.location());
+        // Use member ParserDiagnosticBuilder for better error reporting
 
-        // Determine specific error code based on expected token
-        ErrorCode error_code = get_token_error_code(expected);
-
-        auto &diagnostic = _diagnostic_manager->create_error(error_code, range, _source_file);
-
-        // Add primary span with clear description
-        std::string expected_name = get_token_name(expected);
-        std::string actual_name = get_token_name(_current_token.kind());
-
-        std::string primary_message = "expected `" + expected_name + "`, found `" + actual_name + "`";
-        SourceSpan primary_span(range.start, range.end, _source_file, true);
-        primary_span.set_label(primary_message);
-        diagnostic.with_primary_span(primary_span);
-
-        // Add contextual help based on the specific token mismatch
-        add_token_mismatch_suggestions(diagnostic, expected, _current_token.kind(), context_message);
-
-        // Add secondary spans for context if helpful
-        add_context_spans(diagnostic, expected);
-
-        // Note: Diagnostic is automatically stored by create_error
+        // Check for specific token patterns and use appropriate diagnostic methods
+        if (_current_token.is_eof())
+        {
+            // Handle unexpected EOF
+            _diagnostic_builder->create_missing_token_error(expected, _current_token.location(), context_message);
+        }
+        else if (is_delimiter_token(expected))
+        {
+            // Handle delimiter-related errors with better context
+            if (is_delimiter_token(_current_token.kind()))
+            {
+                // Mismatched delimiters
+                char expected_char = get_delimiter_char(expected);
+                char found_char = get_delimiter_char(_current_token.kind());
+                _diagnostic_builder->create_mismatched_delimiter_error(found_char, expected_char, 
+                                                        _current_token.location());
+            }
+            else
+            {
+                // Missing delimiter
+                _diagnostic_builder->create_missing_token_error(expected, _current_token.location(), context_message);
+            }
+        }
+        else
+        {
+            // Use general unexpected token error
+            _diagnostic_builder->create_unexpected_token_error(_current_token, expected, context_message);
+        }
     }
 
     ErrorCode Parser::get_token_error_code(TokenKind expected)
@@ -361,6 +373,46 @@ namespace Cryo
         {
             error("Expected '>' after generic type arguments");
             return Token{};
+        }
+    }
+
+    bool Parser::is_delimiter_token(TokenKind kind) const
+    {
+        switch (kind)
+        {
+        case TokenKind::TK_L_PAREN:
+        case TokenKind::TK_R_PAREN:
+        case TokenKind::TK_L_BRACE:
+        case TokenKind::TK_R_BRACE:
+        case TokenKind::TK_L_SQUARE:
+        case TokenKind::TK_R_SQUARE:
+        case TokenKind::TK_SEMICOLON:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    char Parser::get_delimiter_char(TokenKind kind) const
+    {
+        switch (kind)
+        {
+        case TokenKind::TK_L_PAREN:
+            return '(';
+        case TokenKind::TK_R_PAREN:
+            return ')';
+        case TokenKind::TK_L_BRACE:
+            return '{';
+        case TokenKind::TK_R_BRACE:
+            return '}';
+        case TokenKind::TK_L_SQUARE:
+            return '[';
+        case TokenKind::TK_R_SQUARE:
+            return ']';
+        case TokenKind::TK_SEMICOLON:
+            return ';';
+        default:
+            return '?'; // Unknown delimiter
         }
     }
 

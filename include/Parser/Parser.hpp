@@ -6,6 +6,7 @@
 #include "AST/ASTContext.hpp"
 #include "AST/Type.hpp"
 #include "GDM/GDM.hpp"
+#include "GDM/DiagnosticBuilders.hpp"
 #include <memory>
 #include <vector>
 #include <stdexcept>
@@ -34,6 +35,7 @@ namespace Cryo
         std::vector<ParseError> _errors;
         DiagnosticManager *_diagnostic_manager;
         std::string _source_file;
+        std::unique_ptr<ParserDiagnosticBuilder> _diagnostic_builder;
 
         // Context tracking
         bool _in_implementation_block = false;
@@ -206,5 +208,9 @@ namespace Cryo
         
         // Enhanced type parsing using tokens
         Type *parse_type_annotation_with_tokens();
+        
+        // Enhanced diagnostic helper methods
+        bool is_delimiter_token(TokenKind kind) const;
+        char get_delimiter_char(TokenKind kind) const;
     };
 }

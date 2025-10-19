@@ -205,6 +205,63 @@ namespace Cryo
                 "Move the continue statement inside a loop or remove it."
             ));
 
+        // ==== Parser Errors (missing registrations) ====
+        _error_info.emplace(ErrorCode::E0111_INVALID_SYNTAX,
+            ErrorInfo(ErrorCode::E0111_INVALID_SYNTAX,
+                "invalid syntax",
+                "The syntax is not valid in this context.",
+                "Check the language reference for correct syntax."
+            ));
+
+        _error_info.emplace(ErrorCode::E0216_TOO_FEW_ARGS,
+            ErrorInfo(ErrorCode::E0216_TOO_FEW_ARGS,
+                "too few arguments",
+                "This function call has fewer arguments than required.",
+                "Add the missing arguments to match the function signature."
+            ));
+
+        _error_info.emplace(ErrorCode::E0215_TOO_MANY_ARGS,
+            ErrorInfo(ErrorCode::E0215_TOO_MANY_ARGS,
+                "too many arguments",
+                "This function call has more arguments than expected.",
+                "Remove the extra arguments to match the function signature."
+            ));
+
+        _error_info.emplace(ErrorCode::E0106_EXPECTED_SEMICOLON,
+            ErrorInfo(ErrorCode::E0106_EXPECTED_SEMICOLON,
+                "expected semicolon",
+                "A semicolon is required to terminate this statement.",
+                "Add a semicolon (;) at the end of the statement."
+            ));
+
+        _error_info.emplace(ErrorCode::E0107_EXPECTED_PAREN,
+            ErrorInfo(ErrorCode::E0107_EXPECTED_PAREN,
+                "expected parenthesis",
+                "A parenthesis is expected in this context.",
+                "Add the missing opening or closing parenthesis."
+            ));
+
+        _error_info.emplace(ErrorCode::E0108_EXPECTED_BRACE,
+            ErrorInfo(ErrorCode::E0108_EXPECTED_BRACE,
+                "expected brace",
+                "A brace is expected in this context.",
+                "Add the missing opening or closing brace."
+            ));
+
+        _error_info.emplace(ErrorCode::E0109_EXPECTED_BRACKET,
+            ErrorInfo(ErrorCode::E0109_EXPECTED_BRACKET,
+                "expected bracket",
+                "A bracket is expected in this context.",
+                "Add the missing opening or closing bracket."
+            ));
+
+        _error_info.emplace(ErrorCode::E0110_MISMATCHED_DELIMITERS,
+            ErrorInfo(ErrorCode::E0110_MISMATCHED_DELIMITERS,
+                "mismatched delimiters",
+                "The opening and closing delimiters don't match.",
+                "Ensure that each opening delimiter has a matching closing delimiter."
+            ));
+
         // ==== System/IO Errors ====
         _error_info.emplace(ErrorCode::E0800_FILE_NOT_FOUND,
             ErrorInfo(ErrorCode::E0800_FILE_NOT_FOUND,
