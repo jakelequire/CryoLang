@@ -200,13 +200,18 @@ namespace Cryo
         
         // Symbol resolution errors
         Diagnostic& create_undefined_symbol_error(const std::string& symbol_name,
-                                                 const std::string& symbol_type,
+                                                 NodeKind symbol_kind,
                                                  SourceLocation location,
                                                  const std::vector<std::string>& suggestions = {});
         
         Diagnostic& create_redefinition_error(const std::string& symbol_name,
                                              SourceLocation new_location,
                                              SourceLocation original_location);
+        
+        // NEW: Redefined symbol error with NodeKind
+        Diagnostic& create_redefined_symbol_error(const std::string& symbol_name,
+                                                 NodeKind symbol_kind,
+                                                 SourceLocation location);
         
         // Access and dereference errors
         Diagnostic& create_invalid_member_access_error(const std::string& member_name,
@@ -239,7 +244,7 @@ namespace Cryo
                                               SourceLocation location);
         
         Diagnostic& create_undefined_variable_error(const std::string& symbol_name,
-                                                   const std::string& context_description,
+                                                   NodeKind symbol_kind,
                                                    SourceLocation location);
         
         Diagnostic& create_invalid_assignment_error(Type* target_type, Type* value_type,
