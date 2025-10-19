@@ -757,24 +757,54 @@ namespace Cryo
     }
 
     Diagnostic &TypeCheckerDiagnosticBuilder::create_undefined_symbol_error(const std::string &symbol_name,
-                                                                            const std::string &symbol_type,
+                                                                            NodeKind symbol_kind,
                                                                             SourceLocation location,
                                                                             const std::vector<std::string> &suggestions)
     {
         SourceSpan span(location, location, _source_file, true);
-        span.set_label("undefined " + symbol_type);
-
-        std::string message = "undefined " + symbol_type + " `" + symbol_name + "`";
-
+        
+        // Convert NodeKind to symbol type string and error code
+        std::string symbol_type;
         ErrorCode error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
-        if (symbol_type == "function")
-        {
-            error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
+        
+        switch (symbol_kind) {
+            case NodeKind::FunctionDeclaration:
+                symbol_type = "function";
+                error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
+                break;
+            case NodeKind::StructDeclaration:
+                symbol_type = "struct";
+                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+                break;
+            case NodeKind::ClassDeclaration:
+                symbol_type = "class";
+                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+                break;
+            case NodeKind::TraitDeclaration:
+                symbol_type = "trait";
+                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+                break;
+            case NodeKind::EnumDeclaration:
+                symbol_type = "enum";
+                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+                break;
+            case NodeKind::TypeAliasDeclaration:
+                symbol_type = "type alias";
+                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+                break;
+            case NodeKind::ImplementationBlock:
+                symbol_type = "implementation target type";
+                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+                break;
+            case NodeKind::VariableDeclaration:
+            default:
+                symbol_type = "variable";
+                error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
+                break;
         }
-        else if (symbol_type == "type")
-        {
-            error_code = ErrorCode::E0203_UNDEFINED_TYPE;
-        }
+        
+        span.set_label("undefined " + symbol_type);
+        std::string message = "undefined " + symbol_type + " `" + symbol_name + "`";
 
         auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
 
@@ -785,6 +815,55 @@ namespace Cryo
         }
 
         add_common_help(diagnostic, error_code);
+
+        return diagnostic;
+    }
+
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_redefined_symbol_error(const std::string &symbol_name,
+                                                                           NodeKind symbol_kind,
+                                                                           SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        
+        // Convert NodeKind to symbol type string
+        std::string symbol_type;
+        switch (symbol_kind) {
+            case NodeKind::FunctionDeclaration:
+                symbol_type = "function";
+                break;
+            case NodeKind::StructDeclaration:
+                symbol_type = "struct";
+                break;
+            case NodeKind::ClassDeclaration:
+                symbol_type = "class";
+                break;
+            case NodeKind::TraitDeclaration:
+                symbol_type = "trait";
+                break;
+            case NodeKind::EnumDeclaration:
+                symbol_type = "enum";
+                break;
+            case NodeKind::TypeAliasDeclaration:
+                symbol_type = "type alias";
+                break;
+            case NodeKind::VariableDeclaration:
+                symbol_type = "variable";
+                break;
+            case NodeKind::Declaration: // Generic parameter
+                symbol_type = "generic parameter";
+                break;
+            default:
+                symbol_type = "symbol";
+                break;
+        }
+        
+        span.set_label("redefined " + symbol_type);
+        std::string message = symbol_type + " `" + symbol_name + "` is already defined";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0205_REDEFINED_SYMBOL, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        add_common_help(diagnostic, ErrorCode::E0205_REDEFINED_SYMBOL);
 
         return diagnostic;
     }
@@ -908,11 +987,38 @@ namespace Cryo
     }
 
     Diagnostic &TypeCheckerDiagnosticBuilder::create_undefined_variable_error(const std::string &symbol_name,
-                                                                             const std::string &context_description,
+                                                                             NodeKind symbol_kind,
                                                                              SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("undefined symbol");
+
+        // Convert NodeKind to context description
+        std::string context_description;
+        switch (symbol_kind) {
+            case NodeKind::FunctionDeclaration:
+                context_description = "function";
+                break;
+            case NodeKind::StructDeclaration:
+                context_description = "struct";
+                break;
+            case NodeKind::ClassDeclaration:
+                context_description = "class";
+                break;
+            case NodeKind::TraitDeclaration:
+                context_description = "trait";
+                break;
+            case NodeKind::EnumDeclaration:
+                context_description = "enum";
+                break;
+            case NodeKind::TypeAliasDeclaration:
+                context_description = "type alias";
+                break;
+            case NodeKind::VariableDeclaration:
+            default:
+                context_description = "variable";
+                break;
+        }
 
         std::string message = "Undefined " + context_description + " '" + symbol_name + "'";
 
