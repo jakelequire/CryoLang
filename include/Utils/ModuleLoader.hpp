@@ -150,6 +150,14 @@ namespace Cryo
         Type *create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context);
 
         /**
+         * @brief Create a FunctionType from an IntrinsicDeclarationNode
+         * @param intrinsic_decl The intrinsic declaration node
+         * @param type_context TypeContext for creating type objects
+         * @return FunctionType object or nullptr if creation fails
+         */
+        Type *create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context);
+
+        /**
          * @brief Filter import result to only include specific symbols
          * @param result The import result to filter
          * @param specific_imports List of specific symbols to include

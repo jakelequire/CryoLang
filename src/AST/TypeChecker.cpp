@@ -1711,6 +1711,60 @@ namespace Cryo
         }
     }
 
+    void TypeChecker::visit(IntrinsicDeclarationNode &node)
+    {
+        const std::string &func_name = node.name();
+        
+        LOG_DEBUG(Cryo::LogComponent::AST, "Type checking intrinsic function: {}", func_name);
+
+        // Create function type from intrinsic declaration
+        std::vector<Type *> param_types;
+        for (const auto &param : node.parameters())
+        {
+            if (param)
+            {
+                // For intrinsic parameters, use type annotation if available
+                const std::string &param_type_str = param->type_annotation();
+                Type *param_type = lookup_type_by_name(param_type_str);
+                if (param_type)
+                {
+                    param_types.push_back(param_type);
+                }
+                else
+                {
+                    _diagnostic_builder->create_undefined_symbol_error(param_type_str, NodeKind::Declaration, param->location());
+                    param_types.push_back(_type_context.get_unknown_type());
+                }
+            }
+        }
+
+        // Get return type
+        Type *return_type = node.get_resolved_return_type();
+        if (!return_type)
+        {
+            const std::string &return_type_str = node.return_type_annotation();
+            return_type = lookup_type_by_name(return_type_str);
+            if (!return_type)
+            {
+                _diagnostic_builder->create_undefined_symbol_error(return_type_str, NodeKind::Declaration, node.location());
+                return_type = _type_context.get_unknown_type();
+            }
+            node.set_resolved_return_type(return_type);
+        }
+
+        // Create function type for the intrinsic
+        FunctionType *func_type = static_cast<FunctionType*>(_type_context.create_function_type(return_type, param_types));
+        
+        // Register the intrinsic function in the symbol table with special handling
+        // Since we don't have a specific method for intrinsics, we'll declare it as a normal symbol
+        if (!_symbol_table->declare_symbol(func_name, func_type, node.location()))
+        {
+            _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic function: {} with type: {}", func_name, func_type->to_string());
+    }
+
     //===----------------------------------------------------------------------===//
     // Statement Visitors
     //===----------------------------------------------------------------------===//
@@ -1954,6 +2008,23 @@ namespace Cryo
                     // Found runtime function - for now set to unknown type
                     // TODO: Create proper function types for runtime functions
                     node.set_resolved_type(_type_context.get_unknown_type());
+                    return;
+                }
+
+                // Try to find the symbol in the std::Intrinsics namespace as well
+                // This allows intrinsic functions like __printf__ to be used without qualification
+                Symbol *intrinsic_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context("std::Intrinsics", name, _current_namespace);
+                if (intrinsic_symbol)
+                {
+                    // Found intrinsic function - use the actual function type
+                    if (intrinsic_symbol->data_type)
+                    {
+                        node.set_resolved_type(intrinsic_symbol->data_type);
+                    }
+                    else
+                    {
+                        node.set_resolved_type(_type_context.get_unknown_type());
+                    }
                     return;
                 }
             }

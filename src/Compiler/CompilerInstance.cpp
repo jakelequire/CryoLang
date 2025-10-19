@@ -1321,6 +1321,51 @@ namespace Cryo
 
     void CompilerInstance::inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name)
     {
+        // Special handling for runtime files in stdlib mode - they need access to intrinsics
+        if (_stdlib_compilation_mode && 
+            (_source_file.find("runtime/runtime.cryo") != std::string::npos ||
+             _source_file.find("stdlib/runtime/runtime.cryo") != std::string::npos))
+        {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading intrinsics for runtime compilation");
+            
+            // Load intrinsics for runtime compilation by importing the compiled stdlib
+            try {
+                // Create a synthetic ImportDeclarationNode for core/intrinsics
+                auto intrinsics_import = std::make_unique<ImportDeclarationNode>(
+                    SourceLocation(0, 0),                       // synthetic location
+                    "core/intrinsics",                          // path
+                    ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
+                );
+
+                // Temporarily disable stdlib mode for this import to allow loading
+                bool original_stdlib_mode = _stdlib_compilation_mode;
+                _stdlib_compilation_mode = false;
+
+                // Load the intrinsics import
+                auto intrinsics_result = _module_loader->load_import(*intrinsics_import);
+
+                // Restore stdlib mode
+                _stdlib_compilation_mode = original_stdlib_mode;
+
+                if (intrinsics_result.success && !intrinsics_result.symbol_map.empty())
+                {
+                    current_scope->register_namespace(intrinsics_result.module_name, intrinsics_result.symbol_map);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loaded {} intrinsic symbols for runtime compilation",
+                              intrinsics_result.symbol_map.size());
+                }
+                else
+                {
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to load intrinsics for runtime: {}", intrinsics_result.error_message);
+                }
+            }
+            catch (const std::exception& e)
+            {
+                LOG_ERROR(Cryo::LogComponent::GENERAL, "Exception loading intrinsics for runtime: {}", e.what());
+            }
+
+            return; // Don't do other auto-imports in stdlib mode
+        }
+
         // Skip auto-import if we're in stdlib compilation mode to avoid circular dependencies
         if (_stdlib_compilation_mode)
         {
@@ -1378,6 +1423,45 @@ namespace Cryo
             LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import core/types: {}", result.error_message);
         }
 
+        // Auto-import intrinsic functions for user projects
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: core/intrinsics");
+
+        // Create a synthetic ImportDeclarationNode for core/intrinsics
+        // This simulates: import <core/intrinsics>;
+        auto intrinsics_import = std::make_unique<ImportDeclarationNode>(
+            SourceLocation(0, 0),                       // synthetic location
+            "core/intrinsics",                          // path
+            ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
+        );
+
+        // Load the intrinsics import
+        auto intrinsics_result = _module_loader->load_import(*intrinsics_import);
+
+        if (intrinsics_result.success)
+        {
+            // Register the namespace and symbols (wildcard import behavior)
+            if (!intrinsics_result.symbol_map.empty())
+            {
+                current_scope->register_namespace(intrinsics_result.module_name, intrinsics_result.symbol_map);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported intrinsics: registered namespace '{}' with {} symbols",
+                          intrinsics_result.module_name, intrinsics_result.symbol_map.size());
+                
+                // Also register under the short name "Intrinsics" for convenience
+                // This allows both Intrinsics::__printf__ and std::Intrinsics::__printf__ to work
+                current_scope->register_namespace("Intrinsics", intrinsics_result.symbol_map);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported intrinsics: also registered under short name 'Intrinsics' with {} symbols",
+                          intrinsics_result.symbol_map.size());
+            }
+            else
+            {
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in intrinsics");
+            }
+        }
+        else
+        {
+            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import intrinsics: {}", intrinsics_result.error_message);
+        }
+
         // Auto-import runtime functions
         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: runtime/runtime");
 
@@ -1400,6 +1484,12 @@ namespace Cryo
                 current_scope->register_namespace(runtime_result.module_name, runtime_result.symbol_map);
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: registered namespace '{}' with {} symbols",
                           runtime_result.module_name, runtime_result.symbol_map.size());
+                
+                // Also register under the short name "Runtime" for convenience
+                // This allows both Runtime::cryo_alloc and std::Runtime::cryo_alloc to work
+                current_scope->register_namespace("Runtime", runtime_result.symbol_map);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: also registered under short name 'Runtime' with {} symbols",
+                          runtime_result.symbol_map.size());
             }
             else
             {

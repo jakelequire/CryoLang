@@ -314,6 +314,7 @@ namespace Cryo
         // Visitor methods - Declarations
         void visit(VariableDeclarationNode &node) override;
         void visit(FunctionDeclarationNode &node) override;
+        void visit(IntrinsicDeclarationNode &node) override;
         void visit(StructDeclarationNode &node) override;
         void visit(ClassDeclarationNode &node) override;
         void visit(TraitDeclarationNode &node) override;
