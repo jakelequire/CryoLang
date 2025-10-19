@@ -447,7 +447,7 @@ namespace Cryo
                     // For now, use single-position ranges - the diagnostic formatter will handle the display
                     SourceRange range = SourceRange(type_error.location);
                     _diagnostic_manager->create_error(error_code,
-                                                      range, _source_file);
+                                                      range, _source_file, type_error.message);
                 }
 
                 if (_debug_mode)

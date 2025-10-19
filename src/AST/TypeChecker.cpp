@@ -4361,7 +4361,7 @@ namespace Cryo
             }
 
             SourceRange range(loc);
-            _diagnostic_manager->create_error(error_code, range, _source_file);
+            _diagnostic_manager->create_error(error_code, range, _source_file, message);
         }
         else
         {
