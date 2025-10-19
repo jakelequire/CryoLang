@@ -374,6 +374,7 @@ namespace Cryo
         bool requires_explicit_cast(Type *from, Type *to);
 
         // Error reporting
+        [[deprecated("Use _diagnostic_builder->create_*_error() methods instead")]]
         void report_error(TypeError::ErrorKind kind, SourceLocation loc, const std::string &message);
         void report_warning(TypeWarning::WarningKind kind, SourceLocation loc, const std::string &message);
         void report_conversion_warning(TypeWarning::WarningKind kind, SourceLocation loc,

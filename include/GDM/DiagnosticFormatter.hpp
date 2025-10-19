@@ -28,6 +28,7 @@ namespace Cryo
             std::string line_number_color = "\033[34m";  // Blue
             std::string primary_span_color = "\033[1;31m";   // Bold red
             std::string secondary_span_color = "\033[1;36m"; // Bold cyan
+            std::string error_code_color = "\033[1;38;5;208m"; // Bold orange (256-color mode)
             std::string reset = "\033[0m";               // Reset
             std::string bold = "\033[1m";                // Bold
 

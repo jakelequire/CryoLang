@@ -920,7 +920,8 @@ namespace Cryo
         // Create diagnostic
         Diagnostic diagnostic(error_code, severity, category, final_message, range, filename);
 
-        // Auto-add explanations and suggestions from ErrorInfo
+        // Auto-add explanations and suggestions from ErrorInfo - TEMPORARILY DISABLED
+        /*
         if (!error_info.explanation.empty())
         {
             diagnostic.add_note(error_info.explanation);
@@ -929,6 +930,7 @@ namespace Cryo
         {
             diagnostic.add_note("Help: " + error_info.suggestion);
         }
+        */
 
         // Create appropriate payload based on ErrorCode
         if (DiagnosticPayload::is_type_mismatch_error(error_code) ||

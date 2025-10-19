@@ -384,8 +384,9 @@ namespace Cryo
         auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
 
-        diagnostic.add_note("This field does not exist in the struct or class.");
-        diagnostic.add_help("Check the field name for typos or verify the struct/class definition.");
+        // TEMPORARILY DISABLED
+        // diagnostic.add_note("This field does not exist in the struct or class.");
+        // diagnostic.add_help("Check the field name for typos or verify the struct/class definition.");
 
         return diagnostic;
     }
@@ -823,6 +824,100 @@ namespace Cryo
 
         diagnostic.add_note("This field does not exist in the struct or class.");
         diagnostic.add_help("Check the field name for typos or verify the struct/class definition.");
+
+        return diagnostic;
+    }
+
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_operation_error(const std::string &operation,
+                                                                             Type *left_type, Type *right_type,
+                                                                             SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        
+        std::string left_name = left_type ? left_type->to_string() : "unknown";
+        std::string right_name = right_type ? right_type->to_string() : "unknown";
+        
+        if (right_type) {
+            span.set_label("incompatible types for " + operation + " operation");
+        } else {
+            span.set_label("invalid " + operation + " operation on type '" + left_name + "'");
+        }
+
+        std::string message = right_type ? 
+            ("Cannot apply '" + operation + "' to types '" + left_name + "' and '" + right_name + "'") :
+            ("Cannot apply '" + operation + "' to type '" + left_name + "'");
+
+        ErrorCode error_code = right_type ? ErrorCode::E0229_INVALID_BINARY_OP : ErrorCode::E0230_INVALID_UNARY_OP;
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        return diagnostic;
+    }
+
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_non_callable_error(Type *type, SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        
+        std::string type_name = type ? type->to_string() : "unknown";
+        span.set_label("type '" + type_name + "' cannot be called");
+
+        std::string message = "Cannot call type '" + type_name + "' as a function";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0231_NON_CALLABLE_TYPE, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_note("Only functions and callable objects can be invoked with ()");
+
+        return diagnostic;
+    }
+
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_too_many_args_error(const std::string &function_name,
+                                                                         size_t expected, size_t actual,
+                                                                         SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        
+        span.set_label("too many arguments");
+
+        std::string message = "Function '" + function_name + "' expects " + std::to_string(expected) + 
+                             " argument" + (expected == 1 ? "" : "s") + 
+                             ", but " + std::to_string(actual) + " were provided";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0215_TOO_MANY_ARGS, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        return diagnostic;
+    }
+
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_assignment_error(Type *target_type, Type *value_type,
+                                                                              SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        
+        std::string target_name = target_type ? target_type->to_string() : "unknown";
+        std::string value_name = value_type ? value_type->to_string() : "unknown";
+        
+        span.set_label("invalid assignment to '" + target_name + "'");
+
+        std::string message = "Cannot assign value of type '" + value_name + "' to target of type '" + target_name + "'";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        return diagnostic;
+    }
+
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_undefined_variable_error(const std::string &symbol_name,
+                                                                             const std::string &context_description,
+                                                                             SourceLocation location)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("undefined symbol");
+
+        std::string message = "Undefined " + context_description + " '" + symbol_name + "'";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0233_UNDEFINED_SYMBOL, span.to_source_range(), _source_file, message);
+        diagnostic.with_primary_span(span);
 
         return diagnostic;
     }

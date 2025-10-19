@@ -6,146 +6,157 @@
 
 namespace Cryo
 {
-    // Systematic error codes for precise error identification and documentation
+    // X-Macro pattern for error codes - define once, use everywhere
+    #define ERROR_CODE_LIST(X) \
+        /* General Errors */ \
+        X(E0000_UNKNOWN, 0) \
+        \
+        /* Lexical Analysis Errors (E0001-E0099) */ \
+        X(E0001_UNEXPECTED_CHARACTER, 1) \
+        X(E0002_UNTERMINATED_STRING, 2) \
+        X(E0003_UNTERMINATED_CHAR, 3) \
+        X(E0004_INVALID_NUMBER, 4) \
+        X(E0005_INVALID_ESCAPE, 5) \
+        X(E0006_INVALID_UNICODE, 6) \
+        X(E0007_INVALID_HEX, 7) \
+        X(E0008_INVALID_BINARY, 8) \
+        X(E0009_INVALID_OCTAL, 9) \
+        X(E0010_NUMBER_TOO_LARGE, 10) \
+        \
+        /* Syntax Errors (E0100-E0199) */ \
+        X(E0100_EXPECTED_TOKEN, 100) \
+        X(E0101_UNEXPECTED_TOKEN, 101) \
+        X(E0102_EXPECTED_EXPRESSION, 102) \
+        X(E0103_EXPECTED_STATEMENT, 103) \
+        X(E0104_EXPECTED_TYPE, 104) \
+        X(E0105_EXPECTED_IDENTIFIER, 105) \
+        X(E0106_EXPECTED_SEMICOLON, 106) \
+        X(E0107_EXPECTED_PAREN, 107) \
+        X(E0108_EXPECTED_BRACE, 108) \
+        X(E0109_EXPECTED_BRACKET, 109) \
+        X(E0110_MISMATCHED_DELIMITERS, 110) \
+        X(E0111_INVALID_SYNTAX, 111) \
+        X(E0112_UNEXPECTED_EOF, 112) \
+        X(E0113_INVALID_PATTERN, 113) \
+        X(E0114_DUPLICATE_DEFAULT, 114) \
+        \
+        /* Type Checking Errors (E0200-E0399) */ \
+        X(E0200_TYPE_MISMATCH, 200) \
+        X(E0201_UNDEFINED_VARIABLE, 201) \
+        X(E0202_UNDEFINED_FUNCTION, 202) \
+        X(E0203_UNDEFINED_TYPE, 203) \
+        X(E0204_UNDEFINED_FIELD, 204) \
+        X(E0205_REDEFINED_SYMBOL, 205) \
+        X(E0206_REDEFINED_FUNCTION, 206) \
+        X(E0207_REDEFINED_TYPE, 207) \
+        X(E0208_INVALID_CAST, 208) \
+        X(E0209_INVALID_OPERATION, 209) \
+        X(E0210_INVALID_ASSIGNMENT, 210) \
+        X(E0211_INCOMPATIBLE_TYPES, 211) \
+        X(E0212_VOID_VALUE_USED, 212) \
+        X(E0213_NON_CALLABLE, 213) \
+        X(E0214_ARGUMENT_MISMATCH, 214) \
+        X(E0215_TOO_MANY_ARGS, 215) \
+        X(E0216_TOO_FEW_ARGS, 216) \
+        X(E0217_CONST_VIOLATION, 217) \
+        X(E0218_IMMUTABLE_ASSIGNMENT, 218) \
+        X(E0219_UNINITIALIZED_VAR, 219) \
+        X(E0220_UNREACHABLE_CODE, 220) \
+        X(E0221_CIRCULAR_DEPENDENCY, 221) \
+        X(E0222_INVALID_DEREF, 222) \
+        X(E0223_INVALID_ADDRESS_OF, 223) \
+        X(E0224_INVALID_INDEX, 224) \
+        X(E0225_INDEX_OUT_OF_BOUNDS, 225) \
+        X(E0226_DIVISION_BY_ZERO, 226) \
+        X(E0227_OVERFLOW, 227) \
+        X(E0228_UNDERFLOW, 228) \
+        X(E0229_INVALID_BINARY_OP, 229) \
+        X(E0230_INVALID_UNARY_OP, 230) \
+        X(E0231_NON_CALLABLE_TYPE, 231) \
+        X(E0232_INVALID_ASSIGNMENT_TARGET, 232) \
+        X(E0233_UNDEFINED_SYMBOL, 233) \
+        \
+        /* Generic/Template Errors (E0300-E0349) */ \
+        X(E0300_GENERIC_INSTANTIATION_FAILED, 300) \
+        X(E0301_GENERIC_TYPE_RESOLUTION_FAILED, 301) \
+        X(E0302_GENERIC_PARAM_MISMATCH, 302) \
+        X(E0303_INVALID_GENERIC_CONSTRAINT, 303) \
+        X(E0304_AMBIGUOUS_GENERIC, 304) \
+        X(E0305_RECURSIVE_GENERIC, 305) \
+        \
+        /* Struct/Class Errors (E0350-E0399) */ \
+        X(E0350_STRUCT_FIELD_NOT_FOUND, 350) \
+        X(E0351_CLASS_MEMBER_NOT_FOUND, 351) \
+        X(E0352_CONSTRUCTOR_NOT_FOUND, 352) \
+        X(E0353_PRIVATE_ACCESS, 353) \
+        X(E0354_ABSTRACT_METHOD_CALL, 354) \
+        X(E0355_MISSING_FIELD_INIT, 355) \
+        X(E0356_DUPLICATE_FIELD, 356) \
+        \
+        /* Control Flow Errors (E0400-E0449) */ \
+        X(E0400_INVALID_BREAK, 400) \
+        X(E0401_INVALID_CONTINUE, 401) \
+        X(E0402_INVALID_RETURN, 402) \
+        X(E0403_MISSING_RETURN, 403) \
+        X(E0404_UNREACHABLE_PATTERN, 404) \
+        X(E0405_NON_EXHAUSTIVE_MATCH, 405) \
+        \
+        /* Memory Management Errors (E0450-E0499) */ \
+        X(E0450_INVALID_BORROW, 450) \
+        X(E0451_BORROW_CHECK_FAILED, 451) \
+        X(E0452_USE_AFTER_MOVE, 452) \
+        X(E0453_DOUBLE_FREE, 453) \
+        X(E0454_MEMORY_LEAK, 454) \
+        X(E0455_DANGLING_POINTER, 455) \
+        \
+        /* Module System Errors (E0500-E0549) */ \
+        X(E0500_MODULE_NOT_FOUND, 500) \
+        X(E0501_CIRCULAR_IMPORT, 501) \
+        X(E0502_INVALID_IMPORT, 502) \
+        X(E0503_PRIVATE_SYMBOL_ACCESS, 503) \
+        X(E0504_NAMESPACE_CONFLICT, 504) \
+        \
+        /* Code Generation Errors (E0600-E0699) */ \
+        X(E0600_CODEGEN_FAILED, 600) \
+        X(E0601_LLVM_ERROR, 601) \
+        X(E0602_INVALID_LLVM_TYPE, 602) \
+        X(E0603_INVALID_LLVM_VALUE, 603) \
+        X(E0604_UNIMPLEMENTED_INTRINSIC, 604) \
+        X(E0605_OPTIMIZATION_FAILED, 605) \
+        \
+        /* Linker Errors (E0700-E0799) */ \
+        X(E0700_LINK_ERROR, 700) \
+        X(E0701_UNDEFINED_SYMBOL_LINK, 701) \
+        X(E0702_DUPLICATE_SYMBOL_LINK, 702) \
+        X(E0703_LIBRARY_NOT_FOUND, 703) \
+        X(E0704_INVALID_TARGET, 704) \
+        \
+        /* System/IO Errors (E0800-E0899) */ \
+        X(E0800_FILE_NOT_FOUND, 800) \
+        X(E0801_FILE_READ_ERROR, 801) \
+        X(E0802_FILE_WRITE_ERROR, 802) \
+        X(E0803_PERMISSION_DENIED, 803) \
+        X(E0804_OUT_OF_MEMORY, 804) \
+        X(E0805_INTERNAL_ERROR, 805) \
+        \
+        /* Warning Codes (W0001-W9999) */ \
+        X(W0001_UNUSED_VARIABLE, 10001) \
+        X(W0002_UNUSED_FUNCTION, 10002) \
+        X(W0003_UNUSED_IMPORT, 10003) \
+        X(W0004_SHADOWED_VARIABLE, 10004) \
+        X(W0005_IMPLICIT_CONVERSION, 10005) \
+        X(W0006_LOSSY_CONVERSION, 10006) \
+        X(W0007_DEPRECATED, 10007) \
+        X(W0008_UNNECESSARY_CAST, 10008) \
+        X(W0009_DEAD_CODE, 10009) \
+        X(W0010_MISSING_DOCS, 10010)
+
+    // Generate the enum using the X-macro
     enum class ErrorCode : uint32_t
     {
-        // ==== General Errors ====
-        E0000_UNKNOWN = 0,                     // Unknown/generic error
-
-        // ==== Lexical Analysis Errors (E0001-E0099) ====
-        E0001_UNEXPECTED_CHARACTER = 1,        // Unexpected character in source
-        E0002_UNTERMINATED_STRING = 2,         // String literal not terminated
-        E0003_UNTERMINATED_CHAR = 3,           // Character literal not terminated
-        E0004_INVALID_NUMBER = 4,              // Malformed numeric literal
-        E0005_INVALID_ESCAPE = 5,              // Invalid escape sequence
-        E0006_INVALID_UNICODE = 6,             // Invalid Unicode escape
-        E0007_INVALID_HEX = 7,                 // Invalid hexadecimal literal
-        E0008_INVALID_BINARY = 8,              // Invalid binary literal
-        E0009_INVALID_OCTAL = 9,               // Invalid octal literal
-        E0010_NUMBER_TOO_LARGE = 10,           // Numeric literal too large
-
-        // ==== Syntax Errors (E0100-E0199) ====
-        E0100_EXPECTED_TOKEN = 100,            // Expected specific token
-        E0101_UNEXPECTED_TOKEN = 101,          // Unexpected token encountered
-        E0102_EXPECTED_EXPRESSION = 102,       // Expected expression
-        E0103_EXPECTED_STATEMENT = 103,        // Expected statement
-        E0104_EXPECTED_TYPE = 104,             // Expected type annotation
-        E0105_EXPECTED_IDENTIFIER = 105,       // Expected identifier
-        E0106_EXPECTED_SEMICOLON = 106,        // Missing semicolon
-        E0107_EXPECTED_PAREN = 107,            // Missing closing parenthesis
-        E0108_EXPECTED_BRACE = 108,            // Missing closing brace
-        E0109_EXPECTED_BRACKET = 109,          // Missing closing bracket
-        E0110_MISMATCHED_DELIMITERS = 110,     // Mismatched delimiters
-        E0111_INVALID_SYNTAX = 111,            // Invalid syntax structure
-        E0112_UNEXPECTED_EOF = 112,            // Unexpected end of file
-        E0113_INVALID_PATTERN = 113,           // Invalid pattern in match/destructuring
-        E0114_DUPLICATE_DEFAULT = 114,         // Duplicate default case in match
-
-        // ==== Type Checking Errors (E0200-E0399) ====
-        E0200_TYPE_MISMATCH = 200,             // Type mismatch in assignment/operation
-        E0201_UNDEFINED_VARIABLE = 201,        // Use of undefined variable
-        E0202_UNDEFINED_FUNCTION = 202,        // Call to undefined function
-        E0203_UNDEFINED_TYPE = 203,            // Reference to undefined type
-        E0204_UNDEFINED_FIELD = 204,           // Access to undefined struct field
-        E0205_REDEFINED_SYMBOL = 205,          // Redefinition of symbol
-        E0206_REDEFINED_FUNCTION = 206,        // Function redefinition
-        E0207_REDEFINED_TYPE = 207,            // Type redefinition
-        E0208_INVALID_CAST = 208,              // Invalid type cast
-        E0209_INVALID_OPERATION = 209,         // Invalid operation for type(s)
-        E0210_INVALID_ASSIGNMENT = 210,        // Invalid assignment operation
-        E0211_INCOMPATIBLE_TYPES = 211,        // Incompatible types in operation
-        E0212_VOID_VALUE_USED = 212,           // Void value used in expression
-        E0213_NON_CALLABLE = 213,              // Attempt to call non-callable type
-        E0214_ARGUMENT_MISMATCH = 214,         // Function argument count mismatch
-        E0215_TOO_MANY_ARGS = 215,             // Too many arguments provided
-        E0216_TOO_FEW_ARGS = 216,              // Too few arguments provided
-        E0217_CONST_VIOLATION = 217,           // Attempt to modify const value
-        E0218_IMMUTABLE_ASSIGNMENT = 218,      // Assignment to immutable variable
-        E0219_UNINITIALIZED_VAR = 219,         // Use of uninitialized variable
-        E0220_UNREACHABLE_CODE = 220,          // Code after return/break is unreachable
-        E0221_CIRCULAR_DEPENDENCY = 221,       // Circular type/module dependency
-        E0222_INVALID_DEREF = 222,             // Invalid dereference operation
-        E0223_INVALID_ADDRESS_OF = 223,        // Invalid address-of operation
-        E0224_INVALID_INDEX = 224,             // Invalid array/container indexing
-        E0225_INDEX_OUT_OF_BOUNDS = 225,       // Array index out of bounds (compile-time)
-        E0226_DIVISION_BY_ZERO = 226,          // Division by zero (compile-time)
-        E0227_OVERFLOW = 227,                  // Arithmetic overflow (compile-time)
-        E0228_UNDERFLOW = 228,                 // Arithmetic underflow (compile-time)
-
-        // ==== Generic/Template Errors (E0300-E0349) ====
-        E0300_GENERIC_INSTANTIATION_FAILED = 300,  // Generic instantiation failed
-        E0301_GENERIC_TYPE_RESOLUTION_FAILED = 301, // Generic type resolution failed
-        E0302_GENERIC_PARAM_MISMATCH = 302,        // Generic parameter mismatch
-        E0303_INVALID_GENERIC_CONSTRAINT = 303,    // Invalid generic constraint
-        E0304_AMBIGUOUS_GENERIC = 304,             // Ambiguous generic resolution
-        E0305_RECURSIVE_GENERIC = 305,             // Recursive generic instantiation
-
-        // ==== Struct/Class Errors (E0350-E0399) ====
-        E0350_STRUCT_FIELD_NOT_FOUND = 350,    // Struct field not found
-        E0351_CLASS_MEMBER_NOT_FOUND = 351,    // Class member not found
-        E0352_CONSTRUCTOR_NOT_FOUND = 352,     // Constructor not found
-        E0353_PRIVATE_ACCESS = 353,            // Access to private member
-        E0354_ABSTRACT_METHOD_CALL = 354,      // Call to abstract method
-        E0355_MISSING_FIELD_INIT = 355,        // Missing field initialization
-        E0356_DUPLICATE_FIELD = 356,           // Duplicate field in struct literal
-
-        // ==== Control Flow Errors (E0400-E0449) ====
-        E0400_INVALID_BREAK = 400,             // Break outside loop
-        E0401_INVALID_CONTINUE = 401,          // Continue outside loop
-        E0402_INVALID_RETURN = 402,            // Return outside function
-        E0403_MISSING_RETURN = 403,            // Missing return in non-void function
-        E0404_UNREACHABLE_PATTERN = 404,       // Unreachable pattern in match
-        E0405_NON_EXHAUSTIVE_MATCH = 405,      // Non-exhaustive match patterns
-
-        // ==== Memory Management Errors (E0450-E0499) ====
-        E0450_INVALID_BORROW = 450,            // Invalid borrow operation
-        E0451_BORROW_CHECK_FAILED = 451,       // Borrow checker violation
-        E0452_USE_AFTER_MOVE = 452,            // Use after move
-        E0453_DOUBLE_FREE = 453,               // Double free detected
-        E0454_MEMORY_LEAK = 454,               // Potential memory leak
-        E0455_DANGLING_POINTER = 455,          // Dangling pointer access
-
-        // ==== Module System Errors (E0500-E0549) ====
-        E0500_MODULE_NOT_FOUND = 500,          // Module not found
-        E0501_CIRCULAR_IMPORT = 501,           // Circular module import
-        E0502_INVALID_IMPORT = 502,            // Invalid import statement
-        E0503_PRIVATE_SYMBOL_ACCESS = 503,     // Access to private symbol
-        E0504_NAMESPACE_CONFLICT = 504,        // Namespace conflict
-
-        // ==== Code Generation Errors (E0600-E0699) ====
-        E0600_CODEGEN_FAILED = 600,            // General code generation failure
-        E0601_LLVM_ERROR = 601,                // LLVM backend error
-        E0602_INVALID_LLVM_TYPE = 602,         // Invalid LLVM type mapping
-        E0603_INVALID_LLVM_VALUE = 603,        // Invalid LLVM value
-        E0604_UNIMPLEMENTED_INTRINSIC = 604,   // Unimplemented intrinsic function
-        E0605_OPTIMIZATION_FAILED = 605,       // Optimization pass failed
-
-        // ==== Linker Errors (E0700-E0799) ====
-        E0700_LINK_ERROR = 700,                // General linking error
-        E0701_UNDEFINED_SYMBOL_LINK = 701,     // Undefined symbol at link time
-        E0702_DUPLICATE_SYMBOL_LINK = 702,     // Duplicate symbol at link time
-        E0703_LIBRARY_NOT_FOUND = 703,         // Required library not found
-        E0704_INVALID_TARGET = 704,            // Invalid target architecture
-
-        // ==== System/IO Errors (E0800-E0899) ====
-        E0800_FILE_NOT_FOUND = 800,            // Source file not found
-        E0801_FILE_READ_ERROR = 801,           // Error reading file
-        E0802_FILE_WRITE_ERROR = 802,          // Error writing file
-        E0803_PERMISSION_DENIED = 803,         // File permission denied
-        E0804_OUT_OF_MEMORY = 804,             // System out of memory
-        E0805_INTERNAL_ERROR = 805,            // Internal compiler error
-
-        // ==== Warning Codes (W0001-W9999) ====
-        W0001_UNUSED_VARIABLE = 10001,         // Unused variable
-        W0002_UNUSED_FUNCTION = 10002,         // Unused function
-        W0003_UNUSED_IMPORT = 10003,           // Unused import
-        W0004_SHADOWED_VARIABLE = 10004,       // Variable shadows another
-        W0005_IMPLICIT_CONVERSION = 10005,     // Implicit type conversion
-        W0006_LOSSY_CONVERSION = 10006,        // Lossy type conversion
-        W0007_DEPRECATED = 10007,              // Use of deprecated feature
-        W0008_UNNECESSARY_CAST = 10008,        // Unnecessary explicit cast
-        W0009_DEAD_CODE = 10009,               // Dead/unreachable code
-        W0010_MISSING_DOCS = 10010,            // Missing documentation
+        #define X(name, value) name = value,
+        ERROR_CODE_LIST(X)
+        #undef X
     };
 
     // Error code information for rich diagnostics
@@ -173,6 +184,7 @@ namespace Cryo
         static void initialize();
         static const ErrorInfo& get_error_info(ErrorCode code);
         static std::string format_error_code(ErrorCode code);
+        static std::string error_code_to_string(ErrorCode code);
         static bool is_warning(ErrorCode code);
         
     private:

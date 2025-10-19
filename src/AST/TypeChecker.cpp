@@ -1537,8 +1537,21 @@ namespace Cryo
         }
         else
         {
-            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Cannot infer type for variable '" + var_name + "'");
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->create_undefined_symbol_error(var_name, "variable type", node.location());
+            }
+            else
+            {
+                if (_diagnostic_builder) {
+                    Type* expected = _type_context.get_void_type(); // Placeholder for "inferred type" 
+                    Type* found = _type_context.get_unknown_type();
+                    _diagnostic_builder->create_assignment_type_error(expected, found, node.location());
+                } else {
+                    report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                                 "Cannot infer type for variable '" + var_name + "'");
+                }
+            }
             final_type = _type_context.get_unknown_type();
         }
 
@@ -1598,8 +1611,15 @@ namespace Cryo
 
         if (!return_type)
         {
-            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                         "Unable to parse return type: " + return_type_str);
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->create_undefined_symbol_error(return_type_str, "type", node.location());
+            }
+            else
+            {
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                             "Unable to parse return type: " + return_type_str);
+            }
             return_type = _type_context.get_unknown_type();
         }
 
@@ -1613,8 +1633,15 @@ namespace Cryo
                 Type *param_type = resolve_type_with_generic_context(param_type_str);
                 if (!param_type)
                 {
-                    report_error(TypeError::ErrorKind::InvalidOperation, param->location(),
-                                 "Unable to parse parameter type: " + param_type_str);
+                    if (_diagnostic_builder)
+                    {
+                        _diagnostic_builder->create_undefined_symbol_error(param_type_str, "type", param->location());
+                    }
+                    else
+                    {
+                        report_error(TypeError::ErrorKind::UndefinedVariable, param->location(),
+                                     "Unable to parse parameter type: " + param_type_str);
+                    }
                     param_type = _type_context.get_unknown_type();
                 }
                 param_types.push_back(param_type);
@@ -1730,8 +1757,15 @@ namespace Cryo
     {
         if (!_in_function)
         {
-            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                         "Return statement outside of function");
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->create_invalid_operation_error("return", nullptr, nullptr, node.location());
+            }
+            else
+            {
+                report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                             "Return statement outside of function");
+            }
             return;
         }
 
@@ -1757,9 +1791,17 @@ namespace Cryo
             // Void return - check if function expects void
             if (_current_function_return_type && !_current_function_return_type->is_void())
             {
-                report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                             "Function must return a value of type '" +
-                                 _current_function_return_type->to_string() + "'");
+                if (_diagnostic_builder)
+                {
+                    Type* void_type = _type_context.get_void_type();
+                    _diagnostic_builder->create_assignment_type_error(_current_function_return_type, void_type, node.location());
+                }
+                else
+                {
+                    report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                                 "Function must return a value of type '" +
+                                     _current_function_return_type->to_string() + "'");
+                }
             }
         }
     }
@@ -2002,9 +2044,16 @@ namespace Cryo
                     // For assignment, check if right is assignable to left using enhanced compatibility check
                     if (!check_assignment_compatibility(left_type, right_type, node.location()))
                     {
-                        report_error(TypeError::ErrorKind::InvalidAssignment, node.location(),
-                                     "Type mismatch in assignment: cannot assign " +
-                                         right_type->name() + " to " + left_type->name());
+                        if (_diagnostic_builder)
+                        {
+                            _diagnostic_builder->create_invalid_assignment_error(left_type, right_type, node.location());
+                        }
+                        else
+                        {
+                            report_error(TypeError::ErrorKind::InvalidAssignment, node.location(),
+                                         "Type mismatch in assignment: cannot assign " +
+                                             right_type->name() + " to " + left_type->name());
+                        }
                     }
                     // Assignment result has the type of the left operand
                     node.set_resolved_type(left_type);
@@ -2054,16 +2103,22 @@ namespace Cryo
                             }
                             else
                             {
-                                report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                             "Type mismatch in arithmetic operation: " +
-                                                 left_type->name() + " and " + right_type->name());
+                                report_type_mismatch(node.location(), left_type, right_type,
+                                                   "arithmetic operation");
                             }
                         }
                         else
                         {
-                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                         "Type mismatch in arithmetic operation: " +
-                                             left_type->name() + " and " + right_type->name());
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->create_invalid_operation_error("arithmetic", left_type, right_type, node.location());
+                            }
+                            else
+                            {
+                                report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                             "Type mismatch in arithmetic operation: " +
+                                                 left_type->name() + " and " + right_type->name());
+                            }
                         }
                     }
                     // Comparison operations
@@ -2105,9 +2160,16 @@ namespace Cryo
                         }
                         else
                         {
-                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                         "Cannot compare incompatible types: " +
-                                             left_type->name() + " and " + right_type->name());
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->create_invalid_operation_error("comparison", left_type, right_type, node.location());
+                            }
+                            else
+                            {
+                                report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                             "Cannot compare incompatible types: " +
+                                                 left_type->name() + " and " + right_type->name());
+                            }
                         }
                     }
 
@@ -2162,11 +2224,6 @@ namespace Cryo
                         {
                             _diagnostic_builder->create_invalid_dereference_error(operand_type, node.location());
                         }
-                        else if (_diagnostic_manager)
-                        {
-                            SourceRange range(node.location());
-                            _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, range, _source_file);
-                        }
                         else
                         {
                             report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
@@ -2194,8 +2251,15 @@ namespace Cryo
                     }
                     else
                     {
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                     "Logical NOT cannot be applied to non-boolean type: " + operand_type->to_string());
+                        if (_diagnostic_builder)
+                        {
+                            _diagnostic_builder->create_invalid_operation_error("logical NOT", operand_type, nullptr, node.location());
+                        }
+                        else
+                        {
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Logical NOT cannot be applied to non-boolean type: " + operand_type->to_string());
+                        }
                     }
                 }
                 else if (op == TokenKind::TK_PLUSPLUS) // Increment operator (++ prefix or postfix)
@@ -2207,8 +2271,15 @@ namespace Cryo
                     }
                     else
                     {
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                     "Increment operator cannot be applied to non-numeric type: " + operand_type->to_string());
+                        if (_diagnostic_builder)
+                        {
+                            _diagnostic_builder->create_invalid_operation_error("increment", operand_type, nullptr, node.location());
+                        }
+                        else
+                        {
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Increment operator cannot be applied to non-numeric type: " + operand_type->to_string());
+                        }
                     }
                 }
                 else if (op == TokenKind::TK_MINUSMINUS) // Decrement operator (-- prefix or postfix)
@@ -2220,14 +2291,28 @@ namespace Cryo
                     }
                     else
                     {
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                     "Decrement operator cannot be applied to non-numeric type: " + operand_type->to_string());
+                        if (_diagnostic_builder)
+                        {
+                            _diagnostic_builder->create_invalid_operation_error("decrement", operand_type, nullptr, node.location());
+                        }
+                        else
+                        {
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Decrement operator cannot be applied to non-numeric type: " + operand_type->to_string());
+                        }
                     }
                 }
                 else
                 {
-                    report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                 "Unknown unary operator: " + node.operator_token().to_string());
+                    if (_diagnostic_builder)
+                    {
+                        _diagnostic_builder->create_invalid_operation_error(node.operator_token().to_string(), operand_type, nullptr, node.location());
+                    }
+                    else
+                    {
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Unknown unary operator: " + node.operator_token().to_string());
+                    }
                 }
             }
         }
@@ -2277,8 +2362,15 @@ namespace Cryo
                         // Validate that we have exactly one argument for primitive type constructors
                         if (arg_types.size() != 1)
                         {
-                            report_error(TypeError::ErrorKind::TooManyArguments, node.location(),
-                                         "Primitive type constructor requires exactly one argument");
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->create_too_many_args_error(callee_name + " constructor", 1, arg_types.size(), node.location());
+                            }
+                            else
+                            {
+                                report_error(TypeError::ErrorKind::TooManyArguments, node.location(),
+                                             "Primitive type constructor requires exactly one argument");
+                            }
                             node.set_resolved_type(_type_context.get_unknown_type());
                             return;
                         }
@@ -2293,8 +2385,15 @@ namespace Cryo
                         }
                         else
                         {
-                            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                                         "Cannot convert " + arg_type->to_string() + " to " + callee_name);
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->create_assignment_type_error(target_type, arg_type, node.location());
+                            }
+                            else
+                            {
+                                report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                                             "Cannot convert " + arg_type->to_string() + " to " + callee_name);
+                            }
                             node.set_resolved_type(_type_context.get_unknown_type());
                             return;
                         }
@@ -2348,8 +2447,15 @@ namespace Cryo
             // If callee type is not resolved, fall back to unknown
             if (!callee_type)
             {
-                report_error(TypeError::ErrorKind::NonCallableType, node.location(),
-                             "Cannot determine type of expression being called");
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->create_non_callable_error(nullptr, node.location());
+                }
+                else
+                {
+                    report_error(TypeError::ErrorKind::NonCallableType, node.location(),
+                                 "Cannot determine type of expression being called");
+                }
                 node.set_resolved_type(_type_context.get_unknown_type());
                 return;
             }
@@ -2373,10 +2479,9 @@ namespace Cryo
             }
 
             // Not callable
-            if (_diagnostic_manager)
+            if (_diagnostic_builder)
             {
-                SourceRange range(node.location());
-                _diagnostic_manager->create_error(ErrorCode::E0213_NON_CALLABLE, range, _source_file);
+                _diagnostic_builder->create_non_callable_error(callee_type, node.location());
             }
             else
             {
@@ -2459,8 +2564,16 @@ namespace Cryo
         else
         {
             // Type not found - report error and set to unknown
-            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                         "Undefined type '" + node.type_name() + "' in constructor call");
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->create_undefined_symbol_error(node.type_name(), "type", node.location());
+            }
+            else
+            {
+                // Fallback to old error reporting
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                             "Undefined type '" + node.type_name() + "' in constructor call");
+            }
             node.set_type("unknown");
         }
 
@@ -2532,8 +2645,12 @@ namespace Cryo
         else
         {
             // Type not found - report error and set to unknown
-            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                         "Undefined type '" + type_name + "' in sizeof expression");
+            if (_diagnostic_builder) {
+                _diagnostic_builder->create_undefined_variable_error(type_name, "type in sizeof expression", node.location());
+            } else {
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                             "Undefined type '" + type_name + "' in sizeof expression");
+            }
             node.set_type("u64"); // Still return u64 even on error
         }
     }
@@ -2619,8 +2736,14 @@ namespace Cryo
         if (!object_type)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Object type is null, cannot resolve member access");
-            report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
-                         "Cannot resolve type for member access");
+            if (_diagnostic_builder) {
+                Type* expected_type = _type_context.get_struct_type(""); // Placeholder for "object type"
+                Type* found_type = _type_context.get_unknown_type();
+                _diagnostic_builder->create_assignment_type_error(expected_type, found_type, node.location());
+            } else {
+                report_error(TypeError::ErrorKind::TypeMismatch, node.location(),
+                             "Cannot resolve type for member access");
+            }
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
@@ -2664,8 +2787,12 @@ namespace Cryo
                 node.set_resolved_type(_type_context.get_u64_type());
                 return;
             }
-            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                         "Unknown array property '" + member_name + "' for array type");
+            if (_diagnostic_builder) {
+                _diagnostic_builder->create_undefined_variable_error(member_name, "array property", node.location());
+            } else {
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                             "Unknown array property '" + member_name + "' for array type");
+            }
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
@@ -2823,9 +2950,18 @@ namespace Cryo
                   effective_type ? effective_type->name() : "null",
                   effective_type ? static_cast<int>(effective_type->kind()) : -1);
 
-        std::string error_msg = "Unknown struct type or field in member access: " + member_name + " (type: " +
-                                (effective_type ? effective_type->name() : "null") + ")";
-        report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), error_msg);
+        // Use enhanced diagnostic builder for field access errors
+        if (_diagnostic_builder)
+        {
+            _diagnostic_builder->create_invalid_member_access_error(member_name, effective_type, node.location());
+        }
+        else
+        {
+            // Fallback to old error reporting
+            std::string error_msg = "Unknown struct type or field in member access: " + member_name + " (type: " +
+                                    (effective_type ? effective_type->name() : "null") + ")";
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), error_msg);
+        }
         node.set_resolved_type(_type_context.get_unknown_type());
     }
 
@@ -3317,7 +3453,11 @@ namespace Cryo
             TypedSymbol *parent_symbol = _symbol_table->lookup_symbol(base_trait.name);
             if (!parent_symbol)
             {
-                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), "Undefined parent trait '" + base_trait.name + "'");
+                if (_diagnostic_builder) {
+                    _diagnostic_builder->create_undefined_variable_error(base_trait.name, "parent trait", node.location());
+                } else {
+                    report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), "Undefined parent trait '" + base_trait.name + "'");
+                }
             }
             else if (parent_symbol->type->kind() != TypeKind::Trait)
             {
@@ -4535,12 +4675,20 @@ namespace Cryo
             std::string inline_label = "expected `" + expected_name + "`, found `" + actual_name + "`";
             value_span.set_label(inline_label);
 
-            // Create enhanced diagnostic with proper message
+            // Create enhanced diagnostic with proper message and type context
             std::string message = "type mismatch in " + context;
-            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0200_TYPE_MISMATCH, value_span.to_source_range(), _source_file);
+            
+            // Create context for structured payload
+            std::any type_context = std::make_pair(expected, actual);
+            
+            auto &diagnostic = _diagnostic_manager->create_diagnostic(ErrorCode::E0200_TYPE_MISMATCH, 
+                                                                     value_span.to_source_range(), 
+                                                                     _source_file, 
+                                                                     message, 
+                                                                     type_context);
 
-            // Add primary span (the problematic value)
-            // No need for with_primary_span since it's already set in create_error
+            // Add primary span with the smart label (this preserves the label information)
+            diagnostic.with_primary_span(value_span);
 
             // For variable declarations, create a better secondary span for type annotation
             if (context == "variable initialization")
@@ -4550,7 +4698,8 @@ namespace Cryo
                 // TODO: Add proper type annotation span tracking in the parser
             }
 
-            // Add context-aware suggestions based on the types
+            // Add context-aware suggestions based on the types - TEMPORARILY DISABLED
+            /*
             if (expected_name == "int" && actual_name == "string")
             {
                 diagnostic.add_help("if you meant to create a string variable, remove the type annotation");
@@ -4577,6 +4726,7 @@ namespace Cryo
                 diagnostic.add_help("use dereference operator `*` to get the value");
                 diagnostic.add_help("use address-of (&) or dereference (*) operators as appropriate");
             }
+            */
 
             // Diagnostic is automatically stored by create_error, no emit() needed
         }
