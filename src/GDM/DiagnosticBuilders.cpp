@@ -1014,7 +1014,7 @@ namespace Cryo
         span.set_label("undefined " + symbol_type);
         std::string message = "undefined " + symbol_type + " `" + symbol_name + "`";
 
-        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file, message);
 
         // Add suggestions if available
         for (const auto &suggestion : suggestions)
