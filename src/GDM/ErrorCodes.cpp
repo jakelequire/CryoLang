@@ -176,6 +176,13 @@ namespace Cryo
                 "Provide the correct number of arguments as defined in the function declaration."
             ));
 
+        _error_info.emplace(ErrorCode::E0209_INVALID_OPERATION,
+            ErrorInfo(ErrorCode::E0209_INVALID_OPERATION,
+                "invalid operation",
+                "This operation cannot be performed on the given type(s).",
+                "Check that the operands are compatible with this operation."
+            ));
+
         _error_info.emplace(ErrorCode::E0222_INVALID_DEREF,
             ErrorInfo(ErrorCode::E0222_INVALID_DEREF,
                 "invalid dereference",
@@ -188,6 +195,20 @@ namespace Cryo
                 "invalid address-of operation",
                 "Cannot take the address of this expression.",
                 "The & operator can only be used with lvalue expressions and variables."
+            ));
+
+        _error_info.emplace(ErrorCode::E0229_INVALID_BINARY_OP,
+            ErrorInfo(ErrorCode::E0229_INVALID_BINARY_OP,
+                "invalid binary operation",
+                "Cannot perform this operation on the given types.",
+                "Check that the operands are compatible with this operator."
+            ));
+
+        _error_info.emplace(ErrorCode::E0230_INVALID_UNARY_OP,
+            ErrorInfo(ErrorCode::E0230_INVALID_UNARY_OP,
+                "invalid unary operation",
+                "Cannot perform this unary operation on the given type.",
+                "Check that the operand is compatible with this operator."
             ));
 
         // ==== Control Flow Errors ====

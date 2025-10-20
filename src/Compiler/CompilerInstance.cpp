@@ -438,6 +438,9 @@ namespace Cryo
                     case TypeError::ErrorKind::RedefinedSymbol:
                         error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
                         break;
+                    case TypeError::ErrorKind::InvalidOperation:
+                        error_code = ErrorCode::E0209_INVALID_OPERATION;
+                        break;
                     default:
                         error_code = ErrorCode::E0000_UNKNOWN;
                         break;
