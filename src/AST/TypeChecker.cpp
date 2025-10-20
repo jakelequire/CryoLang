@@ -2133,7 +2133,11 @@ namespace Cryo
                         }
                         else
                         {
-                            _diagnostic_builder->create_invalid_operation_error("arithmetic", left_type, right_type, node.location());
+                            std::string left_name = left_type ? left_type->to_string() : "unknown";
+                            std::string right_name = right_type ? right_type->to_string() : "unknown";
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(), 
+                                        "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'");
+                            node.set_resolved_type(_type_context.get_unknown_type());
                         }
                     }
                     // Comparison operations
@@ -2226,7 +2230,10 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_dereference_error(operand_type, node.location());
+                        std::string type_name = operand_type ? operand_type->to_string() : "unknown";
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(), 
+                                    "Cannot dereference value of type '" + type_name + "'");
+                        node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
                 else if (op == TokenKind::TK_MINUS) // Unary minus
@@ -2237,7 +2244,10 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("unary minus", operand_type, nullptr, node.location());
+                        std::string type_name = operand_type ? operand_type->to_string() : "unknown";
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(), 
+                                    "Cannot apply unary minus to type '" + type_name + "'");
+                        node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
                 else if (op == TokenKind::TK_EXCLAIM) // Logical NOT
@@ -2712,7 +2722,9 @@ namespace Cryo
             effective_type->kind() != TypeKind::Enum &&
             effective_type->kind() != TypeKind::Generic)
         {
-            _diagnostic_builder->create_invalid_member_access_error(member_name, effective_type, node.location());
+            std::string type_name = effective_type ? effective_type->to_string() : "unknown";
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), 
+                        "No field '" + member_name + "' on type '" + type_name + "'");
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
@@ -2843,7 +2855,9 @@ namespace Cryo
             {
                 // For other primitive types, we can add support for methods as needed
                 // For now, reject member access on non-enum primitive types
-                _diagnostic_builder->create_invalid_member_access_error(member_name, effective_type, node.location());
+                std::string type_name = effective_type ? effective_type->to_string() : "unknown";
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), 
+                            "No field '" + member_name + "' on type '" + type_name + "'");
                 node.set_resolved_type(_type_context.get_unknown_type());
                 return;
             }
@@ -2858,7 +2872,9 @@ namespace Cryo
                   effective_type ? static_cast<int>(effective_type->kind()) : -1);
 
         // Use enhanced diagnostic builder for field access errors
-        _diagnostic_builder->create_invalid_member_access_error(member_name, effective_type, node.location());
+        std::string type_name = effective_type ? effective_type->to_string() : "unknown";
+        report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), 
+                    "No field '" + member_name + "' on type '" + type_name + "'");
         node.set_resolved_type(_type_context.get_unknown_type());
     }
 
@@ -4433,6 +4449,8 @@ namespace Cryo
 
             SourceRange range(loc);
             _diagnostic_manager->create_error(error_code, range, _source_file, message);
+            // Also add to internal errors for has_errors() check
+            _errors.emplace_back(kind, loc, message);
         }
         else
         {

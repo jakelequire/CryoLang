@@ -381,7 +381,7 @@ namespace Cryo
 
         std::string message = "No field '" + field_name + "' on type '" + type_name + "'";
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file);
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file, message);
         diagnostic.with_primary_span(span);
 
         // TEMPORARILY DISABLED
@@ -399,7 +399,7 @@ namespace Cryo
 
         std::string message = "Cannot dereference value of type '" + type_name + "'";
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, span.to_source_range(), _source_file);
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, span.to_source_range(), _source_file, message);
         diagnostic.with_primary_span(span);
 
         diagnostic.add_note("Cannot dereference a non-pointer type.");
@@ -1086,7 +1086,7 @@ namespace Cryo
 
         std::string message = "Cannot dereference value of type '" + type_name + "'";
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, span.to_source_range(), _source_file);
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, span.to_source_range(), _source_file, message);
         diagnostic.with_primary_span(span);
 
         diagnostic.add_note("Cannot dereference a non-pointer type.");
@@ -1106,7 +1106,7 @@ namespace Cryo
 
         std::string message = "No field '" + member_name + "' on type '" + type_name + "'";
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file);
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file, message);
         diagnostic.with_primary_span(span);
 
         diagnostic.add_note("This field does not exist in the struct or class.");
@@ -1135,7 +1135,7 @@ namespace Cryo
             ("Cannot apply '" + operation + "' to type '" + left_name + "'");
 
         ErrorCode error_code = right_type ? ErrorCode::E0229_INVALID_BINARY_OP : ErrorCode::E0230_INVALID_UNARY_OP;
-        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file);
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file, message);
         diagnostic.with_primary_span(span);
 
         return diagnostic;
