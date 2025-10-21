@@ -250,7 +250,7 @@ namespace Cryo
         // Diagnostic manager for error reporting (optional)
         DiagnosticManager *_diagnostic_manager = nullptr;
         std::string _source_file; // Current source file being checked
-        
+
         // Diagnostic builder for enhanced error reporting
         std::unique_ptr<TypeCheckerDiagnosticBuilder> _diagnostic_builder;
 
@@ -297,6 +297,9 @@ namespace Cryo
         const std::vector<TypeWarning> &warnings() const { return _warnings; }
         bool has_warnings() const { return !_warnings.empty(); }
         size_t warning_count() const { return _warnings.size(); }
+
+        // Diagnostic manager status
+        bool has_diagnostic_manager() const { return _diagnostic_manager != nullptr; }
 
         // Type table access
         void print_type_table(std::ostream &os = std::cout) const { _symbol_table->print_type_table(os); }
@@ -377,6 +380,7 @@ namespace Cryo
         // Error reporting
         [[deprecated("Use _diagnostic_builder->create_*_error() methods instead")]]
         void report_error(TypeError::ErrorKind kind, SourceLocation loc, const std::string &message);
+        void report_error(TypeError::ErrorKind kind, SourceLocation loc, const std::string &message, ASTNode *node);
         void report_warning(TypeWarning::WarningKind kind, SourceLocation loc, const std::string &message);
         void report_conversion_warning(TypeWarning::WarningKind kind, SourceLocation loc,
                                        const std::string &message, Type *from, Type *to);

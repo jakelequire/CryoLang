@@ -420,37 +420,42 @@ namespace Cryo
             }
             if (_type_checker->has_errors())
             {
-                // Convert type errors to diagnostic manager errors
-                for (const auto &type_error : _type_checker->errors())
+                // Only convert type errors to diagnostic manager errors if TypeChecker doesn't have its own diagnostic manager
+                // This prevents duplicate error reporting
+                if (!_type_checker->has_diagnostic_manager())
                 {
-                    ErrorCode error_code = ErrorCode::E0000_UNKNOWN;
-                    switch (type_error.kind)
+                    // Convert type errors to diagnostic manager errors
+                    for (const auto &type_error : _type_checker->errors())
                     {
-                    case TypeError::ErrorKind::TypeMismatch:
-                        error_code = ErrorCode::E0200_TYPE_MISMATCH;
-                        break;
-                    case TypeError::ErrorKind::UndefinedVariable:
-                        error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
-                        break;
-                    case TypeError::ErrorKind::UndefinedFunction:
-                        error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
-                        break;
-                    case TypeError::ErrorKind::RedefinedSymbol:
-                        error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
-                        break;
-                    case TypeError::ErrorKind::InvalidOperation:
-                        error_code = ErrorCode::E0209_INVALID_OPERATION;
-                        break;
-                    default:
-                        error_code = ErrorCode::E0000_UNKNOWN;
-                        break;
-                    }
+                        ErrorCode error_code = ErrorCode::E0000_UNKNOWN;
+                        switch (type_error.kind)
+                        {
+                        case TypeError::ErrorKind::TypeMismatch:
+                            error_code = ErrorCode::E0200_TYPE_MISMATCH;
+                            break;
+                        case TypeError::ErrorKind::UndefinedVariable:
+                            error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
+                            break;
+                        case TypeError::ErrorKind::UndefinedFunction:
+                            error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
+                            break;
+                        case TypeError::ErrorKind::RedefinedSymbol:
+                            error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
+                            break;
+                        case TypeError::ErrorKind::InvalidOperation:
+                            error_code = ErrorCode::E0209_INVALID_OPERATION;
+                            break;
+                        default:
+                            error_code = ErrorCode::E0000_UNKNOWN;
+                            break;
+                        }
 
-                    // Create better ranges for specific error types
-                    // For now, use single-position ranges - the diagnostic formatter will handle the display
-                    SourceRange range = SourceRange(type_error.location);
-                    _diagnostic_manager->create_error(error_code,
-                                                      range, _source_file, type_error.message);
+                        // Create better ranges for specific error types
+                        // For now, use single-position ranges - the diagnostic formatter will handle the display
+                        SourceRange range = SourceRange(type_error.location);
+                        _diagnostic_manager->create_error(error_code,
+                                                          range, _source_file, type_error.message);
+                    }
                 }
 
                 if (_debug_mode)
@@ -1325,14 +1330,15 @@ namespace Cryo
     void CompilerInstance::inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name)
     {
         // Special handling for runtime files in stdlib mode - they need access to intrinsics
-        if (_stdlib_compilation_mode && 
+        if (_stdlib_compilation_mode &&
             (_source_file.find("runtime/runtime.cryo") != std::string::npos ||
              _source_file.find("stdlib/runtime/runtime.cryo") != std::string::npos))
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading intrinsics for runtime compilation");
-            
+
             // Load intrinsics for runtime compilation by importing the compiled stdlib
-            try {
+            try
+            {
                 // Create a synthetic ImportDeclarationNode for core/intrinsics
                 auto intrinsics_import = std::make_unique<ImportDeclarationNode>(
                     SourceLocation(0, 0),                       // synthetic location
@@ -1361,7 +1367,7 @@ namespace Cryo
                     LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to load intrinsics for runtime: {}", intrinsics_result.error_message);
                 }
             }
-            catch (const std::exception& e)
+            catch (const std::exception &e)
             {
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "Exception loading intrinsics for runtime: {}", e.what());
             }
@@ -1448,7 +1454,7 @@ namespace Cryo
                 current_scope->register_namespace(intrinsics_result.module_name, intrinsics_result.symbol_map);
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported intrinsics: registered namespace '{}' with {} symbols",
                           intrinsics_result.module_name, intrinsics_result.symbol_map.size());
-                
+
                 // Also register under the short name "Intrinsics" for convenience
                 // This allows both Intrinsics::__printf__ and std::Intrinsics::__printf__ to work
                 current_scope->register_namespace("Intrinsics", intrinsics_result.symbol_map);
@@ -1487,7 +1493,7 @@ namespace Cryo
                 current_scope->register_namespace(runtime_result.module_name, runtime_result.symbol_map);
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: registered namespace '{}' with {} symbols",
                           runtime_result.module_name, runtime_result.symbol_map.size());
-                
+
                 // Also register under the short name "Runtime" for convenience
                 // This allows both Runtime::cryo_alloc and std::Runtime::cryo_alloc to work
                 current_scope->register_namespace("Runtime", runtime_result.symbol_map);

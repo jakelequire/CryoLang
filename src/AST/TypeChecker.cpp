@@ -1543,8 +1543,8 @@ namespace Cryo
             }
             else
             {
-                Type* expected = _type_context.get_void_type(); // Placeholder for "inferred type" 
-                Type* found = _type_context.get_unknown_type();
+                Type *expected = _type_context.get_void_type(); // Placeholder for "inferred type"
+                Type *found = _type_context.get_unknown_type();
                 _diagnostic_builder->create_assignment_type_error(expected, found, node.location());
             }
             final_type = _type_context.get_unknown_type();
@@ -1714,7 +1714,7 @@ namespace Cryo
     void TypeChecker::visit(IntrinsicDeclarationNode &node)
     {
         const std::string &func_name = node.name();
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Type checking intrinsic function: {}", func_name);
 
         // Create function type from intrinsic declaration
@@ -1753,8 +1753,8 @@ namespace Cryo
         }
 
         // Create function type for the intrinsic
-        FunctionType *func_type = static_cast<FunctionType*>(_type_context.create_function_type(return_type, param_types));
-        
+        FunctionType *func_type = static_cast<FunctionType *>(_type_context.create_function_type(return_type, param_types));
+
         // Register the intrinsic function in the symbol table with special handling
         // Since we don't have a specific method for intrinsics, we'll declare it as a normal symbol
         if (!_symbol_table->declare_symbol(func_name, func_type, node.location()))
@@ -1816,7 +1816,7 @@ namespace Cryo
             // Void return - check if function expects void
             if (_current_function_return_type && !_current_function_return_type->is_void())
             {
-                Type* void_type = _type_context.get_void_type();
+                Type *void_type = _type_context.get_void_type();
                 _diagnostic_builder->create_assignment_type_error(_current_function_return_type, void_type, node.location());
             }
         }
@@ -2128,15 +2128,15 @@ namespace Cryo
                             else
                             {
                                 report_type_mismatch(node.location(), left_type, right_type,
-                                                   "arithmetic operation");
+                                                     "arithmetic operation");
                             }
                         }
                         else
                         {
                             std::string left_name = left_type ? left_type->to_string() : "unknown";
                             std::string right_name = right_type ? right_type->to_string() : "unknown";
-                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(), 
-                                        "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'");
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'");
                             node.set_resolved_type(_type_context.get_unknown_type());
                         }
                     }
@@ -2231,8 +2231,8 @@ namespace Cryo
                     else
                     {
                         std::string type_name = operand_type ? operand_type->to_string() : "unknown";
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(), 
-                                    "Cannot dereference value of type '" + type_name + "'");
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Cannot dereference value of type '" + type_name + "'");
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -2245,8 +2245,8 @@ namespace Cryo
                     else
                     {
                         std::string type_name = operand_type ? operand_type->to_string() : "unknown";
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(), 
-                                    "Cannot apply unary minus to type '" + type_name + "'");
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Cannot apply unary minus to type '" + type_name + "'");
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -2406,7 +2406,7 @@ namespace Cryo
             // If callee type is not resolved, fall back to unknown
             if (!callee_type)
             {
-                _diagnostic_builder->create_non_callable_error(nullptr, node.location());
+                _diagnostic_builder->create_non_callable_error(nullptr, node.location(), &node);
                 node.set_resolved_type(_type_context.get_unknown_type());
                 return;
             }
@@ -2430,7 +2430,7 @@ namespace Cryo
             }
 
             // Not callable
-            _diagnostic_builder->create_non_callable_error(callee_type, node.location());
+            _diagnostic_builder->create_non_callable_error(callee_type, node.location(), &node);
             node.set_resolved_type(_type_context.get_unknown_type());
         }
         else
@@ -2665,8 +2665,8 @@ namespace Cryo
         if (!object_type)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Object type is null, cannot resolve member access");
-            Type* expected_type = _type_context.get_struct_type(""); // Placeholder for "object type"
-            Type* found_type = _type_context.get_unknown_type();
+            Type *expected_type = _type_context.get_struct_type(""); // Placeholder for "object type"
+            Type *found_type = _type_context.get_unknown_type();
             _diagnostic_builder->create_assignment_type_error(expected_type, found_type, node.location());
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
@@ -2723,8 +2723,8 @@ namespace Cryo
             effective_type->kind() != TypeKind::Generic)
         {
             std::string type_name = effective_type ? effective_type->to_string() : "unknown";
-            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), 
-                        "No field '" + member_name + "' on type '" + type_name + "'");
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                         "No field '" + member_name + "' on type '" + type_name + "'", &node);
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
@@ -2856,8 +2856,8 @@ namespace Cryo
                 // For other primitive types, we can add support for methods as needed
                 // For now, reject member access on non-enum primitive types
                 std::string type_name = effective_type ? effective_type->to_string() : "unknown";
-                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), 
-                            "No field '" + member_name + "' on type '" + type_name + "'");
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                             "No field '" + member_name + "' on type '" + type_name + "'", &node);
                 node.set_resolved_type(_type_context.get_unknown_type());
                 return;
             }
@@ -2873,8 +2873,8 @@ namespace Cryo
 
         // Use enhanced diagnostic builder for field access errors
         std::string type_name = effective_type ? effective_type->to_string() : "unknown";
-        report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), 
-                    "No field '" + member_name + "' on type '" + type_name + "'");
+        report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                     "No field '" + member_name + "' on type '" + type_name + "'", &node);
         node.set_resolved_type(_type_context.get_unknown_type());
     }
 
@@ -4459,6 +4459,24 @@ namespace Cryo
         }
     }
 
+    void TypeChecker::report_error(TypeError::ErrorKind kind, SourceLocation loc, const std::string &message, ASTNode *node)
+    {
+        // Check if this node already has an error reported to prevent duplicates
+        if (node && node->has_error())
+        {
+            return; // Skip duplicate error reporting
+        }
+
+        // Mark this node as having an error
+        if (node)
+        {
+            node->mark_error();
+        }
+
+        // Delegate to the original report_error method
+        report_error(kind, loc, message);
+    }
+
     void TypeChecker::report_warning(TypeWarning::WarningKind kind, SourceLocation loc, const std::string &message)
     {
         _warnings.emplace_back(kind, loc, message);
@@ -4576,15 +4594,15 @@ namespace Cryo
 
             // Create enhanced diagnostic with proper message and type context
             std::string message = "type mismatch in " + context;
-            
+
             // Create context for structured payload
             std::any type_context = std::make_pair(expected, actual);
-            
-            auto &diagnostic = _diagnostic_manager->create_diagnostic(ErrorCode::E0200_TYPE_MISMATCH, 
-                                                                     value_span.to_source_range(), 
-                                                                     _source_file, 
-                                                                     message, 
-                                                                     type_context);
+
+            auto &diagnostic = _diagnostic_manager->create_diagnostic(ErrorCode::E0200_TYPE_MISMATCH,
+                                                                      value_span.to_source_range(),
+                                                                      _source_file,
+                                                                      message,
+                                                                      type_context);
 
             // Add primary span with the smart label (this preserves the label information)
             diagnostic.with_primary_span(value_span);

@@ -197,6 +197,7 @@ namespace Cryo
     protected:
         NodeKind _kind;
         SourceLocation _location;
+        mutable bool _has_error = false; // Track if this node already has errors reported
 
     public:
         ASTNode(NodeKind kind, SourceLocation location)
@@ -204,6 +205,11 @@ namespace Cryo
 
         NodeKind kind() const { return _kind; }
         const SourceLocation &location() const { return _location; }
+
+        // Error tracking to prevent duplicate error reports
+        bool has_error() const { return _has_error; }
+        void mark_error() const { _has_error = true; }
+        void clear_error() const { _has_error = false; }
 
         virtual void print(std::ostream &os, int indent = 0) const = 0;
         virtual void accept(ASTVisitor &visitor) = 0;
