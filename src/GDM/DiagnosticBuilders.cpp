@@ -115,6 +115,12 @@ namespace Cryo
         }
     }
 
+    bool BaseDiagnosticBuilder::should_skip_error_reporting(ASTNode *node) const
+    {
+        // Skip if node is null or already has an error reported
+        return !node || node->has_error();
+    }
+
     //===================================================================
     // CodegenDiagnosticBuilder Implementation
     //===================================================================
@@ -123,21 +129,33 @@ namespace Cryo
                                                             ASTNode *node,
                                                             const std::string &llvm_message)
     {
+        // Check if we should skip error reporting for this node to prevent duplicates
+        if (should_skip_error_reporting(node))
+        {
+            // Return a dummy/placeholder diagnostic to maintain interface compatibility
+            static Diagnostic dummy_diagnostic(ErrorCode::E0101_UNEXPECTED_TOKEN, DiagnosticSeverity::Error,
+                                               DiagnosticCategory::CodeGen, "duplicate error suppressed",
+                                               SourceRange{}, "");
+            return dummy_diagnostic;
+        }
+
         SourceSpan span = create_node_span(node);
 
         // Create more specific labels based on the actual error message
         std::string label = "compilation error";
         std::string message = operation;
-        
 
         if (llvm_message.find("Unknown type in new expression") != std::string::npos)
         {
             // Extract the specific type name for a more informative label
             size_t colon_pos = llvm_message.rfind(": ");
-            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length()) {
+            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length())
+            {
                 std::string type_name = llvm_message.substr(colon_pos + 2);
                 label = "unknown type '" + type_name + "'";
-            } else {
+            }
+            else
+            {
                 label = "unknown type";
             }
             message = operation + ": " + llvm_message; // Combine both parts
@@ -146,10 +164,13 @@ namespace Cryo
         {
             // Extract the specific type name for constructor errors
             size_t colon_pos = llvm_message.rfind(": ");
-            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length()) {
+            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length())
+            {
                 std::string type_name = llvm_message.substr(colon_pos + 2);
                 label = "no constructor for '" + type_name + "'";
-            } else {
+            }
+            else
+            {
                 label = "constructor not found";
             }
             message = operation + ": " + llvm_message;
@@ -173,10 +194,13 @@ namespace Cryo
         {
             // Extract the specific field name
             size_t colon_pos = llvm_message.rfind(": ");
-            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length()) {
+            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length())
+            {
                 std::string field_name = llvm_message.substr(colon_pos + 2);
                 label = "field '" + field_name + "' not found";
-            } else {
+            }
+            else
+            {
                 label = "field not found";
             }
             message = operation + ": " + llvm_message;
@@ -226,16 +250,22 @@ namespace Cryo
         {
             // Extract the specific struct type name
             size_t colon_pos = llvm_message.rfind(": ");
-            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length()) {
+            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length())
+            {
                 std::string remaining = llvm_message.substr(colon_pos + 2);
                 size_t space_pos = remaining.find(" ");
-                if (space_pos != std::string::npos) {
+                if (space_pos != std::string::npos)
+                {
                     std::string type_name = remaining.substr(0, space_pos);
                     label = "unknown struct '" + type_name + "'";
-                } else {
+                }
+                else
+                {
                     label = "unknown struct type";
                 }
-            } else {
+            }
+            else
+            {
                 label = "unknown struct type";
             }
             message = operation + ": " + llvm_message;
@@ -260,7 +290,7 @@ namespace Cryo
                 message += ": " + llvm_message;
             }
         }
-        
+
         // Set the label after determining the specific type
         span.set_label(label);
 
@@ -299,6 +329,12 @@ namespace Cryo
             diagnostic.add_help("try simplifying the expression or check for type compatibility issues");
         }
 
+        // Mark the node as having an error to prevent duplicate reporting
+        if (node)
+        {
+            node->mark_error();
+        }
+
         return diagnostic;
     }
 
@@ -306,45 +342,49 @@ namespace Cryo
                                                                     ASTNode *node,
                                                                     const std::string &reason)
     {
-        SourceSpan span = create_node_span(node);
-        std::string type_name = cryo_type ? cryo_type->to_string() : "unknown";
-        span.set_label("cannot map type '" + type_name + "' to LLVM");
+        return *create_diagnostic_with_error_tracking(node, [&]()
+                                                      {
+            SourceSpan span = create_node_span(node);
+            std::string type_name = cryo_type ? cryo_type->to_string() : "unknown";
+            span.set_label("cannot map type '" + type_name + "' to LLVM");
 
-        std::string message = "failed to map Cryo type '" + type_name + "' to LLVM type";
-        if (!reason.empty())
-        {
-            message += ": " + reason;
-        }
+            std::string message = "failed to map Cryo type '" + type_name + "' to LLVM type";
+            if (!reason.empty())
+            {
+                message += ": " + reason;
+            }
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0602_INVALID_LLVM_TYPE, span.to_source_range(), _source_file);
-        diagnostic.with_primary_span(span);
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0602_INVALID_LLVM_TYPE, span.to_source_range(), _source_file);
+            diagnostic.with_primary_span(span);
 
-        diagnostic.add_note("Type mapping converts Cryo types to LLVM representations");
-        diagnostic.add_help("ensure the type is properly defined and supported");
+            diagnostic.add_note("Type mapping converts Cryo types to LLVM representations");
+            diagnostic.add_help("ensure the type is properly defined and supported");
 
-        return diagnostic;
+            return &diagnostic; });
     }
 
     Diagnostic &CodegenDiagnosticBuilder::create_value_generation_error(const std::string &value_type,
                                                                         ASTNode *node,
                                                                         const std::string &context)
     {
-        SourceSpan span = create_node_span(node);
-        span.set_label("failed to generate " + value_type + " value");
+        return *create_diagnostic_with_error_tracking(node, [&]()
+                                                      {
+            SourceSpan span = create_node_span(node);
+            span.set_label("failed to generate " + value_type + " value");
 
-        std::string message = "code generation failed for " + value_type;
-        if (!context.empty())
-        {
-            message += " in " + context;
-        }
+            std::string message = "code generation failed for " + value_type;
+            if (!context.empty())
+            {
+                message += " in " + context;
+            }
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0603_INVALID_LLVM_VALUE, span.to_source_range(), _source_file);
-        diagnostic.with_primary_span(span);
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0603_INVALID_LLVM_VALUE, span.to_source_range(), _source_file);
+            diagnostic.with_primary_span(span);
 
-        diagnostic.add_note("Value generation creates LLVM instructions for expressions");
-        add_common_help(diagnostic, ErrorCode::E0600_CODEGEN_FAILED);
+            diagnostic.add_note("Value generation creates LLVM instructions for expressions");
+            add_common_help(diagnostic, ErrorCode::E0600_CODEGEN_FAILED);
 
-        return diagnostic;
+            return &diagnostic; });
     }
 
     Diagnostic &CodegenDiagnosticBuilder::create_invalid_control_flow_error(const std::string &statement_type,
@@ -409,18 +449,20 @@ namespace Cryo
     Diagnostic &CodegenDiagnosticBuilder::create_allocation_error(const std::string &allocation_type,
                                                                   ASTNode *node)
     {
-        SourceSpan span = create_node_span(node);
-        span.set_label("allocation failed");
+        return *create_diagnostic_with_error_tracking(node, [&]()
+                                                      {
+            SourceSpan span = create_node_span(node);
+            span.set_label("allocation failed");
 
-        std::string message = "failed to allocate " + allocation_type;
+            std::string message = "failed to allocate " + allocation_type;
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0600_CODEGEN_FAILED, span.to_source_range(), _source_file);
-        diagnostic.with_primary_span(span);
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0600_CODEGEN_FAILED, span.to_source_range(), _source_file);
+            diagnostic.with_primary_span(span);
 
-        diagnostic.add_note("Memory allocation failed during code generation");
-        diagnostic.add_help("this may indicate a compiler bug or system resource limitation");
+            diagnostic.add_note("Memory allocation failed during code generation");
+            diagnostic.add_help("this may indicate a compiler bug or system resource limitation");
 
-        return diagnostic;
+            return &diagnostic; });
     }
 
     Diagnostic &CodegenDiagnosticBuilder::create_function_signature_error(const std::string &function_name,
@@ -449,68 +491,74 @@ namespace Cryo
                                                              ASTNode *node,
                                                              const std::string &details)
     {
-        SourceSpan span = create_node_span(node);
-        span.set_label("array " + operation + " failed");
+        return *create_diagnostic_with_error_tracking(node, [&]()
+                                                      {
+            SourceSpan span = create_node_span(node);
+            span.set_label("array " + operation + " failed");
 
-        std::string message = "array " + operation + " error";
-        if (!details.empty())
-        {
-            message += ": " + details;
-        }
+            std::string message = "array " + operation + " error";
+            if (!details.empty())
+            {
+                message += ": " + details;
+            }
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0224_INVALID_INDEX, span.to_source_range(), _source_file);
-        diagnostic.with_primary_span(span);
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0224_INVALID_INDEX, span.to_source_range(), _source_file);
+            diagnostic.with_primary_span(span);
 
-        diagnostic.add_note("Array operations require valid indices and compatible types");
-        diagnostic.add_help("ensure array indices are integers and within bounds");
+            diagnostic.add_note("Array operations require valid indices and compatible types");
+            diagnostic.add_help("ensure array indices are integers and within bounds");
 
-        return diagnostic;
+            return &diagnostic; });
     }
 
     Diagnostic &CodegenDiagnosticBuilder::create_field_access_error(const std::string &field_name,
                                                                     const std::string &type_name,
                                                                     ASTNode *node)
     {
-        SourceSpan span = create_node_span(node);
+        return *create_diagnostic_with_error_tracking(node, [&]()
+                                                      {
+            SourceSpan span = create_node_span(node);
 
-        // For member access, try to create a span that covers the field name
-        if (node)
-        {
-            SourceLocation start = node->location();
-            // Create a span that matches the field name length
-            SourceLocation end(start.line(), start.column() + field_name.length());
-            span = SourceSpan(start, end, _source_file, true);
-        }
+            // For member access, try to create a span that covers the field name
+            if (node)
+            {
+                SourceLocation start = node->location();
+                // Create a span that matches the field name length
+                SourceLocation end(start.line(), start.column() + field_name.length());
+                span = SourceSpan(start, end, _source_file, true);
+            }
 
-        span.set_label("field does not exist on type '" + type_name + "'");
+            span.set_label("field does not exist on type '" + type_name + "'");
 
-        std::string message = "No field '" + field_name + "' on type '" + type_name + "'";
+            std::string message = "No field '" + field_name + "' on type '" + type_name + "'";
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file, message);
-        diagnostic.with_primary_span(span);
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0204_UNDEFINED_FIELD, span.to_source_range(), _source_file, message);
+            diagnostic.with_primary_span(span);
 
-        // TEMPORARILY DISABLED
-        // diagnostic.add_note("This field does not exist in the struct or class.");
-        // diagnostic.add_help("Check the field name for typos or verify the struct/class definition.");
+            // TEMPORARILY DISABLED
+            // diagnostic.add_note("This field does not exist in the struct or class.");
+            // diagnostic.add_help("Check the field name for typos or verify the struct/class definition.");
 
-        return diagnostic;
+            return &diagnostic; });
     }
 
     Diagnostic &CodegenDiagnosticBuilder::create_invalid_dereference_error(const std::string &type_name,
                                                                            ASTNode *node)
     {
-        SourceSpan span = create_node_span(node);
-        span.set_label("cannot dereference non-pointer type '" + type_name + "'");
+        return *create_diagnostic_with_error_tracking(node, [&]()
+                                                      {
+            SourceSpan span = create_node_span(node);
+            span.set_label("cannot dereference non-pointer type '" + type_name + "'");
 
-        std::string message = "Cannot dereference value of type '" + type_name + "'";
+            std::string message = "Cannot dereference value of type '" + type_name + "'";
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, span.to_source_range(), _source_file, message);
-        diagnostic.with_primary_span(span);
+            auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0222_INVALID_DEREF, span.to_source_range(), _source_file, message);
+            diagnostic.with_primary_span(span);
 
-        diagnostic.add_note("Cannot dereference a non-pointer type.");
-        diagnostic.add_help("Only pointer types can be dereferenced with the * operator.");
+            diagnostic.add_note("Cannot dereference a non-pointer type.");
+            diagnostic.add_help("Only pointer types can be dereferenced with the * operator.");
 
-        return diagnostic;
+            return &diagnostic; });
     }
 
     Diagnostic &CodegenDiagnosticBuilder::create_invalid_address_of_error(const std::string &type_name,
@@ -707,20 +755,21 @@ namespace Cryo
     }
 
     Diagnostic &ParserDiagnosticBuilder::create_mismatched_delimiter_error(char found, char expected,
-                                                                          SourceLocation location,
-                                                                          SourceLocation opening_location)
+                                                                           SourceLocation location,
+                                                                           SourceLocation opening_location)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label(std::string("found '") + found + "', expected '" + expected + "'");
 
-        std::string message = "mismatched delimiter: found '" + std::string(1, found) + 
-                             "', expected '" + std::string(1, expected) + "'";
+        std::string message = "mismatched delimiter: found '" + std::string(1, found) +
+                              "', expected '" + std::string(1, expected) + "'";
 
         auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0110_MISMATCHED_DELIMITERS, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
 
         // Add secondary span for opening delimiter if available
-        if (opening_location.line() > 0) {
+        if (opening_location.line() > 0)
+        {
             SourceSpan opening_span(opening_location, opening_location, _source_file, false);
             opening_span.set_label("opening delimiter here");
             diagnostic.add_secondary_span(opening_span);
@@ -732,38 +781,43 @@ namespace Cryo
     }
 
     Diagnostic &ParserDiagnosticBuilder::create_invalid_syntax_error(SourceLocation location,
-                                                                    const std::string& construct,
-                                                                    const std::string& suggestion)
+                                                                     const std::string &construct,
+                                                                     const std::string &suggestion)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("invalid syntax");
 
         std::string message = "invalid syntax";
-        if (!construct.empty()) {
+        if (!construct.empty())
+        {
             message += " in " + construct;
         }
 
         auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0111_INVALID_SYNTAX, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
 
-        if (!suggestion.empty()) {
+        if (!suggestion.empty())
+        {
             diagnostic.add_help(suggestion);
-        } else {
+        }
+        else
+        {
             diagnostic.add_help("check the syntax against the language specification");
         }
 
         return diagnostic;
     }
 
-    Diagnostic &ParserDiagnosticBuilder::create_invalid_declaration_error(const std::string& declaration_type,
-                                                                         SourceLocation location,
-                                                                         const std::string& issue)
+    Diagnostic &ParserDiagnosticBuilder::create_invalid_declaration_error(const std::string &declaration_type,
+                                                                          SourceLocation location,
+                                                                          const std::string &issue)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("invalid " + declaration_type + " declaration");
 
         std::string message = "invalid " + declaration_type + " declaration";
-        if (!issue.empty()) {
+        if (!issue.empty())
+        {
             message += ": " + issue;
         }
 
@@ -776,13 +830,14 @@ namespace Cryo
     }
 
     Diagnostic &ParserDiagnosticBuilder::create_invalid_pattern_error(SourceLocation location,
-                                                                     const std::string& pattern_context)
+                                                                      const std::string &pattern_context)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("invalid pattern");
 
         std::string message = "invalid pattern";
-        if (!pattern_context.empty()) {
+        if (!pattern_context.empty())
+        {
             message += " in " + pattern_context;
         }
 
@@ -855,13 +910,14 @@ namespace Cryo
     }
 
     Diagnostic &LexerDiagnosticBuilder::create_invalid_unicode_error(SourceLocation location,
-                                                                    const std::string& sequence)
+                                                                     const std::string &sequence)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("invalid unicode sequence");
 
         std::string message = "invalid unicode sequence";
-        if (!sequence.empty()) {
+        if (!sequence.empty())
+        {
             message += ": '" + sequence + "'";
         }
 
@@ -886,15 +942,16 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &LexerDiagnosticBuilder::create_invalid_number_error(const std::string& number_text,
-                                                                   SourceLocation location,
-                                                                   const std::string& reason)
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_number_error(const std::string &number_text,
+                                                                    SourceLocation location,
+                                                                    const std::string &reason)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("invalid number format");
 
         std::string message = "invalid number format: '" + number_text + "'";
-        if (!reason.empty()) {
+        if (!reason.empty())
+        {
             message += " (" + reason + ")";
         }
 
@@ -906,15 +963,16 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &LexerDiagnosticBuilder::create_number_overflow_error(const std::string& number_text,
-                                                                    SourceLocation location,
-                                                                    const std::string& number_type)
+    Diagnostic &LexerDiagnosticBuilder::create_number_overflow_error(const std::string &number_text,
+                                                                     SourceLocation location,
+                                                                     const std::string &number_type)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("number overflow");
 
         std::string message = "number too large: '" + number_text + "'";
-        if (!number_type.empty()) {
+        if (!number_type.empty())
+        {
             message += " for type " + number_type;
         }
 
@@ -926,8 +984,8 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &LexerDiagnosticBuilder::create_invalid_hex_error(const std::string& hex_text,
-                                                                SourceLocation location)
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_hex_error(const std::string &hex_text,
+                                                                 SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("invalid hexadecimal number");
@@ -942,8 +1000,8 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &LexerDiagnosticBuilder::create_invalid_binary_error(const std::string& binary_text,
-                                                                   SourceLocation location)
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_binary_error(const std::string &binary_text,
+                                                                    SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("invalid binary number");
@@ -958,8 +1016,8 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &LexerDiagnosticBuilder::create_invalid_octal_error(const std::string& octal_text,
-                                                                  SourceLocation location)
+    Diagnostic &LexerDiagnosticBuilder::create_invalid_octal_error(const std::string &octal_text,
+                                                                   SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("invalid octal number");
@@ -983,6 +1041,16 @@ namespace Cryo
                                                                            SourceLocation location,
                                                                            ASTNode *node)
     {
+        // Check if we should skip error reporting for this node to prevent duplicates
+        if (should_skip_error_reporting(node))
+        {
+            // Return a dummy/placeholder diagnostic to maintain interface compatibility
+            static Diagnostic dummy_diagnostic(ErrorCode::E0101_UNEXPECTED_TOKEN, DiagnosticSeverity::Error,
+                                               DiagnosticCategory::Semantic, "duplicate error suppressed",
+                                               SourceRange{}, "");
+            return dummy_diagnostic;
+        }
+
         SourceSpan span = node ? create_node_span(node) : SourceSpan(location, location, _source_file, true);
 
         std::string expected_name = expected ? expected->to_string() : "unknown";
@@ -1008,6 +1076,12 @@ namespace Cryo
         }
 
         add_common_help(diagnostic, ErrorCode::E0200_TYPE_MISMATCH);
+
+        // Mark the node as having an error to prevent duplicate reporting
+        if (node)
+        {
+            node->mark_error();
+        }
 
         return diagnostic;
     }
@@ -1075,47 +1149,48 @@ namespace Cryo
                                                                             const std::vector<std::string> &suggestions)
     {
         SourceSpan span(location, location, _source_file, true);
-        
+
         // Convert NodeKind to symbol type string and error code
         std::string symbol_type;
         ErrorCode error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
-        
-        switch (symbol_kind) {
-            case NodeKind::FunctionDeclaration:
-                symbol_type = "function";
-                error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
-                break;
-            case NodeKind::StructDeclaration:
-                symbol_type = "struct";
-                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
-                break;
-            case NodeKind::ClassDeclaration:
-                symbol_type = "class";
-                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
-                break;
-            case NodeKind::TraitDeclaration:
-                symbol_type = "trait";
-                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
-                break;
-            case NodeKind::EnumDeclaration:
-                symbol_type = "enum";
-                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
-                break;
-            case NodeKind::TypeAliasDeclaration:
-                symbol_type = "type alias";
-                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
-                break;
-            case NodeKind::ImplementationBlock:
-                symbol_type = "implementation target type";
-                error_code = ErrorCode::E0203_UNDEFINED_TYPE;
-                break;
-            case NodeKind::VariableDeclaration:
-            default:
-                symbol_type = "variable";
-                error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
-                break;
+
+        switch (symbol_kind)
+        {
+        case NodeKind::FunctionDeclaration:
+            symbol_type = "function";
+            error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
+            break;
+        case NodeKind::StructDeclaration:
+            symbol_type = "struct";
+            error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+            break;
+        case NodeKind::ClassDeclaration:
+            symbol_type = "class";
+            error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+            break;
+        case NodeKind::TraitDeclaration:
+            symbol_type = "trait";
+            error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+            break;
+        case NodeKind::EnumDeclaration:
+            symbol_type = "enum";
+            error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+            break;
+        case NodeKind::TypeAliasDeclaration:
+            symbol_type = "type alias";
+            error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+            break;
+        case NodeKind::ImplementationBlock:
+            symbol_type = "implementation target type";
+            error_code = ErrorCode::E0203_UNDEFINED_TYPE;
+            break;
+        case NodeKind::VariableDeclaration:
+        default:
+            symbol_type = "variable";
+            error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
+            break;
         }
-        
+
         span.set_label("undefined " + symbol_type);
         std::string message = "undefined " + symbol_type + " `" + symbol_name + "`";
 
@@ -1133,43 +1208,44 @@ namespace Cryo
     }
 
     Diagnostic &TypeCheckerDiagnosticBuilder::create_redefined_symbol_error(const std::string &symbol_name,
-                                                                           NodeKind symbol_kind,
-                                                                           SourceLocation location)
+                                                                            NodeKind symbol_kind,
+                                                                            SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
-        
+
         // Convert NodeKind to symbol type string
         std::string symbol_type;
-        switch (symbol_kind) {
-            case NodeKind::FunctionDeclaration:
-                symbol_type = "function";
-                break;
-            case NodeKind::StructDeclaration:
-                symbol_type = "struct";
-                break;
-            case NodeKind::ClassDeclaration:
-                symbol_type = "class";
-                break;
-            case NodeKind::TraitDeclaration:
-                symbol_type = "trait";
-                break;
-            case NodeKind::EnumDeclaration:
-                symbol_type = "enum";
-                break;
-            case NodeKind::TypeAliasDeclaration:
-                symbol_type = "type alias";
-                break;
-            case NodeKind::VariableDeclaration:
-                symbol_type = "variable";
-                break;
-            case NodeKind::Declaration: // Generic parameter
-                symbol_type = "generic parameter";
-                break;
-            default:
-                symbol_type = "symbol";
-                break;
+        switch (symbol_kind)
+        {
+        case NodeKind::FunctionDeclaration:
+            symbol_type = "function";
+            break;
+        case NodeKind::StructDeclaration:
+            symbol_type = "struct";
+            break;
+        case NodeKind::ClassDeclaration:
+            symbol_type = "class";
+            break;
+        case NodeKind::TraitDeclaration:
+            symbol_type = "trait";
+            break;
+        case NodeKind::EnumDeclaration:
+            symbol_type = "enum";
+            break;
+        case NodeKind::TypeAliasDeclaration:
+            symbol_type = "type alias";
+            break;
+        case NodeKind::VariableDeclaration:
+            symbol_type = "variable";
+            break;
+        case NodeKind::Declaration: // Generic parameter
+            symbol_type = "generic parameter";
+            break;
+        default:
+            symbol_type = "symbol";
+            break;
         }
-        
+
         span.set_label("redefined " + symbol_type);
         std::string message = symbol_type + " `" + symbol_name + "` is already defined";
 
@@ -1225,19 +1301,20 @@ namespace Cryo
                                                                              SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
-        
+
         std::string left_name = left_type ? left_type->to_string() : "unknown";
         std::string right_name = right_type ? right_type->to_string() : "unknown";
-        
-        if (right_type) {
+
+        if (right_type)
+        {
             span.set_label("incompatible types for " + operation + " operation");
-        } else {
+        }
+        else
+        {
             span.set_label("invalid " + operation + " operation on type '" + left_name + "'");
         }
 
-        std::string message = right_type ? 
-            ("Cannot apply '" + operation + "' to types '" + left_name + "' and '" + right_name + "'") :
-            ("Cannot apply '" + operation + "' to type '" + left_name + "'");
+        std::string message = right_type ? ("Cannot apply '" + operation + "' to types '" + left_name + "' and '" + right_name + "'") : ("Cannot apply '" + operation + "' to type '" + left_name + "'");
 
         ErrorCode error_code = right_type ? ErrorCode::E0229_INVALID_BINARY_OP : ErrorCode::E0230_INVALID_UNARY_OP;
         auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file, message);
@@ -1246,10 +1323,20 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &TypeCheckerDiagnosticBuilder::create_non_callable_error(Type *type, SourceLocation location)
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_non_callable_error(Type *type, SourceLocation location, ASTNode *node)
     {
+        // Check for duplicate error reporting
+        if (should_skip_error_reporting(node))
+        {
+            // Return a dummy/placeholder diagnostic to maintain interface compatibility
+            static Diagnostic dummy_diagnostic(ErrorCode::E0231_NON_CALLABLE_TYPE, DiagnosticSeverity::Error,
+                                               DiagnosticCategory::Semantic, "duplicate error suppressed",
+                                               SourceRange{}, "");
+            return dummy_diagnostic;
+        }
+
         SourceSpan span(location, location, _source_file, true);
-        
+
         std::string type_name = type ? type->to_string() : "unknown";
         span.set_label("type '" + type_name + "' cannot be called");
 
@@ -1260,6 +1347,12 @@ namespace Cryo
 
         diagnostic.add_note("Only functions and callable objects can be invoked with ()");
 
+        // Mark the node as having an error
+        if (node)
+        {
+            node->mark_error();
+        }
+
         return diagnostic;
     }
 
@@ -1268,12 +1361,12 @@ namespace Cryo
                                                                          SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
-        
+
         span.set_label("too many arguments");
 
-        std::string message = "Function '" + function_name + "' expects " + std::to_string(expected) + 
-                             " argument" + (expected == 1 ? "" : "s") + 
-                             ", but " + std::to_string(actual) + " were provided";
+        std::string message = "Function '" + function_name + "' expects " + std::to_string(expected) +
+                              " argument" + (expected == 1 ? "" : "s") +
+                              ", but " + std::to_string(actual) + " were provided";
 
         auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0215_TOO_MANY_ARGS, span.to_source_range(), _source_file);
         diagnostic.with_primary_span(span);
@@ -1285,10 +1378,10 @@ namespace Cryo
                                                                               SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
-        
+
         std::string target_name = target_type ? target_type->to_string() : "unknown";
         std::string value_name = value_type ? value_type->to_string() : "unknown";
-        
+
         span.set_label("invalid assignment to '" + target_name + "'");
 
         std::string message = "Cannot assign value of type '" + value_name + "' to target of type '" + target_name + "'";
@@ -1300,37 +1393,38 @@ namespace Cryo
     }
 
     Diagnostic &TypeCheckerDiagnosticBuilder::create_undefined_variable_error(const std::string &symbol_name,
-                                                                             NodeKind symbol_kind,
-                                                                             SourceLocation location)
+                                                                              NodeKind symbol_kind,
+                                                                              SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
         span.set_label("undefined symbol");
 
         // Convert NodeKind to context description
         std::string context_description;
-        switch (symbol_kind) {
-            case NodeKind::FunctionDeclaration:
-                context_description = "function";
-                break;
-            case NodeKind::StructDeclaration:
-                context_description = "struct";
-                break;
-            case NodeKind::ClassDeclaration:
-                context_description = "class";
-                break;
-            case NodeKind::TraitDeclaration:
-                context_description = "trait";
-                break;
-            case NodeKind::EnumDeclaration:
-                context_description = "enum";
-                break;
-            case NodeKind::TypeAliasDeclaration:
-                context_description = "type alias";
-                break;
-            case NodeKind::VariableDeclaration:
-            default:
-                context_description = "variable";
-                break;
+        switch (symbol_kind)
+        {
+        case NodeKind::FunctionDeclaration:
+            context_description = "function";
+            break;
+        case NodeKind::StructDeclaration:
+            context_description = "struct";
+            break;
+        case NodeKind::ClassDeclaration:
+            context_description = "class";
+            break;
+        case NodeKind::TraitDeclaration:
+            context_description = "trait";
+            break;
+        case NodeKind::EnumDeclaration:
+            context_description = "enum";
+            break;
+        case NodeKind::TypeAliasDeclaration:
+            context_description = "type alias";
+            break;
+        case NodeKind::VariableDeclaration:
+        default:
+            context_description = "variable";
+            break;
         }
 
         std::string message = "Undefined " + context_description + " '" + symbol_name + "'";

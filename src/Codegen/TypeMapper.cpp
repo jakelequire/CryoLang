@@ -657,8 +657,21 @@ namespace Cryo::Codegen
             auto struct_node = ast_it->second;
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating field types for struct: {}", struct_name);
 
-            for (const auto &field : struct_node->fields())
+            // CRITICAL FIX: Use safe index-based iteration like classes to avoid iterator corruption with visibility parsing
+            const auto &fields_vec = struct_node->fields();
+            size_t num_fields = fields_vec.size();
+
+            for (size_t i = 0; i < num_fields; ++i)
             {
+                const auto &field_ptr = fields_vec[i];
+                if (!field_ptr || field_ptr.get() == nullptr)
+                {
+                    LOG_WARN(Cryo::LogComponent::CODEGEN, "Null field pointer at index {} in struct {}", i, struct_name);
+                    field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                    continue;
+                }
+
+                auto *field = field_ptr.get();
                 if (field)
                 {
                     LOG_TRACE(Cryo::LogComponent::CODEGEN, "Processing field: {} : {}",
