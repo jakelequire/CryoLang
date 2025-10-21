@@ -115,6 +115,7 @@ namespace Cryo
         std::string generate_enhanced_inline_label(ErrorCode error_code, const std::string& message) const;
         std::string generate_structured_inline_label(const Diagnostic& diagnostic) const; // NEW: Use structured data
         std::string extract_type_mismatch_label(const std::string& message) const;
+        std::string extract_codegen_label(const std::string& message) const;
         std::string generate_generic_label(const std::string& message) const;
 
         // Smart context determination

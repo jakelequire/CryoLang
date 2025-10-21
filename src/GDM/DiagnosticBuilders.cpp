@@ -125,67 +125,172 @@ namespace Cryo
     {
         SourceSpan span = create_node_span(node);
 
-        // Avoid generic "LLVM code generation failed" labels
+        // Create more specific labels based on the actual error message
         std::string label = "compilation error";
-        if (operation.find("dereference") != std::string::npos)
+        std::string message = operation;
+        
+
+        if (llvm_message.find("Unknown type in new expression") != std::string::npos)
+        {
+            // Extract the specific type name for a more informative label
+            size_t colon_pos = llvm_message.rfind(": ");
+            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length()) {
+                std::string type_name = llvm_message.substr(colon_pos + 2);
+                label = "unknown type '" + type_name + "'";
+            } else {
+                label = "unknown type";
+            }
+            message = operation + ": " + llvm_message; // Combine both parts
+        }
+        else if (llvm_message.find("Constructor not found") != std::string::npos)
+        {
+            // Extract the specific type name for constructor errors
+            size_t colon_pos = llvm_message.rfind(": ");
+            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length()) {
+                std::string type_name = llvm_message.substr(colon_pos + 2);
+                label = "no constructor for '" + type_name + "'";
+            } else {
+                label = "constructor not found";
+            }
+            message = operation + ": " + llvm_message;
+        }
+        else if (operation.find("Failed to generate generic constructor") != std::string::npos)
+        {
+            label = "generic instantiation failed";
+            message = operation;
+        }
+        else if (operation.find("dereference") != std::string::npos)
         {
             label = "invalid dereference operation";
+            message = operation;
         }
         else if (operation.find("address") != std::string::npos || operation.find("Address-of") != std::string::npos)
         {
             label = "invalid address-of operation";
+            message = operation;
+        }
+        else if (llvm_message.find("Unknown struct type or field in member assignment") != std::string::npos)
+        {
+            // Extract the specific field name
+            size_t colon_pos = llvm_message.rfind(": ");
+            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length()) {
+                std::string field_name = llvm_message.substr(colon_pos + 2);
+                label = "field '" + field_name + "' not found";
+            } else {
+                label = "field not found";
+            }
+            message = operation + ": " + llvm_message;
+        }
+        else if (llvm_message.find("Failed to generate binary expression") != std::string::npos)
+        {
+            // Extract more specific information from enhanced error messages
+            if (llvm_message.find("assignment '='") != std::string::npos)
+            {
+                if (llvm_message.find("member access") != std::string::npos)
+                {
+                    label = "assignment to member failed";
+                }
+                else
+                {
+                    label = "assignment failed";
+                }
+            }
+            else if (llvm_message.find("addition '+'") != std::string::npos)
+            {
+                label = "addition failed";
+            }
+            else if (llvm_message.find("subtraction '-'") != std::string::npos)
+            {
+                label = "subtraction failed";
+            }
+            else if (llvm_message.find("multiplication '*'") != std::string::npos)
+            {
+                label = "multiplication failed";
+            }
+            else if (llvm_message.find("division '/'") != std::string::npos)
+            {
+                label = "division failed";
+            }
+            else
+            {
+                label = "binary operation failed";
+            }
+            message = operation + ": " + llvm_message;
         }
         else if (operation.find("field") != std::string::npos || operation.find("member access") != std::string::npos)
         {
             label = "field access error";
+            message = operation;
+        }
+        else if (llvm_message.find("Unknown struct type in implementation block") != std::string::npos)
+        {
+            // Extract the specific struct type name
+            size_t colon_pos = llvm_message.rfind(": ");
+            if (colon_pos != std::string::npos && colon_pos + 2 < llvm_message.length()) {
+                std::string remaining = llvm_message.substr(colon_pos + 2);
+                size_t space_pos = remaining.find(" ");
+                if (space_pos != std::string::npos) {
+                    std::string type_name = remaining.substr(0, space_pos);
+                    label = "unknown struct '" + type_name + "'";
+                } else {
+                    label = "unknown struct type";
+                }
+            } else {
+                label = "unknown struct type";
+            }
+            message = operation + ": " + llvm_message;
         }
         else if (operation.find("struct type") != std::string::npos)
         {
             label = "unknown struct type";
+            message = operation;
         }
         else if (operation.find("type") != std::string::npos)
         {
             label = "type error";
-        }
-        span.set_label(label);
-
-        // Make the message more semantic and less technical
-        std::string message;
-        if (operation.find("Unknown struct type or field") != std::string::npos)
-        {
-            // This should be caught by field access error, but just in case
-            message = operation;
-        }
-        else if (operation.find("Dereference operator") != std::string::npos)
-        {
-            message = operation;
-        }
-        else if (operation.find("Address-of operator") != std::string::npos)
-        {
             message = operation;
         }
         else
         {
-            // Generic case - try to make it less technical
+            // For any other case, use the operation as both label and message
+            label = "compilation error";
             message = operation;
             if (!llvm_message.empty())
             {
                 message += ": " + llvm_message;
             }
         }
+        
+        // Set the label after determining the specific type
+        span.set_label(label);
 
-        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0601_LLVM_ERROR, span.to_source_range(), _source_file);
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0601_LLVM_ERROR, span.to_source_range(), _source_file, message);
         diagnostic.with_primary_span(span);
 
-        // Provide more helpful notes instead of generic LLVM references
-        if (operation.find("type") != std::string::npos)
+        // Provide more helpful notes based on the specific error type
+        if (operation.find("Unknown type in new expression") != std::string::npos)
         {
-            diagnostic.add_note("This indicates a type compatibility issue.");
+            diagnostic.add_note("The type specified in the 'new' expression was not found or is not properly defined");
+            diagnostic.add_help("ensure the type is declared before use, check for typos in the type name, or verify generic type arguments are correct");
+        }
+        else if (operation.find("Constructor not found") != std::string::npos)
+        {
+            diagnostic.add_note("No constructor was found that matches the provided arguments");
+            diagnostic.add_help("check that a constructor exists with the correct parameter types, or use a different constructor signature");
+        }
+        else if (operation.find("Failed to generate generic constructor") != std::string::npos)
+        {
+            diagnostic.add_note("The compiler could not instantiate the generic constructor for this type");
+            diagnostic.add_help("ensure the generic type is properly defined and all generic constraints are satisfied");
+        }
+        else if (operation.find("type") != std::string::npos)
+        {
+            diagnostic.add_note("This indicates a type compatibility issue");
             diagnostic.add_help("check that all types match and variables are properly declared");
         }
         else if (operation.find("dereference") != std::string::npos || operation.find("address") != std::string::npos)
         {
-            diagnostic.add_note("This indicates an incorrect pointer operation.");
+            diagnostic.add_note("This indicates an incorrect pointer operation");
             diagnostic.add_help("ensure you're using pointers and references correctly");
         }
         else

@@ -2222,7 +2222,65 @@ namespace Cryo::Codegen
             }
             else
             {
-                report_error("Failed to generate binary expression", &node);
+                // Provide more specific error context for binary expression failures
+                std::string left_desc = "unknown";
+                std::string right_desc = "unknown";
+                std::string op_desc = "unknown";
+                
+                if (node.left())
+                {
+                    if (auto* id = dynamic_cast<IdentifierNode*>(node.left()))
+                    {
+                        left_desc = "identifier '" + id->name() + "'";
+                    }
+                    else if (auto* member = dynamic_cast<MemberAccessNode*>(node.left()))
+                    {
+                        left_desc = "member access";
+                    }
+                    else if (auto* literal = dynamic_cast<LiteralNode*>(node.left()))
+                    {
+                        left_desc = "literal";
+                    }
+                    else
+                    {
+                        left_desc = "expression";
+                    }
+                }
+                
+                if (node.right())
+                {
+                    if (auto* id = dynamic_cast<IdentifierNode*>(node.right()))
+                    {
+                        right_desc = "identifier '" + id->name() + "'";
+                    }
+                    else if (auto* member = dynamic_cast<MemberAccessNode*>(node.right()))
+                    {
+                        right_desc = "member access";
+                    }
+                    else if (auto* literal = dynamic_cast<LiteralNode*>(node.right()))
+                    {
+                        right_desc = "literal";
+                    }
+                    else
+                    {
+                        right_desc = "expression";
+                    }
+                }
+                
+                TokenKind op_kind = node.operator_token().kind();
+                switch (op_kind)
+                {
+                    case TokenKind::TK_EQUAL: op_desc = "assignment '='"; break;
+                    case TokenKind::TK_PLUS: op_desc = "addition '+'"; break;
+                    case TokenKind::TK_MINUS: op_desc = "subtraction '-'"; break;
+                    case TokenKind::TK_STAR: op_desc = "multiplication '*'"; break;
+                    case TokenKind::TK_SLASH: op_desc = "division '/'"; break;
+                    default: op_desc = "operator"; break;
+                }
+                
+                std::string detailed_error = "Failed to generate binary expression: " + op_desc + 
+                                           " between " + left_desc + " and " + right_desc;
+                report_error(detailed_error, &node);
             }
         }
         catch (const std::exception &e)
@@ -5123,7 +5181,19 @@ namespace Cryo::Codegen
 
                 if (!left_val)
                 {
-                    report_error("Failed to generate left operand of binary expression");
+                    std::string error_msg = "Failed to generate left operand of binary expression";
+                    if (node->left())
+                    {
+                        if (auto* id = dynamic_cast<IdentifierNode*>(node->left()))
+                        {
+                            error_msg += ": identifier '" + id->name() + "' not found";
+                        }
+                        else if (auto* member = dynamic_cast<MemberAccessNode*>(node->left()))
+                        {
+                            error_msg += ": member access failed";
+                        }
+                    }
+                    report_error(error_msg);
                     return nullptr;
                 }
 
@@ -5383,7 +5453,19 @@ namespace Cryo::Codegen
 
             if (!left_val)
             {
-                report_error("Failed to generate left operand of binary expression");
+                std::string error_msg = "Failed to generate left operand of binary expression";
+                if (node->left())
+                {
+                    if (auto* id = dynamic_cast<IdentifierNode*>(node->left()))
+                    {
+                        error_msg += ": identifier '" + id->name() + "' not found";
+                    }
+                    else if (auto* member = dynamic_cast<MemberAccessNode*>(node->left()))
+                    {
+                        error_msg += ": member access failed";
+                    }
+                }
+                report_error(error_msg);
                 return nullptr;
             }
 
@@ -5393,7 +5475,19 @@ namespace Cryo::Codegen
 
             if (!right_val)
             {
-                report_error("Failed to generate right operand of binary expression");
+                std::string error_msg = "Failed to generate right operand of binary expression";
+                if (node->right())
+                {
+                    if (auto* id = dynamic_cast<IdentifierNode*>(node->right()))
+                    {
+                        error_msg += ": identifier '" + id->name() + "' not found";
+                    }
+                    else if (auto* member = dynamic_cast<MemberAccessNode*>(node->right()))
+                    {
+                        error_msg += ": member access failed";
+                    }
+                }
+                report_error(error_msg);
                 return nullptr;
             }
 

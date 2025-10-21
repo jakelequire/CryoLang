@@ -615,6 +615,7 @@ namespace Cryo
         // This method is being deprecated in favor of structured data approach
         // For backward compatibility, still handle string-based approach for now
         
+
         switch (error_code) {
             case ErrorCode::E0200_TYPE_MISMATCH: // Type mismatch
                 return extract_type_mismatch_label(message);
@@ -633,6 +634,9 @@ namespace Cryo
                 
             case ErrorCode::E0102_EXPECTED_EXPRESSION: // Expected expression
                 return "expected expression";
+                
+            case ErrorCode::E0601_LLVM_ERROR: // LLVM/Codegen errors
+                return extract_codegen_label(message);
                 
             default:
                 // Generate a descriptive label from the message
@@ -762,6 +766,72 @@ namespace Cryo
         
         // Ultimate fallback
         return "type mismatch";
+    }
+
+    std::string DiagnosticFormatter::extract_codegen_label(const std::string& message) const
+    {
+        // Extract concise inline labels from LLVM/codegen error messages
+        
+        if (message.find("Unknown type in new expression") != std::string::npos) {
+            // Extract the type name from "code generation: Unknown type in new expression: TypeName"
+            size_t last_colon = message.rfind(": ");
+            if (last_colon != std::string::npos && last_colon + 2 < message.length()) {
+                std::string type_name = message.substr(last_colon + 2);
+                return "unknown type '" + type_name + "'";
+            }
+            return "unknown type";
+        }
+        
+        if (message.find("Constructor not found") != std::string::npos) {
+            // Extract the type name from "code generation: Constructor not found for type: TypeName"
+            size_t last_colon = message.rfind(": ");
+            if (last_colon != std::string::npos && last_colon + 2 < message.length()) {
+                std::string type_name = message.substr(last_colon + 2);
+                return "constructor not found for '" + type_name + "'";
+            }
+            return "constructor not found";
+        }
+        
+        if (message.find("Failed to generate generic constructor") != std::string::npos) {
+            return "generic instantiation failed";
+        }
+        
+        if (message.find("Unknown struct type in implementation block") != std::string::npos) {
+            // Extract the type name from "code generation: Unknown struct type in implementation block: TypeName (node kind: ...)"
+            size_t last_colon = message.rfind(": ");
+            if (last_colon != std::string::npos && last_colon + 2 < message.length()) {
+                std::string remaining = message.substr(last_colon + 2);
+                size_t space_pos = remaining.find(" ");
+                if (space_pos != std::string::npos) {
+                    std::string type_name = remaining.substr(0, space_pos);
+                    return "unknown struct type '" + type_name + "'";
+                }
+            }
+            return "unknown struct type";
+        }
+        
+        if (message.find("Unknown struct type or field in member assignment") != std::string::npos) {
+            // Extract the field name from "code generation: Unknown struct type or field in member assignment: FieldName"
+            size_t last_colon = message.rfind(": ");
+            if (last_colon != std::string::npos && last_colon + 2 < message.length()) {
+                std::string field_name = message.substr(last_colon + 2);
+                return "field '" + field_name + "' not found";
+            }
+            return "field not found";
+        }
+        
+        if (message.find("Failed to generate binary expression") != std::string::npos) {
+            return "binary expression failed";
+        }
+        
+        // Generic codegen error fallback
+        if (message.find("code generation") != std::string::npos) {
+            return "codegen error";
+        }
+        
+        // If none of the patterns match, return the original message for debugging
+        // This will help us see what messages aren't being caught
+        return message;
     }
 
     std::string DiagnosticFormatter::generate_generic_label(const std::string& message) const
