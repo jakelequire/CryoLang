@@ -987,7 +987,7 @@ namespace Cryo
         // Fall back to direct type lookups without string parsing
         LOG_DEBUG(Cryo::LogComponent::AST, "Attempting direct type lookup for '{}'", type_string);
 
-        // For simple identifiers that are NOT primitive types, check enum types first, then class types
+        // For simple identifiers that are NOT primitive types, check enum types first, then struct/class types
         // This ensures that enum declarations take precedence over class types for same-named identifiers
         if (type_string.find('*') == std::string::npos &&
             type_string.find('<') == std::string::npos &&
@@ -996,7 +996,7 @@ namespace Cryo
             type_string.find('(') == std::string::npos &&
             // Skip primitive types - let token parsing handle them
             type_string != "void" && type_string != "boolean" && type_string != "char" &&
-            type_string != "string" && type_string != "auto" &&
+            type_string != "string" && type_string != "auto" && type_string != "..." &&
             type_string != "i8" && type_string != "i16" && type_string != "i32" && type_string != "i64" &&
             type_string != "u8" && type_string != "u16" && type_string != "u32" && type_string != "u64" &&
             type_string != "int" && type_string != "float" && type_string != "double")
@@ -1010,7 +1010,15 @@ namespace Cryo
                 return enum_symbol->type;
             }
 
-            // Check for class types SECOND for user-defined type identifiers
+            // Check for existing struct types SECOND (consistent with CallExpressionNode)
+            Type *struct_type = _type_context.lookup_struct_type(type_string);
+            if (struct_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found existing struct type '{}', kind={}", struct_type->name(), static_cast<int>(struct_type->kind()));
+                return struct_type;
+            }
+
+            // Check for class types THIRD for user-defined type identifiers
             Type *class_type = _type_context.get_class_type(type_string);
             LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
             if (class_type)
@@ -1646,7 +1654,7 @@ namespace Cryo
             return_type = _type_context.get_unknown_type();
         }
 
-        // Collect parameter types
+        // Collect parameter types (exclude variadic parameters from param_types)
         std::vector<Type *> param_types;
         for (const auto &param : node.parameters())
         {
@@ -1659,16 +1667,27 @@ namespace Cryo
                     _diagnostic_builder->create_undefined_symbol_error(param_type_str, NodeKind::Declaration, param->location());
                     param_type = _type_context.get_unknown_type();
                 }
-                param_types.push_back(param_type);
+
+                // Skip variadic parameters - they're handled by the is_variadic flag
+                if (param_type && param_type->kind() != TypeKind::Variadic)
+                {
+                    param_types.push_back(param_type);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Added parameter type '{}' (kind={})", param_type->name(), static_cast<int>(param_type->kind()));
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Skipped variadic parameter type '{}' (kind={})", param_type ? param_type->name() : "null", param_type ? static_cast<int>(param_type->kind()) : -1);
+                }
             }
         }
 
         // Create function type - check if this is a variadic function
         bool is_variadic = node.is_variadic();
+        LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode '{}' - is_variadic from node: {}, param_count: {}", func_name, is_variadic, param_types.size());
         FunctionType *func_type = static_cast<FunctionType *>(
             _type_context.create_function_type(return_type, param_types, is_variadic));
 
-        LOG_DEBUG(Cryo::LogComponent::AST, "Created function type for '{}' - is_variadic: {}", func_name, is_variadic);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Created function type for '{}' - is_variadic: {}, func_type->is_variadic(): {}", func_name, is_variadic, func_type->is_variadic());
 
         TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(func_name);
         if (!existing_symbol)
@@ -1687,6 +1706,25 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Function '{}' already exists", func_name);
             LOG_DEBUG(Cryo::LogComponent::AST, "Existing type: {}", (existing_symbol->type ? existing_symbol->type->to_string() : "null"));
             LOG_DEBUG(Cryo::LogComponent::AST, "New type: {}", (func_type ? func_type->to_string() : "null"));
+
+            // Check if the new function type is more specific (e.g., variadic vs non-variadic)
+            bool should_update_type = false;
+            if (existing_symbol->type && func_type)
+            {
+                auto existing_func_type = dynamic_cast<FunctionType *>(existing_symbol->type);
+                auto new_func_type = dynamic_cast<FunctionType *>(func_type);
+
+                if (existing_func_type && new_func_type)
+                {
+                    // If new type is variadic but existing is not, prefer the variadic version
+                    if (new_func_type->is_variadic() && !existing_func_type->is_variadic())
+                    {
+                        should_update_type = true;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Updating '{}' type from non-variadic to variadic", func_name);
+                    }
+                }
+            }
+
             if (existing_symbol->type != func_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Types don't match - checking type equality more deeply");
@@ -1694,6 +1732,14 @@ namespace Cryo
                 // For now, allow redefinition if it's the same function
                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing redefinition for now");
             }
+
+            // Update the symbol with new type if needed
+            if (should_update_type)
+            {
+                existing_symbol->type = func_type;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Updated function '{}' type to: {}", func_name, func_type->to_string());
+            }
+
             // Function exists with compatible type - update with AST node reference for LSP
             LOG_DEBUG(Cryo::LogComponent::AST, "Updating existing function '{}' with AST node reference", func_name);
             existing_symbol->function_node = &node;
@@ -1791,11 +1837,27 @@ namespace Cryo
         // Create function type for the intrinsic
         FunctionType *func_type = static_cast<FunctionType *>(_type_context.create_function_type(return_type, param_types));
 
-        // Register the intrinsic function in the symbol table with special handling
-        // Since we don't have a specific method for intrinsics, we'll declare it as a normal symbol
-        if (!_symbol_table->declare_symbol(func_name, func_type, node.location()))
+        // Check if intrinsic already exists (likely loaded via load_intrinsic_symbols)
+        TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(func_name);
+        if (existing_symbol)
         {
-            _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+            // Intrinsic already loaded - verify type compatibility and update AST reference
+            LOG_DEBUG(Cryo::LogComponent::AST, "Intrinsic '{}' already exists, verifying type compatibility", func_name);
+            if (existing_symbol->type && func_type)
+            {
+                // Types should match, but we can be lenient for intrinsics
+                LOG_DEBUG(Cryo::LogComponent::AST, "Existing type: {}", existing_symbol->type->to_string());
+                LOG_DEBUG(Cryo::LogComponent::AST, "New type: {}", func_type->to_string());
+            }
+            LOG_DEBUG(Cryo::LogComponent::AST, "Intrinsic '{}' already registered, skipping duplicate declaration", func_name);
+        }
+        else
+        {
+            // Intrinsic not loaded yet - declare it now
+            if (!_symbol_table->declare_symbol(func_name, func_type, node.location()))
+            {
+                _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+            }
         }
 
         LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic function: {} with type: {}", func_name, func_type->to_string());
@@ -2032,6 +2094,7 @@ namespace Cryo
         }
 
         TypedSymbol *symbol = _symbol_table->lookup_symbol(name);
+        LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': symbol lookup result = {}", name, symbol ? "found" : "not found");
         if (!symbol)
         {
             // Try to find the symbol in the std::Runtime namespace as a fallback
@@ -2070,6 +2133,9 @@ namespace Cryo
         }
         else
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': setting resolved type to {} (kind={})", name,
+                      symbol->type ? symbol->type->name() : "null",
+                      symbol->type ? static_cast<int>(symbol->type->kind()) : -1);
             node.set_resolved_type(symbol->type);
         }
     }
@@ -2357,14 +2423,22 @@ namespace Cryo
         }
 
         // Special handling for primitive type constructors (e.g., u64(0), i32(42))
+        // Check for constructors regardless of resolved type status since primitive types may have unknown type
         if (node.callee() && node.callee()->kind() == NodeKind::Identifier)
         {
             auto identifier = dynamic_cast<IdentifierNode *>(node.callee());
             if (identifier)
             {
                 const std::string &callee_name = identifier->name();
+                bool has_resolved = node.callee()->has_resolved_type();
+                Type *callee_resolved_type = has_resolved ? node.callee()->get_resolved_type() : nullptr;
 
-                if (is_primitive_integer_type(callee_name) || callee_name == "f32" || callee_name == "f64" || callee_name == "float")
+                LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression checking constructor for '{}', has_resolved_type: {}, type: {}",
+                          callee_name, has_resolved, callee_resolved_type ? callee_resolved_type->to_string() : "none");
+
+                // Handle primitive constructors: either not resolved, or resolved to unknown type
+                if ((!has_resolved || (callee_resolved_type && callee_resolved_type->kind() == TypeKind::Unknown)) &&
+                    (is_primitive_integer_type(callee_name) || callee_name == "f32" || callee_name == "f64" || callee_name == "float"))
                 {
                     // This is a primitive type constructor call like u64(0)
                     Type *target_type = lookup_type_by_name(callee_name);
@@ -2405,28 +2479,47 @@ namespace Cryo
             if (identifier)
             {
                 const std::string &callee_name = identifier->name();
+                bool has_resolved = node.callee()->has_resolved_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression checking struct/class constructor for '{}', has_resolved_type: {}",
+                          callee_name, has_resolved);
 
-                // Only check for existing struct types, don't create new ones
-                Type *struct_type = _type_context.lookup_struct_type(callee_name);
-                if (struct_type && struct_type->kind() == TypeKind::Struct)
+                if (has_resolved)
                 {
-                    // This is a valid stack allocation constructor call for a struct
-                    // TODO: Add proper constructor argument validation here
-                    node.set_resolved_type(struct_type);
-                    return;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Skipping constructor checks for '{}' because it has resolved type", callee_name);
+                    // Skip constructor checks - this is likely a function call
                 }
+                else
+                {
 
-                // Check if this is an existing enum type
-                Type *enum_type = _type_context.lookup_enum_type(callee_name);
-                if (enum_type && enum_type->kind() == TypeKind::Enum)
-                {
-                    // This is a valid enum constructor call
-                    node.set_resolved_type(enum_type);
-                    return;
-                }
-                
-                // For classes, we'll let this fall through to the regular function call handling
-                // since we don't want to accidentally create class types for function names
+                    // Check for existing struct types first
+                    Type *struct_type = _type_context.lookup_struct_type(callee_name);
+                    if (struct_type && struct_type->kind() == TypeKind::Struct)
+                    {
+                        // This is a valid stack allocation constructor call for a struct
+                        // TODO: Add proper constructor argument validation here
+                        node.set_resolved_type(struct_type);
+                        return;
+                    }
+
+                    // Check for existing class types (consistent with resolve_type_with_generic_context)
+                    Type *class_type = _type_context.get_class_type(callee_name);
+                    if (class_type && class_type->kind() == TypeKind::Class)
+                    {
+                        // This is a valid stack allocation constructor call for a class
+                        // TODO: Add proper constructor argument validation here
+                        node.set_resolved_type(class_type);
+                        return;
+                    }
+
+                    // Check if this is an existing enum type
+                    Type *enum_type = _type_context.lookup_enum_type(callee_name);
+                    if (enum_type && enum_type->kind() == TypeKind::Enum)
+                    {
+                        // This is a valid enum constructor call
+                        node.set_resolved_type(enum_type);
+                        return;
+                    }
+                } // End !has_resolved check
             }
         }
 
@@ -2435,6 +2528,9 @@ namespace Cryo
         {
             // Get the callee's resolved type directly
             Type *callee_type = node.callee()->get_resolved_type();
+            LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression callee has resolved type: {} (kind={})",
+                      callee_type ? callee_type->name() : "null",
+                      callee_type ? static_cast<int>(callee_type->kind()) : -1);
 
             // Special handling for ScopeResolution callees
             if (node.callee()->kind() == NodeKind::ScopeResolution)
@@ -2489,7 +2585,17 @@ namespace Cryo
                 // Check function call compatibility
                 if (check_function_call_compatibility(func_type, arg_types, node.location()))
                 {
-                    node.set_resolved_type(func_type->return_type().get());
+                    Type *return_type = func_type->return_type().get();
+                    if (return_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Setting resolved type to function return type: {}", return_type->to_string());
+                        node.set_resolved_type(return_type);
+                    }
+                    else
+                    {
+                        LOG_WARN(Cryo::LogComponent::AST, "CallExpression: Function return type is null, using unknown type");
+                        node.set_resolved_type(_type_context.get_unknown_type());
+                    }
                 }
                 else
                 {
@@ -2504,6 +2610,7 @@ namespace Cryo
         }
         else
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression callee does not have resolved type, setting to unknown");
             node.set_resolved_type(_type_context.get_unknown_type());
         }
     }
@@ -4433,12 +4540,24 @@ namespace Cryo
                                                         const std::vector<Type *> &arg_types,
                                                         SourceLocation loc)
     {
+        std::string func_name = func_type ? func_type->name() : "unknown";
+        bool is_variadic = func_type ? func_type->is_variadic() : false;
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: function={}, is_variadic={}, arg_count={}",
+                  func_name, is_variadic, arg_types.size());
+
+        // Special debug output for printf
+        if (func_name.find("printf") != std::string::npos || func_name == "(string, ...) -> i32")
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "PRINTF DEBUG: func_type->is_variadic()={}, param_types.size()={}",
+                      is_variadic, func_type ? func_type->parameter_types().size() : 0);
+        }
+
         if (!func_type)
             return false;
 
         const auto &param_types = func_type->parameter_types();
-
-        // For variadic functions, we need at least the required (non-variadic) parameters
+        LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: param_types.size()={}", param_types.size()); // For variadic functions, we need at least the required (non-variadic) parameters
         size_t required_params = param_types.size();
         if (func_type->is_variadic() && required_params > 0)
         {
@@ -4449,8 +4568,10 @@ namespace Cryo
         }
 
         // Check minimum argument count
+        LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: required_params={}, arg_types.size()={}", required_params, arg_types.size());
         if (arg_types.size() < required_params)
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: FAILED - too few arguments");
             if (_diagnostic_manager)
             {
                 SourceRange range(loc);
@@ -4493,6 +4614,7 @@ namespace Cryo
         // For variadic functions, the remaining arguments are not type-checked against specific parameter types
         // They will be handled at the call site (usually by the runtime or specific intrinsic handling)
 
+        LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: SUCCESS - all checks passed");
         return true;
     }
 
