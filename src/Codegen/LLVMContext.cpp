@@ -316,7 +316,8 @@ namespace Cryo::Codegen
             return false;
         }
 
-        return !llvm::verifyModule(*target_module, &llvm::errs());
+        // Disable LLVM error output to prevent type dump spam that can trigger segfaults
+        return !llvm::verifyModule(*target_module, nullptr);
     }
 
     void LLVMContextManager::print_module(std::ostream &os, const std::string &module_name) const

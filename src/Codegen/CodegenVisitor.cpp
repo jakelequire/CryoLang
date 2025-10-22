@@ -2226,18 +2226,18 @@ namespace Cryo::Codegen
                 std::string left_desc = "unknown";
                 std::string right_desc = "unknown";
                 std::string op_desc = "unknown";
-                
+
                 if (node.left())
                 {
-                    if (auto* id = dynamic_cast<IdentifierNode*>(node.left()))
+                    if (auto *id = dynamic_cast<IdentifierNode *>(node.left()))
                     {
                         left_desc = "identifier '" + id->name() + "'";
                     }
-                    else if (auto* member = dynamic_cast<MemberAccessNode*>(node.left()))
+                    else if (auto *member = dynamic_cast<MemberAccessNode *>(node.left()))
                     {
                         left_desc = "member access";
                     }
-                    else if (auto* literal = dynamic_cast<LiteralNode*>(node.left()))
+                    else if (auto *literal = dynamic_cast<LiteralNode *>(node.left()))
                     {
                         left_desc = "literal";
                     }
@@ -2246,18 +2246,18 @@ namespace Cryo::Codegen
                         left_desc = "expression";
                     }
                 }
-                
+
                 if (node.right())
                 {
-                    if (auto* id = dynamic_cast<IdentifierNode*>(node.right()))
+                    if (auto *id = dynamic_cast<IdentifierNode *>(node.right()))
                     {
                         right_desc = "identifier '" + id->name() + "'";
                     }
-                    else if (auto* member = dynamic_cast<MemberAccessNode*>(node.right()))
+                    else if (auto *member = dynamic_cast<MemberAccessNode *>(node.right()))
                     {
                         right_desc = "member access";
                     }
-                    else if (auto* literal = dynamic_cast<LiteralNode*>(node.right()))
+                    else if (auto *literal = dynamic_cast<LiteralNode *>(node.right()))
                     {
                         right_desc = "literal";
                     }
@@ -2266,20 +2266,32 @@ namespace Cryo::Codegen
                         right_desc = "expression";
                     }
                 }
-                
+
                 TokenKind op_kind = node.operator_token().kind();
                 switch (op_kind)
                 {
-                    case TokenKind::TK_EQUAL: op_desc = "assignment '='"; break;
-                    case TokenKind::TK_PLUS: op_desc = "addition '+'"; break;
-                    case TokenKind::TK_MINUS: op_desc = "subtraction '-'"; break;
-                    case TokenKind::TK_STAR: op_desc = "multiplication '*'"; break;
-                    case TokenKind::TK_SLASH: op_desc = "division '/'"; break;
-                    default: op_desc = "operator"; break;
+                case TokenKind::TK_EQUAL:
+                    op_desc = "assignment '='";
+                    break;
+                case TokenKind::TK_PLUS:
+                    op_desc = "addition '+'";
+                    break;
+                case TokenKind::TK_MINUS:
+                    op_desc = "subtraction '-'";
+                    break;
+                case TokenKind::TK_STAR:
+                    op_desc = "multiplication '*'";
+                    break;
+                case TokenKind::TK_SLASH:
+                    op_desc = "division '/'";
+                    break;
+                default:
+                    op_desc = "operator";
+                    break;
                 }
-                
-                std::string detailed_error = "Failed to generate binary expression: " + op_desc + 
-                                           " between " + left_desc + " and " + right_desc;
+
+                std::string detailed_error = "Failed to generate binary expression: " + op_desc +
+                                             " between " + left_desc + " and " + right_desc;
                 report_error(detailed_error, &node);
             }
         }
@@ -5184,11 +5196,11 @@ namespace Cryo::Codegen
                     std::string error_msg = "Failed to generate left operand of binary expression";
                     if (node->left())
                     {
-                        if (auto* id = dynamic_cast<IdentifierNode*>(node->left()))
+                        if (auto *id = dynamic_cast<IdentifierNode *>(node->left()))
                         {
                             error_msg += ": identifier '" + id->name() + "' not found";
                         }
-                        else if (auto* member = dynamic_cast<MemberAccessNode*>(node->left()))
+                        else if (auto *member = dynamic_cast<MemberAccessNode *>(node->left()))
                         {
                             error_msg += ": member access failed";
                         }
@@ -5456,11 +5468,11 @@ namespace Cryo::Codegen
                 std::string error_msg = "Failed to generate left operand of binary expression";
                 if (node->left())
                 {
-                    if (auto* id = dynamic_cast<IdentifierNode*>(node->left()))
+                    if (auto *id = dynamic_cast<IdentifierNode *>(node->left()))
                     {
                         error_msg += ": identifier '" + id->name() + "' not found";
                     }
-                    else if (auto* member = dynamic_cast<MemberAccessNode*>(node->left()))
+                    else if (auto *member = dynamic_cast<MemberAccessNode *>(node->left()))
                     {
                         error_msg += ": member access failed";
                     }
@@ -5478,11 +5490,11 @@ namespace Cryo::Codegen
                 std::string error_msg = "Failed to generate right operand of binary expression";
                 if (node->right())
                 {
-                    if (auto* id = dynamic_cast<IdentifierNode*>(node->right()))
+                    if (auto *id = dynamic_cast<IdentifierNode *>(node->right()))
                     {
                         error_msg += ": identifier '" + id->name() + "' not found";
                     }
-                    else if (auto* member = dynamic_cast<MemberAccessNode*>(node->right()))
+                    else if (auto *member = dynamic_cast<MemberAccessNode *>(node->right()))
                     {
                         error_msg += ": member access failed";
                     }
@@ -7654,13 +7666,14 @@ namespace Cryo::Codegen
         for (size_t i = 0; i < args.size(); ++i)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Arg {}: address={}, type={}", i, static_cast<void *>(args[i]), static_cast<void *>(args[i]->getType()));
-            if (args[i]->getType())
-            {
-                args[i]->getType()->print(llvm::errs());
-                llvm::errs() << "\n";
-            }
-            args[i]->getType()->print(llvm::errs());
-            llvm::errs() << "\n";
+            // Debug type printing disabled to prevent stderr spam and potential segfaults
+            // if (args[i]->getType())
+            // {
+            //     args[i]->getType()->print(llvm::errs());
+            //     llvm::errs() << "\n";
+            // }
+            // args[i]->getType()->print(llvm::errs());
+            // llvm::errs() << "\n";
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to call CreateCall with {} arguments...", args.size());
 
             // Add even more detailed debugging before CreateCall
@@ -7744,8 +7757,8 @@ namespace Cryo::Codegen
                 if (call_result->getType())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Result type verified, printing...");
-                    call_result->getType()->print(llvm::errs());
-                    llvm::errs() << "\n";
+                    // call_result->getType()->print(llvm::errs());
+                    // llvm::errs() << "\n";
                 }
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to return call_result...");
@@ -8075,8 +8088,8 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry return type for '{}': {}", c_name, (void *)return_type);
         if (return_type)
         {
-            return_type->print(llvm::errs());
-            llvm::errs() << "\n";
+            // return_type->print(llvm::errs());
+            // llvm::errs() << "\n";
         }
 
         // TEMPORARY FIX: Override return type for known cross-module functions
