@@ -1301,7 +1301,7 @@ namespace Cryo
                                                                                  SourceLocation location)
     {
         // Debug logging for location info
-        LOG_DEBUG(Cryo::LogComponent::DIAGNOSTIC, "Creating E0353_PRIVATE_ACCESS error: member='{}', type='{}', location=line:{}, col:{}, file='{}'", 
+        LOG_DEBUG(Cryo::LogComponent::DIAGNOSTIC, "Creating E0353_PRIVATE_ACCESS error: member='{}', type='{}', location=line:{}, col:{}, file='{}'",
                   member_name, type_name, location.line(), location.column(), _source_file);
 
         SourceSpan span(location, location, _source_file, true);

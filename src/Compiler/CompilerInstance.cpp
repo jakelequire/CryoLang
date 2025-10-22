@@ -57,7 +57,7 @@ namespace Cryo
     void CompilerInstance::set_source_file(const std::string &file_path)
     {
         _source_file = file_path;
-        
+
         // Update TypeChecker with the source file for proper error reporting
         if (_type_checker)
         {

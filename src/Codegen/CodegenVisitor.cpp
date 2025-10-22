@@ -10275,7 +10275,7 @@ namespace Cryo::Codegen
 
         auto &context = _context_manager.get_context();
         auto &builder = _context_manager.get_builder();
-        
+
         // Get the LLVM struct type
         llvm::Type *llvm_struct_type = get_llvm_type(struct_type);
         if (!llvm_struct_type)
@@ -10288,17 +10288,27 @@ namespace Cryo::Codegen
         llvm::AllocaInst *struct_alloca = builder.CreateAlloca(llvm_struct_type, nullptr, type_name + "_stack_alloc");
 
         // Look for a constructor method to call
-        std::string constructor_name = get_namespaced_name(type_name);
-        llvm::Function *constructor_func = get_function(constructor_name);
-        
+        std::string constructor_name = type_name;
+        if (!_namespace_context.empty())
+        {
+            constructor_name = _namespace_context + "::" + type_name;
+        }
+
+        auto func_it = _functions.find(constructor_name);
+        llvm::Function *constructor_func = nullptr;
+        if (func_it != _functions.end())
+        {
+            constructor_func = func_it->second;
+        }
+
         if (constructor_func)
         {
             // Generate arguments for the constructor call
             std::vector<llvm::Value *> args;
-            
+
             // First argument is the struct pointer (this)
             args.push_back(struct_alloca);
-            
+
             // Add constructor arguments
             for (const auto &arg : node->arguments())
             {
