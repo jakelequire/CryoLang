@@ -987,8 +987,8 @@ namespace Cryo
         // Fall back to direct type lookups without string parsing
         LOG_DEBUG(Cryo::LogComponent::AST, "Attempting direct type lookup for '{}'", type_string);
 
-        // For simple identifiers that are NOT primitive types, check class types first
-        // This ensures that class declarations take precedence over struct types
+        // For simple identifiers that are NOT primitive types, check enum types first, then class types
+        // This ensures that enum declarations take precedence over class types for same-named identifiers
         if (type_string.find('*') == std::string::npos &&
             type_string.find('<') == std::string::npos &&
             type_string.find('[') == std::string::npos &&
@@ -1001,7 +1001,16 @@ namespace Cryo
             type_string != "u8" && type_string != "u16" && type_string != "u32" && type_string != "u64" &&
             type_string != "int" && type_string != "float" && type_string != "double")
         {
-            // Check for class types FIRST for user-defined type identifiers
+            // Check for enum types FIRST in symbol table for user-defined type identifiers
+            TypedSymbol *enum_symbol = _symbol_table->lookup_symbol(type_string);
+            LOG_DEBUG(Cryo::LogComponent::AST, "lookup_symbol for '{}' returned: {}", type_string, (enum_symbol ? "valid pointer" : "nullptr"));
+            if (enum_symbol && enum_symbol->type && enum_symbol->type->kind() == TypeKind::Enum)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found enum type '{}', kind={}", enum_symbol->type->name(), static_cast<int>(enum_symbol->type->kind()));
+                return enum_symbol->type;
+            }
+
+            // Check for class types SECOND for user-defined type identifiers
             Type *class_type = _type_context.get_class_type(type_string);
             LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
             if (class_type)
@@ -2397,23 +2406,27 @@ namespace Cryo
             {
                 const std::string &callee_name = identifier->name();
 
-                // Check if this is a struct or class type
-                Type *type = lookup_type_by_name(callee_name);
-                if (type && type->kind() == TypeKind::Struct)
+                // Only check for existing struct types, don't create new ones
+                Type *struct_type = _type_context.lookup_struct_type(callee_name);
+                if (struct_type && struct_type->kind() == TypeKind::Struct)
                 {
                     // This is a valid stack allocation constructor call for a struct
                     // TODO: Add proper constructor argument validation here
-                    node.set_resolved_type(type);
+                    node.set_resolved_type(struct_type);
                     return;
                 }
-                else if (type && type->kind() == TypeKind::Class)
+
+                // Check if this is an existing enum type
+                Type *enum_type = _type_context.lookup_enum_type(callee_name);
+                if (enum_type && enum_type->kind() == TypeKind::Enum)
                 {
-                    // For classes, we need to ensure we return the correct class type
-                    // Get the class type instead of the struct type
-                    Type *class_type = _type_context.get_class_type(callee_name);
-                    node.set_resolved_type(class_type);
+                    // This is a valid enum constructor call
+                    node.set_resolved_type(enum_type);
                     return;
                 }
+                
+                // For classes, we'll let this fall through to the regular function call handling
+                // since we don't want to accidentally create class types for function names
             }
         }
 
