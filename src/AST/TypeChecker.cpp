@@ -987,8 +987,8 @@ namespace Cryo
         // Fall back to direct type lookups without string parsing
         LOG_DEBUG(Cryo::LogComponent::AST, "Attempting direct type lookup for '{}'", type_string);
 
-        // For simple identifiers that are NOT primitive types, check enum types first, then struct/class types
-        // This ensures that enum declarations take precedence over class types for same-named identifiers
+        // For simple identifiers that are NOT primitive types, check the symbol table first for correct type
+        // This ensures that the correct type (struct vs class) is returned based on the actual declaration
         if (type_string.find('*') == std::string::npos &&
             type_string.find('<') == std::string::npos &&
             type_string.find('[') == std::string::npos &&
@@ -1001,16 +1001,17 @@ namespace Cryo
             type_string != "u8" && type_string != "u16" && type_string != "u32" && type_string != "u64" &&
             type_string != "int" && type_string != "float" && type_string != "double")
         {
-            // Check for enum types FIRST in symbol table for user-defined type identifiers
-            TypedSymbol *enum_symbol = _symbol_table->lookup_symbol(type_string);
-            LOG_DEBUG(Cryo::LogComponent::AST, "lookup_symbol for '{}' returned: {}", type_string, (enum_symbol ? "valid pointer" : "nullptr"));
-            if (enum_symbol && enum_symbol->type && enum_symbol->type->kind() == TypeKind::Enum)
+            // Check the symbol table FIRST to get the correct declared type (enum, struct, or class)
+            TypedSymbol *type_symbol = _symbol_table->lookup_symbol(type_string);
+            LOG_DEBUG(Cryo::LogComponent::AST, "lookup_symbol for '{}' returned: {}", type_string, (type_symbol ? "valid pointer" : "nullptr"));
+            if (type_symbol && type_symbol->type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found enum type '{}', kind={}", enum_symbol->type->name(), static_cast<int>(enum_symbol->type->kind()));
-                return enum_symbol->type;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found declared type '{}', kind={}", type_symbol->type->name(), static_cast<int>(type_symbol->type->kind()));
+                // Return the correct type as declared (enum, struct, or class)
+                return type_symbol->type;
             }
 
-            // Check for existing struct types SECOND (consistent with CallExpressionNode)
+            // Fallback: Check for existing struct types if not found in symbol table
             Type *struct_type = _type_context.lookup_struct_type(type_string);
             if (struct_type)
             {
@@ -1018,7 +1019,7 @@ namespace Cryo
                 return struct_type;
             }
 
-            // Check for class types THIRD for user-defined type identifiers
+            // Fallback: Check for class types if not found elsewhere
             Type *class_type = _type_context.get_class_type(type_string);
             LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
             if (class_type)
@@ -2422,6 +2423,87 @@ namespace Cryo
             }
         }
 
+        // Special handling for struct/class constructor calls (e.g., TestClass(20), TestStruct(25))
+        // Constructor calls without 'new' are stack allocations and should be allowed
+        // This check takes priority over function call logic
+        if (node.callee() && node.callee()->kind() == NodeKind::Identifier)
+        {
+            auto identifier = dynamic_cast<IdentifierNode *>(node.callee());
+            if (identifier)
+            {
+                const std::string &callee_name = identifier->name();
+                bool has_resolved = node.callee()->has_resolved_type();
+                Type *callee_resolved_type = has_resolved ? node.callee()->get_resolved_type() : nullptr;
+
+                LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression checking struct/class constructor for '{}', has_resolved_type: {}, type: {}",
+                          callee_name, has_resolved, callee_resolved_type ? callee_resolved_type->to_string() : "none");
+
+                // Check if the resolved type is a struct or class type (constructor call)
+                if (has_resolved && callee_resolved_type)
+                {
+                    if (callee_resolved_type->kind() == TypeKind::Struct)
+                    {
+                        // This is a valid stack allocation constructor call for a struct
+                        // TODO: Add proper constructor argument validation here
+                        LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Recognized struct constructor call for '{}'", callee_name);
+                        node.set_resolved_type(callee_resolved_type);
+                        return;
+                    }
+                    else if (callee_resolved_type->kind() == TypeKind::Class)
+                    {
+                        // This is a valid stack allocation constructor call for a class
+                        // TODO: Add proper constructor argument validation here
+                        LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Recognized class constructor call for '{}'", callee_name);
+                        node.set_resolved_type(callee_resolved_type);
+                        return;
+                    }
+                    else if (callee_resolved_type->kind() == TypeKind::Enum)
+                    {
+                        // This is a valid enum constructor call
+                        LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Recognized enum constructor call for '{}'", callee_name);
+                        node.set_resolved_type(callee_resolved_type);
+                        return;
+                    }
+                }
+
+                // If not resolved, try to look up struct/class types manually
+                if (!has_resolved)
+                {
+                    // Check for existing struct types first
+                    Type *struct_type = _type_context.lookup_struct_type(callee_name);
+                    if (struct_type && struct_type->kind() == TypeKind::Struct)
+                    {
+                        // This is a valid stack allocation constructor call for a struct
+                        // TODO: Add proper constructor argument validation here
+                        LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Found unresolved struct constructor call for '{}'", callee_name);
+                        node.set_resolved_type(struct_type);
+                        return;
+                    }
+
+                    // Check for existing class types (consistent with resolve_type_with_generic_context)
+                    Type *class_type = _type_context.get_class_type(callee_name);
+                    if (class_type && class_type->kind() == TypeKind::Class)
+                    {
+                        // This is a valid stack allocation constructor call for a class
+                        // TODO: Add proper constructor argument validation here
+                        LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Found unresolved class constructor call for '{}'", callee_name);
+                        node.set_resolved_type(class_type);
+                        return;
+                    }
+
+                    // Check if this is an existing enum type
+                    Type *enum_type = _type_context.lookup_enum_type(callee_name);
+                    if (enum_type && enum_type->kind() == TypeKind::Enum)
+                    {
+                        // This is a valid enum constructor call
+                        LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Found unresolved enum constructor call for '{}'", callee_name);
+                        node.set_resolved_type(enum_type);
+                        return;
+                    }
+                }
+            }
+        }
+
         // Special handling for primitive type constructors (e.g., u64(0), i32(42))
         // Check for constructors regardless of resolved type status since primitive types may have unknown type
         if (node.callee() && node.callee()->kind() == NodeKind::Identifier)
@@ -2433,7 +2515,7 @@ namespace Cryo
                 bool has_resolved = node.callee()->has_resolved_type();
                 Type *callee_resolved_type = has_resolved ? node.callee()->get_resolved_type() : nullptr;
 
-                LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression checking constructor for '{}', has_resolved_type: {}, type: {}",
+                LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression checking primitive constructor for '{}', has_resolved_type: {}, type: {}",
                           callee_name, has_resolved, callee_resolved_type ? callee_resolved_type->to_string() : "none");
 
                 // Handle primitive constructors: either not resolved, or resolved to unknown type
@@ -2468,58 +2550,6 @@ namespace Cryo
                         }
                     }
                 }
-            }
-        }
-
-        // Special handling for struct/class constructor calls (e.g., TestClass(20), TestStruct(25))
-        // Constructor calls without 'new' are stack allocations and should be allowed
-        if (node.callee() && node.callee()->kind() == NodeKind::Identifier)
-        {
-            auto identifier = dynamic_cast<IdentifierNode *>(node.callee());
-            if (identifier)
-            {
-                const std::string &callee_name = identifier->name();
-                bool has_resolved = node.callee()->has_resolved_type();
-                LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression checking struct/class constructor for '{}', has_resolved_type: {}",
-                          callee_name, has_resolved);
-
-                if (has_resolved)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Skipping constructor checks for '{}' because it has resolved type", callee_name);
-                    // Skip constructor checks - this is likely a function call
-                }
-                else
-                {
-
-                    // Check for existing struct types first
-                    Type *struct_type = _type_context.lookup_struct_type(callee_name);
-                    if (struct_type && struct_type->kind() == TypeKind::Struct)
-                    {
-                        // This is a valid stack allocation constructor call for a struct
-                        // TODO: Add proper constructor argument validation here
-                        node.set_resolved_type(struct_type);
-                        return;
-                    }
-
-                    // Check for existing class types (consistent with resolve_type_with_generic_context)
-                    Type *class_type = _type_context.get_class_type(callee_name);
-                    if (class_type && class_type->kind() == TypeKind::Class)
-                    {
-                        // This is a valid stack allocation constructor call for a class
-                        // TODO: Add proper constructor argument validation here
-                        node.set_resolved_type(class_type);
-                        return;
-                    }
-
-                    // Check if this is an existing enum type
-                    Type *enum_type = _type_context.lookup_enum_type(callee_name);
-                    if (enum_type && enum_type->kind() == TypeKind::Enum)
-                    {
-                        // This is a valid enum constructor call
-                        node.set_resolved_type(enum_type);
-                        return;
-                    }
-                } // End !has_resolved check
             }
         }
 
@@ -2975,6 +3005,9 @@ namespace Cryo
                     LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' but access is forbidden from different class '{}' - reporting E0353_PRIVATE_ACCESS", member_name, _current_struct_name);
                     // This is a private method being accessed from outside the class - report error
                     _diagnostic_builder->create_private_member_access_error(member_name, lookup_type_name, node.location());
+                    // Also add to TypeChecker's error list so has_errors() returns true
+                    _errors.emplace_back(TypeError::ErrorKind::InvalidOperation, node.location(), 
+                                       "Cannot access private member '" + member_name + "' of type '" + lookup_type_name + "'");
                     node.set_resolved_type(_type_context.get_unknown_type());
                     return;
                 }
