@@ -162,8 +162,9 @@ namespace Cryo
             if (!analyze())
             {
                 std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                                  SourceRange{}, file_path);
+                _diagnostic_manager->create_error(ErrorCode::E0805_INTERNAL_ERROR,
+                                                  SourceRange{}, file_path, 
+                                                  "Module contains compilation errors");
                 return false;
             }
 
@@ -423,6 +424,11 @@ namespace Cryo
             if (_debug_mode)
             {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Checking for type errors...");
+            }
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "TypeChecker has {} errors, has_errors() = {}", 
+                         _type_checker->error_count(), _type_checker->has_errors());
             }
             if (_type_checker->has_errors())
             {
