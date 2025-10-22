@@ -2837,13 +2837,11 @@ namespace Cryo
         {
             try
             {
-                // STRUCT VISIBILITY FIX: Parse visibility syntax but don't store the result
-                // This prevents LLVM recursion issues while maintaining proper syntax support
+                // Check for visibility modifiers  
                 if (is_visibility_modifier())
                 {
-                    parse_visibility_modifier(); // Parse but discard result
+                    current_visibility = parse_visibility_modifier(); // Store the parsed visibility
                     consume(TokenKind::TK_COLON, "Expected ':' after visibility modifier");
-                    // Keep current_visibility as Public for structs - don't update it
                     continue;
                 }
 
@@ -3663,10 +3661,8 @@ namespace Cryo
         SourceLocation start_loc = _current_token.location();
 
         // Use the visibility passed from the calling context
-        // Don't try to parse visibility again if it was already parsed in the outer scope
-        // WORKAROUND: Force struct methods to always be public to avoid LLVM codegen crash
-        // TODO: Fix the root cause in TypeMapper/CodegenVisitor for private struct members
-        Visibility visibility = Visibility::Public;
+        // This respects the private:/public: sections in classes and structs
+        Visibility visibility = default_visibility;
 
         // Check for static keyword
         bool is_static = false;

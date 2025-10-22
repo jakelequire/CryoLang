@@ -1296,6 +1296,29 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_private_member_access_error(const std::string &member_name,
+                                                                                 const std::string &type_name,
+                                                                                 SourceLocation location)
+    {
+        // Debug logging for location info
+        LOG_DEBUG(Cryo::LogComponent::DIAGNOSTIC, "Creating E0353_PRIVATE_ACCESS error: member='{}', type='{}', location=line:{}, col:{}, file='{}'", 
+                  member_name, type_name, location.line(), location.column(), _source_file);
+
+        SourceSpan span(location, location, _source_file, true);
+
+        span.set_label("cannot access private member '" + member_name + "'");
+
+        std::string message = "Cannot access private member '" + member_name + "' of type '" + type_name + "'";
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0353_PRIVATE_ACCESS, span.to_source_range(), _source_file, message);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_note("This member is marked as private and can only be accessed from within the same class or struct.");
+        diagnostic.add_help("Make the member public or access it through a public method.");
+
+        return diagnostic;
+    }
+
     Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_operation_error(const std::string &operation,
                                                                              Type *left_type, Type *right_type,
                                                                              SourceLocation location)

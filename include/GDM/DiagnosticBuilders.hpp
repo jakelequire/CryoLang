@@ -238,6 +238,10 @@ namespace Cryo
                                                        Type *object_type,
                                                        SourceLocation location);
 
+        Diagnostic &create_private_member_access_error(const std::string &member_name,
+                                                       const std::string &type_name,
+                                                       SourceLocation location);
+
         Diagnostic &create_invalid_dereference_error(Type *type, SourceLocation location);
 
         Diagnostic &create_invalid_address_of_error(SourceLocation location,
