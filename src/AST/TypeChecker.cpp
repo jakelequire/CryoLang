@@ -2130,6 +2130,7 @@ namespace Cryo
             }
 
             _diagnostic_builder->create_undefined_symbol_error(name, NodeKind::FunctionDeclaration, node.location());
+            report_undefined_symbol(node.location(), name);
             node.set_resolved_type(_type_context.get_unknown_type());
         }
         else
@@ -3006,8 +3007,8 @@ namespace Cryo
                     // This is a private method being accessed from outside the class - report error
                     _diagnostic_builder->create_private_member_access_error(member_name, lookup_type_name, node.location());
                     // Also add to TypeChecker's error list so has_errors() returns true
-                    _errors.emplace_back(TypeError::ErrorKind::InvalidOperation, node.location(), 
-                                       "Cannot access private member '" + member_name + "' of type '" + lookup_type_name + "'");
+                    _errors.emplace_back(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Cannot access private member '" + member_name + "' of type '" + lookup_type_name + "'");
                     node.set_resolved_type(_type_context.get_unknown_type());
                     return;
                 }
@@ -4922,6 +4923,7 @@ namespace Cryo
     {
         std::string message = "Undefined symbol '" + symbol_name + "'";
         _errors.emplace_back(TypeError::ErrorKind::UndefinedVariable, loc, message);
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::report_undefined_symbol - Added error for '{}', total errors: {}", symbol_name, _errors.size());
     }
 
     void TypeChecker::report_redefined_symbol(SourceLocation loc, const std::string &symbol_name)
