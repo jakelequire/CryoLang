@@ -496,9 +496,25 @@ namespace Cryo
             if (i > 0)
                 oss << ", ";
 
-            // Avoid virtual function calls on potentially corrupted parameter types
-            LOG_WARN(Cryo::LogComponent::AST, "FunctionType: Avoiding virtual function calls on parameter type at index {} due to potential Type corruption, using 'void'", i);
-            oss << "void";
+            // Try to safely get the parameter type name
+            if (_parameter_types[i])
+            {
+                try
+                {
+                    std::string param_name = _parameter_types[i]->name();
+                    oss << param_name;
+                }
+                catch (...)
+                {
+                    // Only fall back to void if there's an actual exception
+                    LOG_WARN(Cryo::LogComponent::AST, "FunctionType: Exception getting parameter type at index {}, using 'void'", i);
+                    oss << "void";
+                }
+            }
+            else
+            {
+                oss << "void";
+            }
         }
         if (_is_variadic)
         {
@@ -536,16 +552,18 @@ namespace Cryo
                     }
                     else
                     {
-                        // Since we know the return type objects can be corrupted,
-                        // and try-catch doesn't catch segmentation faults,
-                        // let's just use a safe default to avoid crashes entirely
-                        std::string return_type_str = "void"; // Safe default
-
-                        // Skip all virtual function calls to avoid segfaults
-                        // This is a temporary workaround until the root cause is fixed
-                        LOG_WARN(Cryo::LogComponent::AST, "FunctionType: Avoiding virtual function calls due to potential Type corruption, using 'void'");
-
-                        oss << ") -> " << return_type_str;
+                        // Try to safely get the return type name
+                        try
+                        {
+                            std::string return_type_str = raw_ptr->name();
+                            oss << ") -> " << return_type_str;
+                        }
+                        catch (...)
+                        {
+                            // Only fall back to void if there's an actual exception
+                            LOG_WARN(Cryo::LogComponent::AST, "FunctionType: Exception getting return type name, using 'void'");
+                            oss << ") -> void";
+                        }
                     }
                 }
             }
@@ -1006,6 +1024,8 @@ namespace Cryo
             return get_auto_type();
         case TokenKind::TK_KW_NULL:
             return get_null_type();
+        case TokenKind::TK_ELLIPSIS:
+            return get_variadic_type();
 
         default:
             return nullptr; // Not a primitive type token
