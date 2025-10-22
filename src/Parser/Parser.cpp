@@ -2837,7 +2837,7 @@ namespace Cryo
         {
             try
             {
-                // Check for visibility modifiers  
+                // Check for visibility modifiers
                 if (is_visibility_modifier())
                 {
                     current_visibility = parse_visibility_modifier(); // Store the parsed visibility

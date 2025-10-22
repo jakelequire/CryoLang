@@ -634,7 +634,7 @@ namespace Cryo
     void TypeChecker::set_source_file(const std::string &source_file)
     {
         _source_file = source_file;
-        
+
         // Recreate diagnostic builder with new source file
         if (_diagnostic_manager)
         {
@@ -987,10 +987,33 @@ namespace Cryo
         // Fall back to direct type lookups without string parsing
         LOG_DEBUG(Cryo::LogComponent::AST, "Attempting direct type lookup for '{}'", type_string);
 
-        // IMPORTANT: Try token-based parsing FIRST before direct type lookups
+        // For simple identifiers that are NOT primitive types, check class types first
+        // This ensures that class declarations take precedence over struct types
+        if (type_string.find('*') == std::string::npos &&
+            type_string.find('<') == std::string::npos &&
+            type_string.find('[') == std::string::npos &&
+            type_string.find('&') == std::string::npos &&
+            type_string.find('(') == std::string::npos &&
+            // Skip primitive types - let token parsing handle them
+            type_string != "void" && type_string != "boolean" && type_string != "char" &&
+            type_string != "string" && type_string != "auto" &&
+            type_string != "i8" && type_string != "i16" && type_string != "i32" && type_string != "i64" &&
+            type_string != "u8" && type_string != "u16" && type_string != "u32" && type_string != "u64" &&
+            type_string != "int" && type_string != "float" && type_string != "double")
+        {
+            // Check for class types FIRST for user-defined type identifiers
+            Type *class_type = _type_context.get_class_type(type_string);
+            LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
+            if (class_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "class_type name='{}', kind={}", class_type->name(), static_cast<int>(class_type->kind()));
+                return class_type;
+            }
+        }
+
+        // IMPORTANT: Try token-based parsing for complex types (pointers, etc.)
         // This ensures pointer syntax like "HeapBlock*" gets parsed correctly
-        // instead of being treated as struct type names
-        LOG_DEBUG(Cryo::LogComponent::AST, "Trying TypeContext token-based parsing first...");
+        LOG_DEBUG(Cryo::LogComponent::AST, "Trying TypeContext token-based parsing...");
         Lexer type_lexer(type_string);
         Type *parsed_type = _type_context.parse_type_from_tokens(type_lexer);
         LOG_DEBUG(Cryo::LogComponent::AST, "Token parsing result for '{}': {} (kind={})",
@@ -1050,17 +1073,10 @@ namespace Cryo
             type_string.find('[') == std::string::npos &&
             type_string.find('&') == std::string::npos)
         {
+            // Class types were already checked above, so check structs now
             Type *struct_type = _type_context.get_struct_type(type_string);
             if (struct_type)
                 return struct_type;
-
-            Type *class_type = _type_context.get_class_type(type_string);
-            LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
-            if (class_type)
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "class_type name='{}', kind={}", class_type->name(), static_cast<int>(class_type->kind()));
-                return class_type;
-            }
 
             Type *trait_type = _type_context.get_trait_type(type_string);
             if (trait_type)
@@ -2380,14 +2396,22 @@ namespace Cryo
             if (identifier)
             {
                 const std::string &callee_name = identifier->name();
-                
+
                 // Check if this is a struct or class type
                 Type *type = lookup_type_by_name(callee_name);
-                if (type && (type->kind() == TypeKind::Struct || type->kind() == TypeKind::Class))
+                if (type && type->kind() == TypeKind::Struct)
                 {
-                    // This is a valid stack allocation constructor call
+                    // This is a valid stack allocation constructor call for a struct
                     // TODO: Add proper constructor argument validation here
                     node.set_resolved_type(type);
+                    return;
+                }
+                else if (type && type->kind() == TypeKind::Class)
+                {
+                    // For classes, we need to ensure we return the correct class type
+                    // Get the class type instead of the struct type
+                    Type *class_type = _type_context.get_class_type(callee_name);
+                    node.set_resolved_type(class_type);
                     return;
                 }
             }
@@ -3938,9 +3962,9 @@ namespace Cryo
                     _type_context.create_function_type(return_type, param_types));
 
                 // Register in appropriate registry based on visibility
-                LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' in struct '{}' has visibility: {}", method_name, _current_struct_name, 
-                         (node.visibility() == Visibility::Private ? "Private" : 
-                          node.visibility() == Visibility::Public ? "Public" : "Unknown"));
+                LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' in struct '{}' has visibility: {}", method_name, _current_struct_name,
+                          (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
+                                                                                                                          : "Unknown"));
                 if (node.visibility() == Visibility::Private)
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
