@@ -365,6 +365,9 @@ namespace Cryo
         // Type lookup helpers to replace parse_type_from_string
         Type *lookup_type_by_name(const std::string &type_name);
 
+        // Method signature registration for forward references
+        void register_method_signature(StructMethodNode &method);
+
         // Type compatibility checking
         bool check_assignment_compatibility(Type *lhs_type, Type *rhs_type, SourceLocation loc);
         bool check_binary_operation_compatibility(TokenKind op, Type *lhs_type, Type *rhs_type, SourceLocation loc);

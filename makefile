@@ -364,7 +364,7 @@ ifeq ($(OS), Windows_NT)
 else
 	@mkdir -p $(dir $@)
 	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
-	@$(MAIN_BIN) $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(shell pwd)/$@ || ( \
+	@$(MAIN_BIN) $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode --debug -o $(shell pwd)/$@ || ( \
 		echo "[RUNTIME] Compilation failed for $*.cryo" && \
 		exit 1 \
 	)

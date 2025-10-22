@@ -2833,9 +2833,8 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_methods map", lookup_type_name);
         }
 
-        // Check for private methods - but only allow access from within the same class
-        // For now, we're being strict and disallowing all private access from outside the class
-        LOG_DEBUG(Cryo::LogComponent::AST, "Checking for private methods: lookup_type_name='{}', member_name='{}'", lookup_type_name, member_name);
+        // Check for private methods - allow access from within the same class
+        LOG_DEBUG(Cryo::LogComponent::AST, "Checking for private methods: lookup_type_name='{}', member_name='{}', current_struct='{}'", lookup_type_name, member_name, _current_struct_name);
         auto private_method_struct_it = _private_struct_methods.find(lookup_type_name);
         if (private_method_struct_it != _private_struct_methods.end())
         {
@@ -2843,11 +2842,22 @@ namespace Cryo
             auto private_method_it = private_method_struct_it->second.find(member_name);
             if (private_method_it != private_method_struct_it->second.end())
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' but access is forbidden - reporting E0353_PRIVATE_ACCESS", member_name);
-                // This is a private method being accessed from outside the class - report error
-                _diagnostic_builder->create_private_member_access_error(member_name, lookup_type_name, node.location());
-                node.set_resolved_type(_type_context.get_unknown_type());
-                return;
+                // Check if we're accessing the private method from within the same class
+                if (_current_struct_name == lookup_type_name)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' and allowing access from within same class '{}'", member_name, lookup_type_name);
+                    // Allow access to private method from within the same class
+                    node.set_resolved_type(private_method_it->second);
+                    return;
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' but access is forbidden from different class '{}' - reporting E0353_PRIVATE_ACCESS", member_name, _current_struct_name);
+                    // This is a private method being accessed from outside the class - report error
+                    _diagnostic_builder->create_private_member_access_error(member_name, lookup_type_name, node.location());
+                    node.set_resolved_type(_type_context.get_unknown_type());
+                    return;
+                }
             }
             else
             {
@@ -3209,7 +3219,18 @@ namespace Cryo
             }
         }
 
-        // Process methods
+        // Process methods in two passes to handle forward references
+        // Pass 1: Register all method signatures without type-checking bodies
+        for (const auto &method : node.methods())
+        {
+            if (method)
+            {
+                // Register method signature only, skip body type-checking
+                register_method_signature(*method);
+            }
+        }
+
+        // Pass 2: Type-check all method bodies with all signatures available
         for (const auto &method : node.methods())
         {
             if (method)
@@ -3312,7 +3333,18 @@ namespace Cryo
             }
         }
 
-        // Process methods
+        // Process methods in two passes to handle forward references
+        // Pass 1: Register all method signatures without type-checking bodies
+        for (const auto &method : node.methods())
+        {
+            if (method)
+            {
+                // Register method signature only, skip body type-checking
+                register_method_signature(*method);
+            }
+        }
+
+        // Pass 2: Type-check all method bodies with all signatures available
         for (const auto &method : node.methods())
         {
             if (method)
@@ -3929,52 +3961,80 @@ namespace Cryo
             visit(static_cast<FunctionDeclarationNode &>(node));
         }
 
-        // Store method information for member access resolution
+        // Store method information for member access resolution (if not already registered)
         if (!_current_struct_name.empty())
         {
-            // Get the return type from the node
-            Type *return_type = node.get_resolved_return_type();
-            std::string return_type_str = return_type ? return_type->to_string() : "";
-            if (return_type_str.empty() && is_constructor)
+            // Check if method is already registered (from signature registration pass)
+            bool already_registered = false;
+            if (node.visibility() == Visibility::Private)
             {
-                return_type_str = "void"; // Constructors typically return void
+                auto struct_it = _private_struct_methods.find(_current_struct_name);
+                if (struct_it != _private_struct_methods.end())
+                {
+                    auto method_it = struct_it->second.find(method_name);
+                    already_registered = (method_it != struct_it->second.end());
+                }
+            }
+            else
+            {
+                auto struct_it = _struct_methods.find(_current_struct_name);
+                if (struct_it != _struct_methods.end())
+                {
+                    auto method_it = struct_it->second.find(method_name);
+                    already_registered = (method_it != struct_it->second.end());
+                }
             }
 
-            if (return_type)
+            if (!already_registered)
             {
-                // Build full function signature for method type checking
-                std::vector<Type *> param_types;
-                for (const auto &param : node.parameters())
+                // Get the return type from the node
+                Type *return_type = node.get_resolved_return_type();
+                std::string return_type_str = return_type ? return_type->to_string() : "";
+                if (return_type_str.empty() && is_constructor)
                 {
-                    if (param)
+                    return_type_str = "void"; // Constructors typically return void
+                }
+
+                if (return_type)
+                {
+                    // Build full function signature for method type checking
+                    std::vector<Type *> param_types;
+                    for (const auto &param : node.parameters())
                     {
-                        Type *param_type = param->get_resolved_type();
-                        const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
-                        if (param_type)
+                        if (param)
                         {
-                            param_types.push_back(param_type);
+                            Type *param_type = param->get_resolved_type();
+                            const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
+                            if (param_type)
+                            {
+                                param_types.push_back(param_type);
+                            }
                         }
                     }
-                }
 
-                // Create function type with full signature
-                FunctionType *func_type = static_cast<FunctionType *>(
-                    _type_context.create_function_type(return_type, param_types));
+                    // Create function type with full signature
+                    FunctionType *func_type = static_cast<FunctionType *>(
+                        _type_context.create_function_type(return_type, param_types));
 
-                // Register in appropriate registry based on visibility
-                LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' in struct '{}' has visibility: {}", method_name, _current_struct_name,
-                          (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
-                                                                                                                          : "Unknown"));
-                if (node.visibility() == Visibility::Private)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
-                    _private_struct_methods[_current_struct_name][method_name] = func_type;
+                    // Register in appropriate registry based on visibility
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' in struct '{}' has visibility: {}", method_name, _current_struct_name,
+                              (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
+                                                                                                                              : "Unknown"));
+                    if (node.visibility() == Visibility::Private)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
+                        _private_struct_methods[_current_struct_name][method_name] = func_type;
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method '{}' for struct '{}'", method_name, _current_struct_name);
+                        _struct_methods[_current_struct_name][method_name] = func_type;
+                    }
                 }
-                else
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method '{}' for struct '{}'", method_name, _current_struct_name);
-                    _struct_methods[_current_struct_name][method_name] = func_type;
-                }
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' in struct '{}' already registered, skipping duplicate registration", method_name, _current_struct_name);
             }
         }
     }
@@ -4836,6 +4896,93 @@ namespace Cryo
 
         // Fall back to unknown type
         return _type_context.get_unknown_type();
+    }
+
+    void TypeChecker::register_method_signature(StructMethodNode &node)
+    {
+        // Extract method information
+        std::string method_name = node.name();
+        bool is_constructor = node.is_constructor();
+
+        // Get return type or use struct name for constructors
+        Type *return_type = node.get_resolved_return_type();
+
+        if (!return_type && is_constructor)
+        {
+            // Constructors return void or their class type
+            return_type = _type_context.get_void_type();
+        }
+
+        if (!return_type)
+        {
+            // Try to resolve return type from annotation
+            std::string return_type_annotation = node.return_type_annotation();
+            if (!return_type_annotation.empty())
+            {
+                return_type = resolve_type_with_generic_context(return_type_annotation);
+                if (return_type)
+                {
+                    node.set_resolved_return_type(return_type);
+                }
+            }
+        }
+
+        if (!return_type)
+        {
+            // Default to void if no return type can be determined
+            return_type = _type_context.get_void_type();
+        }
+
+        // Build parameter types for function signature
+        std::vector<Type *> param_types;
+        for (const auto &param : node.parameters())
+        {
+            if (param)
+            {
+                Type *param_type = param->get_resolved_type();
+                if (!param_type)
+                {
+                    // Try to resolve parameter type from annotation
+                    std::string param_type_annotation = param->type_annotation();
+                    if (!param_type_annotation.empty())
+                    {
+                        param_type = resolve_type_with_generic_context(param_type_annotation);
+                        if (param_type)
+                        {
+                            param->set_resolved_type(param_type);
+                        }
+                    }
+                }
+
+                if (param_type)
+                {
+                    param_types.push_back(param_type);
+                }
+            }
+        }
+
+        // Create function type
+        FunctionType *func_type = static_cast<FunctionType *>(
+            _type_context.create_function_type(return_type, param_types));
+
+        // Register in appropriate registry based on visibility
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering signature for method '{}' in struct '{}' with visibility: {}",
+                  method_name, _current_struct_name,
+                  (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
+                                                                                                                  : "Unknown"));
+
+        if (node.visibility() == Visibility::Private)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method signature '{}' for struct '{}'",
+                      method_name, _current_struct_name);
+            _private_struct_methods[_current_struct_name][method_name] = func_type;
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method signature '{}' for struct '{}'",
+                      method_name, _current_struct_name);
+            _struct_methods[_current_struct_name][method_name] = func_type;
+        }
     }
 
     //===----------------------------------------------------------------------===//
