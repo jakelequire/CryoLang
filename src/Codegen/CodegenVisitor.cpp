@@ -6505,6 +6505,22 @@ namespace Cryo::Codegen
                 return generate_primitive_constructor_call(node, function_name);
             }
 
+            // Check if this is a struct/class constructor call without 'new' keyword
+            // e.g., TestClass(20) instead of new TestClass(20)
+            auto symbol = _symbol_table.lookup_symbol(function_name);
+            if (symbol && symbol->kind == SymbolKind::Type)
+            {
+                // Double-check if this is actually a struct/class type by looking at the type
+                if (symbol->data_type && (symbol->data_type->kind() == TypeKind::Struct || symbol->data_type->kind() == TypeKind::Class))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected constructor call without 'new' keyword for type: {}", function_name);
+                    // Report an error through the diagnostic manager
+                    // This should be treated as an error case - constructor calls without 'new' are invalid syntax
+                    report_error("Constructor call without 'new' keyword is not allowed. Use 'new " + function_name + "()' or struct literal syntax '" + function_name + "({...})'", node);
+                    return nullptr;
+                }
+            }
+
             // Check if this is an intrinsic call (intrinsics start with "__")
             if (function_name.length() > 4 && function_name.substr(0, 2) == "__" && function_name.substr(function_name.length() - 2) == "__")
             {
