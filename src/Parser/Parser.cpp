@@ -2837,14 +2837,13 @@ namespace Cryo
         {
             try
             {
-                // CRITICAL FIX: Disable visibility parsing for structs due to LLVM recursion issue
-                // Structs in Cryo have all members public by default
-                // TODO: Investigate and fix the root cause of stack overflow with struct visibility parsing
-                // Check for visibility modifiers
-                if (false && is_visibility_modifier())
+                // STRUCT VISIBILITY FIX: Parse visibility syntax but don't store the result
+                // This prevents LLVM recursion issues while maintaining proper syntax support
+                if (is_visibility_modifier())
                 {
-                    current_visibility = parse_visibility_modifier();
+                    parse_visibility_modifier(); // Parse but discard result
                     consume(TokenKind::TK_COLON, "Expected ':' after visibility modifier");
+                    // Keep current_visibility as Public for structs - don't update it
                     continue;
                 }
 
