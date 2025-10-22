@@ -631,6 +631,17 @@ namespace Cryo
         // No hardcoded type registrations here
     }
 
+    void TypeChecker::set_source_file(const std::string &source_file)
+    {
+        _source_file = source_file;
+        
+        // Recreate diagnostic builder with new source file
+        if (_diagnostic_manager)
+        {
+            _diagnostic_builder = std::make_unique<TypeCheckerDiagnosticBuilder>(_diagnostic_manager, _source_file);
+        }
+    }
+
     //===----------------------------------------------------------------------===//
     // Generic Context Management
     //===----------------------------------------------------------------------===//
@@ -2361,6 +2372,27 @@ namespace Cryo
             }
         }
 
+        // Special handling for struct/class constructor calls (e.g., TestClass(20), TestStruct(25))
+        // Constructor calls without 'new' are stack allocations and should be allowed
+        if (node.callee() && node.callee()->kind() == NodeKind::Identifier)
+        {
+            auto identifier = dynamic_cast<IdentifierNode *>(node.callee());
+            if (identifier)
+            {
+                const std::string &callee_name = identifier->name();
+                
+                // Check if this is a struct or class type
+                Type *type = lookup_type_by_name(callee_name);
+                if (type && (type->kind() == TypeKind::Struct || type->kind() == TypeKind::Class))
+                {
+                    // This is a valid stack allocation constructor call
+                    // TODO: Add proper constructor argument validation here
+                    node.set_resolved_type(type);
+                    return;
+                }
+            }
+        }
+
         // Check if callee is callable
         if (node.callee() && node.callee()->has_resolved_type())
         {
@@ -2754,82 +2786,53 @@ namespace Cryo
         }
 
         // Look up method in struct method map
+        LOG_DEBUG(Cryo::LogComponent::AST, "Starting method lookup for '{}' in struct '{}'", member_name, lookup_type_name);
         auto method_struct_it = _struct_methods.find(lookup_type_name);
         if (method_struct_it != _struct_methods.end())
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found struct '{}' in _struct_methods with {} methods", lookup_type_name, method_struct_it->second.size());
             auto method_it = method_struct_it->second.find(member_name);
             if (method_it != method_struct_it->second.end())
             {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found public method '{}' in struct '{}'", member_name, lookup_type_name);
                 // Found the method - store the resolved Type*
                 node.set_resolved_type(method_it->second);
                 return;
             }
-        }
-
-        // Check for private methods within the same class/struct context
-        if (!_current_struct_name.empty() && lookup_type_name == _current_struct_name)
-        {
-            auto private_method_struct_it = _private_struct_methods.find(lookup_type_name);
-            if (private_method_struct_it != _private_struct_methods.end())
-            {
-                auto private_method_it = private_method_struct_it->second.find(member_name);
-                if (private_method_it != private_method_struct_it->second.end())
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' in current class '{}'", member_name, lookup_type_name);
-                    node.set_resolved_type(private_method_it->second);
-                    return;
-                }
-            }
-
-            // Hardcoded signatures for known private methods during class definition
-            if (member_name == "align_size" && lookup_type_name == "HeapManager")
-            {
-                std::vector<Type *> params = {_type_context.get_u64_type(), _type_context.get_u64_type()};
-                node.set_resolved_type(_type_context.create_function_type(_type_context.get_u64_type(), params));
-                return;
-            }
-            else if (member_name == "get_block_from_ptr" && lookup_type_name == "HeapManager")
-            {
-                Type *void_ptr_type = _type_context.create_pointer_type(_type_context.get_void_type());
-                Type *heap_block_type = lookup_variable_type("HeapBlock");
-                if (heap_block_type)
-                {
-                    Type *heap_block_ptr_type = _type_context.create_pointer_type(heap_block_type);
-                    std::vector<Type *> params = {void_ptr_type};
-                    node.set_resolved_type(_type_context.create_function_type(heap_block_ptr_type, params));
-                    return;
-                }
-            }
-            else if (member_name == "coalesce_block" && lookup_type_name == "HeapManager")
-            {
-                Type *heap_block_type = lookup_variable_type("HeapBlock");
-                if (heap_block_type)
-                {
-                    Type *heap_block_ptr_type = _type_context.create_pointer_type(heap_block_type);
-                    std::vector<Type *> params = {heap_block_ptr_type};
-                    node.set_resolved_type(_type_context.create_function_type(_type_context.get_void_type(), params));
-                    return;
-                }
-            }
             else
             {
-                std::vector<Type *> params = {};
-                node.set_resolved_type(_type_context.create_function_type(_type_context.get_void_type(), params));
-                return;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' NOT found in public methods for struct '{}'", member_name, lookup_type_name);
             }
         }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_methods map", lookup_type_name);
+        }
 
-        // Check for other private methods
+        // Check for private methods - but only allow access from within the same class
+        // For now, we're being strict and disallowing all private access from outside the class
+        LOG_DEBUG(Cryo::LogComponent::AST, "Checking for private methods: lookup_type_name='{}', member_name='{}'", lookup_type_name, member_name);
         auto private_method_struct_it = _private_struct_methods.find(lookup_type_name);
         if (private_method_struct_it != _private_struct_methods.end())
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found private methods for type '{}'", lookup_type_name);
             auto private_method_it = private_method_struct_it->second.find(member_name);
             if (private_method_it != private_method_struct_it->second.end())
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}'", member_name);
-                node.set_resolved_type(private_method_it->second);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' but access is forbidden - reporting E0353_PRIVATE_ACCESS", member_name);
+                // This is a private method being accessed from outside the class - report error
+                _diagnostic_builder->create_private_member_access_error(member_name, lookup_type_name, node.location());
+                node.set_resolved_type(_type_context.get_unknown_type());
                 return;
             }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' not found in private methods for type '{}'", member_name, lookup_type_name);
+            }
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "No private methods found for type '{}'", lookup_type_name);
         }
 
         // Handle built-in type methods (string, primitive types, etc.)
@@ -3935,6 +3938,9 @@ namespace Cryo
                     _type_context.create_function_type(return_type, param_types));
 
                 // Register in appropriate registry based on visibility
+                LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' in struct '{}' has visibility: {}", method_name, _current_struct_name, 
+                         (node.visibility() == Visibility::Private ? "Private" : 
+                          node.visibility() == Visibility::Public ? "Public" : "Unknown"));
                 if (node.visibility() == Visibility::Private)
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
@@ -3942,6 +3948,7 @@ namespace Cryo
                 }
                 else
                 {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method '{}' for struct '{}'", method_name, _current_struct_name);
                     _struct_methods[_current_struct_name][method_name] = func_type;
                 }
             }

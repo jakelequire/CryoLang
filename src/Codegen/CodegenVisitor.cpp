@@ -2469,8 +2469,16 @@ namespace Cryo::Codegen
         // If there are constructor arguments, call the constructor
         if (!node.arguments().empty())
         {
-            // Look up the constructor function
-            std::string constructor_name = full_type_name + "::" + base_type_name; // Constructor has base name
+            // Look up the constructor function - need to include namespace context
+            std::string constructor_name;
+            if (!_namespace_context.empty())
+            {
+                constructor_name = _namespace_context + "::" + full_type_name + "::" + base_type_name;
+            }
+            else
+            {
+                constructor_name = full_type_name + "::" + base_type_name;
+            }
             auto constructor_it = _functions.find(constructor_name);
 
             if (constructor_it != _functions.end())
@@ -6507,17 +6515,16 @@ namespace Cryo::Codegen
 
             // Check if this is a struct/class constructor call without 'new' keyword
             // e.g., TestClass(20) instead of new TestClass(20)
+            // This is valid and creates a stack allocation
             auto symbol = _symbol_table.lookup_symbol(function_name);
             if (symbol && symbol->kind == SymbolKind::Type)
             {
                 // Double-check if this is actually a struct/class type by looking at the type
                 if (symbol->data_type && (symbol->data_type->kind() == TypeKind::Struct || symbol->data_type->kind() == TypeKind::Class))
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected constructor call without 'new' keyword for type: {}", function_name);
-                    // Report an error through the diagnostic manager
-                    // This should be treated as an error case - constructor calls without 'new' are invalid syntax
-                    report_error("Constructor call without 'new' keyword is not allowed. Use 'new " + function_name + "()' or struct literal syntax '" + function_name + "({...})'", node);
-                    return nullptr;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected stack allocation constructor call for type: {}", function_name);
+                    // Generate stack allocation constructor call
+                    return generate_stack_constructor_call(node, function_name, symbol->data_type);
                 }
             }
 
@@ -10260,6 +10267,63 @@ namespace Cryo::Codegen
         }
 
         return param_type;
+    }
+
+    llvm::Value *CodegenVisitor::generate_stack_constructor_call(CallExpressionNode *node, const std::string &type_name, Type *struct_type)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating stack allocation constructor call for type: {}", type_name);
+
+        auto &context = _context_manager.get_context();
+        auto &builder = _context_manager.get_builder();
+        
+        // Get the LLVM struct type
+        llvm::Type *llvm_struct_type = get_llvm_type(struct_type);
+        if (!llvm_struct_type)
+        {
+            report_error("Failed to get LLVM type for struct: " + type_name, node);
+            return nullptr;
+        }
+
+        // Create a stack allocation for the struct
+        llvm::AllocaInst *struct_alloca = builder.CreateAlloca(llvm_struct_type, nullptr, type_name + "_stack_alloc");
+
+        // Look for a constructor method to call
+        std::string constructor_name = get_namespaced_name(type_name);
+        llvm::Function *constructor_func = get_function(constructor_name);
+        
+        if (constructor_func)
+        {
+            // Generate arguments for the constructor call
+            std::vector<llvm::Value *> args;
+            
+            // First argument is the struct pointer (this)
+            args.push_back(struct_alloca);
+            
+            // Add constructor arguments
+            for (const auto &arg : node->arguments())
+            {
+                arg->accept(*this);
+                llvm::Value *arg_value = get_current_value();
+                if (!arg_value)
+                {
+                    report_error("Failed to generate argument for stack constructor", arg.get());
+                    return nullptr;
+                }
+                args.push_back(arg_value);
+            }
+
+            // Call the constructor
+            builder.CreateCall(constructor_func, args);
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No explicit constructor found for {}, using default initialization", type_name);
+            // If no explicit constructor, just zero-initialize the struct
+            builder.CreateStore(llvm::Constant::getNullValue(llvm_struct_type), struct_alloca);
+        }
+
+        set_current_value(struct_alloca);
+        return struct_alloca;
     }
 
 } // namespace Cryo::Codegen
