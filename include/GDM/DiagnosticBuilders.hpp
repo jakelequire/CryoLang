@@ -154,6 +154,11 @@ namespace Cryo
         // Pattern and match errors
         Diagnostic &create_invalid_pattern_error(SourceLocation location,
                                                  const std::string &pattern_context = "");
+
+        // Instantiation errors
+        Diagnostic &create_invalid_instantiation_error(const std::string &type_name,
+                                                      SourceLocation location,
+                                                      const std::string &reason = "");
     };
 
     /**

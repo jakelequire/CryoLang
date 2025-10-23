@@ -83,6 +83,9 @@ namespace Cryo
         case ErrorCode::E0600_CODEGEN_FAILED:
             diagnostic.add_help("this is usually caused by earlier semantic errors");
             break;
+        case ErrorCode::E0357_INVALID_INSTANTIATION:
+            diagnostic.add_help("use 'new ClassName(args)' for constructor calls or 'ClassName({field: value})' for struct literals, but not both");
+            break;
         default:
             // No specific help for this error code
             break;
@@ -849,6 +852,27 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &ParserDiagnosticBuilder::create_invalid_instantiation_error(const std::string &type_name,
+                                                                            SourceLocation location,
+                                                                            const std::string &reason)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("invalid instantiation");
+
+        std::string message = "invalid instantiation of '" + type_name + "'";
+        if (!reason.empty())
+        {
+            message += ": " + reason;
+        }
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0357_INVALID_INSTANTIATION, span.to_source_range(), _source_file);
+        diagnostic.with_primary_span(span);
+
+        diagnostic.add_help("use 'new ClassName(args)' for constructor calls or 'ClassName({field: value})' for struct literals, but not both");
+
+        return diagnostic;
+    }
+
     //===================================================================
     // LexerDiagnosticBuilder Implementation
     //===================================================================
@@ -1161,11 +1185,11 @@ namespace Cryo
             error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
             break;
         case NodeKind::StructDeclaration:
-            symbol_type = "struct";
+            symbol_type = "type";
             error_code = ErrorCode::E0203_UNDEFINED_TYPE;
             break;
         case NodeKind::ClassDeclaration:
-            symbol_type = "class";
+            symbol_type = "type";
             error_code = ErrorCode::E0203_UNDEFINED_TYPE;
             break;
         case NodeKind::TraitDeclaration:
