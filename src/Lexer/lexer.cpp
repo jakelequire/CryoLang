@@ -140,9 +140,6 @@ namespace Cryo
         // Memory & Ownership
         {"ref", TokenKind::TK_KW_REF},
         {"mut", TokenKind::TK_KW_MUT},
-        {"own", TokenKind::TK_KW_OWN},
-        {"move", TokenKind::TK_KW_MOVE},
-        {"copy", TokenKind::TK_KW_COPY},
 
         // Special Values
         {"true", TokenKind::TK_KW_TRUE},

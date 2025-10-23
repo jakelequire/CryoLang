@@ -2129,9 +2129,17 @@ namespace Cryo
                 }
             }
 
-            _diagnostic_builder->create_undefined_symbol_error(name, NodeKind::FunctionDeclaration, node.location());
-            report_undefined_symbol(node.location(), name);
-            node.set_resolved_type(_type_context.get_unknown_type());
+            if (_in_call_expression)
+            {
+                // Don't report error here if in call context - let CallExpressionNode handle it
+                node.set_resolved_type(_type_context.get_unknown_type());
+            }
+            else
+            {
+                _diagnostic_builder->create_undefined_symbol_error(name, NodeKind::VariableDeclaration, node.location());
+                report_undefined_symbol(node.location(), name);
+                node.set_resolved_type(_type_context.get_unknown_type());
+            }
         }
         else
         {
@@ -2399,10 +2407,13 @@ namespace Cryo
 
     void TypeChecker::visit(CallExpressionNode &node)
     {
-        // Visit callee
+        // Visit callee with call expression context
         if (node.callee())
         {
+            bool prev_in_call = _in_call_expression;
+            _in_call_expression = true;
             node.callee()->accept(*this);
+            _in_call_expression = prev_in_call;
         }
 
         // Visit arguments
@@ -2438,6 +2449,20 @@ namespace Cryo
 
                 LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression checking struct/class constructor for '{}', has_resolved_type: {}, type: {}",
                           callee_name, has_resolved, callee_resolved_type ? callee_resolved_type->to_string() : "none");
+
+                // Check if the resolved type is unknown - this indicates an undefined identifier
+                if (has_resolved && callee_resolved_type && callee_resolved_type->kind() == TypeKind::Unknown)
+                {
+                    // Check if it's not a known primitive type
+                    if (!is_primitive_integer_type(callee_name) && callee_name != "f32" && callee_name != "f64" && callee_name != "float")
+                    {
+                        // The identifier was processed but not found - this is an undefined function call
+                        // Report as undefined function and return to avoid cascading non-callable errors
+                        _diagnostic_builder->create_undefined_symbol_error(callee_name, NodeKind::FunctionDeclaration, node.location());
+                        node.set_resolved_type(_type_context.get_unknown_type());
+                        return;
+                    }
+                }
 
                 // Check if the resolved type is a struct or class type (constructor call)
                 if (has_resolved && callee_resolved_type)
@@ -2499,6 +2524,16 @@ namespace Cryo
                         // This is a valid enum constructor call
                         LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Found unresolved enum constructor call for '{}'", callee_name);
                         node.set_resolved_type(enum_type);
+                        return;
+                    }
+
+                    // If we reach here and the callee is not resolved and it's not a known type,
+                    // and it's not a primitive type, then it's likely an undefined function call
+                    if (!is_primitive_integer_type(callee_name) && callee_name != "f32" && callee_name != "f64" && callee_name != "float")
+                    {
+                        // This is an undefined function call
+                        _diagnostic_builder->create_undefined_symbol_error(callee_name, NodeKind::FunctionDeclaration, node.location());
+                        node.set_resolved_type(_type_context.get_unknown_type());
                         return;
                     }
                 }
@@ -2714,13 +2749,44 @@ namespace Cryo
         else
         {
             // Type not found - report error and set to unknown
-            _diagnostic_builder->create_undefined_symbol_error(node.type_name(), NodeKind::Declaration, node.location());
+            _diagnostic_builder->create_undefined_symbol_error(node.type_name(), NodeKind::ClassDeclaration, node.location());
             node.set_type("unknown");
         }
 
         // TODO: Add constructor argument validation
         // For now, we assume any struct/class can be constructed with any arguments
         // Later we can add proper constructor signature checking
+    }
+
+    void TypeChecker::visit(StructLiteralNode &node)
+    {
+        // Look up the struct type in the symbol table
+        const std::string &struct_name = node.struct_type();
+        TypedSymbol *type_symbol = _symbol_table->lookup_symbol(struct_name);
+
+        if (!type_symbol)
+        {
+            // Struct type not found - report error
+            _diagnostic_builder->create_undefined_symbol_error(struct_name, NodeKind::StructDeclaration, node.location());
+            node.set_resolved_type(_type_context.get_unknown_type());
+        }
+        else
+        {
+            // Struct type exists - set the resolved type
+            node.set_resolved_type(type_symbol->type);
+            
+            // TODO: Validate field initializers against struct definition
+            // For now, assume all field initializers are valid
+        }
+
+        // Visit all field initializers for type checking
+        for (const auto &field_init : node.field_initializers())
+        {
+            if (field_init && field_init->value())
+            {
+                field_init->value()->accept(*this);
+            }
+        }
     }
 
     void TypeChecker::visit(SizeofExpressionNode &node)

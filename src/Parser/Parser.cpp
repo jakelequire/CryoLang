@@ -2643,53 +2643,43 @@ namespace Cryo
         // Check if this is a struct literal ({field: value})
         if (_current_token.is(TokenKind::TK_L_BRACE))
         {
-            // This is a struct literal, not a regular constructor call
+            // This is invalid syntax: 'new' keyword cannot be used with struct literal syntax
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->create_invalid_instantiation_error(
+                    type_name, 
+                    new_location, 
+                    "cannot use 'new' keyword with struct literal syntax"
+                );
+            }
+            
+            // Error recovery: skip the invalid struct literal syntax
+            // Consume the opening brace
             advance(); // consume '{'
-
-            auto struct_literal = _builder.create_struct_literal(new_location, type_name);
-
-            // Copy generic arguments to struct literal
-            for (const auto &generic_arg : new_expr->generic_args())
+            
+            // Skip until we find the closing brace
+            int brace_count = 1;
+            while (!_current_token.is(TokenKind::TK_EOF) && brace_count > 0)
             {
-                struct_literal->add_generic_arg(generic_arg);
-            }
-
-            // Parse field initializers
-            if (!_current_token.is(TokenKind::TK_R_BRACE))
-            {
-                do
+                if (_current_token.is(TokenKind::TK_L_BRACE))
                 {
-                    // Parse field name
-                    if (!_current_token.is(TokenKind::TK_IDENTIFIER))
-                    {
-                        error("Expected field name in struct literal");
-                        return nullptr;
-                    }
-
-                    std::string field_name = std::string(_current_token.text());
-                    advance(); // consume field name
-
-                    consume(TokenKind::TK_COLON, "Expected ':' after field name");
-
-                    // Parse field value
-                    auto field_value = parse_expression();
-                    if (!field_value)
-                    {
-                        error("Expected expression for field value");
-                        return nullptr;
-                    }
-
-                    // Create field initializer
-                    auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
-                    struct_literal->add_field_initializer(std::move(field_init));
-
-                } while (match(TokenKind::TK_COMMA));
+                    brace_count++;
+                }
+                else if (_current_token.is(TokenKind::TK_R_BRACE))
+                {
+                    brace_count--;
+                }
+                advance();
             }
-
-            consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
-            consume(TokenKind::TK_R_PAREN, "Expected ')' after struct literal");
-
-            return struct_literal;
+            
+            // Consume the closing parenthesis if present
+            if (_current_token.is(TokenKind::TK_R_PAREN))
+            {
+                advance();
+            }
+            
+            // Return a valid new expression node without arguments for error recovery
+            return new_expr;
         }
         else
         {

@@ -189,6 +189,7 @@ namespace Cryo
         // Type checking state
         bool _in_function = false;
         bool _in_loop = false;
+        bool _in_call_expression = false;
 
         // Struct field tracking - maps struct name -> field name -> field type
         std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _struct_fields;
@@ -346,6 +347,7 @@ namespace Cryo
         void visit(UnaryExpressionNode &node) override;
         void visit(CallExpressionNode &node) override;
         void visit(NewExpressionNode &node) override;
+        void visit(StructLiteralNode &node) override;
         void visit(SizeofExpressionNode &node) override;
         void visit(MemberAccessNode &node) override;
         void visit(ScopeResolutionNode &node) override;

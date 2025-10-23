@@ -173,6 +173,12 @@ namespace Cryo
                                       "Cannot call this type as a function - only functions and callable objects can be invoked.",
                                       "Check if this should be a function call, field access, or method invocation."));
 
+        _error_info.emplace(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
+                            ErrorInfo(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
+                                      "invalid assignment target",
+                                      "Cannot assign to this expression - assignment requires a mutable variable or field.",
+                                      "Ensure the target is a mutable variable, or check if you're trying to modify a constant."));
+
         _error_info.emplace(ErrorCode::E0209_INVALID_OPERATION,
                             ErrorInfo(ErrorCode::E0209_INVALID_OPERATION,
                                       "invalid operation",
