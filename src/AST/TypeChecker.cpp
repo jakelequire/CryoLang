@@ -610,6 +610,9 @@ namespace Cryo
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
         _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
+        
+        // Connect TypeRegistry to TypeContext for generic instantiation
+        type_ctx.set_type_registry(_type_registry.get());
 
         // Generic types will be discovered dynamically from standard library parsing
         // No hardcoded type registrations here
@@ -620,6 +623,9 @@ namespace Cryo
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
         _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
+        
+        // Connect TypeRegistry to TypeContext for generic instantiation
+        type_ctx.set_type_registry(_type_registry.get());
 
         // Initialize diagnostic builder if we have a diagnostic manager
         if (_diagnostic_manager)

@@ -1455,8 +1455,21 @@ namespace Cryo
                 }
             }
 
-            // This looks like a generic instantiation - create struct type for it
-            return get_struct_type(normalized_type_str);
+            // This looks like a generic instantiation - use TypeRegistry if available
+            if (_type_registry)
+            {
+                // Try to instantiate using the TypeRegistry
+                ParameterizedType *instantiated_type = _type_registry->parse_and_instantiate(normalized_type_str);
+                if (instantiated_type)
+                {
+                    return instantiated_type;
+                }
+            }
+            
+            // Fallback: For unknown generic types during parsing (before TypeRegistry is set up),
+            // return an unknown type instead of creating a struct type with the full generic name.
+            // This allows parsing to continue and type checking will resolve it later.
+            return get_unknown_type();
         }
 
         // Check for user-defined enum types FIRST (before struct types)

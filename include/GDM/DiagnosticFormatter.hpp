@@ -66,12 +66,13 @@ namespace Cryo
                                     size_t terminal_width = 80);
 
         // Main formatting method
-        std::string format_diagnostic(const Diagnostic& diagnostic);
+        std::string format_diagnostic(const Diagnostic& diagnostic, size_t error_number = 0);
 
         // Enhanced diagnostic formatting (when we upgrade Diagnostic)
         std::string format_enhanced_diagnostic(const Diagnostic& diagnostic,
                                                const MultiSpan& spans,
-                                               const std::vector<CodeSuggestion>& suggestions);
+                                               const std::vector<CodeSuggestion>& suggestions,
+                                               size_t error_number = 0);
 
     private:
         // Source snippet extraction and formatting

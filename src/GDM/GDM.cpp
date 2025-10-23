@@ -965,12 +965,20 @@ namespace Cryo
 
     void DiagnosticManager::print_all(std::ostream &os) const
     {
+        size_t error_number = 0;
         for (const auto &diagnostic : _diagnostics)
         {
             // Always use the sophisticated Rust-style formatter
             if (_formatter)
             {
-                std::string formatted = _formatter->format_diagnostic(diagnostic);
+                // Only count actual errors (not warnings or notes) for numbering
+                if (diagnostic.severity() == DiagnosticSeverity::Error || 
+                    diagnostic.severity() == DiagnosticSeverity::Fatal)
+                {
+                    error_number++;
+                }
+                
+                std::string formatted = _formatter->format_diagnostic(diagnostic, error_number);
                 os << formatted;
             }
         }
