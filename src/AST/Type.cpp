@@ -890,12 +890,38 @@ namespace Cryo
 
     Type *TypeContext::create_reference_type(Type *referent_type)
     {
-        auto reference_type = std::make_unique<ReferenceType>(
-            std::shared_ptr<Type>(referent_type, [](Type *) {}));
+        if (!referent_type)
+        {
+            LOG_ERROR(Cryo::LogComponent::AST, "TypeContext::create_reference_type() - null referent type");
+            return nullptr;
+        }
+
+        // Generate the reference type name (automatically set by ReferenceType constructor)
+        std::string reference_key = "&" + referent_type->name();
+
+        // Check if we already have this reference type (simple name-based check)
+        for (const auto &existing_type : _complex_types)
+        {
+            if (existing_type->name() == reference_key)
+            {
+                LOG_TRACE(Cryo::LogComponent::AST, "TypeContext::create_reference_type() - found cached reference type: {}", reference_key);
+                return existing_type.get();
+            }
+        }
+
+        // Create a non-owning shared_ptr since TypeContext manages the lifetime
+        // This is safe because referent_type is guaranteed to live as long as TypeContext
+        std::shared_ptr<Type> referent_shared(referent_type, [](Type *)
+                                             {
+                                                 // Non-deleting deleter - TypeContext owns the referent type
+                                             });
+
+        auto reference_type = std::make_unique<ReferenceType>(referent_shared);
 
         Type *result = reference_type.get();
         _complex_types.push_back(std::move(reference_type));
 
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_reference_type() - created new reference type: {}", reference_key);
         return result;
     }
 
