@@ -2,7 +2,7 @@
 #include "AST/ASTNode.hpp"
 #include "AST/TemplateRegistry.hpp"
 #include "Lexer/lexer.hpp"
-#include "Utils/ModuleLoader.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include "Utils/Logger.hpp"
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Constants.h>

@@ -8,7 +8,7 @@
 #include "Codegen/TypeMapper.hpp"
 #include "Codegen/Intrinsics.hpp"
 #include "Codegen/FunctionRegistry.hpp"
-#include "Utils/ModuleLoader.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
 
 #include <llvm/IR/Value.h>
