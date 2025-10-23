@@ -8287,36 +8287,6 @@ namespace Cryo::Codegen
                 LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Return type from FunctionRegistry is corrupted! Using safe fallback.");
                 return_type = llvm::Type::getInt32Ty(_context_manager.get_context());
             }
-
-            // return_type->print(llvm::errs());
-            // llvm::errs() << "\n";
-        }
-
-        // TEMPORARY FIX: Override return type for known cross-module functions
-        if (c_name == "std::String::_strlen")
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::String::_strlen to u64");
-            return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
-        }
-        else if (c_name == "std::Syscall::IO::write")
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::Syscall::IO::write to i64");
-            return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
-        }
-        else if (c_name == "std::String::_int_to_string")
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::String::_int_to_string to string");
-            return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
-        }
-        else if (c_name == "std::String::_float_to_string")
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::String::_float_to_string to string");
-            return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
-        }
-        else if (c_name == "std::String::from_char")
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Overriding return type for std::String::from_char to string");
-            return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
         }
 
         // Validate all parameter types before creating function type
@@ -8510,9 +8480,6 @@ namespace Cryo::Codegen
             builder.CreateBr(merge_block);
         }
 
-        // CRITICAL FIX: Also ensure then_block itself has a terminator
-        // If the body generation moved the insert point away (due to nested control flow),
-        // then_block might have instructions but no terminator
         if (then_block && !then_block->getTerminator())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IF-STATEMENT: then_block lacks terminator, adding branch to merge");
