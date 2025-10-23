@@ -716,6 +716,16 @@ namespace Cryo::Codegen
                         {
                             create_store(init_value, alloca);
                         }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Warning: Variable '{}' initializer returned null value, skipping store", var_name);
+                            // Create a default zero initializer for the variable instead of crashing
+                            llvm::Value *zero_init = llvm::Constant::getNullValue(llvm_type);
+                            if (zero_init)
+                            {
+                                create_store(zero_init, alloca);
+                            }
+                        }
                     }
                 }
             }
@@ -2407,9 +2417,48 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::CallExpressionNode &node)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: About to call generate_function_call");
         llvm::Value *call_result = generate_function_call(&node);
-        set_current_value(call_result); // Set the current value for expressions
-        register_value(&node, call_result);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: Returned from generate_function_call, result: {}", (void *)call_result);
+
+        if (call_result)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: Checking result type...");
+            llvm::Type *result_type = call_result->getType();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: Result type: {}", (void *)result_type);
+
+            try
+            {
+                // Try basic type operations to see if they cause the crash
+                bool is_void = result_type->isVoidTy();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: Type is void: {}", is_void);
+
+                auto type_id = result_type->getTypeID();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: Type ID: {}", static_cast<int>(type_id));
+
+                // THIS might be where it crashes - when LLVM tries to get alignment/size info
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: About to call set_current_value...");
+                set_current_value(call_result); // Set the current value for expressions
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: set_current_value completed");
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: About to call register_value...");
+                register_value(&node, call_result);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: register_value completed");
+            }
+            catch (...)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Exception in CallExpression visitor after generate_function_call");
+                return;
+            }
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "CallExpression visit: generate_function_call returned NULL - aborting compilation to prevent crash");
+
+            // For undefined functions, we need to abort compilation gracefully
+            // rather than continue with invalid IR that leads to segfaults
+            throw std::runtime_error("Compilation failed due to undefined function call");
+        }
     }
 
     void CodegenVisitor::visit(Cryo::NewExpressionNode &node)
@@ -7514,22 +7563,19 @@ namespace Cryo::Codegen
             }
         }
 
-        // Map Cryo function names to C runtime function names
-        std::string c_function_name = map_cryo_to_c_function(resolved_function_name);
-
         // Look up the function in the module using the C runtime name
         // Use FunctionRegistry to get the runtime function name
-        FunctionMetadata metadata = _function_registry->get_function_metadata(c_function_name, _namespace_context);
-        std::string lookup_name = metadata.runtime_name.empty() ? c_function_name : metadata.runtime_name;
+        FunctionMetadata metadata = _function_registry->get_function_metadata(resolved_function_name, _namespace_context);
+        std::string lookup_name = metadata.runtime_name.empty() ? resolved_function_name : metadata.runtime_name;
 
         llvm::Function *function = module->getFunction(lookup_name);
         if (!function)
         {
             // Function not declared yet, create a declaration
-            function = create_runtime_function_declaration(c_function_name, node);
+            function = create_runtime_function_declaration(lookup_name, node);
             if (!function)
             {
-                std::cerr << "Failed to create function declaration for: " << c_function_name
+                std::cerr << "Failed to create function declaration for: " << lookup_name
                           << " (resolved from: " << function_name << ")" << std::endl;
 
                 // Dump current IR state before crash
@@ -7689,114 +7735,215 @@ namespace Cryo::Codegen
         for (size_t i = 0; i < args.size(); ++i)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Arg {}: address={}, type={}", i, static_cast<void *>(args[i]), static_cast<void *>(args[i]->getType()));
-            // Debug type printing disabled to prevent stderr spam and potential segfaults
-            // if (args[i]->getType())
-            // {
-            //     args[i]->getType()->print(llvm::errs());
-            //     llvm::errs() << "\n";
-            // }
-            // args[i]->getType()->print(llvm::errs());
-            // llvm::errs() << "\n";
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to call CreateCall with {} arguments...", args.size());
+        }
 
-            // Add even more detailed debugging before CreateCall
-            try
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to call CreateCall with {} arguments...", args.size());
+
+        // Add even more detailed debugging before CreateCall
+        try
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Verifying function before CreateCall...");
+
+            // Check if function is valid
+            if (!function)
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Verifying function before CreateCall...");
-
-                // Check if function is valid
-                if (!function)
-                {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function is null!");
-                    return nullptr;
-                }
-
-                // Check function type
-                llvm::FunctionType *funcType = function->getFunctionType();
-                if (!funcType)
-                {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function type is null!");
-                    return nullptr;
-                }
-
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function type params: {}", funcType->getNumParams());
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function is vararg: {}", funcType->isVarArg());
-
-                // Verify module compatibility
-                llvm::Module *funcModule = function->getParent();
-                llvm::Module *currentModule = builder.GetInsertBlock()->getModule();
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function module: {}", (funcModule ? funcModule->getName().str() : "NULL"));
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current module: {}", (currentModule ? currentModule->getName().str() : "NULL"));
-
-                if (funcModule != currentModule)
-                {
-                    LOG_WARN(Cryo::LogComponent::CODEGEN, "Cross-module function call detected!");
-                }
-
-                // Detailed argument verification
-                for (size_t i = 0; i < args.size(); ++i)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Arg {} verification:", i);
-                    if (!args[i])
-                    {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Argument is null!");
-                        return nullptr;
-                    }
-
-                    llvm::Type *argType = args[i]->getType();
-                    if (!argType)
-                    {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Argument type is null!");
-                        return nullptr;
-                    }
-
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Argument value: {}", (void *)args[i]);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Argument type: {}", (void *)argType);
-
-                    if (i < funcType->getNumParams())
-                    {
-                        llvm::Type *expectedType = funcType->getParamType(i);
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Expected type: {}", (void *)expectedType);
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Types match: {}", (argType == expectedType ? "YES" : "NO"));
-                    }
-                }
-
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "All pre-CreateCall checks passed, creating call...");
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function Name: {}", function->getName().str());
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Number of Args: {}", args.size());
-                llvm::Value *call_result = builder.CreateCall(function, args);
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CreateCall completed successfully!");
-
-                // Add debugging for the result
-                if (!call_result)
-                {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "CreateCall returned NULL!");
-                    return nullptr;
-                }
-
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Call result: {}", (void *)call_result);
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Call result type: {}", (void *)call_result->getType());
-
-                if (call_result->getType())
-                {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Result type verified, printing...");
-                    // call_result->getType()->print(llvm::errs());
-                    // llvm::errs() << "\n";
-                }
-
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to return call_result...");
-                return call_result;
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception during CreateCall: {}", e.what());
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function is null!");
                 return nullptr;
             }
-            catch (...)
+
+            // Check function type
+            llvm::FunctionType *funcType = function->getFunctionType();
+            if (!funcType)
             {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown exception during CreateCall!");
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function type is null!");
                 return nullptr;
             }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function type params: {}", funcType->getNumParams());
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function is vararg: {}", funcType->isVarArg());
+
+            // Verify module compatibility
+            llvm::Module *funcModule = function->getParent();
+            llvm::Module *currentModule = builder.GetInsertBlock()->getModule();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function module: {}", (funcModule ? funcModule->getName().str() : "NULL"));
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current module: {}", (currentModule ? currentModule->getName().str() : "NULL"));
+
+            if (funcModule != currentModule)
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN, "Cross-module function call detected!");
+            }
+
+            // Detailed argument verification
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Arg {} verification:", i);
+                if (!args[i])
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Argument is null!");
+                    return nullptr;
+                }
+
+                llvm::Type *argType = args[i]->getType();
+                if (!argType)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Argument type is null!");
+                    return nullptr;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Argument value: {}", (void *)args[i]);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Argument type: {}", (void *)argType);
+
+                if (i < funcType->getNumParams())
+                {
+                    llvm::Type *expectedType = funcType->getParamType(i);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Expected type: {}", (void *)expectedType);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Types match: {}", (argType == expectedType ? "YES" : "NO"));
+                }
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "All pre-CreateCall checks passed, creating call...");
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function Name: {}", function->getName().str());
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Number of Args: {}", args.size());
+
+            // Pre-CreateCall validation
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "PRE-CreateCall validation:");
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function valid: {}", function ? "YES" : "NO");
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function pointer: {}", (void *)function);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Builder valid: {}", (void *)&builder);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Builder insertion point valid: {}", builder.GetInsertBlock() ? "YES" : "NO");
+            if (function)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function type: {}", (void *)function->getFunctionType());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function module: {}", (void *)function->getParent());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function name: {}", function->getName().str());
+            }
+
+            // Special handling for empty arguments case
+            llvm::Value *call_result = nullptr;
+            if (args.empty())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EMPTY ARGS: Using alternative CreateCall method for zero arguments");
+                // Try using the no-args version of CreateCall
+                try
+                {
+                    call_result = builder.CreateCall(function->getFunctionType(), function, llvm::ArrayRef<llvm::Value *>(), "");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EMPTY ARGS: Alternative CreateCall succeeded: {}", (void *)call_result);
+                }
+                catch (...)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EMPTY ARGS: Alternative CreateCall failed, trying standard method");
+                    call_result = builder.CreateCall(function, args);
+                }
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "NON-EMPTY ARGS: Using standard CreateCall method");
+                call_result = builder.CreateCall(function, args);
+            }
+
+            // Post-CreateCall validation
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "POST-CreateCall validation:");
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Call result pointer: {}", (void *)call_result);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Call result valid: {}", call_result ? "YES" : "NO");
+            if (call_result)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Call result address space valid: checking...");
+                // Try to access the type - this might crash if the pointer is corrupted
+                try
+                {
+                    llvm::Type *result_type = call_result->getType();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Call result type: {}", (void *)result_type);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Type access: SUCCESS");
+                }
+                catch (...)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Type access: FAILED - corrupted pointer");
+                }
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CreateCall completed successfully!");
+
+            // IMMEDIATE type checking right after CreateCall
+            if (call_result)
+            {
+                try
+                {
+                    llvm::Type *immediate_type = call_result->getType();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IMMEDIATE type check after CreateCall: {}", (void *)immediate_type);
+                    if (immediate_type)
+                    {
+                        bool immediate_void = immediate_type->isVoidTy();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IMMEDIATE type is void: {}", immediate_void);
+                    }
+                    else
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "IMMEDIATE type is NULL right after CreateCall!");
+                    }
+                }
+                catch (...)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "IMMEDIATE type check failed right after CreateCall!");
+                    return nullptr;
+                }
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "CreateCall returned NULL result!");
+                return nullptr;
+            }
+
+            // Add debugging for the result
+            if (!call_result)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "CreateCall returned NULL!");
+                return nullptr;
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Call result: {}", (void *)call_result);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Call result type: {}", (void *)call_result->getType());
+
+            if (call_result->getType())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Result type verified, checking type validity...");
+
+                // Validate the result type before returning
+                llvm::Type *result_type = call_result->getType();
+
+                // Check if the type is valid by trying to access its properties safely
+                try
+                {
+                    // These operations should be safe on a valid type
+                    bool is_void = result_type->isVoidTy();
+                    bool is_integer = result_type->isIntegerTy();
+                    bool is_pointer = result_type->isPointerTy();
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type validation: void={}, int={}, ptr={}", is_void, is_integer, is_pointer);
+
+                    // Additional safety check - try to get the type ID
+                    auto type_id = result_type->getTypeID();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type ID: {}", static_cast<int>(type_id));
+                }
+                catch (...)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Result type is corrupted! Cannot safely return.");
+                    return nullptr;
+                }
+
+                // call_result->getType()->print(llvm::errs());
+                // llvm::errs() << "\n";
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to return call_result...");
+            return call_result;
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception during CreateCall: {}", e.what());
+            return nullptr;
+        }
+        catch (...)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown exception during CreateCall!");
+            return nullptr;
         }
     }
 
@@ -7814,14 +7961,6 @@ namespace Cryo::Codegen
         // For Std::Runtime::print_int, we want "print_int"
         // This is a simplified extraction - just get the final member name
         return member_name;
-    }
-
-    std::string Cryo::Codegen::CodegenVisitor::map_cryo_to_c_function(const std::string &cryo_name)
-    {
-        // TODO: This should be replaced with a proper symbol table lookup
-        // that gets the C function name from the symbol's metadata
-        // For now, return the original name and let the linker handle it
-        return cryo_name;
     }
 
     llvm::Function *Cryo::Codegen::CodegenVisitor::create_runtime_function_declaration(const std::string &c_name, Cryo::CallExpressionNode *call_node)
@@ -8055,7 +8194,26 @@ namespace Cryo::Codegen
         }
 
         // If we reach here, the function wasn't found anywhere
-        // Create a forward declaration based on the call site
+        // Check if this is truly an undefined function that should cause a compilation error
+
+        // If no symbol was found in any namespace or scope, this is likely an undefined function.
+        // Creating forward declarations for undefined functions causes LLVM DataLayout crashes later
+        // when LLVM tries to process IR for functions that will never be linked.
+
+        if (!symbol)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Undefined function detected: '{}' - function not found in symbol table. Refusing to create forward declaration to prevent LLVM DataLayout crash", c_name);
+
+            // Generate a proper GDM error for undefined function
+            std::string error_message = "undefined function `" + c_name + "`";
+            report_error(error_message, call_node);
+
+            // Instead of creating a dummy function, return nullptr to let the call site handle it
+            // This prevents LLVM from generating invalid IR for undefined functions
+            return nullptr;
+        }
+
+        // Create a forward declaration based on the call site (only for functions that exist in symbol table)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating forward declaration for: {}", c_name);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current namespace context: {}", _namespace_context);
 
@@ -8111,6 +8269,34 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry return type for '{}': {}", c_name, (void *)return_type);
         if (return_type)
         {
+            // Validate the return type before using it
+            try
+            {
+                // Test basic type operations
+                bool is_void = return_type->isVoidTy();
+                bool is_integer = return_type->isIntegerTy();
+                bool is_pointer = return_type->isPointerTy();
+                auto type_id = return_type->getTypeID();
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Return type validation: void={}, int={}, ptr={}, typeID={}",
+                          is_void, is_integer, is_pointer, static_cast<int>(type_id));
+
+                // Additional check - try to get size info (this might trigger the alignment issue)
+                if (return_type->isSized())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Return type is sized");
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Return type is not sized");
+                }
+            }
+            catch (...)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Return type from FunctionRegistry is corrupted! Using safe fallback.");
+                return_type = llvm::Type::getInt32Ty(_context_manager.get_context());
+            }
+
             // return_type->print(llvm::errs());
             // llvm::errs() << "\n";
         }
@@ -8142,8 +8328,54 @@ namespace Cryo::Codegen
             return_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
         }
 
+        // Validate all parameter types before creating function type
+        for (size_t i = 0; i < param_types.size(); ++i)
+        {
+            if (!param_types[i])
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Parameter type {} is null, using i32 fallback", i);
+                param_types[i] = llvm::Type::getInt32Ty(_context_manager.get_context());
+            }
+
+            try
+            {
+                // Test parameter type validity
+                auto param_type_id = param_types[i]->getTypeID();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Parameter {} type ID: {}", i, static_cast<int>(param_type_id));
+            }
+            catch (...)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Parameter type {} is corrupted, using i32 fallback", i);
+                param_types[i] = llvm::Type::getInt32Ty(_context_manager.get_context());
+            }
+        }
+
         // Create function type and declaration
-        llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+        llvm::FunctionType *func_type = nullptr;
+        try
+        {
+            func_type = llvm::FunctionType::get(return_type, param_types, false);
+
+            // Validate the created function type
+            if (func_type)
+            {
+                auto func_type_id = func_type->getTypeID();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function type created successfully, type ID: {}", static_cast<int>(func_type_id));
+            }
+        }
+        catch (...)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Failed to create function type! Creating safe fallback.");
+            // Create a safe fallback function type: void -> i32
+            std::vector<llvm::Type *> safe_params;
+            func_type = llvm::FunctionType::get(llvm::Type::getInt32Ty(_context_manager.get_context()), safe_params, false);
+        }
+
+        if (!func_type)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Function type is null after creation attempt!");
+            return nullptr;
+        }
 
         // Use FunctionRegistry to get the runtime function name
         FunctionMetadata metadata = _function_registry->get_function_metadata(c_name, _namespace_context);
@@ -8151,11 +8383,25 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry provided runtime name for '{}': '{}'", c_name, c_runtime_name);
 
-        llvm::Function *forward_decl = llvm::Function::Create(
-            func_type,
-            llvm::Function::ExternalLinkage,
-            c_runtime_name, // Use the C runtime function name instead of the full Cryo name
-            _context_manager.get_module());
+        llvm::Function *forward_decl = nullptr;
+        try
+        {
+            forward_decl = llvm::Function::Create(
+                func_type,
+                llvm::Function::ExternalLinkage,
+                c_runtime_name, // Use the C runtime function name instead of the full Cryo name
+                _context_manager.get_module());
+
+            if (forward_decl)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function::Create succeeded for: {}", c_runtime_name);
+            }
+        }
+        catch (...)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Function::Create failed for: {}", c_runtime_name);
+            return nullptr;
+        }
 
         if (!forward_decl)
         {
