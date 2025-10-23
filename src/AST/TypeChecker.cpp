@@ -1757,31 +1757,17 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Successfully declared variable '{}'", var_name);
         }
 
-        // If we're in a struct/class context, also register this as a field
-        // BUT NOT if we're currently parsing function parameters (inside a function)
-        if (!_current_struct_name.empty() && !_in_function)
+        // If we're in a struct/class context and NOT in a function, register this as a field
+        // This is the proper place for struct field registration when fields are incorrectly
+        // processed as VariableDeclarationNode instead of StructFieldNode
+        if (!_current_struct_name.empty() && !_in_function && final_type && final_type->kind() != TypeKind::Unknown)
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Field registration check for '{}': current_struct='{}', final_type={}, kind={}",
-                      var_name, _current_struct_name,
-                      final_type ? final_type->name() : "null",
-                      final_type ? static_cast<int>(final_type->kind()) : -1);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Registering variable '{}' as struct field in '{}' (type: {})",
+                      var_name, _current_struct_name, final_type->name());
 
-            if (final_type && final_type->kind() != TypeKind::Unknown)
-            {
-                _struct_fields[_current_struct_name][var_name] = final_type;
-                LOG_DEBUG(Cryo::LogComponent::AST, "Registered field '{}' of type '{}' in struct/class '{}'",
-                          var_name, final_type->name(), _current_struct_name);
-            }
-            else
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "SKIPPED field registration for '{}': {}",
-                          var_name, final_type ? "TypeKind::Unknown" : "null type");
-            }
-        }
-        else if (!_current_struct_name.empty() && _in_function)
-        {
-            LOG_DEBUG(Cryo::LogComponent::AST, "SKIPPED field registration for '{}': function parameter in struct '{}' (in_function={})",
-                      var_name, _current_struct_name, _in_function);
+            _struct_fields[_current_struct_name][var_name] = final_type;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Registered struct field '{}' of type '{}' in struct/class '{}'",
+                      var_name, final_type->name(), _current_struct_name);
         }
     }
 
