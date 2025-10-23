@@ -408,7 +408,6 @@ namespace Cryo::Codegen
 
         // Function call helpers
         std::string extract_function_name_from_member_access(Cryo::MemberAccessNode *node);
-        std::string map_cryo_to_c_function(const std::string &cryo_name);
         std::string determine_member_type(const std::string &base_name, const std::string &member_name);
         llvm::Function *create_runtime_function_declaration(const std::string &c_name, Cryo::CallExpressionNode *call_node);
 
