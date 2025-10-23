@@ -124,15 +124,18 @@ namespace Cryo
         auto it = _symbols.find(name);
         if (it != _symbols.end())
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypedSymbolTable::lookup_symbol('{}') - FOUND in current scope (has_parent={}) [table={}]", name, _parent_scope ? "true" : "false", static_cast<void *>(this));
             return &it->second;
         }
 
         // Search parent scopes
         if (_parent_scope)
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypedSymbolTable::lookup_symbol('{}') - checking parent scope [table={}]", name, static_cast<void *>(this));
             return _parent_scope->lookup_symbol(name);
         }
 
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypedSymbolTable::lookup_symbol('{}') - NOT FOUND (symbol_count={}) [table={}]", name, _symbols.size(), static_cast<void *>(this));
         return nullptr;
     }
 
@@ -606,11 +609,14 @@ namespace Cryo
     //===----------------------------------------------------------------------===//
 
     TypeChecker::TypeChecker(TypeContext &type_ctx)
-        : _type_context(type_ctx), _diagnostic_manager(nullptr)
+        : _type_context(type_ctx), _diagnostic_manager(nullptr),
+          _builtin_symbols_loaded(false), _intrinsic_symbols_loaded(false),
+          _user_symbols_loaded(false), _runtime_symbols_loaded(false),
+          _stdlib_compilation_mode(false)
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
         _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
-        
+
         // Connect TypeRegistry to TypeContext for generic instantiation
         type_ctx.set_type_registry(_type_registry.get());
 
@@ -619,11 +625,14 @@ namespace Cryo
     }
 
     TypeChecker::TypeChecker(TypeContext &type_ctx, DiagnosticManager *diagnostic_manager, const std::string &source_file)
-        : _type_context(type_ctx), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
+        : _type_context(type_ctx), _diagnostic_manager(diagnostic_manager), _source_file(source_file),
+          _builtin_symbols_loaded(false), _intrinsic_symbols_loaded(false),
+          _user_symbols_loaded(false), _runtime_symbols_loaded(false),
+          _stdlib_compilation_mode(false)
     {
         _symbol_table = std::make_unique<TypedSymbolTable>();
         _type_registry = std::make_unique<TypeRegistry>(&type_ctx);
-        
+
         // Connect TypeRegistry to TypeContext for generic instantiation
         type_ctx.set_type_registry(_type_registry.get());
 
@@ -966,6 +975,14 @@ namespace Cryo
 
                     // Track the base template (without &), but record the clean type name for instantiation
                     track_instantiation(base_type, concrete_types, clean_type_string, SourceLocation{});
+
+                    // For valid generic instantiations, return the base type as a placeholder
+                    // The monomorphization pass will later create the concrete types
+                    if (alias_symbol && alias_symbol->type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Returning base generic type '{}' for instantiation '{}'", base_type, clean_type_string);
+                        return alias_symbol->type; // Return the base generic type
+                    }
                 }
             }
         }
@@ -1185,6 +1202,13 @@ namespace Cryo
 
     void TypeChecker::load_builtin_symbols(const SymbolTable &main_symbol_table)
     {
+        // Check if already loaded to prevent duplicate loading
+        if (_builtin_symbols_loaded)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Builtin symbols already loaded, skipping");
+            return;
+        }
+
         // Store reference to main symbol table for scope lookups
         _main_symbol_table = &main_symbol_table;
 
@@ -1193,55 +1217,127 @@ namespace Cryo
 
         // Copy all built-in function symbols from main symbol table
         int copied_count = 0;
+        int skipped_count = 0;
         for (const auto &[name, symbol] : main_symbol_table.get_symbols())
         {
             if ((symbol.kind == SymbolKind::Function || symbol.kind == SymbolKind::Intrinsic) && symbol.data_type != nullptr)
             {
-                _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
-                copied_count++;
+                // Check if symbol already exists to avoid redefinition errors
+                if (_symbol_table->lookup_symbol(name) != nullptr)
+                {
+                    skipped_count++;
+                    continue;
+                }
+
+                if (_symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location))
+                {
+                    copied_count++;
+                }
             }
         }
-        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} builtin functions to TypeChecker symbol table", copied_count);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} builtin functions, skipped {} existing symbols to TypeChecker symbol table", copied_count, skipped_count);
+
+        _builtin_symbols_loaded = true;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Builtin symbols loading completed");
     }
 
     void TypeChecker::load_intrinsic_symbols(const SymbolTable &main_symbol_table)
     {
+        // Check if already loaded to prevent duplicate loading
+        if (_intrinsic_symbols_loaded)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Intrinsic symbols already loaded, skipping");
+            return;
+        }
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Loading intrinsic symbols into TypeChecker...");
 
         // Copy only intrinsic symbols from main symbol table
         int copied_count = 0;
+        int skipped_count = 0;
         for (const auto &[name, symbol] : main_symbol_table.get_symbols())
         {
             if (symbol.kind == SymbolKind::Intrinsic && symbol.data_type != nullptr)
             {
-                _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
-                copied_count++;
-                LOG_DEBUG(Cryo::LogComponent::AST, "Loaded intrinsic: {}", name);
+                // Check if symbol already exists to avoid redefinition errors
+                if (_symbol_table->lookup_symbol(name) != nullptr)
+                {
+                    skipped_count++;
+                    continue;
+                }
+
+                if (_symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location))
+                {
+                    copied_count++;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Loaded intrinsic: {}", name);
+                }
             }
         }
-        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} intrinsic symbols to TypeChecker symbol table", copied_count);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} intrinsic symbols, skipped {} existing symbols to TypeChecker symbol table", copied_count, skipped_count);
+
+        _intrinsic_symbols_loaded = true;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Intrinsic symbols loading completed");
     }
 
     void TypeChecker::load_user_symbols(const SymbolTable &main_symbol_table)
     {
-        LOG_DEBUG(Cryo::LogComponent::AST, "Loading user-defined symbols into TypeChecker...");
+        // Check if already loaded to prevent duplicate loading
+        if (_user_symbols_loaded)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "User symbols already loaded, skipping");
+            return;
+        }
 
-        // Copy user-defined function symbols from main symbol table
+        LOG_DEBUG(Cryo::LogComponent::AST, "Loading user-defined symbols into TypeChecker... [table={}]", static_cast<void *>(_symbol_table.get()));
+
+        // Copy user-defined symbols from main symbol table (functions AND variables)
         int copied_count = 0;
+        int skipped_count = 0;
         for (const auto &[name, symbol] : main_symbol_table.get_symbols())
         {
-            if (symbol.kind == SymbolKind::Function && symbol.data_type != nullptr)
+            if ((symbol.kind == SymbolKind::Function || symbol.kind == SymbolKind::Variable) && symbol.data_type != nullptr)
             {
-                _symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location);
-                copied_count++;
-                LOG_DEBUG(Cryo::LogComponent::AST, "Loaded user function: {}", name);
+                // Check if symbol already exists to avoid redefinition errors
+                if (_symbol_table->lookup_symbol(name) != nullptr)
+                {
+                    skipped_count++;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Skipped existing symbol: {} [table={}]", name, static_cast<void *>(_symbol_table.get()));
+                    continue;
+                }
+
+                if (_symbol_table->declare_symbol(name, symbol.data_type, symbol.declaration_location))
+                {
+                    copied_count++;
+                    if (symbol.kind == SymbolKind::Function)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Loaded user function: {} [table={}]", name, static_cast<void *>(_symbol_table.get()));
+                    }
+                    else if (symbol.kind == SymbolKind::Variable)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Loaded user variable: {} [table={}]", name, static_cast<void *>(_symbol_table.get()));
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Failed to declare symbol: {} (already exists) [table={}]", name, static_cast<void *>(_symbol_table.get()));
+                }
             }
         }
-        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} user symbols to TypeChecker symbol table", copied_count);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Copied {} user symbols, skipped {} existing symbols to TypeChecker symbol table [table={}]", copied_count, skipped_count, static_cast<void *>(_symbol_table.get()));
+
+        _user_symbols_loaded = true;
+        LOG_DEBUG(Cryo::LogComponent::AST, "User symbols loading completed");
     }
 
     void TypeChecker::load_runtime_symbols(const SymbolTable &main_symbol_table)
     {
+        // Check if already loaded to prevent duplicate loading
+        if (_runtime_symbols_loaded)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Runtime symbols already loaded, skipping");
+            return;
+        }
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Loading runtime symbols into TypeChecker...");
 
         // Debug: Show all symbols in the main symbol table
@@ -1293,6 +1389,9 @@ namespace Cryo
         // during function call analysis. This is actually the preferred approach since it allows
         // the type system to resolve the correct function signature at call sites.
         LOG_DEBUG(Cryo::LogComponent::AST, "NOTE: Runtime functions will be resolved via std::Runtime namespace during function calls");
+
+        _runtime_symbols_loaded = true;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Runtime symbols loading completed");
     }
 
     void TypeChecker::register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names)
@@ -1532,6 +1631,8 @@ namespace Cryo
         Type *declared_type = nullptr;
         Type *inferred_type = nullptr;
 
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Processing variable '{}' is_mutable={}, stdlib_compilation_mode={}", var_name, node.is_mutable(), _stdlib_compilation_mode);
+
         // Parse type annotation from node
         if (!node.type_annotation().empty() && node.type_annotation() != "auto")
         {
@@ -1602,9 +1703,58 @@ namespace Cryo
         }
 
         // Declare the variable in symbol table
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Attempting to declare variable '{}' with type '{}' (kind={})", var_name, final_type ? final_type->name() : "null", final_type ? static_cast<int>(final_type->kind()) : -1);
         if (!declare_variable(var_name, final_type, node.location(), node.is_mutable()))
         {
-            _diagnostic_builder->create_redefined_symbol_error(var_name, NodeKind::VariableDeclaration, node.location());
+            // Check if we're in stdlib compilation mode and if this is a compatible redefinition
+            bool should_report_error = true;
+            if (_stdlib_compilation_mode)
+            {
+                // In stdlib compilation mode, check if this is a compatible redefinition
+                TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(var_name);
+                if (existing_symbol && existing_symbol->type && final_type)
+                {
+                    // Allow redefinition if the types are the same
+                    bool types_match = (existing_symbol->type == final_type) ||
+                                       (existing_symbol->type->name() == final_type->name());
+
+                    // In stdlib compilation mode, be more lenient with mutability:
+                    // Allow if current declaration is mutable (which is the intended state)
+                    // or if both have the same mutability
+                    bool mutability_compatible = (existing_symbol->is_mutable == node.is_mutable()) ||
+                                                 (node.is_mutable() && !existing_symbol->is_mutable);
+
+                    if (types_match && mutability_compatible)
+                    {
+                        should_report_error = false;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Allowing compatible redefinition of variable '{}' (type: {}, mutable: {}) in stdlib compilation mode",
+                                  var_name, final_type->name(), node.is_mutable());
+
+                        // Update the existing symbol with the correct mutability if needed
+                        if (!existing_symbol->is_mutable && node.is_mutable())
+                        {
+                            existing_symbol->is_mutable = true;
+                            LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Updated mutability for variable '{}' to mutable in stdlib compilation mode", var_name);
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Incompatible redefinition of variable '{}' - existing: {} ({}), new: {} ({}), existing_mutable: {}, new_mutable: {}",
+                                  var_name, existing_symbol->type->name(), static_cast<void *>(existing_symbol->type),
+                                  final_type->name(), static_cast<void *>(final_type), existing_symbol->is_mutable, node.is_mutable());
+                    }
+                }
+            }
+
+            if (should_report_error)
+            {
+                LOG_ERROR(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Failed to declare variable '{}' - already exists! stdlib_compilation_mode={}", var_name, _stdlib_compilation_mode);
+                _diagnostic_builder->create_redefined_symbol_error(var_name, NodeKind::VariableDeclaration, node.location());
+            }
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Successfully declared variable '{}'", var_name);
         }
 
         // If we're in a struct/class context, also register this as a field
@@ -2133,8 +2283,19 @@ namespace Cryo
                     }
                     return;
                 }
+
+                // Try to find the symbol in the main symbol table as a final fallback
+                // This handles variables that were declared but not properly loaded into current scope
+                Symbol *main_symbol = _main_symbol_table->lookup_symbol(name);
+                if (main_symbol && main_symbol->data_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': found in main symbol table fallback (kind={})", name, static_cast<int>(main_symbol->kind));
+                    node.set_resolved_type(main_symbol->data_type);
+                    return;
+                }
             }
 
+            // Check if we're in call context before reporting error
             if (_in_call_expression)
             {
                 // Don't report error here if in call context - let CallExpressionNode handle it
@@ -2142,6 +2303,7 @@ namespace Cryo
             }
             else
             {
+                // Only report the error if none of the fallback mechanisms worked
                 _diagnostic_builder->create_undefined_symbol_error(name, NodeKind::VariableDeclaration, node.location());
                 report_undefined_symbol(node.location(), name);
                 node.set_resolved_type(_type_context.get_unknown_type());
@@ -2780,7 +2942,7 @@ namespace Cryo
         {
             // Struct type exists - set the resolved type
             node.set_resolved_type(type_symbol->type);
-            
+
             // TODO: Validate field initializers against struct definition
             // For now, assume all field initializers are valid
         }
@@ -3685,6 +3847,12 @@ namespace Cryo
         // Check for redefinition
         if (_symbol_table->lookup_symbol(alias_name))
         {
+            // In stdlib compilation mode, be more lenient with type alias redefinitions
+            if (_stdlib_compilation_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Type alias '{}' already exists in stdlib compilation mode, skipping redeclaration", alias_name);
+                return;
+            }
             _diagnostic_builder->create_redefined_symbol_error(alias_name, NodeKind::TypeAliasDeclaration, node.location());
             return;
         }
@@ -3756,6 +3924,8 @@ namespace Cryo
     void TypeChecker::visit(EnumDeclarationNode &node)
     {
         std::string enum_name = node.name();
+        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: TypeChecker::visit(EnumDeclarationNode) called for '{}'", enum_name);
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: Visiting enum declaration: {} - stdlib_compilation_mode={}", enum_name, _stdlib_compilation_mode);
 
         // Check if enum already exists in symbol table (from populate_symbol_table phase)
         TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(enum_name);
@@ -3772,7 +3942,31 @@ namespace Cryo
                     {
                         std::string variant_name = variant->name();
                         Type *int_type = _type_context.get_int_type();
-                        _symbol_table->declare_symbol(variant_name, int_type, variant->location(), false);
+
+                        // In stdlib compilation mode, always skip enum variant redeclarations
+                        // since they're often processed multiple times during compilation
+                        if (_stdlib_compilation_mode)
+                        {
+                            TypedSymbol *existing_variant = _symbol_table->lookup_symbol(variant_name);
+                            if (existing_variant)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Enum variant '{}' already exists in stdlib compilation mode, skipping redeclaration", variant_name);
+                                variant_value++;
+                                continue;
+                            }
+                        }
+
+                        // Attempt to declare the variant
+                        if (!_symbol_table->declare_symbol(variant_name, int_type, variant->location(), false))
+                        {
+                            // Declaration failed - only report error if not in stdlib mode
+                            if (!_stdlib_compilation_mode)
+                            {
+                                // Use VariableDeclaration as NodeKind since enum variants are essentially constant variables
+                                _diagnostic_builder->create_redefined_symbol_error(variant_name, NodeKind::VariableDeclaration, variant->location());
+                            }
+                            // In stdlib mode, silently skip all redefinition errors for enum variants
+                        }
                         variant_value++;
                     }
                 }
@@ -3784,6 +3978,12 @@ namespace Cryo
         // populate_symbol_table didn't handle it properly
         if (existing_symbol)
         {
+            // In stdlib compilation mode, be more lenient with enum redefinitions
+            if (_stdlib_compilation_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Enum '{}' already exists in stdlib compilation mode, skipping redeclaration", enum_name);
+                return;
+            }
             _diagnostic_builder->create_redefined_symbol_error(enum_name, NodeKind::EnumDeclaration, node.location());
             return;
         }

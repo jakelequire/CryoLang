@@ -340,9 +340,10 @@ namespace Cryo
             if (_stdlib_compilation_mode)
             {
                 _codegen->set_stdlib_compilation_mode(true);
+                _type_checker->set_stdlib_compilation_mode(true);
                 if (_debug_mode)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Enabled stdlib compilation mode in CodeGenerator");
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Enabled stdlib compilation mode in CodeGenerator and TypeChecker");
                 }
             }
 
@@ -428,8 +429,8 @@ namespace Cryo
             }
             if (_debug_mode)
             {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "TypeChecker has {} errors, has_errors() = {}", 
-                         _type_checker->error_count(), _type_checker->has_errors());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "TypeChecker has {} errors, has_errors() = {}",
+                          _type_checker->error_count(), _type_checker->has_errors());
             }
             if (_type_checker->has_errors())
             {
