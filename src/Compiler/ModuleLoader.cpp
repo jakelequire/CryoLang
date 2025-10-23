@@ -1,4 +1,4 @@
-#include "Utils/ModuleLoader.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include "Parser/Parser.hpp"
 #include "Lexer/lexer.hpp"
 #include "Utils/File.hpp"

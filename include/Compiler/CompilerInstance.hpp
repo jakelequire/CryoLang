@@ -13,7 +13,7 @@
 #include "Codegen/CodeGenerator.hpp"
 #include "Linker/CryoLinker.hpp"
 #include "Utils/File.hpp"
-#include "Utils/ModuleLoader.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include <memory>
 #include <string>
 #include <vector>

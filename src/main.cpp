@@ -3,7 +3,7 @@
 #include "Compiler/CompilerInstance.hpp"
 #include "CLI/CLI.hpp"
 #include "Utils/Logger.hpp"
-#include "Utils/ModuleLoader.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include "Utils/OS.hpp"
 
 int main(int argc, char *argv[])

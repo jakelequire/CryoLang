@@ -162,9 +162,10 @@ namespace Cryo
             if (!analyze())
             {
                 std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
+                std::string error_message = "Module contains: " + std::to_string(_diagnostic_manager->diagnostics().size()) + " errors in namespace '" + namespace_name + "'";
                 _diagnostic_manager->create_error(ErrorCode::E0805_INTERNAL_ERROR,
-                                                  SourceRange{}, file_path, 
-                                                  "Module contains compilation errors");
+                                                  SourceRange{}, file_path,
+                                                  error_message);
                 return false;
             }
 
