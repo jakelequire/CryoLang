@@ -1134,6 +1134,9 @@ namespace Cryo
 
         // Global template registry access for AST-based analysis
         TemplateRegistry *_global_template_registry = nullptr;
+        
+        // Type registry for generic instantiation
+        class TypeRegistry *_type_registry = nullptr;
 
     public:
         TypeContext();
@@ -1230,6 +1233,10 @@ namespace Cryo
         // Template registry access for AST-based analysis
         void set_global_template_registry(TemplateRegistry *registry) { _global_template_registry = registry; }
         TemplateRegistry *get_global_template_registry() const { return _global_template_registry; }
+        
+        // Type registry access for generic type instantiation
+        void set_type_registry(class TypeRegistry *registry) { _type_registry = registry; }
+        class TypeRegistry *get_type_registry() const { return _type_registry; }
 
         // Type parsing utilities
 

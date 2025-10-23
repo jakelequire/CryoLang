@@ -209,6 +209,12 @@ namespace Cryo
                                       "Cannot perform this unary operation on the given type.",
                                       "Check that the operand is compatible with this operator."));
 
+        _error_info.emplace(ErrorCode::E0357_INVALID_INSTANTIATION,
+                            ErrorInfo(ErrorCode::E0357_INVALID_INSTANTIATION,
+                                      "invalid generic instantiation",
+                                      "Cannot instantiate generic type with the provided type parameters.",
+                                      "Check that the type arguments match the generic constraints and are valid types."));
+
         // ==== Control Flow Errors ====
         _error_info.emplace(ErrorCode::E0400_INVALID_BREAK,
                             ErrorInfo(ErrorCode::E0400_INVALID_BREAK,

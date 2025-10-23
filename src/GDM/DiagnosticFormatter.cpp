@@ -42,7 +42,7 @@ namespace Cryo
         */
     }
 
-    std::string DiagnosticFormatter::format_diagnostic(const Diagnostic &diagnostic)
+    std::string DiagnosticFormatter::format_diagnostic(const Diagnostic &diagnostic, size_t error_number)
     {
         // Use existing multi-span from diagnostic if available, otherwise create from legacy range
         MultiSpan spans = diagnostic.multi_span();
@@ -174,20 +174,28 @@ namespace Cryo
         const auto &suggestions = diagnostic.code_suggestions();
 
         // Use the enhanced formatter for sophisticated Rust-style output
-        return format_enhanced_diagnostic(diagnostic, spans, suggestions);
+        return format_enhanced_diagnostic(diagnostic, spans, suggestions, error_number);
     }
 
     std::string DiagnosticFormatter::format_enhanced_diagnostic(
         const Diagnostic &diagnostic,
         const MultiSpan &spans,
-        const std::vector<CodeSuggestion> &suggestions)
+        const std::vector<CodeSuggestion> &suggestions,
+        size_t error_number)
     {
         std::ostringstream output;
 
         // Header line with error code and message - ensure proper newline
-        output << format_severity(diagnostic.severity())
-               << "[" << colorize(ErrorRegistry::error_code_to_string(diagnostic.error_code()), _style.error_code_color) << "]: "
-               << diagnostic.message() << "\n";
+        if (error_number > 0)
+        {
+            output << colorize("(" + std::to_string(error_number) + ")", "\x1b[1;31m") << " " << format_severity(diagnostic.severity());
+        }
+        else
+        {
+            output << format_severity(diagnostic.severity());
+        }
+        output << "[" << colorize(ErrorRegistry::error_code_to_string(diagnostic.error_code()), _style.error_code_color) << "]: "
+               << "\n" << diagnostic.message() << "\n\n";
 
         // Location line
         if (!spans.is_empty())

@@ -661,6 +661,8 @@ namespace Cryo
 
     Type *Parser::parse_type_annotation()
     {
+
+        
         // Handle reference types (&type, &mut type) - keep existing logic
         if (_current_token.is(TokenKind::TK_AMP))
         {
@@ -865,6 +867,7 @@ namespace Cryo
 
     std::unique_ptr<VariableDeclarationNode> Parser::parse_variable_declaration()
     {
+
         SourceLocation start_loc = _current_token.location();
 
         // Parse variable modifier (const or mut)
