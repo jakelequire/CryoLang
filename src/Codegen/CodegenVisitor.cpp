@@ -1582,7 +1582,15 @@ namespace Cryo::Codegen
                 continue;
 
             std::string method_name = method->name();
-            std::string qualified_name = target_type_name + "::" + method_name;
+            std::string qualified_name;
+            if (!_namespace_context.empty())
+            {
+                qualified_name = _namespace_context + "::" + target_type_name + "::" + method_name;
+            }
+            else
+            {
+                qualified_name = target_type_name + "::" + method_name;
+            }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating method: {}", qualified_name);
 
