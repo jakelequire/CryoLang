@@ -248,6 +248,15 @@ namespace Cryo
         // Reference to main symbol table (for scope resolution lookups)
         const SymbolTable *_main_symbol_table = nullptr;
 
+        // Symbol loading state tracking to prevent duplicate loading
+        bool _builtin_symbols_loaded = false;
+        bool _intrinsic_symbols_loaded = false;
+        bool _user_symbols_loaded = false;
+        bool _runtime_symbols_loaded = false;
+
+        // Standard library compilation mode flag
+        bool _stdlib_compilation_mode = false;
+
         // Diagnostic manager for error reporting (optional)
         DiagnosticManager *_diagnostic_manager = nullptr;
         std::string _source_file; // Current source file being checked
@@ -265,6 +274,9 @@ namespace Cryo
         void load_intrinsic_symbols(const SymbolTable &main_symbol_table);
         void load_runtime_symbols(const SymbolTable &main_symbol_table);
         void load_user_symbols(const SymbolTable &main_symbol_table);
+
+        // Standard library compilation mode control
+        void set_stdlib_compilation_mode(bool enable) { _stdlib_compilation_mode = enable; }
 
         // Generic type management
         void register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names);
