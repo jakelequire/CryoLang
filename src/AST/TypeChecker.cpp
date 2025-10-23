@@ -2321,9 +2321,9 @@ namespace Cryo
 
                 if (op == TokenKind::TK_AMP) // Address-of operator (&)
                 {
-                    // Create a pointer type to the operand type
-                    Type *pointer_type = _type_context.create_pointer_type(operand_type);
-                    node.set_resolved_type(pointer_type);
+                    // Create a reference type to the operand type
+                    Type *reference_type = _type_context.create_reference_type(operand_type);
+                    node.set_resolved_type(reference_type);
                 }
                 else if (op == TokenKind::TK_STAR) // Dereference operator (*)
                 {

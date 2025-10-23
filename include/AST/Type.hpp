@@ -891,6 +891,12 @@ namespace Cryo
         size_t size_bytes() const override;
         size_t alignment() const override { return sizeof(void *); }
         std::string to_string() const override { return _name; }
+        
+        // Ensure ClassType instances with same name are equal
+        bool equals(const Type &other) const override
+        {
+            return other.kind() == TypeKind::Class && other.name() == _name;
+        }
     };
 
     // Trait type (user-defined)
