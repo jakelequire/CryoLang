@@ -7577,15 +7577,6 @@ namespace Cryo::Codegen
             {
                 std::cerr << "Failed to create function declaration for: " << lookup_name
                           << " (resolved from: " << function_name << ")" << std::endl;
-
-                // Dump current IR state before crash
-                std::cerr << "=== CURRENT IR DUMP BEFORE CRASH ===" << std::endl;
-                std::string ir_string;
-                llvm::raw_string_ostream stream(ir_string);
-                module->print(stream, nullptr);
-                std::cerr << stream.str() << std::endl;
-                std::cerr << "=== END IR DUMP ===" << std::endl;
-
                 return nullptr;
             }
         }
@@ -8204,9 +8195,9 @@ namespace Cryo::Codegen
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Undefined function detected: '{}' - function not found in symbol table. Refusing to create forward declaration to prevent LLVM DataLayout crash", c_name);
 
-            // Generate a proper GDM error for undefined function
-            std::string error_message = "undefined function `" + c_name + "`";
-            report_error(error_message, call_node);
+            // Don't report GDM error here - AST/type checking phase already reports E0202_UNDEFINED_FUNCTION
+            // We just need to return nullptr to prevent LLVM crashes, the actual error reporting
+            // is handled by the AST phase which properly categorizes it as an undefined function error
 
             // Instead of creating a dummy function, return nullptr to let the call site handle it
             // This prevents LLVM from generating invalid IR for undefined functions
