@@ -313,11 +313,27 @@ namespace Cryo::Codegen
         llvm::Module *target_module = module_name.empty() ? _active_module : get_module(module_name);
         if (!target_module)
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cannot verify module '{}' - does not exist", module_name);
             return false;
         }
 
-        // Disable LLVM error output to prevent type dump spam that can trigger segfaults
-        return !llvm::verifyModule(*target_module, nullptr);
+        // Capture verification errors in a string stream
+        std::string error_str;
+        llvm::raw_string_ostream error_stream(error_str);
+        
+        bool result = llvm::verifyModule(*target_module, &error_stream);
+        if (result)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Module '{}' verification failed", module_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Error: {}", error_str);
+            // report `error_str` to the GDM
+            // ...
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Module '{}' verified successfully", module_name);
+        }
+        return !result;
     }
 
     void LLVMContextManager::print_module(std::ostream &os, const std::string &module_name) const

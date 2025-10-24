@@ -543,13 +543,18 @@ public:
         this.small_allocs = u64(0);
         this.medium_allocs = u64(0);
         this.large_allocs = u64(0);
+        this.heap_size = u64(0);
     }
 
     // Record allocation
     record_allocation(size: u64) -> void {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_allocation} Recording allocation: size=%llu bytes\n", size);
         this.total_allocations = this.total_allocations + u64(1);
+        this.current_allocations = this.current_allocations + u64(1);
         this.bytes_allocated = this.bytes_allocated + size;
+        
+        // Update allocation size histogram
+        this.update_allocation_histogram(size);
         
         if (this.bytes_allocated > this.peak_allocation) {
             this.peak_allocation = this.bytes_allocated;
@@ -563,30 +568,83 @@ public:
         Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_deallocation} Recording deallocation: size=%llu bytes\n", size);
         this.total_deallocations = this.total_deallocations + u64(1);
         this.bytes_allocated = this.bytes_allocated - size;
+        this.current_allocations = this.current_allocations - u64(1);
+        return;
+    }
+
+    // Set heap size (called during heap initialization)
+    set_heap_size(size: u64) -> void {
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::set_heap_size} Setting heap size: %llu bytes\n", size);
+        this.heap_size = size;
+        return;
+    }
+
+    // Get heap utilization as a percentage
+    get_heap_utilization() -> f64 {
+        if (this.heap_size == u64(0)) {
+            return 0.0;
+        }
+        const utilization: f64 = (this.bytes_allocated * 100.0) / this.heap_size;
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::get_heap_utilization} Heap utilization: %.2f%%\n", utilization);
+        return utilization;
+    }
+
+    // Record failed allocation
+    record_failed_allocation(requested_size: u64) -> void {
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_failed_allocation} Recording failed allocation: size=%llu bytes\n", requested_size);
+        this.failed_allocations = this.failed_allocations + u64(1);
+        return;
+    }
+
+    // Update allocation size histogram
+    update_allocation_histogram(size: u64) -> void {
+        if (size < u64(64)) {
+            this.small_allocs = this.small_allocs + u64(1);
+        } else if (size <= u64(4096)) {
+            this.medium_allocs = this.medium_allocs + u64(1);
+        } else {
+            this.large_allocs = this.large_allocs + u64(1);
+        }
         return;
     }
 
     // Print statistics
     print_stats() -> void {
-        Intrinsics::__printf__("═══════════════════════════════════════════════════════════\n");
-        Intrinsics::__printf__("                RUNTIME STATISTICS                         \n");
-        Intrinsics::__printf__("═══════════════════════════════════════════════════════════\n");
+        Intrinsics::__printf__("===========================================================\n");
+        Intrinsics::__printf__("                    RUNTIME STATISTICS                     \n");
+        Intrinsics::__printf__("===========================================================\n");
         Intrinsics::__printf__("Allocations:\n");
         Intrinsics::__printf__("  Total allocations:   %10llu\n", this.total_allocations);
         Intrinsics::__printf__("  Total deallocations: %10llu\n", this.total_deallocations);
         Intrinsics::__printf__("  Current allocations: %10llu\n", this.current_allocations);
         Intrinsics::__printf__("  Failed allocations:  %10llu\n", this.failed_allocations);
         Intrinsics::__printf__("\n");
-        Intrinsics::__printf__("Memory Usage:\n");
+        Intrinsics::__printf__("Heap Information:\n");
+        Intrinsics::__printf__("  Total heap size:     %10llu bytes\n", this.heap_size);
         Intrinsics::__printf__("  Bytes allocated:     %10llu bytes\n", this.bytes_allocated);
         Intrinsics::__printf__("  Peak allocation:     %10llu bytes\n", this.peak_allocation);
         Intrinsics::__printf__("  Largest free block:  %10llu bytes\n", this.largest_free_block);
+        
+        // Calculate and display heap utilization
+        const utilization: f64 = this.get_heap_utilization();
+        Intrinsics::__printf__("  Heap utilization:    %10.2f%%\n", utilization);
+        
+        // Display fragmentation info if available
+        if (this.heap_size > u64(0)) {
+            const free_bytes: u64 = this.heap_size - this.bytes_allocated;
+            Intrinsics::__printf__("  Free bytes:          %10llu bytes\n", free_bytes);
+            if (this.largest_free_block > u64(0) && free_bytes > u64(0)) {
+                const fragmentation: f64 = (1.0 - (this.largest_free_block / free_bytes)) * 100.0;
+                Intrinsics::__printf__("  Fragmentation:       %10.2f%%\n", fragmentation);
+            }
+        }
+        
         Intrinsics::__printf__("\n");
         Intrinsics::__printf__("Allocation Sizes:\n");
         Intrinsics::__printf__("  Small  (< 64B):      %10llu\n", this.small_allocs);
         Intrinsics::__printf__("  Medium (64B-4KB):    %10llu\n", this.medium_allocs);
         Intrinsics::__printf__("  Large  (> 4KB):      %10llu\n", this.large_allocs);
-        Intrinsics::__printf__("═══════════════════════════════════════════════════════════\n");
+        Intrinsics::__printf__("===========================================================\n");
         
         if (this.current_allocations > 0) {
             Intrinsics::__printf__("\nWARNING: Memory leak detected!\n");
@@ -691,6 +749,9 @@ public:
             return heap_result;
         }
         
+        // Set heap size in statistics manager
+        this.stats.set_heap_size(this.heap.heap_size);
+        
         this.state = RuntimeState::RUNNING;
         Intrinsics::__printf__("[DEBUG::RUNTIME] {RuntimeManager::initialize} Runtime initialized successfully\n");
         return RuntimeError::SUCCESS;
@@ -701,6 +762,8 @@ public:
         const ptr: void* = this.heap.allocate(size);
         if (ptr != null) {
             this.stats.record_allocation(size);
+        } else {
+            this.stats.record_failed_allocation(size);
         }
         return ptr;
     }
@@ -831,11 +894,13 @@ function main() -> int {
     }
 
     Intrinsics::__printf__("[DEBUG::RUNTIME] {main} Runtime initialized, calling user main\n");
+    Intrinsics::__printf__("vvv================== USER PROGRAM OUTPUT ==================vvv\n\n");
 
     // Call user main function
     mut user_result: int = 0;
     user_result = _user_main_();
 
+    Intrinsics::__printf__("\n^^^=========================================================^^^\n");
     Intrinsics::__printf__("[DEBUG::RUNTIME] {main} User main returned: %d\n", user_result);
     
     // Shutdown runtime
