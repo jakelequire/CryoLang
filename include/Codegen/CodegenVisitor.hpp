@@ -188,6 +188,11 @@ namespace Cryo::Codegen
          * @brief Get TypeMapper for manual AST node registration
          */
         TypeMapper *get_type_mapper() const { return _type_mapper.get(); }
+        
+        /**
+         * @brief Get current AST node being processed (for error reporting)
+         */
+        Cryo::ASTNode *get_current_node() const { return _current_node; }
 
     private:
         //===================================================================
@@ -285,6 +290,9 @@ namespace Cryo::Codegen
 
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
+        
+        // Current AST node being processed (for error reporting)
+        Cryo::ASTNode *_current_node;
 
         // Control flags
         bool _stdlib_compilation_mode; // Generate full implementations for imports in stdlib mode
@@ -396,10 +404,14 @@ namespace Cryo::Codegen
 
         // Constructor helpers
         bool is_primitive_integer_constructor(const std::string &function_name) const;
+        bool is_primitive_float_constructor(const std::string &function_name) const;
+        bool is_primitive_constructor(const std::string &function_name) const;
         llvm::Value *generate_primitive_constructor_call(CallExpressionNode *node, const std::string &target_type);
         llvm::Value *generate_stack_constructor_call(CallExpressionNode *node, const std::string &type_name, Type *struct_type);
         llvm::Value *generate_integer_cast(llvm::Value *source_value, llvm::Type *source_type,
                                            llvm::Type *target_type, const std::string &target_type_name);
+        llvm::Value *generate_float_cast(llvm::Value *source_value, llvm::Type *source_type,
+                                         llvm::Type *target_type, const std::string &target_type_name);
 
         // String concatenation helpers
         llvm::Value *generate_string_concatenation(llvm::Value *left_str, llvm::Value *right_str);
@@ -446,6 +458,25 @@ namespace Cryo::Codegen
         void set_current_value(llvm::Value *value) { _current_value = value; }
         llvm::Value *get_current_value() const { return _current_value; }
         void register_value(Cryo::ASTNode *node, llvm::Value *value);
+        
+        // AST node tracking for error reporting
+        void set_current_node(Cryo::ASTNode *node) { _current_node = node; }
+        
+        // RAII helper for automatic AST node tracking
+        class NodeTracker {
+        private:
+            CodegenVisitor* visitor;
+            Cryo::ASTNode* previous_node;
+        public:
+            NodeTracker(CodegenVisitor* v, Cryo::ASTNode* node) : visitor(v), previous_node(v->get_current_node()) {
+                visitor->set_current_node(node);
+            }
+            ~NodeTracker() {
+                visitor->set_current_node(previous_node);
+            }
+        };
+        
+        friend class NodeTracker;
 
         // Utility methods
         llvm::BasicBlock *create_basic_block(const std::string &name, llvm::Function *function = nullptr);

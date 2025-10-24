@@ -31,6 +31,7 @@ namespace Cryo::Codegen
           _intrinsics(std::make_unique<Intrinsics>(context_manager, gdm)),
           _function_registry(std::make_unique<FunctionRegistry>(symbol_table, *symbol_table.get_type_context())),
           _current_value(nullptr),
+          _current_node(nullptr),
           _has_errors(false),
           _stdlib_compilation_mode(false)
     {
@@ -241,6 +242,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::FunctionDeclarationNode &node)
     {
+        NodeTracker tracker(this, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Visiting FunctionDeclarationNode: {}", node.name());
 
         // Check if this is a StructMethodNode that was already processed as a primitive method
@@ -340,6 +342,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::VariableDeclarationNode &node)
     {
+        NodeTracker tracker(this, &node);
         try
         {
             // Debug: Check ValueContext state at the very beginning
@@ -738,6 +741,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::StructDeclarationNode &node)
     {
+        NodeTracker tracker(this, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating struct declaration: {}", node.name());
 
         // Register AST node with TypeMapper for field metadata
@@ -1817,7 +1821,7 @@ namespace Cryo::Codegen
         }
         catch (const std::exception &e)
         {
-            report_error("Exception in return statement: " + std::string(e.what()), &node);
+            report_error("<!> Exception in return statement: " + std::string(e.what()), &node);
         }
     }
 
@@ -2230,6 +2234,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::BinaryExpressionNode &node)
     {
+        NodeTracker tracker(this, &node);
         try
         {
             llvm::Value *result = generate_binary_operation(&node);
@@ -2425,6 +2430,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::CallExpressionNode &node)
     {
+        NodeTracker tracker(this, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: About to call generate_function_call");
         llvm::Value *call_result = generate_function_call(&node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CallExpression visit: Returned from generate_function_call, result: {}", (void *)call_result);
@@ -3284,6 +3290,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::MemberAccessNode &node)
     {
+        NodeTracker tracker(this, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating member access");
 
         auto &context = _context_manager.get_context();
@@ -3654,6 +3661,8 @@ namespace Cryo::Codegen
         // For variables like "initial_block: HeapBlock*", we have an alloca containing a pointer
         // We need to load the pointer value to access struct fields
         llvm::Value *struct_ptr = object_ptr;
+        bool is_struct_value = false;
+        
         if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
         {
             llvm::Type *allocated_type = alloca_inst->getAllocatedType();
@@ -3662,6 +3671,31 @@ namespace Cryo::Codegen
                 // Load the pointer from the alloca to get the actual struct pointer
                 struct_ptr = create_load(object_ptr, allocated_type, "struct_ptr");
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Loaded struct pointer for member access");
+            }
+            else if (llvm::isa<llvm::StructType>(allocated_type))
+            {
+                // This is an alloca of a struct value (not pointer to struct)
+                // The alloca itself is the pointer we need for GEP
+                struct_ptr = object_ptr;  // Use the alloca as the pointer
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using alloca of struct value for member access");
+            }
+        }
+        else
+        {
+            // Check if the struct_ptr itself is a struct value or struct pointer
+            llvm::Type *struct_ptr_type = struct_ptr->getType();
+            if (llvm::isa<llvm::StructType>(struct_ptr_type))
+            {
+                // This is a struct value, not a pointer to a struct
+                is_struct_value = true;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected struct value for member access, will use extractvalue");
+            }
+            else if (struct_ptr_type->isPointerTy())
+            {
+                // With opaque pointers in newer LLVM, we can't verify the pointed-to type directly
+                // Let's be more conservative and check if CreateStructGEP would work
+                // If it fails at IR verification, that's when we'll catch the issue
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found pointer value for member access, proceeding with CreateStructGEP");
             }
         }
 
@@ -3678,18 +3712,35 @@ namespace Cryo::Codegen
         }
 
         // Create GEP instruction to access the field
-        llvm::Value *field_ptr = builder.CreateStructGEP(struct_type, struct_ptr, field_index, member_name + "_ptr");
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created GEP for field access");
+        llvm::Value *field_ptr = nullptr;
+        llvm::Value *field_value = nullptr;
+        
+        if (is_struct_value && !llvm::isa<llvm::AllocaInst>(struct_ptr))
+        {
+            // Handle struct values using extractvalue
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using extractvalue for struct value field access");
+            field_value = builder.CreateExtractValue(struct_ptr, {static_cast<unsigned>(field_index)}, member_name + "_val");
+        }
+        else
+        {
+            // Handle pointers to structs using GEP
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using CreateStructGEP for pointer-to-struct field access");
+            field_ptr = builder.CreateStructGEP(struct_type, struct_ptr, field_index, member_name + "_ptr");
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created GEP for field access");
 
-        // Load the field value
-        llvm::Type *field_type = struct_type->getStructElementType(field_index);
-        llvm::Value *field_value = create_load(field_ptr, field_type, member_name + "_val");
+            // Load the field value
+            llvm::Type *field_type = struct_type->getStructElementType(field_index);
+            field_value = create_load(field_ptr, field_type, member_name + "_val");
+        }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully generated field access for: {}", member_name);
 
         // IMPORTANT: Store BOTH the pointer (for method calls) and the value (for regular access)
         // Store the field pointer with a special key so we can retrieve it for method calls
-        _value_context->set_value("__field_ptr_" + std::to_string(reinterpret_cast<uintptr_t>(&node)), field_ptr);
+        if (field_ptr)
+        {
+            _value_context->set_value("__field_ptr_" + std::to_string(reinterpret_cast<uintptr_t>(&node)), field_ptr);
+        }
 
         register_value(&node, field_value);
         set_current_value(field_value); // Make sure the value is available for binary expressions
@@ -6564,8 +6615,8 @@ namespace Cryo::Codegen
             function_name = identifier->name();
             resolved_function_name = function_name;
 
-            // Check if this is a primitive type constructor (e.g., i64, i32, etc.)
-            if (is_primitive_integer_constructor(function_name))
+            // Check if this is a primitive type constructor (e.g., i64, i32, f64, etc.)
+            if (is_primitive_constructor(function_name))
             {
                 return generate_primitive_constructor_call(node, function_name);
             }
@@ -10297,6 +10348,19 @@ namespace Cryo::Codegen
         return integer_types.find(function_name) != integer_types.end();
     }
 
+    bool CodegenVisitor::is_primitive_float_constructor(const std::string &function_name) const
+    {
+        static const std::unordered_set<std::string> float_types = {
+            "f32", "f64", "float"};
+
+        return float_types.find(function_name) != float_types.end();
+    }
+
+    bool CodegenVisitor::is_primitive_constructor(const std::string &function_name) const
+    {
+        return is_primitive_integer_constructor(function_name) || is_primitive_float_constructor(function_name);
+    }
+
     llvm::Value *CodegenVisitor::generate_primitive_constructor_call(CallExpressionNode *node, const std::string &target_type)
     {
         if (!node || node->arguments().empty())
@@ -10375,7 +10439,14 @@ namespace Cryo::Codegen
         }
 
         // Generate appropriate cast instruction
-        return generate_integer_cast(source_value, source_type, target_llvm_type, target_type);
+        if (is_primitive_float_constructor(target_type))
+        {
+            return generate_float_cast(source_value, source_type, target_llvm_type, target_type);
+        }
+        else
+        {
+            return generate_integer_cast(source_value, source_type, target_llvm_type, target_type);
+        }
     }
 
     llvm::Value *CodegenVisitor::generate_integer_cast(llvm::Value *source_value, llvm::Type *source_type,
@@ -10425,6 +10496,72 @@ namespace Cryo::Codegen
         {
             // Narrowing conversion
             return builder.CreateTrunc(source_value, target_type);
+        }
+    }
+
+    llvm::Value *CodegenVisitor::generate_float_cast(llvm::Value *source_value, llvm::Type *source_type,
+                                                     llvm::Type *target_type, const std::string &target_type_name)
+    {
+        auto &builder = _context_manager.get_builder();
+
+        // Debug output to understand what types we're working with
+        std::string source_desc, target_desc;
+        llvm::raw_string_ostream source_stream(source_desc), target_stream(target_desc);
+        source_type->print(source_stream);
+        target_type->print(target_stream);
+        std::cerr << "DEBUG: generate_float_cast - source: " << source_desc 
+                  << ", target: " << target_desc 
+                  << ", target_name: " << target_type_name << std::endl;
+
+        // If types are the same, no cast needed
+        if (source_type == target_type)
+        {
+            std::cerr << "DEBUG: Types are identical, returning source value" << std::endl;
+            return source_value;
+        }
+
+        // Handle conversions between different types
+        if (source_type->isIntegerTy() && target_type->isFloatTy())
+        {
+            // Integer to float conversion
+            // Assume signed integer for now (could be enhanced to check signedness)
+            return builder.CreateSIToFP(source_value, target_type, "int2float");
+        }
+        else if (source_type->isFloatTy() && target_type->isIntegerTy())
+        {
+            // Float to integer conversion
+            return builder.CreateFPToSI(source_value, target_type, "float2int");
+        }
+        else if (source_type->isFloatTy() && target_type->isFloatTy())
+        {
+            // Float to float conversion
+            unsigned source_bits = source_type->getPrimitiveSizeInBits();
+            unsigned target_bits = target_type->getPrimitiveSizeInBits();
+            
+            if (source_bits < target_bits)
+            {
+                // Extending float precision (f32 -> f64)
+                return builder.CreateFPExt(source_value, target_type, "fpext");
+            }
+            else if (source_bits > target_bits)
+            {
+                // Truncating float precision (f64 -> f32)
+                return builder.CreateFPTrunc(source_value, target_type, "fptrunc");
+            }
+            else
+            {
+                // Same precision, just return as-is (shouldn't happen due to early check)
+                return source_value;
+            }
+        }
+        else
+        {
+            std::cerr << "DEBUG: Unsupported type conversion - source is int: " << source_type->isIntegerTy() 
+                      << ", source is float: " << source_type->isFloatTy()
+                      << ", target is int: " << target_type->isIntegerTy()
+                      << ", target is float: " << target_type->isFloatTy() << std::endl;
+            std::cerr << "Error: Unsupported type conversion in float cast" << std::endl;
+            return nullptr;
         }
     }
 

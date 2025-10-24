@@ -310,9 +310,16 @@ namespace Cryo::Codegen
 
     bool LLVMContextManager::verify_module(const std::string &module_name) const
     {
+        std::string error_details;
+        return verify_module_with_details(module_name, error_details);
+    }
+
+    bool LLVMContextManager::verify_module_with_details(const std::string &module_name, std::string &error_details) const
+    {
         llvm::Module *target_module = module_name.empty() ? _active_module : get_module(module_name);
         if (!target_module)
         {
+            error_details = "Module '" + module_name + "' does not exist";
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cannot verify module '{}' - does not exist", module_name);
             return false;
         }
@@ -324,13 +331,13 @@ namespace Cryo::Codegen
         bool result = llvm::verifyModule(*target_module, &error_stream);
         if (result)
         {
+            error_details = error_str;
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Module '{}' verification failed", module_name);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Error: {}", error_str);
-            // report `error_str` to the GDM
-            // ...
         }
         else
         {
+            error_details.clear();
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Module '{}' verified successfully", module_name);
         }
         return !result;

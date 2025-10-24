@@ -3,6 +3,7 @@
 #include "Codegen/TargetConfig.hpp"
 #include "AST/ASTNode.hpp"
 #include "Utils/Logger.hpp"
+#include "GDM/GDM.hpp"
 #include <iostream>
 #include <memory>
 #include <system_error>
@@ -198,9 +199,57 @@ namespace Cryo::Codegen
             return false;
         }
 
-        // Verify the generated IR
-        if (!_context_manager->verify_module())
+        // Verify the generated IR with detailed error reporting
+        std::string verification_errors;
+        if (!_context_manager->verify_module_with_details("", verification_errors))
         {
+            // Try to get the current AST node from the visitor for better error location
+            SourceRange error_range(SourceLocation(1, 1), SourceLocation(1, 1));
+            std::string context_info = "";
+            
+            if (_visitor && _visitor->get_current_node())
+            {
+                auto current_node = _visitor->get_current_node();
+                auto location = current_node->location();
+                error_range = SourceRange(location, location);
+                
+                // Get additional context about what was being processed
+                switch (current_node->kind())
+                {
+                    case NodeKind::FunctionDeclaration:
+                        context_info = "while generating function";
+                        break;
+                    case NodeKind::StructDeclaration:
+                        context_info = "while generating struct";
+                        break;
+                    case NodeKind::VariableDeclaration:
+                        context_info = "while generating variable declaration";
+                        break;
+                    case NodeKind::CallExpression:
+                        context_info = "while generating function call";
+                        break;
+                    case NodeKind::BinaryExpression:
+                        context_info = "while generating binary expression";
+                        break;
+                    default:
+                        context_info = "while generating AST node";
+                        break;
+                }
+            }
+            
+            // Report the detailed LLVM verification error to the GDM
+            if (_gdm)
+            {
+                std::string full_message = "Generated IR failed verification";
+                if (!context_info.empty())
+                {
+                    full_message += " " + context_info;
+                }
+                full_message += ": " + verification_errors;
+                
+                _gdm->create_error(ErrorCode::E0601_LLVM_ERROR, error_range, "", full_message);
+            }
+            
             report_error("Generated IR failed verification");
             return false;
         }

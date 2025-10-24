@@ -454,7 +454,7 @@ namespace Cryo::CLI
         }
         else
         {
-            std::cerr << "\n❌ Compilation failed!" << std::endl;
+            std::cerr << "\nX Compilation failed!" << std::endl;
         }
 
         // Show outputs based on requested flags - regardless of compilation success
