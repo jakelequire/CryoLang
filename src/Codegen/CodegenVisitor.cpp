@@ -970,7 +970,7 @@ namespace Cryo::Codegen
                     }
                     catch (const std::exception &e)
                     {
-                        report_error("Exception in struct method body generation: " + std::string(e.what()), method.get());
+                        // report_error("Exception in struct method body generation: " + std::string(e.what()), method.get());
                     }
 
                     // Exit function scope

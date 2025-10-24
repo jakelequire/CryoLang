@@ -257,6 +257,16 @@ namespace Cryo
     {
         auto program = _builder.create_program_node(SourceLocation{});
 
+        // Parse file-level directives before anything else
+        while (is_directive_start())
+        {
+            auto directive = parse_directive();
+            if (directive)
+            {
+                program->add_statement(std::move(directive));
+            }
+        }
+
         // Parse optional namespace declaration
         if (_current_token.is(TokenKind::TK_KW_NAMESPACE))
         {
@@ -4277,7 +4287,7 @@ namespace Cryo
         }
 
         // Let the processor parse the directive arguments
-        // The processor should consume tokens up to and including the closing ']'
+        // The processor should consume tokens up to but NOT including the closing ']'
         auto directive_node = processor->parse_directive_arguments(*this);
 
         if (!directive_node)
@@ -4285,6 +4295,9 @@ namespace Cryo
             error("Failed to parse directive arguments for: " + directive_name);
             return nullptr;
         }
+
+        // Consume the closing ']'
+        consume(TokenKind::TK_R_SQUARE, "Expected ']' after directive");
 
         return directive_node;
     }
