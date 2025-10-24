@@ -5,6 +5,7 @@
 #include "AST/ASTBuilder.hpp"
 #include "AST/ASTContext.hpp"
 #include "AST/Type.hpp"
+#include "AST/DirectiveSystem.hpp"
 #include "GDM/GDM.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
 #include <memory>
@@ -45,6 +46,9 @@ namespace Cryo
         // Documentation comment collection
         std::vector<std::string> _pending_doc_comments; // Collected doc comments waiting to be attached
 
+        // Directive system
+        DirectiveRegistry *_directive_registry = nullptr; // Will be set during initialization
+
     public:
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file);
@@ -68,18 +72,21 @@ namespace Cryo
                 _scope_depth--;
         }
 
+        // Directive system
+        void set_directive_registry(DirectiveRegistry *registry) { _directive_registry = registry; }
+
     private:
         // Diagnostic reporting
         void report_error(ErrorCode error_code, const std::string &message, SourceRange range = SourceRange{});
         void report_warning(ErrorCode error_code, const std::string &message, SourceRange range = SourceRange{});
-        
+
         // Enhanced diagnostic reporting
         void report_enhanced_token_error(TokenKind expected, const std::string &context_message);
         ErrorCode get_token_error_code(TokenKind expected);
         std::string get_token_name(TokenKind kind);
-        void add_token_mismatch_suggestions(Diagnostic& diagnostic, TokenKind expected, TokenKind actual, const std::string& context);
-        void add_context_spans(Diagnostic& diagnostic, TokenKind expected);
-        void add_generic_parsing_suggestions(Diagnostic& diagnostic, const std::string& message);
+        void add_token_mismatch_suggestions(Diagnostic &diagnostic, TokenKind expected, TokenKind actual, const std::string &context);
+        void add_context_spans(Diagnostic &diagnostic, TokenKind expected);
+        void add_generic_parsing_suggestions(Diagnostic &diagnostic, const std::string &message);
 
         // Token management
         void advance();
@@ -183,6 +190,21 @@ namespace Cryo
         // Enum parsing helpers
         std::unique_ptr<EnumVariantNode> parse_enum_variant();
 
+        // Directive parsing
+        std::unique_ptr<DirectiveNode> parse_directive();
+        bool is_directive_start(); // Check for # followed by [
+        std::vector<std::unique_ptr<DirectiveNode>> parse_leading_directives();
+
+    public:
+        // Directive parsing utilities (public for directive processors)
+        Token peek_current() const { return _current_token; }
+        bool match_token(TokenKind kind);
+        void advance_token();
+        Token consume_token(TokenKind expected, const std::string &error_message);
+        void report_error(const std::string &message);
+        bool is_parser_at_end() const;
+
+    private:
         // Utility methods
         bool is_type_token() const;
         bool is_primitive_type_token() const;
@@ -205,10 +227,10 @@ namespace Cryo
 
         // Type resolution helper
         Type *resolve_type_from_string(const std::string &type_str);
-        
+
         // Enhanced type parsing using tokens
         Type *parse_type_annotation_with_tokens();
-        
+
         // Enhanced diagnostic helper methods
         bool is_delimiter_token(TokenKind kind) const;
         char get_delimiter_char(TokenKind kind) const;

@@ -109,6 +109,7 @@ namespace Cryo
         void visit(GenericParameterNode &node) override;
         void visit(StructFieldNode &node) override;
         void visit(StructMethodNode &node) override;
+        void visit(DirectiveNode &node) override;
 
     private:
         // Helper methods for traversing children

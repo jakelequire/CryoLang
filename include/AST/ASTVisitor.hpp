@@ -50,6 +50,7 @@ namespace Cryo
     class GenericParameterNode;
     class StructFieldNode;
     class StructMethodNode;
+    class DirectiveNode;
 
     class ASTVisitor
     {
@@ -104,6 +105,7 @@ namespace Cryo
         virtual void visit(GenericParameterNode &node) = 0;
         virtual void visit(StructFieldNode &node) = 0;
         virtual void visit(StructMethodNode &node) = 0;
+        virtual void visit(DirectiveNode &node) = 0;
     };
 
     // Base visitor with default implementations
@@ -157,5 +159,6 @@ namespace Cryo
         void visit(GenericParameterNode &node) override {}
         void visit(StructFieldNode &node) override {}
         void visit(StructMethodNode &node) override {}
+        void visit(DirectiveNode &node) override {}
     };
 }
