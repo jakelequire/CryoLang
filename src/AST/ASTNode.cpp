@@ -3,6 +3,85 @@
 
 namespace Cryo
 {
+    //===----------------------------------------------------------------------===//
+    // DirectiveStorage - PIMPL implementation for directive support
+    //===----------------------------------------------------------------------===//
+
+    struct ASTNode::DirectiveStorage
+    {
+        std::vector<std::unique_ptr<DirectiveNode>> attached_directives;
+    };
+
+    //===----------------------------------------------------------------------===//
+    // ASTNode Implementation
+    //===----------------------------------------------------------------------===//
+
+    ASTNode::ASTNode(NodeKind kind, SourceLocation location)
+        : _kind(kind), _location(location), _directive_storage(std::make_unique<DirectiveStorage>())
+    {
+    }
+
+    ASTNode::~ASTNode() = default;
+
+    ASTNode::ASTNode(const ASTNode &other)
+        : _kind(other._kind), _location(other._location), _has_error(other._has_error),
+          _directive_storage(std::make_unique<DirectiveStorage>())
+    {
+        // Note: We don't copy directives as they are typically tied to specific parse locations
+    }
+
+    ASTNode &ASTNode::operator=(const ASTNode &other)
+    {
+        if (this != &other)
+        {
+            _kind = other._kind;
+            _location = other._location;
+            _has_error = other._has_error;
+            _directive_storage = std::make_unique<DirectiveStorage>();
+            // Note: We don't copy directives as they are typically tied to specific parse locations
+        }
+        return *this;
+    }
+
+    ASTNode::ASTNode(ASTNode &&other) noexcept
+        : _kind(other._kind), _location(other._location), _has_error(other._has_error),
+          _directive_storage(std::move(other._directive_storage))
+    {
+    }
+
+    ASTNode &ASTNode::operator=(ASTNode &&other) noexcept
+    {
+        if (this != &other)
+        {
+            _kind = other._kind;
+            _location = other._location;
+            _has_error = other._has_error;
+            _directive_storage = std::move(other._directive_storage);
+        }
+        return *this;
+    }
+
+    void ASTNode::attach_directive(std::unique_ptr<DirectiveNode> directive)
+    {
+        if (directive)
+        {
+            _directive_storage->attached_directives.push_back(std::move(directive));
+        }
+    }
+
+    const std::vector<std::unique_ptr<DirectiveNode>> &ASTNode::get_directives() const
+    {
+        return _directive_storage->attached_directives;
+    }
+
+    bool ASTNode::has_directives() const
+    {
+        return !_directive_storage->attached_directives.empty();
+    }
+
+    //===----------------------------------------------------------------------===//
+    // AST Node accept() implementations
+    //===----------------------------------------------------------------------===//
     void CallExpressionNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);
@@ -260,6 +339,12 @@ namespace Cryo
 
     // CaseStatementNode visitor implementation
     void CaseStatementNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // DirectiveNode visitor implementation
+    void DirectiveNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);
     }

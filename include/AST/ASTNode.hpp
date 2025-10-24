@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <algorithm>
+#include <unordered_map>
 
 namespace Cryo
 {
@@ -15,6 +16,9 @@ namespace Cryo
 
     // Forward declaration for type system (for migration support)
     class Type;
+
+    // Forward declaration for directive system
+    class DirectiveNode;
 
     // Forward declarations for pattern matching
     class MatchArmNode;
@@ -93,6 +97,9 @@ namespace Cryo
         MatchArm,
         Pattern,
         EnumPattern,
+
+        // Directive system
+        Directive,
 
         Unknown
     };
@@ -187,6 +194,8 @@ namespace Cryo
             return "Pattern";
         case NodeKind::EnumPattern:
             return "EnumPattern";
+        case NodeKind::Directive:
+            return "Directive";
         default:
             return "Unknown";
         }
@@ -199,9 +208,21 @@ namespace Cryo
         SourceLocation _location;
         mutable bool _has_error = false; // Track if this node already has errors reported
 
+    private:
+        struct DirectiveStorage; // PIMPL to avoid circular dependency
+        std::unique_ptr<DirectiveStorage> _directive_storage;
+
     public:
-        ASTNode(NodeKind kind, SourceLocation location)
-            : _kind(kind), _location(location) {}
+        ASTNode(NodeKind kind, SourceLocation location);
+        virtual ~ASTNode();
+
+        // Copy constructor and assignment operator
+        ASTNode(const ASTNode &other);
+        ASTNode &operator=(const ASTNode &other);
+
+        // Move constructor and assignment operator
+        ASTNode(ASTNode &&other) noexcept;
+        ASTNode &operator=(ASTNode &&other) noexcept;
 
         NodeKind kind() const { return _kind; }
         const SourceLocation &location() const { return _location; }
@@ -211,9 +232,27 @@ namespace Cryo
         void mark_error() const { _has_error = true; }
         void clear_error() const { _has_error = false; }
 
+        // Directive support
+        void attach_directive(std::unique_ptr<DirectiveNode> directive);
+        const std::vector<std::unique_ptr<DirectiveNode>> &get_directives() const;
+        bool has_directives() const;
+
+        template <typename T>
+        std::vector<T *> get_directives_of_type() const
+        {
+            std::vector<T *> result;
+            for (const auto &directive : get_directives())
+            {
+                if (auto casted = dynamic_cast<T *>(directive.get()))
+                {
+                    result.push_back(casted);
+                }
+            }
+            return result;
+        }
+
         virtual void print(std::ostream &os, int indent = 0) const = 0;
         virtual void accept(ASTVisitor &visitor) = 0;
-        virtual ~ASTNode() = default;
     };
 
     // Concrete node types
@@ -2284,6 +2323,140 @@ namespace Cryo
         }
 
         void accept(ASTVisitor &visitor) override;
+    };
+
+    //===----------------------------------------------------------------------===//
+    // Directive System AST Nodes
+    //===----------------------------------------------------------------------===//
+
+    // Base class for all directive nodes
+    class DirectiveNode : public ASTNode
+    {
+    protected:
+        std::string _directive_name;
+        std::unordered_map<std::string, std::string> _arguments;
+
+    public:
+        DirectiveNode(SourceLocation loc, const std::string &name)
+            : ASTNode(NodeKind::Directive, loc), _directive_name(name) {}
+
+        const std::string &name() const { return _directive_name; }
+
+        void add_argument(const std::string &key, const std::string &value)
+        {
+            _arguments[key] = value;
+        }
+
+        std::optional<std::string> get_argument(const std::string &key) const
+        {
+            auto it = _arguments.find(key);
+            return (it != _arguments.end()) ? std::make_optional(it->second) : std::nullopt;
+        }
+
+        const std::unordered_map<std::string, std::string> &arguments() const
+        {
+            return _arguments;
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "Directive[" << _directive_name << "]";
+            if (!_arguments.empty())
+            {
+                os << " {";
+                bool first = true;
+                for (const auto &[key, value] : _arguments)
+                {
+                    if (!first)
+                        os << ", ";
+                    os << key << "=" << value;
+                    first = false;
+                }
+                os << "}";
+            }
+            os << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Test directive node - #[test(name="...", category="...")]
+    class TestDirectiveNode : public DirectiveNode
+    {
+    private:
+        std::string _test_name;
+        std::string _test_category;
+
+    public:
+        TestDirectiveNode(SourceLocation loc, const std::string &name = "", const std::string &category = "")
+            : DirectiveNode(loc, "test"), _test_name(name), _test_category(category)
+        {
+            if (!name.empty())
+                add_argument("name", name);
+            if (!category.empty())
+                add_argument("category", category);
+        }
+
+        const std::string &test_name() const { return _test_name; }
+        const std::string &test_category() const { return _test_category; }
+
+        void set_test_name(const std::string &name)
+        {
+            _test_name = name;
+            add_argument("name", name);
+        }
+
+        void set_test_category(const std::string &category)
+        {
+            _test_category = category;
+            add_argument("category", category);
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "TestDirective[name=" << _test_name
+               << ", category=" << _test_category << "]" << std::endl;
+        }
+    };
+
+    // Expect error directive node - #[expect_error("ErrorCode")] or #[expect_errors("E1", "E2")]
+    class ExpectErrorDirectiveNode : public DirectiveNode
+    {
+    private:
+        std::vector<std::string> _expected_error_codes;
+
+    public:
+        ExpectErrorDirectiveNode(SourceLocation loc, const std::vector<std::string> &error_codes)
+            : DirectiveNode(loc, error_codes.size() == 1 ? "expect_error" : "expect_errors"),
+              _expected_error_codes(error_codes)
+        {
+
+            // Store as arguments for generic access
+            for (size_t i = 0; i < error_codes.size(); ++i)
+            {
+                add_argument("error" + std::to_string(i), error_codes[i]);
+            }
+        }
+
+        const std::vector<std::string> &expected_errors() const { return _expected_error_codes; }
+
+        void add_expected_error(const std::string &error_code)
+        {
+            _expected_error_codes.push_back(error_code);
+            add_argument("error" + std::to_string(_expected_error_codes.size() - 1), error_code);
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "ExpectErrorDirective[";
+            for (size_t i = 0; i < _expected_error_codes.size(); ++i)
+            {
+                if (i > 0)
+                    os << ", ";
+                os << _expected_error_codes[i];
+            }
+            os << "]" << std::endl;
+        }
     };
 
 }

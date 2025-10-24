@@ -115,6 +115,9 @@ namespace Cryo::Codegen
         void visit(Cryo::StructFieldNode &node) override;
         void visit(Cryo::StructMethodNode &node) override;
 
+        // DirectiveNode - No codegen needed, directives are compile-time only
+        void visit(Cryo::DirectiveNode &node) override;
+
         //===================================================================
         // AST Visitor Implementation - Statements
         //===================================================================
@@ -188,7 +191,7 @@ namespace Cryo::Codegen
          * @brief Get TypeMapper for manual AST node registration
          */
         TypeMapper *get_type_mapper() const { return _type_mapper.get(); }
-        
+
         /**
          * @brief Get current AST node being processed (for error reporting)
          */
@@ -290,7 +293,7 @@ namespace Cryo::Codegen
 
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
-        
+
         // Current AST node being processed (for error reporting)
         Cryo::ASTNode *_current_node;
 
@@ -458,24 +461,28 @@ namespace Cryo::Codegen
         void set_current_value(llvm::Value *value) { _current_value = value; }
         llvm::Value *get_current_value() const { return _current_value; }
         void register_value(Cryo::ASTNode *node, llvm::Value *value);
-        
+
         // AST node tracking for error reporting
         void set_current_node(Cryo::ASTNode *node) { _current_node = node; }
-        
+
         // RAII helper for automatic AST node tracking
-        class NodeTracker {
+        class NodeTracker
+        {
         private:
-            CodegenVisitor* visitor;
-            Cryo::ASTNode* previous_node;
+            CodegenVisitor *visitor;
+            Cryo::ASTNode *previous_node;
+
         public:
-            NodeTracker(CodegenVisitor* v, Cryo::ASTNode* node) : visitor(v), previous_node(v->get_current_node()) {
+            NodeTracker(CodegenVisitor *v, Cryo::ASTNode *node) : visitor(v), previous_node(v->get_current_node())
+            {
                 visitor->set_current_node(node);
             }
-            ~NodeTracker() {
+            ~NodeTracker()
+            {
                 visitor->set_current_node(previous_node);
             }
         };
-        
+
         friend class NodeTracker;
 
         // Utility methods

@@ -1424,6 +1424,13 @@ namespace Cryo::Codegen
         register_value(&node, nullptr);
     }
 
+    void CodegenVisitor::visit(Cryo::DirectiveNode &node)
+    {
+        // Directives are compile-time only and don't generate any LLVM IR
+        // They are processed during compilation for testing and error expectations
+        register_value(&node, nullptr);
+    }
+
     void CodegenVisitor::visit(Cryo::StatementNode &node)
     {
         // Base statement node - delegate to specific implementations
@@ -3662,7 +3669,7 @@ namespace Cryo::Codegen
         // We need to load the pointer value to access struct fields
         llvm::Value *struct_ptr = object_ptr;
         bool is_struct_value = false;
-        
+
         if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
         {
             llvm::Type *allocated_type = alloca_inst->getAllocatedType();
@@ -3676,7 +3683,7 @@ namespace Cryo::Codegen
             {
                 // This is an alloca of a struct value (not pointer to struct)
                 // The alloca itself is the pointer we need for GEP
-                struct_ptr = object_ptr;  // Use the alloca as the pointer
+                struct_ptr = object_ptr; // Use the alloca as the pointer
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using alloca of struct value for member access");
             }
         }
@@ -3714,7 +3721,7 @@ namespace Cryo::Codegen
         // Create GEP instruction to access the field
         llvm::Value *field_ptr = nullptr;
         llvm::Value *field_value = nullptr;
-        
+
         if (is_struct_value && !llvm::isa<llvm::AllocaInst>(struct_ptr))
         {
             // Handle struct values using extractvalue
@@ -10509,8 +10516,8 @@ namespace Cryo::Codegen
         llvm::raw_string_ostream source_stream(source_desc), target_stream(target_desc);
         source_type->print(source_stream);
         target_type->print(target_stream);
-        std::cerr << "DEBUG: generate_float_cast - source: " << source_desc 
-                  << ", target: " << target_desc 
+        std::cerr << "DEBUG: generate_float_cast - source: " << source_desc
+                  << ", target: " << target_desc
                   << ", target_name: " << target_type_name << std::endl;
 
         // If types are the same, no cast needed
@@ -10537,7 +10544,7 @@ namespace Cryo::Codegen
             // Float to float conversion
             unsigned source_bits = source_type->getPrimitiveSizeInBits();
             unsigned target_bits = target_type->getPrimitiveSizeInBits();
-            
+
             if (source_bits < target_bits)
             {
                 // Extending float precision (f32 -> f64)
@@ -10556,7 +10563,7 @@ namespace Cryo::Codegen
         }
         else
         {
-            std::cerr << "DEBUG: Unsupported type conversion - source is int: " << source_type->isIntegerTy() 
+            std::cerr << "DEBUG: Unsupported type conversion - source is int: " << source_type->isIntegerTy()
                       << ", source is float: " << source_type->isFloatTy()
                       << ", target is int: " << target_type->isIntegerTy()
                       << ", target is float: " << target_type->isFloatTy() << std::endl;

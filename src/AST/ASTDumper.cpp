@@ -987,7 +987,7 @@ namespace Cryo
                 if (_use_colors)
                     _output << Colors::RESET;
             }
-            
+
             if (node.is_constructor())
             {
                 _output << " ";
@@ -1044,6 +1044,52 @@ namespace Cryo
         if (node.body())
         {
             dump_child(node.body(), true);
+        }
+    }
+
+    void ASTDumper::visit(DirectiveNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "Directive";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+        _output << std::endl;
+
+        // Show directive-specific information
+        if (auto test_directive = dynamic_cast<TestDirectiveNode *>(&node))
+        {
+            push_level(false);
+            print_prefix();
+            _output << "test_name: '" << test_directive->test_name() << "'" << std::endl;
+            pop_level();
+
+            push_level(true);
+            print_prefix();
+            _output << "test_category: '" << test_directive->test_category() << "'" << std::endl;
+            pop_level();
+        }
+        else if (auto expect_directive = dynamic_cast<ExpectErrorDirectiveNode *>(&node))
+        {
+            push_level(true);
+            print_prefix();
+            _output << "expected_errors: [";
+            const auto &errors = expect_directive->expected_errors();
+            for (size_t i = 0; i < errors.size(); ++i)
+            {
+                if (i > 0)
+                    _output << ", ";
+                _output << "'" << errors[i] << "'";
+            }
+            _output << "]" << std::endl;
+            pop_level();
         }
     }
 

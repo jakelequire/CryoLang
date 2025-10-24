@@ -1,6 +1,8 @@
 #include "Compiler/CompilerInstance.hpp"
 #include "Codegen/TypeMapper.hpp"
 #include "Codegen/CodegenVisitor.hpp"
+#include "AST/DirectiveProcessors.hpp"
+#include "AST/DirectiveWalker.hpp"
 #include "Utils/File.hpp"
 #include "Utils/Logger.hpp"
 #include <iostream>
@@ -36,6 +38,9 @@ namespace Cryo
         // Create module loader - needs to be created after symbol table and template registry
         // Pass the main ASTContext to ensure all modules use the same TypeContext
         _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry, *_ast_context);
+
+        // Initialize directive system
+        initialize_directive_system();
 
         // Note: CodeGenerator will be created after parsing when namespace is known
 
@@ -143,6 +148,7 @@ namespace Cryo
 
             // Phase 2: Create parser with lexer and AST context
             _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostic_manager.get(), file_path);
+            _parser->set_directive_registry(_directive_registry.get());
 
             // Phase 3: Parse the program
             if (!parse())
@@ -244,6 +250,7 @@ namespace Cryo
 
             // Phase 2: Create parser with lexer and AST context
             _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostic_manager.get(), file_path);
+            _parser->set_directive_registry(_directive_registry.get());
 
             // Phase 3: Parse the program
             if (!parse())
@@ -381,6 +388,16 @@ namespace Cryo
 
         try
         {
+            // Phase -1: Process directives first
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase -1: Processing directives...");
+            }
+            if (!process_directives())
+            {
+                return false;
+            }
+
             if (_debug_mode)
             {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase 0: Symbol table population...");
@@ -516,6 +533,16 @@ namespace Cryo
             if (_debug_mode)
             {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Type checking completed successfully");
+            }
+
+            // Final phase: Validate directive effects
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Validating directive effects...");
+            }
+            if (!validate_directive_effects())
+            {
+                return false;
             }
 
             return true;
@@ -1658,6 +1685,61 @@ namespace Cryo
         // Fallback to relative path
         return "./bin";
     }
+
+    //===----------------------------------------------------------------------===//
+    // Directive System Implementation
+    //===----------------------------------------------------------------------===//
+
+    void CompilerInstance::initialize_directive_system()
+    {
+        _directive_registry = std::make_unique<DirectiveRegistry>();
+
+        // Register built-in directive processors
+        _directive_registry->register_processor(std::make_unique<TestDirectiveProcessor>());
+        _directive_registry->register_processor(std::make_unique<ExpectErrorDirectiveProcessor>());
+        _directive_registry->register_processor(std::make_unique<ExpectErrorsDirectiveProcessor>());
+
+        LOG_DEBUG(LogComponent::GENERAL, "Initialized directive system with {} processors",
+                  _directive_registry->get_available_directives().size());
+    }
+
+    bool CompilerInstance::process_directives()
+    {
+        if (!_ast_root || !_directive_registry)
+        {
+            return true; // No directives to process
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL, "Processing directives in AST");
+
+        // Create and use DirectiveWalker to process all directives in the AST
+        DirectiveWalker walker(_directive_registry.get(), _compilation_context);
+
+        // Walk the entire AST and process directives
+        _ast_root->accept(walker);
+
+        if (walker.has_errors())
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Errors occurred while processing directives");
+            return false;
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL, "Successfully processed all directives");
+        return true;
+    }
+
+    bool CompilerInstance::validate_directive_effects()
+    {
+        bool all_valid = _compilation_context.validate_all_effects();
+
+        if (!all_valid)
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Directive validation failed");
+        }
+
+        return all_valid;
+    }
+
     std::unique_ptr<CompilerInstance> create_compiler_instance()
     {
         return std::make_unique<CompilerInstance>();

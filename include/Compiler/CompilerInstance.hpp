@@ -9,6 +9,8 @@
 #include "AST/TypeChecker.hpp"
 #include "AST/MonomorphizationPass.hpp"
 #include "AST/TemplateRegistry.hpp"
+#include "AST/DirectiveSystem.hpp"
+#include "AST/DirectiveProcessors.hpp"
 #include "GDM/GDM.hpp"
 #include "Codegen/CodeGenerator.hpp"
 #include "Linker/CryoLinker.hpp"
@@ -55,6 +57,10 @@ namespace Cryo
         // ModuleLoader must be declared AFTER the objects it references (symbol_table, template_registry)
         // This ensures proper destruction order (ModuleLoader destroyed first)
         std::unique_ptr<ModuleLoader> _module_loader;
+
+        // Directive system
+        std::unique_ptr<DirectiveRegistry> _directive_registry;
+        CompilationContext _compilation_context;
 
         // Compilation state
         std::string _source_file;
@@ -107,6 +113,11 @@ namespace Cryo
         Cryo::Linker::CryoLinker *linker() const { return _linker.get(); }
         ModuleLoader *module_loader() const { return _module_loader.get(); }
 
+        // Directive system access
+        DirectiveRegistry *directive_registry() const { return _directive_registry.get(); }
+        CompilationContext &compilation_context() { return _compilation_context; }
+        const CompilationContext &compilation_context() const { return _compilation_context; }
+
         // Standard library linking control
         void set_stdlib_linking(bool enable) { _stdlib_linking_enabled = enable; }
         bool stdlib_linking_enabled() const { return _stdlib_linking_enabled; }
@@ -147,6 +158,11 @@ namespace Cryo
         void process_struct_declarations_recursive(ASTNode *node);
         std::string build_function_signature(FunctionDeclarationNode *func_decl);
         void inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name); // Auto-import core types
+
+        // Directive system
+        void initialize_directive_system();
+        bool process_directives();
+        bool validate_directive_effects();
 
         // Dynamic path resolution
         std::string find_bin_directory() const;

@@ -662,7 +662,6 @@ namespace Cryo
     Type *Parser::parse_type_annotation()
     {
 
-        
         // Handle reference types (&type, &mut type) - keep existing logic
         if (_current_token.is(TokenKind::TK_AMP))
         {
@@ -727,142 +726,145 @@ namespace Cryo
     // Statement parsing
     std::unique_ptr<ASTNode> Parser::parse_statement()
     {
+        // First, check for and parse any leading directives
+        std::vector<std::unique_ptr<DirectiveNode>> leading_directives = parse_leading_directives();
+
+        // Now parse the actual statement
+        std::unique_ptr<ASTNode> statement = nullptr;
+
         // Variable declarations
         if (_current_token.is(TokenKind::TK_KW_CONST) || _current_token.is(TokenKind::TK_KW_MUT))
         {
-            return parse_variable_declaration();
+            statement = parse_variable_declaration();
         }
-
         // Import declarations
-        if (_current_token.is(TokenKind::TK_KW_IMPORT))
+        else if (_current_token.is(TokenKind::TK_KW_IMPORT))
         {
-            return parse_import_declaration();
+            statement = parse_import_declaration();
         }
 
         // Type declarations - struct, class, type alias, enum
-        if (_current_token.is(TokenKind::TK_KW_TYPE))
+        else if (_current_token.is(TokenKind::TK_KW_TYPE))
         {
             // Look ahead to see if it's "type struct", "type class", or "type alias"
             Token next = peek_next();
             if (next.is(TokenKind::TK_KW_STRUCT))
             {
-                return parse_struct_declaration();
+                statement = parse_struct_declaration();
             }
             else if (next.is(TokenKind::TK_KW_CLASS))
             {
-                return parse_class_declaration();
+                statement = parse_class_declaration();
             }
             else if (next.is(TokenKind::TK_KW_ENUM))
             {
-                return parse_enum_declaration();
+                statement = parse_enum_declaration();
             }
             else
             {
-                return parse_type_alias_declaration();
+                statement = parse_type_alias_declaration();
             }
         }
-
         // Standalone enum declaration
-        if (_current_token.is(TokenKind::TK_KW_ENUM))
+        else if (_current_token.is(TokenKind::TK_KW_ENUM))
         {
-            return parse_enum_declaration();
+            statement = parse_enum_declaration();
         }
-
         // Class declaration
-        if (_current_token.is(TokenKind::TK_KW_CLASS))
+        else if (_current_token.is(TokenKind::TK_KW_CLASS))
         {
-            return parse_class_declaration();
+            statement = parse_class_declaration();
         }
-
         // Trait declaration
-        if (_current_token.is(TokenKind::TK_KW_TRAIT))
+        else if (_current_token.is(TokenKind::TK_KW_TRAIT))
         {
-            return parse_trait_declaration();
+            statement = parse_trait_declaration();
         }
-
         // Implementation block
-        if (_current_token.is(TokenKind::TK_KW_IMPLEMENT))
+        else if (_current_token.is(TokenKind::TK_KW_IMPLEMENT))
         {
-            return parse_implementation_block();
+            statement = parse_implementation_block();
         }
 
         // Extern block or extern function
-        if (_current_token.is(TokenKind::TK_KW_EXTERN))
+        else if (_current_token.is(TokenKind::TK_KW_EXTERN))
         {
             // Look ahead to see if this is "extern function" or "extern block"
             if (peek_next().is(TokenKind::TK_KW_FUNCTION))
             {
                 // This is "extern function ..." syntax
                 advance(); // consume 'extern'
-                return parse_extern_function_declaration();
+                statement = parse_extern_function_declaration();
             }
             else
             {
                 // This is "extern \"C\" { ... }" syntax
-                return parse_extern_block();
+                statement = parse_extern_block();
+            }
+        }
+        // Intrinsic function declarations
+        else if (_current_token.is(TokenKind::TK_KW_INTRINSIC))
+        {
+            statement = parse_intrinsic_declaration();
+        }
+        // Function declarations
+        else if (_current_token.is(TokenKind::TK_KW_FUNCTION) || is_visibility_modifier())
+        {
+            statement = parse_function_declaration();
+        }
+        // Control flow statements
+        else if (_current_token.is(TokenKind::TK_KW_IF))
+        {
+            statement = parse_if_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_WHILE))
+        {
+            statement = parse_while_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_FOR))
+        {
+            statement = parse_for_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_MATCH))
+        {
+            statement = parse_match_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_SWITCH))
+        {
+            statement = parse_switch_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_RETURN))
+        {
+            statement = parse_return_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_BREAK))
+        {
+            statement = parse_break_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_CONTINUE))
+        {
+            statement = parse_continue_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_L_BRACE))
+        {
+            statement = parse_block_statement();
+        }
+        else
+        {
+            // Expression statements
+            statement = parse_expression_statement();
+        }
+
+        // Attach any directives that were parsed
+        if (statement && !leading_directives.empty())
+        {
+            for (auto &directive : leading_directives)
+            {
+                statement->attach_directive(std::move(directive));
             }
         }
 
-        // Intrinsic function declarations
-        if (_current_token.is(TokenKind::TK_KW_INTRINSIC))
-        {
-            return parse_intrinsic_declaration();
-        }
-
-        // Function declarations
-        if (_current_token.is(TokenKind::TK_KW_FUNCTION) || is_visibility_modifier())
-        {
-            return parse_function_declaration();
-        }
-
-        // Control flow statements
-        if (_current_token.is(TokenKind::TK_KW_IF))
-        {
-            return parse_if_statement();
-        }
-
-        if (_current_token.is(TokenKind::TK_KW_WHILE))
-        {
-            return parse_while_statement();
-        }
-
-        if (_current_token.is(TokenKind::TK_KW_FOR))
-        {
-            return parse_for_statement();
-        }
-
-        if (_current_token.is(TokenKind::TK_KW_MATCH))
-        {
-            return parse_match_statement();
-        }
-
-        if (_current_token.is(TokenKind::TK_KW_SWITCH))
-        {
-            return parse_switch_statement();
-        }
-
-        if (_current_token.is(TokenKind::TK_KW_RETURN))
-        {
-            return parse_return_statement();
-        }
-
-        if (_current_token.is(TokenKind::TK_KW_BREAK))
-        {
-            return parse_break_statement();
-        }
-
-        if (_current_token.is(TokenKind::TK_KW_CONTINUE))
-        {
-            return parse_continue_statement();
-        }
-
-        if (_current_token.is(TokenKind::TK_L_BRACE))
-        {
-            return parse_block_statement();
-        }
-
-        // Expression statements
-        return parse_expression_statement();
+        return statement;
     }
 
     std::unique_ptr<VariableDeclarationNode> Parser::parse_variable_declaration()
@@ -2650,16 +2652,15 @@ namespace Cryo
             if (_diagnostic_builder)
             {
                 _diagnostic_builder->create_invalid_instantiation_error(
-                    type_name, 
-                    new_location, 
-                    "cannot use 'new' keyword with struct literal syntax"
-                );
+                    type_name,
+                    new_location,
+                    "cannot use 'new' keyword with struct literal syntax");
             }
-            
+
             // Error recovery: skip the invalid struct literal syntax
             // Consume the opening brace
             advance(); // consume '{'
-            
+
             // Skip until we find the closing brace
             int brace_count = 1;
             while (!_current_token.is(TokenKind::TK_EOF) && brace_count > 0)
@@ -2674,13 +2675,13 @@ namespace Cryo
                 }
                 advance();
             }
-            
+
             // Consume the closing parenthesis if present
             if (_current_token.is(TokenKind::TK_R_PAREN))
             {
                 advance();
             }
-            
+
             // Return a valid new expression node without arguments for error recovery
             return new_expr;
         }
@@ -4154,11 +4155,15 @@ namespace Cryo
             return _context.types().get_f32_type();
         if (type_str == "f64")
             return _context.types().get_f64_type();
+        if (type_str == "float")
+            return _context.types().get_f32_type();
+        if (type_str == "double")
+            return _context.types().get_f64_type();
         if (type_str == "boolean")
             return _context.types().get_boolean_type();
         if (type_str == "char")
             return _context.types().get_char_type();
-        if (type_str == "string" || type_str == "str")
+        if (type_str == "string")
             return _context.types().get_string_type();
         if (type_str == "auto")
             return _context.types().get_auto_type(); // Auto type inference
@@ -4201,5 +4206,115 @@ namespace Cryo
         // Return unknown type - the TypeChecker will attempt to resolve it again during type checking
         // when all enum and struct declarations have been processed
         return _context.types().get_unknown_type();
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Directive Parsing Implementation
+    //===----------------------------------------------------------------------===//
+
+    bool Parser::is_directive_start()
+    {
+        return _current_token.is(TokenKind::TK_HASH) && peek_next().is(TokenKind::TK_L_SQUARE);
+    }
+
+    std::vector<std::unique_ptr<DirectiveNode>> Parser::parse_leading_directives()
+    {
+        std::vector<std::unique_ptr<DirectiveNode>> directives;
+
+        // Parse any leading directives
+        while (is_directive_start())
+        {
+            auto directive = parse_directive();
+            if (directive)
+            {
+                directives.push_back(std::move(directive));
+            }
+            else
+            {
+                // If we failed to parse a directive, break to avoid infinite loop
+                break;
+            }
+        }
+
+        return directives;
+    }
+
+    std::unique_ptr<DirectiveNode> Parser::parse_directive()
+    {
+        if (!is_directive_start())
+        {
+            error("Expected directive starting with '#['");
+            return nullptr;
+        }
+
+        // Consume '#' and '['
+        consume(TokenKind::TK_HASH, "Expected '#'");
+        consume(TokenKind::TK_L_SQUARE, "Expected '[' after '#'");
+
+        // Parse directive name
+        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            error("Expected directive name after '#['");
+            return nullptr;
+        }
+
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected directive name");
+        std::string directive_name = std::string(name_token.text());
+
+        // Check if we have a processor for this directive
+        if (!_directive_registry || !_directive_registry->has_processor(directive_name))
+        {
+            error("Unknown directive: " + directive_name);
+            return nullptr;
+        }
+
+        // Get the processor and let it parse the arguments
+        auto processor = _directive_registry->get_processor(directive_name);
+        if (!processor)
+        {
+            error("Failed to get processor for directive: " + directive_name);
+            return nullptr;
+        }
+
+        // Let the processor parse the directive arguments
+        // The processor should consume tokens up to and including the closing ']'
+        auto directive_node = processor->parse_directive_arguments(*this);
+
+        if (!directive_node)
+        {
+            error("Failed to parse directive arguments for: " + directive_name);
+            return nullptr;
+        }
+
+        return directive_node;
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Directive Parsing Utilities
+    //===----------------------------------------------------------------------===//
+
+    bool Parser::match_token(TokenKind kind)
+    {
+        return match(kind);
+    }
+
+    void Parser::advance_token()
+    {
+        advance();
+    }
+
+    Token Parser::consume_token(TokenKind expected, const std::string &error_message)
+    {
+        return consume(expected, error_message);
+    }
+
+    void Parser::report_error(const std::string &message)
+    {
+        error(message);
+    }
+
+    bool Parser::is_parser_at_end() const
+    {
+        return is_at_end();
     }
 }
