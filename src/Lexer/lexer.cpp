@@ -505,12 +505,12 @@ namespace Cryo
                 // Hexadecimal
                 advance(); // consume 'x' or 'X'
                 const char *hex_start = _current;
-                
+
                 while (!at_end() && is_hex_digit(peek()))
                 {
                     advance();
                 }
-                
+
                 // Check if we actually consumed any hex digits
                 if (_current == hex_start)
                 {
@@ -522,7 +522,7 @@ namespace Cryo
                     }
                     return make_error_token("Invalid hexadecimal number");
                 }
-                
+
                 // Skip decimal and exponent parsing for hex numbers
                 goto handle_suffixes;
             }
@@ -531,12 +531,12 @@ namespace Cryo
                 // Binary
                 advance(); // consume 'b' or 'B'
                 const char *bin_start = _current;
-                
+
                 while (!at_end() && (peek() == '0' || peek() == '1'))
                 {
                     advance();
                 }
-                
+
                 // Check if we actually consumed any binary digits
                 if (_current == bin_start)
                 {
@@ -548,7 +548,7 @@ namespace Cryo
                     }
                     return make_error_token("Invalid binary number");
                 }
-                
+
                 // Skip decimal and exponent parsing for binary numbers
                 goto handle_suffixes;
             }
@@ -557,12 +557,12 @@ namespace Cryo
                 // Octal
                 advance(); // consume 'o' or 'O'
                 const char *oct_start = _current;
-                
+
                 while (!at_end() && peek() >= '0' && peek() <= '7')
                 {
                     advance();
                 }
-                
+
                 // Check if we actually consumed any octal digits
                 if (_current == oct_start)
                 {
@@ -574,7 +574,7 @@ namespace Cryo
                     }
                     return make_error_token("Invalid octal number");
                 }
-                
+
                 // Skip decimal and exponent parsing for octal numbers
                 goto handle_suffixes;
             }
@@ -1214,7 +1214,7 @@ namespace Cryo
 
         // Create enhanced lexer diagnostic builder
         LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
-        
+
         // Use appropriate diagnostic method based on message content
         if (message.find("unexpected character") != std::string::npos)
         {
