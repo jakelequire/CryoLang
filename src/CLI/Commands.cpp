@@ -856,7 +856,7 @@ namespace Cryo::CLI::Commands
 
         if (!compilation_success)
         {
-            std::cerr << "❌ Compilation failed!" << std::endl;
+            std::cerr << "X Compilation failed!" << std::endl;
             compiler->print_diagnostics();
             return 1;
         }

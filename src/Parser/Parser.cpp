@@ -1684,16 +1684,16 @@ namespace Cryo
             return std::move(expr);
         }
 
-        // Primitive type constructors (e.g., i64(value), i32(value))
-        if (is_integer_primitive_type_token())
+        // Primitive type constructors (e.g., i64(value), i32(value), f64(value))
+        if (is_primitive_type_token())
         {
             // Look ahead to see if this is followed by parentheses
             if (peek_next().is(TokenKind::TK_L_PAREN))
             {
-                // This is a primitive constructor call like i64(value)
+                // This is a primitive constructor call like i64(value) or f64(value)
                 std::string type_name = std::string(_current_token.text());
                 SourceLocation type_location = _current_token.location();
-                advance(); // consume the type name (e.g., 'i64')
+                advance(); // consume the type name (e.g., 'i64', 'f64')
 
                 // Create an identifier node with the type name
                 Token type_token(TokenKind::TK_IDENTIFIER, type_name, type_location);

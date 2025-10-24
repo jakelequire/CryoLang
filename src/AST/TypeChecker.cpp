@@ -1022,7 +1022,8 @@ namespace Cryo
             type_string != "string" && type_string != "auto" && type_string != "..." &&
             type_string != "i8" && type_string != "i16" && type_string != "i32" && type_string != "i64" &&
             type_string != "u8" && type_string != "u16" && type_string != "u32" && type_string != "u64" &&
-            type_string != "int" && type_string != "float" && type_string != "double")
+            type_string != "int" && type_string != "float" && type_string != "double" &&
+            type_string != "f32" && type_string != "f64")
         {
             // Check the symbol table FIRST to get the correct declared type (enum, struct, or class)
             TypedSymbol *type_symbol = _symbol_table->lookup_symbol(type_string);
@@ -2708,9 +2709,13 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression checking primitive constructor for '{}', has_resolved_type: {}, type: {}",
                           callee_name, has_resolved, callee_resolved_type ? callee_resolved_type->to_string() : "none");
 
-                // Handle primitive constructors: either not resolved, or resolved to unknown type
-                if ((!has_resolved || (callee_resolved_type && callee_resolved_type->kind() == TypeKind::Unknown)) &&
-                    (is_primitive_integer_type(callee_name) || callee_name == "f32" || callee_name == "f64" || callee_name == "float"))
+                // Handle primitive constructors: either not resolved, resolved to unknown type, or resolved to the matching primitive type
+                bool is_primitive_constructor = (is_primitive_integer_type(callee_name) || callee_name == "f32" || callee_name == "f64" || callee_name == "float");
+                bool should_handle_as_constructor = (!has_resolved || 
+                                                   (callee_resolved_type && callee_resolved_type->kind() == TypeKind::Unknown) ||
+                                                   (is_primitive_constructor && callee_resolved_type && callee_resolved_type->name() == callee_name));
+                
+                if (should_handle_as_constructor && is_primitive_constructor)
                 {
                     // This is a primitive type constructor call like u64(0)
                     Type *target_type = lookup_type_by_name(callee_name);
