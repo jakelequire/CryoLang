@@ -195,6 +195,14 @@ namespace Cryo::Codegen
         bool verify_module(const std::string& module_name = "") const;
 
         /**
+         * @brief Verify module and get detailed error information
+         * @param module_name Specific module name (defaults to active module)
+         * @param error_details Output parameter for detailed error information
+         * @return true if module is valid
+         */
+        bool verify_module_with_details(const std::string& module_name, std::string& error_details) const;
+
+        /**
          * @brief Print module IR to stream
          * @param os Output stream
          * @param module_name Specific module name (defaults to active module)
