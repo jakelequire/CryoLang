@@ -889,6 +889,22 @@ namespace Cryo
             break;
         }
 
+        case NodeKind::UnaryExpression:
+        {
+            auto *unary_expr = static_cast<UnaryExpressionNode *>(original_expr);
+
+            auto cloned_operand = clone_expression_with_substitution(unary_expr->operand(), type_substitutions);
+            if (cloned_operand)
+            {
+                return std::make_unique<UnaryExpressionNode>(
+                    NodeKind::UnaryExpression,
+                    unary_expr->location(),
+                    unary_expr->operator_token(),
+                    std::move(cloned_operand));
+            }
+            break;
+        }
+
         case NodeKind::ArrayAccess:
         {
             auto *array_access = static_cast<ArrayAccessNode *>(original_expr);
@@ -981,12 +997,10 @@ namespace Cryo
 
         // Add more expression types as needed (simplified for now)
         default:
-            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Unsupported expression type for cloning: {}", static_cast<int>(original_expr->kind()));
-            // For unsupported expressions, return a simple identifier as fallback
-            return std::make_unique<IdentifierNode>(
-                NodeKind::Identifier,
-                original_expr->location(),
-                "UNSUPPORTED_EXPR");
+            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Unsupported expression type for cloning: {} ({})", static_cast<int>(original_expr->kind()), NodeKindToString(original_expr->kind()));
+            // For unsupported expressions, try to return null instead of creating a problematic identifier
+            // This allows graceful degradation instead of causing undefined identifier errors
+            return nullptr;
         }
 
         return nullptr;

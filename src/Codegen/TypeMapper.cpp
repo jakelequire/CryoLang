@@ -1516,6 +1516,12 @@ namespace Cryo::Codegen
         return _type_cache.find(name) != _type_cache.end();
     }
 
+    llvm::Type *TypeMapper::get_struct_type(const std::string &name)
+    {
+        auto it = _struct_cache.find(name);
+        return (it != _struct_cache.end()) ? it->second : nullptr;
+    }
+
     void TypeMapper::clear_cache()
     {
         _type_cache.clear();

@@ -3017,23 +3017,39 @@ namespace Cryo::Codegen
                     llvm::Value *array_var_alloca = _value_context->get_value(array_var_name);
                     if (array_var_alloca && array_var_alloca->getType()->isPointerTy())
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array variable alloca found, attempting load...");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array<T> variable alloca found, accessing elements field...");
 
-                        // Load the array pointer from the Array variable
-                        // Since the Array<int> struct is empty but contains the array literal pointer,
-                        // we need to load it carefully - the stored data is actually a pointer to the first element
-                        llvm::Type *stored_ptr_type = llvm::PointerType::get(context, 0);
-                        llvm::Value *loaded_array_ptr = builder.CreateLoad(
-                            stored_ptr_type,
+                        // Array<T> is a struct with fields: elements (T*), length (u64), capacity (u64)
+                        // We need to access the 'elements' field (index 0) first
+                        
+                        // Get the Array<T> struct type - we need to map it properly
+                        llvm::Type *array_struct_type = _type_mapper->map_type(var_type);
+                        if (!array_struct_type)
+                        {
+                            report_error("Could not map Array<T> struct type", &node);
+                            return;
+                        }
+
+                        // Create GEP to access the 'elements' field (index 0)
+                        llvm::Value *elements_field_ptr = builder.CreateStructGEP(
+                            array_struct_type,
                             array_var_alloca,
-                            array_var_name + ".array.load");
+                            0, // elements field is at index 0
+                            array_var_name + ".elements.ptr");
 
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully loaded array pointer, creating element access...");
+                        // Load the elements pointer (T*)
+                        llvm::Type *elements_ptr_type = llvm::PointerType::get(context, 0);
+                        llvm::Value *elements_ptr = builder.CreateLoad(
+                            elements_ptr_type,
+                            elements_field_ptr,
+                            array_var_name + ".elements.load");
 
-                        // Create GEP to access the specific element directly
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully loaded elements pointer, creating element access...");
+
+                        // Create GEP to access the specific element
                         llvm::Value *element_ptr = builder.CreateGEP(
                             llvm_element_type,
-                            loaded_array_ptr,
+                            elements_ptr,
                             {index_val},
                             array_var_name + ".element.ptr");
 
@@ -3045,7 +3061,7 @@ namespace Cryo::Codegen
 
                         register_value(&node, element_value);
                         set_current_value(element_value);
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated Array<T> direct element access successfully - RETURNING");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated Array<T> element access successfully - RETURNING");
                         return;
                     }
                     else
@@ -5053,6 +5069,107 @@ namespace Cryo::Codegen
                         return nullptr;
                     }
                 }
+                // Handle assignment to array access: arr[index] = value
+                else if (auto *left_array_access = dynamic_cast<Cryo::ArrayAccessNode *>(node->left()))
+                {
+                    // Check if this is an Array<T> type that needs special handling
+                    std::string array_var_name;
+                    if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(left_array_access->array()))
+                    {
+                        array_var_name = identifier->name();
+                    }
+
+                    // Generate right operand first
+                    node->right()->accept(*this);
+                    llvm::Value *right_val = get_current_value();
+
+                    if (!right_val)
+                    {
+                        report_error("Failed to generate right operand for array assignment");
+                        return nullptr;
+                    }
+
+                    // Check if this is an Array<T> type
+                    if (!array_var_name.empty())
+                    {
+                        auto type_it = _variable_types.find(array_var_name);
+                        if (type_it != _variable_types.end() && type_it->second && type_it->second->kind() == TypeKind::Array)
+                        {
+                            auto *array_type = static_cast<ArrayType *>(type_it->second);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array<T> assignment for variable '{}' of type '{}'",
+                                      array_var_name, type_it->second->to_string());
+
+                            // Get the element type
+                            Cryo::Type *cryo_element_type = array_type->element_type().get();
+                            llvm::Type *llvm_element_type = cryo_element_type ? _type_mapper->map_type(cryo_element_type) : nullptr;
+
+                            if (!llvm_element_type)
+                            {
+                                report_error("Could not resolve element type for Array assignment");
+                                return nullptr;
+                            }
+
+                            // Generate the index
+                            left_array_access->index()->accept(*this);
+                            llvm::Value *index_val = get_generated_value(left_array_access->index());
+
+                            if (!index_val)
+                            {
+                                report_error("Failed to generate index for array assignment");
+                                return nullptr;
+                            }
+
+                            // Get the Array variable alloca
+                            llvm::Value *array_var_alloca = _value_context->get_value(array_var_name);
+                            if (array_var_alloca && array_var_alloca->getType()->isPointerTy())
+                            {
+                                // Get Array<T> struct type
+                                llvm::Type *array_struct_type = _type_mapper->map_type(type_it->second);
+                                if (!array_struct_type)
+                                {
+                                    report_error("Could not map Array<T> struct type for assignment");
+                                    return nullptr;
+                                }
+
+                                // Access the 'elements' field (index 0)
+                                llvm::Value *elements_field_ptr = builder.CreateStructGEP(
+                                    array_struct_type,
+                                    array_var_alloca,
+                                    0, // elements field
+                                    array_var_name + ".elements.ptr");
+
+                                // Load the elements pointer
+                                llvm::Type *elements_ptr_type = llvm::PointerType::get(_context_manager.get_context(), 0);
+                                llvm::Value *elements_ptr = builder.CreateLoad(
+                                    elements_ptr_type,
+                                    elements_field_ptr,
+                                    array_var_name + ".elements.load");
+
+                                // Create GEP to the specific element
+                                llvm::Value *element_ptr = builder.CreateGEP(
+                                    llvm_element_type,
+                                    elements_ptr,
+                                    {index_val},
+                                    array_var_name + ".element.ptr");
+
+                                // Store the value
+                                create_store(right_val, element_ptr);
+
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated Array<T> element assignment successfully");
+                                return right_val;
+                            }
+                            else
+                            {
+                                report_error("Array variable not found or invalid for assignment: " + array_var_name);
+                                return nullptr;
+                            }
+                        }
+                    }
+
+                    // Fallback to general array access assignment handling
+                    report_error("Array assignment not fully implemented for non-Array<T> types");
+                    return nullptr;
+                }
                 // Handle assignment to member access: obj.field = value
                 else if (auto *left_member_access = dynamic_cast<Cryo::MemberAccessNode *>(node->left()))
                 {
@@ -6478,6 +6595,8 @@ namespace Cryo::Codegen
 
     llvm::Value *CodegenVisitor::generate_unary_operation(Cryo::UnaryExpressionNode *node)
     {
+        std::cerr << "[DEBUG] generate_unary_operation called" << std::endl;
+        
         if (!node)
             return nullptr;
 
@@ -6491,6 +6610,7 @@ namespace Cryo::Codegen
 
         // Get the operator type
         std::string operator_str = node->operator_token().to_string();
+        std::cerr << "[DEBUG] Unary operator: " << operator_str << std::endl;
 
         // Handle increment and decrement operators
         if (operator_str == "++" || operator_str == "--")
@@ -6611,7 +6731,10 @@ namespace Cryo::Codegen
         }
         else if (operator_str == "&")
         {
-            // Address-of operator: get the address of a variable
+            std::cerr << "[DEBUG] Address-of operator detected" << std::endl;
+            std::cerr << "[DEBUG] Operand type: " << typeid(*operand).name() << std::endl;
+            
+            // Address-of operator: get the address of a variable, member access, or array access
             if (auto identifierNode = dynamic_cast<Cryo::IdentifierNode *>(operand))
             {
                 std::string varName = identifierNode->name();
@@ -6638,6 +6761,371 @@ namespace Cryo::Codegen
 
                 // Return the alloca (address) directly for non-array address-of operator
                 return varAlloca;
+            }
+            else if (auto memberAccessNode = dynamic_cast<Cryo::MemberAccessNode *>(operand))
+            {
+                // Handle &obj.field - need to get the field pointer, not the value
+                // We need to manually generate the member access to get the pointer
+                
+                // Generate the object
+                memberAccessNode->object()->accept(*this);
+                llvm::Value *object_ptr = get_generated_value(memberAccessNode->object());
+                
+                if (!object_ptr)
+                {
+                    report_error("Failed to generate object for member access in address-of", operand);
+                    return nullptr;
+                }
+                
+                // Get the field info from the member access
+                std::string member_name = memberAccessNode->member();
+                
+                // Resolve the struct type and field index
+                llvm::Type *struct_type = nullptr;
+                std::string type_name;
+                int field_index = -1;
+                
+                // Use resolved type from TypeChecker (most reliable)
+                if (memberAccessNode->object() && memberAccessNode->object()->has_resolved_type())
+                {
+                    Cryo::Type *resolved_type = memberAccessNode->object()->get_resolved_type();
+                    if (resolved_type)
+                    {
+                        // For pointer types, get the pointed-to type
+                        Cryo::Type *effective_type = resolved_type;
+                        if (resolved_type->kind() == Cryo::TypeKind::Pointer)
+                        {
+                            Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
+                            effective_type = ptr_type->pointee_type().get();
+                        }
+                        
+                        if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class)
+                        {
+                            type_name = effective_type->name();
+                            struct_type = _type_mapper->map_type(effective_type);
+                            field_index = _type_mapper->get_field_index(type_name, member_name);
+                        }
+                    }
+                }
+                
+                if (!struct_type || field_index == -1)
+                {
+                    report_error("Could not resolve struct type or field for address-of member access: " + member_name, operand);
+                    return nullptr;
+                }
+                
+                // Handle pointer dereferencing if needed
+                llvm::Value *struct_ptr = object_ptr;
+                if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
+                {
+                    llvm::Type *allocated_type = alloca_inst->getAllocatedType();
+                    if (allocated_type->isPointerTy())
+                    {
+                        // Load the pointer from the alloca to get the actual struct pointer
+                        struct_ptr = create_load(object_ptr, allocated_type, "struct_ptr");
+                    }
+                }
+                
+                // Create GEP to get field pointer
+                llvm::Value *field_ptr = builder.CreateStructGEP(struct_type, struct_ptr, field_index, member_name + "_addr");
+                return field_ptr;
+            }
+            else if (auto arrayAccessNode = dynamic_cast<Cryo::ArrayAccessNode *>(operand))
+            {
+                printf("DEBUG: Address-of Array Access detected\n");
+                
+                // Handle &arr[index] - need to get the element pointer, not the value
+                // We need to manually generate the array access to get the pointer
+                
+                // For address-of operations, we need the alloca, not the loaded value
+                // So we can't use arrayAccessNode->array()->accept(*this) as it loads the value
+                
+                llvm::Value *array_alloca = nullptr;
+                std::string array_var_name;
+                
+                if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(arrayAccessNode->array()))
+                {
+                    array_var_name = identifier->name();
+                    array_alloca = _value_context->get_alloca(array_var_name);
+                    printf("DEBUG: Array variable name: %s, alloca: %p\n", array_var_name.c_str(), array_alloca);
+                }
+                
+                // Generate the index
+                arrayAccessNode->index()->accept(*this);
+                llvm::Value *index_val = get_generated_value(arrayAccessNode->index());
+                
+                if (!array_alloca || !index_val)
+                {
+                    printf("DEBUG: Failed to get array_alloca or index_val\n");
+                    report_error("Failed to generate array alloca or index for array access in address-of", operand);
+                    return nullptr;
+                }
+                
+                printf("DEBUG: Got alloca and index, checking variable types\n");
+                
+                // Determine element type - simplified approach for address-of
+                llvm::Type *element_type = nullptr;
+                
+                // Try to get element type from array variable type info
+                if (!array_var_name.empty())
+                {
+                    auto type_it = _variable_types.find(array_var_name);
+                    if (type_it != _variable_types.end() && type_it->second)
+                    {
+                        printf("DEBUG: Found variable type for %s\n", array_var_name.c_str());
+                        Cryo::Type *var_type = type_it->second;
+                        printf("DEBUG: Variable type string: %s, kind: %d\n", var_type->to_string().c_str(), (int)var_type->kind());
+                        
+                        // Check for both direct Array type and Array<T> template types
+                        std::string type_str = var_type->to_string();
+                        bool is_array_type = (var_type->kind() == TypeKind::Array) || 
+                                           (type_str.find("Array") == 0 && type_str.find("<") != std::string::npos);
+                        
+                        if (is_array_type)
+                        {
+                            printf("DEBUG: Variable type is Array\n");
+                            Cryo::Type *cryo_element_type = nullptr;
+                            
+                            // Handle different array type representations
+                            if (var_type->kind() == TypeKind::Array)
+                            {
+                                // Traditional ArrayType
+                                auto *array_type = static_cast<ArrayType *>(var_type);
+                                cryo_element_type = array_type->element_type().get();
+                            }
+                            else if (var_type->kind() == TypeKind::Class)
+                            {
+                                // Array<T> template - check if it's a ParameterizedClassType
+                                printf("DEBUG: Attempting to cast Class type to ParameterizedClassType\n");
+                                auto *parameterized_type = dynamic_cast<ParameterizedClassType *>(var_type);
+                                if (parameterized_type)
+                                {
+                                    printf("DEBUG: Successfully cast to ParameterizedClassType\n");
+                                    if (!parameterized_type->type_parameters().empty())
+                                    {
+                                        // Get the first type parameter (T in Array<T>)
+                                        cryo_element_type = parameterized_type->type_parameters()[0].get();
+                                        printf("DEBUG: Got element type from ParameterizedClassType: %s\n", 
+                                               cryo_element_type ? cryo_element_type->to_string().c_str() : "null");
+                                    }
+                                    else
+                                    {
+                                        printf("DEBUG: ParameterizedClassType has no type parameters\n");
+                                    }
+                                }
+                                else
+                                {
+                                    printf("DEBUG: Failed to cast to ParameterizedClassType, checking if it's a regular ParameterizedType\n");
+                                    auto *param_type = dynamic_cast<ParameterizedType *>(var_type);
+                                    if (param_type)
+                                    {
+                                        printf("DEBUG: Successfully cast to ParameterizedType\n");
+                                        if (!param_type->type_parameters().empty())
+                                        {
+                                            // Get the first type parameter (T in Array<T>)
+                                            cryo_element_type = param_type->type_parameters()[0].get();
+                                            printf("DEBUG: Got element type from ParameterizedType: %s\n", 
+                                                   cryo_element_type ? cryo_element_type->to_string().c_str() : "null");
+                                        }
+                                        else
+                                        {
+                                            printf("DEBUG: ParameterizedType has no type parameters\n");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        printf("DEBUG: Failed to cast to any parameterized type\n");
+                                        // Fallback: parse type string manually to extract element type
+                                        std::string type_str = var_type->to_string();
+                                        printf("DEBUG: Parsing type string manually: %s\n", type_str.c_str());
+                                        
+                                        // Parse "Array < int >" to extract "int"
+                                        size_t start = type_str.find('<');
+                                        size_t end = type_str.find('>', start);
+                                        if (start != std::string::npos && end != std::string::npos && start < end)
+                                        {
+                                            std::string element_type_name = type_str.substr(start + 1, end - start - 1);
+                                            // Trim whitespace
+                                            element_type_name.erase(0, element_type_name.find_first_not_of(" \t"));
+                                            element_type_name.erase(element_type_name.find_last_not_of(" \t") + 1);
+                                            printf("DEBUG: Extracted element type name: '%s'\n", element_type_name.c_str());
+                                            
+                                            // Look up the type by name - remove primitive type call
+                                            // For now, hard-code common types
+                                            if (element_type_name == "int")
+                                            {
+                                                cryo_element_type = _symbol_table.get_type_context()->get_int_type();
+                                            }
+                                            else if (element_type_name == "float")
+                                            {
+                                                cryo_element_type = _symbol_table.get_type_context()->get_default_float_type();
+                                            }
+                                            else if (element_type_name == "bool")
+                                            {
+                                                cryo_element_type = _symbol_table.get_type_context()->get_boolean_type();
+                                            }
+                                            else if (element_type_name == "string")
+                                            {
+                                                cryo_element_type = _symbol_table.get_type_context()->get_string_type();
+                                            }
+                                            else
+                                            {
+                                                printf("DEBUG: Unknown element type: %s\n", element_type_name.c_str());
+                                            }
+                                            if (cryo_element_type)
+                                            {
+                                                printf("DEBUG: Successfully found element type: %s\n", cryo_element_type->to_string().c_str());
+                                            }
+                                            else
+                                            {
+                                                printf("DEBUG: Failed to find element type for: %s\n", element_type_name.c_str());
+                                            }
+                                        }
+                                        else
+                                        {
+                                            printf("DEBUG: Failed to parse type string for element type\n");
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if (cryo_element_type)
+                            {
+                                element_type = _type_mapper->map_type(cryo_element_type);
+                                printf("DEBUG: Got element type\n");
+                                
+                                // Special handling for Array<T> - need to access elements field first
+                                if (array_alloca && array_alloca->getType()->isPointerTy())
+                                {
+                                    printf("DEBUG: Array alloca is pointer type, performing Array<T> special handling\n");
+                                    
+                                    // Cast to AllocaInst to get the allocated type
+                                    auto* alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(array_alloca);
+                                    if (!alloca_inst) {
+                                        printf("DEBUG: Array value is not an AllocaInst\n");
+                                        return nullptr;
+                                    }
+                                    
+                                    // Get the actual LLVM struct type from the alloca
+                                    llvm::Type* alloca_struct_type = alloca_inst->getAllocatedType();
+                                    if (!alloca_struct_type || !alloca_struct_type->isStructTy()) {
+                                        printf("DEBUG: Array alloca does not point to a struct type\n");
+                                        return nullptr;
+                                    }
+                                    
+                                    // For Array<T> types, we need to use the monomorphized type name
+                                    // Convert "Array < int >" to "Array_int"
+                                    std::string var_type_str = var_type->to_string();
+                                    std::string monomorphized_name = "Array";
+                                    
+                                    // Extract element type and create monomorphized name
+                                    size_t start = var_type_str.find('<');
+                                    size_t end = var_type_str.find('>', start);
+                                    if (start != std::string::npos && end != std::string::npos && start < end)
+                                    {
+                                        std::string element_type_name = var_type_str.substr(start + 1, end - start - 1);
+                                        // Trim whitespace
+                                        element_type_name.erase(0, element_type_name.find_first_not_of(" \t"));
+                                        element_type_name.erase(element_type_name.find_last_not_of(" \t") + 1);
+                                        monomorphized_name += "_" + element_type_name;
+                                    }
+                                    
+                                    printf("DEBUG: Using monomorphized type name: %s\n", monomorphized_name.c_str());
+                                    
+                                    // Get the struct type by the monomorphized name
+                                    llvm::Type* array_struct_type = _type_mapper->get_struct_type(monomorphized_name);
+                                    if (!array_struct_type) {
+                                        printf("DEBUG: Failed to get monomorphized struct type: %s\n", monomorphized_name.c_str());
+                                        return nullptr;
+                                    }
+                                    
+                                    printf("DEBUG: Creating GEP for elements field with correct struct type\n");
+                                    
+                                    // Access the 'elements' field (index 0)
+                                    llvm::Value *elements_field_ptr = builder.CreateStructGEP(
+                                        array_struct_type,
+                                        array_alloca,
+                                        0, // elements field
+                                        array_var_name + ".elements.ptr");
+
+                                    // Load the elements pointer
+                                    llvm::Type *elements_ptr_type = llvm::PointerType::get(_context_manager.get_context(), 0);
+                                    llvm::Value *elements_ptr = builder.CreateLoad(
+                                        elements_ptr_type,
+                                        elements_field_ptr,
+                                        array_var_name + ".elements.load");
+
+                                    // Create GEP to get element pointer
+                                    llvm::Value *element_ptr = builder.CreateInBoundsGEP(
+                                        element_type,
+                                        elements_ptr,
+                                        index_val,
+                                        "array_element_addr");
+                                    printf("DEBUG: Created element pointer successfully\n");
+                                    return element_ptr;
+                                }
+                                else
+                                {
+                                    printf("DEBUG: Array alloca is not pointer type or alloca is null\n");
+                                }
+                            }
+                            else
+                            {
+                                printf("DEBUG: Failed to get element type from array\n");
+                            }
+                        }
+                        else
+                        {
+                            printf("DEBUG: Variable type is not Array, kind: %d\n", (int)var_type->kind());
+                        }
+                    }
+                    else
+                    {
+                        printf("DEBUG: Variable type not found for %s\n", array_var_name.c_str());
+                    }
+                }
+                
+                // If Array<T> special handling failed, use traditional approach
+                llvm::Value *array_ptr = nullptr;
+                if (!array_alloca)
+                {
+                    // Fallback: generate the array in the traditional way
+                    arrayAccessNode->array()->accept(*this);
+                    array_ptr = get_generated_value(arrayAccessNode->array());
+                }
+                else
+                {
+                    // Load the Array<T> value for the traditional path
+                    auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(array_alloca);
+                    if (alloca_inst)
+                    {
+                        array_ptr = builder.CreateLoad(
+                            alloca_inst->getAllocatedType(),
+                            array_alloca,
+                            array_var_name + ".load");
+                    }
+                    else
+                    {
+                        // If it's not an alloca, just use it directly
+                        array_ptr = array_alloca;
+                    }
+                }
+                
+                // Fallback to int32 if we can't determine the type
+                if (!element_type)
+                {
+                    element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
+                }
+                
+                printf("DEBUG: Fallback code - creating GEP with array_ptr (type: %s)\n", array_ptr ? "valid" : "null");
+                
+                // Create GEP to get element pointer (non-Array<T> case)
+                llvm::Value *element_ptr = builder.CreateInBoundsGEP(
+                    element_type,
+                    array_ptr,
+                    index_val,
+                    "array_element_addr");
+                return element_ptr;
             }
             else
             {
