@@ -2878,9 +2878,44 @@ namespace Cryo
                 // This is a function type - extract return type
                 FunctionType *func_type = static_cast<FunctionType *>(callee_type);
 
-                // Check function call compatibility
+                // Check function call compatibility and promote integer literals if needed
                 if (check_function_call_compatibility(func_type, arg_types, node.location()))
                 {
+                    // Promote integer literals to match parameter types
+                    const auto &param_types = func_type->parameter_types();
+                    size_t fixed_params = func_type->is_variadic() ? param_types.size() - 1 : param_types.size();
+                    
+                    for (size_t i = 0; i < fixed_params && i < node.arguments().size(); ++i)
+                    {
+                        auto &arg = node.arguments()[i];
+                        if (arg && arg->kind() == NodeKind::Literal)
+                        {
+                            LiteralNode *literal = static_cast<LiteralNode *>(arg.get());
+                            Type *arg_type = arg->get_resolved_type();
+                            Type *param_type = param_types[i].get();
+                            
+                            // Check if this is an integer literal (represented as 'int' type) that should be promoted
+                            if (arg_type && param_type && 
+                                arg_type->name() == "int" && 
+                                param_type->kind() == TypeKind::Integer &&
+                                literal->literal_kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                            {
+                                // Check if the literal value doesn't have a type suffix
+                                const std::string &value = literal->value();
+                                if (!value.ends_with("u8") && !value.ends_with("u16") && !value.ends_with("u32") && 
+                                    !value.ends_with("u64") && !value.ends_with("i8") && !value.ends_with("i16") && 
+                                    !value.ends_with("i32") && !value.ends_with("i64") && !value.ends_with("f32") && 
+                                    !value.ends_with("f64") && !value.ends_with("usize") && !value.ends_with("isize"))
+                                {
+                                    // Promote the literal to the parameter type
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Promoting integer literal from 'int' to '{}' for parameter {}", 
+                                             param_type->to_string(), i + 1);
+                                    literal->set_resolved_type(param_type);
+                                }
+                            }
+                        }
+                    }
+                    
                     Type *return_type = func_type->return_type().get();
                     if (return_type)
                     {
@@ -4683,6 +4718,28 @@ namespace Cryo
                   lhs_str, rhs_str,
                   std::to_string(static_cast<int>(lhs_type->kind())),
                   std::to_string(static_cast<int>(rhs_type->kind())));
+
+        // SPECIAL CASE: Integer literal promotion to larger integer types
+        // Allow integer literals (represented as 'int' type) to promote to larger integer types
+        if (lhs_type->is_integral() && rhs_type->is_integral())
+        {
+            auto lhs_int = static_cast<IntegerType *>(lhs_type);
+            auto rhs_int = static_cast<IntegerType *>(rhs_type);
+            
+            // Check if RHS is the default 'int' type (likely from a literal)
+            // and LHS is a larger integer type - allow safe promotion
+            if (rhs_str == "int" && lhs_int->size_bytes() >= rhs_int->size_bytes())
+            {
+                // Additional check: ensure we're not going from signed to unsigned
+                // unless the target type is larger
+                if (rhs_int->is_signed() == lhs_int->is_signed() || 
+                    lhs_int->size_bytes() > rhs_int->size_bytes())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", rhs_str, lhs_str);
+                    return true;
+                }
+            }
+        }
 
         // Check if both are pointer types of the same base type (HeapBlock* = HeapBlock*)
         if (lhs_str.find("*") != std::string::npos && rhs_str.find("*") != std::string::npos)
