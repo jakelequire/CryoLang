@@ -159,6 +159,7 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> parse_bitwise_xor();
         std::unique_ptr<ExpressionNode> parse_bitwise_and();
         std::unique_ptr<ExpressionNode> parse_relational();
+        std::unique_ptr<ExpressionNode> parse_shift();
         std::unique_ptr<ExpressionNode> parse_additive();
         std::unique_ptr<ExpressionNode> parse_multiplicative();
         std::unique_ptr<ExpressionNode> parse_unary();
