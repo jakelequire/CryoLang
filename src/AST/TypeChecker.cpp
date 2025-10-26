@@ -1775,6 +1775,8 @@ namespace Cryo
     void TypeChecker::visit(FunctionDeclarationNode &node)
     {
         const std::string &func_name = node.name();
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(FunctionDeclarationNode) - Processing function '{}' in struct context '{}'", 
+                 func_name, _current_struct_name);
 
         // Handle generic functions - enter generic context if needed
         bool is_generic_function = !node.generic_parameters().empty();
@@ -1893,19 +1895,52 @@ namespace Cryo
             // Function doesn't exist yet, declare it
             if (!declare_function(func_name, func_type, node.location(), &node))
             {
-                // Check if this is a false positive - look up the existing symbol to see what it actually is
-                TypedSymbol* existing_symbol = _symbol_table->lookup_symbol(func_name);
-                if (existing_symbol && existing_symbol->type) {
-                    // If the existing symbol is not a function type, this is a false positive
-                    // Don't report function redefinition errors for variables, etc.
-                    if (existing_symbol->type->kind() != TypeKind::Function) {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing false positive function redefinition error for variable '{}'", func_name);
+                // Check if this is a class/struct method that was already registered during signature registration
+                bool is_method_already_registered = false;
+                LOG_DEBUG(Cryo::LogComponent::AST, "declare_function failed for '{}', current_struct_name='{}', checking method registries...", 
+                         func_name, _current_struct_name);
+                if (!_current_struct_name.empty())
+                {
+                    // Check if this method was already registered in the method registries
+                    auto public_methods_it = _struct_methods.find(_current_struct_name);
+                    auto private_methods_it = _private_struct_methods.find(_current_struct_name);
+                    
+                    bool found_in_public = (public_methods_it != _struct_methods.end() && 
+                                          public_methods_it->second.find(func_name) != public_methods_it->second.end());
+                    bool found_in_private = (private_methods_it != _private_struct_methods.end() && 
+                                           private_methods_it->second.find(func_name) != private_methods_it->second.end());
+                    
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Method lookup for '{}': found_in_public={}, found_in_private={}", 
+                             func_name, found_in_public, found_in_private);
+                    
+                    if (found_in_public || found_in_private)
+                    {
+                        is_method_already_registered = true;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing redefinition error for method '{}' in '{}' - already registered during signature phase", 
+                                 func_name, _current_struct_name);
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Not in struct context, current_struct_name is empty for function '{}'", func_name);
+                }
+                
+                if (!is_method_already_registered)
+                {
+                    // Check if this is a false positive - look up the existing symbol to see what it actually is
+                    TypedSymbol* existing_symbol = _symbol_table->lookup_symbol(func_name);
+                    if (existing_symbol && existing_symbol->type) {
+                        // If the existing symbol is not a function type, this is a false positive
+                        // Don't report function redefinition errors for variables, etc.
+                        if (existing_symbol->type->kind() != TypeKind::Function) {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing false positive function redefinition error for variable '{}'", func_name);
+                        } else {
+                            _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                        }
                     } else {
+                        // If we can't determine the existing symbol type, report the error as usual
                         _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
                     }
-                } else {
-                    // If we can't determine the existing symbol type, report the error as usual
-                    _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
                 }
             }
         }
@@ -4420,8 +4455,37 @@ namespace Cryo
         // Check for redefinition within the same struct/class (but allow constructors)
         if (!is_constructor && _symbol_table->lookup_symbol(method_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, node.location());
-            return;
+            // Check if this method was already registered during signature registration
+            bool is_method_already_registered = false;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found existing symbol '{}', current_struct_name='{}', checking method registries...", 
+                     method_name, _current_struct_name);
+            if (!_current_struct_name.empty())
+            {
+                // Check if this method was already registered in the method registries
+                auto public_methods_it = _struct_methods.find(_current_struct_name);
+                auto private_methods_it = _private_struct_methods.find(_current_struct_name);
+                
+                bool found_in_public = (public_methods_it != _struct_methods.end() && 
+                                      public_methods_it->second.find(method_name) != public_methods_it->second.end());
+                bool found_in_private = (private_methods_it != _private_struct_methods.end() && 
+                                       private_methods_it->second.find(method_name) != private_methods_it->second.end());
+                
+                LOG_DEBUG(Cryo::LogComponent::AST, "StructMethod lookup for '{}': found_in_public={}, found_in_private={}", 
+                         method_name, found_in_public, found_in_private);
+                
+                if (found_in_public || found_in_private)
+                {
+                    is_method_already_registered = true;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing redefinition error for struct method '{}' in '{}' - already registered during signature phase", 
+                             method_name, _current_struct_name);
+                }
+            }
+            
+            if (!is_method_already_registered)
+            {
+                _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, node.location());
+                return;
+            }
         }
 
         // Special handling for constructors to avoid name conflicts with struct/class type
@@ -5524,6 +5588,9 @@ namespace Cryo
         // Extract method information
         std::string method_name = node.name();
         bool is_constructor = node.is_constructor();
+        
+        LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: method_name='{}', struct='{}', is_constructor={}", 
+                  method_name, _current_struct_name, is_constructor);
 
         // Get return type or use struct name for constructors
         Type *return_type = node.get_resolved_return_type();
@@ -5594,12 +5661,32 @@ namespace Cryo
 
         if (node.visibility() == Visibility::Private)
         {
+            // Check if method already exists
+            auto struct_it = _private_struct_methods.find(_current_struct_name);
+            if (struct_it != _private_struct_methods.end()) {
+                auto method_it = struct_it->second.find(method_name);
+                if (method_it != struct_it->second.end()) {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Private method '{}' already exists for struct '{}' - DUPLICATE REGISTRATION", 
+                              method_name, _current_struct_name);
+                }
+            }
+            
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
             _private_struct_methods[_current_struct_name][method_name] = func_type;
         }
         else
         {
+            // Check if method already exists
+            auto struct_it = _struct_methods.find(_current_struct_name);
+            if (struct_it != _struct_methods.end()) {
+                auto method_it = struct_it->second.find(method_name);
+                if (method_it != struct_it->second.end()) {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Public method '{}' already exists for struct '{}' - DUPLICATE REGISTRATION", 
+                              method_name, _current_struct_name);
+                }
+            }
+            
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
             _struct_methods[_current_struct_name][method_name] = func_type;
