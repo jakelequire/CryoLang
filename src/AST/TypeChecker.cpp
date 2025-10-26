@@ -1893,7 +1893,20 @@ namespace Cryo
             // Function doesn't exist yet, declare it
             if (!declare_function(func_name, func_type, node.location(), &node))
             {
-                _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                // Check if this is a false positive - look up the existing symbol to see what it actually is
+                TypedSymbol* existing_symbol = _symbol_table->lookup_symbol(func_name);
+                if (existing_symbol && existing_symbol->type) {
+                    // If the existing symbol is not a function type, this is a false positive
+                    // Don't report function redefinition errors for variables, etc.
+                    if (existing_symbol->type->kind() != TypeKind::Function) {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing false positive function redefinition error for variable '{}'", func_name);
+                    } else {
+                        _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                    }
+                } else {
+                    // If we can't determine the existing symbol type, report the error as usual
+                    _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                }
             }
         }
 
