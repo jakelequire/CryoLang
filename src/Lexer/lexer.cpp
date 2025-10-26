@@ -735,7 +735,7 @@ namespace Cryo
     {
         const char *start = _current - 1;
 
-        if (*(_current - 1) == '/' && peek() == '/')
+        if (*(_current - 1) == '/' && *_current == '/')
         {
             // Line comment
             advance(); // consume second '/'
@@ -744,7 +744,7 @@ namespace Cryo
                 advance();
             }
         }
-        else if (*(_current - 1) == '/' && peek() == '*')
+        else if (*(_current - 1) == '/' && *_current == '*')
         {
             // Block comment
             advance(); // consume '*'
