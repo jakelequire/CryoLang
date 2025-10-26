@@ -241,7 +241,7 @@ public:
         Intrinsics::__printf__("[DEBUG::RUNTIME] {HeapManager::constructor} Initializing HeapManager\n");
         this.heap_base = null;
         this.heap_size = u64(64);
-        this.free_list = new FreeListManager();
+        this.free_list = FreeListManager();
         this.is_initialized = false;
     }
 
@@ -531,11 +531,19 @@ public:
 
     StatisticsManager() {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::StatisticsManager} Initializing StatisticsManager\n");
+        this.initialize_fields();
+        
+        // Debug: verify initialization
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::StatisticsManager} After init: total_allocations=%llu\n", this.total_allocations);
+    }
+
+    // Explicit field initialization method
+    initialize_fields() -> void {
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::initialize_fields} Explicitly initializing all fields\n");
         this.total_allocations = u64(0);
         this.total_deallocations = u64(0);
         this.bytes_allocated = u64(0);
         this.peak_allocation = u64(0);
-        // New fields
         this.current_allocations = u64(0);
         this.failed_allocations = u64(0);
         this.fragmentation_ratio = 0.0;
@@ -544,14 +552,20 @@ public:
         this.medium_allocs = u64(0);
         this.large_allocs = u64(0);
         this.heap_size = u64(0);
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::initialize_fields} Fields initialized: total_allocations=%llu\n", this.total_allocations);
     }
 
     // Record allocation
     record_allocation(size: u64) -> void {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_allocation} Recording allocation: size=%llu bytes\n", size);
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_allocation} Before increment: total_allocations=%llu\n", this.total_allocations);
         this.total_allocations = this.total_allocations + u64(1);
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_allocation} After increment: total_allocations=%llu\n", this.total_allocations);
         this.current_allocations = this.current_allocations + u64(1);
+        
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_allocation} Before: bytes_allocated=%llu\n", this.bytes_allocated);
         this.bytes_allocated = this.bytes_allocated + size;
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_allocation} After: bytes_allocated=%llu\n", this.bytes_allocated);
         
         // Update allocation size histogram
         this.update_allocation_histogram(size);
@@ -567,7 +581,11 @@ public:
     record_deallocation(size: u64) -> void {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_deallocation} Recording deallocation: size=%llu bytes\n", size);
         this.total_deallocations = this.total_deallocations + u64(1);
+        
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_deallocation} Before: bytes_allocated=%llu\n", this.bytes_allocated);
         this.bytes_allocated = this.bytes_allocated - size;
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {StatisticsManager::record_deallocation} After: bytes_allocated=%llu\n", this.bytes_allocated);
+        
         this.current_allocations = this.current_allocations - u64(1);
         return;
     }
@@ -724,9 +742,26 @@ public:
     RuntimeManager() {
         Intrinsics::__printf__("[DEBUG::RUNTIME] {RuntimeManager::RuntimeManager} Initializing RuntimeManager\n");
         this.state = RuntimeState::UNINITIALIZED;
-        this.heap = new HeapManager();
-        this.stats = new StatisticsManager();
-        this.error = new ErrorManager();
+        
+        // Initialize managers directly
+        this.heap = HeapManager();
+        this.stats = StatisticsManager();
+        this.error = ErrorManager();
+    }
+
+    // Reset runtime to uninitialized state
+    reset() -> void {
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {RuntimeManager::reset} Resetting RuntimeManager\n");
+        this.state = RuntimeState::UNINITIALIZED;
+        
+        // Reset managers
+        this.heap = HeapManager();
+        this.stats = StatisticsManager();
+        this.error = ErrorManager();
+        
+        // Explicitly reinitialize statistics to ensure clean state
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {RuntimeManager::reset} Explicitly reinitializing statistics\n");
+        this.stats.initialize_fields();
     }
 
     // Initialize runtime system
@@ -758,13 +793,31 @@ public:
 
     // Allocate memory
     allocate(size: u64) -> void* {
+        Intrinsics::__printf__("[DEBUG::RUNTIME] {RuntimeManager::allocate} METHOD CALLED - size=%llu\n", size);
         const ptr: void* = this.heap.allocate(size);
         if (ptr != null) {
-            this.stats.record_allocation(size);
+            // Calculate aligned size to match what the heap actually allocated
+            // This replicates the heap's alignment logic for consistent tracking
+            const aligned_size: u64 = this.align_size_for_tracking(size);
+            Intrinsics::__printf__("[DEBUG::RUNTIME] {RuntimeManager::allocate} Original size=%llu, aligned size=%llu\n", size, aligned_size);
+            this.stats.record_allocation(aligned_size);
         } else {
             this.stats.record_failed_allocation(size);
         }
         return ptr;
+    }
+
+    // Helper method to align size for consistent tracking
+    // This should match the heap's alignment logic
+    align_size_for_tracking(size: u64) -> u64 {
+        const alignment: u64 = u64(16); // BLOCK_ALIGNMENT = 16
+        if (alignment == 0) {
+            return size;
+        }
+        const size_plus_align: u64 = size + alignment;
+        const size_plus_align_minus_1: u64 = size_plus_align - u64(1);
+        const neg_alignment: u64 = u64(0) - alignment;
+        return size_plus_align_minus_1 & neg_alignment;
     }
 
     // Free memory
@@ -842,7 +895,9 @@ function cryo_assert(condition: boolean, message: string) -> void {
 
 function cryo_alloc(size: u64) -> void* {
     Intrinsics::__printf__("[DEBUG::RUNTIME] {cryo_alloc} Allocating memory: size=%llu bytes\n", size);
+    Intrinsics::__printf__("[DEBUG::RUNTIME] {cryo_alloc} About to call g_runtime_manager.allocate()\n");
     const ptr: void* = g_runtime_manager.allocate(size);
+    Intrinsics::__printf__("[DEBUG::RUNTIME] {cryo_alloc} Returned from g_runtime_manager.allocate(): ptr=%p\n", ptr);
     return ptr;
 }
 
@@ -882,8 +937,10 @@ function cryo_panic(message: string, file: string, line: i32) -> void {
 extern function _user_main_() -> int;
 
 function main() -> int {
-    Intrinsics::__printf__("[DEBUG::RUNTIME] {main} Starting CryoLang Runtime System\n");
-    g_runtime_manager = new RuntimeManager();
+    Intrinsics::__printf__("[DEBUG::RUNTIME] {main} Starting runtime initialization...\n");
+
+    // Reset global runtime manager to ensure clean state
+    g_runtime_manager.reset();
 
     // Initialize runtime
     const init_result: RuntimeError = g_runtime_manager.initialize();
