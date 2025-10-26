@@ -2050,9 +2050,30 @@ namespace Cryo::Codegen
             }
             else
             {
-                // Integer literal
+                // Integer literal - check if it has a resolved type from TypeChecker
                 int64_t int_val = std::stoll(value_str);
-                literal_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
+                
+                if (node.has_resolved_type())
+                {
+                    // Use the resolved type from TypeChecker (e.g., promoted to u64)
+                    Type *resolved_type = node.get_resolved_type();
+                    llvm::Type *llvm_type = _type_mapper->map_type(resolved_type);
+                    
+                    if (llvm_type && llvm_type->isIntegerTy())
+                    {
+                        literal_value = llvm::ConstantInt::get(llvm_type, int_val);
+                    }
+                    else
+                    {
+                        // Fallback to default i32 if type mapping fails
+                        literal_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
+                    }
+                }
+                else
+                {
+                    // Default behavior - generate as i32
+                    literal_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
+                }
             }
             break;
         }
@@ -3834,6 +3855,32 @@ namespace Cryo::Codegen
                     result += '\v';
                     break;
                 default:
+                    // Check for octal escape sequences (\000 to \377)
+                    if (next >= '0' && next <= '7' && i + 2 < str.length())
+                    {
+                        // Try to parse up to 3 octal digits
+                        std::string octal_str;
+                        size_t octal_start = i + 1;
+                        size_t octal_end = std::min(octal_start + 3, str.length());
+                        
+                        for (size_t j = octal_start; j < octal_end && str[j] >= '0' && str[j] <= '7'; ++j)
+                        {
+                            octal_str += str[j];
+                        }
+                        
+                        if (!octal_str.empty())
+                        {
+                            // Convert octal string to integer
+                            int octal_value = std::stoi(octal_str, nullptr, 8);
+                            if (octal_value >= 0 && octal_value <= 255)
+                            {
+                                result += static_cast<char>(octal_value);
+                                i += octal_str.length() - 1; // Skip the octal digits (minus 1 because we'll increment i later)
+                                break;
+                            }
+                        }
+                    }
+                    
                     // If unknown escape sequence, just include the character as-is
                     result += next;
                     break;
