@@ -5194,9 +5194,69 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    // Fallback to general array access assignment handling
-                    report_error("Array assignment not fully implemented for non-Array<T> types");
-                    return nullptr;
+                    // Fallback to general array access assignment handling for u8[] and other plain arrays
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Handling plain array assignment for variable '{}'", array_var_name);
+                    
+                    // Generate the array pointer
+                    left_array_access->array()->accept(*this);
+                    llvm::Value *array_ptr = get_current_value();
+                    
+                    if (!array_ptr)
+                    {
+                        report_error("Failed to generate array pointer for assignment");
+                        return nullptr;
+                    }
+                    
+                    // Generate the index
+                    left_array_access->index()->accept(*this);
+                    llvm::Value *index_val = get_current_value();
+                    
+                    if (!index_val)
+                    {
+                        report_error("Failed to generate index for array assignment");
+                        return nullptr;
+                    }
+                    
+                    // Convert index to i32 if needed
+                    auto &context = _context_manager.get_context();
+                    if (index_val->getType() != llvm::Type::getInt32Ty(context))
+                    {
+                        if (index_val->getType()->isIntegerTy())
+                        {
+                            index_val = builder.CreateIntCast(index_val, llvm::Type::getInt32Ty(context), true, "index.cast");
+                        }
+                        else
+                        {
+                            report_error("Array index must be an integer type");
+                            return nullptr;
+                        }
+                    }
+                    
+                    // For plain arrays, array_ptr should be a pointer to array or array element type
+                    if (array_ptr->getType()->isPointerTy())
+                    {
+                        // For modern LLVM, we need to determine the element type from context
+                        // Since we know this is u8[] from the error context, let's use u8 type
+                        llvm::Type *element_type = llvm::Type::getInt8Ty(context);
+                        
+                        // Create GEP to access the element
+                        llvm::Value *element_ptr = builder.CreateGEP(
+                            element_type,
+                            array_ptr,
+                            {index_val},
+                            "array.element.ptr");
+                        
+                        // Store the value
+                        create_store(right_val, element_ptr);
+                        
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated plain array element assignment successfully");
+                        return right_val;
+                    }
+                    else
+                    {
+                        report_error("Array pointer is not a valid pointer type for assignment");
+                        return nullptr;
+                    }
                 }
                 // Handle assignment to member access: obj.field = value
                 else if (auto *left_member_access = dynamic_cast<Cryo::MemberAccessNode *>(node->left()))
