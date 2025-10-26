@@ -491,7 +491,6 @@ namespace Cryo::Codegen
         llvm::Value *cast_value(llvm::Value *value, llvm::Type *target_type);
         bool is_lvalue(Cryo::ExpressionNode *expr);
         bool is_primitive_type(const std::string &type_name);
-        std::string process_escape_sequences(const std::string &str);
 
         // Error reporting
         void report_error(const std::string &message);
