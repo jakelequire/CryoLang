@@ -4790,17 +4790,18 @@ namespace Cryo
         // Special case: &T[] (reference to array) can be assigned to T* (pointer to element type)
         if (lhs_type->kind() == TypeKind::Pointer && rhs_type->kind() == TypeKind::Reference)
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Checking array-to-pointer conversion: {} = {}", lhs_str, rhs_str);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Checking reference-to-pointer conversion: {} = {}", lhs_str, rhs_str);
             auto lhs_ptr = static_cast<PointerType *>(lhs_type);
             auto rhs_ref = static_cast<ReferenceType *>(rhs_type);
             
-            // Check if RHS is a reference to an array type
             auto referenced_type = rhs_ref->referent_type();
+            auto pointer_pointee = lhs_ptr->pointee_type();
+            
+            // Check if RHS is a reference to an array type (special case for array-to-pointer)
             if (referenced_type && referenced_type->kind() == TypeKind::Array)
             {
                 auto array_type = static_cast<ArrayType *>(referenced_type.get());
                 auto element_type = array_type->element_type();
-                auto pointer_pointee = lhs_ptr->pointee_type();
                 
                 // Check if the pointer's pointee type matches the array's element type
                 if (element_type && pointer_pointee && 
@@ -4810,6 +4811,14 @@ namespace Cryo
                              element_type->to_string(), pointer_pointee->to_string());
                     return true;
                 }
+            }
+            // Check if RHS is a reference to the same type as the pointer points to (general case)
+            else if (referenced_type && pointer_pointee && 
+                     referenced_type->to_string() == pointer_pointee->to_string())
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing reference-to-pointer conversion: &{} = {}*", 
+                         referenced_type->to_string(), pointer_pointee->to_string());
+                return true;
             }
         }
 

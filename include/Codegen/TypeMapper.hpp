@@ -265,6 +265,13 @@ namespace Cryo::Codegen
         bool has_type(const std::string &name);
 
         /**
+         * @brief Get struct type by name from cache
+         * @param name Struct type name
+         * @return LLVM struct type or nullptr if not found
+         */
+        llvm::Type *get_struct_type(const std::string &name);
+
+        /**
          * @brief Clear type cache
          */
         void clear_cache();
