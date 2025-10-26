@@ -1804,6 +1804,32 @@ namespace Cryo::Codegen
                     return;
                 }
 
+                // Check if we need to perform implicit conversion for return type
+                if (_current_function && _current_function->ast_node)
+                {
+                    Cryo::Type *expected_return_type = _current_function->ast_node->get_resolved_return_type();
+                    if (expected_return_type)
+                    {
+                        llvm::Type *expected_llvm_type = _type_mapper->map_type(expected_return_type);
+                        llvm::Type *actual_type = return_value->getType();
+                        
+                        // Check if we need implicit float conversion (float to double)
+                        if (expected_llvm_type && actual_type != expected_llvm_type)
+                        {
+                            if (actual_type->isFloatTy() && expected_llvm_type->isDoubleTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Performing implicit float to double conversion for return value");
+                                return_value = builder.CreateFPExt(return_value, expected_llvm_type);
+                            }
+                            else if (actual_type->isDoubleTy() && expected_llvm_type->isFloatTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Performing implicit double to float conversion for return value");
+                                return_value = builder.CreateFPTrunc(return_value, expected_llvm_type);
+                            }
+                        }
+                    }
+                }
+
                 if (_current_function && _current_function->return_value_alloca)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using structured return pattern");
