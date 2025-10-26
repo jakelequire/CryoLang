@@ -7,6 +7,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <optional>
+#include <vector>
 #include "Utils/File.hpp"
 
 namespace Cryo
@@ -140,6 +141,9 @@ namespace Cryo
         DiagnosticManager* _diagnostic_manager;
         std::string _source_file;
 
+        // String pool for processed string literals
+        std::vector<std::string> _string_pool;
+
         // Static keyword lookup table
         static const std::unordered_map<std::string_view, TokenKind> _keywords;
 
@@ -199,6 +203,10 @@ namespace Cryo
         
         // Enhanced error reporting
         void report_lexer_error(const std::string& message, const SourceLocation& location);
+
+        // String processing helpers
+        std::string process_escape_sequences(const std::string& raw_string);
+        std::string_view store_processed_string(std::string processed_string);
 
         // Character classification
         static bool is_alpha(char c);

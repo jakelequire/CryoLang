@@ -2164,15 +2164,7 @@ namespace Cryo::Codegen
         {
             std::string str_val = node.value();
 
-            // Remove surrounding quotes if they exist
-            if (str_val.length() >= 2 && str_val.front() == '"' && str_val.back() == '"')
-            {
-                str_val = str_val.substr(1, str_val.length() - 2);
-            }
-
-            // Process escape sequences
-            str_val = process_escape_sequences(str_val);
-
+            // The string value is already processed by the lexer, so we can use it directly
             literal_value = _context_manager.get_builder().CreateGlobalStringPtr(str_val);
             break;
         }
@@ -3878,93 +3870,6 @@ namespace Cryo::Codegen
     //===================================================================
     // Error Handling
     //===================================================================
-
-    std::string CodegenVisitor::process_escape_sequences(const std::string &str)
-    {
-        std::string result;
-        result.reserve(str.length());
-
-        for (size_t i = 0; i < str.length(); ++i)
-        {
-            if (str[i] == '\\' && i + 1 < str.length())
-            {
-                char next = str[i + 1];
-                switch (next)
-                {
-                case 'n':
-                    result += '\n';
-                    break;
-                case 't':
-                    result += '\t';
-                    break;
-                case 'r':
-                    result += '\r';
-                    break;
-                case '\\':
-                    result += '\\';
-                    break;
-                case '\'':
-                    result += '\'';
-                    break;
-                case '\"':
-                    result += '\"';
-                    break;
-                case '0':
-                    result += '\0';
-                    break;
-                case 'a':
-                    result += '\a';
-                    break;
-                case 'b':
-                    result += '\b';
-                    break;
-                case 'f':
-                    result += '\f';
-                    break;
-                case 'v':
-                    result += '\v';
-                    break;
-                default:
-                    // Check for octal escape sequences (\000 to \377)
-                    if (next >= '0' && next <= '7' && i + 2 < str.length())
-                    {
-                        // Try to parse up to 3 octal digits
-                        std::string octal_str;
-                        size_t octal_start = i + 1;
-                        size_t octal_end = std::min(octal_start + 3, str.length());
-                        
-                        for (size_t j = octal_start; j < octal_end && str[j] >= '0' && str[j] <= '7'; ++j)
-                        {
-                            octal_str += str[j];
-                        }
-                        
-                        if (!octal_str.empty())
-                        {
-                            // Convert octal string to integer
-                            int octal_value = std::stoi(octal_str, nullptr, 8);
-                            if (octal_value >= 0 && octal_value <= 255)
-                            {
-                                result += static_cast<char>(octal_value);
-                                i += octal_str.length() - 1; // Skip the octal digits (minus 1 because we'll increment i later)
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // If unknown escape sequence, just include the character as-is
-                    result += next;
-                    break;
-                }
-                ++i; // Skip the next character since we processed it
-            }
-            else
-            {
-                result += str[i];
-            }
-        }
-
-        return result;
-    }
 
     void CodegenVisitor::clear_errors()
     {

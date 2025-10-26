@@ -684,10 +684,18 @@ namespace Cryo
 
         advance(); // consume closing quote
 
-        std::string_view text(start, _current - start);
-        return Token(TokenKind::TK_STRING_LITERAL, text,
+        // Extract the string content without quotes
+        std::string_view raw_text(start + 1, _current - start - 2);
+        
+        // Process escape sequences during lexical analysis
+        std::string processed_content = process_escape_sequences(std::string(raw_text));
+        
+        // Store the processed string in the string pool and get a string_view to it
+        std::string_view processed_text = store_processed_string(std::move(processed_content));
+
+        return Token(TokenKind::TK_STRING_LITERAL, processed_text,
                      SourceLocation(_current_location.line(),
-                                    _current_location.column() - text.length()));
+                                    _current_location.column() - ((_current - start))));
     }
 
     Token Lexer::lex_character()
@@ -1236,6 +1244,118 @@ namespace Cryo
             SourceRange range(location, location);
             _diagnostic_manager->create_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, range, _source_file);
         }
+    }
+
+    // ================================================================
+    // String Processing Helper Methods
+    // ================================================================
+
+    std::string Lexer::process_escape_sequences(const std::string &str)
+    {
+        std::string result;
+        result.reserve(str.length());
+
+        for (size_t i = 0; i < str.length(); ++i)
+        {
+            if (str[i] == '\\' && i + 1 < str.length())
+            {
+                char next = str[i + 1];
+                switch (next)
+                {
+                case 'n':
+                    result += '\n';
+                    break;
+                case 't':
+                    result += '\t';
+                    break;
+                case 'r':
+                    result += '\r';
+                    break;
+                case '\\':
+                    result += '\\';
+                    break;
+                case '\'':
+                    result += '\'';
+                    break;
+                case '\"':
+                    result += '\"';
+                    break;
+                case 'a':
+                    result += '\a';
+                    break;
+                case 'b':
+                    result += '\b';
+                    break;
+                case 'f':
+                    result += '\f';
+                    break;
+                case 'v':
+                    result += '\v';
+                    break;
+                case '0':
+                case '1':
+                case '2':
+                case '3':
+                case '4':
+                case '5':
+                case '6':
+                case '7':
+                    // Handle octal escape sequences (\000 to \377)
+                    {
+                        std::string octal_str;
+                        octal_str += next; // Include the first digit we already found
+                        size_t octal_pos = i + 2; // Start from the next position after the first digit
+                        
+                        // Collect up to 2 more octal digits (we already have 1)
+                        for (int digit_count = 1; digit_count < 3 && octal_pos < str.length() && str[octal_pos] >= '0' && str[octal_pos] <= '7'; ++digit_count, ++octal_pos)
+                        {
+                            octal_str += str[octal_pos];
+                        }
+                        
+                        // Special case: if we only have \0 and no following octal digits, treat as null terminator
+                        if (octal_str == "0" && (i + 2 >= str.length() || str[i + 2] < '0' || str[i + 2] > '7'))
+                        {
+                            result += '\0';
+                        }
+                        else
+                        {
+                            // Convert octal string to integer
+                            int octal_value = std::stoi(octal_str, nullptr, 8);
+                            if (octal_value >= 0 && octal_value <= 255)
+                            {
+                                result += static_cast<char>(octal_value);
+                                // Skip the remaining octal digits (first digit is handled by normal ++i)
+                                i += octal_str.length() - 1;
+                            }
+                            else
+                            {
+                                // Invalid octal value, treat as literal
+                                result += '\\';
+                                result += next;
+                            }
+                        }
+                    }
+                    break;
+                default:
+                    // If unknown escape sequence, just include the character as-is
+                    result += next;
+                    break;
+                }
+                ++i; // Skip the next character since we processed it
+            }
+            else
+            {
+                result += str[i];
+            }
+        }
+
+        return result;
+    }
+
+    std::string_view Lexer::store_processed_string(std::string processed_string)
+    {
+        _string_pool.emplace_back(std::move(processed_string));
+        return std::string_view(_string_pool.back());
     }
 
 } // namespace Cryo
