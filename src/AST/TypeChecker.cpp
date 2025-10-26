@@ -2372,6 +2372,36 @@ namespace Cryo
                         {
                             result_type = right_type; // char + string = string
                         }
+                        // Handle pointer arithmetic: pointer + integer = pointer, pointer - integer = pointer
+                        else if ((op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS) && 
+                                 left_type->kind() == TypeKind::Pointer && right_type->is_integral())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer arithmetic: {} {} {} = {}", 
+                                     left_type->to_string(), 
+                                     (op == TokenKind::TK_PLUS ? "+" : "-"), 
+                                     right_type->to_string(), 
+                                     left_type->to_string());
+                            result_type = left_type; // pointer +/- int = pointer
+                        }
+                        // Handle integer + pointer = pointer (commutative for addition only)
+                        else if (op == TokenKind::TK_PLUS && 
+                                 left_type->is_integral() && right_type->kind() == TypeKind::Pointer)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer arithmetic (commutative): {} + {} = {}", 
+                                     left_type->to_string(), 
+                                     right_type->to_string(), 
+                                     right_type->to_string());
+                            result_type = right_type; // int + pointer = pointer
+                        }
+                        // Handle pointer - pointer = integer (pointer difference)
+                        else if (op == TokenKind::TK_MINUS && 
+                                 left_type->kind() == TypeKind::Pointer && right_type->kind() == TypeKind::Pointer)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer difference: {} - {} = ptrdiff_t", 
+                                     left_type->to_string(), right_type->to_string());
+                            // Return a signed integer type for pointer difference
+                            result_type = _type_context.get_integer_type(IntegerKind::I64, true);
+                        }
                         // Handle numeric arithmetic
                         else if (left_type->is_numeric() && right_type->is_numeric())
                         {
@@ -2404,6 +2434,25 @@ namespace Cryo
                             std::string right_name = right_type ? right_type->to_string() : "unknown";
                             report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
                                          "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'");
+                            node.set_resolved_type(_type_context.get_unknown_type());
+                        }
+                    }
+                    // Bit shift operations
+                    else if (op == TokenKind::TK_LESSLESS || op == TokenKind::TK_GREATERGREATER)
+                    {
+                        // Bit shift operations require integral types
+                        if (left_type->is_integral() && right_type->is_integral())
+                        {
+                            // Result type is the type of the left operand (the value being shifted)
+                            result_type = left_type;
+                        }
+                        else
+                        {
+                            std::string left_name = left_type ? left_type->to_string() : "unknown";
+                            std::string right_name = right_type ? right_type->to_string() : "unknown";
+                            std::string op_str = (op == TokenKind::TK_LESSLESS) ? "<<" : ">>";
+                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                         "Cannot apply bit shift operation '" + op_str + "' to types '" + left_name + "' and '" + right_name + "' (both operands must be integral types)");
                             node.set_resolved_type(_type_context.get_unknown_type());
                         }
                     }
@@ -2476,9 +2525,31 @@ namespace Cryo
 
                 if (op == TokenKind::TK_AMP) // Address-of operator (&)
                 {
-                    // Create a reference type to the operand type
-                    Type *reference_type = _type_context.create_reference_type(operand_type);
-                    node.set_resolved_type(reference_type);
+                    // Special handling for arrays: &array should give pointer to element type
+                    if (operand_type->kind() == TypeKind::Array)
+                    {
+                        auto array_type = static_cast<ArrayType *>(operand_type);
+                        auto element_type = array_type->element_type();
+                        if (element_type)
+                        {
+                            Type *pointer_type = _type_context.create_pointer_type(element_type.get());
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Array address-of: &{}[] = {}*", 
+                                     element_type->to_string(), element_type->to_string());
+                            node.set_resolved_type(pointer_type);
+                        }
+                        else
+                        {
+                            // Fallback to reference type
+                            Type *reference_type = _type_context.create_reference_type(operand_type);
+                            node.set_resolved_type(reference_type);
+                        }
+                    }
+                    else
+                    {
+                        // Create a reference type to the operand type for non-arrays
+                        Type *reference_type = _type_context.create_reference_type(operand_type);
+                        node.set_resolved_type(reference_type);
+                    }
                 }
                 else if (op == TokenKind::TK_STAR) // Dereference operator (*)
                 {
@@ -2530,7 +2601,7 @@ namespace Cryo
                 }
                 else if (op == TokenKind::TK_PLUSPLUS) // Increment operator (++ prefix or postfix)
                 {
-                    if (is_numeric_type(operand_type))
+                    if (is_numeric_type(operand_type) || operand_type->kind() == TypeKind::Pointer)
                     {
                         // For both prefix and postfix increment, the result type is the same as operand type
                         node.set_resolved_type(operand_type);
@@ -2542,7 +2613,7 @@ namespace Cryo
                 }
                 else if (op == TokenKind::TK_MINUSMINUS) // Decrement operator (-- prefix or postfix)
                 {
-                    if (is_numeric_type(operand_type))
+                    if (is_numeric_type(operand_type) || operand_type->kind() == TypeKind::Pointer)
                     {
                         // For both prefix and postfix decrement, the result type is the same as operand type
                         node.set_resolved_type(operand_type);
@@ -4657,6 +4728,32 @@ namespace Cryo
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Allowing null assignment to pointer type {} (string fallback)", lhs_type->to_string());
             return true;
+        }
+
+        // Special case: &T[] (reference to array) can be assigned to T* (pointer to element type)
+        if (lhs_type->kind() == TypeKind::Pointer && rhs_type->kind() == TypeKind::Reference)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Checking array-to-pointer conversion: {} = {}", lhs_str, rhs_str);
+            auto lhs_ptr = static_cast<PointerType *>(lhs_type);
+            auto rhs_ref = static_cast<ReferenceType *>(rhs_type);
+            
+            // Check if RHS is a reference to an array type
+            auto referenced_type = rhs_ref->referent_type();
+            if (referenced_type && referenced_type->kind() == TypeKind::Array)
+            {
+                auto array_type = static_cast<ArrayType *>(referenced_type.get());
+                auto element_type = array_type->element_type();
+                auto pointer_pointee = lhs_ptr->pointee_type();
+                
+                // Check if the pointer's pointee type matches the array's element type
+                if (element_type && pointer_pointee && 
+                    element_type->to_string() == pointer_pointee->to_string())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing array-to-pointer conversion: &{}[] = {}*", 
+                             element_type->to_string(), pointer_pointee->to_string());
+                    return true;
+                }
+            }
         }
 
         // Special case: void* can be implicitly converted to any pointer type

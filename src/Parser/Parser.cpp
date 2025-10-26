@@ -1528,10 +1528,25 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_relational()
     {
-        auto expr = parse_additive();
+        auto expr = parse_shift();
 
         while (_current_token.is(TokenKind::TK_L_ANGLE) || _current_token.is(TokenKind::TK_R_ANGLE) ||
                _current_token.is(TokenKind::TK_LESSEQUAL) || _current_token.is(TokenKind::TK_GREATEREQUAL))
+        {
+            Token op = _current_token;
+            advance();
+            auto right = parse_shift();
+            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_shift()
+    {
+        auto expr = parse_additive();
+
+        while (_current_token.is(TokenKind::TK_LESSLESS) || _current_token.is(TokenKind::TK_GREATERGREATER))
         {
             Token op = _current_token;
             advance();
