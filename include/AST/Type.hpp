@@ -875,6 +875,12 @@ namespace Cryo
         size_t size_bytes() const override;
         size_t alignment() const override { return sizeof(void *); }
         std::string to_string() const override { return _name; }
+        
+        // Allow assignment between same struct types
+        bool is_assignable_from(const Type &other) const override
+        {
+            return other.kind() == TypeKind::Struct && other.name() == _name;
+        }
     };
 
     // Class type (user-defined)
@@ -896,6 +902,12 @@ namespace Cryo
         bool equals(const Type &other) const override
         {
             return other.kind() == TypeKind::Class && other.name() == _name;
+        }
+        
+        // Allow assignment between same class types
+        bool is_assignable_from(const Type &other) const override
+        {
+            return equals(other);
         }
     };
 

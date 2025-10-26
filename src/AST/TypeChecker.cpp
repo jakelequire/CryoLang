@@ -4719,6 +4719,18 @@ namespace Cryo
                   std::to_string(static_cast<int>(lhs_type->kind())),
                   std::to_string(static_cast<int>(rhs_type->kind())));
 
+        // SPECIAL CASE: Class/Struct assignment compatibility
+        // Allow assignment between same class/struct types (e.g., HeapManager = HeapManager())
+        if ((lhs_type->kind() == TypeKind::Class || lhs_type->kind() == TypeKind::Struct) &&
+            (rhs_type->kind() == TypeKind::Class || rhs_type->kind() == TypeKind::Struct))
+        {
+            if (lhs_str == rhs_str)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing class/struct assignment: {} = {}", lhs_str, rhs_str);
+                return true;
+            }
+        }
+
         // SPECIAL CASE: Integer literal promotion to larger integer types
         // Allow integer literals (represented as 'int' type) to promote to larger integer types
         if (lhs_type->is_integral() && rhs_type->is_integral())
