@@ -1856,7 +1856,7 @@ namespace Cryo
             // Check if the new function type is more specific (e.g., variadic vs non-variadic)
             bool should_update_type = false;
             if (existing_symbol->type && func_type)
-            {
+            { 
                 auto existing_func_type = dynamic_cast<FunctionType *>(existing_symbol->type);
                 auto new_func_type = dynamic_cast<FunctionType *>(func_type);
 
