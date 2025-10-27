@@ -1023,9 +1023,13 @@ namespace Cryo::Codegen
                     if (printf_func)
                     {
                         // Create format string for the printf call
-                        std::string message = "Default destructor called for " + node.name() + "\n";
+                        std::string message = "Default destructor called for " + node.name() + " - At Address: %p\n";
                         llvm::Value *format_str = _context_manager.get_builder().CreateGlobalStringPtr(message, "destructor_msg");
-                        _context_manager.get_builder().CreateCall(printf_func, {format_str});
+                        
+                        // Get the 'this' pointer (first parameter of the destructor function)
+                        llvm::Value *this_ptr = func->getArg(0);
+                        
+                        _context_manager.get_builder().CreateCall(printf_func, {format_str, this_ptr});
                     }
 
                     // Default destructor is empty - just clean up and return
@@ -1335,9 +1339,13 @@ namespace Cryo::Codegen
                     if (printf_func)
                     {
                         // Create format string for the printf call
-                        std::string message = "Default destructor called for class " + class_name + "\n";
+                        std::string message = "Default destructor called for class " + class_name + " - At Address: %p\n";
                         llvm::Value *format_str = _context_manager.get_builder().CreateGlobalStringPtr(message, "class_destructor_msg");
-                        _context_manager.get_builder().CreateCall(printf_func, {format_str});
+                        
+                        // Get the 'this' pointer (first parameter of the destructor function)
+                        llvm::Value *this_ptr = func->getArg(0);
+                        
+                        _context_manager.get_builder().CreateCall(printf_func, {format_str, this_ptr});
                     }
 
                     // Default destructor is empty - just clean up and return
@@ -2458,6 +2466,18 @@ namespace Cryo::Codegen
                     break;
                 case TokenKind::TK_SLASH:
                     op_desc = "division '/'";
+                    break;
+                case TokenKind::TK_PLUSEQUAL:
+                    op_desc = "compound assignment '+='";
+                    break;
+                case TokenKind::TK_MINUSEQUAL:
+                    op_desc = "compound assignment '-='";
+                    break;
+                case TokenKind::TK_STAREQUAL:
+                    op_desc = "compound assignment '*='";
+                    break;
+                case TokenKind::TK_SLASHEQUAL:
+                    op_desc = "compound assignment '/='";
                     break;
                 default:
                     op_desc = "operator";
@@ -6502,6 +6522,269 @@ namespace Cryo::Codegen
                     return nullptr;
                 }
                 break;
+
+            // Compound assignment operators
+            case TokenKind::TK_PLUSEQUAL:
+            case TokenKind::TK_MINUSEQUAL:
+            case TokenKind::TK_STAREQUAL:
+            case TokenKind::TK_SLASHEQUAL:
+            {
+                // For compound assignment (e.g., p.x += 10), we need to:
+                // 1. Load the current value from the left operand
+                // 2. Perform the operation with the right operand
+                // 3. Store the result back to the left operand
+
+                llvm::Value *lvalue_ptr = nullptr;
+                
+                // Get the left-hand side as an lvalue (address)
+                if (auto *left_identifier = dynamic_cast<IdentifierNode *>(node->left()))
+                {
+                    std::string var_name = left_identifier->name();
+                    if (_value_context)
+                    {
+                        lvalue_ptr = _value_context->get_alloca(var_name);
+                    }
+                    if (!lvalue_ptr)
+                    {
+                        auto global_it = _globals.find(var_name);
+                        if (global_it != _globals.end())
+                        {
+                            lvalue_ptr = global_it->second;
+                        }
+                    }
+                }
+                else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->left()))
+                {
+                    // Handle member access (e.g., p.x += 10)
+                    // We need to generate the address of the member, not its value
+                    lvalue_ptr = generate_member_field_address(member_access);
+                    
+                    // If that failed, try a more simplified approach
+                    if (!lvalue_ptr)
+                    {
+                        // Use similar logic to normal member access visitor
+                        llvm::Value *object_ptr = nullptr;
+                        std::string var_name;
+                        
+                        if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
+                        {
+                            var_name = identifier->name();
+                            
+                            // Try to get the alloca or value
+                            object_ptr = _value_context->get_alloca(var_name);
+                            if (!object_ptr)
+                            {
+                                object_ptr = _value_context->get_value(var_name);
+                            }
+                            if (!object_ptr)
+                            {
+                                auto global_it = _globals.find(var_name);
+                                if (global_it != _globals.end())
+                                {
+                                    object_ptr = global_it->second;
+                                }
+                            }
+                        }
+                        
+                        if (object_ptr)
+                        {
+                            std::string member_name = member_access->member();
+                            
+                            // Use resolved type from TypeChecker if available
+                            if (member_access->object() && member_access->object()->has_resolved_type())
+                            {
+                                Cryo::Type *resolved_type = member_access->object()->get_resolved_type();
+                                if (resolved_type)
+                                {
+                                    // For pointer types, get the pointed-to type
+                                    Cryo::Type *effective_type = resolved_type;
+                                    if (resolved_type->kind() == Cryo::TypeKind::Pointer)
+                                    {
+                                        Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
+                                        effective_type = ptr_type->pointee_type().get();
+                                    }
+
+                                    if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class)
+                                    {
+                                        std::string type_name = effective_type->name();
+                                        llvm::Type *struct_type = _type_mapper->map_type(effective_type);
+                                        int field_index = _type_mapper->get_field_index(type_name, member_name);
+                                        
+                                        if (struct_type && field_index != -1)
+                                        {
+                                            if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(struct_type))
+                                            {
+                                                lvalue_ptr = builder.CreateStructGEP(struct_llvm_type, object_ptr, field_index, member_name + "_ptr");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!lvalue_ptr)
+                {
+                    report_error("Invalid left-hand side for compound assignment");
+                    return nullptr;
+                }
+
+                // Load the current value - determine the actual field type
+                llvm::Type *element_type = nullptr;
+                
+                // Try to determine the field type from the struct definition
+                if (lvalue_ptr)
+                {
+                    // If lvalue_ptr is a GEP result, we can get the element type from it
+                    if (auto *gep_inst = llvm::dyn_cast<llvm::GetElementPtrInst>(lvalue_ptr))
+                    {
+                        element_type = gep_inst->getResultElementType();
+                    }
+                    else if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(lvalue_ptr))
+                    {
+                        element_type = alloca_inst->getAllocatedType();
+                    }
+                    else if (lvalue_ptr->getType()->isPointerTy())
+                    {
+                        element_type = lvalue_ptr->getType()->getPointerElementType();
+                    }
+                }
+                
+                // Fallback to i32 if we can't determine the type
+                if (!element_type)
+                {
+                    element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
+                }
+                
+                llvm::Value *current_value = builder.CreateLoad(element_type, lvalue_ptr, "compound.load");
+
+                // Evaluate the right-hand side
+                node->right()->accept(*this);
+                llvm::Value *right_val = get_current_value();
+                if (!right_val)
+                {
+                    report_error("Failed to evaluate right-hand side of compound assignment");
+                    return nullptr;
+                }
+
+                // Perform the operation based on the compound operator
+                llvm::Value *operation_result = nullptr;
+                
+                // Manually perform the operation based on the compound operator type
+                if (op_kind == TokenKind::TK_PLUSEQUAL)
+                {
+                    if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Handle integer addition with type coercion
+                        if (current_value->getType() != right_val->getType())
+                        {
+                            llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? current_value->getType()
+                                                          : right_val->getType();
+                            if (current_value->getType() != target_type)
+                                current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        operation_result = builder.CreateAdd(current_value, right_val, "add.tmp");
+                    }
+                    else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (current_value->getType()->isIntegerTy())
+                            current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
+                        else if (right_val->getType()->isIntegerTy())
+                            right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
+                        operation_result = builder.CreateFAdd(current_value, right_val, "fadd.tmp");
+                    }
+                }
+                else if (op_kind == TokenKind::TK_MINUSEQUAL)
+                {
+                    if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        if (current_value->getType() != right_val->getType())
+                        {
+                            llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? current_value->getType()
+                                                          : right_val->getType();
+                            if (current_value->getType() != target_type)
+                                current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        operation_result = builder.CreateSub(current_value, right_val, "sub.tmp");
+                    }
+                    else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (current_value->getType()->isIntegerTy())
+                            current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
+                        else if (right_val->getType()->isIntegerTy())
+                            right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
+                        operation_result = builder.CreateFSub(current_value, right_val, "fsub.tmp");
+                    }
+                }
+                else if (op_kind == TokenKind::TK_STAREQUAL)
+                {
+                    if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        if (current_value->getType() != right_val->getType())
+                        {
+                            llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? current_value->getType()
+                                                          : right_val->getType();
+                            if (current_value->getType() != target_type)
+                                current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        operation_result = builder.CreateMul(current_value, right_val, "mul.tmp");
+                    }
+                    else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (current_value->getType()->isIntegerTy())
+                            current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
+                        else if (right_val->getType()->isIntegerTy())
+                            right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
+                        operation_result = builder.CreateFMul(current_value, right_val, "fmul.tmp");
+                    }
+                }
+                else if (op_kind == TokenKind::TK_SLASHEQUAL)
+                {
+                    if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        if (current_value->getType() != right_val->getType())
+                        {
+                            llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? current_value->getType()
+                                                          : right_val->getType();
+                            if (current_value->getType() != target_type)
+                                current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        operation_result = builder.CreateSDiv(current_value, right_val, "sdiv.tmp");
+                    }
+                    else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (current_value->getType()->isIntegerTy())
+                            current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
+                        else if (right_val->getType()->isIntegerTy())
+                            right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
+                        operation_result = builder.CreateFDiv(current_value, right_val, "fdiv.tmp");
+                    }
+                }
+
+                if (!operation_result)
+                {
+                    report_error("Failed to generate operation for compound assignment");
+                    return nullptr;
+                }
+
+                // Store the result back to the lvalue
+                builder.CreateStore(operation_result, lvalue_ptr);
+                result = operation_result;
+                break;
+            }
 
             default:
                 report_error("Unsupported binary operator: " + node->operator_token().to_string());
@@ -11568,6 +11851,121 @@ namespace Cryo::Codegen
 
         set_current_value(struct_alloca);
         return struct_alloca;
+    }
+
+    // Helper method to generate the address of a member field for compound assignments
+    llvm::Value *CodegenVisitor::generate_member_field_address(Cryo::MemberAccessNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        auto &builder = _context_manager.get_builder();
+        
+        // Get the object pointer
+        llvm::Value *object_ptr = nullptr;
+        std::string var_name;
+        
+        if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(node->object()))
+        {
+            var_name = identifier->name();
+            
+            // Try to get the alloca or value
+            object_ptr = _value_context->get_alloca(var_name);
+            if (!object_ptr)
+            {
+                object_ptr = _value_context->get_value(var_name);
+            }
+            if (!object_ptr)
+            {
+                auto global_it = _globals.find(var_name);
+                if (global_it != _globals.end())
+                {
+                    object_ptr = global_it->second;
+                }
+            }
+        }
+        else
+        {
+            // For more complex expressions, generate them normally
+            node->object()->accept(*this);
+            object_ptr = get_generated_value(node->object());
+        }
+
+        if (!object_ptr)
+        {
+            return nullptr;
+        }
+
+        std::string member_name = node->member();
+        
+        // Get the struct type and field index
+        llvm::StructType *struct_type = nullptr;
+        std::string type_name;
+        int field_index = -1;
+
+        // Strategy 1: Try variable type tracking (most reliable)
+        if (!var_name.empty())
+        {
+            auto var_type_it = _variable_types.find(var_name);
+            if (var_type_it != _variable_types.end())
+            {
+                Cryo::Type *cryo_type = var_type_it->second;
+                
+                // Handle pointer types - get the pointee type
+                if (auto *ptr_type = dynamic_cast<Cryo::PointerType*>(cryo_type))
+                {
+                    cryo_type = ptr_type->pointee_type().get();
+                }
+                
+                if (auto *struct_cryo_type = dynamic_cast<Cryo::StructType*>(cryo_type))
+                {
+                    type_name = struct_cryo_type->name();
+                    struct_type = llvm::dyn_cast<llvm::StructType>(_type_mapper->map_type(cryo_type));
+                    field_index = _type_mapper->get_field_index(type_name, member_name);
+                }
+            }
+        }
+
+        // Strategy 2: Try current struct context (fallback)
+        if (!struct_type && !current_struct_type.empty())
+        {
+            auto context_type_it = _types.find(current_struct_type);
+            if (context_type_it != _types.end())
+            {
+                if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(context_type_it->second))
+                {
+                    int test_field_index = _type_mapper->get_field_index(current_struct_type, member_name);
+                    if (test_field_index != -1)
+                    {
+                        struct_type = struct_llvm_type;
+                        type_name = current_struct_type;
+                        field_index = test_field_index;
+                    }
+                }
+            }
+        }
+
+        if (!struct_type || field_index == -1)
+        {
+            return nullptr;
+        }
+
+        // Generate the field address
+        llvm::Value *field_ptr = nullptr;
+        
+        // Check if object_ptr is a pointer to the struct or the struct itself
+        if (object_ptr->getType()->isPointerTy())
+        {
+            // For pointers (like p: Point*), we can directly use CreateStructGEP
+            field_ptr = builder.CreateStructGEP(struct_type, object_ptr, field_index, member_name + "_ptr");
+        }
+        else
+        {
+            // This shouldn't happen in our case, but handle it for completeness
+            return nullptr;
+        }
+
+        return field_ptr;
     }
 
 } // namespace Cryo::Codegen
