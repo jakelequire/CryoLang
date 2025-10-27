@@ -360,8 +360,9 @@ namespace Cryo::Codegen
             // Use Type* object directly from AST node instead of string parsing
             Cryo::Type *cryo_type = node.get_resolved_type();
 
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Variable Declaration: name='{}', type='{}'",
-                      var_name, (cryo_type ? cryo_type->to_string() : "nullptr"));
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Variable Declaration: name='{}', type='{}', kind={}",
+                      var_name, (cryo_type ? cryo_type->to_string() : "nullptr"), 
+                      (cryo_type ? static_cast<int>(cryo_type->kind()) : -1));
 
             if (!cryo_type)
             {
@@ -371,9 +372,23 @@ namespace Cryo::Codegen
 
             // Check if this is an array type for later use in initialization
             ArrayType *array_type = nullptr;
+            bool is_array_class = false;
             if (cryo_type->kind() == TypeKind::Array)
             {
                 array_type = static_cast<ArrayType *>(cryo_type);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected Array type for variable: {}", var_name);
+            }
+            else if (cryo_type->kind() == TypeKind::Generic || cryo_type->kind() == TypeKind::Parameterized || cryo_type->kind() == TypeKind::Class)
+            {
+                // Check if this is Array<T> which might be classified as Generic/Parameterized/Class
+                std::string type_str = cryo_type->to_string();
+                if (type_str.find("Array<") == 0 || type_str.find("Array < ") == 0)
+                {
+                    // This is Array<T> but it's a ClassType, not ArrayType
+                    // We'll use a flag to indicate this is an array-like class
+                    is_array_class = true;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected Array<T> as Generic/Parameterized/Class type for variable: {}", var_name);
+                }
             }
 
             // Check for auto type that needs inference
@@ -646,7 +661,7 @@ namespace Cryo::Codegen
                     //
                     // This is a very special case and not generalizable to other types
                     // so we hardcode the check for Array<T> here.
-                    if (array_type)
+                    if (array_type || is_array_class)
                     {
                         // This is an Array<T> type - call the constructor instead of direct assignment
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array<T> variable initialization - calling constructor");
@@ -666,11 +681,46 @@ namespace Cryo::Codegen
                         if (array_ptr)
                         {
                             // Extract the concrete type name using the Type* object
-                            std::string element_type_name = array_type->element_type()->to_string();
+                            std::string element_type_name;
+                            if (array_type)
+                            {
+                                // This is a true ArrayType
+                                element_type_name = array_type->element_type()->to_string();
+                            }
+                            else if (is_array_class)
+                            {
+                                // This is Array<T> as a ClassType - extract T from the type string
+                                std::string type_str = cryo_type->to_string();
+                                // Extract the type parameter from "Array<int>" or "Array < int >"
+                                size_t start = type_str.find('<');
+                                size_t end = type_str.find_last_of('>');
+                                if (start != std::string::npos && end != std::string::npos && end > start)
+                                {
+                                    element_type_name = type_str.substr(start + 1, end - start - 1);
+                                    // Remove spaces
+                                    element_type_name.erase(std::remove_if(element_type_name.begin(), 
+                                                                          element_type_name.end(), 
+                                                                          ::isspace), 
+                                                           element_type_name.end());
+                                }
+                                else
+                                {
+                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to extract element type from Array class: {}", type_str);
+                                    return;
+                                }
+                            }
                             std::string monomorphized_name = "Array_" + element_type_name;
 
-                            // Find the constructor function
-                            std::string constructor_name = monomorphized_name + "::" + "Array";
+                            // Find the constructor function - include namespace context
+                            std::string constructor_name;
+                            if (!_namespace_context.empty())
+                            {
+                                constructor_name = _namespace_context + "::" + monomorphized_name + "::" + "Array";
+                            }
+                            else
+                            {
+                                constructor_name = monomorphized_name + "::" + "Array";
+                            }
                             auto constructor_it = _functions.find(constructor_name);
 
                             if (constructor_it != _functions.end())
@@ -685,46 +735,34 @@ namespace Cryo::Codegen
                                 // Get the exact parameter type from the constructor function
                                 // This ensures we match the constructor parameter type exactly
                                 llvm::FunctionType *constructor_type = constructor_func->getFunctionType();
-                                llvm::Type *dynamic_array_type = nullptr;
 
-                                // The constructor should have 2 parameters: 'this' pointer and dynamic array struct
-                                if (constructor_type->getNumParams() >= 2)
+                                // New implementation for Array(elements: T*, length: u64) constructor
+                                // The constructor should have 3 parameters: 'this' pointer, elements T*, and length u64
+                                if (constructor_type->getNumParams() >= 3)
                                 {
-                                    dynamic_array_type = constructor_type->getParamType(1); // Second parameter
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using constructor parameter type for dynamic array");
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using new Array(elements: T*, length: u64) constructor");
+                                    
+                                    // Call constructor with 'this' pointer, elements pointer, and length
+                                    std::vector<llvm::Value *> args;
+                                    args.push_back(alloca);              // 'this' pointer
+                                    args.push_back(array_ptr);           // elements: T* (pointer to array literal)
+                                    
+                                    llvm::Value* length_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size);
+                                    args.push_back(length_value); // length: u64
+                                    
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling constructor with args: this={}, elements={}, length={}", 
+                                             static_cast<void*>(alloca), static_cast<void*>(array_ptr), array_literal_size);
+
+                                    builder.CreateCall(constructor_func, args);
+
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Called new Array(elements: T*, length: u64) constructor successfully");
                                 }
                                 else
                                 {
-                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Constructor doesn't have expected parameter count");
-                                    return; // Skip this variable declaration
+                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Constructor doesn't have expected parameter count for new signature (expected 3, got {})", constructor_type->getNumParams());
+                                    // Fall back to direct assignment
+                                    create_store(array_ptr, alloca);
                                 }
-
-                                // Allocate and initialize the dynamic array struct
-                                llvm::AllocaInst *dynamic_array_alloca = builder.CreateAlloca(dynamic_array_type, nullptr, "dynamic_array");
-
-                                // Set ptr field (first field) to the array pointer
-                                llvm::Value *ptr_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 0, "ptr_field");
-                                builder.CreateStore(array_ptr, ptr_field_ptr);
-
-                                // Set length field (second field) to the actual array literal size
-                                llvm::Value *length_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 1, "length_field");
-                                builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size), length_field_ptr);
-
-                                // Set capacity field (third field) to the same value as length initially
-                                llvm::Value *capacity_field_ptr = builder.CreateStructGEP(dynamic_array_type, dynamic_array_alloca, 2, "capacity_field");
-                                builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size), capacity_field_ptr);
-
-                                // Load the dynamic array struct to pass by value
-                                llvm::Value *dynamic_array_value = builder.CreateLoad(dynamic_array_type, dynamic_array_alloca, "dynamic_array_value");
-
-                                // Call constructor with 'this' pointer and dynamic array struct
-                                std::vector<llvm::Value *> args;
-                                args.push_back(alloca);              // 'this' pointer
-                                args.push_back(dynamic_array_value); // dynamic array struct
-
-                                builder.CreateCall(constructor_func, args);
-
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Called Array constructor successfully");
                             }
                             else
                             {
