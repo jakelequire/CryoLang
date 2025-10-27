@@ -419,6 +419,7 @@ namespace Cryo::Codegen
         llvm::Value *generate_function_call(Cryo::CallExpressionNode *node);
         llvm::Value *generate_array_access(Cryo::ArrayAccessNode *node);
         llvm::Value *generate_member_access(Cryo::MemberAccessNode *node);
+        llvm::Value *generate_member_field_address(Cryo::MemberAccessNode *node);
 
         // Constructor helpers
         bool is_primitive_integer_constructor(const std::string &function_name) const;
