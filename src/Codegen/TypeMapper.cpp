@@ -4,6 +4,7 @@
 #include "Utils/Logger.hpp"
 #include <iostream>
 #include <sstream>
+#include <algorithm>
 
 namespace Cryo::Codegen
 {
@@ -1142,24 +1143,66 @@ namespace Cryo::Codegen
 
         // Classes are similar to structs but may include vtable pointers
         std::string class_name = class_type->name();
+        std::string lookup_name = class_name;
 
-        // Check cache
+        // Check if this is a parameterized class like "Array < int >" and convert to monomorphized name
+        if (class_name.find('<') != std::string::npos && class_name.find('>') != std::string::npos)
+        {
+            auto parsed = parse_generic_type_string(class_name);
+            std::string base_name = parsed.first;
+            std::vector<std::string> type_args = parsed.second;
+
+            // Trim spaces from base name as well
+            base_name.erase(std::remove(base_name.begin(), base_name.end(), ' '), base_name.end());
+
+            if (!type_args.empty())
+            {
+                // Generate the monomorphized name (e.g., Array<int> -> Array_int)
+                lookup_name = base_name;
+                for (const auto &arg : type_args)
+                {
+                    // Remove spaces from type arg and append
+                    std::string clean_arg = arg;
+                    clean_arg.erase(std::remove(clean_arg.begin(), clean_arg.end(), ' '), clean_arg.end());
+                    lookup_name += "_" + clean_arg;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting parameterized class name '{}' to monomorphized name '{}'", 
+                          class_name, lookup_name);
+            }
+        }
+
+        // Check cache first with both original and lookup names
         auto it = _struct_cache.find(class_name);
         if (it != _struct_cache.end())
         {
             return it->second;
         }
+        
+        // Also check cache with lookup name if different
+        if (lookup_name != class_name)
+        {
+            auto lookup_it = _struct_cache.find(lookup_name);
+            if (lookup_it != _struct_cache.end())
+            {
+                return lookup_it->second;
+            }
+        }
 
         // Create named struct type for the class
         llvm::StructType *llvm_class = llvm::StructType::create(_context_manager.get_context(), class_name);
 
-        // Add to cache early to handle recursive classes
+        // Add to cache early to handle recursive classes (use both names if different)
         _struct_cache[class_name] = llvm_class;
+        if (lookup_name != class_name)
+        {
+            _struct_cache[lookup_name] = llvm_class;
+        }
 
         // Generate field types from AST node if available
         std::vector<llvm::Type *> field_types;
 
-        auto ast_it = _class_ast_nodes.find(class_name);
+        auto ast_it = _class_ast_nodes.find(lookup_name);
         if (ast_it != _class_ast_nodes.end())
         {
             auto class_node = ast_it->second;
@@ -1209,7 +1252,7 @@ namespace Cryo::Codegen
         }
         else
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No AST node found for class: {}, creating empty struct", class_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No AST node found for class: {} (lookup name: {}), creating empty struct", class_name, lookup_name);
         }
 
         // TODO: Add vtable pointer if the class has virtual methods
@@ -1886,6 +1929,162 @@ namespace Cryo::Codegen
 
         LOG_ERROR(Cryo::LogComponent::CODEGEN, "Field '{}' not found in type '{}' (lookup name: '{}')",
                   field_name, type_name, lookup_name);
+        
+        // Debug: Log what's available in the AST node maps
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available class AST nodes:");
+        for (const auto &[key, _] : _class_ast_nodes)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - Class: '{}'", key);
+        }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available struct AST nodes:");
+        for (const auto &[key, _] : _struct_ast_nodes)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - Struct: '{}'", key);
+        }
+        
+        // For base generic types (e.g., "Array"), try to find any instantiated version
+        // by looking for types that start with the base name followed by an underscore
+        if (lookup_name == type_name && lookup_name.find('<') == std::string::npos)
+        {
+            std::string pattern = lookup_name + "_";
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying pattern matching for generic base type '{}' with pattern '{}'",
+                      lookup_name, pattern);
+            
+            // Try class nodes with pattern matching
+            for (const auto &[key, class_node] : _class_ast_nodes)
+            {
+                if (key.find(pattern) == 0) // Starts with pattern
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found matching instantiated class type: '{}'", key);
+                    const auto &fields = class_node->fields();
+
+                    for (size_t i = 0; i < fields.size(); ++i)
+                    {
+                        if (fields[i] && fields[i]->name() == field_name)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found field '{}' at index {} in instantiated class '{}'",
+                                      field_name, i, key);
+                            return static_cast<int>(i);
+                        }
+                    }
+                }
+            }
+
+            // Try struct nodes with pattern matching
+            for (const auto &[key, struct_node] : _struct_ast_nodes)
+            {
+                if (key.find(pattern) == 0) // Starts with pattern
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found matching instantiated struct type: '{}'", key);
+                    const auto &fields = struct_node->fields();
+
+                    for (size_t i = 0; i < fields.size(); ++i)
+                    {
+                        if (fields[i] && fields[i]->name() == field_name)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found field '{}' at index {} in instantiated struct '{}'",
+                                      field_name, i, key);
+                            return static_cast<int>(i);
+                        }
+                    }
+                }
+            }
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pattern matching for generic type '{}' found no results", lookup_name);
+        }
+        
+        // For instantiated types, try fallback with base type name
+        if (lookup_name != type_name && lookup_name.find('_') != std::string::npos)
+        {
+            // Extract base name from mangled name (e.g., "Array_int" -> "Array")
+            size_t underscore_pos = lookup_name.find('_');
+            std::string base_name = lookup_name.substr(0, underscore_pos);
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying fallback lookup with base type '{}' for failed lookup of '{}'",
+                      base_name, lookup_name);
+            
+            // Try class nodes with base name
+            auto base_class_it = _class_ast_nodes.find(base_name);
+            if (base_class_it != _class_ast_nodes.end())
+            {
+                auto class_node = base_class_it->second;
+                const auto &fields = class_node->fields();
+
+                for (size_t i = 0; i < fields.size(); ++i)
+                {
+                    if (fields[i] && fields[i]->name() == field_name)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found field '{}' at index {} in base class '{}'",
+                                  field_name, i, base_name);
+                        return static_cast<int>(i);
+                    }
+                }
+            }
+
+            // Try struct nodes with base name
+            auto base_struct_it = _struct_ast_nodes.find(base_name);
+            if (base_struct_it != _struct_ast_nodes.end())
+            {
+                auto struct_node = base_struct_it->second;
+                const auto &fields = struct_node->fields();
+
+                for (size_t i = 0; i < fields.size(); ++i)
+                {
+                    if (fields[i] && fields[i]->name() == field_name)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found field '{}' at index {} in base struct '{}'",
+                                  field_name, i, base_name);
+                        return static_cast<int>(i);
+                    }
+                }
+            }
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fallback lookup with base type '{}' also failed", base_name);
+        }
+        // For non-generic types, try fallback with original type name if conversion happened
+        else if (lookup_name != type_name)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying fallback lookup with original type name '{}'", type_name);
+            
+            // Try class nodes with original name
+            auto orig_class_it = _class_ast_nodes.find(type_name);
+            if (orig_class_it != _class_ast_nodes.end())
+            {
+                auto class_node = orig_class_it->second;
+                const auto &fields = class_node->fields();
+
+                for (size_t i = 0; i < fields.size(); ++i)
+                {
+                    if (fields[i] && fields[i]->name() == field_name)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found field '{}' at index {} in original class '{}'",
+                                  field_name, i, type_name);
+                        return static_cast<int>(i);
+                    }
+                }
+            }
+
+            // Try struct nodes with original name
+            auto orig_struct_it = _struct_ast_nodes.find(type_name);
+            if (orig_struct_it != _struct_ast_nodes.end())
+            {
+                auto struct_node = orig_struct_it->second;
+                const auto &fields = struct_node->fields();
+
+                for (size_t i = 0; i < fields.size(); ++i)
+                {
+                    if (fields[i] && fields[i]->name() == field_name)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found field '{}' at index {} in original struct '{}'",
+                                  field_name, i, type_name);
+                        return static_cast<int>(i);
+                    }
+                }
+            }
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fallback lookup with original type name '{}' also failed", type_name);
+        }
+        
         return -1; // Field not found
     }
 

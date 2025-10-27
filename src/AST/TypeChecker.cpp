@@ -3337,6 +3337,35 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_fields map", lookup_type_name);
+            
+            // For generic types like "Array<int>", try looking up the base type "Array"
+            size_t bracket_pos = lookup_type_name.find('<');
+            if (bracket_pos != std::string::npos)
+            {
+                std::string base_type_name = lookup_type_name.substr(0, bracket_pos);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Trying base type '{}' for generic type '{}'", base_type_name, lookup_type_name);
+                
+                auto base_struct_it = _struct_fields.find(base_type_name);
+                if (base_struct_it != _struct_fields.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found base struct '{}' in _struct_fields with {} fields", base_type_name, base_struct_it->second.size());
+                    auto field_it = base_struct_it->second.find(member_name);
+                    if (field_it != base_struct_it->second.end())
+                    {
+                        // Found the field in the base type - store the resolved Type*
+                        node.set_resolved_type(field_it->second);
+                        return;
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Field '{}' NOT found in base struct '{}'", member_name, base_type_name);
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Base struct '{}' NOT found in _struct_fields map", base_type_name);
+                }
+            }
         }
 
         // Look up method in struct method map
@@ -3361,6 +3390,36 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_methods map", lookup_type_name);
+            
+            // For generic types like "Array<int>", try looking up the base type "Array"
+            size_t bracket_pos = lookup_type_name.find('<');
+            if (bracket_pos != std::string::npos)
+            {
+                std::string base_type_name = lookup_type_name.substr(0, bracket_pos);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Trying base type '{}' for generic method lookup", base_type_name);
+                
+                auto base_method_struct_it = _struct_methods.find(base_type_name);
+                if (base_method_struct_it != _struct_methods.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found base struct '{}' in _struct_methods with {} methods", base_type_name, base_method_struct_it->second.size());
+                    auto method_it = base_method_struct_it->second.find(member_name);
+                    if (method_it != base_method_struct_it->second.end())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found public method '{}' in base struct '{}'", member_name, base_type_name);
+                        // Found the method in the base type - store the resolved Type*
+                        node.set_resolved_type(method_it->second);
+                        return;
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' NOT found in base struct '{}'", member_name, base_type_name);
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Base struct '{}' NOT found in _struct_methods map", base_type_name);
+                }
+            }
         }
 
         // Check for private methods - allow access from within the same class
@@ -3400,6 +3459,50 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "No private methods found for type '{}'", lookup_type_name);
+            
+            // For generic types like "Array<int>", try looking up the base type "Array"
+            size_t bracket_pos = lookup_type_name.find('<');
+            if (bracket_pos != std::string::npos)
+            {
+                std::string base_type_name = lookup_type_name.substr(0, bracket_pos);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Trying base type '{}' for generic private method lookup", base_type_name);
+                
+                auto base_private_method_struct_it = _private_struct_methods.find(base_type_name);
+                if (base_private_method_struct_it != _private_struct_methods.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found base struct '{}' in _private_struct_methods", base_type_name);
+                    auto private_method_it = base_private_method_struct_it->second.find(member_name);
+                    if (private_method_it != base_private_method_struct_it->second.end())
+                    {
+                        // Check if we're accessing the private method from within the same class
+                        if (_current_struct_name == base_type_name)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' in base type and allowing access from within same class '{}'", member_name, base_type_name);
+                            // Allow access to private method from within the same class
+                            node.set_resolved_type(private_method_it->second);
+                            return;
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' in base type but access is forbidden from different class '{}'", member_name, _current_struct_name);
+                            // This is a private method being accessed from outside the class - report error
+                            _diagnostic_builder->create_private_member_access_error(member_name, base_type_name, node.location());
+                            _errors.emplace_back(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                                 "Cannot access private member '" + member_name + "' of type '" + base_type_name + "'");
+                            node.set_resolved_type(_type_context.get_unknown_type());
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' not found in private methods for base type '{}'", member_name, base_type_name);
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "No private methods found for base type '{}'", base_type_name);
+                }
+            }
         }
 
         // Handle built-in type methods (string, primitive types, etc.)
