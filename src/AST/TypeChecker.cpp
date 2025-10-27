@@ -1030,7 +1030,7 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "lookup_symbol for '{}' returned: {}", type_string, (type_symbol ? "valid pointer" : "nullptr"));
             if (type_symbol && type_symbol->type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found declared type '{}', kind={}", type_symbol->type->name(), static_cast<int>(type_symbol->type->kind()));
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found declared type '{}', kind={}", type_symbol->type->name(), TypeKindToString(type_symbol->type->kind()));
                 // Return the correct type as declared (enum, struct, or class)
                 return type_symbol->type;
             }
@@ -1039,7 +1039,7 @@ namespace Cryo
             Type *struct_type = _type_context.lookup_struct_type(type_string);
             if (struct_type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found existing struct type '{}', kind={}", struct_type->name(), static_cast<int>(struct_type->kind()));
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found existing struct type '{}', kind={}", struct_type->name(), TypeKindToString(struct_type->kind()));
                 return struct_type;
             }
 
@@ -1048,7 +1048,7 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "get_class_type returned: {}", (class_type ? "valid pointer" : "nullptr"));
             if (class_type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "class_type name='{}', kind={}", class_type->name(), static_cast<int>(class_type->kind()));
+                LOG_DEBUG(Cryo::LogComponent::AST, "class_type name='{}', kind={}", class_type->name(), TypeKindToString(class_type->kind()));
                 return class_type;
             }
         }
@@ -1058,10 +1058,11 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "Trying TypeContext token-based parsing...");
         Lexer type_lexer(type_string);
         Type *parsed_type = _type_context.parse_type_from_tokens(type_lexer);
+        std::string kind_str = parsed_type ? TypeKindToString(parsed_type->kind()) : "N/A";
         LOG_DEBUG(Cryo::LogComponent::AST, "Token parsing result for '{}': {} (kind={})",
                   type_string,
                   parsed_type ? parsed_type->name() : "null",
-                  parsed_type ? static_cast<int>(parsed_type->kind()) : -1);
+                  kind_str);
 
         if (parsed_type && parsed_type->kind() != TypeKind::Unknown)
         {
@@ -1645,12 +1646,12 @@ namespace Cryo
                 if (declared_type->kind() == TypeKind::Struct)
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "MALFORMED TYPE DETECTED: Variable '{}' with annotation '{}' resolved to struct type '{}' (kind={}) instead of pointer type",
-                              var_name, node.type_annotation(), declared_type->name(), static_cast<int>(declared_type->kind()));
+                              var_name, node.type_annotation(), declared_type->name(), TypeKindToString(declared_type->kind()));
                 }
                 else
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "CORRECT TYPE: Variable '{}' with annotation '{}' resolved to type '{}' (kind={})",
-                              var_name, node.type_annotation(), declared_type->name(), static_cast<int>(declared_type->kind()));
+                              var_name, node.type_annotation(), declared_type->name(), TypeKindToString(declared_type->kind()));
                 }
             }
         }
@@ -1704,7 +1705,7 @@ namespace Cryo
         }
 
         // Declare the variable in symbol table
-        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Attempting to declare variable '{}' with type '{}' (kind={})", var_name, final_type ? final_type->name() : "null", final_type ? static_cast<int>(final_type->kind()) : -1);
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Attempting to declare variable '{}' with type '{}' (kind={})", var_name, final_type ? final_type->name() : "null", final_type ? TypeKindToString(final_type->kind()) : "null");
         if (!declare_variable(var_name, final_type, node.location(), node.is_mutable()))
         {
             // Check if we're in stdlib compilation mode and if this is a compatible redefinition
@@ -1775,8 +1776,8 @@ namespace Cryo
     void TypeChecker::visit(FunctionDeclarationNode &node)
     {
         const std::string &func_name = node.name();
-        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(FunctionDeclarationNode) - Processing function '{}' in struct context '{}'", 
-                 func_name, _current_struct_name);
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(FunctionDeclarationNode) - Processing function '{}' in struct context '{}'",
+                  func_name, _current_struct_name);
 
         // Handle generic functions - enter generic context if needed
         bool is_generic_function = !node.generic_parameters().empty();
@@ -1818,11 +1819,11 @@ namespace Cryo
                 if (param_type && param_type->kind() != TypeKind::Variadic)
                 {
                     param_types.push_back(param_type);
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Added parameter type '{}' (kind={})", param_type->name(), static_cast<int>(param_type->kind()));
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Added parameter type '{}' (kind={})", param_type->name(), TypeKindToString(param_type->kind()));
                 }
                 else
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Skipped variadic parameter type '{}' (kind={})", param_type ? param_type->name() : "null", param_type ? static_cast<int>(param_type->kind()) : -1);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Skipped variadic parameter type '{}' (kind={})", param_type ? param_type->name() : "null", param_type ? TypeKindToString(param_type->kind()) : "null");
                 }
             }
         }
@@ -1856,7 +1857,7 @@ namespace Cryo
             // Check if the new function type is more specific (e.g., variadic vs non-variadic)
             bool should_update_type = false;
             if (existing_symbol->type && func_type)
-            { 
+            {
                 auto existing_func_type = dynamic_cast<FunctionType *>(existing_symbol->type);
                 auto new_func_type = dynamic_cast<FunctionType *>(func_type);
 
@@ -1897,47 +1898,53 @@ namespace Cryo
             {
                 // Check if this is a class/struct method that was already registered during signature registration
                 bool is_method_already_registered = false;
-                LOG_DEBUG(Cryo::LogComponent::AST, "declare_function failed for '{}', current_struct_name='{}', checking method registries...", 
-                         func_name, _current_struct_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "declare_function failed for '{}', current_struct_name='{}', checking method registries...",
+                          func_name, _current_struct_name);
                 if (!_current_struct_name.empty())
                 {
                     // Check if this method was already registered in the method registries
                     auto public_methods_it = _struct_methods.find(_current_struct_name);
                     auto private_methods_it = _private_struct_methods.find(_current_struct_name);
-                    
-                    bool found_in_public = (public_methods_it != _struct_methods.end() && 
-                                          public_methods_it->second.find(func_name) != public_methods_it->second.end());
-                    bool found_in_private = (private_methods_it != _private_struct_methods.end() && 
-                                           private_methods_it->second.find(func_name) != private_methods_it->second.end());
-                    
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Method lookup for '{}': found_in_public={}, found_in_private={}", 
-                             func_name, found_in_public, found_in_private);
-                    
+
+                    bool found_in_public = (public_methods_it != _struct_methods.end() &&
+                                            public_methods_it->second.find(func_name) != public_methods_it->second.end());
+                    bool found_in_private = (private_methods_it != _private_struct_methods.end() &&
+                                             private_methods_it->second.find(func_name) != private_methods_it->second.end());
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Method lookup for '{}': found_in_public={}, found_in_private={}",
+                              func_name, found_in_public, found_in_private);
+
                     if (found_in_public || found_in_private)
                     {
                         is_method_already_registered = true;
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing redefinition error for method '{}' in '{}' - already registered during signature phase", 
-                                 func_name, _current_struct_name);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing redefinition error for method '{}' in '{}' - already registered during signature phase",
+                                  func_name, _current_struct_name);
                     }
                 }
                 else
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Not in struct context, current_struct_name is empty for function '{}'", func_name);
                 }
-                
+
                 if (!is_method_already_registered)
                 {
                     // Check if this is a false positive - look up the existing symbol to see what it actually is
-                    TypedSymbol* existing_symbol = _symbol_table->lookup_symbol(func_name);
-                    if (existing_symbol && existing_symbol->type) {
+                    TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(func_name);
+                    if (existing_symbol && existing_symbol->type)
+                    {
                         // If the existing symbol is not a function type, this is a false positive
                         // Don't report function redefinition errors for variables, etc.
-                        if (existing_symbol->type->kind() != TypeKind::Function) {
+                        if (existing_symbol->type->kind() != TypeKind::Function)
+                        {
                             LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing false positive function redefinition error for variable '{}'", func_name);
-                        } else {
+                        }
+                        else
+                        {
                             _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
                         }
-                    } else {
+                    }
+                    else
+                    {
                         // If we can't determine the existing symbol type, report the error as usual
                         _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
                     }
@@ -2348,7 +2355,7 @@ namespace Cryo
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': setting resolved type to {} (kind={})", name,
                       symbol->type ? symbol->type->name() : "null",
-                      symbol->type ? static_cast<int>(symbol->type->kind()) : -1);
+                      symbol->type ? TypeKindToString(symbol->type->kind()) : "null");
             node.set_resolved_type(symbol->type);
         }
     }
@@ -2421,32 +2428,32 @@ namespace Cryo
                             result_type = right_type; // char + string = string
                         }
                         // Handle pointer arithmetic: pointer + integer = pointer, pointer - integer = pointer
-                        else if ((op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS) && 
+                        else if ((op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS) &&
                                  left_type->kind() == TypeKind::Pointer && right_type->is_integral())
                         {
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer arithmetic: {} {} {} = {}", 
-                                     left_type->to_string(), 
-                                     (op == TokenKind::TK_PLUS ? "+" : "-"), 
-                                     right_type->to_string(), 
-                                     left_type->to_string());
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer arithmetic: {} {} {} = {}",
+                                      left_type->to_string(),
+                                      (op == TokenKind::TK_PLUS ? "+" : "-"),
+                                      right_type->to_string(),
+                                      left_type->to_string());
                             result_type = left_type; // pointer +/- int = pointer
                         }
                         // Handle integer + pointer = pointer (commutative for addition only)
-                        else if (op == TokenKind::TK_PLUS && 
+                        else if (op == TokenKind::TK_PLUS &&
                                  left_type->is_integral() && right_type->kind() == TypeKind::Pointer)
                         {
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer arithmetic (commutative): {} + {} = {}", 
-                                     left_type->to_string(), 
-                                     right_type->to_string(), 
-                                     right_type->to_string());
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer arithmetic (commutative): {} + {} = {}",
+                                      left_type->to_string(),
+                                      right_type->to_string(),
+                                      right_type->to_string());
                             result_type = right_type; // int + pointer = pointer
                         }
                         // Handle pointer - pointer = integer (pointer difference)
-                        else if (op == TokenKind::TK_MINUS && 
+                        else if (op == TokenKind::TK_MINUS &&
                                  left_type->kind() == TypeKind::Pointer && right_type->kind() == TypeKind::Pointer)
                         {
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer difference: {} - {} = ptrdiff_t", 
-                                     left_type->to_string(), right_type->to_string());
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Pointer difference: {} - {} = ptrdiff_t",
+                                      left_type->to_string(), right_type->to_string());
                             // Return a signed integer type for pointer difference
                             result_type = _type_context.get_integer_type(IntegerKind::I64, true);
                         }
@@ -2581,8 +2588,8 @@ namespace Cryo
                         if (element_type)
                         {
                             Type *pointer_type = _type_context.create_pointer_type(element_type.get());
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Array address-of: &{}[] = {}*", 
-                                     element_type->to_string(), element_type->to_string());
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Array address-of: &{}[] = {}*",
+                                      element_type->to_string(), element_type->to_string());
                             node.set_resolved_type(pointer_type);
                         }
                         else
@@ -2830,10 +2837,10 @@ namespace Cryo
 
                 // Handle primitive constructors: either not resolved, resolved to unknown type, or resolved to the matching primitive type
                 bool is_primitive_constructor = (is_primitive_integer_type(callee_name) || callee_name == "f32" || callee_name == "f64" || callee_name == "float");
-                bool should_handle_as_constructor = (!has_resolved || 
-                                                   (callee_resolved_type && callee_resolved_type->kind() == TypeKind::Unknown) ||
-                                                   (is_primitive_constructor && callee_resolved_type && callee_resolved_type->name() == callee_name));
-                
+                bool should_handle_as_constructor = (!has_resolved ||
+                                                     (callee_resolved_type && callee_resolved_type->kind() == TypeKind::Unknown) ||
+                                                     (is_primitive_constructor && callee_resolved_type && callee_resolved_type->name() == callee_name));
+
                 if (should_handle_as_constructor && is_primitive_constructor)
                 {
                     // This is a primitive type constructor call like u64(0)
@@ -2874,7 +2881,7 @@ namespace Cryo
             Type *callee_type = node.callee()->get_resolved_type();
             LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression callee has resolved type: {} (kind={})",
                       callee_type ? callee_type->name() : "null",
-                      callee_type ? static_cast<int>(callee_type->kind()) : -1);
+                      callee_type ? TypeKindToString(callee_type->kind()) : "null");
 
             // Special handling for ScopeResolution callees
             if (node.callee()->kind() == NodeKind::ScopeResolution)
@@ -2932,7 +2939,7 @@ namespace Cryo
                     // Promote integer literals to match parameter types
                     const auto &param_types = func_type->parameter_types();
                     size_t fixed_params = func_type->is_variadic() ? param_types.size() - 1 : param_types.size();
-                    
+
                     for (size_t i = 0; i < fixed_params && i < node.arguments().size(); ++i)
                     {
                         auto &arg = node.arguments()[i];
@@ -2941,29 +2948,29 @@ namespace Cryo
                             LiteralNode *literal = static_cast<LiteralNode *>(arg.get());
                             Type *arg_type = arg->get_resolved_type();
                             Type *param_type = param_types[i].get();
-                            
+
                             // Check if this is an integer literal (represented as 'int' type) that should be promoted
-                            if (arg_type && param_type && 
-                                arg_type->name() == "int" && 
+                            if (arg_type && param_type &&
+                                arg_type->name() == "int" &&
                                 param_type->kind() == TypeKind::Integer &&
                                 literal->literal_kind() == TokenKind::TK_NUMERIC_CONSTANT)
                             {
                                 // Check if the literal value doesn't have a type suffix
                                 const std::string &value = literal->value();
-                                if (!value.ends_with("u8") && !value.ends_with("u16") && !value.ends_with("u32") && 
-                                    !value.ends_with("u64") && !value.ends_with("i8") && !value.ends_with("i16") && 
-                                    !value.ends_with("i32") && !value.ends_with("i64") && !value.ends_with("f32") && 
+                                if (!value.ends_with("u8") && !value.ends_with("u16") && !value.ends_with("u32") &&
+                                    !value.ends_with("u64") && !value.ends_with("i8") && !value.ends_with("i16") &&
+                                    !value.ends_with("i32") && !value.ends_with("i64") && !value.ends_with("f32") &&
                                     !value.ends_with("f64") && !value.ends_with("usize") && !value.ends_with("isize"))
                                 {
                                     // Promote the literal to the parameter type
-                                    LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Promoting integer literal from 'int' to '{}' for parameter {}", 
-                                             param_type->to_string(), i + 1);
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression: Promoting integer literal from 'int' to '{}' for parameter {}",
+                                              param_type->to_string(), i + 1);
                                     literal->set_resolved_type(param_type);
                                 }
                             }
                         }
                     }
-                    
+
                     Type *return_type = func_type->return_type().get();
                     if (return_type)
                     {
@@ -3271,7 +3278,7 @@ namespace Cryo
         if (object_type->name().find("HeapBlock") != std::string::npos)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "HEAPBLOCK DEBUG: type='{}', kind={} (7=Pointer, 10=Struct, 4=Class)",
-                      object_type->name(), static_cast<int>(object_type->kind()));
+                      object_type->name(), TypeKindToString(object_type->kind()));
         }
 
         if (object_type->kind() == TypeKind::Pointer)
@@ -3337,14 +3344,14 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_fields map", lookup_type_name);
-            
+
             // For generic types like "Array<int>", try looking up the base type "Array"
             size_t bracket_pos = lookup_type_name.find('<');
             if (bracket_pos != std::string::npos)
             {
                 std::string base_type_name = lookup_type_name.substr(0, bracket_pos);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Trying base type '{}' for generic type '{}'", base_type_name, lookup_type_name);
-                
+
                 auto base_struct_it = _struct_fields.find(base_type_name);
                 if (base_struct_it != _struct_fields.end())
                 {
@@ -3390,14 +3397,14 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_methods map", lookup_type_name);
-            
+
             // For generic types like "Array<int>", try looking up the base type "Array"
             size_t bracket_pos = lookup_type_name.find('<');
             if (bracket_pos != std::string::npos)
             {
                 std::string base_type_name = lookup_type_name.substr(0, bracket_pos);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Trying base type '{}' for generic method lookup", base_type_name);
-                
+
                 auto base_method_struct_it = _struct_methods.find(base_type_name);
                 if (base_method_struct_it != _struct_methods.end())
                 {
@@ -3459,14 +3466,14 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "No private methods found for type '{}'", lookup_type_name);
-            
+
             // For generic types like "Array<int>", try looking up the base type "Array"
             size_t bracket_pos = lookup_type_name.find('<');
             if (bracket_pos != std::string::npos)
             {
                 std::string base_type_name = lookup_type_name.substr(0, bracket_pos);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Trying base type '{}' for generic private method lookup", base_type_name);
-                
+
                 auto base_private_method_struct_it = _private_struct_methods.find(base_type_name);
                 if (base_private_method_struct_it != _private_struct_methods.end())
                 {
@@ -3542,7 +3549,7 @@ namespace Cryo
                   object_type ? object_type->name() : "null",
                   object_type ? static_cast<int>(object_type->kind()) : -1,
                   effective_type ? effective_type->name() : "null",
-                  effective_type ? static_cast<int>(effective_type->kind()) : -1);
+                  effective_type ? TypeKindToString(effective_type->kind()) : "null");
 
         // Use enhanced diagnostic builder for field access errors
         std::string type_name = effective_type ? effective_type->to_string() : "unknown";
@@ -4532,7 +4539,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "StructField registration check for '{}': current_struct='{}', field_type={}, kind={}",
                           field_name, _current_struct_name,
                           field_type ? field_type->name() : "null",
-                          field_type ? static_cast<int>(field_type->kind()) : -1);
+                          field_type ? TypeKindToString(field_type->kind()) : "null");
 
                 _struct_fields[_current_struct_name][field_name] = field_type;
                 LOG_DEBUG(Cryo::LogComponent::AST, "Registered struct field '{}' of type '{}' in struct/class '{}'",
@@ -4560,30 +4567,30 @@ namespace Cryo
         {
             // Check if this method was already registered during signature registration
             bool is_method_already_registered = false;
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found existing symbol '{}', current_struct_name='{}', checking method registries...", 
-                     method_name, _current_struct_name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found existing symbol '{}', current_struct_name='{}', checking method registries...",
+                      method_name, _current_struct_name);
             if (!_current_struct_name.empty())
             {
                 // Check if this method was already registered in the method registries
                 auto public_methods_it = _struct_methods.find(_current_struct_name);
                 auto private_methods_it = _private_struct_methods.find(_current_struct_name);
-                
-                bool found_in_public = (public_methods_it != _struct_methods.end() && 
-                                      public_methods_it->second.find(method_name) != public_methods_it->second.end());
-                bool found_in_private = (private_methods_it != _private_struct_methods.end() && 
-                                       private_methods_it->second.find(method_name) != private_methods_it->second.end());
-                
-                LOG_DEBUG(Cryo::LogComponent::AST, "StructMethod lookup for '{}': found_in_public={}, found_in_private={}", 
-                         method_name, found_in_public, found_in_private);
-                
+
+                bool found_in_public = (public_methods_it != _struct_methods.end() &&
+                                        public_methods_it->second.find(method_name) != public_methods_it->second.end());
+                bool found_in_private = (private_methods_it != _private_struct_methods.end() &&
+                                         private_methods_it->second.find(method_name) != private_methods_it->second.end());
+
+                LOG_DEBUG(Cryo::LogComponent::AST, "StructMethod lookup for '{}': found_in_public={}, found_in_private={}",
+                          method_name, found_in_public, found_in_private);
+
                 if (found_in_public || found_in_private)
                 {
                     is_method_already_registered = true;
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing redefinition error for struct method '{}' in '{}' - already registered during signature phase", 
-                             method_name, _current_struct_name);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing redefinition error for struct method '{}' in '{}' - already registered during signature phase",
+                              method_name, _current_struct_name);
                 }
             }
-            
+
             if (!is_method_already_registered)
             {
                 _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, node.location());
@@ -4917,14 +4924,14 @@ namespace Cryo
         {
             auto lhs_int = static_cast<IntegerType *>(lhs_type);
             auto rhs_int = static_cast<IntegerType *>(rhs_type);
-            
+
             // Check if RHS is the default 'int' type (likely from a literal)
             // and LHS is a larger integer type - allow safe promotion
             if (rhs_str == "int" && lhs_int->size_bytes() >= rhs_int->size_bytes())
             {
                 // Additional check: ensure we're not going from signed to unsigned
                 // unless the target type is larger
-                if (rhs_int->is_signed() == lhs_int->is_signed() || 
+                if (rhs_int->is_signed() == lhs_int->is_signed() ||
                     lhs_int->size_bytes() > rhs_int->size_bytes())
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", rhs_str, lhs_str);
@@ -4985,31 +4992,31 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Checking reference-to-pointer conversion: {} = {}", lhs_str, rhs_str);
             auto lhs_ptr = static_cast<PointerType *>(lhs_type);
             auto rhs_ref = static_cast<ReferenceType *>(rhs_type);
-            
+
             auto referenced_type = rhs_ref->referent_type();
             auto pointer_pointee = lhs_ptr->pointee_type();
-            
+
             // Check if RHS is a reference to an array type (special case for array-to-pointer)
             if (referenced_type && referenced_type->kind() == TypeKind::Array)
             {
                 auto array_type = static_cast<ArrayType *>(referenced_type.get());
                 auto element_type = array_type->element_type();
-                
+
                 // Check if the pointer's pointee type matches the array's element type
-                if (element_type && pointer_pointee && 
+                if (element_type && pointer_pointee &&
                     element_type->to_string() == pointer_pointee->to_string())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing array-to-pointer conversion: &{}[] = {}*", 
-                             element_type->to_string(), pointer_pointee->to_string());
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing array-to-pointer conversion: &{}[] = {}*",
+                              element_type->to_string(), pointer_pointee->to_string());
                     return true;
                 }
             }
             // Check if RHS is a reference to the same type as the pointer points to (general case)
-            else if (referenced_type && pointer_pointee && 
+            else if (referenced_type && pointer_pointee &&
                      referenced_type->to_string() == pointer_pointee->to_string())
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing reference-to-pointer conversion: &{} = {}*", 
-                         referenced_type->to_string(), pointer_pointee->to_string());
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing reference-to-pointer conversion: &{} = {}*",
+                          referenced_type->to_string(), pointer_pointee->to_string());
                 return true;
             }
         }
@@ -5025,7 +5032,7 @@ namespace Cryo
             auto rhs_pointee = rhs_ptr->pointee_type();
             LOG_DEBUG(Cryo::LogComponent::AST, "RHS pointee type: {} (kind={})",
                       (rhs_pointee ? rhs_pointee->to_string() : "NULL"),
-                      (rhs_pointee ? std::to_string(static_cast<int>(rhs_pointee->kind())) : "N/A"));
+                      (rhs_pointee ? TypeKindToString(rhs_pointee->kind()) : "N/A"));
 
             if (rhs_pointee && rhs_pointee->kind() == TypeKind::Void)
             {
@@ -5691,8 +5698,8 @@ namespace Cryo
         // Extract method information
         std::string method_name = node.name();
         bool is_constructor = node.is_constructor();
-        
-        LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: method_name='{}', struct='{}', is_constructor={}", 
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: method_name='{}', struct='{}', is_constructor={}",
                   method_name, _current_struct_name, is_constructor);
 
         // Get return type or use struct name for constructors
@@ -5766,14 +5773,16 @@ namespace Cryo
         {
             // Check if method already exists
             auto struct_it = _private_struct_methods.find(_current_struct_name);
-            if (struct_it != _private_struct_methods.end()) {
+            if (struct_it != _private_struct_methods.end())
+            {
                 auto method_it = struct_it->second.find(method_name);
-                if (method_it != struct_it->second.end()) {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Private method '{}' already exists for struct '{}' - DUPLICATE REGISTRATION", 
+                if (method_it != struct_it->second.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Private method '{}' already exists for struct '{}' - DUPLICATE REGISTRATION",
                               method_name, _current_struct_name);
                 }
             }
-            
+
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
             _private_struct_methods[_current_struct_name][method_name] = func_type;
@@ -5782,14 +5791,16 @@ namespace Cryo
         {
             // Check if method already exists
             auto struct_it = _struct_methods.find(_current_struct_name);
-            if (struct_it != _struct_methods.end()) {
+            if (struct_it != _struct_methods.end())
+            {
                 auto method_it = struct_it->second.find(method_name);
-                if (method_it != struct_it->second.end()) {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Public method '{}' already exists for struct '{}' - DUPLICATE REGISTRATION", 
+                if (method_it != struct_it->second.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Public method '{}' already exists for struct '{}' - DUPLICATE REGISTRATION",
                               method_name, _current_struct_name);
                 }
             }
-            
+
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
             _struct_methods[_current_struct_name][method_name] = func_type;

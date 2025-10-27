@@ -361,7 +361,7 @@ namespace Cryo::Codegen
             Cryo::Type *cryo_type = node.get_resolved_type();
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Variable Declaration: name='{}', type='{}', kind={}",
-                      var_name, (cryo_type ? cryo_type->to_string() : "nullptr"), 
+                      var_name, (cryo_type ? cryo_type->to_string() : "nullptr"),
                       (cryo_type ? static_cast<int>(cryo_type->kind()) : -1));
 
             if (!cryo_type)
@@ -630,24 +630,24 @@ namespace Cryo::Codegen
                 // Check if the initializer is a new expression to determine if this is heap-allocated
                 bool is_heap_allocated = false;
                 std::string destruction_type_name = cryo_type->to_string();
-                
+
                 if (node.has_initializer())
                 {
                     // Check if the initializer is a NewExpressionNode
-                    if (dynamic_cast<Cryo::NewExpressionNode*>(node.initializer()))
+                    if (dynamic_cast<Cryo::NewExpressionNode *>(node.initializer()))
                     {
                         is_heap_allocated = true;
-                        
+
                         // For heap-allocated objects, we need to register the pointee type for destruction
                         // not the pointer type. E.g., for Point*, we register Point for destruction.
-                        if (auto ptr_type = dynamic_cast<Cryo::PointerType*>(cryo_type))
+                        if (auto ptr_type = dynamic_cast<Cryo::PointerType *>(cryo_type))
                         {
                             destruction_type_name = ptr_type->pointee_type()->to_string();
                         }
                     }
                 }
-                
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registering variable {} of type {} for destruction (heap: {}, destructor type: {})", 
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registering variable {} of type {} for destruction (heap: {}, destructor type: {})",
                           var_name, cryo_type->to_string(), is_heap_allocated, destruction_type_name);
                 register_variable_for_destruction(var_name, destruction_type_name, alloca, is_heap_allocated);
 
@@ -698,10 +698,10 @@ namespace Cryo::Codegen
                                 {
                                     element_type_name = type_str.substr(start + 1, end - start - 1);
                                     // Remove spaces
-                                    element_type_name.erase(std::remove_if(element_type_name.begin(), 
-                                                                          element_type_name.end(), 
-                                                                          ::isspace), 
-                                                           element_type_name.end());
+                                    element_type_name.erase(std::remove_if(element_type_name.begin(),
+                                                                           element_type_name.end(),
+                                                                           ::isspace),
+                                                            element_type_name.end());
                                 }
                                 else
                                 {
@@ -741,17 +741,17 @@ namespace Cryo::Codegen
                                 if (constructor_type->getNumParams() >= 3)
                                 {
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using new Array(elements: T*, length: u64) constructor");
-                                    
+
                                     // Call constructor with 'this' pointer, elements pointer, and length
                                     std::vector<llvm::Value *> args;
-                                    args.push_back(alloca);              // 'this' pointer
-                                    args.push_back(array_ptr);           // elements: T* (pointer to array literal)
-                                    
-                                    llvm::Value* length_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size);
+                                    args.push_back(alloca);    // 'this' pointer
+                                    args.push_back(array_ptr); // elements: T* (pointer to array literal)
+
+                                    llvm::Value *length_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_literal_size);
                                     args.push_back(length_value); // length: u64
-                                    
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling constructor with args: this={}, elements={}, length={}", 
-                                             static_cast<void*>(alloca), static_cast<void*>(array_ptr), array_literal_size);
+
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling constructor with args: this={}, elements={}, length={}",
+                                              static_cast<void *>(alloca), static_cast<void *>(array_ptr), array_literal_size);
 
                                     builder.CreateCall(constructor_func, args);
 
@@ -774,9 +774,95 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        // Regular variable initialization
-                        node.initializer()->accept(*this);
-                        llvm::Value *init_value = get_current_value();
+                        bool is_address_of_array_access = false;
+                        llvm::Value *array_element_pointer = nullptr;
+
+                        // Check if this is a pointer variable being initialized with address-of Array<T> element
+                        if (cryo_type->kind() == TypeKind::Pointer)
+                        {
+                            // Check for &array[index] pattern
+                            if (auto *unary_expr = dynamic_cast<Cryo::UnaryExpressionNode *>(node.initializer()))
+                            {
+                                if (unary_expr->operator_token().to_string() == "&")
+                                {
+                                    if (auto *nested_array_access = dynamic_cast<Cryo::ArrayAccessNode *>(unary_expr->operand()))
+                                    {
+                                        // Generate the array access to get the element pointer (not value)
+                                        // For Array<T> types, we need special handling
+                                        if (auto *array_identifier = dynamic_cast<Cryo::IdentifierNode *>(nested_array_access->array()))
+                                        {
+                                            std::string array_var_name = array_identifier->name();
+                                            auto type_it = _variable_types.find(array_var_name);
+                                            if (type_it != _variable_types.end() && type_it->second)
+                                            {
+                                                Cryo::Type *array_var_type = type_it->second;
+                                                std::string type_str = array_var_type->to_string();
+                                                bool is_array_class = (type_str.find("Array<") == 0 || type_str.find("Array < ") == 0);
+
+                                                if (is_array_class)
+                                                {
+                                                    // Generate the index
+                                                    nested_array_access->index()->accept(*this);
+                                                    llvm::Value *index_val = get_generated_value(nested_array_access->index());
+
+                                                    // Get element type from pointer type
+                                                    auto *pointer_type = static_cast<Cryo::PointerType *>(cryo_type);
+                                                    Cryo::Type *element_cryo_type = pointer_type->pointee_type().get();
+                                                    llvm::Type *llvm_element_type = _type_mapper->map_type(element_cryo_type);
+
+                                                    // Get the Array variable's alloca
+                                                    llvm::Value *array_var_alloca = _value_context->get_value(array_var_name);
+                                                    if (array_var_alloca && index_val && llvm_element_type)
+                                                    {
+                                                        auto &builder = _context_manager.get_builder();
+                                                        auto &context = _context_manager.get_context();
+
+                                                        // Get Array<T> struct type
+                                                        llvm::Type *array_struct_type = _type_mapper->map_type(array_var_type);
+
+                                                        // Access elements field (index 0)
+                                                        llvm::Value *elements_field_ptr = builder.CreateStructGEP(
+                                                            array_struct_type,
+                                                            array_var_alloca,
+                                                            0,
+                                                            array_var_name + ".elements.ptr");
+
+                                                        // Load elements pointer
+                                                        llvm::Type *elements_ptr_type = llvm::PointerType::get(context, 0);
+                                                        llvm::Value *elements_ptr = builder.CreateLoad(
+                                                            elements_ptr_type,
+                                                            elements_field_ptr,
+                                                            array_var_name + ".elements.load");
+
+                                                        // Create GEP to get element pointer (don't load the value!)
+                                                        array_element_pointer = builder.CreateGEP(
+                                                            llvm_element_type,
+                                                            elements_ptr,
+                                                            {index_val},
+                                                            array_var_name + ".element.ptr");
+
+                                                        is_address_of_array_access = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        llvm::Value *init_value = nullptr;
+                        if (is_address_of_array_access && array_element_pointer)
+                        {
+                            // Use the generated element pointer directly
+                            init_value = array_element_pointer;
+                        }
+                        else
+                        {
+                            // Regular variable initialization
+                            node.initializer()->accept(*this);
+                            init_value = get_current_value();
+                        }
 
                         if (init_value)
                         {
@@ -1064,7 +1150,7 @@ namespace Cryo::Codegen
                 {
                     // Generate default destructor body: empty destructor for proper RAII
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating default destructor body for {}::{}", node.name(), method->name());
-                    
+
                     // Create basic block for destructor entry
                     llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", func);
                     _context_manager.get_builder().SetInsertPoint(entry_block);
@@ -1083,10 +1169,10 @@ namespace Cryo::Codegen
                         // Create format string for the printf call
                         std::string message = "Default destructor called for " + node.name() + " - At Address: %p\n";
                         llvm::Value *format_str = _context_manager.get_builder().CreateGlobalStringPtr(message, "destructor_msg");
-                        
+
                         // Get the 'this' pointer (first parameter of the destructor function)
                         llvm::Value *this_ptr = func->getArg(0);
-                        
+
                         _context_manager.get_builder().CreateCall(printf_func, {format_str, this_ptr});
                     }
 
@@ -1380,7 +1466,7 @@ namespace Cryo::Codegen
                 {
                     // Generate default destructor body: empty destructor for proper RAII
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating default destructor body for class {}::{}", class_name, method->name());
-                    
+
                     // Create basic block for destructor entry
                     llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", func);
                     _context_manager.get_builder().SetInsertPoint(entry_block);
@@ -1399,10 +1485,10 @@ namespace Cryo::Codegen
                         // Create format string for the printf call
                         std::string message = "Default destructor called for class " + class_name + " - At Address: %p\n";
                         llvm::Value *format_str = _context_manager.get_builder().CreateGlobalStringPtr(message, "class_destructor_msg");
-                        
+
                         // Get the 'this' pointer (first parameter of the destructor function)
                         llvm::Value *this_ptr = func->getArg(0);
-                        
+
                         _context_manager.get_builder().CreateCall(printf_func, {format_str, this_ptr});
                     }
 
@@ -1983,7 +2069,7 @@ namespace Cryo::Codegen
                     {
                         llvm::Type *expected_llvm_type = _type_mapper->map_type(expected_return_type);
                         llvm::Type *actual_type = return_value->getType();
-                        
+
                         // Check if we need implicit float conversion (float to double)
                         if (expected_llvm_type && actual_type != expected_llvm_type)
                         {
@@ -2249,13 +2335,13 @@ namespace Cryo::Codegen
             {
                 // Integer literal - check if it has a resolved type from TypeChecker
                 int64_t int_val = std::stoll(value_str);
-                
+
                 if (node.has_resolved_type())
                 {
                     // Use the resolved type from TypeChecker (e.g., promoted to u64)
                     Type *resolved_type = node.get_resolved_type();
                     llvm::Type *llvm_type = _type_mapper->map_type(resolved_type);
-                    
+
                     if (llvm_type && llvm_type->isIntegerTy())
                     {
                         literal_value = llvm::ConstantInt::get(llvm_type, int_val);
@@ -2758,7 +2844,7 @@ namespace Cryo::Codegen
         // Calculate the size of the struct for heap allocation
         const llvm::DataLayout &data_layout = module->getDataLayout();
         uint64_t struct_size = data_layout.getTypeAllocSize(struct_type);
-        
+
         // Call cryo_alloc to allocate memory on the heap
         llvm::Function *cryo_alloc_func = module->getFunction("cryo_alloc");
         if (!cryo_alloc_func)
@@ -2766,13 +2852,13 @@ namespace Cryo::Codegen
             report_error("cryo_alloc function not found for heap allocation", &node);
             return;
         }
-        
+
         // Create size argument for cryo_alloc (u64)
         llvm::Value *size_arg = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), struct_size);
-        
+
         // Call cryo_alloc to get void* pointer
         llvm::Value *heap_ptr = builder.CreateCall(cryo_alloc_func, {size_arg}, "heap_alloc");
-        
+
         // Cast void* to the struct type pointer
         llvm::Value *struct_ptr = builder.CreateBitCast(heap_ptr, llvm::PointerType::get(struct_type, 0), full_type_name + "_ptr");
 
@@ -2789,18 +2875,18 @@ namespace Cryo::Codegen
             {
                 constructor_name = full_type_name + "::" + base_type_name;
             }
-            
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for constructor: {}", constructor_name);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current namespace context: '{}'", _namespace_context);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Full type name: '{}', Base type name: '{}'", full_type_name, base_type_name);
-            
+
             // Debug: List all available functions
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available functions ({} total):", _functions.size());
-            for (const auto& [name, func] : _functions)
+            for (const auto &[name, func] : _functions)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function: '{}'", name);
             }
-            
+
             auto constructor_it = _functions.find(constructor_name);
 
             if (constructor_it != _functions.end())
@@ -3217,27 +3303,63 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array access: var_name='{}', is_nested={}",
                   array_var_name, (is_nested_access ? "true" : "false"));
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to check Array<T> condition: var_name empty={}, is_nested={}",
+                  array_var_name.empty(), is_nested_access);
+
         // Special handling for Array<T> types - treat them as direct array access
         if (!array_var_name.empty() && !is_nested_access)
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking for Array<T> special handling for variable: {}", array_var_name);
             auto type_it = _variable_types.find(array_var_name);
             if (type_it != _variable_types.end())
             {
                 Cryo::Type *var_type = type_it->second;
-                // Check if this is an Array<T> type
-                if (var_type && var_type->kind() == TypeKind::Array)
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found variable type: {} (kind={})", var_type ? var_type->to_string() : "null", var_type ? static_cast<int>(var_type->kind()) : -1);
+                // Check if this is an Array<T> type - could be Array or Class type
+                bool is_array_type = (var_type && (var_type->kind() == TypeKind::Array ||
+                                                   (var_type->kind() == TypeKind::Class && var_type->to_string().find("Array") == 0)));
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Is Array<T> type: {}", is_array_type ? "true" : "false");
+
+                if (is_array_type)
                 {
-                    auto *array_type = static_cast<ArrayType *>(var_type);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Special Array<T> direct access for variable '{}' of type '{}'",
                               array_var_name, var_type->to_string());
 
-                    // Get the element type directly from the ArrayType
-                    Cryo::Type *cryo_element_type = array_type->element_type().get();
-                    llvm::Type *llvm_element_type = cryo_element_type ? _type_mapper->map_type(cryo_element_type) : nullptr;
+                    // Get the element type - handle both ArrayType and Class types
+                    llvm::Type *llvm_element_type = nullptr;
+                    if (var_type->kind() == TypeKind::Array)
+                    {
+                        auto *array_type = static_cast<ArrayType *>(var_type);
+                        Cryo::Type *cryo_element_type = array_type->element_type().get();
+                        llvm_element_type = cryo_element_type ? _type_mapper->map_type(cryo_element_type) : nullptr;
+                    }
+                    else if (var_type->kind() == TypeKind::Class)
+                    {
+                        // For Array<T> class types, extract the T type from the type string
+                        std::string type_str = var_type->to_string();
+                        if (type_str.find("Array < int >") != std::string::npos)
+                        {
+                            llvm_element_type = llvm::Type::getInt32Ty(context);
+                        }
+                        else if (type_str.find("Array < f64 >") != std::string::npos)
+                        {
+                            llvm_element_type = llvm::Type::getDoubleTy(context);
+                        }
+                        else if (type_str.find("Array < float >") != std::string::npos)
+                        {
+                            llvm_element_type = llvm::Type::getFloatTy(context);
+                        }
+                        else
+                        {
+                            // Default to int32 if we can't determine the type
+                            llvm_element_type = llvm::Type::getInt32Ty(context);
+                        }
+                    }
 
                     if (!llvm_element_type)
                     {
-                        std::string element_type_str = cryo_element_type ? cryo_element_type->to_string() : "unknown";
+                        std::string element_type_str = "unknown";
                         report_error("Could not resolve element type for Array indexing: " + element_type_str, &node);
                         return;
                     }
@@ -3250,7 +3372,7 @@ namespace Cryo::Codegen
 
                         // Array<T> is a struct with fields: elements (T*), length (u64), capacity (u64)
                         // We need to access the 'elements' field (index 0) first
-                        
+
                         // Get the Array<T> struct type - we need to map it properly
                         llvm::Type *array_struct_type = _type_mapper->map_type(var_type);
                         if (!array_struct_type)
@@ -5310,27 +5432,27 @@ namespace Cryo::Codegen
 
                     // Fallback to general array access assignment handling for u8[] and other plain arrays
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Handling plain array assignment for variable '{}'", array_var_name);
-                    
+
                     // Generate the array pointer
                     left_array_access->array()->accept(*this);
                     llvm::Value *array_ptr = get_current_value();
-                    
+
                     if (!array_ptr)
                     {
                         report_error("Failed to generate array pointer for assignment");
                         return nullptr;
                     }
-                    
+
                     // Generate the index
                     left_array_access->index()->accept(*this);
                     llvm::Value *index_val = get_current_value();
-                    
+
                     if (!index_val)
                     {
                         report_error("Failed to generate index for array assignment");
                         return nullptr;
                     }
-                    
+
                     // Convert index to i32 if needed
                     auto &context = _context_manager.get_context();
                     if (index_val->getType() != llvm::Type::getInt32Ty(context))
@@ -5345,24 +5467,24 @@ namespace Cryo::Codegen
                             return nullptr;
                         }
                     }
-                    
+
                     // For plain arrays, array_ptr should be a pointer to array or array element type
                     if (array_ptr->getType()->isPointerTy())
                     {
                         // For modern LLVM, we need to determine the element type from context
                         // Since we know this is u8[] from the error context, let's use u8 type
                         llvm::Type *element_type = llvm::Type::getInt8Ty(context);
-                        
+
                         // Create GEP to access the element
                         llvm::Value *element_ptr = builder.CreateGEP(
                             element_type,
                             array_ptr,
                             {index_val},
                             "array.element.ptr");
-                        
+
                         // Store the value
                         create_store(right_val, element_ptr);
-                        
+
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated plain array element assignment successfully");
                         return right_val;
                     }
@@ -6121,7 +6243,7 @@ namespace Cryo::Codegen
                     llvm::Value *left_int = builder.CreatePtrToInt(left_val, intptr_type, "left_int");
                     llvm::Value *right_int = builder.CreatePtrToInt(right_val, intptr_type, "right_int");
                     llvm::Value *diff = builder.CreateSub(left_int, right_int, "ptr_diff");
-                    
+
                     // For proper pointer difference, divide by element size
                     // Assume 4 bytes for int* for now
                     llvm::Value *element_size_val = llvm::ConstantInt::get(intptr_type, 4);
@@ -6593,7 +6715,7 @@ namespace Cryo::Codegen
                 // 3. Store the result back to the left operand
 
                 llvm::Value *lvalue_ptr = nullptr;
-                
+
                 // Get the left-hand side as an lvalue (address)
                 if (auto *left_identifier = dynamic_cast<IdentifierNode *>(node->left()))
                 {
@@ -6616,7 +6738,7 @@ namespace Cryo::Codegen
                     // Handle member access (e.g., p.x += 10)
                     // We need to generate the address of the member, not its value
                     lvalue_ptr = generate_member_field_address(member_access);
-                    
+
                     // If that failed, try a more simplified approach
                     if (!lvalue_ptr)
                     {
@@ -6624,11 +6746,11 @@ namespace Cryo::Codegen
                         // Use similar logic to normal member access visitor
                         llvm::Value *object_ptr = nullptr;
                         std::string var_name;
-                        
+
                         if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
                         {
                             var_name = identifier->name();
-                            
+
                             // Try to get the alloca or value
                             object_ptr = _value_context->get_alloca(var_name);
                             if (!object_ptr)
@@ -6644,11 +6766,11 @@ namespace Cryo::Codegen
                                 }
                             }
                         }
-                        
+
                         if (object_ptr)
                         {
                             std::string member_name = member_access->member();
-                            
+
                             // Use resolved type from TypeChecker if available
                             if (member_access->object() && member_access->object()->has_resolved_type())
                             {
@@ -6661,7 +6783,7 @@ namespace Cryo::Codegen
                                     {
                                         Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
                                         effective_type = ptr_type->pointee_type().get();
-                                        
+
                                         // For pointer variables, we need to load the pointer first
                                         object_ptr = builder.CreateLoad(object_ptr->getType(), object_ptr, "struct_ptr");
                                     }
@@ -6671,7 +6793,7 @@ namespace Cryo::Codegen
                                         std::string type_name = effective_type->name();
                                         llvm::Type *struct_type = _type_mapper->map_type(effective_type);
                                         int field_index = _type_mapper->get_field_index(type_name, member_name);
-                                        
+
                                         if (struct_type && field_index != -1)
                                         {
                                             if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(struct_type))
@@ -6694,7 +6816,7 @@ namespace Cryo::Codegen
 
                 // Load the current value - determine the actual field type
                 llvm::Type *element_type = nullptr;
-                
+
                 // Try to determine the field type from the struct definition
                 if (lvalue_ptr)
                 {
@@ -6713,13 +6835,13 @@ namespace Cryo::Codegen
                         element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
                     }
                 }
-                
+
                 // Fallback to i32 if we can't determine the type
                 if (!element_type)
                 {
                     element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
                 }
-                
+
                 llvm::Value *current_value = builder.CreateLoad(element_type, lvalue_ptr, "compound.load");
 
                 // Evaluate the right-hand side
@@ -6733,7 +6855,7 @@ namespace Cryo::Codegen
 
                 // Perform the operation based on the compound operator
                 llvm::Value *operation_result = nullptr;
-                
+
                 // Manually perform the operation based on the compound operator type
                 if (op_kind == TokenKind::TK_PLUSEQUAL)
                 {
@@ -6842,7 +6964,7 @@ namespace Cryo::Codegen
                     report_error("Failed to generate operation for compound assignment - operation_result is null");
                     return nullptr;
                 }
-                
+
                 if (!lvalue_ptr)
                 {
                     report_error("Failed to generate operation for compound assignment - lvalue_ptr is null");
@@ -7235,25 +7357,25 @@ namespace Cryo::Codegen
             {
                 // Handle &obj.field - need to get the field pointer, not the value
                 // We need to manually generate the member access to get the pointer
-                
+
                 // Generate the object
                 memberAccessNode->object()->accept(*this);
                 llvm::Value *object_ptr = get_generated_value(memberAccessNode->object());
-                
+
                 if (!object_ptr)
                 {
                     report_error("Failed to generate object for member access in address-of", operand);
                     return nullptr;
                 }
-                
+
                 // Get the field info from the member access
                 std::string member_name = memberAccessNode->member();
-                
+
                 // Resolve the struct type and field index
                 llvm::Type *struct_type = nullptr;
                 std::string type_name;
                 int field_index = -1;
-                
+
                 // Use resolved type from TypeChecker (most reliable)
                 if (memberAccessNode->object() && memberAccessNode->object()->has_resolved_type())
                 {
@@ -7267,7 +7389,7 @@ namespace Cryo::Codegen
                             Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
                             effective_type = ptr_type->pointee_type().get();
                         }
-                        
+
                         if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class)
                         {
                             type_name = effective_type->name();
@@ -7276,13 +7398,13 @@ namespace Cryo::Codegen
                         }
                     }
                 }
-                
+
                 if (!struct_type || field_index == -1)
                 {
                     report_error("Could not resolve struct type or field for address-of member access: " + member_name, operand);
                     return nullptr;
                 }
-                
+
                 // Handle pointer dereferencing if needed
                 llvm::Value *struct_ptr = object_ptr;
                 if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
@@ -7294,7 +7416,7 @@ namespace Cryo::Codegen
                         struct_ptr = create_load(object_ptr, allocated_type, "struct_ptr");
                     }
                 }
-                
+
                 // Create GEP to get field pointer
                 llvm::Value *field_ptr = builder.CreateStructGEP(struct_type, struct_ptr, field_index, member_name + "_addr");
                 return field_ptr;
@@ -7302,39 +7424,39 @@ namespace Cryo::Codegen
             else if (auto arrayAccessNode = dynamic_cast<Cryo::ArrayAccessNode *>(operand))
             {
                 ("DEBUG: Address-of Array Access detected\n");
-                
+
                 // Handle &arr[index] - need to get the element pointer, not the value
                 // We need to manually generate the array access to get the pointer
-                
+
                 // For address-of operations, we need the alloca, not the loaded value
                 // So we can't use arrayAccessNode->array()->accept(*this) as it loads the value
-                
+
                 llvm::Value *array_alloca = nullptr;
                 std::string array_var_name;
-                
+
                 if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(arrayAccessNode->array()))
                 {
                     array_var_name = identifier->name();
                     array_alloca = _value_context->get_alloca(array_var_name);
                     ("DEBUG: Array variable name: %s, alloca: %p\n", array_var_name.c_str(), array_alloca);
                 }
-                
+
                 // Generate the index
                 arrayAccessNode->index()->accept(*this);
                 llvm::Value *index_val = get_generated_value(arrayAccessNode->index());
-                
+
                 if (!array_alloca || !index_val)
                 {
                     ("DEBUG: Failed to get array_alloca or index_val\n");
                     report_error("Failed to generate array alloca or index for array access in address-of", operand);
                     return nullptr;
                 }
-                
+
                 ("DEBUG: Got alloca and index, checking variable types\n");
-                
+
                 // Determine element type - simplified approach for address-of
                 llvm::Type *element_type = nullptr;
-                
+
                 // Try to get element type from array variable type info
                 if (!array_var_name.empty())
                 {
@@ -7344,17 +7466,17 @@ namespace Cryo::Codegen
                         ("DEBUG: Found variable type for %s\n", array_var_name.c_str());
                         Cryo::Type *var_type = type_it->second;
                         ("DEBUG: Variable type string: %s, kind: %d\n", var_type->to_string().c_str(), (int)var_type->kind());
-                        
+
                         // Check for both direct Array type and Array<T> template types
                         std::string type_str = var_type->to_string();
-                        bool is_array_type = (var_type->kind() == TypeKind::Array) || 
-                                           (type_str.find("Array") == 0 && type_str.find("<") != std::string::npos);
-                        
+                        bool is_array_type = (var_type->kind() == TypeKind::Array) ||
+                                             (type_str.find("Array") == 0 && type_str.find("<") != std::string::npos);
+
                         if (is_array_type)
                         {
                             ("DEBUG: Variable type is Array\n");
                             Cryo::Type *cryo_element_type = nullptr;
-                            
+
                             // Handle different array type representations
                             if (var_type->kind() == TypeKind::Array)
                             {
@@ -7372,8 +7494,8 @@ namespace Cryo::Codegen
                                     {
                                         // Get the first type parameter (T in Array<T>)
                                         cryo_element_type = parameterized_type->type_parameters()[0].get();
-                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got element type from ParameterizedClassType: %s\n", 
-                                                   cryo_element_type ? cryo_element_type->to_string().c_str() : "null");
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got element type from ParameterizedClassType: %s\n",
+                                                  cryo_element_type ? cryo_element_type->to_string().c_str() : "null");
                                     }
                                     else
                                     {
@@ -7391,8 +7513,8 @@ namespace Cryo::Codegen
                                         {
                                             // Get the first type parameter (T in Array<T>)
                                             cryo_element_type = param_type->type_parameters()[0].get();
-                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got element type from ParameterizedType: %s\n", 
-                                                       cryo_element_type ? cryo_element_type->to_string().c_str() : "null");
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got element type from ParameterizedType: %s\n",
+                                                      cryo_element_type ? cryo_element_type->to_string().c_str() : "null");
                                         }
                                         else
                                         {
@@ -7416,7 +7538,7 @@ namespace Cryo::Codegen
                                             element_type_name.erase(0, element_type_name.find_first_not_of(" \t"));
                                             element_type_name.erase(element_type_name.find_last_not_of(" \t") + 1);
                                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Extracted element type name: '%s'\n", element_type_name.c_str());
-                                            
+
                                             // Look up the type by name - remove primitive type call
                                             // For now, hard-code common types
                                             if (element_type_name == "int")
@@ -7455,7 +7577,7 @@ namespace Cryo::Codegen
                                     }
                                 }
                             }
-                            
+
                             if (cryo_element_type)
                             {
                                 element_type = _type_mapper->map_type(cryo_element_type);
@@ -7466,24 +7588,26 @@ namespace Cryo::Codegen
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array alloca is pointer type, performing Array<T> special handling\n");
 
                                     // Cast to AllocaInst to get the allocated type
-                                    auto* alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(array_alloca);
-                                    if (!alloca_inst) {
+                                    auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(array_alloca);
+                                    if (!alloca_inst)
+                                    {
                                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array value is not an AllocaInst\n");
                                         return nullptr;
                                     }
-                                    
+
                                     // Get the actual LLVM struct type from the alloca
-                                    llvm::Type* alloca_struct_type = alloca_inst->getAllocatedType();
-                                    if (!alloca_struct_type || !alloca_struct_type->isStructTy()) {
+                                    llvm::Type *alloca_struct_type = alloca_inst->getAllocatedType();
+                                    if (!alloca_struct_type || !alloca_struct_type->isStructTy())
+                                    {
                                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array alloca does not point to a struct type\n");
                                         return nullptr;
                                     }
-                                    
+
                                     // For Array<T> types, we need to use the monomorphized type name
                                     // Convert "Array < int >" to "Array_int"
                                     std::string var_type_str = var_type->to_string();
                                     std::string monomorphized_name = "Array";
-                                    
+
                                     // Extract element type and create monomorphized name
                                     size_t start = var_type_str.find('<');
                                     size_t end = var_type_str.find('>', start);
@@ -7499,8 +7623,9 @@ namespace Cryo::Codegen
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using monomorphized type name: %s\n", monomorphized_name.c_str());
 
                                     // Get the struct type by the monomorphized name
-                                    llvm::Type* array_struct_type = _type_mapper->get_struct_type(monomorphized_name);
-                                    if (!array_struct_type) {
+                                    llvm::Type *array_struct_type = _type_mapper->get_struct_type(monomorphized_name);
+                                    if (!array_struct_type)
+                                    {
                                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Failed to get monomorphized struct type: %s\n", monomorphized_name.c_str());
                                         return nullptr;
                                     }
@@ -7550,7 +7675,7 @@ namespace Cryo::Codegen
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Variable type not found for %s\n", array_var_name.c_str());
                     }
                 }
-                
+
                 // If Array<T> special handling failed, use traditional approach
                 llvm::Value *array_ptr = nullptr;
                 if (!array_alloca)
@@ -7576,13 +7701,13 @@ namespace Cryo::Codegen
                         array_ptr = array_alloca;
                     }
                 }
-                
+
                 // Fallback to int32 if we can't determine the type
                 if (!element_type)
                 {
                     element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
                 }
-                
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fallback code - creating GEP with array_ptr (type: %s)\n", array_ptr ? "valid" : "null");
 
                 // Create GEP to get element pointer (non-Array<T> case)
@@ -10584,16 +10709,16 @@ namespace Cryo::Codegen
             if (_current_function && !_current_function->scope_stack.empty())
             {
                 ScopeContext &current_scope = _current_function->scope_stack.back();
-                
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Exiting scope with {} destructors to call", 
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Exiting scope with {} destructors to call",
                           current_scope.destructors.size());
-                
+
                 // Call destructors in reverse order (LIFO - last in, first out)
                 for (auto it = current_scope.destructors.rbegin(); it != current_scope.destructors.rend(); ++it)
                 {
                     const DestructorInfo &destructor_info = *it;
                     std::string destructor_method_name = "~" + destructor_info.type_name;
-                    
+
                     // Construct the qualified destructor name to match the actual function name
                     std::string destructor_name;
                     if (!_namespace_context.empty())
@@ -10604,19 +10729,19 @@ namespace Cryo::Codegen
                     {
                         destructor_name = destructor_info.type_name + "::" + destructor_method_name;
                     }
-                    
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for destructor function: {}", destructor_name);
-                    
+
                     llvm::Function *destructor_fn = _context_manager.get_module()->getFunction(destructor_name);
                     if (destructor_fn)
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found destructor function, calling for variable: {}", 
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found destructor function, calling for variable: {}",
                                   destructor_info.variable_name);
-                        
+
                         // For stack objects, call destructor with the alloca directly
                         // For heap objects, we need to call the destructor on the pointed-to object
                         llvm::Value *object_ptr = destructor_info.variable_value;
-                        
+
                         if (destructor_info.is_heap_allocated)
                         {
                             // For heap objects (pointers), we need to:
@@ -10624,12 +10749,12 @@ namespace Cryo::Codegen
                             // 2. Call the destructor on the object
                             // 3. Call cryo_free on the object
                             llvm::Value *heap_object_ptr = _context_manager.get_builder().CreateLoad(
-                                llvm::PointerType::get(_context_manager.get_context(), 0), 
+                                llvm::PointerType::get(_context_manager.get_context(), 0),
                                 object_ptr, "heap_object_ptr");
-                                
+
                             // Call destructor on the heap object
                             _context_manager.get_builder().CreateCall(destructor_fn, {heap_object_ptr});
-                            
+
                             // Free the heap memory
                             llvm::Function *cryo_free_func = _context_manager.get_module()->getFunction("cryo_free");
                             if (cryo_free_func)
@@ -11545,16 +11670,16 @@ namespace Cryo::Codegen
         {
             destructor_name = type_name + "::" + destructor_method_name;
         }
-        
+
         llvm::Function *destructor_fn = _context_manager.get_module()->getFunction(destructor_name);
         return destructor_fn != nullptr;
     }
 
     void CodegenVisitor::register_variable_for_destruction(const std::string &variable_name, const std::string &type_name, llvm::Value *value, bool is_heap_allocated)
     {
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "register_variable_for_destruction called: {} type:{} heap:{}", 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "register_variable_for_destruction called: {} type:{} heap:{}",
                   variable_name, type_name, is_heap_allocated);
-        
+
         if (!has_destructor(type_name))
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type {} does not have a destructor, skipping registration", type_name);
@@ -11571,8 +11696,8 @@ namespace Cryo::Codegen
         // Add to the current scope's destructor list
         ScopeContext &current_scope = _current_function->scope_stack.back();
         current_scope.destructors.push_back(DestructorInfo(variable_name, value, type_name, is_heap_allocated));
-        
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully registered {} for destruction. Total destructors in scope: {}", 
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully registered {} for destruction. Total destructors in scope: {}",
                   variable_name, current_scope.destructors.size());
     }
 
@@ -11879,19 +12004,19 @@ namespace Cryo::Codegen
         {
             constructor_name = _namespace_context + "::" + type_name;
         }
-        
+
         // Try multiple constructor name patterns
         std::vector<std::string> constructor_names = {
-            constructor_name + "::" + type_name,  // Full::Namespace::Type::Type
-            constructor_name,                      // Full::Namespace::Type
-            type_name + "::" + type_name,         // Type::Type
-            type_name                             // Type
+            constructor_name + "::" + type_name, // Full::Namespace::Type::Type
+            constructor_name,                    // Full::Namespace::Type
+            type_name + "::" + type_name,        // Type::Type
+            type_name                            // Type
         };
 
         auto func_it = _functions.end();
         llvm::Function *constructor_func = nullptr;
-        
-        for (const auto& name : constructor_names)
+
+        for (const auto &name : constructor_names)
         {
             func_it = _functions.find(name);
             if (func_it != _functions.end())
@@ -11901,11 +12026,11 @@ namespace Cryo::Codegen
                 break;
             }
         }
-        
+
         if (!constructor_func)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available constructor functions:");
-            for (const auto& pair : _functions)
+            for (const auto &pair : _functions)
             {
                 if (pair.first.find(type_name) != std::string::npos)
                 {
@@ -11956,15 +12081,15 @@ namespace Cryo::Codegen
             return nullptr;
 
         auto &builder = _context_manager.get_builder();
-        
+
         // Get the object pointer
         llvm::Value *object_ptr = nullptr;
         std::string var_name;
-        
+
         if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(node->object()))
         {
             var_name = identifier->name();
-            
+
             // Try to get the alloca or value
             object_ptr = _value_context->get_alloca(var_name);
             if (!object_ptr)
@@ -11993,7 +12118,7 @@ namespace Cryo::Codegen
         }
 
         std::string member_name = node->member();
-        
+
         // Get the struct type and field index
         llvm::StructType *struct_type = nullptr;
         std::string type_name;
@@ -12006,14 +12131,14 @@ namespace Cryo::Codegen
             if (var_type_it != _variable_types.end())
             {
                 Cryo::Type *cryo_type = var_type_it->second;
-                
+
                 // Handle pointer types - get the pointee type
-                if (auto *ptr_type = dynamic_cast<Cryo::PointerType*>(cryo_type))
+                if (auto *ptr_type = dynamic_cast<Cryo::PointerType *>(cryo_type))
                 {
                     cryo_type = ptr_type->pointee_type().get();
                 }
-                
-                if (auto *struct_cryo_type = dynamic_cast<Cryo::StructType*>(cryo_type))
+
+                if (auto *struct_cryo_type = dynamic_cast<Cryo::StructType *>(cryo_type))
                 {
                     type_name = struct_cryo_type->name();
                     struct_type = llvm::dyn_cast<llvm::StructType>(_type_mapper->map_type(cryo_type));
@@ -12048,7 +12173,7 @@ namespace Cryo::Codegen
 
         // Generate the field address
         llvm::Value *field_ptr = nullptr;
-        
+
         // Check if object_ptr is a pointer to the struct or the struct itself
         if (object_ptr->getType()->isPointerTy())
         {
@@ -12059,7 +12184,7 @@ namespace Cryo::Codegen
                 auto var_type_it = _variable_types.find(var_name);
                 if (var_type_it != _variable_types.end())
                 {
-                    if (auto *ptr_cryo_type = dynamic_cast<Cryo::PointerType*>(var_type_it->second))
+                    if (auto *ptr_cryo_type = dynamic_cast<Cryo::PointerType *>(var_type_it->second))
                     {
                         // This is a pointer variable, so object_ptr is alloca storing the pointer
                         llvm::Value *actual_ptr = builder.CreateLoad(object_ptr->getType(), object_ptr, "struct_ptr");
