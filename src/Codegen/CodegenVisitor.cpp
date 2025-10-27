@@ -278,15 +278,48 @@ namespace Cryo::Codegen
                 return;
             }
 
+            // Generate unique registration key for constructor overloads
+            std::string registration_key = node.name();
+            std::string qualified_registration_key;
+
+            // For constructors, include parameter types in the key to handle overloads
+            auto struct_method = dynamic_cast<Cryo::StructMethodNode *>(&node);
+            if (struct_method && struct_method->is_constructor())
+            {
+                std::string param_signature = "(";
+                for (size_t i = 0; i < node.parameters().size(); ++i)
+                {
+                    if (i > 0)
+                        param_signature += ",";
+                    auto param = node.parameters()[i].get();
+                    if (param && param->get_resolved_type())
+                    {
+                        param_signature += param->get_resolved_type()->to_string();
+                    }
+                    else
+                    {
+                        param_signature += "unknown";
+                    }
+                }
+                param_signature += ")";
+                registration_key = node.name() + param_signature;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor signature-based key: {}", registration_key);
+            }
+
             // Register the function in symbol table with multiple lookup keys
-            _functions[node.name()] = function; // Simple name lookup
+            _functions[node.name()] = function;      // Simple name lookup (keep for backward compatibility)
+            _functions[registration_key] = function; // Signature-based lookup for overloads
 
             // Also register with namespace-qualified name if we're in a namespace
             if (!_namespace_context.empty())
             {
-                std::string qualified_name = _namespace_context + "::" + node.name();
-                _functions[qualified_name] = function;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered function with qualified name: {}", qualified_name);
+                qualified_registration_key = _namespace_context + "::" + registration_key;
+                _functions[qualified_registration_key] = function;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered function with qualified signature-based key: {}", qualified_registration_key);
+
+                // Also register the simple qualified name for backward compatibility
+                std::string simple_qualified_name = _namespace_context + "::" + node.name();
+                _functions[simple_qualified_name] = function;
             }
 
             register_value(&node, function);
@@ -712,21 +745,49 @@ namespace Cryo::Codegen
                             std::string monomorphized_name = "Array_" + element_type_name;
 
                             // Find the constructor function - include namespace context
+                            // After MonomorphizationPass, constructors are named after the specialized class name
                             std::string constructor_name;
+                            std::string constructor_signature_name;
                             if (!_namespace_context.empty())
                             {
-                                constructor_name = _namespace_context + "::" + monomorphized_name + "::" + "Array";
+                                constructor_name = _namespace_context + "::" + monomorphized_name + "::" + monomorphized_name;
+                                // For array literals, we specifically want Array_int(elements: T*, length: u64)
+                                constructor_signature_name = _namespace_context + "::" + monomorphized_name + "::" + monomorphized_name + "(" + element_type_name + "*,u64)";
                             }
                             else
                             {
-                                constructor_name = monomorphized_name + "::" + "Array";
+                                constructor_name = monomorphized_name + "::" + monomorphized_name;
+                                constructor_signature_name = monomorphized_name + "::" + monomorphized_name + "(" + element_type_name + "*,u64)";
                             }
-                            auto constructor_it = _functions.find(constructor_name);
+
+                            // Try to find the specific constructor overload first
+                            auto constructor_it = _functions.find(constructor_signature_name);
+                            if (constructor_it == _functions.end())
+                            {
+                                // Try alternative signature with generic T* instead of concrete type
+                                std::string alt_signature_name;
+                                if (!_namespace_context.empty())
+                                {
+                                    alt_signature_name = _namespace_context + "::" + monomorphized_name + "::" + monomorphized_name + "(T*,u64)";
+                                }
+                                else
+                                {
+                                    alt_signature_name = monomorphized_name + "::" + monomorphized_name + "(T*,u64)";
+                                }
+                                constructor_it = _functions.find(alt_signature_name);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying alternative constructor signature: {}", alt_signature_name);
+                            }
+                            if (constructor_it == _functions.end())
+                            {
+                                // Fallback to simple name lookup
+                                constructor_it = _functions.find(constructor_name);
+                            }
 
                             if (constructor_it != _functions.end())
                             {
                                 llvm::Function *constructor_func = constructor_it->second;
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found Array constructor: {}", constructor_name);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found Array constructor: {} (using signature: {})",
+                                          constructor_name, constructor_signature_name);
 
                                 // Get the builder from context manager
                                 auto &builder = _context_manager.get_builder();
@@ -922,6 +983,16 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic struct detected: {} with {} type parameters",
                       node.name(), node.generic_parameters().size());
 
+            // Debug: Log the generic parameters to see what's causing Array_int to be treated as generic
+            for (size_t i = 0; i < node.generic_parameters().size(); ++i)
+            {
+                auto param = node.generic_parameters()[i].get();
+                if (param)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Generic parameter {}: {}", i, param->name());
+                }
+            }
+
             // For generic structs, we don't generate the LLVM type immediately
             // Instead, we just register that this is a generic struct template
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered generic struct template: {}", node.name());
@@ -977,6 +1048,30 @@ namespace Cryo::Codegen
                 else
                 {
                     qualified_name = node.name() + "::" + method_name;
+                }
+
+                // For constructors, include parameter signature in the LLVM IR function name to prevent conflicts
+                bool is_constructor = (method_name == node.name()); // Constructor has same name as struct
+                if (is_constructor)
+                {
+                    std::string param_signature = "(";
+                    for (size_t i = 0; i < method->parameters().size(); ++i)
+                    {
+                        if (i > 0)
+                            param_signature += ",";
+                        auto param = method->parameters()[i].get();
+                        if (param && param->get_resolved_type())
+                        {
+                            param_signature += param->get_resolved_type()->to_string();
+                        }
+                        else
+                        {
+                            param_signature += "unknown";
+                        }
+                    }
+                    param_signature += ")";
+                    qualified_name += param_signature;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor LLVM IR name with signature: {}", qualified_name);
                 }
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Full qualified struct method name: {}", qualified_name);
@@ -1258,6 +1353,38 @@ namespace Cryo::Codegen
                     qualified_name = class_name + "::" + method_name;
                 }
 
+                // For constructors, include parameter signature in the LLVM IR function name to prevent conflicts
+                bool is_constructor = (method_name == class_name);
+                if (is_constructor)
+                {
+                    std::string param_signature = "(";
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Building signature for constructor {}, {} parameters",
+                              method_name, method->parameters().size());
+                    for (size_t i = 0; i < method->parameters().size(); ++i)
+                    {
+                        if (i > 0)
+                            param_signature += ",";
+                        auto param = method->parameters()[i].get();
+                        if (param && param->get_resolved_type())
+                        {
+                            std::string param_type_str = param->get_resolved_type()->to_string();
+                            param_signature += param_type_str;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: {})",
+                                      i, param->name(), param_type_str);
+                        }
+                        else
+                        {
+                            param_signature += "unknown";
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: UNKNOWN - param={}, resolved_type={})",
+                                      i, param ? param->name() : "null", param ? "non-null" : "null",
+                                      (param && param->get_resolved_type()) ? "non-null" : "null");
+                        }
+                    }
+                    param_signature += ")";
+                    qualified_name += param_signature;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class constructor LLVM IR name with signature: {}", qualified_name);
+                }
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Full qualified method name: {}", qualified_name);
 
                 // Build parameter types - static methods don't need 'this' parameter
@@ -1350,16 +1477,66 @@ namespace Cryo::Codegen
                     qualified_name = class_name + "::" + method_name;
                 }
 
+                // For constructors, include parameter signature in the LLVM IR function name to prevent conflicts
+                bool is_constructor = (method_name == class_name);
+                std::string current_param_signature;
+                if (is_constructor)
+                {
+                    std::string param_signature = "(";
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Building signature for constructor body {}, {} parameters",
+                              method_name, method->parameters().size());
+                    for (size_t i = 0; i < method->parameters().size(); ++i)
+                    {
+                        if (i > 0)
+                            param_signature += ",";
+                        auto param = method->parameters()[i].get();
+                        if (param && param->get_resolved_type())
+                        {
+                            std::string param_type_str = param->get_resolved_type()->to_string();
+                            param_signature += param_type_str;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Body Parameter {}: {} (type: {})",
+                                      i, param->name(), param_type_str);
+                        }
+                        else
+                        {
+                            param_signature += "unknown";
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Body Parameter {}: {} (type: UNKNOWN)",
+                                      i, param ? param->name() : "null");
+                        }
+                    }
+                    param_signature += ")";
+                    current_param_signature = param_signature;
+                    qualified_name += param_signature;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor body generation - matching signature: {}", param_signature);
+                }
+
                 // Retrieve the function we created in pass 1
                 auto func_it = _functions.find(qualified_name);
                 if (func_it == _functions.end())
                 {
-                    std::cerr << "[ERROR] Failed to find function declaration for method: " << qualified_name << std::endl;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping method body generation - function not found: {}", qualified_name);
                     continue;
                 }
                 llvm::Function *func = func_it->second;
 
                 bool is_static = method->is_static();
+
+                // Log which constructor body we're generating
+                if (is_constructor)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating constructor body for qualified name: {}", qualified_name);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current method signature: {}", current_param_signature);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor has {} parameters", method->parameters().size());
+                    for (size_t i = 0; i < method->parameters().size(); ++i)
+                    {
+                        auto param = method->parameters()[i].get();
+                        if (param && param->get_resolved_type())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} of type {}",
+                                      i, param->name(), param->get_resolved_type()->to_string());
+                        }
+                    }
+                }
 
                 // Generate method body if it exists
                 if (method->body())
@@ -2867,6 +3044,8 @@ namespace Cryo::Codegen
         {
             // Look up the constructor function - need to include namespace context
             std::string constructor_name;
+            std::string constructor_signature_name;
+            
             if (!_namespace_context.empty())
             {
                 constructor_name = _namespace_context + "::" + full_type_name + "::" + base_type_name;
@@ -2876,7 +3055,34 @@ namespace Cryo::Codegen
                 constructor_name = full_type_name + "::" + base_type_name;
             }
 
+            // Generate signature-based constructor name for overload resolution
+            if (!_namespace_context.empty())
+            {
+                constructor_signature_name = _namespace_context + "::" + full_type_name + "::" + base_type_name + "(";
+            }
+            else
+            {
+                constructor_signature_name = full_type_name + "::" + base_type_name + "(";
+            }
+            
+            // Add parameter types to signature
+            for (size_t i = 0; i < node.arguments().size(); ++i)
+            {
+                if (i > 0) constructor_signature_name += ",";
+                auto arg = node.arguments()[i].get();
+                if (arg && arg->get_resolved_type())
+                {
+                    constructor_signature_name += arg->get_resolved_type()->to_string();
+                }
+                else
+                {
+                    constructor_signature_name += "unknown";
+                }
+            }
+            constructor_signature_name += ")";
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for constructor: {}", constructor_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for signature-based constructor: {}", constructor_signature_name);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current namespace context: '{}'", _namespace_context);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Full type name: '{}', Base type name: '{}'", full_type_name, base_type_name);
 
@@ -2887,12 +3093,18 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Function: '{}'", name);
             }
 
-            auto constructor_it = _functions.find(constructor_name);
+            // Try signature-based constructor first
+            auto constructor_it = _functions.find(constructor_signature_name);
+            if (constructor_it == _functions.end())
+            {
+                // Fallback to old naming scheme for compatibility
+                constructor_it = _functions.find(constructor_name);
+            }
 
             if (constructor_it != _functions.end())
             {
                 llvm::Function *constructor_func = constructor_it->second;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling constructor: {}", constructor_name);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found constructor: {}", constructor_it->first);
 
                 // Prepare arguments: this pointer + constructor arguments
                 std::vector<llvm::Value *> args;
@@ -3853,7 +4065,7 @@ namespace Cryo::Codegen
             if (resolved_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using resolved type from TypeChecker: {} (kind={})",
-                          resolved_type->name(), static_cast<int>(resolved_type->kind()));
+                          resolved_type->name(), TypeKindToString(resolved_type->kind()));
 
                 // For pointer types, get the pointed-to type
                 Cryo::Type *effective_type = resolved_type;
@@ -3864,7 +4076,7 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Dereferencing pointer type to: {}", effective_type->name());
                 }
 
-                if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class)
+                if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class || effective_type->kind() == Cryo::TypeKind::Parameterized)
                 {
                     type_name = effective_type->name();
                     struct_type = _type_mapper->map_type(effective_type);

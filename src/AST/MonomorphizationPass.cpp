@@ -185,9 +185,10 @@ namespace Cryo
         auto type_substitutions_map = convert_to_type_substitutions(string_substitutions);
 
         // Clone the template node
+        std::string mangled_class_name = generate_mangled_name(instantiation.base_name, instantiation.concrete_types);
         auto specialized = std::make_unique<ClassDeclarationNode>(
             template_node.location(),
-            generate_mangled_name(instantiation.base_name, instantiation.concrete_types));
+            mangled_class_name);
 
         // Deep copy fields with Type*-based substitution (no more string manipulation)
         LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Copying {} fields from template", template_node.fields().size());
@@ -222,9 +223,18 @@ namespace Cryo
                 std::shared_ptr<Type> substituted_return_type = substitute_type(original_return_type, type_substitutions_map);
 
                 // Create new method with substituted Type* (no string operations)
+                // For constructors, update the method name to match the specialized class name
+                std::string specialized_method_name = method->name();
+                if (method->is_constructor())
+                {
+                    specialized_method_name = mangled_class_name;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Updated constructor name from '{}' to '{}'",
+                              method->name(), specialized_method_name);
+                }
+
                 auto specialized_method = std::make_unique<StructMethodNode>(
                     method->location(),
-                    method->name(),
+                    specialized_method_name,
                     substituted_return_type.get(), // Convert shared_ptr back to raw pointer
                     method->visibility(),
                     method->is_constructor(),
@@ -256,6 +266,22 @@ namespace Cryo
                     if (cloned_body)
                     {
                         specialized_method->set_body(std::move(cloned_body));
+                        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Successfully cloned method body for constructor '{}' with {} parameters",
+                                  method->name(), method->parameters().size());
+                        for (size_t i = 0; i < method->parameters().size(); ++i)
+                        {
+                            auto param = method->parameters()[i].get();
+                            if (param && param->get_resolved_type())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "  Parameter {}: {} of type {}",
+                                          i, param->name(), param->get_resolved_type()->to_string());
+                            }
+                        }
+                    }
+                    else
+                    {
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Failed to clone method body for constructor '{}' with {} parameters",
+                                 method->name(), method->parameters().size());
                     }
                 }
 
@@ -297,9 +323,10 @@ namespace Cryo
         auto type_substitutions_map = convert_to_type_substitutions(type_substitutions);
 
         // Clone the template node with field substitution
+        std::string mangled_struct_name = generate_mangled_name(instantiation.base_name, instantiation.concrete_types);
         auto specialized = std::make_unique<StructDeclarationNode>(
             template_node.location(),
-            generate_mangled_name(instantiation.base_name, instantiation.concrete_types));
+            mangled_struct_name);
 
         // Copy and substitute fields from the template
         LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Copying {} fields from template", template_node.fields().size());
@@ -335,9 +362,18 @@ namespace Cryo
                 std::shared_ptr<Type> substituted_return_type = substitute_type(original_return_type, type_substitutions_map);
 
                 // Create new method with substituted return type
+                // For constructors, update the method name to match the specialized struct name
+                std::string specialized_method_name = method->name();
+                if (method->is_constructor())
+                {
+                    specialized_method_name = mangled_struct_name;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Updated struct constructor name from '{}' to '{}'",
+                              method->name(), specialized_method_name);
+                }
+
                 auto specialized_method = std::make_unique<StructMethodNode>(
                     method->location(),
-                    method->name(),
+                    specialized_method_name,
                     substituted_return_type.get(), // Convert shared_ptr to raw pointer
                     method->visibility(),
                     method->is_constructor(),
@@ -407,7 +443,7 @@ namespace Cryo
         for (size_t i = 0; i < generic_params.size(); ++i)
         {
             auto param_ptr = generic_params[i].get();
-            LOG_TRACE(Cryo::LogComponent::AST, "MonomorphizationPass: generic_params[{}] = {}", i, (void*)param_ptr);
+            LOG_TRACE(Cryo::LogComponent::AST, "MonomorphizationPass: generic_params[{}] = {}", i, (void *)param_ptr);
             if (param_ptr)
             {
                 LOG_TRACE(Cryo::LogComponent::AST, "MonomorphizationPass: parameter name: {}", param_ptr->name());
