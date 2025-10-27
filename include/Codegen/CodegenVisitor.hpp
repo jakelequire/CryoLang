@@ -203,6 +203,20 @@ namespace Cryo::Codegen
         //===================================================================
 
         /**
+         * @brief Information about a variable that needs a destructor call
+         */
+        struct DestructorInfo
+        {
+            std::string variable_name;
+            llvm::Value *variable_value;       // The variable's value (alloca or pointer)
+            std::string type_name;             // Type name for destructor lookup
+            bool is_heap_allocated;            // Whether this is a heap-allocated object (pointer)
+            
+            DestructorInfo(const std::string& name, llvm::Value* value, const std::string& type, bool is_heap)
+                : variable_name(name), variable_value(value), type_name(type), is_heap_allocated(is_heap) {}
+        };
+
+        /**
          * @brief Scope context for nested declarations/statements
          */
         struct ScopeContext
@@ -211,6 +225,7 @@ namespace Cryo::Codegen
             llvm::BasicBlock *exit_block;
             std::unordered_map<std::string, llvm::Value *> local_values;
             std::unordered_map<std::string, llvm::AllocaInst *> local_allocas;
+            std::vector<DestructorInfo> destructors;  // Variables that need destructor calls
 
             ScopeContext(llvm::BasicBlock *entry, llvm::BasicBlock *exit = nullptr)
                 : entry_block(entry), exit_block(exit) {}
@@ -491,6 +506,10 @@ namespace Cryo::Codegen
         llvm::Value *cast_value(llvm::Value *value, llvm::Type *target_type);
         bool is_lvalue(Cryo::ExpressionNode *expr);
         bool is_primitive_type(const std::string &type_name);
+        
+        // Destructor management
+        bool has_destructor(const std::string &type_name);
+        void register_variable_for_destruction(const std::string &variable_name, const std::string &type_name, llvm::Value *value, bool is_heap_allocated = false);
 
         // Error reporting
         void report_error(const std::string &message);

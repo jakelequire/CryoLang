@@ -611,6 +611,31 @@ namespace Cryo::Codegen
 
                 register_value(&node, alloca);
 
+                // Register for automatic destruction when the variable goes out of scope
+                // Check if the initializer is a new expression to determine if this is heap-allocated
+                bool is_heap_allocated = false;
+                std::string destruction_type_name = cryo_type->to_string();
+                
+                if (node.has_initializer())
+                {
+                    // Check if the initializer is a NewExpressionNode
+                    if (dynamic_cast<Cryo::NewExpressionNode*>(node.initializer()))
+                    {
+                        is_heap_allocated = true;
+                        
+                        // For heap-allocated objects, we need to register the pointee type for destruction
+                        // not the pointer type. E.g., for Point*, we register Point for destruction.
+                        if (auto ptr_type = dynamic_cast<Cryo::PointerType*>(cryo_type))
+                        {
+                            destruction_type_name = ptr_type->pointee_type()->to_string();
+                        }
+                    }
+                }
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registering variable {} of type {} for destruction (heap: {}, destructor type: {})", 
+                          var_name, cryo_type->to_string(), is_heap_allocated, destruction_type_name);
+                register_variable_for_destruction(var_name, destruction_type_name, alloca, is_heap_allocated);
+
                 // Handle initialization if present
                 if (node.has_initializer())
                 {
@@ -979,7 +1004,7 @@ namespace Cryo::Codegen
                 }
                 else if (method->is_destructor() && method->is_default_destructor())
                 {
-                    // Generate default destructor body: call cryo_free(this) for heap-allocated objects
+                    // Generate default destructor body: empty destructor for proper RAII
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating default destructor body for {}::{}", node.name(), method->name());
                     
                     // Create basic block for destructor entry
@@ -993,30 +1018,19 @@ namespace Cryo::Codegen
                     // Enter function scope
                     enter_scope(entry_block);
 
-                    // Handle 'this' parameter
-                    auto param_arg_it = func->arg_begin();
-                    if (!is_static && param_arg_it != func->arg_end())
+                    // Add a printf call to indicate the destructor was called
+                    llvm::Function *printf_func = module->getFunction("printf");
+                    if (printf_func)
                     {
-                        // For default destructors, we get the 'this' pointer and call cryo_free on it
-                        llvm::Value *this_ptr = &*param_arg_it;
-                        
-                        // Look up cryo_free function
-                        llvm::Function *cryo_free_func = module->getFunction("cryo_free");
-                        if (cryo_free_func)
-                        {
-                            // Cast this pointer to void* for cryo_free
-                            llvm::Value *void_ptr = _context_manager.get_builder().CreateBitCast(
-                                this_ptr, llvm::PointerType::get(context, 0), "this_as_void_ptr");
-                            
-                            // Call cryo_free(this)
-                            _context_manager.get_builder().CreateCall(cryo_free_func, {void_ptr});
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated cryo_free call in default destructor");
-                        }
-                        else
-                        {
-                            LOG_WARN(Cryo::LogComponent::CODEGEN, "cryo_free function not found for default destructor");
-                        }
+                        // Create format string for the printf call
+                        std::string message = "Default destructor called for " + node.name() + "\n";
+                        llvm::Value *format_str = _context_manager.get_builder().CreateGlobalStringPtr(message, "destructor_msg");
+                        _context_manager.get_builder().CreateCall(printf_func, {format_str});
                     }
+
+                    // Default destructor is empty - just clean up and return
+                    // Memory management is handled separately by the allocation system
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated empty default destructor (RAII-compliant)");
 
                     // Add return void
                     _context_manager.get_builder().CreateRetVoid();
@@ -1302,7 +1316,7 @@ namespace Cryo::Codegen
                 }
                 else if (method->is_destructor() && method->is_default_destructor())
                 {
-                    // Generate default destructor body: call cryo_free(this) for heap-allocated objects
+                    // Generate default destructor body: empty destructor for proper RAII
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating default destructor body for class {}::{}", class_name, method->name());
                     
                     // Create basic block for destructor entry
@@ -1316,30 +1330,19 @@ namespace Cryo::Codegen
                     // Enter function scope
                     enter_scope(entry_block);
 
-                    // Handle 'this' parameter
-                    auto param_arg_it = func->arg_begin();
-                    if (!is_static && param_arg_it != func->arg_end())
+                    // Add a printf call to indicate the destructor was called
+                    llvm::Function *printf_func = module->getFunction("printf");
+                    if (printf_func)
                     {
-                        // For default destructors, we get the 'this' pointer and call cryo_free on it
-                        llvm::Value *this_ptr = &*param_arg_it;
-                        
-                        // Look up cryo_free function
-                        llvm::Function *cryo_free_func = module->getFunction("cryo_free");
-                        if (cryo_free_func)
-                        {
-                            // Cast this pointer to void* for cryo_free
-                            llvm::Value *void_ptr = _context_manager.get_builder().CreateBitCast(
-                                this_ptr, llvm::PointerType::get(context, 0), "this_as_void_ptr");
-                            
-                            // Call cryo_free(this)
-                            _context_manager.get_builder().CreateCall(cryo_free_func, {void_ptr});
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated cryo_free call in default class destructor");
-                        }
-                        else
-                        {
-                            LOG_WARN(Cryo::LogComponent::CODEGEN, "cryo_free function not found for default class destructor");
-                        }
+                        // Create format string for the printf call
+                        std::string message = "Default destructor called for class " + class_name + "\n";
+                        llvm::Value *format_str = _context_manager.get_builder().CreateGlobalStringPtr(message, "class_destructor_msg");
+                        _context_manager.get_builder().CreateCall(printf_func, {format_str});
                     }
+
+                    // Default destructor is empty - just clean up and return
+                    // Memory management is handled separately by the allocation system
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated empty default class destructor (RAII-compliant)");
 
                     // Add return void
                     _context_manager.get_builder().CreateRetVoid();
@@ -1847,6 +1850,9 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         llvm::BasicBlock *currentBlock = builder.GetInsertBlock();
 
+        // Enter a new scope for this block
+        enter_scope(currentBlock);
+
         for (auto &statement : node.statements())
         {
             if (statement)
@@ -1854,6 +1860,9 @@ namespace Cryo::Codegen
                 statement->accept(*this);
             }
         }
+
+        // Exit the scope - this will call destructors for variables declared in this block
+        exit_scope();
 
         // After processing all statements in the block, make sure the current basic block
         // has a terminator if it doesn't already have one. This is important for nested
@@ -10219,6 +10228,82 @@ namespace Cryo::Codegen
     {
         try
         {
+            // Call destructors for variables in the current scope before exiting
+            if (_current_function && !_current_function->scope_stack.empty())
+            {
+                ScopeContext &current_scope = _current_function->scope_stack.back();
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Exiting scope with {} destructors to call", 
+                          current_scope.destructors.size());
+                
+                // Call destructors in reverse order (LIFO - last in, first out)
+                for (auto it = current_scope.destructors.rbegin(); it != current_scope.destructors.rend(); ++it)
+                {
+                    const DestructorInfo &destructor_info = *it;
+                    std::string destructor_method_name = "~" + destructor_info.type_name;
+                    
+                    // Construct the qualified destructor name to match the actual function name
+                    std::string destructor_name;
+                    if (!_namespace_context.empty())
+                    {
+                        destructor_name = _namespace_context + "::" + destructor_info.type_name + "::" + destructor_method_name;
+                    }
+                    else
+                    {
+                        destructor_name = destructor_info.type_name + "::" + destructor_method_name;
+                    }
+                    
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for destructor function: {}", destructor_name);
+                    
+                    llvm::Function *destructor_fn = _context_manager.get_module()->getFunction(destructor_name);
+                    if (destructor_fn)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found destructor function, calling for variable: {}", 
+                                  destructor_info.variable_name);
+                        
+                        // For stack objects, call destructor with the alloca directly
+                        // For heap objects, we need to call the destructor on the pointed-to object
+                        llvm::Value *object_ptr = destructor_info.variable_value;
+                        
+                        if (destructor_info.is_heap_allocated)
+                        {
+                            // For heap objects (pointers), we need to:
+                            // 1. Load the pointer value from the alloca
+                            // 2. Call the destructor on the object
+                            // 3. Call cryo_free on the object
+                            llvm::Value *heap_object_ptr = _context_manager.get_builder().CreateLoad(
+                                llvm::PointerType::get(_context_manager.get_context(), 0), 
+                                object_ptr, "heap_object_ptr");
+                                
+                            // Call destructor on the heap object
+                            _context_manager.get_builder().CreateCall(destructor_fn, {heap_object_ptr});
+                            
+                            // Free the heap memory
+                            llvm::Function *cryo_free_func = _context_manager.get_module()->getFunction("cryo_free");
+                            if (cryo_free_func)
+                            {
+                                llvm::Value *void_ptr = _context_manager.get_builder().CreateBitCast(
+                                    heap_object_ptr, llvm::PointerType::get(_context_manager.get_context(), 0), "void_ptr");
+                                _context_manager.get_builder().CreateCall(cryo_free_func, {void_ptr});
+                            }
+                        }
+                        else
+                        {
+                            // For stack objects, call destructor with the alloca (object address)
+                            _context_manager.get_builder().CreateCall(destructor_fn, {object_ptr});
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Destructor function not found: {}", destructor_name);
+                    }
+                }
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No function context or empty scope stack during exit_scope");
+            }
+
             _value_context->exit_scope();
 
             if (_current_function && !_current_function->scope_stack.empty())
@@ -11087,6 +11172,56 @@ namespace Cryo::Codegen
             "ptr", "const_ptr"};
 
         return primitive_types.find(type_name) != primitive_types.end();
+    }
+
+    bool CodegenVisitor::has_destructor(const std::string &type_name)
+    {
+        // Primitive types don't have destructors
+        if (is_primitive_type(type_name))
+        {
+            return false;
+        }
+
+        // Check if there's a destructor function for this type using qualified name
+        std::string destructor_method_name = "~" + type_name;
+        std::string destructor_name;
+        if (!_namespace_context.empty())
+        {
+            destructor_name = _namespace_context + "::" + type_name + "::" + destructor_method_name;
+        }
+        else
+        {
+            destructor_name = type_name + "::" + destructor_method_name;
+        }
+        
+        llvm::Function *destructor_fn = _context_manager.get_module()->getFunction(destructor_name);
+        return destructor_fn != nullptr;
+    }
+
+    void CodegenVisitor::register_variable_for_destruction(const std::string &variable_name, const std::string &type_name, llvm::Value *value, bool is_heap_allocated)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "register_variable_for_destruction called: {} type:{} heap:{}", 
+                  variable_name, type_name, is_heap_allocated);
+        
+        if (!has_destructor(type_name))
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type {} does not have a destructor, skipping registration", type_name);
+            return; // No destructor to call
+        }
+
+        if (!_current_function || _current_function->scope_stack.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cannot register variable for destruction: no active scope");
+            report_error("Cannot register variable for destruction: no active scope");
+            return;
+        }
+
+        // Add to the current scope's destructor list
+        ScopeContext &current_scope = _current_function->scope_stack.back();
+        current_scope.destructors.push_back(DestructorInfo(variable_name, value, type_name, is_heap_allocated));
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully registered {} for destruction. Total destructors in scope: {}", 
+                  variable_name, current_scope.destructors.size());
     }
 
     bool CodegenVisitor::is_primitive_integer_constructor(const std::string &function_name) const
