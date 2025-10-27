@@ -3045,7 +3045,7 @@ namespace Cryo::Codegen
             // Look up the constructor function - need to include namespace context
             std::string constructor_name;
             std::string constructor_signature_name;
-            
+
             if (!_namespace_context.empty())
             {
                 constructor_name = _namespace_context + "::" + full_type_name + "::" + base_type_name;
@@ -3064,11 +3064,12 @@ namespace Cryo::Codegen
             {
                 constructor_signature_name = full_type_name + "::" + base_type_name + "(";
             }
-            
+
             // Add parameter types to signature
             for (size_t i = 0; i < node.arguments().size(); ++i)
             {
-                if (i > 0) constructor_signature_name += ",";
+                if (i > 0)
+                    constructor_signature_name += ",";
                 auto arg = node.arguments()[i].get();
                 if (arg && arg->get_resolved_type())
                 {
