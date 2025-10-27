@@ -1064,19 +1064,21 @@ namespace Cryo
         bool _is_constructor;
         bool _is_destructor;
         bool _is_static;
+        bool _is_default_destructor; // For ~TypeName() default; syntax
 
     public:
         StructMethodNode(SourceLocation loc, std::string name, Cryo::Type *return_type,
                          Visibility visibility = Visibility::Public, bool is_constructor = false,
-                         bool is_destructor = false, bool is_static = false)
+                         bool is_destructor = false, bool is_static = false, bool is_default_destructor = false)
             : FunctionDeclarationNode(loc, std::move(name), return_type),
               _visibility(visibility), _is_constructor(is_constructor),
-              _is_destructor(is_destructor), _is_static(is_static) {}
+              _is_destructor(is_destructor), _is_static(is_static), _is_default_destructor(is_default_destructor) {}
 
         Visibility visibility() const { return _visibility; }
         bool is_constructor() const { return _is_constructor; }
         bool is_destructor() const { return _is_destructor; }
         bool is_static() const { return _is_static; }
+        bool is_default_destructor() const { return _is_default_destructor; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
@@ -1090,7 +1092,11 @@ namespace Cryo
             if (_is_constructor)
                 os << "constructor ";
             if (_is_destructor)
+            {
                 os << "destructor ";
+                if (_is_default_destructor)
+                    os << "(default) ";
+            }
 
             // Call parent print method
             FunctionDeclarationNode::print(os, 0);
