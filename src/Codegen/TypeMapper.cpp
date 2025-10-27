@@ -1167,7 +1167,7 @@ namespace Cryo::Codegen
                     lookup_name += "_" + clean_arg;
                 }
 
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting parameterized class name '{}' to monomorphized name '{}'", 
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting parameterized class name '{}' to monomorphized name '{}'",
                           class_name, lookup_name);
             }
         }
@@ -1178,7 +1178,7 @@ namespace Cryo::Codegen
         {
             return it->second;
         }
-        
+
         // Also check cache with lookup name if different
         if (lookup_name != class_name)
         {
@@ -1354,6 +1354,32 @@ namespace Cryo::Codegen
                     return created_type;
                 }
             }
+        }
+
+        // Fallback for Array<T> types: try to find the monomorphized struct
+        if (base_name == "Array")
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying fallback for Array<T>: {}", instantiated_name);
+
+            // Check if the monomorphized struct is already in our cache
+            auto cache_it = _struct_cache.find(instantiated_name);
+            if (cache_it != _struct_cache.end())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found cached monomorphized Array struct: {}", instantiated_name);
+                return cache_it->second;
+            }
+
+            // Try alternate naming conventions (Array_int instead of Array < int >)
+            std::string alternate_name = base_name + "_" + type_args[0]->to_string();
+            cache_it = _struct_cache.find(alternate_name);
+            if (cache_it != _struct_cache.end())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found Array struct with alternate name: {}", alternate_name);
+                _struct_cache[instantiated_name] = cache_it->second; // Cache under original name too
+                return cache_it->second;
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array struct not found in cache for names: '{}' or '{}'", instantiated_name, alternate_name);
         }
 
         report_error("Failed to create parameterized type using enhanced type system: " + base_name);
@@ -1929,7 +1955,7 @@ namespace Cryo::Codegen
 
         LOG_ERROR(Cryo::LogComponent::CODEGEN, "Field '{}' not found in type '{}' (lookup name: '{}')",
                   field_name, type_name, lookup_name);
-        
+
         // Debug: Log what's available in the AST node maps
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available class AST nodes:");
         for (const auto &[key, _] : _class_ast_nodes)
@@ -1941,7 +1967,7 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - Struct: '{}'", key);
         }
-        
+
         // For base generic types (e.g., "Array"), try to find any instantiated version
         // by looking for types that start with the base name followed by an underscore
         if (lookup_name == type_name && lookup_name.find('<') == std::string::npos)
@@ -1949,7 +1975,7 @@ namespace Cryo::Codegen
             std::string pattern = lookup_name + "_";
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying pattern matching for generic base type '{}' with pattern '{}'",
                       lookup_name, pattern);
-            
+
             // Try class nodes with pattern matching
             for (const auto &[key, class_node] : _class_ast_nodes)
             {
@@ -1989,20 +2015,20 @@ namespace Cryo::Codegen
                     }
                 }
             }
-            
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pattern matching for generic type '{}' found no results", lookup_name);
         }
-        
+
         // For instantiated types, try fallback with base type name
         if (lookup_name != type_name && lookup_name.find('_') != std::string::npos)
         {
             // Extract base name from mangled name (e.g., "Array_int" -> "Array")
             size_t underscore_pos = lookup_name.find('_');
             std::string base_name = lookup_name.substr(0, underscore_pos);
-            
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying fallback lookup with base type '{}' for failed lookup of '{}'",
                       base_name, lookup_name);
-            
+
             // Try class nodes with base name
             auto base_class_it = _class_ast_nodes.find(base_name);
             if (base_class_it != _class_ast_nodes.end())
@@ -2038,14 +2064,14 @@ namespace Cryo::Codegen
                     }
                 }
             }
-            
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fallback lookup with base type '{}' also failed", base_name);
         }
         // For non-generic types, try fallback with original type name if conversion happened
         else if (lookup_name != type_name)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying fallback lookup with original type name '{}'", type_name);
-            
+
             // Try class nodes with original name
             auto orig_class_it = _class_ast_nodes.find(type_name);
             if (orig_class_it != _class_ast_nodes.end())
@@ -2081,10 +2107,10 @@ namespace Cryo::Codegen
                     }
                 }
             }
-            
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fallback lookup with original type name '{}' also failed", type_name);
         }
-        
+
         return -1; // Field not found
     }
 

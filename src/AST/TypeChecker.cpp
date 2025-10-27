@@ -3252,6 +3252,163 @@ namespace Cryo
         }
     }
 
+    void TypeChecker::visit(ArrayLiteralNode &node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Visiting ArrayLiteralNode with {} elements", node.size());
+
+        // Visit all elements first
+        Type *common_element_type = nullptr;
+        for (const auto &element : node.elements())
+        {
+            if (element)
+            {
+                element->accept(*this);
+                if (element->has_resolved_type())
+                {
+                    Type *element_type = element->get_resolved_type();
+                    if (!common_element_type)
+                    {
+                        common_element_type = element_type;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "ArrayLiteral: Setting common element type to '{}'", element_type->name());
+                    }
+                    else if (!common_element_type->equals(*element_type))
+                    {
+                        // Type mismatch in array elements
+                        std::string error_msg = "Array elements have mismatched types: '" +
+                                                common_element_type->name() + "' and '" + element_type->name() + "'";
+                        report_error(TypeError::ErrorKind::TypeMismatch, node.location(), error_msg, &node);
+                        node.set_resolved_type(_type_context.get_unknown_type());
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (common_element_type)
+        {
+            // Create an Array<T> parameterized type using the type registry
+            std::string array_type_string = "Array<" + common_element_type->name() + ">";
+            ParameterizedType *array_type = _type_registry->parse_and_instantiate(array_type_string);
+
+            if (array_type)
+            {
+                node.set_resolved_type(array_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "ArrayLiteral: Resolved to parameterized Array type '{}'", array_type->name());
+            }
+            else
+            {
+                // Fallback to traditional array type if parameterized type creation fails
+                Type *fallback_array_type = _type_context.create_array_type(common_element_type);
+                node.set_resolved_type(fallback_array_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "ArrayLiteral: Fallback to traditional array type '{}'", fallback_array_type->name());
+            }
+        }
+        else
+        {
+            // Empty array - can't infer type
+            node.set_resolved_type(_type_context.get_unknown_type());
+            LOG_DEBUG(Cryo::LogComponent::AST, "ArrayLiteral: Empty array, cannot infer type");
+        }
+    }
+
+    void TypeChecker::visit(ArrayAccessNode &node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Visiting ArrayAccessNode");
+
+        // Visit the array expression first
+        if (node.array())
+        {
+            node.array()->accept(*this);
+        }
+
+        // Visit the index expression
+        if (node.index())
+        {
+            node.index()->accept(*this);
+        }
+
+        // Get the array type
+        Type *array_type = node.array() && node.array()->has_resolved_type()
+                               ? node.array()->get_resolved_type()
+                               : nullptr;
+
+        // Get the index type
+        Type *index_type = node.index() && node.index()->has_resolved_type()
+                               ? node.index()->get_resolved_type()
+                               : nullptr;
+
+        if (!array_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Array expression has no resolved type");
+            node.set_resolved_type(_type_context.get_unknown_type());
+            return;
+        }
+
+        // Validate index type (should be integer type)
+        if (index_type && !is_integer_type(index_type))
+        {
+            std::string error_msg = "Array index must be an integer type, got '" + index_type->name() + "'";
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(), error_msg, &node);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Array type is '{}', kind={}",
+                  array_type->name(), static_cast<int>(array_type->kind()));
+
+        // Handle different array types
+        if (array_type->kind() == TypeKind::Array)
+        {
+            // Traditional array type int[]
+            ArrayType *arr_type = static_cast<ArrayType *>(array_type);
+            Type *element_type = arr_type->element_type().get();
+            node.set_resolved_type(element_type);
+            LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Array[] element type is '{}'", element_type->name());
+        }
+        else if (array_type->kind() == TypeKind::Parameterized)
+        {
+            // Parameterized Array<T> type
+            ParameterizedType *param_type = static_cast<ParameterizedType *>(array_type);
+            std::string base_name = param_type->base_name();
+
+            if (base_name == "Array")
+            {
+                // Get the first type parameter (T in Array<T>)
+                const auto &type_params = param_type->type_parameters();
+                if (!type_params.empty())
+                {
+                    Type *element_type = type_params[0].get();
+                    node.set_resolved_type(element_type);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Array<T> element type is '{}'", element_type->name());
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Array<T> has no type parameters");
+                    node.set_resolved_type(_type_context.get_unknown_type());
+                }
+            }
+            else
+            {
+                std::string error_msg = "Cannot index into type '" + array_type->name() + "'";
+                report_error(TypeError::ErrorKind::TypeMismatch, node.location(), error_msg, &node);
+                node.set_resolved_type(_type_context.get_unknown_type());
+            }
+        }
+        else if (array_type->kind() == TypeKind::Pointer)
+        {
+            // Pointer type - can be indexed like an array
+            PointerType *ptr_type = static_cast<PointerType *>(array_type);
+            Type *pointee_type = ptr_type->pointee_type().get();
+            node.set_resolved_type(pointee_type);
+            LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Pointer element type is '{}'", pointee_type->name());
+        }
+        else
+        {
+            // Invalid type for array access
+            std::string error_msg = "Cannot index into type '" + array_type->name() + "'";
+            report_error(TypeError::ErrorKind::TypeMismatch, node.location(), error_msg, &node);
+            node.set_resolved_type(_type_context.get_unknown_type());
+        }
+    }
+
     // Helper function to substitute generic type parameters in a type string
     std::string substitute_generic_type(const std::string &type_str,
                                         const std::string &object_type,
@@ -3384,11 +3541,47 @@ namespace Cryo
             return;
         }
 
-        // For non-struct/class/enum types, reject member access
+        // Handle parameterized Array<T> types
+        if (effective_type->kind() == TypeKind::Parameterized)
+        {
+            ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
+            if (param_type->base_name() == "Array")
+            {
+                if (member_name == "length" || member_name == "size")
+                {
+                    node.set_resolved_type(_type_context.get_u64_type());
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Array<T>.{} resolved to u64", member_name);
+                    return;
+                }
+                // For Array<T>, we need to look up fields in the Array struct definition
+                std::string lookup_type_name = "Array";
+                LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in Array struct for Array<T>", member_name);
+                auto struct_it = _struct_fields.find(lookup_type_name);
+                if (struct_it != _struct_fields.end())
+                {
+                    auto field_it = struct_it->second.find(member_name);
+                    if (field_it != struct_it->second.end())
+                    {
+                        // Found the field - store the resolved Type*
+                        node.set_resolved_type(field_it->second);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found field '{}' in Array struct", member_name);
+                        return;
+                    }
+                }
+                // Field not found in Array<T>
+                std::string error_msg = "No field '" + member_name + "' on type '" + effective_type->name() + "'";
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), error_msg, &node);
+                node.set_resolved_type(_type_context.get_unknown_type());
+                return;
+            }
+        }
+
+        // For non-struct/class/enum/parameterized types, reject member access
         if (effective_type->kind() != TypeKind::Struct &&
             effective_type->kind() != TypeKind::Class &&
             effective_type->kind() != TypeKind::Enum &&
-            effective_type->kind() != TypeKind::Generic)
+            effective_type->kind() != TypeKind::Generic &&
+            effective_type->kind() != TypeKind::Parameterized)
         {
             std::string type_name = effective_type ? effective_type->to_string() : "unknown";
             report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
@@ -5766,6 +5959,20 @@ namespace Cryo
 
         // Fall back to unknown type
         return _type_context.get_unknown_type();
+    }
+
+    bool TypeChecker::is_integer_type(Type *type)
+    {
+        if (!type)
+            return false;
+
+        if (type->kind() != TypeKind::Integer)
+            return false;
+
+        std::string type_name = type->name();
+        return (type_name == "i8" || type_name == "i16" || type_name == "i32" || type_name == "i64" ||
+                type_name == "u8" || type_name == "u16" || type_name == "u32" || type_name == "u64" ||
+                type_name == "int");
     }
 
     void TypeChecker::register_method_signature(StructMethodNode &node)

@@ -3315,9 +3315,10 @@ namespace Cryo::Codegen
             {
                 Cryo::Type *var_type = type_it->second;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found variable type: {} (kind={})", var_type ? var_type->to_string() : "null", var_type ? static_cast<int>(var_type->kind()) : -1);
-                // Check if this is an Array<T> type - could be Array or Class type
+                // Check if this is an Array<T> type - could be Array, Class, or Parameterized type
                 bool is_array_type = (var_type && (var_type->kind() == TypeKind::Array ||
-                                                   (var_type->kind() == TypeKind::Class && var_type->to_string().find("Array") == 0)));
+                                                   (var_type->kind() == TypeKind::Class && var_type->to_string().find("Array") == 0) ||
+                                                   (var_type->kind() == TypeKind::Parameterized && var_type->to_string().find("Array") == 0)));
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Is Array<T> type: {}", is_array_type ? "true" : "false");
 
@@ -3334,12 +3335,12 @@ namespace Cryo::Codegen
                         Cryo::Type *cryo_element_type = array_type->element_type().get();
                         llvm_element_type = cryo_element_type ? _type_mapper->map_type(cryo_element_type) : nullptr;
                     }
-                    else if (var_type->kind() == TypeKind::Class)
+                    else if (var_type->kind() == TypeKind::Class || var_type->kind() == TypeKind::Parameterized)
                     {
-                        // For Array<T> class types, check if it's a ParameterizedClassType first
+                        // For Array<T> class/parameterized types, get type parameters
                         llvm_element_type = nullptr;
 
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array<T> Class type detected: {}", var_type->to_string());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array<T> Class/Parameterized type detected: {}", var_type->to_string());
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type kind: {}", static_cast<int>(var_type->kind()));
 
                         // Try to cast to ParameterizedType to get type parameters
@@ -3408,7 +3409,7 @@ namespace Cryo::Codegen
                         }
                         else
                         {
-                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to cast Array<T> Class type to ParameterizedType or ParameterizedClassType");
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to cast Array<T> Class/Parameterized type to ParameterizedType or ParameterizedClassType");
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Actual type info - name: '{}', kind: {}, to_string: '{}'",
                                       var_type->name(), static_cast<int>(var_type->kind()), var_type->to_string());
                         }
