@@ -977,6 +977,54 @@ namespace Cryo::Codegen
                     exit_scope();
                     _current_function.reset();
                 }
+                else if (method->is_destructor() && method->is_default_destructor())
+                {
+                    // Generate default destructor body: call cryo_free(this) for heap-allocated objects
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating default destructor body for {}::{}", node.name(), method->name());
+                    
+                    // Create basic block for destructor entry
+                    llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", func);
+                    _context_manager.get_builder().SetInsertPoint(entry_block);
+
+                    // Store current function context
+                    _current_function = std::make_unique<FunctionContext>(func, static_cast<FunctionDeclarationNode *>(method.get()));
+                    _current_function->entry_block = entry_block;
+
+                    // Enter function scope
+                    enter_scope(entry_block);
+
+                    // Handle 'this' parameter
+                    auto param_arg_it = func->arg_begin();
+                    if (!is_static && param_arg_it != func->arg_end())
+                    {
+                        // For default destructors, we get the 'this' pointer and call cryo_free on it
+                        llvm::Value *this_ptr = &*param_arg_it;
+                        
+                        // Look up cryo_free function
+                        llvm::Function *cryo_free_func = module->getFunction("cryo_free");
+                        if (cryo_free_func)
+                        {
+                            // Cast this pointer to void* for cryo_free
+                            llvm::Value *void_ptr = _context_manager.get_builder().CreateBitCast(
+                                this_ptr, llvm::PointerType::get(context, 0), "this_as_void_ptr");
+                            
+                            // Call cryo_free(this)
+                            _context_manager.get_builder().CreateCall(cryo_free_func, {void_ptr});
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated cryo_free call in default destructor");
+                        }
+                        else
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN, "cryo_free function not found for default destructor");
+                        }
+                    }
+
+                    // Add return void
+                    _context_manager.get_builder().CreateRetVoid();
+
+                    // Exit function scope
+                    exit_scope();
+                    _current_function.reset();
+                }
             }
         }
 
@@ -1249,6 +1297,54 @@ namespace Cryo::Codegen
                     }
 
                     // Exit scope and clean up
+                    exit_scope();
+                    _current_function.reset();
+                }
+                else if (method->is_destructor() && method->is_default_destructor())
+                {
+                    // Generate default destructor body: call cryo_free(this) for heap-allocated objects
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating default destructor body for class {}::{}", class_name, method->name());
+                    
+                    // Create basic block for destructor entry
+                    llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", func);
+                    _context_manager.get_builder().SetInsertPoint(entry_block);
+
+                    // Store current function context
+                    _current_function = std::make_unique<FunctionContext>(func, static_cast<FunctionDeclarationNode *>(method.get()));
+                    _current_function->entry_block = entry_block;
+
+                    // Enter function scope
+                    enter_scope(entry_block);
+
+                    // Handle 'this' parameter
+                    auto param_arg_it = func->arg_begin();
+                    if (!is_static && param_arg_it != func->arg_end())
+                    {
+                        // For default destructors, we get the 'this' pointer and call cryo_free on it
+                        llvm::Value *this_ptr = &*param_arg_it;
+                        
+                        // Look up cryo_free function
+                        llvm::Function *cryo_free_func = module->getFunction("cryo_free");
+                        if (cryo_free_func)
+                        {
+                            // Cast this pointer to void* for cryo_free
+                            llvm::Value *void_ptr = _context_manager.get_builder().CreateBitCast(
+                                this_ptr, llvm::PointerType::get(context, 0), "this_as_void_ptr");
+                            
+                            // Call cryo_free(this)
+                            _context_manager.get_builder().CreateCall(cryo_free_func, {void_ptr});
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated cryo_free call in default class destructor");
+                        }
+                        else
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN, "cryo_free function not found for default class destructor");
+                        }
+                    }
+
+                    // Add return void
+                    _context_manager.get_builder().CreateRetVoid();
+
+                    // Exit function scope
                     exit_scope();
                     _current_function.reset();
                 }

@@ -3770,7 +3770,15 @@ namespace Cryo
             return_type = _context.types().get_void_type(); // Constructors don't have explicit return types
         }
 
-        auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static);
+        // Check for default destructor syntax: ~TypeName() default;
+        bool is_default_destructor = false;
+        if (is_destructor && _current_token.is(TokenKind::TK_KW_DEFAULT))
+        {
+            is_default_destructor = true;
+            advance(); // consume 'default'
+        }
+
+        auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static, is_default_destructor);
 
         // Set variadic flag if detected
         method->set_variadic(is_variadic);
@@ -3787,6 +3795,11 @@ namespace Cryo
             auto body = parse_block_statement();
             method->set_body(std::unique_ptr<BlockStatementNode>(
                 dynamic_cast<BlockStatementNode *>(body.release())));
+        }
+        else if (is_default_destructor)
+        {
+            // Default destructors don't have a body - the compiler will generate one
+            consume(TokenKind::TK_SEMICOLON, "Expected ';' after default destructor");
         }
         else
         {
