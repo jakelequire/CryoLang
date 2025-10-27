@@ -620,6 +620,10 @@ namespace Cryo
         // Connect TypeRegistry to TypeContext for generic instantiation
         type_ctx.set_type_registry(_type_registry.get());
 
+        // Register essential built-in generic types that are commonly used
+        // before the standard library is fully loaded
+        register_builtin_generic_types();
+
         // Generic types will be discovered dynamically from standard library parsing
         // No hardcoded type registrations here
     }
@@ -635,6 +639,10 @@ namespace Cryo
 
         // Connect TypeRegistry to TypeContext for generic instantiation
         type_ctx.set_type_registry(_type_registry.get());
+
+        // Register essential built-in generic types that are commonly used
+        // before the standard library is fully loaded
+        register_builtin_generic_types();
 
         // Initialize diagnostic builder if we have a diagnostic manager
         if (_diagnostic_manager)
@@ -976,12 +984,21 @@ namespace Cryo
                     // Track the base template (without &), but record the clean type name for instantiation
                     track_instantiation(base_type, concrete_types, clean_type_string, SourceLocation{});
 
-                    // For valid generic instantiations, return the base type as a placeholder
-                    // The monomorphization pass will later create the concrete types
+                    // For valid generic instantiations, create a proper ParameterizedType instance
                     if (alias_symbol && alias_symbol->type)
                     {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Returning base generic type '{}' for instantiation '{}'", base_type, clean_type_string);
-                        return alias_symbol->type; // Return the base generic type
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Creating ParameterizedType for instantiation '{}'", clean_type_string);
+                        ParameterizedType *param_type = resolve_generic_type(clean_type_string);
+                        if (param_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Successfully created ParameterizedType for '{}'", clean_type_string);
+                            return param_type;
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Failed to create ParameterizedType, falling back to base type '{}' for instantiation '{}'", base_type, clean_type_string);
+                            return alias_symbol->type; // Fallback to base generic type
+                        }
                     }
                 }
             }
@@ -1012,8 +1029,25 @@ namespace Cryo
 
         // For simple identifiers that are NOT primitive types, check the symbol table first for correct type
         // This ensures that the correct type (struct vs class) is returned based on the actual declaration
+        // First check if this is a generic type (e.g., "Array<int>")
+        // This must happen before other type lookups to ensure proper parameterized type creation
+        if (type_string.find('<') != std::string::npos && type_string.find('>') != std::string::npos)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Detected generic type syntax in '{}', trying generic type resolution", type_string);
+            ParameterizedType *generic_type = resolve_generic_type(type_string);
+            if (generic_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved generic type '{}' as ParameterizedType", type_string);
+                return generic_type;
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Generic type resolution failed for '{}', continuing with fallback", type_string);
+            }
+        }
+
+        // Check for complex types like pointers, arrays, references (but not generics since we handled those above)
         if (type_string.find('*') == std::string::npos &&
-            type_string.find('<') == std::string::npos &&
             type_string.find('[') == std::string::npos &&
             type_string.find('&') == std::string::npos &&
             type_string.find('(') == std::string::npos &&
@@ -1398,7 +1432,17 @@ namespace Cryo
 
     void TypeChecker::register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names)
     {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering generic type template: '{}' with {} parameters", base_name, param_names.size());
         _type_registry->register_template(base_name, param_names);
+    }
+
+    void TypeChecker::register_builtin_generic_types()
+    {
+        // Register Array<T> as a built-in generic type
+        // This allows user code to use Array<T> before the standard library is fully loaded
+        std::vector<std::string> array_params = {"T"};
+        register_generic_type("Array", array_params);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registered built-in generic type: Array<T>");
     }
 
     ParameterizedType *TypeChecker::resolve_generic_type(const std::string &type_string)
@@ -1408,6 +1452,7 @@ namespace Cryo
 
     void TypeChecker::discover_generic_types_from_ast(ProgramNode &program)
     {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Starting generic type discovery from AST");
         // Traverse the AST to discover generic type definitions
         for (const auto &stmt : program.statements())
         {
@@ -1425,6 +1470,7 @@ namespace Cryo
                 discover_generic_type_from_class(*class_decl);
             }
         }
+        LOG_DEBUG(Cryo::LogComponent::AST, "Completed generic type discovery from AST");
     }
 
     void TypeChecker::discover_generic_type_from_struct(StructDeclarationNode &struct_node)
@@ -1452,6 +1498,9 @@ namespace Cryo
 
     void TypeChecker::discover_generic_type_from_class(ClassDeclarationNode &class_node)
     {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Checking class '{}' for generic parameters (has {} parameters)", 
+                 class_node.name(), class_node.generic_parameters().size());
+                 
         if (!class_node.generic_parameters().empty())
         {
             std::vector<std::string> param_names;
@@ -1639,6 +1688,14 @@ namespace Cryo
         if (!node.type_annotation().empty() && node.type_annotation() != "auto")
         {
             declared_type = resolve_type_with_generic_context(node.type_annotation());
+            
+            // Debug: Check declared type for Array
+            if (declared_type && declared_type->name().find("Array") != std::string::npos)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Variable declaration '{}': declared_type - to_string: '{}', is_parameterized: {}", 
+                         var_name, declared_type->to_string(), 
+                         declared_type->kind() == TypeKind::Parameterized ? "true" : "false");
+            }
 
             // Debug: Track malformed pointer types at declaration time
             if (declared_type && node.type_annotation().find("*") != std::string::npos)
@@ -1706,6 +1763,15 @@ namespace Cryo
 
         // Declare the variable in symbol table
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Attempting to declare variable '{}' with type '{}' (kind={})", var_name, final_type ? final_type->name() : "null", final_type ? TypeKindToString(final_type->kind()) : "null");
+        
+        // Extra debug for Array types being declared
+        if (final_type && final_type->name().find("Array") != std::string::npos)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Variable declaration '{}': Array type details - to_string: '{}', is_parameterized: {}", 
+                     var_name, final_type->to_string(), 
+                     final_type->kind() == TypeKind::Parameterized ? "true" : "false");
+        }
+        
         if (!declare_variable(var_name, final_type, node.location(), node.is_mutable()))
         {
             // Check if we're in stdlib compilation mode and if this is a compatible redefinition
@@ -2356,6 +2422,15 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': setting resolved type to {} (kind={})", name,
                       symbol->type ? symbol->type->name() : "null",
                       symbol->type ? TypeKindToString(symbol->type->kind()) : "null");
+            
+            // Extra debug for Array types
+            if (symbol->type && symbol->type->name().find("Array") != std::string::npos)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': Array type details - to_string: '{}', is_parameterized: {}", 
+                         name, symbol->type->to_string(), 
+                         symbol->type->kind() == TypeKind::Parameterized ? "true" : "false");
+            }
+            
             node.set_resolved_type(symbol->type);
         }
     }

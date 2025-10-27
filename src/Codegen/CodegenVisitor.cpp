@@ -3336,24 +3336,81 @@ namespace Cryo::Codegen
                     }
                     else if (var_type->kind() == TypeKind::Class)
                     {
-                        // For Array<T> class types, extract the T type from the type string
-                        std::string type_str = var_type->to_string();
-                        if (type_str.find("Array < int >") != std::string::npos)
+                        // For Array<T> class types, check if it's a ParameterizedClassType first
+                        llvm_element_type = nullptr;
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array<T> Class type detected: {}", var_type->to_string());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type kind: {}", static_cast<int>(var_type->kind()));
+
+                        // Try to cast to ParameterizedType to get type parameters
+                        if (auto *param_type = dynamic_cast<const ParameterizedType *>(var_type))
                         {
-                            llvm_element_type = llvm::Type::getInt32Ty(context);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully cast to ParameterizedType");
+
+                            // Get type parameters if available
+                            auto type_params = param_type->type_parameters();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type parameters count: {}", type_params.size());
+
+                            if (!type_params.empty())
+                            {
+                                // Get the first type parameter (T in Array<T>)
+                                Cryo::Type *element_cryo_type = type_params[0].get();
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "First type parameter: {}",
+                                          element_cryo_type ? element_cryo_type->to_string() : "null");
+
+                                if (element_cryo_type)
+                                {
+                                    llvm_element_type = _type_mapper->map_type(element_cryo_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved Array<T> element type from parameters: {} -> LLVM type: {}",
+                                              element_cryo_type->to_string(), (llvm_element_type ? "success" : "failed"));
+                                }
+                                else
+                                {
+                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "First type parameter is null");
+                                }
+                            }
+                            else
+                            {
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Type parameters are empty for ParameterizedType");
+                            }
                         }
-                        else if (type_str.find("Array < f64 >") != std::string::npos)
+                        // Try to cast to ParameterizedClassType specifically
+                        else if (auto *param_class_type = dynamic_cast<const ParameterizedClassType *>(var_type))
                         {
-                            llvm_element_type = llvm::Type::getDoubleTy(context);
-                        }
-                        else if (type_str.find("Array < float >") != std::string::npos)
-                        {
-                            llvm_element_type = llvm::Type::getFloatTy(context);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully cast to ParameterizedClassType");
+
+                            // Get type parameters if available
+                            auto type_params = param_class_type->type_parameters();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type parameters count: {}", type_params.size());
+
+                            if (!type_params.empty())
+                            {
+                                // Get the first type parameter (T in Array<T>)
+                                Cryo::Type *element_cryo_type = type_params[0].get();
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "First type parameter: {}",
+                                          element_cryo_type ? element_cryo_type->to_string() : "null");
+
+                                if (element_cryo_type)
+                                {
+                                    llvm_element_type = _type_mapper->map_type(element_cryo_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved Array<T> element type from ParameterizedClassType: {} -> LLVM type: {}",
+                                              element_cryo_type->to_string(), (llvm_element_type ? "success" : "failed"));
+                                }
+                                else
+                                {
+                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "First type parameter is null");
+                                }
+                            }
+                            else
+                            {
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Type parameters are empty for ParameterizedClassType");
+                            }
                         }
                         else
                         {
-                            // Default to int32 if we can't determine the type
-                            llvm_element_type = llvm::Type::getInt32Ty(context);
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to cast Array<T> Class type to ParameterizedType or ParameterizedClassType");
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Actual type info - name: '{}', kind: {}, to_string: '{}'",
+                                      var_type->name(), static_cast<int>(var_type->kind()), var_type->to_string());
                         }
                     }
 

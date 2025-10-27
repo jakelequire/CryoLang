@@ -280,6 +280,7 @@ namespace Cryo
 
         // Generic type management
         void register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names);
+        void register_builtin_generic_types();
         ParameterizedType *resolve_generic_type(const std::string &type_string);
 
         // Dynamic generic type discovery from AST nodes
