@@ -912,9 +912,9 @@ namespace Cryo
         // Create a non-owning shared_ptr since TypeContext manages the lifetime
         // This is safe because referent_type is guaranteed to live as long as TypeContext
         std::shared_ptr<Type> referent_shared(referent_type, [](Type *)
-                                             {
-                                                 // Non-deleting deleter - TypeContext owns the referent type
-                                             });
+                                              {
+                                                  // Non-deleting deleter - TypeContext owns the referent type
+                                              });
 
         auto reference_type = std::make_unique<ReferenceType>(referent_shared);
 
@@ -1465,7 +1465,7 @@ namespace Cryo
                     return instantiated_type;
                 }
             }
-            
+
             // Fallback: For unknown generic types during parsing (before TypeRegistry is set up),
             // return an unknown type instead of creating a struct type with the full generic name.
             // This allows parsing to continue and type checking will resolve it later.
@@ -2502,15 +2502,15 @@ namespace Cryo
     ParameterizedType *TypeRegistry::parse_and_instantiate(const std::string &type_string)
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate called with: '{}'", type_string);
-        
+
         auto [base_name, param_strs] = parse_generic_syntax(type_string);
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Parsed base_name: '{}', param_strs.size(): {}", base_name, param_strs.size());
 
         if (param_strs.empty() || !has_template(base_name))
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "parse_and_instantiate failed: param_strs.empty()={}, has_template('{}')={}", 
-                     param_strs.empty(), base_name, has_template(base_name));
+            LOG_DEBUG(Cryo::LogComponent::AST, "parse_and_instantiate failed: param_strs.empty()={}, has_template('{}')={}",
+                      param_strs.empty(), base_name, has_template(base_name));
             return nullptr;
         }
 

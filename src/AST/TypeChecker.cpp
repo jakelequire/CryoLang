@@ -1498,9 +1498,9 @@ namespace Cryo
 
     void TypeChecker::discover_generic_type_from_class(ClassDeclarationNode &class_node)
     {
-        LOG_DEBUG(Cryo::LogComponent::AST, "Checking class '{}' for generic parameters (has {} parameters)", 
-                 class_node.name(), class_node.generic_parameters().size());
-                 
+        LOG_DEBUG(Cryo::LogComponent::AST, "Checking class '{}' for generic parameters (has {} parameters)",
+                  class_node.name(), class_node.generic_parameters().size());
+
         if (!class_node.generic_parameters().empty())
         {
             std::vector<std::string> param_names;
@@ -1688,13 +1688,13 @@ namespace Cryo
         if (!node.type_annotation().empty() && node.type_annotation() != "auto")
         {
             declared_type = resolve_type_with_generic_context(node.type_annotation());
-            
+
             // Debug: Check declared type for Array
             if (declared_type && declared_type->name().find("Array") != std::string::npos)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Variable declaration '{}': declared_type - to_string: '{}', is_parameterized: {}", 
-                         var_name, declared_type->to_string(), 
-                         declared_type->kind() == TypeKind::Parameterized ? "true" : "false");
+                LOG_DEBUG(Cryo::LogComponent::AST, "Variable declaration '{}': declared_type - to_string: '{}', is_parameterized: {}",
+                          var_name, declared_type->to_string(),
+                          declared_type->kind() == TypeKind::Parameterized ? "true" : "false");
             }
 
             // Debug: Track malformed pointer types at declaration time
@@ -1763,15 +1763,15 @@ namespace Cryo
 
         // Declare the variable in symbol table
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Attempting to declare variable '{}' with type '{}' (kind={})", var_name, final_type ? final_type->name() : "null", final_type ? TypeKindToString(final_type->kind()) : "null");
-        
+
         // Extra debug for Array types being declared
         if (final_type && final_type->name().find("Array") != std::string::npos)
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Variable declaration '{}': Array type details - to_string: '{}', is_parameterized: {}", 
-                     var_name, final_type->to_string(), 
-                     final_type->kind() == TypeKind::Parameterized ? "true" : "false");
+            LOG_DEBUG(Cryo::LogComponent::AST, "Variable declaration '{}': Array type details - to_string: '{}', is_parameterized: {}",
+                      var_name, final_type->to_string(),
+                      final_type->kind() == TypeKind::Parameterized ? "true" : "false");
         }
-        
+
         if (!declare_variable(var_name, final_type, node.location(), node.is_mutable()))
         {
             // Check if we're in stdlib compilation mode and if this is a compatible redefinition
@@ -2422,15 +2422,15 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': setting resolved type to {} (kind={})", name,
                       symbol->type ? symbol->type->name() : "null",
                       symbol->type ? TypeKindToString(symbol->type->kind()) : "null");
-            
+
             // Extra debug for Array types
             if (symbol->type && symbol->type->name().find("Array") != std::string::npos)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': Array type details - to_string: '{}', is_parameterized: {}", 
-                         name, symbol->type->to_string(), 
-                         symbol->type->kind() == TypeKind::Parameterized ? "true" : "false");
+                LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': Array type details - to_string: '{}', is_parameterized: {}",
+                          name, symbol->type->to_string(),
+                          symbol->type->kind() == TypeKind::Parameterized ? "true" : "false");
             }
-            
+
             node.set_resolved_type(symbol->type);
         }
     }
