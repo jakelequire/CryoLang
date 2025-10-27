@@ -742,7 +742,27 @@ namespace Cryo::Codegen
 
                         if (init_value)
                         {
-                            create_store(init_value, alloca);
+                            // Check if we're dealing with a struct type and the initializer returns a pointer to struct
+                            // This happens with stack constructor calls like Point(15, 20)
+                            if (cryo_type->kind() == TypeKind::Struct || cryo_type->kind() == TypeKind::Class)
+                            {
+                                // If init_value is a pointer to struct and alloca expects the struct itself,
+                                // we need to load the struct value and store it
+                                if (init_value->getType()->isPointerTy() && !llvm_type->isPointerTy())
+                                {
+                                    auto &builder = _context_manager.get_builder();
+                                    llvm::Value *struct_value = builder.CreateLoad(llvm_type, init_value, "struct_load");
+                                    create_store(struct_value, alloca);
+                                }
+                                else
+                                {
+                                    create_store(init_value, alloca);
+                                }
+                            }
+                            else
+                            {
+                                create_store(init_value, alloca);
+                            }
                         }
                         else
                         {
@@ -6562,6 +6582,7 @@ namespace Cryo::Codegen
                     // If that failed, try a more simplified approach
                     if (!lvalue_ptr)
                     {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_member_field_address failed, using fallback");
                         // Use similar logic to normal member access visitor
                         llvm::Value *object_ptr = nullptr;
                         std::string var_name;
@@ -6602,6 +6623,9 @@ namespace Cryo::Codegen
                                     {
                                         Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
                                         effective_type = ptr_type->pointee_type().get();
+                                        
+                                        // For pointer variables, we need to load the pointer first
+                                        object_ptr = builder.CreateLoad(object_ptr->getType(), object_ptr, "struct_ptr");
                                     }
 
                                     if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class)
@@ -6647,7 +6671,8 @@ namespace Cryo::Codegen
                     }
                     else if (lvalue_ptr->getType()->isPointerTy())
                     {
-                        element_type = lvalue_ptr->getType()->getPointerElementType();
+                        // For now, just assume i32 for pointer element types due to LLVM API changes
+                        element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
                     }
                 }
                 
@@ -6776,7 +6801,13 @@ namespace Cryo::Codegen
 
                 if (!operation_result)
                 {
-                    report_error("Failed to generate operation for compound assignment");
+                    report_error("Failed to generate operation for compound assignment - operation_result is null");
+                    return nullptr;
+                }
+                
+                if (!lvalue_ptr)
+                {
+                    report_error("Failed to generate operation for compound assignment - lvalue_ptr is null");
                     return nullptr;
                 }
 
@@ -11810,12 +11841,39 @@ namespace Cryo::Codegen
         {
             constructor_name = _namespace_context + "::" + type_name;
         }
+        
+        // Try multiple constructor name patterns
+        std::vector<std::string> constructor_names = {
+            constructor_name + "::" + type_name,  // Full::Namespace::Type::Type
+            constructor_name,                      // Full::Namespace::Type
+            type_name + "::" + type_name,         // Type::Type
+            type_name                             // Type
+        };
 
-        auto func_it = _functions.find(constructor_name);
+        auto func_it = _functions.end();
         llvm::Function *constructor_func = nullptr;
-        if (func_it != _functions.end())
+        
+        for (const auto& name : constructor_names)
         {
-            constructor_func = func_it->second;
+            func_it = _functions.find(name);
+            if (func_it != _functions.end())
+            {
+                constructor_func = func_it->second;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found constructor with name: {}", name);
+                break;
+            }
+        }
+        
+        if (!constructor_func)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available constructor functions:");
+            for (const auto& pair : _functions)
+            {
+                if (pair.first.find(type_name) != std::string::npos)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - {}", pair.first);
+                }
+            }
         }
 
         if (constructor_func)
@@ -11956,7 +12014,23 @@ namespace Cryo::Codegen
         // Check if object_ptr is a pointer to the struct or the struct itself
         if (object_ptr->getType()->isPointerTy())
         {
-            // For pointers (like p: Point*), we can directly use CreateStructGEP
+            // Check if we need to load the pointer value first
+            // For simplicity, use type information from our tracking
+            if (!var_name.empty())
+            {
+                auto var_type_it = _variable_types.find(var_name);
+                if (var_type_it != _variable_types.end())
+                {
+                    if (auto *ptr_cryo_type = dynamic_cast<Cryo::PointerType*>(var_type_it->second))
+                    {
+                        // This is a pointer variable, so object_ptr is alloca storing the pointer
+                        llvm::Value *actual_ptr = builder.CreateLoad(object_ptr->getType(), object_ptr, "struct_ptr");
+                        field_ptr = builder.CreateStructGEP(struct_type, actual_ptr, field_index, member_name + "_ptr");
+                        return field_ptr;
+                    }
+                }
+            }
+            // Direct struct pointer
             field_ptr = builder.CreateStructGEP(struct_type, object_ptr, field_index, member_name + "_ptr");
         }
         else
