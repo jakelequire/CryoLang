@@ -362,6 +362,8 @@ namespace Cryo
         void visit(NewExpressionNode &node) override;
         void visit(StructLiteralNode &node) override;
         void visit(SizeofExpressionNode &node) override;
+        void visit(ArrayLiteralNode &node) override;
+        void visit(ArrayAccessNode &node) override;
         void visit(MemberAccessNode &node) override;
         void visit(ScopeResolutionNode &node) override;
 
@@ -379,6 +381,9 @@ namespace Cryo
 
         // Type lookup helpers to replace parse_type_from_string
         Type *lookup_type_by_name(const std::string &type_name);
+
+        // Type utility helpers
+        bool is_integer_type(Type *type);
 
         // Method signature registration for forward references
         void register_method_signature(StructMethodNode &method);
