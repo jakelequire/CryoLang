@@ -4208,6 +4208,23 @@ namespace Cryo
         if (type_str == "...")
             return _context.types().get_variadic_type(); // Variadic type
 
+        // Check for generic types first (e.g., "Array<int>")
+        if (type_str.find('<') != std::string::npos && type_str.find('>') != std::string::npos)
+        {
+            LOG_DEBUG(LogComponent::PARSER, "Parser detected generic type syntax: '{}'", type_str);
+            // Use TypeRegistry's parse_and_instantiate for proper generic type resolution
+            ParameterizedType *generic_type = _context.types().get_type_registry()->parse_and_instantiate(type_str);
+            if (generic_type && generic_type->kind() != TypeKind::Unknown)
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Successfully resolved generic type '{}' via TypeRegistry", type_str);
+                return generic_type;
+            }
+            else
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Failed to resolve generic type '{}' via TypeRegistry", type_str);
+            }
+        }
+
         // Try to resolve as a struct/class type
         Type *struct_type = _context.types().lookup_struct_type(type_str);
         if (struct_type && struct_type->kind() != TypeKind::Unknown)

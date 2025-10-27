@@ -2501,22 +2501,36 @@ namespace Cryo
 
     ParameterizedType *TypeRegistry::parse_and_instantiate(const std::string &type_string)
     {
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate called with: '{}'", type_string);
+        
         auto [base_name, param_strs] = parse_generic_syntax(type_string);
+        
+        LOG_DEBUG(Cryo::LogComponent::AST, "Parsed base_name: '{}', param_strs.size(): {}", base_name, param_strs.size());
 
         if (param_strs.empty() || !has_template(base_name))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "parse_and_instantiate failed: param_strs.empty()={}, has_template('{}')={}", 
+                     param_strs.empty(), base_name, has_template(base_name));
             return nullptr;
+        }
 
         // Convert parameter strings to types
         std::vector<Type *> concrete_types;
         for (const auto &param_str : param_strs)
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Converting parameter string: '{}'", param_str);
             // Use token-based type parsing
             Type *param_type = _type_context->parse_type_from_string_via_tokens(param_str);
             if (!param_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Failed to parse parameter type: '{}'", param_str);
                 return nullptr;
+            }
+            LOG_DEBUG(Cryo::LogComponent::AST, "Successfully parsed parameter type: '{}' -> {}", param_str, param_type->name());
             concrete_types.push_back(param_type);
         }
 
+        LOG_DEBUG(Cryo::LogComponent::AST, "Calling instantiate('{}', {} types)", base_name, concrete_types.size());
         return instantiate(base_name, concrete_types);
     }
 
@@ -2543,6 +2557,9 @@ namespace Cryo
         }
 
         base_name = type_string.substr(0, angle_pos);
+        // Trim whitespace from base name
+        base_name.erase(0, base_name.find_first_not_of(" \t"));
+        base_name.erase(base_name.find_last_not_of(" \t") + 1);
 
         size_t close_angle = type_string.find('>', angle_pos);
         if (close_angle == std::string::npos)
