@@ -3657,6 +3657,47 @@ namespace Cryo
             ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
             lookup_type_name = param_type->base_name();
             LOG_DEBUG(Cryo::LogComponent::AST, "Using base name '{}' for parameterized type '{}'", lookup_type_name, effective_type->name());
+            
+            // Special case: if base_name is "Unknown", this might be a deferred type that should map to a known template
+            if (lookup_type_name == "Unknown")
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Detected Unknown parameterized type, attempting to map to known template");
+                // Try to infer the correct template name from the type parameters
+                // Look for templates that match the parameter count
+                auto &type_params = param_type->type_parameters();
+                LOG_DEBUG(Cryo::LogComponent::AST, "Unknown type has {} parameters", type_params.size());
+                
+                // Check if we have enum templates with matching parameter count
+                // For MyResult<int, string>, we want to find MyResult<T,E>
+                for (const auto &[template_name, methods] : _struct_methods) 
+                {
+                    if (template_name.find('<') != std::string::npos && template_name.find(',') != std::string::npos)
+                    {
+                        // This looks like a generic template (e.g., "MyResult<T,E>")
+                        size_t start = template_name.find('<');
+                        size_t end = template_name.find('>');
+                        if (start != std::string::npos && end != std::string::npos)
+                        {
+                            std::string base_template = template_name.substr(0, start);
+                            std::string params_str = template_name.substr(start + 1, end - start - 1);
+                            
+                            // Count the parameters by counting commas + 1
+                            size_t param_count = 1;
+                            for (char c : params_str) {
+                                if (c == ',') param_count++;
+                            }
+                            
+                            if (param_count == type_params.size())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Found potential template match: '{}' with {} parameters", template_name, param_count);
+                                lookup_type_name = template_name;  // Use the full template name for method lookup
+                                break;
+                            }
+                        }
+                    }
+                }
+                LOG_DEBUG(Cryo::LogComponent::AST, "After Unknown mapping, using lookup_type_name='{}'", lookup_type_name);
+            }
         }
         else
         {
