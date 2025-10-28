@@ -1913,6 +1913,43 @@ namespace Cryo
         return TypeKind::Parameterized;
     }
 
+    ParameterizedType *TypeContext::create_parameterized_type(const std::string &base_name,
+                                                              const std::vector<std::string> &param_names)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_parameterized_type('{}', {} params)", base_name, param_names.size());
+        
+        // Create a unique key for deduplication
+        std::string key = base_name + "<";
+        for (size_t i = 0; i < param_names.size(); ++i) {
+            if (i > 0) key += ",";
+            key += param_names[i];
+        }
+        key += ">";
+        
+        // Check if we already have a deferred type for this signature
+        static std::unordered_map<std::string, std::unique_ptr<ParameterizedType>> deferred_types;
+        auto it = deferred_types.find(key);
+        if (it != deferred_types.end()) {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Reusing existing deferred ParameterizedType for '{}'", key);
+            return it->second.get();
+        }
+        
+        // Create a deferred parameterized type that can be resolved later
+        // when the template is registered in the TypeRegistry
+        TypeKind param_kind = get_parameterized_type_kind(base_name);
+        
+        // For deferred types, we'll create a ParameterizedType with the base name
+        // and parameter names, but not instantiated yet
+        auto param_type = std::make_unique<ParameterizedType>(base_name, param_names);
+        auto *result = param_type.get();
+        
+        // Store it with deduplication
+        deferred_types[key] = std::move(param_type);
+        
+        LOG_DEBUG(Cryo::LogComponent::AST, "Created new deferred ParameterizedType for '{}' -> '{}'", key, base_name);
+        return result;
+    }
+
     bool TypeContext::is_enum_pattern_type(TypeKind kind)
     {
         return kind == TypeKind::OptionType || kind == TypeKind::ResultType;
@@ -2290,7 +2327,10 @@ namespace Cryo
             return nullptr;
         }
 
-        auto instantiation = std::make_shared<ParameterizedEnumType>(_param_type_kind, concrete_types, _base_enum_type);
+        // Use the base name from this template instead of TypeKind mapping to preserve custom enum names
+        LOG_DEBUG(Cryo::LogComponent::AST, "ParameterizedEnumType::instantiate - template base_name(): '{}'", base_name());
+        auto instantiation = std::make_shared<ParameterizedEnumType>(base_name(), concrete_types, _base_enum_type);
+        LOG_DEBUG(Cryo::LogComponent::AST, "ParameterizedEnumType::instantiate - created instantiation with base_name(): '{}'", instantiation->base_name());
         return instantiation;
     }
 
@@ -2448,6 +2488,7 @@ namespace Cryo
     {
         auto template_type = std::make_shared<ParameterizedType>(base_name, param_names);
         _templates[base_name] = template_type;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::register_template - stored '{}' in templates map, size now: {}", base_name, _templates.size());
     }
 
     ParameterizedType *TypeRegistry::get_template(const std::string &base_name)
@@ -2542,7 +2583,9 @@ namespace Cryo
 
     bool TypeRegistry::has_template(const std::string &base_name) const
     {
-        return _templates.find(base_name) != _templates.end();
+        bool found = _templates.find(base_name) != _templates.end();
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::has_template('{}') - result: {}, templates size: {}", base_name, found, _templates.size());
+        return found;
     }
 
     std::pair<std::string, std::vector<std::string>> TypeRegistry::parse_generic_syntax(const std::string &type_string)
