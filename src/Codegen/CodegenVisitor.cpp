@@ -1862,7 +1862,7 @@ namespace Cryo::Codegen
         if (!current_struct_type.empty())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating enum method in context: {}", current_struct_type);
-            
+
             // Generate the method with enum context (similar to struct method generation)
             generate_enum_method(node, current_struct_type);
             register_value(&node, nullptr);
@@ -11217,7 +11217,7 @@ namespace Cryo::Codegen
             {
                 auto *cryo_enum_type = static_cast<Cryo::EnumType *>(enum_type);
                 const auto &variants = cryo_enum_type->variants();
-                
+
                 // Find the variant index (this is the discriminant value)
                 for (size_t i = 0; i < variants.size(); ++i)
                 {
