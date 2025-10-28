@@ -1086,7 +1086,7 @@ namespace Cryo
                     // Apply type substitution to the enum name
                     std::string original_enum_name = enum_pattern->enum_name();
                     std::string substituted_enum_name = original_enum_name;
-                    
+
                     // Apply type substitutions to the enum name
                     for (const auto &sub : type_substitutions)
                     {
@@ -1096,16 +1096,16 @@ namespace Cryo
                             break;
                         }
                     }
-                    
+
                     // Create the substituted enum pattern
                     auto substituted_pattern = std::make_unique<EnumPatternNode>(arm_location, substituted_enum_name, enum_pattern->variant_name());
-                    
+
                     // Copy bound variables if any
                     for (const auto &var : enum_pattern->bound_variables())
                     {
                         substituted_pattern->add_bound_variable(var);
                     }
-                    
+
                     cloned_pattern = std::move(substituted_pattern);
                 }
                 else
