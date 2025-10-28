@@ -1969,6 +1969,39 @@ namespace Cryo
             advance(); // consume '('
             auto expr = parse_expression();
             consume(TokenKind::TK_R_PAREN, "Expected ')' after expression");
+            
+            // Handle postfix expressions after parentheses (like (*ptr).method())
+            while (true)
+            {
+                if (_current_token.is(TokenKind::TK_L_PAREN))
+                {
+                    // Function call
+                    expr = parse_call_expression(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_L_SQUARE))
+                {
+                    // Array access
+                    expr = parse_array_access(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_PERIOD))
+                {
+                    // Member access
+                    expr = parse_member_access(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_PLUSPLUS) || _current_token.is(TokenKind::TK_MINUSMINUS))
+                {
+                    // Postfix increment/decrement
+                    Token op = _current_token;
+                    advance();
+                    expr = _builder.create_unary_expression(op, std::move(expr));
+                }
+                else
+                {
+                    // No more postfix operations
+                    break;
+                }
+            }
+            
             return expr;
         }
 

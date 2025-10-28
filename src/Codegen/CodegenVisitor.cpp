@@ -2112,6 +2112,18 @@ namespace Cryo::Codegen
                 {
                     builder.CreateStore(&*arg_it, this_alloca);
                     _value_context->set_value("this", this_alloca, this_alloca, struct_ptr_type);
+                    
+                    // Also register the Cryo type for proper member access resolution
+                    if (cryo_target_type)
+                    {
+                        // Create a pointer type for 'this'
+                        auto this_ptr_type = std::make_unique<Cryo::PointerType>(
+                            std::shared_ptr<Cryo::Type>(cryo_target_type, [](Cryo::Type*){})
+                        );
+                        _variable_types["this"] = this_ptr_type.get();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "'this' parameter Cryo type registered: {}", cryo_target_type->name());
+                    }
+                    
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "'this' parameter set up successfully");
                 }
                 else
@@ -2276,12 +2288,35 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using direct return");
                     // Direct return
                     builder.CreateRet(return_value);
+                    
+                    // After creating a return instruction, any subsequent code in this function
+                    // will be unreachable. Create a new unreachable basic block for any remaining instructions.
+                    if (_current_function && _current_function->function)
+                    {
+                        llvm::BasicBlock *unreachable_block = llvm::BasicBlock::Create(
+                            _context_manager.get_context(), "unreachable", _current_function->function);
+                        builder.SetInsertPoint(unreachable_block);
+                        // Add an unreachable instruction to properly terminate this block
+                        builder.CreateUnreachable();
+                    }
                 }
             }
             else
             {
                 // Void return
                 builder.CreateRetVoid();
+                
+                // After creating a return instruction, any subsequent code in this function
+                // will be unreachable. To avoid "terminator in middle of basic block" errors,
+                // we create a new unreachable basic block for any remaining instructions.
+                if (_current_function && _current_function->function)
+                {
+                    llvm::BasicBlock *unreachable_block = llvm::BasicBlock::Create(
+                        _context_manager.get_context(), "unreachable", _current_function->function);
+                    builder.SetInsertPoint(unreachable_block);
+                    // Add an unreachable instruction to properly terminate this block
+                    builder.CreateUnreachable();
+                }
             }
 
             register_value(&node, nullptr);
@@ -4119,24 +4154,53 @@ namespace Cryo::Codegen
         }
 
         // Strategy 2: Try current struct context (fallback for method contexts)
+        // Give priority to implementation block context for 'this' member access
         if (!struct_type && !current_struct_type.empty())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying current struct context: {}", current_struct_type);
 
-            auto context_type_it = _types.find(current_struct_type);
-            if (context_type_it != _types.end())
+            // Special handling for 'this' member access in implementation blocks
+            bool is_this_access = false;
+            if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(node.object()))
             {
-                if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(context_type_it->second))
+                is_this_access = (identifier->name() == "this");
+            }
+
+            if (is_this_access)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected 'this' member access in implementation context, forcing struct type: {}", current_struct_type);
+                
+                auto context_type_it = _types.find(current_struct_type);
+                if (context_type_it != _types.end())
                 {
-                    // Verify this could be the right type by checking field exists
-                    int test_field_index = _type_mapper->get_field_index(current_struct_type, member_name);
-                    if (test_field_index != -1)
+                    if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(context_type_it->second))
                     {
+                        // For 'this' in implementation blocks, always use the implementation target type
                         struct_type = struct_llvm_type;
                         type_name = current_struct_type;
-                        field_index = test_field_index;
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found struct type via method context: {}, field index: {}",
+                        field_index = _type_mapper->get_field_index(current_struct_type, member_name);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Forced struct type for 'this' member access: {}, field index: {}",
                                   current_struct_type, field_index);
+                    }
+                }
+            }
+            else
+            {
+                auto context_type_it = _types.find(current_struct_type);
+                if (context_type_it != _types.end())
+                {
+                    if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(context_type_it->second))
+                    {
+                        // Verify this could be the right type by checking field exists
+                        int test_field_index = _type_mapper->get_field_index(current_struct_type, member_name);
+                        if (test_field_index != -1)
+                        {
+                            struct_type = struct_llvm_type;
+                            type_name = current_struct_type;
+                            field_index = test_field_index;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found struct type via method context: {}, field index: {}",
+                                      current_struct_type, field_index);
+                        }
                     }
                 }
             }
@@ -4991,18 +5055,21 @@ namespace Cryo::Codegen
             // Generate function body
             node->body()->accept(*this);
 
-            // Exit function scope
-            exit_scope();
-
-            // Ensure proper termination
+            // Check if the current basic block already has a terminator
             auto &builder = _context_manager.get_builder();
-
-            // Instead of checking the potentially corrupted entry_block,
-            // try to get the current basic block from the builder
             llvm::BasicBlock *current_block = builder.GetInsertBlock();
+            bool has_terminator = current_block && current_block->getTerminator();
 
-            // Only add termination if the current block doesn't already have one
-            if (current_block && !current_block->getTerminator())
+            // Exit function scope only if we don't already have a terminator
+            // If we have a terminator (like from a return statement), the destructors
+            // should have been called already in the return statement
+            if (!has_terminator)
+            {
+                exit_scope();
+            }
+
+            // Ensure proper termination only if we don't already have one
+            if (!has_terminator)
             {
                 // For void functions, we can try to add a void return if needed
                 if (is_void_function)
@@ -8659,6 +8726,95 @@ namespace Cryo::Codegen
                 report_error("Failed to resolve nested member access for method call: " + member_access->member());
                 return nullptr;
             }
+            else if (auto *unary_expr = dynamic_cast<UnaryExpressionNode *>(member_access->object()))
+            {
+                // Handle member access on unary expressions like (*ptr).method()
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found unary expression in member access: {}", unary_expr->operator_token().text());
+                
+                if (unary_expr->operator_token().is(TokenKind::TK_STAR))
+                {
+                    // This is a dereference operation like (*ptr).method()
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Handling dereference member access: (*{}).{}", 
+                              "ptr_expr", member_access->member());
+                    
+                    // Evaluate the operand to get the pointer value
+                    unary_expr->operand()->accept(*this);
+                    llvm::Value *ptr_value = get_current_value();
+                    
+                    if (ptr_value)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got pointer value for dereference member access");
+                        
+                        // Get the type that the pointer points to using TypeChecker's resolved type
+                        Cryo::Type *resolved_type = member_access->get_resolved_type();
+                        Cryo::Type *object_type = unary_expr->get_resolved_type();
+                        
+                        if (object_type)
+                        {
+                            std::string type_name = object_type->to_string();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Dereferenced object type: '{}'", type_name);
+                            
+                            // Build method name
+                            std::string method_name;
+                            if (!_namespace_context.empty())
+                            {
+                                method_name = _namespace_context + "::" + type_name + "::" + member_access->member();
+                            }
+                            else
+                            {
+                                method_name = type_name + "::" + member_access->member();
+                            }
+                            
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up dereferenced method: '{}'", method_name);
+                            auto method_it = _functions.find(method_name);
+                            
+                            if (method_it != _functions.end())
+                            {
+                                llvm::Function *method_func = method_it->second;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found method for dereferenced object: {}", method_name);
+                                
+                                // Prepare arguments: this pointer + method arguments
+                                std::vector<llvm::Value *> args;
+                                args.push_back(ptr_value); // Use the pointer directly as 'this'
+                                
+                                // Generate method arguments
+                                for (const auto &arg : node->arguments())
+                                {
+                                    if (arg)
+                                    {
+                                        arg->accept(*this);
+                                        llvm::Value *arg_value = get_current_value();
+                                        if (arg_value)
+                                        {
+                                            args.push_back(arg_value);
+                                        }
+                                    }
+                                }
+                                
+                                // Call the method
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling dereferenced method with {} arguments", args.size());
+                                return builder.CreateCall(method_func, args);
+                            }
+                            else
+                            {
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Method not found for dereferenced object: {}", method_name);
+                            }
+                        }
+                        else
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Could not determine type of dereferenced object");
+                        }
+                    }
+                    else
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Could not evaluate pointer expression for dereference");
+                    }
+                }
+                
+                // Fall back to function name extraction
+                function_name = extract_function_name_from_member_access(member_access);
+                resolved_function_name = function_name;
+            }
             else
             {
                 // Check if the object is a literal that needs primitive method handling
@@ -10976,6 +11132,20 @@ namespace Cryo::Codegen
     {
         try
         {
+            // Check if current basic block already has a terminator
+            // If it does, we shouldn't add destructor calls as they would be unreachable
+            llvm::BasicBlock *current_block = _context_manager.get_builder().GetInsertBlock();
+            if (current_block && current_block->getTerminator())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current basic block already has terminator, skipping destructor calls in exit_scope");
+                _value_context->exit_scope();
+                if (_current_function && !_current_function->scope_stack.empty())
+                {
+                    _current_function->scope_stack.pop_back();
+                }
+                return;
+            }
+
             // Call destructors for variables in the current scope before exiting
             if (_current_function && !_current_function->scope_stack.empty())
             {
@@ -12319,8 +12489,10 @@ namespace Cryo::Codegen
             args.push_back(struct_alloca);
 
             // Add constructor arguments
-            for (const auto &arg : node->arguments())
+            llvm::FunctionType *func_type = constructor_func->getFunctionType();
+            for (size_t i = 0; i < node->arguments().size(); ++i)
             {
+                auto &arg = node->arguments()[i];
                 arg->accept(*this);
                 llvm::Value *arg_value = get_current_value();
                 if (!arg_value)
@@ -12328,6 +12500,51 @@ namespace Cryo::Codegen
                     report_error("Failed to generate argument for stack constructor", arg.get());
                     return nullptr;
                 }
+
+                // Check if we need type conversion for this argument
+                // Parameter index is i+1 because first parameter is 'this' pointer
+                if (i + 1 < func_type->getNumParams())
+                {
+                    llvm::Type *expected_type = func_type->getParamType(i + 1);
+                    llvm::Type *actual_type = arg_value->getType();
+
+                    // Perform implicit type conversion if needed
+                    if (actual_type != expected_type)
+                    {
+                        // Handle float to double conversion
+                        if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for constructor parameter {}", i);
+                            arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                        }
+                        // Handle double to float conversion
+                        else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for constructor parameter {}", i);
+                            arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                        }
+                        // Handle integer conversions
+                        else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                        {
+                            unsigned actual_bits = actual_type->getIntegerBitWidth();
+                            unsigned expected_bits = expected_type->getIntegerBitWidth();
+                            if (actual_bits != expected_bits)
+                            {
+                                if (actual_bits < expected_bits)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for constructor parameter {}", actual_bits, expected_bits, i);
+                                    arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for constructor parameter {}", actual_bits, expected_bits, i);
+                                    arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                }
+                            }
+                        }
+                    }
+                }
+
                 args.push_back(arg_value);
             }
 
