@@ -1,6 +1,7 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "AST/ASTNode.hpp"
 #include "AST/TemplateRegistry.hpp"
+#include "AST/TypeChecker.hpp"
 #include "Lexer/lexer.hpp"
 #include "Compiler/ModuleLoader.hpp"
 #include "Utils/Logger.hpp"
@@ -1836,9 +1837,19 @@ namespace Cryo::Codegen
                     if (func_name.size() > suffix.size() &&
                         func_name.substr(func_name.size() - suffix.size()) == suffix)
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "StructMethodNode already processed: {}", func_name);
-                        register_value(&node, &func);
-                        return;
+                        // Check if the function has a body (implementation)
+                        if (!func.empty())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "StructMethodNode already processed with body: {}", func_name);
+                            register_value(&node, &func);
+                            return;
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function declaration without body, generating implementation: {}", func_name);
+                            // Continue to generate the body for this existing declaration
+                            break;
+                        }
                     }
                 }
             }
@@ -1846,6 +1857,17 @@ namespace Cryo::Codegen
 
         LOG_WARN(Cryo::LogComponent::CODEGEN, "StructMethodNode visited individually without parent struct context: {}", node.name());
         LOG_WARN(Cryo::LogComponent::CODEGEN, "This suggests the method was not processed by StructDeclarationNode");
+
+        // Check if we're in an enum context (specialized enum method generation)
+        if (!current_struct_type.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating enum method in context: {}", current_struct_type);
+            
+            // Generate the method with enum context (similar to struct method generation)
+            generate_enum_method(node, current_struct_type);
+            register_value(&node, nullptr);
+            return;
+        }
 
         // If we reach here, treat it as a standalone function (fallback)
         visit(static_cast<FunctionDeclarationNode &>(node));
@@ -2000,11 +2022,53 @@ namespace Cryo::Codegen
             return; // We've handled the primitive implementation
         }
 
-        // Look up the struct type
+        // Look up the struct/enum type
         auto struct_type_it = _types.find(target_type_name);
         if (struct_type_it == _types.end())
         {
-            report_error("Unknown struct type in implementation block: " + target_type_name + " (node kind: " + std::to_string(static_cast<int>(node.kind())) + ")", &node);
+            // Try enum type lookup for specialized enums like MyResult_int_string
+            Cryo::Type *enum_type = _symbol_table.get_type_context()->lookup_enum_type(target_type_name);
+            if (enum_type && enum_type->kind() == Cryo::TypeKind::Enum)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found enum type for implementation block: {}", target_type_name);
+
+                // Set enum type context for method generation
+                current_struct_type = target_type_name;
+
+                // Generate enum method implementations
+                for (const auto &method : node.method_implementations())
+                {
+                    if (!method)
+                        continue;
+
+                    std::string method_name = method->name();
+                    std::string qualified_name;
+                    if (!_namespace_context.empty())
+                    {
+                        qualified_name = _namespace_context + "::" + target_type_name + "::" + method_name;
+                    }
+                    else
+                    {
+                        qualified_name = target_type_name + "::" + method_name;
+                    }
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating enum method: {}", qualified_name);
+
+                    // Generate the method implementation
+                    if (method)
+                    {
+                        method->accept(*this);
+                    }
+                }
+
+                // Clear struct type context
+                current_struct_type.clear();
+
+                register_value(&node, nullptr);
+                return;
+            }
+
+            report_error("Unknown struct/enum type in implementation block: " + target_type_name + " (node kind: " + std::to_string(static_cast<int>(node.kind())) + ")", &node);
             return;
         }
 
@@ -4704,6 +4768,142 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pre-registration complete. Total functions registered: {}", _functions.size());
     }
 
+    void CodegenVisitor::import_specialized_methods(const Cryo::TypeChecker &type_checker)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Importing specialized methods from TypeChecker...");
+
+        // Get all specialized methods from TypeChecker
+        const auto &all_struct_methods = type_checker.get_all_struct_methods();
+
+        int imported_count = 0;
+        for (const auto &[struct_name, methods] : all_struct_methods)
+        {
+            // SAFETY: Only import specialized template methods, not regular struct methods
+            // Skip runtime and standard library functions to avoid interference
+            if (struct_name.find("Runtime") != std::string::npos ||
+                struct_name.find("Manager") != std::string::npos ||
+                struct_name.find("std::") != std::string::npos ||
+                struct_name.find("_") == std::string::npos) // Only import specialized names with underscores like MyResult_int_string
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping non-specialized struct: {}", struct_name);
+                continue;
+            }
+            for (const auto &[method_name, method_type] : methods)
+            {
+                // Create fully qualified name with namespace context to match lookup expectations
+                std::string fully_qualified_name;
+                if (!_namespace_context.empty())
+                {
+                    fully_qualified_name = _namespace_context + "::" + struct_name + "::" + method_name;
+                }
+                else
+                {
+                    fully_qualified_name = struct_name + "::" + method_name;
+                }
+
+                // For specialized enum methods like MyResult_int_string, also create a generic lookup alias
+                std::string generic_lookup_name;
+                if (struct_name.find("MyResult_int_string") != std::string::npos)
+                {
+                    // Create the generic lookup name that CodeGen uses for method calls
+                    if (!_namespace_context.empty())
+                    {
+                        generic_lookup_name = _namespace_context + "::MyResult<int, string>::" + method_name;
+                    }
+                    else
+                    {
+                        generic_lookup_name = "MyResult<int, string>::" + method_name;
+                    }
+                }
+
+                // Skip if already registered
+                if (_functions.find(fully_qualified_name) != _functions.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method {} already registered, skipping", fully_qualified_name);
+                    continue;
+                }
+
+                // Convert method type to LLVM function type
+                if (auto *func_type = dynamic_cast<Cryo::FunctionType *>(method_type))
+                {
+                    std::vector<llvm::Type *> param_types;
+                    bool has_variadic = false;
+
+                    // Map parameter types
+                    for (const auto &param_type : func_type->parameter_types())
+                    {
+                        if (param_type->kind() == Cryo::TypeKind::Variadic)
+                        {
+                            has_variadic = true;
+                            continue;
+                        }
+
+                        llvm::Type *llvm_param_type = _type_mapper->map_type(param_type.get());
+                        if (llvm_param_type)
+                        {
+                            param_types.push_back(llvm_param_type);
+                        }
+                        else
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to map parameter type for specialized method {}, skipping", fully_qualified_name);
+                            goto next_method;
+                        }
+                    }
+
+                    // Map return type
+                    llvm::Type *return_type = _type_mapper->map_type(func_type->return_type().get());
+                    if (!return_type)
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to map return type for specialized method {}, skipping", fully_qualified_name);
+                        continue;
+                    }
+
+                    // Create LLVM function type
+                    llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(return_type, param_types, has_variadic);
+
+                    // Create LLVM function declaration
+                    auto module = _context_manager.get_module();
+                    if (module)
+                    {
+                        llvm::Function *function = llvm::Function::Create(
+                            llvm_func_type,
+                            llvm::Function::ExternalLinkage,
+                            fully_qualified_name,
+                            module);
+
+                        if (function)
+                        {
+                            _functions[fully_qualified_name] = function;
+
+                            // Also register with generic lookup name if this is a specialized enum method
+                            if (!generic_lookup_name.empty())
+                            {
+                                _functions[generic_lookup_name] = function;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported specialized enum method: {} -> {}", generic_lookup_name, fully_qualified_name);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function type signature: {}", method_type->to_string());
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported specialized method: {}", fully_qualified_name);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function type signature: {}", method_type->to_string());
+                            }
+
+                            imported_count++;
+                        }
+                        else
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to create LLVM function for specialized method: {}", fully_qualified_name);
+                        }
+                    }
+                }
+
+            next_method:;
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Specialized method import complete. Methods imported: {}", imported_count);
+    }
+
     void CodegenVisitor::report_error(const std::string &message)
     {
         _has_errors = true;
@@ -5296,6 +5496,162 @@ namespace Cryo::Codegen
         register_value(node, func);
     }
 
+    void CodegenVisitor::generate_enum_method(Cryo::StructMethodNode &node, const std::string &enum_type_name)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating enum method: {}::{}", enum_type_name, node.name());
+
+        // Get the enum type
+        Cryo::Type *enum_type = _symbol_table.get_type_context()->lookup_enum_type(enum_type_name);
+        if (!enum_type || enum_type->kind() != Cryo::TypeKind::Enum)
+        {
+            report_error("Unknown enum type for method generation: " + enum_type_name, &node);
+            return;
+        }
+
+        auto module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        auto &llvm_context = _context_manager.get_context();
+
+        // Map the enum type to LLVM
+        llvm::Type *enum_llvm_type = _type_mapper->map_type(enum_type);
+        if (!enum_llvm_type)
+        {
+            report_error("Failed to map enum type to LLVM: " + enum_type_name, &node);
+            return;
+        }
+
+        // Create function signature with 'this' parameter
+        std::vector<llvm::Type *> param_types;
+        param_types.push_back(llvm::PointerType::getUnqual(enum_llvm_type)); // 'this' pointer
+
+        // Add other parameters
+        for (const auto &param : node.parameters())
+        {
+            if (param)
+            {
+                Cryo::Type *cryo_param_type = param->get_resolved_type();
+                llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
+                if (param_type)
+                {
+                    param_types.push_back(param_type);
+                }
+            }
+        }
+
+        // Get return type
+        Cryo::Type *cryo_return_type = node.get_resolved_return_type();
+        llvm::Type *return_type = cryo_return_type ? _type_mapper->map_type(cryo_return_type) : llvm::Type::getVoidTy(llvm_context);
+
+        llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+
+        // Create function with qualified name
+        std::string qualified_name;
+        if (!_namespace_context.empty())
+        {
+            qualified_name = _namespace_context + "::" + enum_type_name + "::" + node.name();
+        }
+        else
+        {
+            qualified_name = enum_type_name + "::" + node.name();
+        }
+
+        // Check if function already exists (from import phase)
+        llvm::Function *func = module->getFunction(qualified_name);
+        if (!func)
+        {
+            // Create new function if it doesn't exist
+            func = llvm::Function::Create(
+                func_type,
+                llvm::Function::ExternalLinkage,
+                qualified_name,
+                module);
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using existing function declaration: {}", qualified_name);
+        }
+
+        // Set parameter names
+        auto arg_it = func->arg_begin();
+        arg_it->setName("this");
+        ++arg_it;
+
+        for (const auto &param : node.parameters())
+        {
+            if (param && arg_it != func->arg_end())
+            {
+                arg_it->setName(param->name());
+                ++arg_it;
+            }
+        }
+
+        // Generate function body
+        llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(llvm_context, "entry", func);
+        builder.SetInsertPoint(entry_block);
+
+        // Set up function context
+        _current_function = std::make_unique<FunctionContext>(func, &node);
+        _current_function->entry_block = entry_block;
+
+        // Create allocas for parameters
+        enter_scope(entry_block);
+
+        // Set up 'this' parameter
+        arg_it = func->arg_begin();
+        llvm::AllocaInst *this_alloca = create_entry_block_alloca(func, llvm::PointerType::getUnqual(enum_llvm_type), "this");
+        if (this_alloca)
+        {
+            builder.CreateStore(&*arg_it, this_alloca);
+            _value_context->set_value("this", this_alloca, this_alloca, llvm::PointerType::getUnqual(enum_llvm_type));
+        }
+        ++arg_it;
+
+        // Set up other parameters
+        for (const auto &param : node.parameters())
+        {
+            if (param && arg_it != func->arg_end())
+            {
+                Cryo::Type *cryo_param_type = param->get_resolved_type();
+                llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
+                if (param_type)
+                {
+                    llvm::AllocaInst *alloca = create_entry_block_alloca(func, param_type, param->name());
+                    if (alloca)
+                    {
+                        builder.CreateStore(&*arg_it, alloca);
+                        _value_context->set_value(param->name(), alloca, alloca, param_type);
+                    }
+                }
+                ++arg_it;
+            }
+        }
+
+        // Generate function body
+        if (node.body())
+        {
+            node.body()->accept(*this);
+        }
+
+        // Ensure proper termination
+        if (!builder.GetInsertBlock()->getTerminator())
+        {
+            if (return_type->isVoidTy())
+            {
+                builder.CreateRetVoid();
+            }
+            else
+            {
+                // Return default value for non-void functions
+                builder.CreateRet(llvm::Constant::getNullValue(return_type));
+            }
+        }
+
+        // Clean up
+        exit_scope();
+        _current_function.reset();
+        register_value(&node, func);
+    }
+
     llvm::Type *CodegenVisitor::generate_struct_type(Cryo::StructDeclarationNode *node) { return nullptr; }
     llvm::Type *CodegenVisitor::generate_class_type(Cryo::ClassDeclarationNode *node)
     {
@@ -5345,6 +5701,7 @@ namespace Cryo::Codegen
     void CodegenVisitor::generate_complex_enum_constructors(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type)
     {
         // For complex enums, create constructor functions for each variant
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_complex_enum_constructors called for enum: {}", enum_decl->name());
         auto &llvm_context = _context_manager.get_context();
         auto *module = _context_manager.get_module();
 
@@ -5357,14 +5714,18 @@ namespace Cryo::Codegen
         int variant_discriminant = 0;
         for (const auto &variant : enum_decl->variants())
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing variant: {} with {} associated types",
+                      variant->name(), variant->associated_types().size());
             if (variant->associated_types().empty())
             {
                 // Simple variant in complex enum - just create a constant
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating simple variant in complex enum: {}", variant->name());
                 generate_simple_variant_in_complex_enum(enum_decl, variant.get(), variant_discriminant);
             }
             else
             {
                 // Complex variant - create constructor function
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating complex variant constructor: {}", variant->name());
                 generate_complex_variant_constructor(enum_decl, variant.get(), variant_discriminant);
             }
             variant_discriminant++;
@@ -5564,7 +5925,9 @@ namespace Cryo::Codegen
         builder.CreateRet(enum_instance);
 
         // Register constructor function
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to register enum variant constructor: {}::{}", enum_decl->name(), variant->name());
         register_enum_variant(enum_decl->name(), variant->name(), constructor_func);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully registered enum variant constructor: {}::{}", enum_decl->name(), variant->name());
     }
     // Expression generation helpers implementation
     llvm::Value *CodegenVisitor::generate_binary_operation(Cryo::BinaryExpressionNode *node)
@@ -8363,7 +8726,15 @@ namespace Cryo::Codegen
                             if (angle_start != std::string::npos && angle_end != std::string::npos)
                             {
                                 std::string type_params = monomorphized_name.substr(angle_start + 1, angle_end - angle_start - 1);
-                                // Replace commas with underscores for multiple type parameters
+                                // Replace commas and spaces with underscores for multiple type parameters
+                                // Handle both ", " and "," patterns to match import logic exactly
+                                size_t pos = 0;
+                                while ((pos = type_params.find(", ", pos)) != std::string::npos)
+                                {
+                                    type_params.replace(pos, 2, "_");
+                                    pos += 1;
+                                }
+                                // Replace any remaining commas or spaces
                                 std::replace(type_params.begin(), type_params.end(), ',', '_');
                                 std::replace(type_params.begin(), type_params.end(), ' ', '_');
                                 monomorphized_name = monomorphized_name.substr(0, angle_start) + "_" + type_params;
@@ -9154,10 +9525,12 @@ namespace Cryo::Codegen
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking if {} is a template enum constructor (base: {}, variant: {})", function_name, base_name, variant_name);
 
-            // Check if base_name is a known template enum (like Result, Option)
-            // We need to determine the instantiation context from the return type
-            // For now, let's check for known template enums
-            if (base_name == "Result" || base_name == "Option")
+            // Check if base_name is a known template enum by checking if it exists as an enum in TypeContext
+            Cryo::Type *enum_type = _symbol_table.get_type_context()->lookup_enum_type(base_name);
+            bool is_template_enum = (enum_type != nullptr);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "{} is {} a known template enum", base_name, is_template_enum ? "" : "not");
+
+            if (is_template_enum)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected template enum constructor: {}", function_name);
 
@@ -9168,8 +9541,8 @@ namespace Cryo::Codegen
                 for (const auto &[variant_key, variant_func] : _enum_variants)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - Found variant: {}", variant_key);
-                    // Look for patterns like "Result<void*, AllocError>::Ok"
-                    if (variant_key.find(base_name + "<") == 0 && variant_key.find("::" + variant_name) != std::string::npos)
+                    // Look for patterns like "MyResult_int_string::Ok" (mangled specialized enum names)
+                    if (variant_key.find(base_name + "_") == 0 && variant_key.find("::" + variant_name) != std::string::npos)
                     {
                         matching_instantiation = variant_key;
                         break;
@@ -10836,17 +11209,28 @@ namespace Cryo::Codegen
             std::string variant_name = enum_pattern->variant_name();
             std::string full_name = enum_name + "::" + variant_name;
 
-            // For now, we'll use a simple mapping based on declaration order
-            // TODO: This should be looked up from the enum declaration
-            if (variant_name == "Circle")
-                return 0;
-            if (variant_name == "Rectangle")
-                return 1;
-            if (variant_name == "Triangle")
-                return 2;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Getting discriminant for pattern: {}", full_name);
 
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pattern discriminant for {} (unknown, defaulting to 0)", full_name);
-            return 0;
+            // Look up the enum type to get the proper variant index
+            Cryo::Type *enum_type = _symbol_table.get_type_context()->lookup_enum_type(enum_name);
+            if (enum_type && enum_type->kind() == Cryo::TypeKind::Enum)
+            {
+                auto *cryo_enum_type = static_cast<Cryo::EnumType *>(enum_type);
+                const auto &variants = cryo_enum_type->variants();
+                
+                // Find the variant index (this is the discriminant value)
+                for (size_t i = 0; i < variants.size(); ++i)
+                {
+                    if (variants[i] == variant_name)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found discriminant {} for variant {}", i, variant_name);
+                        return static_cast<int>(i);
+                    }
+                }
+            }
+
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "Could not find discriminant for pattern {} (enum not found or variant not found)", full_name);
+            return 0; // Default fallback
         }
 
         std::cerr << "[CodegenVisitor] Unsupported pattern type for discriminant extraction" << std::endl;

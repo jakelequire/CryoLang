@@ -2,6 +2,7 @@
 #include "AST/TemplateRegistry.hpp"
 #include "AST/TypeChecker.hpp"
 #include "AST/ASTNode.hpp"
+#include "AST/Type.hpp"
 #include "Utils/Logger.hpp"
 #include <iostream>
 #include <sstream>
@@ -150,6 +151,18 @@ namespace Cryo
 
             // Add to program (this transfers ownership)
             program.add_statement(std::move(specialized_node));
+
+            // CRITICAL: Also create specialized implementation block for enum methods
+            // Check if this is an enum template by looking at the template info
+            if (template_info && template_info->enum_template)
+            {
+                auto specialized_impl = create_specialized_implementation_block(program, instantiation);
+                if (specialized_impl)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Adding specialized implementation block: {}", instantiation.instantiated_name);
+                    program.add_statement(std::move(specialized_impl));
+                }
+            }
         }
 
         LOG_INFO(Cryo::LogComponent::AST, "MonomorphizationPass: Monomorphization completed. Generated {} specializations", _generated_specializations.size());
@@ -497,12 +510,193 @@ namespace Cryo
 
         LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Created EnumDeclarationNode successfully");
 
-        // TODO: Implement deep copying of the enum body with type substitution
-        // This would involve copying all enum variants with substituted types
+        // Debug: Check the template node variants count
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Template node has {} variants", template_node.variants().size());
+
+        // Copy and substitute enum variants from the template
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Copying {} variants from template", template_node.variants().size());
+        for (const auto &variant : template_node.variants())
+        {
+            if (variant)
+            {
+                // Clone the variant with type substitution applied to associated types
+                std::vector<std::string> substituted_types;
+                for (const auto &type_str : variant->associated_types())
+                {
+                    std::string substituted_type = substitute_type_in_string(type_str, type_substitutions);
+                    substituted_types.push_back(substituted_type);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substituted variant type: {} -> {}", type_str, substituted_type);
+                }
+
+                // Create the specialized variant
+                std::unique_ptr<EnumVariantNode> specialized_variant;
+                if (substituted_types.empty())
+                {
+                    // Simple variant (no associated types)
+                    specialized_variant = std::make_unique<EnumVariantNode>(
+                        variant->location(),
+                        variant->name());
+                }
+                else
+                {
+                    // Complex variant with associated types
+                    specialized_variant = std::make_unique<EnumVariantNode>(
+                        variant->location(),
+                        variant->name(),
+                        std::move(substituted_types));
+                }
+
+                specialized->add_variant(std::move(specialized_variant));
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added variant '{}' to specialized enum", variant->name());
+            }
+        }
 
         LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Generated specialized enum: {}", specialized->name());
 
+        // Register the specialized enum in TypeContext so it can be found during TypeMapper lookup
+        if (_type_checker)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Registering specialized enum {} in TypeContext", mangled_name);
+
+            // Collect variant names from the specialized enum
+            std::vector<std::string> variant_names;
+            for (const auto &variant : specialized->variants())
+            {
+                if (variant)
+                {
+                    variant_names.push_back(variant->name());
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Collected variant: {}", variant->name());
+                }
+            }
+
+            // Register the specialized enum in TypeContext using get_enum_type
+            // This will create and register the enum type if it doesn't exist
+            auto &type_context = _type_checker->get_type_context();
+            Type *specialized_enum_type = type_context.get_enum_type(mangled_name, variant_names, false); // not simple since it's generic
+
+            if (specialized_enum_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Successfully registered specialized enum type: {}", mangled_name);
+
+                // Now specialize any methods from the template enum
+                specialize_enum_methods(template_node, mangled_name, type_substitutions);
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Failed to register specialized enum type: {}", mangled_name);
+            }
+        }
+        else
+        {
+            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: No TypeChecker available to register specialized enum");
+        }
+
         return specialized;
+    }
+
+    void MonomorphizationPass::specialize_enum_methods(
+        const EnumDeclarationNode &template_node,
+        const std::string &specialized_name,
+        const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        if (!_type_checker)
+        {
+            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: No TypeChecker available for method specialization");
+            return;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing methods for enum: {} -> {}", template_node.name(), specialized_name);
+
+        // Create type name for generic template (with angle brackets) using correct parameter order
+        std::string generic_type_name = template_node.name() + "<";
+        const auto &generic_params = template_node.generic_parameters();
+        for (size_t i = 0; i < generic_params.size(); ++i)
+        {
+            if (i > 0)
+                generic_type_name += ",";
+            generic_type_name += generic_params[i]->name();
+        }
+        generic_type_name += ">";
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Looking up methods for generic type: {}", generic_type_name);
+
+        // Access the struct methods using the new public method
+        const auto *methods = _type_checker->get_struct_methods(generic_type_name);
+
+        if (!methods)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: No methods found for generic enum: {}", generic_type_name);
+            return;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Found {} methods for generic enum", methods->size());
+
+        // Convert string substitutions to Type* substitutions
+        auto type_substitutions_map = convert_to_type_substitutions(type_substitutions);
+
+        // Create specialized methods with type substitution
+        for (const auto &[method_name, method_type] : *methods)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing method: {}", method_name);
+
+            // Get the original function type
+            auto original_func_type = dynamic_cast<const FunctionType *>(method_type);
+            if (!original_func_type)
+            {
+                LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Method {} does not have function type", method_name);
+                continue;
+            }
+
+            // Apply type substitution to return type
+            std::shared_ptr<Type> substituted_return_type = substitute_type(original_func_type->return_type().get(), type_substitutions_map);
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialized return type for {}: {} -> {}",
+                      method_name,
+                      original_func_type->return_type()->to_string(),
+                      substituted_return_type->to_string());
+
+            // Apply type substitution to parameter types and add 'this' parameter
+            std::vector<Type *> substituted_param_types;
+
+            // Add the specialized enum type as the first parameter ('this' parameter)
+            auto &type_context = _type_checker->get_type_context();
+            Type *enum_type = type_context.lookup_enum_type(specialized_name);
+            if (enum_type)
+            {
+                // Create pointer to the specialized enum type for 'this' parameter
+                Type *enum_ptr_type = type_context.create_pointer_type(enum_type);
+                substituted_param_types.push_back(enum_ptr_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added 'this' parameter for {}: {}",
+                          method_name, enum_ptr_type->to_string());
+            }
+
+            // Add the original method parameters with type substitution
+            for (size_t i = 0; i < original_func_type->parameter_types().size(); i++)
+            {
+                const auto &param_type = original_func_type->parameter_types()[i];
+                std::shared_ptr<Type> substituted_param = substitute_type(param_type.get(), type_substitutions_map);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialized param {} for {}: {} -> {}",
+                          i, method_name,
+                          param_type->to_string(),
+                          substituted_param->to_string());
+                substituted_param_types.push_back(substituted_param.get());
+            }
+
+            // Create new function type with substituted types
+            Type *specialized_func_type = type_context.create_function_type(
+                substituted_return_type.get(),
+                substituted_param_types,
+                original_func_type->is_variadic());
+
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Created specialized function type for {}: {}",
+                      method_name, specialized_func_type->to_string());
+
+            // Register the specialized method using the new public method
+            _type_checker->register_specialized_method(specialized_name, method_name, specialized_func_type);
+
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Registered specialized method: {}::{}", specialized_name, method_name);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Completed method specialization for: {}", specialized_name);
     }
 
     /* TODO: Fix constructor compilation issue
@@ -640,6 +834,11 @@ namespace Cryo
 
         auto specialized = std::make_unique<EnumDeclarationNode>(
             SourceLocation{}, instantiation.instantiated_name);
+
+        // TODO: For now, we can't copy variants from metadata since we don't have access to the original template node
+        // This metadata-based function should ideally be replaced with direct template access
+        // But we can at least create the enum structure properly
+        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Metadata-based enum specialization creates empty enum - variants not copied");
 
         LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialized enum created successfully");
         return specialized;
@@ -866,6 +1065,65 @@ namespace Cryo
                 std::move(cloned_else));
         }
 
+        case NodeKind::MatchStatement:
+        {
+            auto *match_stmt = static_cast<MatchStatementNode *>(original_statement);
+            auto location = match_stmt->location();
+
+            // Clone the match expression
+            auto cloned_expr = clone_expression_with_substitution(match_stmt->expr(), type_substitutions);
+            auto cloned_match = std::make_unique<MatchStatementNode>(location, std::move(cloned_expr));
+
+            // Clone each match arm
+            for (const auto &arm : match_stmt->arms())
+            {
+                auto arm_location = arm->location();
+
+                // Clone the pattern with type substitution
+                std::unique_ptr<PatternNode> cloned_pattern;
+                if (auto *enum_pattern = dynamic_cast<EnumPatternNode *>(arm->pattern()))
+                {
+                    // Apply type substitution to the enum name
+                    std::string original_enum_name = enum_pattern->enum_name();
+                    std::string substituted_enum_name = original_enum_name;
+                    
+                    // Apply type substitutions to the enum name
+                    for (const auto &sub : type_substitutions)
+                    {
+                        if (original_enum_name == sub.first)
+                        {
+                            substituted_enum_name = sub.second;
+                            break;
+                        }
+                    }
+                    
+                    // Create the substituted enum pattern
+                    auto substituted_pattern = std::make_unique<EnumPatternNode>(arm_location, substituted_enum_name, enum_pattern->variant_name());
+                    
+                    // Copy bound variables if any
+                    for (const auto &var : enum_pattern->bound_variables())
+                    {
+                        substituted_pattern->add_bound_variable(var);
+                    }
+                    
+                    cloned_pattern = std::move(substituted_pattern);
+                }
+                else
+                {
+                    // For non-enum patterns, create a simple placeholder for now
+                    cloned_pattern = std::make_unique<EnumPatternNode>(arm_location, "Placeholder", "Pattern");
+                }
+
+                // Clone the arm body
+                auto cloned_body = clone_statement_with_substitution(arm->body(), type_substitutions);
+
+                auto cloned_arm = std::make_unique<MatchArmNode>(arm_location, std::move(cloned_pattern), std::move(cloned_body));
+                cloned_match->add_arm(std::move(cloned_arm));
+            }
+
+            return std::move(cloned_match);
+        }
+
         // Add more statement types as needed
         default:
             LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Unsupported statement type for cloning: {}", static_cast<int>(original_statement->kind()));
@@ -1053,42 +1311,60 @@ namespace Cryo
             return type_substitutions;
         }
 
+        auto &type_context = _type_checker->get_type_context();
+
         for (const auto &[param_name, type_string] : string_substitutions)
         {
-            // Try to resolve using public TypeChecker methods first
-            ParameterizedType *param_type = _type_checker->resolve_generic_type(type_string);
-            if (param_type)
+            Type *resolved_type = nullptr;
+
+            // Handle primitive types first
+            if (type_string == "int" || type_string == "i32")
             {
-                type_substitutions[param_name] = std::shared_ptr<Type>(param_type, [](Type *)
-                                                                       {
-                                                                           // Custom deleter that doesn't delete - Type* objects are managed by TypeContext
-                                                                       });
+                resolved_type = type_context.get_integer_type(IntegerKind::I32, true);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> IntegerType", type_string);
+            }
+            else if (type_string == "string")
+            {
+                resolved_type = type_context.get_string_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> StringType", type_string);
+            }
+            else if (type_string == "f32" || type_string == "float")
+            {
+                resolved_type = type_context.get_float_type(FloatKind::F32);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> FloatType", type_string);
+            }
+            else if (type_string == "f64" || type_string == "double")
+            {
+                resolved_type = type_context.get_float_type(FloatKind::F64);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> DoubleType", type_string);
+            }
+            else if (type_string == "bool" || type_string == "boolean")
+            {
+                resolved_type = type_context.get_boolean_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> BooleanType", type_string);
             }
             else
             {
-                // Fallback: For basic types, we can create them directly
-                // This is a temporary approach until we have better type resolution access
-                Type *resolved_type = nullptr;
-
-                // Handle basic built-in types
-                if (type_string == "int" || type_string == "i32")
+                // Try to resolve using TypeChecker for complex types
+                ParameterizedType *param_type = _type_checker->resolve_generic_type(type_string);
+                if (param_type)
                 {
-                    // Access through TypeChecker is preferred, but as fallback create basic type
-                    // Note: This needs to be improved to use proper TypeContext access
-                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Using fallback type resolution for: {}", type_string);
-                }
-
-                if (resolved_type)
-                {
-                    type_substitutions[param_name] = std::shared_ptr<Type>(resolved_type, [](Type *)
-                                                                           {
-                                                                               // Custom deleter that doesn't delete - Type* objects are managed by TypeContext
-                                                                           });
+                    resolved_type = param_type;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved complex type '{}' -> ParameterizedType", type_string);
                 }
                 else
                 {
                     LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Could not resolve type '{}' for parameter '{}'", type_string, param_name);
                 }
+            }
+
+            if (resolved_type)
+            {
+                type_substitutions[param_name] = std::shared_ptr<Type>(resolved_type, [](Type *)
+                                                                       {
+                                                                           // Custom deleter that doesn't delete - Type* objects are managed by TypeContext
+                                                                       });
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Successfully added type substitution: '{}' -> '{}'", param_name, type_string);
             }
         }
 
@@ -1104,14 +1380,31 @@ namespace Cryo
             return nullptr;
         }
 
+        std::string type_name = original_type->name();
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: substitute_type called with type '{}' kind={}",
+                  type_name, static_cast<int>(original_type->kind()));
+
         // If this is a generic type parameter that needs substitution
         if (original_type->kind() == TypeKind::Generic)
         {
-            auto it = type_substitutions.find(original_type->name());
+            auto it = type_substitutions.find(type_name);
             if (it != type_substitutions.end())
             {
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substituting Generic type '{}' -> '{}'",
+                          type_name, it->second->name());
                 return it->second;
             }
+        }
+
+        // ENHANCED: Also check by name for template parameters (T, E, etc.)
+        // Sometimes generic types get resolved as different TypeKinds during parsing
+        auto it = type_substitutions.find(type_name);
+        if (it != type_substitutions.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substituting type by name '{}' (kind={}) -> '{}' (kind={})",
+                      type_name, static_cast<int>(original_type->kind()),
+                      it->second->name(), static_cast<int>(it->second->kind()));
+            return it->second;
         }
 
         // If this is a parameterized type, use its built-in substitute method
@@ -1122,9 +1415,160 @@ namespace Cryo
         }
 
         // For other types, return the original (wrapped in shared_ptr)
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: No substitution needed for type '{}' kind={}",
+                  type_name, static_cast<int>(original_type->kind()));
         return std::shared_ptr<Type>(original_type, [](Type *)
                                      {
                                          // Custom deleter that doesn't delete - Type* objects are managed by TypeContext
                                      });
+    }
+
+    std::unique_ptr<ImplementationBlockNode> MonomorphizationPass::create_specialized_implementation_block(
+        const ProgramNode &program,
+        const GenericInstantiation &instantiation)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating specialized implementation block for: {}", instantiation.instantiated_name);
+
+        // Find the original generic implementation block
+        ImplementationBlockNode *original_impl = nullptr;
+        std::string generic_target_type = instantiation.base_name + "<";
+
+        // Build the generic type pattern to match (e.g., "MyResult<T,E>")
+        for (size_t i = 0; i < instantiation.concrete_types.size(); ++i)
+        {
+            if (i > 0)
+                generic_target_type += ",";
+            // Use generic parameter names (we need to find these from the original template)
+            // For now, use common generic parameter names
+            if (i == 0)
+                generic_target_type += "T";
+            else if (i == 1)
+                generic_target_type += "E";
+            else
+                generic_target_type += "T" + std::to_string(i);
+        }
+        generic_target_type += ">";
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Looking for implementation block with target: {}", generic_target_type);
+
+        // Search through all program statements for the matching implementation block
+        for (const auto &stmt : program.statements())
+        {
+            if (auto *impl_block = dynamic_cast<ImplementationBlockNode *>(stmt.get()))
+            {
+                if (impl_block->target_type() == generic_target_type)
+                {
+                    original_impl = impl_block;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Found original implementation block for: {}", generic_target_type);
+                    break;
+                }
+            }
+        }
+
+        if (!original_impl)
+        {
+            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: No implementation block found for: {}", generic_target_type);
+            return nullptr;
+        }
+
+        // Create type substitution map
+        std::unordered_map<std::string, std::string> type_substitutions;
+        for (size_t i = 0; i < instantiation.concrete_types.size(); ++i)
+        {
+            std::string param_name;
+            if (i == 0)
+                param_name = "T";
+            else if (i == 1)
+                param_name = "E";
+            else
+                param_name = "T" + std::to_string(i);
+
+            type_substitutions[param_name] = instantiation.concrete_types[i];
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Implementation substitution: {} -> {}", param_name, instantiation.concrete_types[i]);
+        }
+
+        // Create the specialized implementation block with the mangled target type name
+        std::string specialized_target = generate_mangled_name(instantiation.base_name, instantiation.concrete_types);
+        auto specialized_impl = std::make_unique<ImplementationBlockNode>(SourceLocation{}, specialized_target);
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating specialized implementation for: {}", specialized_target);
+
+        // Clone and specialize each method from the original implementation
+        for (const auto &method : original_impl->method_implementations())
+        {
+            auto specialized_method = clone_and_substitute_method(*method, type_substitutions);
+            if (specialized_method)
+            {
+                specialized_impl->add_method_implementation(std::move(specialized_method));
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added specialized method: {}", method->name());
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Created specialized implementation block with {} methods", specialized_impl->method_implementations().size());
+        return specialized_impl;
+    }
+
+    std::unique_ptr<StructMethodNode> MonomorphizationPass::clone_and_substitute_method(
+        const StructMethodNode &original_method,
+        const std::unordered_map<std::string, std::string> &type_substitutions)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Cloning and substituting method: {}", original_method.name());
+
+        // Get the original return type and apply substitution
+        Type *original_return_type = original_method.get_resolved_return_type();
+        auto type_substitutions_map = convert_to_type_substitutions(type_substitutions);
+        std::shared_ptr<Type> substituted_return_type = substitute_type(original_return_type, type_substitutions_map);
+
+        // Create the specialized method with the concrete return type
+        auto specialized_method = std::make_unique<StructMethodNode>(
+            original_method.location(),
+            original_method.name(),
+            substituted_return_type.get(),
+            original_method.visibility(),
+            original_method.is_constructor(),
+            original_method.is_destructor(),
+            original_method.is_static());
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substituted return type: {} -> {}",
+                  (original_return_type ? original_return_type->to_string() : "unknown"),
+                  (substituted_return_type ? substituted_return_type->to_string() : "unknown"));
+
+        // Clone and substitute parameters
+        for (const auto &param : original_method.parameters())
+        {
+            Type *original_param_type = param->get_resolved_type();
+            std::shared_ptr<Type> substituted_param_type = substitute_type(original_param_type, type_substitutions_map);
+
+            auto specialized_param = std::make_unique<VariableDeclarationNode>(
+                param->location(),
+                param->name(),
+                substituted_param_type.get(),
+                nullptr, // initializer
+                param->is_mutable());
+            specialized_method->add_parameter(std::move(specialized_param));
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substituted parameter {}: {} -> {}",
+                      param->name(),
+                      (original_param_type ? original_param_type->to_string() : "unknown"),
+                      (substituted_param_type ? substituted_param_type->to_string() : "unknown"));
+        }
+
+        // Clone the method body if it exists
+        if (original_method.body())
+        {
+            // Use the existing clone method with type substitution
+            auto cloned_body = clone_method_body_with_substitution(original_method.body(), type_substitutions);
+            if (cloned_body)
+            {
+                specialized_method->set_body(std::move(cloned_body));
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Successfully cloned method body with {} statements",
+                          specialized_method->body()->statements().size());
+            }
+            else
+            {
+                LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Failed to clone method body for: {}", original_method.name());
+            }
+        }
+
+        return specialized_method;
     }
 }

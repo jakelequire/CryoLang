@@ -1302,6 +1302,44 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "map_parameterized_type called for base_name='{}', type_parameters.size()={}", param_type->base_name(), param_type->type_parameters().size());
+
+        // Check if this is a ParameterizedEnumType and handle it specially
+        auto param_enum_type = dynamic_cast<Cryo::ParameterizedEnumType *>(param_type);
+        if (param_enum_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Handling ParameterizedEnumType: {}", param_type->base_name());
+
+            // For enum types, we need to look up the specialized enum by its mangled name
+            std::string mangled_name = generate_mangled_name(param_type->base_name(), param_type->type_parameters());
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for specialized enum: {}", mangled_name);
+
+            // Try to get the enum type from TypeContext
+            if (_type_context)
+            {
+                auto enum_type = _type_context->lookup_enum_type(mangled_name);
+                if (enum_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found specialized enum type, delegating to map_enum_type");
+                    return map_enum_type(static_cast<Cryo::EnumType *>(enum_type));
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_enum_type returned nullptr for: {}", mangled_name);
+                }
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "_type_context is null");
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Specialized enum not found, falling back to generic handling");
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type is not a ParameterizedEnumType, it's type: {}", typeid(*param_type).name());
+        }
+
         std::string base_name = param_type->base_name();
         auto type_args = param_type->type_parameters();
         std::string instantiated_name = param_type->get_instantiated_name();
@@ -2166,6 +2204,20 @@ namespace Cryo::Codegen
                           field->name(), field->type_annotation());
             }
         }
+    }
+
+    std::string TypeMapper::generate_mangled_name(const std::string &base_name,
+                                                  const std::vector<std::shared_ptr<Type>> &type_params)
+    {
+        std::ostringstream mangled;
+        mangled << base_name;
+
+        for (const auto &type_param : type_params)
+        {
+            mangled << "_" << type_param->to_string();
+        }
+
+        return mangled.str();
     }
 
 } // namespace Cryo::Codegen

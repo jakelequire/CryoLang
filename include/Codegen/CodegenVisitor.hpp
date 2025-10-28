@@ -19,6 +19,11 @@
 #include <stack>
 #include <unordered_map>
 
+namespace Cryo
+{
+    class TypeChecker; // Forward declaration
+}
+
 namespace Cryo::Codegen
 {
     /**
@@ -188,6 +193,12 @@ namespace Cryo::Codegen
         void pre_register_functions_from_symbol_table();
 
         /**
+         * @brief Import specialized methods from TypeChecker after monomorphization
+         * @param type_checker Reference to TypeChecker containing specialized methods
+         */
+        void import_specialized_methods(const Cryo::TypeChecker &type_checker);
+
+        /**
          * @brief Get TypeMapper for manual AST node registration
          */
         TypeMapper *get_type_mapper() const { return _type_mapper.get(); }
@@ -348,6 +359,7 @@ namespace Cryo::Codegen
         llvm::Function *generate_method_declaration(Cryo::StructMethodNode *method, llvm::Type *struct_type);
         bool generate_function_body(Cryo::FunctionDeclarationNode *node, llvm::Function *function);
         void generate_primitive_method(Cryo::StructMethodNode *node, Cryo::Type *primitive_type);
+        void generate_enum_method(Cryo::StructMethodNode &node, const std::string &enum_type_name);
 
         // Generic type generation
         llvm::Function *generate_generic_constructor(const std::string &instantiated_type,

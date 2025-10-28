@@ -1436,6 +1436,14 @@ namespace Cryo
         _type_registry->register_template(base_name, param_names);
     }
 
+    void TypeChecker::register_generic_enum_type(const std::string &base_name, const std::vector<std::string> &param_names)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering generic enum template: '{}' with {} parameters", base_name, param_names.size());
+        // Get the base enum type if it exists to pass to the template registration
+        std::shared_ptr<EnumType> base_enum = _type_context.get_parameterized_enum_template(base_name);
+        _type_registry->register_enum_template(base_name, param_names, base_enum);
+    }
+
     void TypeChecker::register_builtin_generic_types()
     {
         // Register Array<T> as a built-in generic type
@@ -1542,7 +1550,7 @@ namespace Cryo
 
             if (!param_names.empty())
             {
-                register_generic_type(enum_node.name(), param_names);
+                register_generic_enum_type(enum_node.name(), param_names);
                 LOG_DEBUG(Cryo::LogComponent::AST,
                           "Discovered generic enum '{}' with {} parameter(s)",
                           enum_node.name(), param_names.size());
@@ -1852,6 +1860,13 @@ namespace Cryo
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Successfully declared variable '{}'", var_name);
         }
+
+        // Set the resolved type on the AST node for CodeGen to use
+        node.set_resolved_type(final_type);
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Set resolved type '{}' (kind={}) on AST node for variable '{}'",
+                  final_type ? final_type->name() : "null",
+                  final_type ? TypeKindToString(final_type->kind()) : "null",
+                  var_name);
 
         // If we're in a struct/class context and NOT in a function, register this as a field
         // This is the proper place for struct field registration when fields are incorrectly
@@ -2977,6 +2992,42 @@ namespace Cryo
             }
         }
 
+        // Check for template enum constructor calls before checking resolved types
+        if (node.callee() && node.callee()->kind() == NodeKind::MemberAccess)
+        {
+            MemberAccessNode *member_access = static_cast<MemberAccessNode *>(node.callee());
+            if (member_access->object()->kind() == NodeKind::Identifier)
+            {
+                IdentifierNode *identifier = static_cast<IdentifierNode *>(member_access->object());
+                std::string base_name = identifier->name();
+                std::string variant_name = member_access->member();
+                std::string full_name = base_name + "::" + variant_name;
+
+                LOG_DEBUG(Cryo::LogComponent::AST, "Checking for template enum constructor: {} (base: {}, variant: {})", full_name, base_name, variant_name);
+
+                // Check if this is a known template enum (like MyResult, Option, Result)
+                ParameterizedType *template_type = _type_registry->get_template(base_name);
+                if (template_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found template enum: {}", base_name);
+
+                    // For now, set the resolved type to the template type
+                    // This allows the call to proceed to CodeGen where proper instantiation happens
+                    node.set_resolved_type(template_type);
+
+                    // Also set the callee's resolved type to help with further processing
+                    member_access->set_resolved_type(template_type);
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Template enum constructor call resolved: {}", full_name);
+                    return;
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "No template found for base: {}", base_name);
+                }
+            }
+        }
+
         // Check if callee is callable
         if (node.callee() && node.callee()->has_resolved_type())
         {
@@ -3480,6 +3531,12 @@ namespace Cryo
             return generic_args[1];
         }
 
+        // Handle E as second parameter for enum templates like MyResult<T,E>
+        if (type_str == "E" && generic_args.size() >= 2)
+        {
+            return generic_args[1];
+        }
+
         // Return original type if no substitution needed
         return type_str;
     }
@@ -3574,12 +3631,12 @@ namespace Cryo
         if (effective_type->kind() == TypeKind::Unknown)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Found Unknown type '{}', checking if it's a deferred parameterized type", effective_type->name());
-            const ParameterizedType *param_type = dynamic_cast<const ParameterizedType*>(effective_type);
+            const ParameterizedType *param_type = dynamic_cast<const ParameterizedType *>(effective_type);
             if (param_type != nullptr)
             {
                 std::string base_name = param_type->base_name();
                 LOG_DEBUG(Cryo::LogComponent::AST, "Handling deferred parameterized type - base_name: '{}', member: '{}'", base_name, member_name);
-                
+
                 // Try to resolve methods for the base type (e.g., MyResult methods)
                 auto base_it = _struct_methods.find(base_name);
                 if (base_it != _struct_methods.end())
@@ -3605,7 +3662,7 @@ namespace Cryo
         {
             ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
             std::string base_name = param_type->base_name();
-            
+
             // Special handling for Array<T> size/length
             if (base_name == "Array")
             {
@@ -3616,7 +3673,7 @@ namespace Cryo
                     return;
                 }
             }
-            
+
             // For all parameterized types, use the base name for lookups
             LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in base type '{}' for parameterized type '{}'", member_name, base_name, effective_type->name());
             auto struct_it = _struct_fields.find(base_name);
@@ -3631,7 +3688,7 @@ namespace Cryo
                     return;
                 }
             }
-            
+
             // Field not found, continue to method lookup using base name
             // Don't return here, fall through to method lookup with the correct base name
         }
@@ -3657,7 +3714,7 @@ namespace Cryo
             ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
             lookup_type_name = param_type->base_name();
             LOG_DEBUG(Cryo::LogComponent::AST, "Using base name '{}' for parameterized type '{}'", lookup_type_name, effective_type->name());
-            
+
             // Special case: if base_name is "Unknown", this might be a deferred type that should map to a known template
             if (lookup_type_name == "Unknown")
             {
@@ -3666,10 +3723,10 @@ namespace Cryo
                 // Look for templates that match the parameter count
                 auto &type_params = param_type->type_parameters();
                 LOG_DEBUG(Cryo::LogComponent::AST, "Unknown type has {} parameters", type_params.size());
-                
+
                 // Check if we have enum templates with matching parameter count
                 // For MyResult<int, string>, we want to find MyResult<T,E>
-                for (const auto &[template_name, methods] : _struct_methods) 
+                for (const auto &[template_name, methods] : _struct_methods)
                 {
                     if (template_name.find('<') != std::string::npos && template_name.find(',') != std::string::npos)
                     {
@@ -3680,17 +3737,19 @@ namespace Cryo
                         {
                             std::string base_template = template_name.substr(0, start);
                             std::string params_str = template_name.substr(start + 1, end - start - 1);
-                            
+
                             // Count the parameters by counting commas + 1
                             size_t param_count = 1;
-                            for (char c : params_str) {
-                                if (c == ',') param_count++;
+                            for (char c : params_str)
+                            {
+                                if (c == ',')
+                                    param_count++;
                             }
-                            
+
                             if (param_count == type_params.size())
                             {
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Found potential template match: '{}' with {} parameters", template_name, param_count);
-                                lookup_type_name = template_name;  // Use the full template name for method lookup
+                                lookup_type_name = template_name; // Use the full template name for method lookup
                                 break;
                             }
                         }
@@ -3703,7 +3762,7 @@ namespace Cryo
         {
             lookup_type_name = effective_type->name();
         }
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in struct '{}'", member_name, lookup_type_name);
         auto struct_it = _struct_fields.find(lookup_type_name);
         if (struct_it != _struct_fields.end())
@@ -3811,9 +3870,9 @@ namespace Cryo
             {
                 // Reverse lookup: for base types like "MyResult", also check for generic versions like "MyResult<T, E>"
                 LOG_DEBUG(Cryo::LogComponent::AST, "Trying generic versions of base type '{}'", lookup_type_name);
-                for (const auto& type_methods : _struct_methods)
+                for (const auto &type_methods : _struct_methods)
                 {
-                    const std::string& registered_type_name = type_methods.first;
+                    const std::string &registered_type_name = type_methods.first;
                     size_t registered_bracket_pos = registered_type_name.find('<');
                     if (registered_bracket_pos != std::string::npos)
                     {
@@ -3825,8 +3884,65 @@ namespace Cryo
                             if (method_it != type_methods.second.end())
                             {
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Found public method '{}' in generic type '{}'", member_name, registered_type_name);
-                                // Found the method in the generic type - store the resolved Type*
-                                node.set_resolved_type(method_it->second);
+
+                                // Need to perform type substitution for the method's type
+                                Type *generic_method_type = method_it->second;
+
+                                // Check if we have a parameterized type with concrete arguments for substitution
+                                if (effective_type && effective_type->kind() == TypeKind::Parameterized)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "Performing type substitution for method '{}' on parameterized type '{}'", member_name, effective_type->name());
+
+                                    // For function types, we need to substitute the return type and parameter types
+                                    if (generic_method_type && generic_method_type->kind() == TypeKind::Function)
+                                    {
+                                        FunctionType *func_type = static_cast<FunctionType *>(generic_method_type);
+
+                                        // Get the parameterized type's concrete arguments
+                                        ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
+                                        auto &concrete_types = param_type->type_parameters();
+
+                                        // Create a type substitution map by extracting parameter names from the template
+                                        std::unordered_map<std::string, std::shared_ptr<Type>> substitution_map;
+
+                                        // Extract template parameter names from the registered type (e.g., "MyResult<T,E>" -> ["T", "E"])
+                                        std::vector<std::string> template_param_names = extract_template_parameter_names(registered_type_name);
+
+                                        // Create mapping from template parameter names to concrete types
+                                        for (size_t i = 0; i < template_param_names.size() && i < concrete_types.size(); ++i)
+                                        {
+                                            substitution_map[template_param_names[i]] = concrete_types[i];
+                                            LOG_DEBUG(Cryo::LogComponent::AST, "Type substitution mapping: {} -> {}",
+                                                      template_param_names[i], concrete_types[i]->name());
+                                        }
+
+                                        // Substitute return type using the mapping
+                                        std::shared_ptr<Type> substituted_return_type = substitute_type_with_map(func_type->return_type(), substitution_map);
+
+                                        // Substitute parameter types using the mapping
+                                        std::vector<Type *> param_types;
+                                        for (const auto &param : func_type->parameter_types())
+                                        {
+                                            std::shared_ptr<Type> substituted_param = substitute_type_with_map(param, substitution_map);
+                                            param_types.push_back(substituted_param.get());
+                                        }
+
+                                        // Create a new function type with substituted types
+                                        Type *substituted_func_type = _type_context.create_function_type(substituted_return_type.get(), param_types, func_type->is_variadic());
+                                        node.set_resolved_type(substituted_func_type);
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted function type with return type: {}", substituted_return_type->name());
+                                    }
+                                    else
+                                    {
+                                        // Not a function type, use as-is for now
+                                        node.set_resolved_type(generic_method_type);
+                                    }
+                                }
+                                else
+                                {
+                                    // No substitution needed or not a parameterized type
+                                    node.set_resolved_type(generic_method_type);
+                                }
                                 return;
                             }
                         }
@@ -3921,9 +4037,9 @@ namespace Cryo
             {
                 // Reverse lookup: for base types like "MyResult", also check for generic versions like "MyResult<T, E>"
                 LOG_DEBUG(Cryo::LogComponent::AST, "Trying generic versions of base type '{}' for private methods", lookup_type_name);
-                for (const auto& type_methods : _private_struct_methods)
+                for (const auto &type_methods : _private_struct_methods)
                 {
-                    const std::string& registered_type_name = type_methods.first;
+                    const std::string &registered_type_name = type_methods.first;
                     size_t registered_bracket_pos = registered_type_name.find('<');
                     if (registered_bracket_pos != std::string::npos)
                     {
@@ -4002,9 +4118,11 @@ namespace Cryo
 
         // Log all available methods in _struct_methods for debugging
         LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_methods:");
-        for (const auto& type_methods : _struct_methods) {
+        for (const auto &type_methods : _struct_methods)
+        {
             LOG_DEBUG(Cryo::LogComponent::AST, "  Type '{}' has {} methods", type_methods.first, type_methods.second.size());
-            for (const auto& method : type_methods.second) {
+            for (const auto &method : type_methods.second)
+            {
                 LOG_DEBUG(Cryo::LogComponent::AST, "    Method: '{}'", method.first);
             }
         }
@@ -4261,6 +4379,25 @@ namespace Cryo
         {
             _diagnostic_builder->create_invalid_operation_error("scope resolution", scope_type, nullptr, node.location());
             node.set_type(_type_context.get_unknown_type()->to_string());
+            return;
+        }
+
+        // Special handling for template enum constructors
+        // Check if this is a template enum (like MyResult::Ok) by checking the type registry
+        std::string template_base_name = scope_name;
+        size_t template_generic_start = scope_name.find('<');
+        if (template_generic_start != std::string::npos)
+        {
+            template_base_name = scope_name.substr(0, template_generic_start);
+        }
+
+        ParameterizedType *template_type = _type_registry->get_template(template_base_name);
+        if (template_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found template enum constructor: {}::{}", scope_name, member_name);
+            // For template enum constructors, set a special type that indicates this is a template enum variant
+            // We'll use the template type itself, which CallExpression can recognize
+            node.set_resolved_type(template_type);
             return;
         }
 
@@ -4743,7 +4880,7 @@ namespace Cryo
         if (!generic_param_names.empty())
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering generic enum '{}' as template with {} parameters", enum_name, generic_param_names.size());
-            register_generic_type(enum_name, generic_param_names);
+            register_generic_enum_type(enum_name, generic_param_names);
         }
 
         // For simple enums (C-style), register each variant as a constant
@@ -4904,28 +5041,28 @@ namespace Cryo
             {
                 // Skip method validation for stdlib files - stdlib implementations
                 // are allowed to extend functionality without requiring explicit declarations
-                bool is_stdlib_file = (_stdlib_compilation_mode || 
-                                     _source_file.find("stdlib") != std::string::npos ||
-                                     _source_file.find("/stdlib/") != std::string::npos ||
-                                     _source_file.find("\\stdlib\\") != std::string::npos ||
-                                     _source_file.find("core/") != std::string::npos ||
-                                     _source_file.find("/core/") != std::string::npos ||
-                                     _source_file.find("\\core\\") != std::string::npos);
-                
+                bool is_stdlib_file = (_stdlib_compilation_mode ||
+                                       _source_file.find("stdlib") != std::string::npos ||
+                                       _source_file.find("/stdlib/") != std::string::npos ||
+                                       _source_file.find("\\stdlib\\") != std::string::npos ||
+                                       _source_file.find("core/") != std::string::npos ||
+                                       _source_file.find("/core/") != std::string::npos ||
+                                       _source_file.find("\\core\\") != std::string::npos);
+
                 if (!is_stdlib_file)
                 {
                     // Validate that the method was declared in the original struct/class
                     std::string method_name = method->name();
                     if (!is_method_declared_in_type(target_type_name, method_name))
                     {
-                        std::string error_message = "Method '" + method_name + "' is not declared in " + 
-                                                  target_type_name + ". Implementation blocks can only implement methods that were declared in the original type.";
-                        _diagnostic_builder->create_type_error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL, 
-                                                              method->location(), error_message);
+                        std::string error_message = "Method '" + method_name + "' is not declared in " +
+                                                    target_type_name + ". Implementation blocks can only implement methods that were declared in the original type.";
+                        _diagnostic_builder->create_type_error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                                                               method->location(), error_message);
                         continue; // Skip processing this method
                     }
                 }
-                
+
                 method->accept(*this);
             }
         }
@@ -6497,5 +6634,85 @@ namespace Cryo
         }
 
         return false;
+    }
+
+    // Method specialization support for MonomorphizationPass
+    const std::unordered_map<std::string, Type *> *TypeChecker::get_struct_methods(const std::string &struct_name) const
+    {
+        auto it = _struct_methods.find(struct_name);
+        if (it != _struct_methods.end())
+        {
+            return &it->second;
+        }
+        return nullptr;
+    }
+
+    void TypeChecker::register_specialized_method(const std::string &struct_name, const std::string &method_name, Type *method_type)
+    {
+        _struct_methods[struct_name][method_name] = method_type;
+    }
+
+    const std::unordered_map<std::string, std::unordered_map<std::string, Type *>> &TypeChecker::get_all_struct_methods() const
+    {
+        return _struct_methods;
+    }
+
+    std::vector<std::string> TypeChecker::extract_template_parameter_names(const std::string &template_type_string)
+    {
+        std::vector<std::string> param_names;
+
+        // Find the angle brackets in the template string (e.g., "MyResult<T,E>" -> "T,E")
+        size_t start = template_type_string.find('<');
+        size_t end = template_type_string.rfind('>');
+
+        if (start == std::string::npos || end == std::string::npos || end <= start)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "No valid template parameters found in: {}", template_type_string);
+            return param_names;
+        }
+
+        // Extract the parameter string
+        std::string params_str = template_type_string.substr(start + 1, end - start - 1);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Extracted template parameters string: '{}'", params_str);
+
+        // Parse comma-separated parameter names
+        std::istringstream ss(params_str);
+        std::string param;
+        while (std::getline(ss, param, ','))
+        {
+            // Trim whitespace
+            param.erase(0, param.find_first_not_of(" \t"));
+            param.erase(param.find_last_not_of(" \t") + 1);
+
+            if (!param.empty())
+            {
+                param_names.push_back(param);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Template parameter: '{}'", param);
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "Extracted {} template parameters from '{}'", param_names.size(), template_type_string);
+        return param_names;
+    }
+
+    std::shared_ptr<Type> TypeChecker::substitute_type_with_map(const std::shared_ptr<Type> &type,
+                                                                const std::unordered_map<std::string, std::shared_ptr<Type>> &substitution_map)
+    {
+        if (!type)
+        {
+            return type;
+        }
+
+        // Check if this type should be substituted
+        auto it = substitution_map.find(type->name());
+        if (it != substitution_map.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Substituting type '{}' -> '{}'", type->name(), it->second->name());
+            return it->second;
+        }
+
+        // For complex types, we might need to recursively substitute their components
+        // For now, return the original type if no substitution is needed
+        return type;
     }
 }

@@ -114,6 +114,42 @@ namespace Cryo
             const GenericInstantiation &instantiation);
 
         /**
+         * Specialize methods for a generic enum template.
+         * This function looks up methods for the template enum and creates specialized versions
+         * with type substitution applied.
+         *
+         * @param template_node The template enum node with generic parameters
+         * @param specialized_name The name of the specialized enum (e.g., "MyResult_int_string")
+         * @param type_substitutions Map of type parameter substitutions
+         */
+        void specialize_enum_methods(
+            const EnumDeclarationNode &template_node,
+            const std::string &specialized_name,
+            const std::unordered_map<std::string, std::string> &type_substitutions);
+
+        /**
+         * Create a specialized implementation block for enum methods.
+         *
+         * @param program The program containing the original implementation block
+         * @param instantiation The specific instantiation to generate implementation for
+         * @return Specialized implementation block node with concrete method bodies
+         */
+        std::unique_ptr<ImplementationBlockNode> create_specialized_implementation_block(
+            const ProgramNode &program,
+            const GenericInstantiation &instantiation);
+
+        /**
+         * Clone and substitute type parameters in a method.
+         *
+         * @param original_method The original method to clone and specialize
+         * @param type_substitutions Map from generic parameter to concrete type
+         * @return Cloned method with type substitutions applied
+         */
+        std::unique_ptr<StructMethodNode> clone_and_substitute_method(
+            const StructMethodNode &original_method,
+            const std::unordered_map<std::string, std::string> &type_substitutions);
+
+        /**
          * Generate a specialized version of a generic function template.
          *
          * @param template_node The generic function template to specialize
