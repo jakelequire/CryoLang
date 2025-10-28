@@ -209,11 +209,23 @@ namespace Cryo
                                       "Cannot perform this unary operation on the given type.",
                                       "Check that the operand is compatible with this operator."));
 
+        _error_info.emplace(ErrorCode::E0356_DUPLICATE_FIELD,
+                            ErrorInfo(ErrorCode::E0356_DUPLICATE_FIELD,
+                                      "duplicate field",
+                                      "A field with this name already exists in the struct or class.",
+                                      "Remove the duplicate field or use a different name."));
+
         _error_info.emplace(ErrorCode::E0357_INVALID_INSTANTIATION,
                             ErrorInfo(ErrorCode::E0357_INVALID_INSTANTIATION,
                                       "invalid generic instantiation",
                                       "Cannot instantiate generic type with the provided type parameters.",
                                       "Check that the type arguments match the generic constraints and are valid types."));
+
+        _error_info.emplace(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                            ErrorInfo(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                                      "method not declared in type",
+                                      "The method being implemented was not declared in the original struct or class.",
+                                      "Add the method declaration to the struct/class or remove the implementation."));
 
         // ==== Control Flow Errors ====
         _error_info.emplace(ErrorCode::E0400_INVALID_BREAK,

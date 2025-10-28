@@ -581,7 +581,7 @@ namespace Cryo
 
         // Access diagnostics
         const std::vector<Diagnostic> &diagnostics() const { return _diagnostics; }
-        bool has_errors() const { return _error_count > 0; }
+        bool has_errors() const { return user_error_count() > 0; }
         bool has_warnings() const { return _warning_count > 0; }
 
         // Statistics
@@ -589,6 +589,14 @@ namespace Cryo
         size_t warning_count() const { return _warning_count; }
         size_t note_count() const { return _note_count; }
         size_t total_count() const { return _diagnostics.size(); }
+        
+        // User code only statistics (excluding stdlib)
+        size_t user_error_count() const;
+        size_t user_warning_count() const;
+        size_t user_total_count() const;
+        
+        // Utility method to detect if a diagnostic is from stdlib code
+        bool is_stdlib_diagnostic(const Diagnostic &diagnostic) const;
 
         // Output
         void print_all(std::ostream &os = std::cerr) const;
