@@ -2535,6 +2535,7 @@ namespace Cryo
         auto instantiation = template_type->instantiate(shared_types);
         if (instantiation)
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::instantiate created type with name='{}', base_name='{}'", instantiation->name(), instantiation->base_name());
             _instantiations[inst_name] = instantiation;
             return instantiation.get();
         }
