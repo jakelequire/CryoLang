@@ -287,6 +287,7 @@ namespace Cryo
         void discover_generic_types_from_ast(ProgramNode &program);
         void discover_generic_type_from_struct(StructDeclarationNode &struct_node);
         void discover_generic_type_from_class(ClassDeclarationNode &class_node);
+        void discover_generic_type_from_enum(EnumDeclarationNode &enum_node);
 
         // Generic instantiation tracking - public access for monomorphization
         const std::vector<GenericInstantiation> &get_required_instantiations() const;

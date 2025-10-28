@@ -1469,6 +1469,11 @@ namespace Cryo
             {
                 discover_generic_type_from_class(*class_decl);
             }
+            // Check for enum declarations with generic parameters
+            else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(stmt.get()))
+            {
+                discover_generic_type_from_enum(*enum_decl);
+            }
         }
         LOG_DEBUG(Cryo::LogComponent::AST, "Completed generic type discovery from AST");
     }
@@ -1518,6 +1523,29 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
                           "Discovered generic class '{}' with {} parameter(s)",
                           class_node.name(), param_names.size());
+            }
+        }
+    }
+
+    void TypeChecker::discover_generic_type_from_enum(EnumDeclarationNode &enum_node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Checking enum '{}' for generic parameters (has {} parameters)",
+                  enum_node.name(), enum_node.generic_parameters().size());
+
+        if (!enum_node.generic_parameters().empty())
+        {
+            std::vector<std::string> param_names;
+            for (const auto &param : enum_node.generic_parameters())
+            {
+                param_names.push_back(param->name());
+            }
+
+            if (!param_names.empty())
+            {
+                register_generic_type(enum_node.name(), param_names);
+                LOG_DEBUG(Cryo::LogComponent::AST,
+                          "Discovered generic enum '{}' with {} parameter(s)",
+                          enum_node.name(), param_names.size());
             }
         }
     }
@@ -3541,11 +3569,45 @@ namespace Cryo
             return;
         }
 
-        // Handle parameterized Array<T> types
+        // Handle deferred parameterized types (created before template registration)
+        // These may show up as Unknown types but are actually ParameterizedTypes
+        if (effective_type->kind() == TypeKind::Unknown)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found Unknown type '{}', checking if it's a deferred parameterized type", effective_type->name());
+            const ParameterizedType *param_type = dynamic_cast<const ParameterizedType*>(effective_type);
+            if (param_type != nullptr)
+            {
+                std::string base_name = param_type->base_name();
+                LOG_DEBUG(Cryo::LogComponent::AST, "Handling deferred parameterized type - base_name: '{}', member: '{}'", base_name, member_name);
+                
+                // Try to resolve methods for the base type (e.g., MyResult methods)
+                auto base_it = _struct_methods.find(base_name);
+                if (base_it != _struct_methods.end())
+                {
+                    auto method_it = base_it->second.find(member_name);
+                    if (method_it != base_it->second.end())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found method '{}' in deferred base type '{}'", member_name, base_name);
+                        node.set_resolved_type(method_it->second);
+                        return;
+                    }
+                }
+                LOG_DEBUG(Cryo::LogComponent::AST, "No method '{}' found in deferred base type '{}'", member_name, base_name);
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Unknown type '{}' is not a ParameterizedType", effective_type->name());
+            }
+        }
+
+        // Handle parameterized types like Array<T>, MyResult<T,E>, etc.
         if (effective_type->kind() == TypeKind::Parameterized)
         {
             ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
-            if (param_type->base_name() == "Array")
+            std::string base_name = param_type->base_name();
+            
+            // Special handling for Array<T> size/length
+            if (base_name == "Array")
             {
                 if (member_name == "length" || member_name == "size")
                 {
@@ -3553,27 +3615,25 @@ namespace Cryo
                     LOG_DEBUG(Cryo::LogComponent::AST, "Array<T>.{} resolved to u64", member_name);
                     return;
                 }
-                // For Array<T>, we need to look up fields in the Array struct definition
-                std::string lookup_type_name = "Array";
-                LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in Array struct for Array<T>", member_name);
-                auto struct_it = _struct_fields.find(lookup_type_name);
-                if (struct_it != _struct_fields.end())
-                {
-                    auto field_it = struct_it->second.find(member_name);
-                    if (field_it != struct_it->second.end())
-                    {
-                        // Found the field - store the resolved Type*
-                        node.set_resolved_type(field_it->second);
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Found field '{}' in Array struct", member_name);
-                        return;
-                    }
-                }
-                // Field not found in Array<T>
-                std::string error_msg = "No field '" + member_name + "' on type '" + effective_type->name() + "'";
-                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(), error_msg, &node);
-                node.set_resolved_type(_type_context.get_unknown_type());
-                return;
             }
+            
+            // For all parameterized types, use the base name for lookups
+            LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in base type '{}' for parameterized type '{}'", member_name, base_name, effective_type->name());
+            auto struct_it = _struct_fields.find(base_name);
+            if (struct_it != _struct_fields.end())
+            {
+                auto field_it = struct_it->second.find(member_name);
+                if (field_it != struct_it->second.end())
+                {
+                    // Found the field - store the resolved Type*
+                    node.set_resolved_type(field_it->second);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found field '{}' in base struct '{}'", member_name, base_name);
+                    return;
+                }
+            }
+            
+            // Field not found, continue to method lookup using base name
+            // Don't return here, fall through to method lookup with the correct base name
         }
 
         // For non-struct/class/enum/parameterized types, reject member access
@@ -3591,7 +3651,18 @@ namespace Cryo
         }
 
         // Look up field in struct field map using the type name
-        std::string lookup_type_name = effective_type->name();
+        std::string lookup_type_name;
+        if (effective_type->kind() == TypeKind::Parameterized)
+        {
+            ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
+            lookup_type_name = param_type->base_name();
+            LOG_DEBUG(Cryo::LogComponent::AST, "Using base name '{}' for parameterized type '{}'", lookup_type_name, effective_type->name());
+        }
+        else
+        {
+            lookup_type_name = effective_type->name();
+        }
+        
         LOG_DEBUG(Cryo::LogComponent::AST, "Looking up field '{}' in struct '{}'", member_name, lookup_type_name);
         auto struct_it = _struct_fields.find(lookup_type_name);
         if (struct_it != _struct_fields.end())
@@ -3695,6 +3766,33 @@ namespace Cryo
                     LOG_DEBUG(Cryo::LogComponent::AST, "Base struct '{}' NOT found in _struct_methods map", base_type_name);
                 }
             }
+            else
+            {
+                // Reverse lookup: for base types like "MyResult", also check for generic versions like "MyResult<T, E>"
+                LOG_DEBUG(Cryo::LogComponent::AST, "Trying generic versions of base type '{}'", lookup_type_name);
+                for (const auto& type_methods : _struct_methods)
+                {
+                    const std::string& registered_type_name = type_methods.first;
+                    size_t registered_bracket_pos = registered_type_name.find('<');
+                    if (registered_bracket_pos != std::string::npos)
+                    {
+                        std::string registered_base_name = registered_type_name.substr(0, registered_bracket_pos);
+                        if (registered_base_name == lookup_type_name)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' matching base type '{}'", registered_type_name, lookup_type_name);
+                            auto method_it = type_methods.second.find(member_name);
+                            if (method_it != type_methods.second.end())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Found public method '{}' in generic type '{}'", member_name, registered_type_name);
+                                // Found the method in the generic type - store the resolved Type*
+                                node.set_resolved_type(method_it->second);
+                                return;
+                            }
+                        }
+                    }
+                }
+                LOG_DEBUG(Cryo::LogComponent::AST, "No generic versions found for base type '{}'", lookup_type_name);
+            }
         }
 
         // Check for private methods - allow access from within the same class
@@ -3778,6 +3876,47 @@ namespace Cryo
                     LOG_DEBUG(Cryo::LogComponent::AST, "No private methods found for base type '{}'", base_type_name);
                 }
             }
+            else
+            {
+                // Reverse lookup: for base types like "MyResult", also check for generic versions like "MyResult<T, E>"
+                LOG_DEBUG(Cryo::LogComponent::AST, "Trying generic versions of base type '{}' for private methods", lookup_type_name);
+                for (const auto& type_methods : _private_struct_methods)
+                {
+                    const std::string& registered_type_name = type_methods.first;
+                    size_t registered_bracket_pos = registered_type_name.find('<');
+                    if (registered_bracket_pos != std::string::npos)
+                    {
+                        std::string registered_base_name = registered_type_name.substr(0, registered_bracket_pos);
+                        if (registered_base_name == lookup_type_name)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' matching base type '{}' for private methods", registered_type_name, lookup_type_name);
+                            auto method_it = type_methods.second.find(member_name);
+                            if (method_it != type_methods.second.end())
+                            {
+                                // Check if we're accessing the private method from within the same class
+                                if (_current_struct_name == registered_type_name || _current_struct_name == lookup_type_name)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' in generic type '{}' and allowing access", member_name, registered_type_name);
+                                    // Allow access to private method from within the same class
+                                    node.set_resolved_type(method_it->second);
+                                    return;
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "Found private method '{}' in generic type '{}' but access is forbidden", member_name, registered_type_name);
+                                    // This is a private method being accessed from outside the class - report error
+                                    _diagnostic_builder->create_private_member_access_error(member_name, registered_type_name, node.location());
+                                    _errors.emplace_back(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                                         "Cannot access private member '" + member_name + "' of type '" + registered_type_name + "'");
+                                    node.set_resolved_type(_type_context.get_unknown_type());
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                LOG_DEBUG(Cryo::LogComponent::AST, "No generic versions found for base type '{}' in private methods", lookup_type_name);
+            }
         }
 
         // Handle built-in type methods (string, primitive types, etc.)
@@ -3812,17 +3951,27 @@ namespace Cryo
         }
 
         // If we get here, the member was not found
-        LOG_DEBUG(Cryo::LogComponent::AST, "MEMBER ACCESS FAILED: member='{}', object_type='{}' (kind={}), effective_type='{}' (kind={})",
+        LOG_DEBUG(Cryo::LogComponent::AST, "MEMBER ACCESS FAILED: member='{}', object_type='{}' (kind={}), effective_type='{}' (kind={}), lookup_type_name='{}'",
                   member_name,
                   object_type ? object_type->name() : "null",
                   object_type ? static_cast<int>(object_type->kind()) : -1,
                   effective_type ? effective_type->name() : "null",
-                  effective_type ? TypeKindToString(effective_type->kind()) : "null");
+                  effective_type ? TypeKindToString(effective_type->kind()) : "null",
+                  lookup_type_name);
+
+        // Log all available methods in _struct_methods for debugging
+        LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_methods:");
+        for (const auto& type_methods : _struct_methods) {
+            LOG_DEBUG(Cryo::LogComponent::AST, "  Type '{}' has {} methods", type_methods.first, type_methods.second.size());
+            for (const auto& method : type_methods.second) {
+                LOG_DEBUG(Cryo::LogComponent::AST, "    Method: '{}'", method.first);
+            }
+        }
 
         // Use enhanced diagnostic builder for field access errors
         std::string type_name = effective_type ? effective_type->to_string() : "unknown";
         report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                     "No field '" + member_name + "' on type '" + type_name + "'", &node);
+                     "No field '" + member_name + "' on type '" + type_name + "' (lookup_type_name='" + lookup_type_name + "')", &node);
         node.set_resolved_type(_type_context.get_unknown_type());
     }
 
@@ -4548,6 +4697,13 @@ namespace Cryo
         // Create enum type and register it
         Type *enum_type = _type_context.get_enum_type(enum_name, variant_names, is_simple_enum);
         _symbol_table->declare_symbol(enum_name, enum_type, node.location(), false);
+
+        // Register as template if this is a generic enum
+        if (!generic_param_names.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Registering generic enum '{}' as template with {} parameters", enum_name, generic_param_names.size());
+            register_generic_type(enum_name, generic_param_names);
+        }
 
         // For simple enums (C-style), register each variant as a constant
         if (is_simple_enum)
@@ -6256,7 +6412,28 @@ namespace Cryo
 
     bool TypeChecker::is_method_declared_in_type(const std::string &type_name, const std::string &method_name)
     {
-        // Check public methods
+        // For enums, we allow any methods to be implemented in implementation blocks
+        // since enums don't typically have method declarations in their original definition
+        Type *target_type = lookup_variable_type(type_name);
+        if (target_type && target_type->kind() == TypeKind::Enum)
+        {
+            return true; // Allow any method to be implemented for enums
+        }
+
+        // Handle generic types by extracting the base type name
+        std::string base_type_name = type_name;
+        size_t generic_start = type_name.find('<');
+        if (generic_start != std::string::npos)
+        {
+            base_type_name = type_name.substr(0, generic_start);
+            Type *base_type = lookup_variable_type(base_type_name);
+            if (base_type && base_type->kind() == TypeKind::Enum)
+            {
+                return true; // Allow any method to be implemented for generic enums
+            }
+        }
+
+        // Check public methods for structs/classes
         auto public_methods_it = _struct_methods.find(type_name);
         if (public_methods_it != _struct_methods.end())
         {
@@ -6267,7 +6444,7 @@ namespace Cryo
             }
         }
 
-        // Check private methods
+        // Check private methods for structs/classes
         auto private_methods_it = _private_struct_methods.find(type_name);
         if (private_methods_it != _private_struct_methods.end())
         {

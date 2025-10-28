@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <optional>
 #include <algorithm>
+#include "Utils/Logger.hpp"
 
 // Forward declarations
 namespace Cryo
@@ -684,7 +685,9 @@ namespace Cryo
                           const std::vector<std::string> &param_names)
             : Type(TypeKind::Parameterized, base_name),
               _param_type_kind(get_parameterized_type_kind_from_string(base_name)),
-              _param_names(param_names) {}
+              _param_names(param_names) {
+            LOG_DEBUG(Cryo::LogComponent::AST, "ParameterizedType constructor: base_name='{}', Type::name()='{}'", base_name, this->name());
+        }
 
         ParameterizedType(const std::string &base_name,
                           const std::vector<std::shared_ptr<Type>> &type_params)
@@ -815,6 +818,12 @@ namespace Cryo
                               const std::vector<std::shared_ptr<Type>> &type_params,
                               std::shared_ptr<EnumType> base_enum)
             : ParameterizedType(enum_type_kind, type_params), _base_enum_type(base_enum) {}
+
+        // Constructor with explicit base name (preserves custom enum names)
+        ParameterizedEnumType(const std::string &base_name,
+                              const std::vector<std::shared_ptr<Type>> &type_params,
+                              std::shared_ptr<EnumType> base_enum)
+            : ParameterizedType(base_name, type_params), _base_enum_type(base_enum) {}
 
         // Enum-specific accessors
         std::shared_ptr<EnumType> get_base_enum_type() const { return _base_enum_type; }

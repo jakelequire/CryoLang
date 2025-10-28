@@ -4150,6 +4150,7 @@ namespace Cryo
         // Create a string stream to build type tokens
         std::string type_string = "";
         std::vector<Token> collected_tokens;
+        int angle_bracket_depth = 0;
 
         // Collect tokens that form the complete type expression
         // This handles complex types like: const int**, Option<Result<T, E>>, etc.
@@ -4166,17 +4167,28 @@ namespace Cryo
                _current_token.is(TokenKind::TK_KW_MUT) ||
                _current_token.is(TokenKind::TK_IDENTIFIER))
         {
+            // Track angle bracket depth
+            if (_current_token.is(TokenKind::TK_L_ANGLE))
+            {
+                angle_bracket_depth++;
+            }
+            else if (_current_token.is(TokenKind::TK_R_ANGLE))
+            {
+                angle_bracket_depth--;
+            }
+
             collected_tokens.push_back(_current_token);
             type_string += std::string(_current_token.text()) + " ";
             advance();
 
-            // Break on certain terminators
-            if (_current_token.is(TokenKind::TK_SEMICOLON) ||
-                _current_token.is(TokenKind::TK_COMMA) ||
-                _current_token.is(TokenKind::TK_R_PAREN) ||
-                _current_token.is(TokenKind::TK_R_BRACE) ||
-                _current_token.is(TokenKind::TK_EQUAL) ||
-                _current_token.is_eof())
+            // Break on certain terminators, but only if we're not inside angle brackets
+            if (angle_bracket_depth == 0 && 
+                (_current_token.is(TokenKind::TK_SEMICOLON) ||
+                 _current_token.is(TokenKind::TK_COMMA) ||
+                 _current_token.is(TokenKind::TK_R_PAREN) ||
+                 _current_token.is(TokenKind::TK_R_BRACE) ||
+                 _current_token.is(TokenKind::TK_EQUAL) ||
+                 _current_token.is_eof()))
             {
                 break;
             }
@@ -4255,6 +4267,14 @@ namespace Cryo
             else
             {
                 LOG_DEBUG(LogComponent::PARSER, "Failed to resolve generic type '{}' via TypeRegistry", type_str);
+                // For generic types that fail to resolve, create a deferred ParameterizedType
+                // that can be resolved later when all templates are registered
+                auto [base_name, param_strs] = _context.types().get_type_registry()->parse_generic_syntax(type_str);
+                if (!param_strs.empty())
+                {
+                    LOG_DEBUG(LogComponent::PARSER, "Creating deferred ParameterizedType for '{}' with {} parameters", base_name, param_strs.size());
+                    return _context.types().create_parameterized_type(base_name, param_strs);
+                }
             }
         }
 
