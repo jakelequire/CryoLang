@@ -4270,6 +4270,7 @@ namespace Cryo
                 // For generic types that fail to resolve, create a deferred ParameterizedType
                 // that can be resolved later when all templates are registered
                 auto [base_name, param_strs] = _context.types().get_type_registry()->parse_generic_syntax(type_str);
+                LOG_DEBUG(LogComponent::PARSER, "parse_generic_syntax('{}') returned base_name='{}', {} params", type_str, base_name, param_strs.size());
                 if (!param_strs.empty())
                 {
                     LOG_DEBUG(LogComponent::PARSER, "Creating deferred ParameterizedType for '{}' with {} parameters", base_name, param_strs.size());

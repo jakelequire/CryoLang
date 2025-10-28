@@ -1940,8 +1940,10 @@ namespace Cryo
         
         // For deferred types, we'll create a ParameterizedType with the base name
         // and parameter names, but not instantiated yet
+        LOG_DEBUG(Cryo::LogComponent::AST, "About to call ParameterizedType constructor with base_name='{}'", base_name);
         auto param_type = std::make_unique<ParameterizedType>(base_name, param_names);
         auto *result = param_type.get();
+        LOG_DEBUG(Cryo::LogComponent::AST, "Created ParameterizedType, result->name()='{}', result->base_name()='{}'", result->name(), result->base_name());
         
         // Store it with deduplication
         deferred_types[key] = std::move(param_type);
