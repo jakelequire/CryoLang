@@ -284,6 +284,25 @@ namespace Cryo
                                       "The specified source file could not be found.",
                                       "Check the file path and ensure the file exists."));
 
+        // ==== Linker Errors ====
+        _error_info.emplace(ErrorCode::E0700_LINK_ERROR,
+                            ErrorInfo(ErrorCode::E0700_LINK_ERROR,
+                                      "linking failed",
+                                      "The linker failed to create the executable or object file.",
+                                      "Check for missing dependencies, undefined symbols, or runtime library issues."));
+
+        _error_info.emplace(ErrorCode::E0701_UNDEFINED_SYMBOL_LINK,
+                            ErrorInfo(ErrorCode::E0701_UNDEFINED_SYMBOL_LINK,
+                                      "undefined symbol during linking",
+                                      "A symbol referenced in the code is not defined anywhere the linker can find.",
+                                      "Ensure all required libraries are linked and functions are properly declared."));
+
+        _error_info.emplace(ErrorCode::E0702_DUPLICATE_SYMBOL_LINK,
+                            ErrorInfo(ErrorCode::E0702_DUPLICATE_SYMBOL_LINK,
+                                      "duplicate symbol during linking",
+                                      "Multiple definitions of the same symbol were found during linking.",
+                                      "Remove duplicate function or variable definitions."));
+
         // ==== Warnings ====
         _error_info.emplace(ErrorCode::W0001_UNUSED_VARIABLE,
                             ErrorInfo(ErrorCode::W0001_UNUSED_VARIABLE,
