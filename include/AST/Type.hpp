@@ -685,7 +685,8 @@ namespace Cryo
                           const std::vector<std::string> &param_names)
             : Type(TypeKind::Parameterized, base_name),
               _param_type_kind(get_parameterized_type_kind_from_string(base_name)),
-              _param_names(param_names) {
+              _param_names(param_names)
+        {
             LOG_DEBUG(Cryo::LogComponent::AST, "ParameterizedType constructor: base_name='{}', Type::name()='{}'", base_name, this->name());
         }
 
@@ -819,7 +820,13 @@ namespace Cryo
                               std::shared_ptr<EnumType> base_enum)
             : ParameterizedType(enum_type_kind, type_params), _base_enum_type(base_enum) {}
 
-        // Constructor with explicit base name (preserves custom enum names)
+        // Constructor with explicit base name (preserves custom enum names) - for templates
+        ParameterizedEnumType(const std::string &base_name,
+                              const std::vector<std::string> &param_names,
+                              std::shared_ptr<EnumType> base_enum)
+            : ParameterizedType(base_name, param_names), _base_enum_type(base_enum) {}
+
+        // Constructor with explicit base name (preserves custom enum names) - for instantiated types
         ParameterizedEnumType(const std::string &base_name,
                               const std::vector<std::shared_ptr<Type>> &type_params,
                               std::shared_ptr<EnumType> base_enum)
@@ -884,7 +891,7 @@ namespace Cryo
         size_t size_bytes() const override;
         size_t alignment() const override { return sizeof(void *); }
         std::string to_string() const override { return _name; }
-        
+
         // Allow assignment between same struct types
         bool is_assignable_from(const Type &other) const override
         {
@@ -906,13 +913,13 @@ namespace Cryo
         size_t size_bytes() const override;
         size_t alignment() const override { return sizeof(void *); }
         std::string to_string() const override { return _name; }
-        
+
         // Ensure ClassType instances with same name are equal
         bool equals(const Type &other) const override
         {
             return other.kind() == TypeKind::Class && other.name() == _name;
         }
-        
+
         // Allow assignment between same class types
         bool is_assignable_from(const Type &other) const override
         {
@@ -1155,7 +1162,7 @@ namespace Cryo
 
         // Global template registry access for AST-based analysis
         TemplateRegistry *_global_template_registry = nullptr;
-        
+
         // Type registry for generic instantiation
         class TypeRegistry *_type_registry = nullptr;
 
@@ -1254,7 +1261,7 @@ namespace Cryo
         // Template registry access for AST-based analysis
         void set_global_template_registry(TemplateRegistry *registry) { _global_template_registry = registry; }
         TemplateRegistry *get_global_template_registry() const { return _global_template_registry; }
-        
+
         // Type registry access for generic type instantiation
         void set_type_registry(class TypeRegistry *registry) { _type_registry = registry; }
         class TypeRegistry *get_type_registry() const { return _type_registry; }
@@ -1330,6 +1337,11 @@ namespace Cryo
         // Register a parameterized type template (e.g., Array<T>)
         void register_template(const std::string &base_name,
                                const std::vector<std::string> &param_names);
+
+        // Register a parameterized enum template (e.g., MyResult<T, E>)
+        void register_enum_template(const std::string &base_name,
+                                    const std::vector<std::string> &param_names,
+                                    std::shared_ptr<EnumType> base_enum = nullptr);
 
         // Get a template by base name
         ParameterizedType *get_template(const std::string &base_name);

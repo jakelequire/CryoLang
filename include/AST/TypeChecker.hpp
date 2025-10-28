@@ -280,6 +280,7 @@ namespace Cryo
 
         // Generic type management
         void register_generic_type(const std::string &base_name, const std::vector<std::string> &param_names);
+        void register_generic_enum_type(const std::string &base_name, const std::vector<std::string> &param_names);
         void register_builtin_generic_types();
         ParameterizedType *resolve_generic_type(const std::string &type_string);
 
@@ -303,6 +304,9 @@ namespace Cryo
 
         // Set source file for error reporting
         void set_source_file(const std::string &source_file);
+
+        // Access to TypeContext for monomorphization
+        TypeContext &get_type_context() { return _type_context; }
 
         // Error and warning handling
         const std::vector<TypeError> &errors() const { return _errors; }
@@ -374,6 +378,11 @@ namespace Cryo
         void visit(PatternNode &node) override;
         void visit(EnumPatternNode &node) override;
 
+        // Method specialization support for MonomorphizationPass
+        const std::unordered_map<std::string, Type *> *get_struct_methods(const std::string &struct_name) const;
+        void register_specialized_method(const std::string &struct_name, const std::string &method_name, Type *method_type);
+        const std::unordered_map<std::string, std::unordered_map<std::string, Type *>> &get_all_struct_methods() const;
+
     private:
         // Type inference and deduction
         Type *infer_literal_type(const LiteralNode &node);
@@ -429,6 +438,11 @@ namespace Cryo
 
         // Enum validation helpers
         void validate_enum_variant(EnumVariantNode &node, const std::vector<std::string> &generic_param_names);
+
+        // Generic type substitution helpers
+        std::vector<std::string> extract_template_parameter_names(const std::string &template_type_string);
+        std::shared_ptr<Type> substitute_type_with_map(const std::shared_ptr<Type> &type,
+                                                       const std::unordered_map<std::string, std::shared_ptr<Type>> &substitution_map);
 
         std::string format_type_error(const std::string &context, Type *expected, Type *actual);
     };

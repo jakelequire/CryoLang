@@ -515,6 +515,12 @@ namespace Cryo::Codegen
         std::vector<llvm::Type *> generate_class_fields(Cryo::ClassDeclarationNode *class_decl);
 
         /**
+         * @brief Generate mangled name for parameterized types
+         */
+        std::string generate_mangled_name(const std::string &base_name,
+                                          const std::vector<std::shared_ptr<Type>> &type_params);
+
+        /**
          * @brief Resolve forward declared structs
          */
         void resolve_forward_declarations();

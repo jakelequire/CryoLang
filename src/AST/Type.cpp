@@ -1917,37 +1917,40 @@ namespace Cryo
                                                               const std::vector<std::string> &param_names)
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_parameterized_type('{}', {} params)", base_name, param_names.size());
-        
+
         // Create a unique key for deduplication
         std::string key = base_name + "<";
-        for (size_t i = 0; i < param_names.size(); ++i) {
-            if (i > 0) key += ",";
+        for (size_t i = 0; i < param_names.size(); ++i)
+        {
+            if (i > 0)
+                key += ",";
             key += param_names[i];
         }
         key += ">";
-        
+
         // Check if we already have a deferred type for this signature
         static std::unordered_map<std::string, std::unique_ptr<ParameterizedType>> deferred_types;
         auto it = deferred_types.find(key);
-        if (it != deferred_types.end()) {
+        if (it != deferred_types.end())
+        {
             LOG_DEBUG(Cryo::LogComponent::AST, "Reusing existing deferred ParameterizedType for '{}'", key);
             return it->second.get();
         }
-        
+
         // Create a deferred parameterized type that can be resolved later
         // when the template is registered in the TypeRegistry
         TypeKind param_kind = get_parameterized_type_kind(base_name);
-        
+
         // For deferred types, we'll create a ParameterizedType with the base name
         // and parameter names, but not instantiated yet
         LOG_DEBUG(Cryo::LogComponent::AST, "About to call ParameterizedType constructor with base_name='{}'", base_name);
         auto param_type = std::make_unique<ParameterizedType>(base_name, param_names);
         auto *result = param_type.get();
         LOG_DEBUG(Cryo::LogComponent::AST, "Created ParameterizedType, result->name()='{}', result->base_name()='{}'", result->name(), result->base_name());
-        
+
         // Store it with deduplication
         deferred_types[key] = std::move(param_type);
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Created new deferred ParameterizedType for '{}' -> '{}'", key, base_name);
         return result;
     }
@@ -2332,7 +2335,7 @@ namespace Cryo
         // Use the base name from this template instead of TypeKind mapping to preserve custom enum names
         LOG_DEBUG(Cryo::LogComponent::AST, "ParameterizedEnumType::instantiate - template base_name(): '{}'", base_name());
         auto instantiation = std::make_shared<ParameterizedEnumType>(base_name(), concrete_types, _base_enum_type);
-        LOG_DEBUG(Cryo::LogComponent::AST, "ParameterizedEnumType::instantiate - created instantiation with base_name(): '{}'", instantiation->base_name());
+        LOG_DEBUG(Cryo::LogComponent::AST, "ParameterizedEnumType::instantiate - created instantiation with base_name(): '{}', type_parameters.size(): {}", instantiation->base_name(), instantiation->type_parameters().size());
         return instantiation;
     }
 
@@ -2491,6 +2494,16 @@ namespace Cryo
         auto template_type = std::make_shared<ParameterizedType>(base_name, param_names);
         _templates[base_name] = template_type;
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::register_template - stored '{}' in templates map, size now: {}", base_name, _templates.size());
+    }
+
+    void TypeRegistry::register_enum_template(const std::string &base_name,
+                                              const std::vector<std::string> &param_names,
+                                              std::shared_ptr<EnumType> base_enum)
+    {
+        // Create a ParameterizedEnumType for enum templates instead of basic ParameterizedType
+        auto template_type = std::make_shared<ParameterizedEnumType>(base_name, param_names, base_enum);
+        _templates[base_name] = template_type;
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::register_enum_template - stored enum '{}' in templates map, size now: {}", base_name, _templates.size());
     }
 
     ParameterizedType *TypeRegistry::get_template(const std::string &base_name)

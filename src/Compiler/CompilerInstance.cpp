@@ -578,6 +578,13 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Setting source info for codegen...");
             _codegen->set_source_info(_source_file, _current_namespace);
 
+            // Import specialized methods from TypeChecker to CodeGen after monomorphization
+            if (_codegen->get_visitor() && _type_checker)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Importing specialized methods from TypeChecker to CodeGen...");
+                _codegen->get_visitor()->import_specialized_methods(*_type_checker);
+            }
+
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Starting IR generation...");
             bool success = _codegen->generate_ir(_ast_root.get());
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "IR generation completed with result: {}", (success ? "success" : "failure"));
@@ -675,28 +682,27 @@ namespace Cryo
                 std::string linker_error = _linker->get_last_error();
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Linker error string length: {}", linker_error.length());
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Linker error content: '{}'", linker_error);
-                
+
                 // Detect specific linker error types and use appropriate error codes
                 ErrorCode error_code = ErrorCode::E0700_LINK_ERROR;
                 std::string custom_message = linker_error;
-                
+
                 if (linker_error.find("undefined reference") != std::string::npos)
                 {
                     error_code = ErrorCode::E0701_UNDEFINED_SYMBOL_LINK;
-                    
+
                     // Special case for WinMain/main issues (common runtime missing issue)
-                    if (linker_error.find("WinMain") != std::string::npos || 
+                    if (linker_error.find("WinMain") != std::string::npos ||
                         linker_error.find("main") != std::string::npos)
                     {
-                        custom_message = "Missing runtime library. The CryoLang runtime (runtime.o) is required to provide the main entry point. "
-                                       + linker_error;
+                        custom_message = "Missing runtime library. The CryoLang runtime (runtime.o) is required to provide the main entry point. " + linker_error;
                     }
                 }
                 else if (linker_error.find("duplicate symbol") != std::string::npos)
                 {
                     error_code = ErrorCode::E0702_DUPLICATE_SYMBOL_LINK;
                 }
-                
+
                 _diagnostic_manager->create_error(error_code,
                                                   SourceRange{}, _source_file,
                                                   custom_message);
