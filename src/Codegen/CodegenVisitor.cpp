@@ -2112,18 +2112,16 @@ namespace Cryo::Codegen
                 {
                     builder.CreateStore(&*arg_it, this_alloca);
                     _value_context->set_value("this", this_alloca, this_alloca, struct_ptr_type);
-                    
+
                     // Also register the Cryo type for proper member access resolution
                     if (cryo_target_type)
                     {
-                        // Create a pointer type for 'this'
-                        auto this_ptr_type = std::make_unique<Cryo::PointerType>(
-                            std::shared_ptr<Cryo::Type>(cryo_target_type, [](Cryo::Type*){})
-                        );
-                        _variable_types["this"] = this_ptr_type.get();
+                        // For 'this' parameter, we don't need to create a pointer type
+                        // Just register the base struct type directly
+                        _variable_types["this"] = cryo_target_type;
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "'this' parameter Cryo type registered: {}", cryo_target_type->name());
                     }
-                    
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "'this' parameter set up successfully");
                 }
                 else
@@ -2288,7 +2286,7 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using direct return");
                     // Direct return
                     builder.CreateRet(return_value);
-                    
+
                     // After creating a return instruction, any subsequent code in this function
                     // will be unreachable. Create a new unreachable basic block for any remaining instructions.
                     if (_current_function && _current_function->function)
@@ -2305,7 +2303,7 @@ namespace Cryo::Codegen
             {
                 // Void return
                 builder.CreateRetVoid();
-                
+
                 // After creating a return instruction, any subsequent code in this function
                 // will be unreachable. To avoid "terminator in middle of basic block" errors,
                 // we create a new unreachable basic block for any remaining instructions.
@@ -4169,7 +4167,7 @@ namespace Cryo::Codegen
             if (is_this_access)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected 'this' member access in implementation context, forcing struct type: {}", current_struct_type);
-                
+
                 auto context_type_it = _types.find(current_struct_type);
                 if (context_type_it != _types.end())
                 {
@@ -5886,19 +5884,49 @@ namespace Cryo::Codegen
                         if (cryo_type_it != _variable_types.end() && cryo_type_it->second)
                         {
                             Cryo::Type *cryo_type = cryo_type_it->second;
-                            // For pointer types, get the pointed-to type
-                            if (cryo_type->kind() == Cryo::TypeKind::Pointer)
-                            {
-                                Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(cryo_type);
-                                cryo_type = ptr_type->pointee_type().get();
-                            }
 
-                            if (cryo_type->kind() == Cryo::TypeKind::Struct)
+                            // Special handling for 'this' parameter which is registered as the base type
+                            if (var_name == "this")
                             {
-                                Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(cryo_type);
-                                type_name = struct_cryo_type->name();
-                                struct_type = _type_mapper->map_type(cryo_type);
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking: var='{}' type='{}'", var_name, type_name);
+                                // 'this' is registered as the base struct type, not a pointer
+                                if (cryo_type->kind() == Cryo::TypeKind::Struct)
+                                {
+                                    Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(cryo_type);
+                                    type_name = struct_cryo_type->name();
+                                    struct_type = _type_mapper->map_type(cryo_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking for 'this': var='{}' type='{}'", var_name, type_name);
+                                }
+                                else if (cryo_type->kind() == Cryo::TypeKind::Class)
+                                {
+                                    Cryo::ClassType *class_cryo_type = static_cast<Cryo::ClassType *>(cryo_type);
+                                    type_name = class_cryo_type->name();
+                                    struct_type = _type_mapper->map_type(cryo_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking for 'this': var='{}' type='{}'", var_name, type_name);
+                                }
+                            }
+                            else
+                            {
+                                // For other variables, handle pointer types normally
+                                if (cryo_type->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(cryo_type);
+                                    cryo_type = ptr_type->pointee_type().get();
+                                }
+
+                                if (cryo_type->kind() == Cryo::TypeKind::Struct)
+                                {
+                                    Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(cryo_type);
+                                    type_name = struct_cryo_type->name();
+                                    struct_type = _type_mapper->map_type(cryo_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking: var='{}' type='{}'", var_name, type_name);
+                                }
+                                else if (cryo_type->kind() == Cryo::TypeKind::Class)
+                                {
+                                    Cryo::ClassType *class_cryo_type = static_cast<Cryo::ClassType *>(cryo_type);
+                                    type_name = class_cryo_type->name();
+                                    struct_type = _type_mapper->map_type(cryo_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking: var='{}' type='{}'", var_name, type_name);
+                                }
                             }
                         }
                     }
@@ -8730,30 +8758,30 @@ namespace Cryo::Codegen
             {
                 // Handle member access on unary expressions like (*ptr).method()
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found unary expression in member access: {}", unary_expr->operator_token().text());
-                
+
                 if (unary_expr->operator_token().is(TokenKind::TK_STAR))
                 {
                     // This is a dereference operation like (*ptr).method()
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Handling dereference member access: (*{}).{}", 
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Handling dereference member access: (*{}).{}",
                               "ptr_expr", member_access->member());
-                    
+
                     // Evaluate the operand to get the pointer value
                     unary_expr->operand()->accept(*this);
                     llvm::Value *ptr_value = get_current_value();
-                    
+
                     if (ptr_value)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got pointer value for dereference member access");
-                        
+
                         // Get the type that the pointer points to using TypeChecker's resolved type
                         Cryo::Type *resolved_type = member_access->get_resolved_type();
                         Cryo::Type *object_type = unary_expr->get_resolved_type();
-                        
+
                         if (object_type)
                         {
                             std::string type_name = object_type->to_string();
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Dereferenced object type: '{}'", type_name);
-                            
+
                             // Build method name
                             std::string method_name;
                             if (!_namespace_context.empty())
@@ -8764,19 +8792,19 @@ namespace Cryo::Codegen
                             {
                                 method_name = type_name + "::" + member_access->member();
                             }
-                            
+
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up dereferenced method: '{}'", method_name);
                             auto method_it = _functions.find(method_name);
-                            
+
                             if (method_it != _functions.end())
                             {
                                 llvm::Function *method_func = method_it->second;
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found method for dereferenced object: {}", method_name);
-                                
+
                                 // Prepare arguments: this pointer + method arguments
                                 std::vector<llvm::Value *> args;
                                 args.push_back(ptr_value); // Use the pointer directly as 'this'
-                                
+
                                 // Generate method arguments
                                 for (const auto &arg : node->arguments())
                                 {
@@ -8790,7 +8818,7 @@ namespace Cryo::Codegen
                                         }
                                     }
                                 }
-                                
+
                                 // Call the method
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling dereferenced method with {} arguments", args.size());
                                 return builder.CreateCall(method_func, args);
@@ -8810,7 +8838,7 @@ namespace Cryo::Codegen
                         LOG_ERROR(Cryo::LogComponent::CODEGEN, "Could not evaluate pointer expression for dereference");
                     }
                 }
-                
+
                 // Fall back to function name extraction
                 function_name = extract_function_name_from_member_access(member_access);
                 resolved_function_name = function_name;
