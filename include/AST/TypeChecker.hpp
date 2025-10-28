@@ -424,6 +424,7 @@ namespace Cryo
         bool is_integral_type(Type *type);
         bool is_boolean_context_valid(Type *type);
         bool is_primitive_integer_type(const std::string &type_name);
+        bool is_method_declared_in_type(const std::string &type_name, const std::string &method_name);
 
         // Enum validation helpers
         void validate_enum_variant(EnumVariantNode &node, const std::vector<std::string> &generic_param_names);

@@ -100,6 +100,7 @@ namespace Cryo
     X(E0355_MISSING_FIELD_INIT, 355)             \
     X(E0356_DUPLICATE_FIELD, 356)                \
     X(E0357_INVALID_INSTANTIATION, 357)          \
+    X(E0358_UNDEFINED_METHOD_IMPL, 358)          \
                                                  \
     /* Control Flow Errors (E0400-E0449) */      \
     X(E0400_INVALID_BREAK, 400)                  \

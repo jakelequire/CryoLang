@@ -278,6 +278,10 @@ namespace Cryo
 
         Diagnostic &create_invalid_assignment_error(Type *target_type, Type *value_type,
                                                     SourceLocation location);
+
+        // Generic type error with custom message
+        Diagnostic &create_type_error(ErrorCode error_code, SourceLocation location, 
+                                     const std::string &custom_message);
     };
 
     /**

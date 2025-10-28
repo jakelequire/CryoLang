@@ -199,8 +199,11 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "=== Compilation Completed ===");
             }
 
-            // Print any diagnostics that were collected
-            print_diagnostics();
+            // Check if there were any errors during compilation
+            if (_diagnostic_manager->has_errors())
+            {
+                return false;
+            }
 
             return true;
         }

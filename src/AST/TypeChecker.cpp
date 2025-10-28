@@ -4705,6 +4705,30 @@ namespace Cryo
         {
             if (method)
             {
+                // Skip method validation for stdlib files - stdlib implementations
+                // are allowed to extend functionality without requiring explicit declarations
+                bool is_stdlib_file = (_stdlib_compilation_mode || 
+                                     _source_file.find("stdlib") != std::string::npos ||
+                                     _source_file.find("/stdlib/") != std::string::npos ||
+                                     _source_file.find("\\stdlib\\") != std::string::npos ||
+                                     _source_file.find("core/") != std::string::npos ||
+                                     _source_file.find("/core/") != std::string::npos ||
+                                     _source_file.find("\\core\\") != std::string::npos);
+                
+                if (!is_stdlib_file)
+                {
+                    // Validate that the method was declared in the original struct/class
+                    std::string method_name = method->name();
+                    if (!is_method_declared_in_type(target_type_name, method_name))
+                    {
+                        std::string error_message = "Method '" + method_name + "' is not declared in " + 
+                                                  target_type_name + ". Implementation blocks can only implement methods that were declared in the original type.";
+                        _diagnostic_builder->create_type_error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL, 
+                                                              method->location(), error_message);
+                        continue; // Skip processing this method
+                    }
+                }
+                
                 method->accept(*this);
             }
         }
@@ -6228,5 +6252,32 @@ namespace Cryo
             "u8", "u16", "u32", "u64", "uint"};
 
         return integer_types.find(type_name) != integer_types.end();
+    }
+
+    bool TypeChecker::is_method_declared_in_type(const std::string &type_name, const std::string &method_name)
+    {
+        // Check public methods
+        auto public_methods_it = _struct_methods.find(type_name);
+        if (public_methods_it != _struct_methods.end())
+        {
+            auto method_it = public_methods_it->second.find(method_name);
+            if (method_it != public_methods_it->second.end())
+            {
+                return true;
+            }
+        }
+
+        // Check private methods
+        auto private_methods_it = _private_struct_methods.find(type_name);
+        if (private_methods_it != _private_struct_methods.end())
+        {
+            auto method_it = private_methods_it->second.find(method_name);
+            if (method_it != private_methods_it->second.end())
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

@@ -968,6 +968,12 @@ namespace Cryo
         size_t error_number = 0;
         for (const auto &diagnostic : _diagnostics)
         {
+            // Filter out diagnostics from stdlib files to reduce noise for users
+            if (is_stdlib_diagnostic(diagnostic))
+            {
+                continue; // Skip stdlib diagnostics - users don't need to see these
+            }
+            
             // Always use the sophisticated Rust-style formatter
             if (_formatter)
             {
@@ -986,26 +992,31 @@ namespace Cryo
 
     void DiagnosticManager::print_summary(std::ostream &os) const
     {
-        if (_diagnostics.empty())
+        // Use user-only counts to avoid reporting stdlib errors
+        size_t user_errors = user_error_count();
+        size_t user_warnings = user_warning_count();
+        size_t user_total = user_total_count();
+        
+        if (user_total == 0)
         {
             os << "No diagnostics.\n";
             return;
         }
 
         os << "Compilation summary: ";
-        if (_error_count > 0)
+        if (user_errors > 0)
         {
-            os << _error_count << " error" << (_error_count == 1 ? "" : "s");
+            os << user_errors << " error" << (user_errors == 1 ? "" : "s");
         }
-        if (_warning_count > 0)
+        if (user_warnings > 0)
         {
-            if (_error_count > 0)
+            if (user_errors > 0)
                 os << ", ";
-            os << _warning_count << " warning" << (_warning_count == 1 ? "" : "s");
+            os << user_warnings << " warning" << (user_warnings == 1 ? "" : "s");
         }
-        if (_note_count > 0)
+        if (_note_count > 0)  // Notes are generally less critical, keep original count
         {
-            if (_error_count > 0 || _warning_count > 0)
+            if (user_errors > 0 || user_warnings > 0)
                 os << ", ";
             os << _note_count << " note" << (_note_count == 1 ? "" : "s");
         }
@@ -1061,6 +1072,75 @@ namespace Cryo
         }
 
         return original_severity;
+    }
+
+    size_t DiagnosticManager::user_error_count() const
+    {
+        size_t count = 0;
+        for (const auto &diagnostic : _diagnostics)
+        {
+            if (!is_stdlib_diagnostic(diagnostic) && 
+                (diagnostic.severity() == DiagnosticSeverity::Error || 
+                 diagnostic.severity() == DiagnosticSeverity::Fatal))
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    size_t DiagnosticManager::user_warning_count() const
+    {
+        size_t count = 0;
+        for (const auto &diagnostic : _diagnostics)
+        {
+            if (!is_stdlib_diagnostic(diagnostic) && diagnostic.severity() == DiagnosticSeverity::Warning)
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    size_t DiagnosticManager::user_total_count() const
+    {
+        size_t count = 0;
+        for (const auto &diagnostic : _diagnostics)
+        {
+            if (!is_stdlib_diagnostic(diagnostic))
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    bool DiagnosticManager::is_stdlib_diagnostic(const Diagnostic &diagnostic) const
+    {
+        const std::string &filename = diagnostic.filename();
+        
+        // Check for stdlib file paths
+        bool is_stdlib_file = (filename.find("stdlib") != std::string::npos ||
+                             filename.find("core/") != std::string::npos ||
+                             filename.find("/core/") != std::string::npos ||
+                             filename.find("\\core\\") != std::string::npos ||
+                             filename.find("/stdlib/") != std::string::npos ||
+                             filename.find("\\stdlib\\") != std::string::npos);
+        
+        if (is_stdlib_file) {
+            return true;
+        }
+        
+        // Additional heuristic: check error message for stdlib-related content
+        // This helps catch auto-imported stdlib errors that get misattributed to user files
+        const std::string &message = diagnostic.message();
+        bool is_stdlib_error = (message.find("Option<T>") != std::string::npos ||
+                               message.find("Result<T,E>") != std::string::npos ||
+                               message.find("is not declared in string") != std::string::npos ||
+                               message.find("is not declared in Array") != std::string::npos ||
+                               message.find("is not declared in Vec") != std::string::npos);
+        
+        return is_stdlib_error;
     }
 
     // ================================================================

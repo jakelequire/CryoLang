@@ -1439,6 +1439,18 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_type_error(ErrorCode error_code, SourceLocation location, 
+                                                               const std::string &custom_message)
+    {
+        SourceSpan span(location, location, _source_file, true);
+        span.set_label("type error");
+
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file, custom_message);
+        diagnostic.with_primary_span(span);
+
+        return diagnostic;
+    }
+
     Diagnostic &TypeCheckerDiagnosticBuilder::create_undefined_variable_error(const std::string &symbol_name,
                                                                               NodeKind symbol_kind,
                                                                               SourceLocation location)
