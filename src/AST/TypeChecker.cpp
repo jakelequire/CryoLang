@@ -5110,11 +5110,20 @@ namespace Cryo
     {
         std::string field_name = node.name();
 
-        // Check for redefinition within the same struct
-        if (_symbol_table->lookup_symbol(field_name))
+        // Check for redefinition within the same struct only
+        // Don't check global symbol table as struct fields are scoped to their struct
+        if (!_current_struct_name.empty())
         {
-            _diagnostic_builder->create_redefined_symbol_error(field_name, NodeKind::VariableDeclaration, node.location());
-            return;
+            auto struct_it = _struct_fields.find(_current_struct_name);
+            if (struct_it != _struct_fields.end())
+            {
+                auto field_it = struct_it->second.find(field_name);
+                if (field_it != struct_it->second.end())
+                {
+                    _diagnostic_builder->create_redefined_symbol_error(field_name, NodeKind::VariableDeclaration, node.location());
+                    return;
+                }
+            }
         }
 
         // Get field type from resolved type (avoid deprecated string methods)
@@ -5590,6 +5599,7 @@ namespace Cryo
 
         // SPECIAL CASE: Array type equivalence - int[] should be equivalent to Array<int>
         // Handle equivalence between ArrayType (int[]) and ParameterizedType Array<T>
+        // This also handles nested arrays like int[][] vs Array<Array<int>>
         if ((lhs_type->kind() == TypeKind::Array && rhs_type->kind() == TypeKind::Parameterized) ||
             (lhs_type->kind() == TypeKind::Parameterized && rhs_type->kind() == TypeKind::Array))
         {
@@ -5620,9 +5630,98 @@ namespace Cryo
                 if (array_element && param_element)
                 {
                     // Recursively check if element types are compatible
+                    // This will handle nested arrays: int[][] element is int[], Array<Array> element is Array
                     if (check_assignment_compatibility(array_element.get(), param_element.get(), loc))
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "Allowing array type equivalence: {} = {} (element types compatible)", lhs_str, rhs_str);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // SPECIAL CASE: Handle pure ParameterizedType Array equivalence
+        // This covers cases like Array<Array> vs Array<Array<int>> where both sides are ParameterizedType
+        if (lhs_type->kind() == TypeKind::Parameterized && rhs_type->kind() == TypeKind::Parameterized)
+        {
+            auto lhs_param = static_cast<ParameterizedType *>(lhs_type);
+            auto rhs_param = static_cast<ParameterizedType *>(rhs_type);
+            
+            // Both must be Array types with same number of parameters
+            if (lhs_param->base_name() == "Array" && rhs_param->base_name() == "Array" &&
+                lhs_param->type_parameters().size() == 1 && rhs_param->type_parameters().size() == 1)
+            {
+                auto lhs_element = lhs_param->type_parameters()[0];
+                auto rhs_element = rhs_param->type_parameters()[0];
+                
+                if (lhs_element && rhs_element)
+                {
+                    // Handle the case where one side has unspecified inner Array type (Array<Array> vs Array<Array<int>>)
+                    std::string lhs_elem_str = lhs_element->to_string();
+                    std::string rhs_elem_str = rhs_element->to_string();
+                    
+                    // If one element is just "Array" and the other is "Array<T>", allow compatibility
+                    if ((lhs_elem_str == "Array" && rhs_elem_str.find("Array<") == 0) ||
+                        (rhs_elem_str == "Array" && lhs_elem_str.find("Array<") == 0))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Allowing Array<Array> vs Array<Array<T>> compatibility: {} = {}", lhs_str, rhs_str);
+                        return true;
+                    }
+                    
+                    // Otherwise recursively check element compatibility
+                    if (check_assignment_compatibility(lhs_element.get(), rhs_element.get(), loc))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Allowing Array<T> assignment with compatible element types: {} = {}", lhs_str, rhs_str);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // SPECIAL CASE: Handle nested array compatibility between ArrayType and ParameterizedType
+        // This covers int[][] vs Array<Array> where we need to match array syntax sugar with generic types
+        if ((lhs_type->kind() == TypeKind::Array && rhs_type->kind() == TypeKind::Parameterized) ||
+            (lhs_type->kind() == TypeKind::Parameterized && rhs_type->kind() == TypeKind::Array))
+        {
+            // For nested arrays like int[][] vs Array<Array>, we need string-based matching as fallback
+            // because the type inference might not preserve full nested parameter information
+            if ((lhs_str.find("[][]") != std::string::npos && rhs_str == "Array<Array>") ||
+                (rhs_str.find("[][]") != std::string::npos && lhs_str == "Array<Array>"))
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing nested array compatibility via string match: {} = {}", lhs_str, rhs_str);
+                return true;
+            }
+            
+            // Also handle more specific patterns like int[][] vs Array<Array<int>>
+            if (lhs_str.find("[][]") != std::string::npos && rhs_str.find("Array<Array<") == 0)
+            {
+                // Extract the base type from int[][]
+                std::string base_type = lhs_str.substr(0, lhs_str.find("[][]"));
+                // Extract the inner type from Array<Array<int>>
+                size_t start = rhs_str.find("Array<Array<") + 12;
+                size_t end = rhs_str.find_last_of(">");
+                if (end != std::string::npos && end > start)
+                {
+                    std::string inner_type = rhs_str.substr(start, end - start - 1); // Remove the extra >
+                    if (base_type == inner_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Allowing nested array compatibility with matching base types: {} = {}", lhs_str, rhs_str);
+                        return true;
+                    }
+                }
+            }
+            else if (rhs_str.find("[][]") != std::string::npos && lhs_str.find("Array<Array<") == 0)
+            {
+                // Handle reverse case: Array<Array<int>> vs int[][]
+                std::string base_type = rhs_str.substr(0, rhs_str.find("[][]"));
+                size_t start = lhs_str.find("Array<Array<") + 12;
+                size_t end = lhs_str.find_last_of(">");
+                if (end != std::string::npos && end > start)
+                {
+                    std::string inner_type = lhs_str.substr(start, end - start - 1);
+                    if (base_type == inner_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Allowing nested array compatibility with matching base types: {} = {}", lhs_str, rhs_str);
                         return true;
                     }
                 }
