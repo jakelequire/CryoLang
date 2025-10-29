@@ -6194,9 +6194,20 @@ namespace Cryo::Codegen
                     // For plain arrays, array_ptr should be a pointer to array or array element type
                     if (array_ptr->getType()->isPointerTy())
                     {
-                        // For modern LLVM, we need to determine the element type from context
-                        // Since we know this is u8[] from the error context, let's use u8 type
-                        llvm::Type *element_type = llvm::Type::getInt8Ty(context);
+                        // Try to infer element type from the right operand value
+                        llvm::Type *element_type = nullptr;
+                        if (right_val && right_val->getType())
+                        {
+                            element_type = right_val->getType();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Inferred element type from right operand: {}", 
+                                     element_type ? "valid" : "null");
+                        }
+                        else
+                        {
+                            // Fallback to i8 for cases where we can't infer
+                            element_type = llvm::Type::getInt8Ty(context);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fallback i8 element type");
+                        }
 
                         // Create GEP to access the element
                         llvm::Value *element_ptr = builder.CreateGEP(
@@ -12895,13 +12906,29 @@ namespace Cryo::Codegen
 
         for (const auto &name : constructor_names)
         {
+            // First try exact match
             func_it = _functions.find(name);
             if (func_it != _functions.end())
             {
                 constructor_func = func_it->second;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found constructor with name: {}", name);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found constructor with exact name: {}", name);
                 break;
             }
+            
+            // If exact match fails, look for functions that start with this name (to handle parameter signatures)
+            for (const auto &pair : _functions)
+            {
+                if (pair.first.length() > name.length() && 
+                    pair.first.substr(0, name.length()) == name &&
+                    pair.first[name.length()] == '(')  // Ensure it's a parameter list
+                {
+                    constructor_func = pair.second;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found constructor with signature: {} (matched base: {})", pair.first, name);
+                    func_it = _functions.find(pair.first);
+                    break;
+                }
+            }
+            if (constructor_func) break;
         }
 
         if (!constructor_func)
