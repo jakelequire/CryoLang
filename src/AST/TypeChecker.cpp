@@ -5532,6 +5532,28 @@ namespace Cryo
                   std::to_string(static_cast<int>(lhs_type->kind())),
                   std::to_string(static_cast<int>(rhs_type->kind())));
 
+        // SPECIAL CASE: Generic type parameter compatibility
+        // Allow assignment between same generic type parameters (e.g., T = T in Array<T> methods)
+        if (lhs_type->kind() == TypeKind::Generic && rhs_type->kind() == TypeKind::Generic)
+        {
+            if (lhs_str == rhs_str)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing generic parameter assignment: {} = {}", lhs_str, rhs_str);
+                return true;
+            }
+        }
+        
+        // SPECIAL CASE: Allow assignment between generic parameters and their concrete instantiations
+        // This handles cases where T (generic) should be compatible with int (concrete) in Array<int>
+        // Also handle Unknown types that might be unresolved generic parameters
+        if ((lhs_type->kind() == TypeKind::Generic || rhs_type->kind() == TypeKind::Generic ||
+             lhs_type->kind() == TypeKind::Unknown || rhs_type->kind() == TypeKind::Unknown) &&
+            (lhs_str.length() == 1 || rhs_str.length() == 1 || lhs_str == rhs_str)) // Simple heuristic for single-letter generic params
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing generic parameter assignment with concrete type: {} = {}", lhs_str, rhs_str);
+            return true;
+        }
+
         // SPECIAL CASE: Class/Struct assignment compatibility
         // Allow assignment between same class/struct types (e.g., HeapManager = HeapManager())
         if ((lhs_type->kind() == TypeKind::Class || lhs_type->kind() == TypeKind::Struct) &&
@@ -5562,6 +5584,47 @@ namespace Cryo
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", rhs_str, lhs_str);
                     return true;
+                }
+            }
+        }
+
+        // SPECIAL CASE: Array type equivalence - int[] should be equivalent to Array<int>
+        // Handle equivalence between ArrayType (int[]) and ParameterizedType Array<T>
+        if ((lhs_type->kind() == TypeKind::Array && rhs_type->kind() == TypeKind::Parameterized) ||
+            (lhs_type->kind() == TypeKind::Parameterized && rhs_type->kind() == TypeKind::Array))
+        {
+            Type *array_type = nullptr;
+            Type *param_type = nullptr;
+            
+            if (lhs_type->kind() == TypeKind::Array)
+            {
+                array_type = lhs_type;
+                param_type = rhs_type;
+            }
+            else
+            {
+                array_type = rhs_type;
+                param_type = lhs_type;
+            }
+            
+            auto array_t = static_cast<ArrayType *>(array_type);
+            auto param_t = static_cast<ParameterizedType *>(param_type);
+            
+            // Check if the parameterized type is Array<T>
+            if (param_t->base_name() == "Array" && param_t->type_parameters().size() == 1)
+            {
+                // Compare element types
+                auto array_element = array_t->element_type();
+                auto param_element = param_t->type_parameters()[0];
+                
+                if (array_element && param_element)
+                {
+                    // Recursively check if element types are compatible
+                    if (check_assignment_compatibility(array_element.get(), param_element.get(), loc))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Allowing array type equivalence: {} = {} (element types compatible)", lhs_str, rhs_str);
+                        return true;
+                    }
                 }
             }
         }
