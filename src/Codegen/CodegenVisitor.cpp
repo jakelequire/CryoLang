@@ -2095,6 +2095,30 @@ namespace Cryo::Codegen
                 qualified_name = target_type_name + "::" + method_name;
             }
 
+            // For constructors, include parameter signature in the LLVM IR function name to match declaration
+            bool is_constructor = (method_name == target_type_name); // Constructor has same name as struct
+            if (is_constructor)
+            {
+                std::string param_signature = "(";
+                for (size_t i = 0; i < method->parameters().size(); ++i)
+                {
+                    if (i > 0)
+                        param_signature += ",";
+                    auto param = method->parameters()[i].get();
+                    if (param && param->get_resolved_type())
+                    {
+                        param_signature += param->get_resolved_type()->to_string();
+                    }
+                    else
+                    {
+                        param_signature += "unknown";
+                    }
+                }
+                param_signature += ")";
+                qualified_name += param_signature;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor implementation LLVM IR name with signature: {}", qualified_name);
+            }
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating method: {}", qualified_name);
 
             // Create function type - first parameter is always 'this' pointer
