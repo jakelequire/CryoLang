@@ -373,7 +373,7 @@ namespace Cryo::Codegen
 
             if (bc_output_stream.has_error())
             {
-                report_error("Error during bytecode write");
+                report_error("Error during bytecode write: " + bc_output_stream.error().message());
                 return false;
             }
 
