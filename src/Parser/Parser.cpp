@@ -4152,6 +4152,9 @@ namespace Cryo
         std::vector<Token> collected_tokens;
         int angle_bracket_depth = 0;
 
+        LOG_DEBUG(LogComponent::PARSER, "parse_type_annotation_with_tokens() starting, current token: {} ({})", 
+                  static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
+
         // Collect tokens that form the complete type expression
         // This handles complex types like: const int**, Option<Result<T, E>>, etc.
         while (is_type_token() ||
@@ -4177,6 +4180,9 @@ namespace Cryo
                 angle_bracket_depth--;
             }
 
+            LOG_DEBUG(LogComponent::PARSER, "Collecting token: {} ({})", 
+                      static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
+            
             collected_tokens.push_back(_current_token);
             type_string += std::string(_current_token.text()) + " ";
             advance();
@@ -4193,6 +4199,8 @@ namespace Cryo
                 break;
             }
         }
+
+        LOG_DEBUG(LogComponent::PARSER, "Collected {} tokens for type: '{}'", collected_tokens.size(), type_string);
 
         if (collected_tokens.empty())
         {

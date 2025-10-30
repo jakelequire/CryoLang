@@ -1361,5 +1361,8 @@ namespace Cryo
 
         // Utility to parse generic type syntax: "Array<int, string>" -> ("Array", ["int", "string"])
         std::pair<std::string, std::vector<std::string>> parse_generic_syntax(const std::string &type_string);
+        
+        // Helper to parse template parameters respecting nested angle brackets
+        std::vector<std::string> parse_template_parameters(const std::string &params_str);
     };
 }

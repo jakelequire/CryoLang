@@ -818,21 +818,21 @@ namespace Cryo
             return nullptr;
         }
 
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - creating array of element_type: '{}' (kind: {})", 
+                  element_type->to_string(), static_cast<int>(element_type->kind()));
+
         // For syntactic sugar Type[] -> Array<Type>, use modern parameterized types when registry is available
         if (_type_registry && !size.has_value())
         {
             // Create Array<ElementType> using the type registry
-            std::string array_type_string = "Array<" + element_type->name() + ">";
+            // Use to_string() instead of name() to get full parameterized type names (e.g., "Array<int>" not "Array")
+            std::string array_type_string = "Array<" + element_type->to_string() + ">";
+            
             ParameterizedType *parameterized_array = _type_registry->parse_and_instantiate(array_type_string);
             
             if (parameterized_array)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - created parameterized Array<{}> for syntactic sugar", element_type->name());
                 return parameterized_array;
-            }
-            else
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - failed to create parameterized Array<{}>, falling back to ArrayType", element_type->name());
             }
         }
 
@@ -1262,6 +1262,7 @@ namespace Cryo
                 // Handle array modifiers for user-defined types
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
                 {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Processing array bracket for struct type: {}", result_type->to_string());
                     ++index; // consume '['
 
                     std::optional<size_t> array_size;
@@ -1276,7 +1277,9 @@ namespace Cryo
                     if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
                     {
                         ++index; // consume ']'
+                        Type *old_type = result_type;
                         result_type = create_array_type(result_type, array_size);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Array type created for struct type: {} -> {}", old_type->to_string(), result_type ? result_type->to_string() : "null");
                     }
                     else
                     {
@@ -2702,16 +2705,10 @@ namespace Cryo
 
     ParameterizedType *TypeRegistry::parse_and_instantiate(const std::string &type_string)
     {
-        LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate called with: '{}'", type_string);
-
         auto [base_name, param_strs] = parse_generic_syntax(type_string);
-
-        LOG_DEBUG(Cryo::LogComponent::AST, "Parsed base_name: '{}', param_strs.size(): {}", base_name, param_strs.size());
 
         if (param_strs.empty() || !has_template(base_name))
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "parse_and_instantiate failed: param_strs.empty()={}, has_template('{}')={}",
-                      param_strs.empty(), base_name, has_template(base_name));
             return nullptr;
         }
 
@@ -2719,19 +2716,25 @@ namespace Cryo
         std::vector<Type *> concrete_types;
         for (const auto &param_str : param_strs)
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Converting parameter string: '{}'", param_str);
-            // Use token-based type parsing
-            Type *param_type = _type_context->parse_type_from_string_via_tokens(param_str);
+            // Try recursive parsing first for parameterized types
+            Type *param_type = nullptr;
+            if (param_str.find('<') != std::string::npos) {
+                // This looks like a parameterized type, try recursive parse_and_instantiate
+                param_type = parse_and_instantiate(param_str);
+            }
+            
+            // Fall back to token-based parsing if recursive parsing failed
+            if (!param_type) {
+                param_type = _type_context->parse_type_from_string_via_tokens(param_str);
+            }
+            
             if (!param_type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Failed to parse parameter type: '{}'", param_str);
                 return nullptr;
             }
-            LOG_DEBUG(Cryo::LogComponent::AST, "Successfully parsed parameter type: '{}' -> {}", param_str, param_type->name());
             concrete_types.push_back(param_type);
         }
 
-        LOG_DEBUG(Cryo::LogComponent::AST, "Calling instantiate('{}', {} types)", base_name, concrete_types.size());
         return instantiate(base_name, concrete_types);
     }
 
@@ -2764,7 +2767,26 @@ namespace Cryo
         base_name.erase(0, base_name.find_first_not_of(" \t"));
         base_name.erase(base_name.find_last_not_of(" \t") + 1);
 
-        size_t close_angle = type_string.find('>', angle_pos);
+        // Find the matching closing angle bracket by counting nested brackets
+        size_t close_angle = std::string::npos;
+        int bracket_count = 0;
+        for (size_t i = angle_pos; i < type_string.size(); ++i)
+        {
+            if (type_string[i] == '<')
+            {
+                bracket_count++;
+            }
+            else if (type_string[i] == '>')
+            {
+                bracket_count--;
+                if (bracket_count == 0)
+                {
+                    close_angle = i;
+                    break;
+                }
+            }
+        }
+
         if (close_angle == std::string::npos)
         {
             return {base_name, param_strs}; // Malformed
@@ -2772,11 +2794,53 @@ namespace Cryo
 
         std::string params_str = type_string.substr(angle_pos + 1, close_angle - angle_pos - 1);
 
-        // Simple parameter parsing (splits on commas)
-        std::stringstream ss(params_str);
-        std::string param;
-        while (std::getline(ss, param, ','))
+        // Parse parameters, respecting nested angle brackets
+        param_strs = parse_template_parameters(params_str);
+
+        return {base_name, param_strs};
+    }
+
+    std::vector<std::string> TypeRegistry::parse_template_parameters(const std::string &params_str)
+    {
+        std::vector<std::string> param_strs;
+        if (params_str.empty())
         {
+            return param_strs;
+        }
+
+        size_t start = 0;
+        int bracket_count = 0;
+        
+        for (size_t i = 0; i < params_str.size(); ++i)
+        {
+            char c = params_str[i];
+            if (c == '<')
+            {
+                bracket_count++;
+            }
+            else if (c == '>')
+            {
+                bracket_count--;
+            }
+            else if (c == ',' && bracket_count == 0)
+            {
+                // Found a parameter boundary
+                std::string param = params_str.substr(start, i - start);
+                // Trim whitespace
+                param.erase(0, param.find_first_not_of(" \t"));
+                param.erase(param.find_last_not_of(" \t") + 1);
+                if (!param.empty())
+                {
+                    param_strs.push_back(param);
+                }
+                start = i + 1;
+            }
+        }
+        
+        // Handle the last parameter
+        if (start < params_str.size())
+        {
+            std::string param = params_str.substr(start);
             // Trim whitespace
             param.erase(0, param.find_first_not_of(" \t"));
             param.erase(param.find_last_not_of(" \t") + 1);
@@ -2786,7 +2850,7 @@ namespace Cryo
             }
         }
 
-        return {base_name, param_strs};
+        return param_strs;
     }
 
     //===----------------------------------------------------------------------===//

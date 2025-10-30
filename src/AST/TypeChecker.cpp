@@ -5582,6 +5582,16 @@ namespace Cryo
             return true;
         }
 
+        // SPECIAL CASE: Empty array literal compatibility
+        // Allow assignment of "unknown" type to array types (this happens with empty array literals [])
+        if (rhs_type->kind() == TypeKind::Unknown && 
+            (lhs_type->kind() == TypeKind::Parameterized || lhs_type->kind() == TypeKind::Array) &&
+            lhs_str.find("Array") != std::string::npos)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing empty array literal assignment: {} = {} (empty array literal)", lhs_str, rhs_str);
+            return true;
+        }
+
         // SPECIAL CASE: Class/Struct assignment compatibility
         // Allow assignment between same class/struct types (e.g., HeapManager = HeapManager())
         if ((lhs_type->kind() == TypeKind::Class || lhs_type->kind() == TypeKind::Struct) &&
