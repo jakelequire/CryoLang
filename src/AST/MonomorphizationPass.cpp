@@ -1345,16 +1345,26 @@ namespace Cryo
             }
             else
             {
-                // Try to resolve using TypeChecker for complex types
-                ParameterizedType *param_type = _type_checker->resolve_generic_type(type_string);
-                if (param_type)
+                // Try to resolve using TypeChecker symbol lookup for user-defined types
+                TypedSymbol *symbol = _type_checker->lookup_symbol_in_any_namespace(type_string);
+                if (symbol && symbol->type)
                 {
-                    resolved_type = param_type;
-                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved complex type '{}' -> ParameterizedType", type_string);
+                    resolved_type = symbol->type;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved user-defined type '{}' -> {} (via symbol lookup)", type_string, symbol->type->name());
                 }
                 else
                 {
-                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Could not resolve type '{}' for parameter '{}'", type_string, param_name);
+                    // Fallback to generic type resolution
+                    ParameterizedType *param_type = _type_checker->resolve_generic_type(type_string);
+                    if (param_type)
+                    {
+                        resolved_type = param_type;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved complex type '{}' -> ParameterizedType", type_string);
+                    }
+                    else
+                    {
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Could not resolve type '{}' for parameter '{}'", type_string, param_name);
+                    }
                 }
             }
 
@@ -1384,6 +1394,13 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: substitute_type called with type '{}' kind={}",
                   type_name, static_cast<int>(original_type->kind()));
 
+        // DEBUG: Print all available substitutions
+        LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Available substitutions:");
+        for (const auto &[key, value] : type_substitutions)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "  '{}' -> '{}'", key, value->name());
+        }
+
         // If this is a generic type parameter that needs substitution
         if (original_type->kind() == TypeKind::Generic)
         {
@@ -1393,6 +1410,10 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Substituting Generic type '{}' -> '{}'",
                           type_name, it->second->name());
                 return it->second;
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: No substitution found for Generic type '{}'", type_name);
             }
         }
 
