@@ -1736,8 +1736,11 @@ namespace Cryo::Codegen
 
         // Determine if this is a simple or complex enum
         bool is_simple = true;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking if enum {} is simple...", node.name());
         for (const auto &variant : node.variants())
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Variant {} has {} associated types", 
+                variant->name(), variant->associated_types().size());
             if (!variant->associated_types().empty())
             {
                 is_simple = false;
@@ -1745,9 +1748,13 @@ namespace Cryo::Codegen
             }
         }
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Enum {} determined to be: {}", 
+            node.name(), is_simple ? "simple" : "complex");
+
         if (is_simple)
         {
             // Generate constants for simple enum variants
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling generate_simple_enum_constants for {}", node.name());
             generate_simple_enum_constants(&node, enum_type);
         }
         else
@@ -2744,6 +2751,8 @@ namespace Cryo::Codegen
         try
         {
             std::string identifier = node.name();
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "IdentifierNode: Looking for identifier '{}'", identifier);
 
             // Handle 'this' keyword in method context
             if (identifier == "this" && _current_function && _current_function->function)
@@ -4569,10 +4578,15 @@ namespace Cryo::Codegen
         std::string member_name = node.member_name();
         std::string qualified_name = scope_name + "::" + member_name;
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ScopeResolutionNode: Looking for '{}' (scope='{}', member='{}')", 
+            qualified_name, scope_name, member_name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  _enum_variants map has {} entries", _enum_variants.size());
+
         // Try to find enum variant
         auto enum_variant_it = _enum_variants.find(qualified_name);
         if (enum_variant_it != _enum_variants.end())
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Found enum variant '{}' in _enum_variants", qualified_name);
             llvm::Value *enum_value = enum_variant_it->second;
             set_current_value(enum_value);
             register_value(&node, enum_value);
@@ -4583,10 +4597,17 @@ namespace Cryo::Codegen
         auto unqualified_it = _enum_variants.find(member_name);
         if (unqualified_it != _enum_variants.end())
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Found enum variant '{}' in _enum_variants (unqualified lookup)", member_name);
             llvm::Value *enum_value = unqualified_it->second;
             set_current_value(enum_value);
             register_value(&node, enum_value);
             return;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Enum variant '{}' NOT FOUND in _enum_variants", qualified_name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Available enum variants:");
+        for (const auto& [key, value] : _enum_variants) {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "    - '{}'", key);
         }
 
         report_error("Unresolved scope resolution: " + qualified_name);
@@ -5698,6 +5719,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::generate_simple_enum_constants(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_simple_enum_constants called for enum: {}", enum_decl->name());
         // For simple enums, create global constants for each variant
         auto &llvm_context = _context_manager.get_context();
         auto *module = _context_manager.get_module();
@@ -5708,6 +5730,9 @@ namespace Cryo::Codegen
             return;
         }
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating constants for {} variants of enum {}", 
+            enum_decl->variants().size(), enum_decl->name());
+
         int variant_value = 0;
         for (const auto &variant : enum_decl->variants())
         {
@@ -5715,11 +5740,15 @@ namespace Cryo::Codegen
             llvm::Constant *variant_const = llvm::ConstantInt::get(
                 llvm::cast<llvm::IntegerType>(enum_type), variant_value);
 
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Registering enum variant: {}::{} = {}", 
+                enum_decl->name(), variant->name(), variant_value);
+
             // Register the constant directly (not a global variable)
             register_enum_variant(enum_decl->name(), variant->name(), variant_const);
 
             variant_value++;
         }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished creating constants for enum: {}", enum_decl->name());
     }
 
     void CodegenVisitor::generate_complex_enum_constructors(Cryo::EnumDeclarationNode *enum_decl, llvm::Type *enum_type)

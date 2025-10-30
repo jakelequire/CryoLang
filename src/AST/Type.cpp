@@ -818,6 +818,25 @@ namespace Cryo
             return nullptr;
         }
 
+        // For syntactic sugar Type[] -> Array<Type>, use modern parameterized types when registry is available
+        if (_type_registry && !size.has_value())
+        {
+            // Create Array<ElementType> using the type registry
+            std::string array_type_string = "Array<" + element_type->name() + ">";
+            ParameterizedType *parameterized_array = _type_registry->parse_and_instantiate(array_type_string);
+            
+            if (parameterized_array)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - created parameterized Array<{}> for syntactic sugar", element_type->name());
+                return parameterized_array;
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - failed to create parameterized Array<{}>, falling back to ArrayType", element_type->name());
+            }
+        }
+
+        // Fallback to traditional ArrayType for sized arrays or when type registry unavailable
         // Generate a unique key for array type caching
         std::string array_key = element_type->name() + "[]";
         if (size.has_value())
@@ -1232,12 +1251,37 @@ namespace Cryo
             Type *user_type = get_struct_type(type_name);
             if (user_type && user_type->kind() != TypeKind::Unknown)
             {
-                // Handle pointer modifiers for user-defined types
+                // Handle pointer and array modifiers for user-defined types
                 Type *result_type = user_type;
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
                 {
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
+                }
+                
+                // Handle array modifiers for user-defined types
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
+                {
+                    ++index; // consume '['
+
+                    std::optional<size_t> array_size;
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                    {
+                        std::string size_str = std::string(tokens[index].text());
+                        array_size = std::stoull(size_str);
+                        ++index; // consume size
+                    }
+
+                    // Expect ']'
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
+                    {
+                        ++index; // consume ']'
+                        result_type = create_array_type(result_type, array_size);
+                    }
+                    else
+                    {
+                        return nullptr; // Malformed array type
+                    }
                 }
                 return result_type;
             }
@@ -1245,12 +1289,37 @@ namespace Cryo
             user_type = get_class_type(type_name);
             if (user_type && user_type->kind() != TypeKind::Unknown)
             {
-                // Handle pointer modifiers for user-defined types
+                // Handle pointer and array modifiers for user-defined types
                 Type *result_type = user_type;
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
                 {
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
+                }
+                
+                // Handle array modifiers for user-defined types
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
+                {
+                    ++index; // consume '['
+
+                    std::optional<size_t> array_size;
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                    {
+                        std::string size_str = std::string(tokens[index].text());
+                        array_size = std::stoull(size_str);
+                        ++index; // consume size
+                    }
+
+                    // Expect ']'
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
+                    {
+                        ++index; // consume ']'
+                        result_type = create_array_type(result_type, array_size);
+                    }
+                    else
+                    {
+                        return nullptr; // Malformed array type
+                    }
                 }
                 return result_type;
             }
@@ -1258,12 +1327,37 @@ namespace Cryo
             user_type = lookup_enum_type(type_name);
             if (user_type)
             {
-                // Handle pointer modifiers for user-defined types
+                // Handle pointer and array modifiers for user-defined types
                 Type *result_type = user_type;
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
                 {
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
+                }
+                
+                // Handle array modifiers for user-defined types
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
+                {
+                    ++index; // consume '['
+
+                    std::optional<size_t> array_size;
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                    {
+                        std::string size_str = std::string(tokens[index].text());
+                        array_size = std::stoull(size_str);
+                        ++index; // consume size
+                    }
+
+                    // Expect ']'
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
+                    {
+                        ++index; // consume ']'
+                        result_type = create_array_type(result_type, array_size);
+                    }
+                    else
+                    {
+                        return nullptr; // Malformed array type
+                    }
                 }
                 return result_type;
             }
@@ -1271,23 +1365,73 @@ namespace Cryo
             user_type = get_trait_type(type_name);
             if (user_type && user_type->kind() != TypeKind::Unknown)
             {
-                // Handle pointer modifiers for user-defined types
+                // Handle pointer and array modifiers for user-defined types
                 Type *result_type = user_type;
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
                 {
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
+                
+                // Handle array modifiers for user-defined types
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
+                {
+                    ++index; // consume '['
+
+                    std::optional<size_t> array_size;
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                    {
+                        std::string size_str = std::string(tokens[index].text());
+                        array_size = std::stoull(size_str);
+                        ++index; // consume size
+                    }
+
+                    // Expect ']'
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
+                    {
+                        ++index; // consume ']'
+                        result_type = create_array_type(result_type, array_size);
+                    }
+                    else
+                    {
+                        return nullptr; // Malformed array type
+                    }
+                }
                 return result_type;
             }
 
-            // Generic parameter - also handle pointers
+            // Generic parameter - also handle pointers and arrays
             Type *generic_type = get_generic_type(type_name);
             Type *result_type = generic_type;
             while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
             {
                 ++index; // consume '*'
                 result_type = create_pointer_type(result_type);
+            }
+            
+            // Handle array modifiers for generic types
+            while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
+            {
+                ++index; // consume '['
+
+                std::optional<size_t> array_size;
+                if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                {
+                    std::string size_str = std::string(tokens[index].text());
+                    array_size = std::stoull(size_str);
+                    ++index; // consume size
+                }
+
+                // Expect ']'
+                if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
+                {
+                    ++index; // consume ']'
+                    result_type = create_array_type(result_type, array_size);
+                }
+                else
+                {
+                    return nullptr; // Malformed array type
+                }
             }
             return result_type;
         }

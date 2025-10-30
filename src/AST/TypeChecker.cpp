@@ -4380,7 +4380,7 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Scope symbol '{}' not found", base_scope_name);
             std::string qualified_name = scope_name + "::" + member_name;
             _diagnostic_builder->create_undefined_symbol_error(qualified_name, NodeKind::Declaration, node.location());
-            node.set_type(_type_context.get_unknown_type()->to_string());
+            node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
@@ -4388,7 +4388,7 @@ namespace Cryo
         if (!scope_type)
         {
             _diagnostic_builder->create_undefined_symbol_error(base_scope_name, NodeKind::Declaration, node.location());
-            node.set_type(_type_context.get_unknown_type()->to_string());
+            node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
@@ -4396,7 +4396,7 @@ namespace Cryo
         if (scope_type->kind() != TypeKind::Enum)
         {
             _diagnostic_builder->create_invalid_operation_error("scope resolution", scope_type, nullptr, node.location());
-            node.set_type(_type_context.get_unknown_type()->to_string());
+            node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
@@ -4421,7 +4421,8 @@ namespace Cryo
 
         // For enum scope resolution like Shape::Circle or Option<T>::None,
         // the type should be the original parameterized type (e.g., "Option<T>")
-        node.set_type(scope_name);
+        node.set_resolved_type(scope_type);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved enum variant {}::{} to type {}", scope_name, member_name, scope_type->name());
 
         // Resolved generic enum variant
     }
