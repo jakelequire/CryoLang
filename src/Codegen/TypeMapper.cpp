@@ -206,8 +206,10 @@ namespace Cryo::Codegen
 
         case Cryo::TypeKind::Generic:
             // Generic type parameters should be instantiated before reaching codegen
-            report_error("Generic type parameters should be instantiated before code generation");
-            return nullptr;
+            // For now, use void* as a placeholder to allow compilation to proceed
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper: Using void* placeholder for generic type parameter");
+            llvm_type = llvm::PointerType::get(get_void_type(), 0);
+            break;
 
         case Cryo::TypeKind::Variadic:
             // Variadic parameters are special and shouldn't be mapped to concrete LLVM types
@@ -1407,17 +1409,50 @@ namespace Cryo::Codegen
                 return cache_it->second;
             }
 
-            // Try alternate naming conventions (Array_int instead of Array < int >)
-            std::string alternate_name = base_name + "_" + type_args[0]->to_string();
-            cache_it = _struct_cache.find(alternate_name);
-            if (cache_it != _struct_cache.end())
+            // For Array<T>, create the struct dynamically based on the Array layout
+            if (!type_args.empty())
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found Array struct with alternate name: {}", alternate_name);
-                _struct_cache[instantiated_name] = cache_it->second; // Cache under original name too
-                return cache_it->second;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating dynamic Array struct for: {}", instantiated_name);
+                
+                // Map the element type
+                llvm::Type *element_type = map_type(type_args[0].get());
+                if (!element_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Failed to map element type for Array: {}", type_args[0]->to_string());
+                    // Don't fail immediately, try alternate naming first
+                }
+                else
+                {
+                    // Create Array<T> struct: { T* elements, u64 length, u64 capacity }
+                    std::vector<llvm::Type *> fields = {
+                        llvm::PointerType::get(element_type, 0), // elements: T*
+                        llvm::Type::getInt64Ty(_context_manager.get_context()), // length: u64
+                        llvm::Type::getInt64Ty(_context_manager.get_context())  // capacity: u64
+                    };
+                    
+                    llvm::StructType *array_struct = llvm::StructType::create(_context_manager.get_context(), fields, instantiated_name);
+                    _struct_cache[instantiated_name] = array_struct;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created dynamic Array struct: {}", instantiated_name);
+                    return array_struct;
+                }
             }
 
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array struct not found in cache for names: '{}' or '{}'", instantiated_name, alternate_name);
+            // Try alternate naming conventions (Array_int instead of Array < int >) 
+            // Only for simple types, not for nested parameterized types
+            if (!type_args.empty() && type_args[0]->to_string().find('<') == std::string::npos)
+            {
+                std::string alternate_name = base_name + "_" + type_args[0]->to_string();
+                cache_it = _struct_cache.find(alternate_name);
+                if (cache_it != _struct_cache.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found Array struct with alternate name: {}", alternate_name);
+                    _struct_cache[instantiated_name] = cache_it->second; // Cache under original name too
+                    return cache_it->second;
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array struct not found with alternate name: {}", alternate_name);
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "All Array<T> fallbacks failed for: {}", instantiated_name);
         }
 
         report_error("Failed to create parameterized type using enhanced type system: " + base_name);
