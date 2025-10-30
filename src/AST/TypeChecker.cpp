@@ -2595,6 +2595,24 @@ namespace Cryo
                             {
                                 result_type = left_type;
                             }
+                            // Handle implicit integer literal promotion (int to specific integer types)
+                            else if (left_type->is_integral() && right_type->name() == "int" &&
+                                     (left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" ||
+                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64"))
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", 
+                                          right_type->to_string(), left_type->to_string());
+                                result_type = left_type; // int literal promotes to specific integer type
+                            }
+                            // Handle implicit integer literal promotion (specific integer type + int literal)
+                            else if (left_type->name() == "int" && right_type->is_integral() &&
+                                     (right_type->name() == "i8" || right_type->name() == "i16" || right_type->name() == "i32" || right_type->name() == "i64" ||
+                                      right_type->name() == "u8" || right_type->name() == "u16" || right_type->name() == "u32" || right_type->name() == "u64"))
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", 
+                                          left_type->to_string(), right_type->to_string());
+                                result_type = right_type; // int literal promotes to specific integer type
+                            }
                             else
                             {
                                 report_type_mismatch(node.location(), left_type, right_type,
