@@ -4847,7 +4847,7 @@ namespace Cryo::Codegen
                     fully_qualified_name = struct_name + "::" + method_name;
                 }
 
-                // For specialized enum methods like MyResult_int_string, also create a generic lookup alias
+                // For specialized types, also create a generic lookup alias
                 std::string generic_lookup_name;
                 if (struct_name.find("MyResult_int_string") != std::string::npos)
                 {
@@ -4860,6 +4860,23 @@ namespace Cryo::Codegen
                     {
                         generic_lookup_name = "MyResult<int, string>::" + method_name;
                     }
+                }
+                else if (struct_name.find("Array_") != std::string::npos)
+                {
+                    // Handle Array_Symbol -> Array<Symbol> mapping
+                    std::string base_name = "Array";
+                    std::string type_param = struct_name.substr(6); // Remove "Array_" prefix
+                    std::string generic_name = base_name + "<" + type_param + ">";
+                    
+                    if (!_namespace_context.empty())
+                    {
+                        generic_lookup_name = _namespace_context + "::" + generic_name + "::" + method_name;
+                    }
+                    else
+                    {
+                        generic_lookup_name = generic_name + "::" + method_name;
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created Array generic lookup alias: {} -> {}", generic_lookup_name, fully_qualified_name);
                 }
 
                 // Skip if already registered
@@ -4921,11 +4938,18 @@ namespace Cryo::Codegen
                         {
                             _functions[fully_qualified_name] = function;
 
-                            // Also register with generic lookup name if this is a specialized enum method
+                            // Also register with generic lookup name if this is a specialized method
                             if (!generic_lookup_name.empty())
                             {
                                 _functions[generic_lookup_name] = function;
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported specialized enum method: {} -> {}", generic_lookup_name, fully_qualified_name);
+                                if (struct_name.find("Array_") != std::string::npos)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported specialized Array method: {} -> {}", generic_lookup_name, fully_qualified_name);
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported specialized enum method: {} -> {}", generic_lookup_name, fully_qualified_name);
+                                }
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function type signature: {}", method_type->to_string());
                             }
                             else
