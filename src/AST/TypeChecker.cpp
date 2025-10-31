@@ -3842,6 +3842,50 @@ namespace Cryo
             if (method_it != method_struct_it->second.end())
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Found public method '{}' in struct '{}'", member_name, lookup_type_name);
+                
+                // Check if this is a parameterized type that needs type substitution
+                if (effective_type && effective_type->kind() == TypeKind::Parameterized)
+                {
+                    Type *generic_method_type = method_it->second;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Performing type substitution for method '{}' on parameterized type '{}'", member_name, effective_type->name());
+
+                    // For function types, we need to substitute the return type and parameter types
+                    if (generic_method_type && generic_method_type->kind() == TypeKind::Function)
+                    {
+                        FunctionType *func_type = static_cast<FunctionType *>(generic_method_type);
+                        ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
+                        auto &concrete_types = param_type->type_parameters();
+
+                        // Create a type substitution map - for Array<T>, map T -> concrete type
+                        std::unordered_map<std::string, std::shared_ptr<Type>> substitution_map;
+                        
+                        // For Array<T>, the template parameter is "T"
+                        if (lookup_type_name == "Array" && concrete_types.size() == 1)
+                        {
+                            substitution_map["T"] = concrete_types[0];
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Type substitution mapping: T -> {}", concrete_types[0]->name());
+                        }
+
+                        // Substitute return type using the mapping
+                        std::shared_ptr<Type> substituted_return_type = substitute_type_with_map(func_type->return_type(), substitution_map);
+
+                        // Substitute parameter types using the mapping
+                        std::vector<Type *> param_types;
+                        for (const auto &param : func_type->parameter_types())
+                        {
+                            std::shared_ptr<Type> substituted_param = substitute_type_with_map(param, substitution_map);
+                            param_types.push_back(substituted_param.get());
+                        }
+
+                        // Create a new function type with substituted types
+                        Type *substituted_func_type = _type_context.create_function_type(substituted_return_type.get(), param_types, func_type->is_variadic());
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted function type: {} -> {}", 
+                                  func_type->return_type()->name(), substituted_return_type->name());
+                        node.set_resolved_type(substituted_func_type);
+                        return;
+                    }
+                }
+                
                 // Found the method - store the resolved Type*
                 node.set_resolved_type(method_it->second);
                 return;
@@ -6902,8 +6946,89 @@ namespace Cryo
             return it->second;
         }
 
-        // For complex types, we might need to recursively substitute their components
-        // For now, return the original type if no substitution is needed
+        // For complex types, recursively substitute their components
+        switch (type->kind())
+        {
+        case TypeKind::Pointer:
+        {
+            auto pointer_type = static_cast<PointerType *>(type.get());
+            auto pointed_to_type = pointer_type->pointee_type();
+            auto substituted_pointed_to = substitute_type_with_map(pointed_to_type, substitution_map);
+            
+            // If the pointed-to type was substituted, create a new pointer type
+            if (substituted_pointed_to != pointed_to_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted pointer type: {}* -> {}*", 
+                         pointed_to_type->name(), substituted_pointed_to->name());
+                return std::make_shared<PointerType>(substituted_pointed_to);
+            }
+            break;
+        }
+        case TypeKind::Reference:
+        {
+            auto ref_type = static_cast<ReferenceType *>(type.get());
+            auto referenced_type = ref_type->referent_type();
+            auto substituted_referenced = substitute_type_with_map(referenced_type, substitution_map);
+            
+            // If the referenced type was substituted, create a new reference type
+            if (substituted_referenced != referenced_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted reference type: {}& -> {}&", 
+                         referenced_type->name(), substituted_referenced->name());
+                return std::make_shared<ReferenceType>(substituted_referenced);
+            }
+            break;
+        }
+        case TypeKind::Array:
+        {
+            auto array_type = static_cast<ArrayType *>(type.get());
+            auto element_type = array_type->element_type();
+            auto substituted_element = substitute_type_with_map(element_type, substitution_map);
+            
+            // If the element type was substituted, create a new array type
+            if (substituted_element != element_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted array type: {}[] -> {}[]", 
+                         element_type->name(), substituted_element->name());
+                return std::make_shared<ArrayType>(substituted_element, array_type->array_size());
+            }
+            break;
+        }
+        case TypeKind::Function:
+        {
+            auto func_type = static_cast<FunctionType *>(type.get());
+            auto return_type = func_type->return_type();
+            auto substituted_return_type = substitute_type_with_map(return_type, substitution_map);
+            
+            // Substitute parameter types
+            std::vector<Type *> substituted_param_types;
+            bool params_changed = false;
+            
+            for (const auto &param_type : func_type->parameter_types())
+            {
+                auto substituted_param = substitute_type_with_map(param_type, substitution_map);
+                substituted_param_types.push_back(substituted_param.get());
+                if (substituted_param.get() != param_type.get())
+                {
+                    params_changed = true;
+                }
+            }
+            
+            // If return type or parameters were substituted, create a new function type
+            if (substituted_return_type != return_type || params_changed)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted function type: return {} -> {}", 
+                         return_type->name(), substituted_return_type->name());
+                return std::shared_ptr<Type>(_type_context.create_function_type(substituted_return_type.get(), substituted_param_types, func_type->is_variadic()), [](Type*) {});
+            }
+            break;
+        }
+        default:
+            // For other types, no substitution needed
+            break;
+        }
+
+        // Return the original type if no substitution was needed
         return type;
     }
 }
