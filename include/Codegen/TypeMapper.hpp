@@ -349,6 +349,14 @@ namespace Cryo::Codegen
          */
         int get_field_index(const std::string &type_name, const std::string &field_name);
 
+        /**
+         * @brief Get field type by name for a registered type
+         * @param type_name Name of the struct/class type
+         * @param field_name Name of the field
+         * @return Cryo type of the field or nullptr if not found
+         */
+        Cryo::Type *get_field_type(const std::string &type_name, const std::string &field_name);
+
         //===================================================================
         // Error Handling
         //===================================================================

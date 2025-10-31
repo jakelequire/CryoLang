@@ -6382,64 +6382,116 @@ namespace Cryo::Codegen
                             }
                         }
                     }
-                    // Handle chained member access (e.g., this.head.prev, block.prev.next)
+                    // Handle chained member access (e.g., this.tape.head_position, this.head.prev)
                     else if (auto nested_member_access = dynamic_cast<Cryo::MemberAccessNode *>(left_member_access->object()))
                     {
-                        // For chained member access like this.head.prev, we need to know the type of this.head
-                        // Since member access already works, let's use the fact that we can determine types
-                        // based on what we know about the field relationships
-                        if (auto base_identifier = dynamic_cast<Cryo::IdentifierNode *>(nested_member_access->object()))
+                        // For chained member access like this.tape.head_position, we need to know the type of this.tape
+                        // Use the TypeChecker's resolved type information if available
+                        if (nested_member_access->has_resolved_type())
                         {
+                            Cryo::Type *resolved_type = nested_member_access->get_resolved_type();
+                            
+                            // If it's a pointer type, get the pointed-to type
+                            if (resolved_type->kind() == Cryo::TypeKind::Pointer)
+                            {
+                                Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
+                                resolved_type = ptr_type->pointee_type().get();
+                            }
+                            
+                            if (resolved_type->kind() == Cryo::TypeKind::Struct)
+                            {
+                                Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(resolved_type);
+                                type_name = struct_cryo_type->name();
+                                struct_type = _type_mapper->map_type(resolved_type);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Chained member assignment using resolved type: '{}'", type_name);
+                            }
+                            else if (resolved_type->kind() == Cryo::TypeKind::Class)
+                            {
+                                Cryo::ClassType *class_cryo_type = static_cast<Cryo::ClassType *>(resolved_type);
+                                type_name = class_cryo_type->name();
+                                struct_type = _type_mapper->map_type(resolved_type);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Chained member assignment using resolved class type: '{}'", type_name);
+                            }
+                        }
+                        else if (auto base_identifier = dynamic_cast<Cryo::IdentifierNode *>(nested_member_access->object()))
+                        {
+                            // Fallback to manual type resolution
                             std::string base_var_name = base_identifier->name();
                             std::string nested_member_name = nested_member_access->member();
 
-                            // For the specific case we're debugging: this.head.prev where:
-                            // - 'this' is HeapManager (or FreeListManager)
-                            // - 'head' is HeapBlock*
-                            // - 'prev' is on HeapBlock
-                            if (base_var_name == "this" && nested_member_name == "head")
+                            // Get the base variable's type
+                            auto base_cryo_type_it = _variable_types.find(base_var_name);
+                            if (base_cryo_type_it != _variable_types.end() && base_cryo_type_it->second)
                             {
-                                // We know this.head is HeapBlock*, so the target type is HeapBlock
-                                type_name = "HeapBlock";
-                                // Look up in registered types
-                                auto type_it = _types.find("HeapBlock");
-                                if (type_it != _types.end())
+                                Cryo::Type *base_cryo_type = base_cryo_type_it->second;
+                                
+                                // For pointer types, get the pointed-to type
+                                if (base_cryo_type->kind() == Cryo::TypeKind::Pointer)
                                 {
-                                    struct_type = type_it->second;
+                                    Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(base_cryo_type);
+                                    base_cryo_type = ptr_type->pointee_type().get();
                                 }
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Chained member assignment detected this.head.* pattern, using HeapBlock type");
-                            }
-                            // Handle block.prev.* and block.next.* patterns
-                            else if ((nested_member_name == "prev" || nested_member_name == "next"))
-                            {
-                                // Check if the base variable is a HeapBlock* type
-                                auto base_cryo_type_it = _variable_types.find(base_var_name);
-                                if (base_cryo_type_it != _variable_types.end() && base_cryo_type_it->second)
+                                
+                                // Now look up the field type in the base struct/class
+                                if (base_cryo_type->kind() == Cryo::TypeKind::Struct)
                                 {
-                                    Cryo::Type *base_cryo_type = base_cryo_type_it->second;
-                                    // For pointer types, get the pointed-to type
-                                    if (base_cryo_type->kind() == Cryo::TypeKind::Pointer)
+                                    Cryo::StructType *base_struct_type = static_cast<Cryo::StructType *>(base_cryo_type);
+                                    
+                                    // Get the field type from the struct definition
+                                    Cryo::Type *field_type = _type_mapper->get_field_type(base_struct_type->name(), nested_member_name);
+                                    if (field_type)
                                     {
-                                        Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(base_cryo_type);
-                                        base_cryo_type = ptr_type->pointee_type().get();
-                                    }
-
-                                    if (base_cryo_type->kind() == Cryo::TypeKind::Struct)
-                                    {
-                                        Cryo::StructType *base_struct_type = static_cast<Cryo::StructType *>(base_cryo_type);
-                                        std::string base_type_name = base_struct_type->name();
-
-                                        // If the base is HeapBlock, then both prev and next fields are HeapBlock*
-                                        // so the chained access target is also HeapBlock
-                                        if (base_type_name == "HeapBlock")
+                                        // If the field is a pointer, get the pointed-to type
+                                        if (field_type->kind() == Cryo::TypeKind::Pointer)
                                         {
-                                            type_name = "HeapBlock";
-                                            auto type_it = _types.find("HeapBlock");
-                                            if (type_it != _types.end())
-                                            {
-                                                struct_type = type_it->second;
-                                            }
-                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Chained member assignment detected {}.{}.* pattern, using HeapBlock type", base_var_name, nested_member_name);
+                                            Cryo::PointerType *field_ptr_type = static_cast<Cryo::PointerType *>(field_type);
+                                            field_type = field_ptr_type->pointee_type().get();
+                                        }
+                                        
+                                        if (field_type->kind() == Cryo::TypeKind::Struct)
+                                        {
+                                            Cryo::StructType *field_struct_type = static_cast<Cryo::StructType *>(field_type);
+                                            type_name = field_struct_type->name();
+                                            struct_type = _type_mapper->map_type(field_type);
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Chained member assignment resolved field type: {}.{} -> '{}'", base_var_name, nested_member_name, type_name);
+                                        }
+                                        else if (field_type->kind() == Cryo::TypeKind::Class)
+                                        {
+                                            Cryo::ClassType *field_class_type = static_cast<Cryo::ClassType *>(field_type);
+                                            type_name = field_class_type->name();
+                                            struct_type = _type_mapper->map_type(field_type);
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Chained member assignment resolved field class type: {}.{} -> '{}'", base_var_name, nested_member_name, type_name);
+                                        }
+                                    }
+                                }
+                                else if (base_cryo_type->kind() == Cryo::TypeKind::Class)
+                                {
+                                    Cryo::ClassType *base_class_type = static_cast<Cryo::ClassType *>(base_cryo_type);
+                                    
+                                    // Get the field type from the class definition
+                                    Cryo::Type *field_type = _type_mapper->get_field_type(base_class_type->name(), nested_member_name);
+                                    if (field_type)
+                                    {
+                                        // If the field is a pointer, get the pointed-to type
+                                        if (field_type->kind() == Cryo::TypeKind::Pointer)
+                                        {
+                                            Cryo::PointerType *field_ptr_type = static_cast<Cryo::PointerType *>(field_type);
+                                            field_type = field_ptr_type->pointee_type().get();
+                                        }
+                                        
+                                        if (field_type->kind() == Cryo::TypeKind::Struct)
+                                        {
+                                            Cryo::StructType *field_struct_type = static_cast<Cryo::StructType *>(field_type);
+                                            type_name = field_struct_type->name();
+                                            struct_type = _type_mapper->map_type(field_type);
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Chained member assignment resolved class field type: {}.{} -> '{}'", base_var_name, nested_member_name, type_name);
+                                        }
+                                        else if (field_type->kind() == Cryo::TypeKind::Class)
+                                        {
+                                            Cryo::ClassType *field_class_type = static_cast<Cryo::ClassType *>(field_type);
+                                            type_name = field_class_type->name();
+                                            struct_type = _type_mapper->map_type(field_type);
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Chained member assignment resolved class field class type: {}.{} -> '{}'", base_var_name, nested_member_name, type_name);
                                         }
                                     }
                                 }
