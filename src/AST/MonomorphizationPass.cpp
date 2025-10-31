@@ -298,8 +298,37 @@ namespace Cryo
                     }
                 }
 
+                // Capture method name before moving the specialized_method
+                std::string final_method_name = specialized_method_name;
+
                 specialized->add_method(std::move(specialized_method));
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added method: {} : {}", method->name(), (substituted_return_type ? substituted_return_type->to_string() : "unknown"));
+
+                // Register the specialized method with TypeChecker for codegen discovery
+                if (_type_checker && substituted_return_type)
+                {
+                    // Create parameter types vector for function type
+                    std::vector<std::shared_ptr<Type>> param_types;
+                    for (const auto &param : method->parameters())
+                    {
+                        if (param)
+                        {
+                            Type *original_param_type = param->get_resolved_type();
+                            std::shared_ptr<Type> substituted_param_type = substitute_type(original_param_type, type_substitutions_map);
+                            if (substituted_param_type)
+                            {
+                                param_types.push_back(substituted_param_type);
+                            }
+                        }
+                    }
+
+                    // Create function type for the specialized method
+                    auto function_type = std::make_shared<FunctionType>(substituted_return_type, param_types);
+                    
+                    // Register with TypeChecker using the specialized class name and method name
+                    _type_checker->register_specialized_method(mangled_class_name, final_method_name, function_type.get());
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Registered specialized method: {}::{}", mangled_class_name, final_method_name);
+                }
             }
         }
 
@@ -430,8 +459,37 @@ namespace Cryo
                     }
                 }
 
+                // Capture method name before moving the specialized_method
+                std::string final_method_name = specialized_method_name;
+
                 specialized->add_method(std::move(specialized_method));
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Added method: {} -> {}", method->name(), substituted_return_type);
+
+                // Register the specialized method with TypeChecker for codegen discovery
+                if (_type_checker && substituted_return_type)
+                {
+                    // Create parameter types vector for function type
+                    std::vector<std::shared_ptr<Type>> param_types;
+                    for (const auto &param : method->parameters())
+                    {
+                        if (param)
+                        {
+                            Type *original_param_type = param->get_resolved_type();
+                            std::shared_ptr<Type> substituted_param_type = substitute_type(original_param_type, type_substitutions_map);
+                            if (substituted_param_type)
+                            {
+                                param_types.push_back(substituted_param_type);
+                            }
+                        }
+                    }
+
+                    // Create function type for the specialized method
+                    auto function_type = std::make_shared<FunctionType>(substituted_return_type, param_types);
+                    
+                    // Register with TypeChecker using the specialized struct name and method name
+                    _type_checker->register_specialized_method(mangled_struct_name, final_method_name, function_type.get());
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Registered specialized method: {}::{}", mangled_struct_name, final_method_name);
+                }
             }
         }
 
