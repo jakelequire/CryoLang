@@ -3852,7 +3852,6 @@ namespace Cryo
                     // For function types, we need to substitute the return type and parameter types
                     if (generic_method_type && generic_method_type->kind() == TypeKind::Function)
                     {
-                        FunctionType *func_type = static_cast<FunctionType *>(generic_method_type);
                         ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
                         auto &concrete_types = param_type->type_parameters();
 
@@ -3866,22 +3865,89 @@ namespace Cryo
                             LOG_DEBUG(Cryo::LogComponent::AST, "Type substitution mapping: T -> {}", concrete_types[0]->name());
                         }
 
-                        // Substitute return type using the mapping
-                        std::shared_ptr<Type> substituted_return_type = substitute_type_with_map(func_type->return_type(), substitution_map);
-
-                        // Substitute parameter types using the mapping
-                        std::vector<Type *> param_types;
-                        for (const auto &param : func_type->parameter_types())
+                        // Create properly managed substituted function type by manual substitution
+                        FunctionType *func_type = dynamic_cast<FunctionType *>(generic_method_type);
+                        if (func_type)
                         {
-                            std::shared_ptr<Type> substituted_param = substitute_type_with_map(param, substitution_map);
-                            param_types.push_back(substituted_param.get());
-                        }
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Original function type: {} -> {}", 
+                                      func_type->to_string(), func_type->return_type()->to_string());
+                            
+                            // Substitute return type manually
+                            std::shared_ptr<Type> substituted_return_type = func_type->return_type();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Return type before substitution: {}, kind: {}", 
+                                      substituted_return_type->to_string(), (int)substituted_return_type->kind());
+                            
+                            if (substituted_return_type->kind() == TypeKind::Generic)
+                            {
+                                GenericType *generic_ret = dynamic_cast<GenericType *>(substituted_return_type.get());
+                                if (generic_ret && !concrete_types.empty())
+                                {
+                                    substituted_return_type = concrete_types[0];
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "Substituted generic return type T -> {}", 
+                                              substituted_return_type->to_string());
+                                }
+                            }
+                            else if (substituted_return_type->kind() == TypeKind::Pointer)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Found pointer type, checking pointee...");
+                                PointerType *ptr_type = dynamic_cast<PointerType *>(substituted_return_type.get());
+                                if (ptr_type)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "Pointee type: {}, kind: {}", 
+                                              ptr_type->pointee_type()->to_string(), (int)ptr_type->pointee_type()->kind());
+                                    
+                                    bool should_substitute = false;
+                                    if (ptr_type->pointee_type()->kind() == TypeKind::Generic ||
+                                        ptr_type->pointee_type()->kind() == TypeKind::Struct  ||
+                                        ptr_type->pointee_type()->kind() == TypeKind::Class   ||
+                                        ptr_type->pointee_type()->kind() == TypeKind::Enum    ||
+                                        ptr_type->pointee_type()->kind() == TypeKind::Parameterized)
+                                    {
+                                        should_substitute = true;
+                                    }
+                                    
+                                    if (should_substitute && !concrete_types.empty())
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Substituting pointer type T* -> {}*", 
+                                                  concrete_types[0]->to_string());
+                                        substituted_return_type = std::shared_ptr<Type>(_type_context.create_pointer_type(concrete_types[0].get()), [](Type*) {});
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted pointer type: {}", 
+                                                  substituted_return_type->to_string());
+                                    }
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "Failed to cast to PointerType");
+                                }
+                            }
+                            
+                            // Substitute parameter types manually  
+                            std::vector<Type *> param_types;
+                            for (const auto &param : func_type->parameter_types())
+                            {
+                                std::shared_ptr<Type> substituted_param = param;
+                                if (param->kind() == TypeKind::Generic)
+                                {
+                                    GenericType *generic_param = dynamic_cast<GenericType *>(param.get());
+                                    if (!concrete_types.empty())
+                                    {
+                                        substituted_param = concrete_types[0];
+                                    }
+                                }
+                                param_types.push_back(substituted_param.get());
+                            }
 
-                        // Create a new function type with substituted types
-                        Type *substituted_func_type = _type_context.create_function_type(substituted_return_type.get(), param_types, func_type->is_variadic());
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted function type: {} -> {}", 
-                                  func_type->return_type()->name(), substituted_return_type->name());
-                        node.set_resolved_type(substituted_func_type);
+                            // Create a new function type with substituted types using TypeContext
+                            Type *substituted_func_type = _type_context.create_function_type(substituted_return_type.get(), param_types, func_type->is_variadic());
+                            node.set_resolved_type(substituted_func_type);
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted function type: {} -> {}", 
+                                      generic_method_type->to_string(), substituted_func_type->to_string());
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Warning: Expected function type for method substitution");
+                            node.set_resolved_type(generic_method_type);
+                        }
                         return;
                     }
                 }
