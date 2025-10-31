@@ -24,22 +24,12 @@ namespace Cryo
         _syntax_highlighter.set_color_output(use_colors);
         _syntax_highlighter.set_default_language("cryo");
 
-        // Use clean ASCII by default for universal compatibility
+
         _style.arrow = "-->";
         _style.vertical_bar = "|";
         _style.horizontal_line = "-";
         _style.caret = "^";
         _style.tilde = "~";
-
-        // Don't use Unicode at all for now to ensure clean display
-        // (commented out to avoid any Unicode issues)
-        /*
-        if (use_unicode) {
-            _style.arrow = "→";
-            _style.vertical_bar = "│";
-            _style.horizontal_line = "─";
-        }
-        */
     }
 
     std::string DiagnosticFormatter::format_diagnostic(const Diagnostic &diagnostic, size_t error_number)

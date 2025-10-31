@@ -1739,8 +1739,8 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking if enum {} is simple...", node.name());
         for (const auto &variant : node.variants())
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Variant {} has {} associated types", 
-                variant->name(), variant->associated_types().size());
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Variant {} has {} associated types",
+                      variant->name(), variant->associated_types().size());
             if (!variant->associated_types().empty())
             {
                 is_simple = false;
@@ -1748,8 +1748,8 @@ namespace Cryo::Codegen
             }
         }
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Enum {} determined to be: {}", 
-            node.name(), is_simple ? "simple" : "complex");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Enum {} determined to be: {}",
+                  node.name(), is_simple ? "simple" : "complex");
 
         if (is_simple)
         {
@@ -4578,8 +4578,8 @@ namespace Cryo::Codegen
         std::string member_name = node.member_name();
         std::string qualified_name = scope_name + "::" + member_name;
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ScopeResolutionNode: Looking for '{}' (scope='{}', member='{}')", 
-            qualified_name, scope_name, member_name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ScopeResolutionNode: Looking for '{}' (scope='{}', member='{}')",
+                  qualified_name, scope_name, member_name);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  _enum_variants map has {} entries", _enum_variants.size());
 
         // Try to find enum variant
@@ -4606,7 +4606,8 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Enum variant '{}' NOT FOUND in _enum_variants", qualified_name);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Available enum variants:");
-        for (const auto& [key, value] : _enum_variants) {
+        for (const auto &[key, value] : _enum_variants)
+        {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "    - '{}'", key);
         }
 
@@ -5730,8 +5731,8 @@ namespace Cryo::Codegen
             return;
         }
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating constants for {} variants of enum {}", 
-            enum_decl->variants().size(), enum_decl->name());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating constants for {} variants of enum {}",
+                  enum_decl->variants().size(), enum_decl->name());
 
         int variant_value = 0;
         for (const auto &variant : enum_decl->variants())
@@ -5740,8 +5741,8 @@ namespace Cryo::Codegen
             llvm::Constant *variant_const = llvm::ConstantInt::get(
                 llvm::cast<llvm::IntegerType>(enum_type), variant_value);
 
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Registering enum variant: {}::{} = {}", 
-                enum_decl->name(), variant->name(), variant_value);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Registering enum variant: {}::{} = {}",
+                      enum_decl->name(), variant->name(), variant_value);
 
             // Register the constant directly (not a global variable)
             register_enum_variant(enum_decl->name(), variant->name(), variant_const);
@@ -6228,8 +6229,8 @@ namespace Cryo::Codegen
                         if (right_val && right_val->getType())
                         {
                             element_type = right_val->getType();
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Inferred element type from right operand: {}", 
-                                     element_type ? "valid" : "null");
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Inferred element type from right operand: {}",
+                                      element_type ? "valid" : "null");
                         }
                         else
                         {
@@ -12943,13 +12944,13 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found constructor with exact name: {}", name);
                 break;
             }
-            
+
             // If exact match fails, look for functions that start with this name (to handle parameter signatures)
             for (const auto &pair : _functions)
             {
-                if (pair.first.length() > name.length() && 
+                if (pair.first.length() > name.length() &&
                     pair.first.substr(0, name.length()) == name &&
-                    pair.first[name.length()] == '(')  // Ensure it's a parameter list
+                    pair.first[name.length()] == '(') // Ensure it's a parameter list
                 {
                     constructor_func = pair.second;
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found constructor with signature: {} (matched base: {})", pair.first, name);
@@ -12957,7 +12958,8 @@ namespace Cryo::Codegen
                     break;
                 }
             }
-            if (constructor_func) break;
+            if (constructor_func)
+                break;
         }
 
         if (!constructor_func)
