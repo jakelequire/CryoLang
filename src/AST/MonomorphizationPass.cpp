@@ -308,7 +308,7 @@ namespace Cryo
                 if (_type_checker && substituted_return_type)
                 {
                     // Create parameter types vector for function type
-                    std::vector<std::shared_ptr<Type>> param_types;
+                    std::vector<Type *> param_types;
                     for (const auto &param : method->parameters())
                     {
                         if (param)
@@ -317,16 +317,17 @@ namespace Cryo
                             std::shared_ptr<Type> substituted_param_type = substitute_type(original_param_type, type_substitutions_map);
                             if (substituted_param_type)
                             {
-                                param_types.push_back(substituted_param_type);
+                                param_types.push_back(substituted_param_type.get());
                             }
                         }
                     }
 
-                    // Create function type for the specialized method
-                    auto function_type = std::make_shared<FunctionType>(substituted_return_type, param_types);
+                    // Create function type for the specialized method using TypeContext to ensure proper memory management
+                    auto &type_context = _type_checker->get_type_context();
+                    Type *function_type = type_context.create_function_type(substituted_return_type.get(), param_types);
                     
                     // Register with TypeChecker using the specialized class name and method name
-                    _type_checker->register_specialized_method(mangled_class_name, final_method_name, function_type.get());
+                    _type_checker->register_specialized_method(mangled_class_name, final_method_name, function_type);
                     LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Registered specialized method: {}::{}", mangled_class_name, final_method_name);
                 }
             }
@@ -469,7 +470,7 @@ namespace Cryo
                 if (_type_checker && substituted_return_type)
                 {
                     // Create parameter types vector for function type
-                    std::vector<std::shared_ptr<Type>> param_types;
+                    std::vector<Type *> param_types;
                     for (const auto &param : method->parameters())
                     {
                         if (param)
@@ -478,16 +479,17 @@ namespace Cryo
                             std::shared_ptr<Type> substituted_param_type = substitute_type(original_param_type, type_substitutions_map);
                             if (substituted_param_type)
                             {
-                                param_types.push_back(substituted_param_type);
+                                param_types.push_back(substituted_param_type.get());
                             }
                         }
                     }
 
-                    // Create function type for the specialized method
-                    auto function_type = std::make_shared<FunctionType>(substituted_return_type, param_types);
+                    // Create function type for the specialized method using TypeContext to ensure proper memory management
+                    auto &type_context = _type_checker->get_type_context();
+                    Type *function_type = type_context.create_function_type(substituted_return_type.get(), param_types);
                     
                     // Register with TypeChecker using the specialized struct name and method name
-                    _type_checker->register_specialized_method(mangled_struct_name, final_method_name, function_type.get());
+                    _type_checker->register_specialized_method(mangled_struct_name, final_method_name, function_type);
                     LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Registered specialized method: {}::{}", mangled_struct_name, final_method_name);
                 }
             }
