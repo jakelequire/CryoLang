@@ -510,6 +510,8 @@ namespace Cryo::Linker
         full_command.push_back("clang++"); // Use system clang++ on other platforms
         // Add PIE-related flags now that libcryo.a is compiled with -fPIC
         full_command.push_back("-fPIE");
+        // Add debug symbols for better debugging
+        full_command.push_back("-g");
 #endif
 
         // Add all the linker arguments
