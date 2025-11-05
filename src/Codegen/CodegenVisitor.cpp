@@ -2006,12 +2006,15 @@ namespace Cryo::Codegen
                   (primitive_type ? "valid" : "null"),
                   (is_primitive_type(target_type_name) ? "yes" : "no"));
 
-        if (primitive_type && is_primitive_type(target_type_name))
+        if (is_primitive_type(target_type_name))
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating implementation block for primitive type: {}", target_type_name);
 
-            // Set primitive type context for method generation
-            current_primitive_type = cryo_target_type;
+            // Set primitive type context for method generation - use direct type lookup for primitive types
+            if (target_type_name == "string")
+                current_primitive_type = _symbol_table.get_type_context()->get_string_type();
+            else
+                current_primitive_type = cryo_target_type;
 
             // Generate all method implementations for primitive type
             for (const auto &method : node.method_implementations())
@@ -4859,21 +4862,48 @@ namespace Cryo::Codegen
         int imported_count = 0;
         for (const auto &[struct_name, methods] : all_struct_methods)
         {
+            // Check if this is a primitive type
+            bool is_primitive_type = (struct_name == "string" || struct_name == "int" || struct_name == "i8" ||
+                                    struct_name == "i16" || struct_name == "i32" || struct_name == "i64" ||
+                                    struct_name == "uint" || struct_name == "u8" || struct_name == "u16" ||
+                                    struct_name == "u32" || struct_name == "u64" || struct_name == "float" ||
+                                    struct_name == "f32" || struct_name == "f64" || struct_name == "double" ||
+                                    struct_name == "boolean" || struct_name == "bool" || struct_name == "char");
+            
             // SAFETY: Only import specialized template methods, not regular struct methods
             // Skip runtime and standard library functions to avoid interference
-            if (struct_name.find("Runtime") != std::string::npos ||
-                struct_name.find("Manager") != std::string::npos ||
-                struct_name.find("std::") != std::string::npos ||
-                struct_name.find("_") == std::string::npos) // Only import specialized names with underscores like MyResult_int_string
+            // BUT allow primitive types to be imported for stdlib method support
+            if (!is_primitive_type && 
+                (struct_name.find("Runtime") != std::string::npos ||
+                 struct_name.find("Manager") != std::string::npos ||
+                 struct_name.find("std::") != std::string::npos ||
+                 struct_name.find("_") == std::string::npos)) // Only import specialized names with underscores like MyResult_int_string
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping non-specialized struct: {}", struct_name);
                 continue;
+            }
+            
+            if (is_primitive_type)
+            {
+                // Skip importing primitive methods during stdlib compilation 
+                // since they will be defined directly in the stdlib
+                if (_stdlib_compilation_mode)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping primitive type method import during stdlib compilation: {}", struct_name);
+                    continue;
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Importing primitive type methods for: {}", struct_name);
             }
             for (const auto &[method_name, method_type] : methods)
             {
                 // Create fully qualified name with namespace context to match lookup expectations
                 std::string fully_qualified_name;
-                if (!_namespace_context.empty())
+                if (is_primitive_type)
+                {
+                    // For primitive types, use the stdlib namespace where the actual implementations exist
+                    fully_qualified_name = "std::core::Types::" + struct_name + "::" + method_name;
+                }
+                else if (!_namespace_context.empty())
                 {
                     fully_qualified_name = _namespace_context + "::" + struct_name + "::" + method_name;
                 }
@@ -5502,8 +5532,16 @@ namespace Cryo::Codegen
         // Create function type
         llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
 
-        // Create function with scoped name
-        std::string func_name = primitive_type_name + "::" + node->name();
+        // Create function with fully qualified name for primitive methods
+        std::string func_name;
+        if (current_primitive_type && is_primitive_type(primitive_type_name))
+        {
+            func_name = "std::core::Types::" + primitive_type_name + "::" + node->name();
+        }
+        else
+        {
+            func_name = primitive_type_name + "::" + node->name();
+        }
         llvm::Function *func = llvm::Function::Create(
             func_type,
             llvm::Function::ExternalLinkage,
@@ -9798,6 +9836,61 @@ namespace Cryo::Codegen
 
         // Check for namespace alias resolution first
         resolved_function_name = function_name;
+
+        // Check for imported primitive methods first
+        if (function_name.find("::") != std::string::npos)
+        {
+            // For primitive methods, check the stdlib namespace first
+            std::string stdlib_qualified_name = "std::core::Types::" + function_name;
+            auto stdlib_func_it = _functions.find(stdlib_qualified_name);
+            if (stdlib_func_it != _functions.end())
+            {
+                llvm::Function *primitive_function = stdlib_func_it->second;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found imported primitive method: {} -> {}", stdlib_qualified_name, primitive_function->getName().str());
+
+                // Generate arguments for the primitive method call
+                std::vector<llvm::Value *> args;
+                for (const auto &arg : node->arguments())
+                {
+                    arg->accept(*this);
+                    llvm::Value *arg_value = get_current_value();
+                    if (arg_value)
+                    {
+                        args.push_back(arg_value);
+                    }
+                }
+
+                llvm::Value *call_result = _context_manager.get_builder().CreateCall(primitive_function, args);
+                set_current_value(call_result);
+                return call_result;
+            }
+
+            // Try the fully qualified name with current namespace
+            std::string full_qualified_name = _namespace_context + "::" + function_name;
+            auto primitive_func_it = _functions.find(full_qualified_name);
+            if (primitive_func_it != _functions.end())
+            {
+                llvm::Function *primitive_function = primitive_func_it->second;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found imported primitive method: {} -> {}", full_qualified_name, primitive_function->getName().str());
+
+                // Generate arguments for the primitive method call
+                std::vector<llvm::Value *> args;
+                for (const auto &arg : node->arguments())
+                {
+                    arg->accept(*this);
+                    llvm::Value *arg_value = get_current_value();
+                    if (arg_value)
+                    {
+                        args.push_back(arg_value);
+                    }
+                }
+
+                // Call the primitive method  
+                llvm::Value *call_result = _context_manager.get_builder().CreateCall(primitive_function, args);
+                set_current_value(call_result);
+                return call_result;
+            }
+        }
 
         // Check if this is a namespace-qualified call (contains "::")
         size_t scope_pos = function_name.find("::");
