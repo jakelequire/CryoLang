@@ -242,6 +242,8 @@ namespace Cryo::Codegen
                 : entry_block(entry), exit_block(exit) {}
         };
 
+
+
         /**
          * @brief Function generation context
          */
@@ -456,6 +458,7 @@ namespace Cryo::Codegen
 
         // Intrinsic call generation
         llvm::Value *generate_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name);
+        llvm::Value *generate_member_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name, llvm::Value *object_value);
 
         // Control flow generation
         void generate_if_statement(Cryo::IfStatementNode *node);
@@ -528,5 +531,5 @@ namespace Cryo::Codegen
         void report_error(const std::string &message);
         void report_error(const std::string &message, Cryo::ASTNode *node);
     };
-
+    
 } // namespace Cryo::Codegen

@@ -815,6 +815,28 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
+        // SAFETY: Add null pointer checks to prevent segfault
+        llvm::Value *str_arg = args[0];
+        if (!str_arg)
+        {
+            report_error("__strlen__ received null argument");
+            return nullptr;
+        }
+
+        // SAFETY: Check if the argument has a valid type
+        llvm::Type *arg_type = str_arg->getType();
+        if (!arg_type)
+        {
+            report_error("__strlen__ argument has null type");
+            return nullptr;
+        }
+
+        if (!arg_type->isPointerTy())
+        {
+            report_error("__strlen__ argument must be a pointer");
+            return nullptr;
+        }
+
         // Create strlen function type: size_t strlen(const char* str)
         llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
         llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
@@ -824,15 +846,18 @@ namespace Cryo::Codegen
         // Get or create strlen function
         llvm::Function *strlen_func = get_or_create_libc_function("strlen", strlen_type);
 
-        llvm::Value *str_arg = args[0];
-        if (!str_arg->getType()->isPointerTy())
+        // SAFETY: Check function creation
+        if (!strlen_func)
         {
-            report_error("__strlen__ argument must be a pointer");
+            report_error("Failed to create strlen function");
             return nullptr;
         }
 
         // Call strlen
-        return builder.CreateCall(strlen_func, {str_arg}, "strlen.result");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "__strlen__ about to call strlen with argument: {}", static_cast<void*>(str_arg));
+        llvm::Value *result = builder.CreateCall(strlen_func, {str_arg}, "strlen.result");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "__strlen__ call completed, result: {}", static_cast<void*>(result));
+        return result;
     }
 
     llvm::Value *Intrinsics::generate_strcmp(const std::vector<llvm::Value *> &args)

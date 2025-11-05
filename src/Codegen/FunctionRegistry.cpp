@@ -90,6 +90,58 @@ namespace Cryo::Codegen
     {
         FunctionMetadata metadata = get_function_metadata(function_name, resolved_namespace);
 
+        // SPECIAL HANDLING: Check if we have a symbol with direct type information
+        // This handles cases where primitive methods have direct type info but aren't FunctionType
+        Cryo::Symbol *symbol = nullptr;
+        if (!resolved_namespace.empty())
+        {
+            symbol = _symbol_table.lookup_namespaced_symbol(resolved_namespace, function_name);
+        }
+        if (!symbol)
+        {
+            symbol = _symbol_table.lookup_symbol(function_name);
+        }
+        
+        if (symbol && symbol->data_type)
+        {
+            std::string type_name = symbol->data_type->name();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry: Direct type mapping for '{}' with type '{}'", function_name, type_name);
+            
+            // Direct type mapping for primitive return types
+            if (type_name == "u64")
+            {
+                return llvm::Type::getInt64Ty(llvm_context);
+            }
+            else if (type_name == "i64")
+            {
+                return llvm::Type::getInt64Ty(llvm_context);
+            }
+            else if (type_name == "u32" || type_name == "i32" || type_name == "int")
+            {
+                return llvm::Type::getInt32Ty(llvm_context);
+            }
+            else if (type_name == "u16" || type_name == "i16")
+            {
+                return llvm::Type::getInt16Ty(llvm_context);
+            }
+            else if (type_name == "u8" || type_name == "i8")
+            {
+                return llvm::Type::getInt8Ty(llvm_context);
+            }
+            else if (type_name == "string")
+            {
+                return llvm::PointerType::get(llvm_context, 0);
+            }
+            else if (type_name == "boolean")
+            {
+                return llvm::Type::getInt1Ty(llvm_context);
+            }
+            else if (type_name == "void")
+            {
+                return llvm::Type::getVoidTy(llvm_context);
+            }
+        }
+
         // Special handling for enum constructors
         if (metadata.category == FunctionCategory::StructFunction)
         {
