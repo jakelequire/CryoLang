@@ -4957,6 +4957,23 @@ namespace Cryo::Codegen
                     std::vector<llvm::Type *> param_types;
                     bool has_variadic = false;
 
+                    // For primitive types, add the 'this' parameter as the first parameter
+                    if (is_primitive_type)
+                    {
+                        // Add 'this' parameter - for strings, it's a pointer to the string data
+                        if (struct_name == "string")
+                        {
+                            param_types.push_back(llvm::PointerType::get(_context_manager.get_context(), 0)); // ptr for string data
+                        }
+                        else
+                        {
+                            // For other primitive types, we can handle them later as needed
+                            // For now, just add a generic pointer type
+                            param_types.push_back(llvm::PointerType::get(_context_manager.get_context(), 0));
+                        }
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added 'this' parameter for primitive method: {}", fully_qualified_name);
+                    }
+
                     // Map parameter types
                     for (const auto &param_type : func_type->parameter_types())
                     {
@@ -9850,6 +9867,38 @@ namespace Cryo::Codegen
 
                 // Generate arguments for the primitive method call
                 std::vector<llvm::Value *> args;
+                
+                // For primitive method calls, add the 'this' pointer as the first argument
+                if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
+                {
+                    if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
+                    {
+                        std::string object_name = object_identifier->name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Adding 'this' parameter for primitive method call on object: {}", object_name);
+                        
+                        // Get the object value to use as 'this' parameter
+                        llvm::Value *object_value = _value_context->get_value(object_name);
+                        if (object_value)
+                        {
+                            // For string alloca, load the string pointer value
+                            if (llvm::isa<llvm::AllocaInst>(object_value))
+                            {
+                                llvm::Type *element_type = _value_context->get_alloca_type(object_name);
+                                llvm::Value *loaded_value = create_load(object_value, element_type, object_name + ".load");
+                                args.push_back(loaded_value); // Pass the string pointer as 'this'
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added loaded string pointer as 'this' for primitive method: {}", stdlib_qualified_name);
+                            }
+                            else
+                            {
+                                // For direct string values (function parameters), use directly
+                                args.push_back(object_value); 
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added direct string pointer as 'this' for primitive method: {}", stdlib_qualified_name);
+                            }
+                        }
+                    }
+                }
+                
+                // Add the regular function arguments
                 for (const auto &arg : node->arguments())
                 {
                     arg->accept(*this);
@@ -9875,6 +9924,38 @@ namespace Cryo::Codegen
 
                 // Generate arguments for the primitive method call
                 std::vector<llvm::Value *> args;
+                
+                // For primitive method calls, add the 'this' pointer as the first argument
+                if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
+                {
+                    if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
+                    {
+                        std::string object_name = object_identifier->name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Adding 'this' parameter for primitive method call on object: {}", object_name);
+                        
+                        // Get the object value to use as 'this' parameter
+                        llvm::Value *object_value = _value_context->get_value(object_name);
+                        if (object_value)
+                        {
+                            // For string alloca, load the string pointer value
+                            if (llvm::isa<llvm::AllocaInst>(object_value))
+                            {
+                                llvm::Type *element_type = _value_context->get_alloca_type(object_name);
+                                llvm::Value *loaded_value = create_load(object_value, element_type, object_name + ".load");
+                                args.push_back(loaded_value); // Pass the string pointer as 'this'
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added loaded string pointer as 'this' for primitive method: {}", full_qualified_name);
+                            }
+                            else
+                            {
+                                // For direct string values (function parameters), use directly
+                                args.push_back(object_value); 
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added direct string pointer as 'this' for primitive method: {}", full_qualified_name);
+                            }
+                        }
+                    }
+                }
+                
+                // Add the regular function arguments
                 for (const auto &arg : node->arguments())
                 {
                     arg->accept(*this);
@@ -10009,19 +10090,6 @@ namespace Cryo::Codegen
                     {
                         std::string type_name = type_it->second->to_string();
                         std::string member_name = member_access->member();
-                        
-                        // Handle string.length() -> __strlen__ intrinsic fallback
-                        if (type_name == "string" && member_name == "length")
-                        {
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using intrinsic fallback: string.length() -> __strlen__");
-                            llvm::Value *object_value = _value_context->get_value(object_name);
-                            if (object_value && llvm::isa<llvm::AllocaInst>(object_value))
-                            {
-                                llvm::Type *element_type = _value_context->get_alloca_type(object_name);
-                                object_value = create_load(object_value, element_type, object_name + ".load");
-                            }
-                            return generate_member_intrinsic_call(node, "__strlen__", object_value);
-                        }
                     }
                 }
             }
@@ -10039,33 +10107,65 @@ namespace Cryo::Codegen
         // Generate arguments
         std::vector<llvm::Value *> args;
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_function_call: Processing function: {}", function_name);
+
         // For primitive method calls (like string::length), we need to add the 'this' pointer as the first argument
         if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
         {
             if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
             {
                 std::string object_name = object_identifier->name();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing member access on object: {}", object_name);
 
                 // Check if this is a primitive type method call
                 auto type_it = _variable_types.find(object_name);
-                if (type_it != _variable_types.end() && type_it->second && is_primitive_type(type_it->second->to_string()))
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Variable type lookup for {}: {}", object_name, (type_it != _variable_types.end() ? "found" : "not found"));
+                if (type_it != _variable_types.end() && type_it->second)
                 {
-                    // This is a primitive method call - add the object as 'this' pointer
-                    llvm::Value *object_value = _value_context->get_value(object_name);
-                    if (object_value)
+                    std::string type_name = type_it->second->to_string();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type name: {}, is_primitive: {}", type_name, is_primitive_type(type_name));
+                    
+                    if (is_primitive_type(type_name))
                     {
-                        // If it's an alloca (stack variable), load the value first
-                        if (llvm::isa<llvm::AllocaInst>(object_value))
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "This is a primitive method call - function: {}", function_name);
+                        // This is a primitive method call - add the object as 'this' pointer
+                        llvm::Value *object_value = _value_context->get_value(object_name);
+                        if (object_value)
                         {
-                            llvm::Type *element_type = _value_context->get_alloca_type(object_name);
-                            llvm::Value *loaded_value = create_load(object_value, element_type, object_name + ".load");
-                            args.push_back(loaded_value); // Load the actual value for primitive methods
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added loaded 'this' value for primitive method: {}", function_name);
-                        }
-                        else
-                        {
-                            args.push_back(object_value); // Direct value (like function parameters)
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added direct 'this' value for primitive method: {}", function_name);
+                            // For string primitive methods, we need to pass the string pointer correctly
+                            if (type_name == "string")
+                            {
+                                if (llvm::isa<llvm::AllocaInst>(object_value))
+                                {
+                                    // For string alloca, load the string pointer value
+                                    llvm::Type *element_type = _value_context->get_alloca_type(object_name);
+                                    llvm::Value *loaded_value = create_load(object_value, element_type, object_name + ".load");
+                                    args.push_back(loaded_value); // This should be the actual string pointer
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added loaded string pointer as 'this' for primitive method: {}", function_name);
+                                }
+                                else
+                                {
+                                    // For direct string values (function parameters), use directly
+                                    args.push_back(object_value); 
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added direct string pointer as 'this' for primitive method: {}", function_name);
+                                }
+                            }
+                            else
+                            {
+                                // For other primitive types, handle differently if needed
+                                if (llvm::isa<llvm::AllocaInst>(object_value))
+                                {
+                                    llvm::Type *element_type = _value_context->get_alloca_type(object_name);
+                                    llvm::Value *loaded_value = create_load(object_value, element_type, object_name + ".load");
+                                    args.push_back(loaded_value);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added loaded 'this' value for primitive method: {}", function_name);
+                                }
+                                else
+                                {
+                                    args.push_back(object_value);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added direct 'this' value for primitive method: {}", function_name);
+                                }
+                            }
                         }
                     }
                 }
