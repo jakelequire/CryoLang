@@ -1644,10 +1644,15 @@ namespace Cryo
                     case NodeKind::ExternBlock:
                         node_type = "ExternBlock";
                         break;
+                    case NodeKind::ImplementationBlock:
+                        node_type = "ImplementationBlock";
+                        break;
                     default:
                         node_type = "other";
                         break;
                     }
+                    
+                    // std::cout << "[DEBUG] Found " << node_type << " in imported module " << module_name << std::endl;
 
                     // For function declarations, we need to check with qualified names
                     if (stmt->kind() == NodeKind::FunctionDeclaration)
@@ -1681,7 +1686,9 @@ namespace Cryo
                     else
                     {
                         // For non-function statements, use normal visitor
+                        // std::cout << "[DEBUG] Calling accept() on " << node_type << " from module " << module_name << std::endl;
                         stmt->accept(*this);
+                        // std::cout << "[DEBUG] Finished accept() on " << node_type << std::endl;
                     }
                 }
             }
@@ -2378,10 +2385,26 @@ namespace Cryo
             // TODO: Add proper implementation block context checking
             if (_current_struct_type)
             {
-                // 'this' should be a pointer to the current struct type, not the struct type itself
-                Type *this_ptr_type = _type_context.create_pointer_type(_current_struct_type);
-                node.set_resolved_type(this_ptr_type);
-                LOG_DEBUG(Cryo::LogComponent::AST, "Set 'this' type to: {}", this_ptr_type->to_string());
+                // For primitive types, 'this' is the primitive type itself
+                // For struct/class types, 'this' should be a pointer to the type
+                if (_current_struct_type->kind() == TypeKind::String ||
+                    _current_struct_type->kind() == TypeKind::Integer ||
+                    _current_struct_type->kind() == TypeKind::Float ||
+                    _current_struct_type->kind() == TypeKind::Boolean ||
+                    _current_struct_type->kind() == TypeKind::Char ||
+                    _current_struct_type->kind() == TypeKind::Void)
+                {
+                    // For primitive types, 'this' is the type itself
+                    node.set_resolved_type(_current_struct_type);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Set 'this' (primitive) type to: {}", _current_struct_type->to_string());
+                }
+                else
+                {
+                    // For struct/class types, 'this' should be a pointer to the current struct type
+                    Type *this_ptr_type = _type_context.create_pointer_type(_current_struct_type);
+                    node.set_resolved_type(this_ptr_type);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Set 'this' (pointer) type to: {}", this_ptr_type->to_string());
+                }
             }
             else
             {
@@ -3497,6 +3520,13 @@ namespace Cryo
             node.set_resolved_type(pointee_type);
             LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Pointer element type is '{}'", pointee_type->name());
         }
+        else if (array_type->kind() == TypeKind::String)
+        {
+            // String type - can be indexed to get individual characters
+            Type *char_type = _type_context.get_char_type();
+            node.set_resolved_type(char_type);
+            LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: String element type is 'char'");
+        }
         else
         {
             // Invalid type for array access
@@ -3709,6 +3739,47 @@ namespace Cryo
 
             // Field not found, continue to method lookup using base name
             // Don't return here, fall through to method lookup with the correct base name
+        }
+
+        // Handle primitive types by looking up methods in _struct_methods
+        if (effective_type->kind() == TypeKind::String ||
+            effective_type->kind() == TypeKind::Integer ||
+            effective_type->kind() == TypeKind::Float ||
+            effective_type->kind() == TypeKind::Boolean ||
+            effective_type->kind() == TypeKind::Char)
+        {
+            std::string primitive_type_name = effective_type->name();
+            LOG_DEBUG(Cryo::LogComponent::AST, "=== PRIMITIVE TYPE DEBUG ===");
+            LOG_DEBUG(Cryo::LogComponent::AST, "Looking for method '{}' on primitive type '{}'", member_name, primitive_type_name);
+            
+            auto it = _struct_methods.find(primitive_type_name);
+            if (it != _struct_methods.end())
+            {
+                auto method_it = it->second.find(member_name);
+                if (method_it != it->second.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found primitive method '{}' for type '{}', return type '{}'",
+                              member_name, primitive_type_name, method_it->second->name());
+                    node.set_resolved_type(method_it->second);
+                    return;
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' not found in primitive type '{}', {} methods available",
+                              member_name, primitive_type_name, it->second.size());
+                }
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "No methods registered for primitive type '{}'", primitive_type_name);
+            }
+            
+            // Fall through to error if method not found
+            std::string type_name = effective_type ? effective_type->to_string() : "unknown";
+            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                         "No field '" + member_name + "' on type '" + type_name + "'", &node);
+            node.set_resolved_type(_type_context.get_unknown_type());
+            return;
         }
 
         // For non-struct/class/enum/parameterized types, reject member access
@@ -4207,16 +4278,6 @@ namespace Cryo
         // Handle built-in type methods (string, primitive types, etc.)
         if (effective_type->is_primitive())
         {
-            // Check for string methods
-            if (effective_type->name() == "string")
-            {
-                if (member_name == "length" || member_name == "size")
-                {
-                    node.set_resolved_type(_type_context.get_u64_type());
-                    return;
-                }
-            }
-
             // Allow method access on enum types even though they're considered primitive
             if (effective_type->kind() == TypeKind::Enum)
             {
@@ -4225,8 +4286,52 @@ namespace Cryo
             }
             else
             {
-                // For other primitive types, we can add support for methods as needed
-                // For now, reject member access on non-enum primitive types
+                // Check for primitive type methods in the struct methods registry
+                // This allows stdlib-defined primitive methods to be properly resolved
+                std::string primitive_type_name = effective_type->name();
+                
+                LOG_DEBUG(Cryo::LogComponent::AST, "Looking for primitive method '{}' on type '{}'", member_name, primitive_type_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Available struct types in _struct_methods: {}", _struct_methods.size());
+                for (const auto& entry : _struct_methods) {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "  - Type '{}' has {} methods", entry.first, entry.second.size());
+                }
+                
+                auto primitive_methods_it = _struct_methods.find(primitive_type_name);
+                
+                if (primitive_methods_it != _struct_methods.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found type '{}' in _struct_methods with {} methods", primitive_type_name, primitive_methods_it->second.size());
+                    auto method_it = primitive_methods_it->second.find(member_name);
+                    if (method_it != primitive_methods_it->second.end())
+                    {
+                        // Found the method in the primitive methods registry
+                        Type *method_type = method_it->second;
+                        if (method_type && method_type->kind() == TypeKind::Function)
+                        {
+                            FunctionType *func_type = static_cast<FunctionType *>(method_type);
+                            if (func_type->return_type())
+                            {
+                                node.set_resolved_type(func_type->return_type().get());
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved primitive method '{}' on type '{}' to return type '{}'",
+                                         member_name, primitive_type_name, func_type->return_type()->to_string());
+                                return;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' not found in type '{}', available methods:", member_name, primitive_type_name);
+                        for (const auto& method_entry : primitive_methods_it->second) {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "  - {}", method_entry.first);
+                        }
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Type '{}' not found in _struct_methods", primitive_type_name);
+                }
+                
+                // No method found in registry - reject member access on primitive types
                 std::string type_name = effective_type ? effective_type->to_string() : "unknown";
                 report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
                              "No field '" + member_name + "' on type '" + type_name + "'", &node);
@@ -5109,6 +5214,9 @@ namespace Cryo
         Type *target_type = nullptr;
         bool is_primitive_type = false;
 
+        // std::cout << "[DEBUG] ImplementationBlockNode::visit() - Processing implementation for type: " << target_type_name << std::endl;
+        // std::cout << "[DEBUG] Number of methods in this implementation: " << node.method_implementations().size() << std::endl;
+
         if (!target_type_name.empty())
         {
             // Handle generic types like "Option<T>" by extracting the base type name
@@ -5168,6 +5276,8 @@ namespace Cryo
         {
             if (method)
             {
+                // std::cout << "[DEBUG] Checking method: " << method->name() << " for type " << target_type_name << std::endl;
+                
                 // Skip method validation for stdlib files - stdlib implementations
                 // are allowed to extend functionality without requiring explicit declarations
                 bool is_stdlib_file = (_stdlib_compilation_mode ||
@@ -5176,9 +5286,22 @@ namespace Cryo
                                        _source_file.find("\\stdlib\\") != std::string::npos ||
                                        _source_file.find("core/") != std::string::npos ||
                                        _source_file.find("/core/") != std::string::npos ||
-                                       _source_file.find("\\core\\") != std::string::npos);
+                                       _source_file.find("\\core\\") != std::string::npos ||
+                                       _source_file.find("std::core::Types") != std::string::npos ||
+                                       _source_file.find("std::Intrinsics") != std::string::npos);
 
-                if (!is_stdlib_file)
+                // Also treat primitive types as stdlib types for validation purposes
+                bool is_primitive_target = (target_type_name == "string" || 
+                                          target_type_name == "i32" || 
+                                          target_type_name == "u32" || 
+                                          target_type_name == "i64" || 
+                                          target_type_name == "u64" || 
+                                          target_type_name == "f32" || 
+                                          target_type_name == "f64" || 
+                                          target_type_name == "bool" || 
+                                          target_type_name == "char");
+
+                if (!is_stdlib_file && !is_primitive_target)
                 {
                     // Validate that the method was declared in the original struct/class
                     std::string method_name = method->name();
@@ -5192,7 +5315,10 @@ namespace Cryo
                     }
                 }
 
+                // std::cout << "[DEBUG] Processing method: " << method->name() << " for type " << target_type_name << std::endl;
+                // std::cout << "[DEBUG] About to call accept() on method: " << method->name() << std::endl;
                 method->accept(*this);
+                // std::cout << "[DEBUG] Finished processing method: " << method->name() << " for type " << target_type_name << std::endl;
             }
         }
 
@@ -5322,6 +5448,7 @@ namespace Cryo
     void TypeChecker::visit(StructMethodNode &node)
     {
         std::string method_name = node.name();
+        LOG_DEBUG(Cryo::LogComponent::AST, "StructMethodNode::visit() called for method: '{}' in struct: '{}'", method_name, _current_struct_name);
 
         // Check if this is a constructor (method name matches the current struct/class name)
         bool is_constructor = !_current_struct_name.empty() && method_name == _current_struct_name;
@@ -5329,6 +5456,35 @@ namespace Cryo
         // Check for redefinition within the same struct/class (but allow constructors)
         if (!is_constructor && _symbol_table->lookup_symbol(method_name))
         {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found existing symbol for method: '{}', checking if it's already registered...", method_name);
+            
+            // Allow method registration for primitive types from stdlib without redefinition errors
+            bool is_primitive_method = (_current_struct_name == "string" || 
+                                      _current_struct_name == "i32" || 
+                                      _current_struct_name == "u32" || 
+                                      _current_struct_name == "i64" || 
+                                      _current_struct_name == "u64" || 
+                                      _current_struct_name == "f32" || 
+                                      _current_struct_name == "f64" || 
+                                      _current_struct_name == "bool" || 
+                                      _current_struct_name == "char");
+            
+            bool is_stdlib_context = (_stdlib_compilation_mode ||
+                                    _source_file.find("stdlib") != std::string::npos ||
+                                    _source_file.find("/stdlib/") != std::string::npos ||
+                                    _source_file.find("\\stdlib\\") != std::string::npos ||
+                                    _source_file.find("core/") != std::string::npos ||
+                                    _source_file.find("/core/") != std::string::npos ||
+                                    _source_file.find("\\core\\") != std::string::npos ||
+                                    _source_file.find("std::core::Types") != std::string::npos ||
+                                    _source_file.find("std::Intrinsics") != std::string::npos);
+            
+            if (is_primitive_method && is_stdlib_context)
+            {
+                // Skip redefinition check for primitive methods from stdlib
+            }
+            else
+            {
             // Check if this method was already registered during signature registration
             bool is_method_already_registered = false;
             LOG_DEBUG(Cryo::LogComponent::AST, "Found existing symbol '{}', current_struct_name='{}', checking method registries...",
@@ -5359,6 +5515,7 @@ namespace Cryo
             {
                 _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, node.location());
                 return;
+            }
             }
         }
 

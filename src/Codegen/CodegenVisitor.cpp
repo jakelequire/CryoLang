@@ -3633,6 +3633,41 @@ namespace Cryo::Codegen
             return;
         }
 
+        // Check if this is string indexing (s[i] to get character)
+        if (node.array()->has_resolved_type() && 
+            node.array()->get_resolved_type()->kind() == TypeKind::String)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "String indexing detected - generating character access");
+            
+            // Convert index to i32 if needed
+            if (index_val->getType() != llvm::Type::getInt32Ty(context))
+            {
+                if (index_val->getType()->isIntegerTy())
+                {
+                    index_val = builder.CreateIntCast(index_val, llvm::Type::getInt32Ty(context), true, "index.cast");
+                }
+            }
+            
+            // For string indexing, we need to use GEP to get a pointer to the character
+            // Strings are stored as i8* in LLVM, so we create a GEP with the index
+            llvm::Value *char_ptr = builder.CreateGEP(
+                llvm::Type::getInt8Ty(context),
+                array_ptr,
+                {index_val},
+                "string.char.ptr");
+            
+            // Load the character value
+            llvm::Value *char_val = builder.CreateLoad(
+                llvm::Type::getInt8Ty(context),
+                char_ptr,
+                "string.char.load");
+            
+            register_value(&node, char_val);
+            set_current_value(char_val);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated string character access successfully");
+            return;
+        }
+
         // Check if this is a nested array access (chained access like matrix[1][0])
         bool is_nested_access = dynamic_cast<Cryo::ArrayAccessNode *>(node.array()) != nullptr;
 
@@ -5544,7 +5579,40 @@ namespace Cryo::Codegen
         // Generate function body
         if (node->body())
         {
-            node->body()->accept(*this);
+            try
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to generate primitive method body for: {}::{}", primitive_type_name, node->name());
+                
+                // SAFETY: Add comprehensive checks before generating body
+                auto &builder = _context_manager.get_builder();
+                auto &context = _context_manager.get_context();
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Builder valid: {}", static_cast<void*>(&builder));
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Context valid: {}", static_cast<void*>(&context));
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current function valid: {}", static_cast<void*>(_current_function.get()));
+                
+                if (_current_function && _current_function->function)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "LLVM Function valid: {}", static_cast<void*>(_current_function->function));
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function name: {}", _current_function->function->getName().str());
+                }
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to call node->body()->accept(*this)");
+                node->body()->accept(*this);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully generated primitive method body for: {}::{}", primitive_type_name, node->name());
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception generating primitive method body: {}", e.what());
+                report_error("Failed to generate primitive method body: " + std::string(e.what()));
+                return;
+            }
+            catch (...)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown exception generating primitive method body");
+                report_error("Failed to generate primitive method body: unknown exception");
+                return;
+            }
         }
 
         // Ensure proper termination
@@ -8842,9 +8910,10 @@ namespace Cryo::Codegen
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Stripped pointer asterisk: '{}' -> '{}'", type_name, base_type_name);
                         }
 
-                        // Look up the method function - include namespace context to match how methods are stored
+                        // Look up the method function - for primitive types, don't use namespace context
+                        // since primitive methods are defined globally in stdlib
                         std::string method_name;
-                        if (!_namespace_context.empty())
+                        if (!_namespace_context.empty() && !is_primitive_type(base_type_name))
                         {
                             method_name = _namespace_context + "::" + base_type_name + "::" + member_access->member();
                         }
@@ -8947,13 +9016,14 @@ namespace Cryo::Codegen
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method not found: {} for type: {}", method_name, base_type_name);
 
-                            // For primitive types, use the fully qualified method name instead of just the member name
-                            // This allows linking with precompiled primitive methods in libcryo.a
+                            // For primitive types, use qualified method name and handle intrinsic fallback
                             if (is_primitive_type(base_type_name))
                             {
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using qualified name for primitive method: {}", method_name);
                                 function_name = method_name;          // Use string::length instead of just length
                                 resolved_function_name = method_name; // Also update the resolved name
+                                
+                                // Note: Intrinsic fallback will be handled later if the custom method is not found
                             }
                             else
                             {
@@ -9835,6 +9905,34 @@ namespace Cryo::Codegen
         llvm::Function *function = module->getFunction(lookup_name);
         if (!function)
         {
+            // Before trying to create a runtime declaration, check for primitive intrinsic fallbacks
+            if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
+            {
+                if (auto *object_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
+                {
+                    std::string object_name = object_identifier->name();
+                    auto type_it = _variable_types.find(object_name);
+                    if (type_it != _variable_types.end() && type_it->second)
+                    {
+                        std::string type_name = type_it->second->to_string();
+                        std::string member_name = member_access->member();
+                        
+                        // Handle string.length() -> __strlen__ intrinsic fallback
+                        if (type_name == "string" && member_name == "length")
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using intrinsic fallback: string.length() -> __strlen__");
+                            llvm::Value *object_value = _value_context->get_value(object_name);
+                            if (object_value && llvm::isa<llvm::AllocaInst>(object_value))
+                            {
+                                llvm::Type *element_type = _value_context->get_alloca_type(object_name);
+                                object_value = create_load(object_value, element_type, object_name + ".load");
+                            }
+                            return generate_member_intrinsic_call(node, "__strlen__", object_value);
+                        }
+                    }
+                }
+            }
+            
             // Function not declared yet, create a declaration
             function = create_runtime_function_declaration(lookup_name, node);
             if (!function)
@@ -12615,6 +12713,51 @@ namespace Cryo::Codegen
             if (!arg_value)
             {
                 report_error("Failed to generate argument for intrinsic: " + intrinsic_name);
+                return nullptr;
+            }
+            args.push_back(arg_value);
+        }
+
+        // Delegate to the Intrinsics module
+        llvm::Value *result = _intrinsics->generate_intrinsic_call(node, intrinsic_name, args);
+
+        if (_intrinsics->has_errors())
+        {
+            report_error("Intrinsic generation failed: " + _intrinsics->get_last_error());
+            return nullptr;
+        }
+
+        return result;
+    }
+
+    llvm::Value *CodegenVisitor::generate_member_intrinsic_call(Cryo::CallExpressionNode *node, const std::string &intrinsic_name, llvm::Value *object_value)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Delegating member intrinsic call to Intrinsics module: {} with object",
+                  intrinsic_name);
+
+        // Generate arguments: object first, then any additional arguments
+        std::vector<llvm::Value *> args;
+        
+        // Add the object as the first argument
+        if (object_value)
+        {
+            args.push_back(object_value);
+        }
+        else
+        {
+            report_error("Object value is null for member intrinsic: " + intrinsic_name);
+            return nullptr;
+        }
+        
+        // Add any additional arguments from the call expression
+        for (const auto &arg : node->arguments())
+        {
+            arg->accept(*this);
+            llvm::Value *arg_value = get_current_value();
+            if (!arg_value)
+            {
+                report_error("Failed to generate argument for member intrinsic: " + intrinsic_name);
                 return nullptr;
             }
             args.push_back(arg_value);
