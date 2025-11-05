@@ -5655,11 +5655,21 @@ namespace Cryo
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
                         _private_struct_methods[_current_struct_name][method_name] = func_type;
+                        
+                        // Also declare the method in the main symbol table for CodeGen lookup
+                        std::string full_method_name = _current_struct_name + "::" + method_name;
+                        declare_function(full_method_name, func_type, node.location(), nullptr);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Declared private method '{}' in symbol table as '{}'", method_name, full_method_name);
                     }
                     else
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method '{}' for struct '{}'", method_name, _current_struct_name);
                         _struct_methods[_current_struct_name][method_name] = func_type;
+                        
+                        // Also declare the method in the main symbol table for CodeGen lookup
+                        std::string full_method_name = _current_struct_name + "::" + method_name;
+                        declare_function(full_method_name, func_type, node.location(), nullptr);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Declared method '{}' in symbol table as '{}'", method_name, full_method_name);
                     }
                 }
             }
@@ -6884,6 +6894,11 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
             _private_struct_methods[_current_struct_name][method_name] = func_type;
+            
+            // Also declare the method in the main symbol table for CodeGen lookup
+            std::string full_method_name = _current_struct_name + "::" + method_name;
+            declare_function(full_method_name, func_type, node.location(), nullptr);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Declared private method '{}' in symbol table as '{}'", method_name, full_method_name);
         }
         else
         {
@@ -6902,6 +6917,11 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
             _struct_methods[_current_struct_name][method_name] = func_type;
+            
+            // Also declare the method in the main symbol table for CodeGen lookup
+            std::string full_method_name = _current_struct_name + "::" + method_name;
+            declare_function(full_method_name, func_type, node.location(), nullptr);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Declared method '{}' in symbol table as '{}'", method_name, full_method_name);
         }
     }
 
