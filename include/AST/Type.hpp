@@ -390,6 +390,7 @@ namespace Cryo
         CharType() : Type(TypeKind::Char, "char") {}
 
         bool is_primitive() const override { return true; }
+        bool is_numeric() const override { return true; }
         bool is_integral() const override { return true; }
         bool is_unsigned() const override { return true; }
         size_t size_bytes() const override { return 1; }

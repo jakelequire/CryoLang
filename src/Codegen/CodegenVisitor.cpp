@@ -5393,6 +5393,11 @@ namespace Cryo::Codegen
 
                         // Register the parameter in value context with proper type information
                         _value_context->set_value(param_name, alloca, alloca, param_type);
+                        
+                        // Store the Cryo type for member access resolution
+                        _variable_types[param_name] = cryo_param_type;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Stored function parameter '{}' with type: {}",
+                                  param_name, (cryo_param_type ? cryo_param_type->to_string() : "null"));
                     }
                     else
                     {
@@ -5683,6 +5688,13 @@ namespace Cryo::Codegen
                 builder.CreateRet(llvm::Constant::getNullValue(return_type));
             }
         }
+
+        // Register the function in the functions map
+        _functions[func_name] = func;
+        
+        // Also register with simpler names for lookup flexibility
+        std::string simple_name = primitive_type_name + "::" + node->name();
+        _functions[simple_name] = func;
 
         // Clean up
         _current_function.reset();
@@ -13035,7 +13047,7 @@ namespace Cryo::Codegen
     {
         static const std::unordered_set<std::string> integer_types = {
             "i8", "i16", "i32", "i64", "int",
-            "u8", "u16", "u32", "u64", "uint"};
+            "u8", "u16", "u32", "u64", "uint", "char"};
 
         return integer_types.find(function_name) != integer_types.end();
     }
