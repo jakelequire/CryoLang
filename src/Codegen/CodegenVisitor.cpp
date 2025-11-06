@@ -7163,16 +7163,8 @@ namespace Cryo::Codegen
                     }
                     result = builder.CreateFAdd(left_val, right_val, "fadd.tmp");
                 }
-                // Handle pointer arithmetic (pointer + integer)
-                else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy())
-                {
-                    // This is pointer + integer arithmetic - use GEP
-                    // For opaque pointers in newer LLVM, we need to know the pointed-to type
-                    // We'll assume int* for now, but this should be improved
-                    llvm::Type *element_type = llvm::Type::getInt32Ty(builder.getContext());
-                    result = builder.CreateGEP(element_type, left_val, right_val, "ptr_add");
-                }
-                // Handle string concatenation (string + string, string + char, char + string)
+                // Handle string concatenation BEFORE generic pointer arithmetic
+                // (string + string, string + char, char + string)
                 else if (left_val->getType()->isPointerTy() && right_val->getType()->isPointerTy())
                 {
                     // This is string + string concatenation
@@ -7189,6 +7181,15 @@ namespace Cryo::Codegen
                 {
                     // This is char + string concatenation
                     result = generate_char_string_concatenation(left_val, right_val);
+                }
+                // Handle generic pointer arithmetic (pointer + integer) as fallback
+                else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy())
+                {
+                    // This is pointer + integer arithmetic - use GEP
+                    // For string operations, use i8 (char) elements
+                    // For other pointer types, we'd need better type tracking
+                    llvm::Type *element_type = llvm::Type::getInt8Ty(builder.getContext());
+                    result = builder.CreateGEP(element_type, left_val, right_val, "ptr_add");
                 }
                 break;
 
@@ -7237,7 +7238,8 @@ namespace Cryo::Codegen
                 {
                     // This is pointer - integer arithmetic - use GEP with negative offset
                     llvm::Value *neg_offset = builder.CreateNeg(right_val, "neg_offset");
-                    llvm::Type *element_type = llvm::Type::getInt32Ty(builder.getContext());
+                    // For string operations, use i8 (char) elements  
+                    llvm::Type *element_type = llvm::Type::getInt8Ty(builder.getContext());
                     result = builder.CreateGEP(element_type, left_val, neg_offset, "ptr_sub");
                 }
                 else if (left_val->getType()->isPointerTy() && right_val->getType()->isPointerTy())
