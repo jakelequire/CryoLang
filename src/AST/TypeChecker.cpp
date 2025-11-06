@@ -2614,14 +2614,25 @@ namespace Cryo
                             else if (left_type == right_type &&
                                      (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float" ||
                                       left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" ||
-                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64"))
+                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64" ||
+                                      left_type->name() == "char"))
                             {
                                 result_type = left_type;
+                            }
+                            // Handle char arithmetic with int (char + int = int, char - int = int)
+                            else if (left_type->name() == "char" && right_type->name() == "int")
+                            {
+                                result_type = right_type; // char + int = int
+                            }
+                            else if (left_type->name() == "int" && right_type->name() == "char")
+                            {
+                                result_type = left_type; // int + char = int
                             }
                             // Handle implicit integer literal promotion (int to specific integer types)
                             else if (left_type->is_integral() && right_type->name() == "int" &&
                                      (left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" ||
-                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64"))
+                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64" ||
+                                      left_type->name() == "char"))
                             {
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", 
                                           right_type->to_string(), left_type->to_string());
@@ -2630,7 +2641,8 @@ namespace Cryo
                             // Handle implicit integer literal promotion (specific integer type + int literal)
                             else if (left_type->name() == "int" && right_type->is_integral() &&
                                      (right_type->name() == "i8" || right_type->name() == "i16" || right_type->name() == "i32" || right_type->name() == "i64" ||
-                                      right_type->name() == "u8" || right_type->name() == "u16" || right_type->name() == "u32" || right_type->name() == "u64"))
+                                      right_type->name() == "u8" || right_type->name() == "u16" || right_type->name() == "u32" || right_type->name() == "u64" ||
+                                      right_type->name() == "char"))
                             {
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", 
                                           left_type->to_string(), right_type->to_string());
@@ -7061,7 +7073,7 @@ namespace Cryo
     {
         static const std::unordered_set<std::string> integer_types = {
             "i8", "i16", "i32", "i64", "int",
-            "u8", "u16", "u32", "u64", "uint"};
+            "u8", "u16", "u32", "u64", "uint", "char"};
 
         return integer_types.find(type_name) != integer_types.end();
     }
