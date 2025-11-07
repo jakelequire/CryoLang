@@ -3709,6 +3709,11 @@ namespace Cryo::Codegen
         {
             array_var_name = identifier->name();
         }
+        else if (auto *member_access = dynamic_cast<Cryo::MemberAccessNode *>(node.array()))
+        {
+            // For member access like this.tape[index], use the member name
+            array_var_name = member_access->member();
+        }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array access: var_name='{}', is_nested={}",
                   array_var_name, (is_nested_access ? "true" : "false"));
