@@ -14,6 +14,16 @@
 #include <sstream>
 #include <algorithm>
 
+// Helper function to normalize type names for constructor signature matching
+static std::string normalize_type_for_signature(const std::string& type_name) {
+    if (type_name == "int") {
+        return "i32";
+    } else if (type_name == "uint") {
+        return "u32";
+    }
+    return type_name;
+}
+
 namespace Cryo::Codegen
 {
     //===================================================================
@@ -295,7 +305,8 @@ namespace Cryo::Codegen
                     auto param = node.parameters()[i].get();
                     if (param && param->get_resolved_type())
                     {
-                        param_signature += param->get_resolved_type()->to_string();
+                        std::string param_type_str = param->get_resolved_type()->to_string();
+                        param_signature += normalize_type_for_signature(param_type_str);
                     }
                     else
                     {
@@ -1063,7 +1074,8 @@ namespace Cryo::Codegen
                         auto param = method->parameters()[i].get();
                         if (param && param->get_resolved_type())
                         {
-                            param_signature += param->get_resolved_type()->to_string();
+                            std::string param_type_str = param->get_resolved_type()->to_string();
+                            param_signature += normalize_type_for_signature(param_type_str);
                         }
                         else
                         {
@@ -1369,9 +1381,10 @@ namespace Cryo::Codegen
                         if (param && param->get_resolved_type())
                         {
                             std::string param_type_str = param->get_resolved_type()->to_string();
-                            param_signature += param_type_str;
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: {})",
-                                      i, param->name(), param_type_str);
+                            std::string normalized_type = normalize_type_for_signature(param_type_str);
+                            param_signature += normalized_type;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: {} -> normalized: {})",
+                                      i, param->name(), param_type_str, normalized_type);
                         }
                         else
                         {
@@ -1416,14 +1429,16 @@ namespace Cryo::Codegen
                     }
                 }
 
-                // Map return type
+                // Map return type - constructors are always void
                 llvm::Type *return_type = llvm::Type::getVoidTy(context);
                 Cryo::Type *cryo_return_type = method->get_resolved_return_type();
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method {} cryo_return_type={} kind={}",
                           method_name,
                           (cryo_return_type ? "non-null" : "null"),
                           (cryo_return_type ? std::to_string((int)cryo_return_type->kind()) : "N/A"));
-                if (cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
+                
+                // Constructors must always return void regardless of their resolved type
+                if (!is_constructor && cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
                 {
                     llvm::Type *mapped_return_type = _type_mapper->map_type(cryo_return_type);
                     if (mapped_return_type)
@@ -1494,9 +1509,10 @@ namespace Cryo::Codegen
                         if (param && param->get_resolved_type())
                         {
                             std::string param_type_str = param->get_resolved_type()->to_string();
-                            param_signature += param_type_str;
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Body Parameter {}: {} (type: {})",
-                                      i, param->name(), param_type_str);
+                            std::string normalized_type = normalize_type_for_signature(param_type_str);
+                            param_signature += normalized_type;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Body Parameter {}: {} (type: {} -> normalized: {})",
+                                      i, param->name(), param_type_str, normalized_type);
                         }
                         else
                         {
@@ -1623,10 +1639,12 @@ namespace Cryo::Codegen
                     llvm::Type *return_type = func->getReturnType();
 
                     // Add return if not already present
-                    if (!entry_block->getTerminator())
+                    llvm::BasicBlock *current_block = _context_manager.get_builder().GetInsertBlock();
+                    if (current_block && !current_block->getTerminator())
                     {
-                        if (return_type->isVoidTy())
+                        if (return_type->isVoidTy() || is_constructor)
                         {
+                            // Constructors and void functions always return void
                             _context_manager.get_builder().CreateRetVoid();
                         }
                         else
@@ -2117,7 +2135,8 @@ namespace Cryo::Codegen
                     auto param = method->parameters()[i].get();
                     if (param && param->get_resolved_type())
                     {
-                        param_signature += param->get_resolved_type()->to_string();
+                        std::string param_type_str = param->get_resolved_type()->to_string();
+                        param_signature += normalize_type_for_signature(param_type_str);
                     }
                     else
                     {
@@ -3206,7 +3225,17 @@ namespace Cryo::Codegen
                 auto arg = node.arguments()[i].get();
                 if (arg && arg->get_resolved_type())
                 {
-                    constructor_signature_name += arg->get_resolved_type()->to_string();
+                    std::string arg_type_name = arg->get_resolved_type()->to_string();
+                    // Normalize common type aliases for signature matching
+                    if (arg_type_name == "int")
+                    {
+                        arg_type_name = "i32";
+                    }
+                    else if (arg_type_name == "uint")
+                    {
+                        arg_type_name = "u32";
+                    }
+                    constructor_signature_name += arg_type_name;
                 }
                 else
                 {
@@ -3920,8 +3949,20 @@ namespace Cryo::Codegen
         // Determine the element type for the GEP instruction
         llvm::Type *element_type = nullptr;
 
+        // Strategy 0: Use resolved type information from AST if available
+        if (node.has_resolved_type())
+        {
+            Cryo::Type *resolved_type = node.get_resolved_type();
+            if (resolved_type)
+            {
+                element_type = _type_mapper->map_type(resolved_type);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array access element type from resolved type: {} -> LLVM type: {}",
+                          resolved_type->to_string(), (element_type ? "success" : "failed"));
+            }
+        }
+
         // Strategy 1: For non-nested access, look up element type from ValueContext
-        if (!is_nested_access && !array_var_name.empty())
+        if (!element_type && !is_nested_access && !array_var_name.empty())
         {
             llvm::Type *stored_element_type = _value_context->get_alloca_type(array_var_name);
             if (stored_element_type)
@@ -11295,8 +11336,11 @@ namespace Cryo::Codegen
             node->body()->accept(*this);
         }
 
-        // After body, branch to increment
-        builder.CreateBr(loopIncrement);
+        // After body, branch to increment (only if current block doesn't have terminator)
+        if (!builder.GetInsertBlock()->getTerminator())
+        {
+            builder.CreateBr(loopIncrement);
+        }
 
         // Generate loop increment
         builder.SetInsertPoint(loopIncrement);
@@ -11313,6 +11357,9 @@ namespace Cryo::Codegen
 
         // Restore previous breakable context
         _breakable_stack.pop();
+
+        // Register the for statement (it doesn't produce a value)
+        register_value(node, nullptr);
     }
 
     void CodegenVisitor::generate_switch_statement(Cryo::SwitchStatementNode *node)
