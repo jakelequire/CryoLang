@@ -3542,7 +3542,8 @@ namespace Cryo
         else
         {
             // Invalid type for array access
-            std::string error_msg = "Cannot index into type '" + array_type->name() + "'";
+            
+            std::string error_msg = "Cannot index into type '" + array_type->name() + "' Kind: " + TypeKindToString(array_type->kind());
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(), error_msg, &node);
             node.set_resolved_type(_type_context.get_unknown_type());
         }
