@@ -5,8 +5,10 @@ import IO from <io/stdio>;
 // Turing Machine States
 enum TuringState {
     START,
-    SCAN_RIGHT,
-    SCAN_LEFT,
+    SCAN_RIGHT_FOR_ONE,    // Looking for a 1 to match with marked 0
+    SCAN_RIGHT_FOR_ZERO,   // Looking for a 0 to match with marked 1
+    SCAN_LEFT_RETURN,      // Returning to start after marking a pair
+    CHECK_COMPLETION,      // Check if all symbols are marked
     ACCEPT,
     REJECT
 }
@@ -114,7 +116,7 @@ public:
     ~TuringMachine() default;
 
     run() -> boolean {
-        const max_steps: i32 = 1000;  // Prevent infinite loops
+        const max_steps: i32 = 50;  // Prevent infinite loops
         
         while (this.steps < max_steps) {
             this.steps = this.steps + 1;
@@ -147,10 +149,14 @@ private:
         
         if (this.state == TuringState::START) {
             this.handle_start_state(current_symbol);
-        } else if (this.state == TuringState::SCAN_RIGHT) {
-            this.handle_scan_right_state(current_symbol);
-        } else if (this.state == TuringState::SCAN_LEFT) {
-            this.handle_scan_left_state(current_symbol);
+        } else if (this.state == TuringState::SCAN_RIGHT_FOR_ONE) {
+            this.handle_scan_right_for_one(current_symbol);
+        } else if (this.state == TuringState::SCAN_RIGHT_FOR_ZERO) {
+            this.handle_scan_right_for_zero(current_symbol);
+        } else if (this.state == TuringState::SCAN_LEFT_RETURN) {
+            this.handle_scan_left_return(current_symbol);
+        } else if (this.state == TuringState::CHECK_COMPLETION) {
+            this.handle_check_completion(current_symbol);
         }
         return;
     }
@@ -160,93 +166,97 @@ private:
             // Mark the 0 and look for a 1 to match
             this.tape.write(Symbol::MARKED_ZERO);
             this.tape.move_right();
-            this.state = TuringState::SCAN_RIGHT;
+            this.state = TuringState::SCAN_RIGHT_FOR_ONE;
         } else if (symbol == Symbol::ONE) {
             // Mark the 1 and look for a 0 to match
             this.tape.write(Symbol::MARKED_ONE);
             this.tape.move_right();
-            this.state = TuringState::SCAN_RIGHT;
+            this.state = TuringState::SCAN_RIGHT_FOR_ZERO;
         } else if (symbol == Symbol::BLANK) {
-            // Empty string - equal 0s and 1s (both zero)
-            this.state = TuringState::ACCEPT;
+            // No more unmarked symbols - check if all are paired
+            this.tape.head_position = 0; // Reset to beginning
+            this.state = TuringState::CHECK_COMPLETION;
         } else {
-            this.state = TuringState::REJECT;
+            // Found marked symbol at start, move right to find unmarked
+            this.tape.move_right();
         }
         return;
     }
 
-    handle_scan_right_state(symbol: Symbol) -> void {
-        if (symbol == Symbol::ZERO || symbol == Symbol::ONE) {
-            // Keep scanning right
+    handle_scan_right_for_one(symbol: Symbol) -> void {
+        if (symbol == Symbol::ONE) {
+            // Found matching 1, mark it and return to start
+            this.tape.write(Symbol::MARKED_ONE);
+            this.state = TuringState::SCAN_LEFT_RETURN;
+        } else if (symbol == Symbol::ZERO) {
+            // Skip over other 0s
             this.tape.move_right();
         } else if (symbol == Symbol::BLANK) {
-            // Reached end, go back to start
-            this.tape.move_left();
-            this.state = TuringState::SCAN_LEFT;
+            // No matching 1 found - reject
+            this.state = TuringState::REJECT;
         } else {
-            // Found a match, mark it and go back
-            if (symbol == Symbol::ZERO) {
-                this.tape.write(Symbol::MARKED_ZERO);
-            } else if (symbol == Symbol::ONE) {
-                this.tape.write(Symbol::MARKED_ONE);
-            }
-            this.tape.move_left();
-            this.state = TuringState::SCAN_LEFT;
+            // Skip over marked symbols
+            this.tape.move_right();
         }
         return;
     }
 
-    handle_scan_left_state(symbol: Symbol) -> void {
+    handle_scan_right_for_zero(symbol: Symbol) -> void {
+        if (symbol == Symbol::ZERO) {
+            // Found matching 0, mark it and return to start
+            this.tape.write(Symbol::MARKED_ZERO);
+            this.state = TuringState::SCAN_LEFT_RETURN;
+        } else if (symbol == Symbol::ONE) {
+            // Skip over other 1s
+            this.tape.move_right();
+        } else if (symbol == Symbol::BLANK) {
+            // No matching 0 found - reject
+            this.state = TuringState::REJECT;
+        } else {
+            // Skip over marked symbols
+            this.tape.move_right();
+        }
+        return;
+    }
+
+    handle_scan_left_return(symbol: Symbol) -> void {
         if (symbol == Symbol::MARKED_ZERO || symbol == Symbol::MARKED_ONE) {
-            // Keep scanning left past marked symbols
+            // Keep going left over marked symbols
             this.tape.move_left();
-        } else if (symbol == Symbol::ZERO || symbol == Symbol::ONE) {
-            // Found start of unmarked section
-            this.state = TuringState::START;
         } else {
-            // Reached beginning - check if all symbols are marked
-            this.tape.move_right();
-            this.check_completion();
+            // Found unmarked symbol or reached start, go back to START state
+            this.state = TuringState::START;
         }
         return;
     }
 
-    check_completion() -> void {
-        // Scan the entire tape to see if all symbols are marked
-        mut all_marked: boolean = true;
-        const original_position: i32 = this.tape.head_position;
-        
-        this.tape.head_position = 0;
-        
-        while (this.tape.head_position < this.tape.tape_size) {
-            const current: Symbol = this.tape.read();
-            if (current == Symbol::ZERO || current == Symbol::ONE) {
-                all_marked = false;
-                break;
-            }
-            if (current == Symbol::BLANK) {
-                break;  // Reached end of input
-            }
-            this.tape.move_right();
-        }
-        
-        this.tape.head_position = original_position;
-        
-        if (all_marked) {
+    handle_check_completion(symbol: Symbol) -> void {
+        if (symbol == Symbol::ZERO || symbol == Symbol::ONE) {
+            // Found unmarked symbol - not all paired, reject
+            this.state = TuringState::REJECT;
+        } else if (symbol == Symbol::BLANK) {
+            // Reached end - all symbols were marked, accept
             this.state = TuringState::ACCEPT;
         } else {
-            this.state = TuringState::REJECT;
+            // Skip marked symbols and continue checking
+            this.tape.move_right();
         }
         return;
     }
+
+
 
     print_state() -> void {
         if (this.state == TuringState::START) {
             IO::println("State: START");
-        } else if (this.state == TuringState::SCAN_RIGHT) {
-            IO::println("State: SCAN_RIGHT");
-        } else if (this.state == TuringState::SCAN_LEFT) {
-            IO::println("State: SCAN_LEFT");
+        } else if (this.state == TuringState::SCAN_RIGHT_FOR_ONE) {
+            IO::println("State: SCAN_RIGHT_FOR_ONE");
+        } else if (this.state == TuringState::SCAN_RIGHT_FOR_ZERO) {
+            IO::println("State: SCAN_RIGHT_FOR_ZERO");
+        } else if (this.state == TuringState::SCAN_LEFT_RETURN) {
+            IO::println("State: SCAN_LEFT_RETURN");
+        } else if (this.state == TuringState::CHECK_COMPLETION) {
+            IO::println("State: CHECK_COMPLETION");
         } else if (this.state == TuringState::ACCEPT) {
             IO::println("State: ACCEPT");
         } else if (this.state == TuringState::REJECT) {
