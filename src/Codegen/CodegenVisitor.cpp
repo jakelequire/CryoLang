@@ -8430,8 +8430,6 @@ namespace Cryo::Codegen
             }
             else if (auto arrayAccessNode = dynamic_cast<Cryo::ArrayAccessNode *>(operand))
             {
-                ("DEBUG: Address-of Array Access detected\n");
-
                 // Handle &arr[index] - need to get the element pointer, not the value
                 // We need to manually generate the array access to get the pointer
 
@@ -8445,21 +8443,24 @@ namespace Cryo::Codegen
                 {
                     array_var_name = identifier->name();
                     array_alloca = _value_context->get_alloca(array_var_name);
-                    ("DEBUG: Array variable name: %s, alloca: %p\n", array_var_name.c_str(), array_alloca);
                 }
 
                 // Generate the index
                 arrayAccessNode->index()->accept(*this);
                 llvm::Value *index_val = get_generated_value(arrayAccessNode->index());
 
-                if (!array_alloca || !index_val)
+                if (!array_alloca)
                 {
-                    ("DEBUG: Failed to get array_alloca or index_val\n");
-                    report_error("Failed to generate array alloca or index for array access in address-of", operand);
+                    std::string err_msg = "Failed to generate array alloca in address-of for variable: " + array_var_name + ", Node type: " + typeid(*arrayAccessNode->array()).name();
+                    report_error(err_msg, operand);
+                    return nullptr;
+                }
+                if (!index_val)
+                {
+                    report_error("Failed to generate index for array access in address-of", operand);
                     return nullptr;
                 }
 
-                ("DEBUG: Got alloca and index, checking variable types\n");
 
                 // Determine element type - simplified approach for address-of
                 llvm::Type *element_type = nullptr;
@@ -8470,9 +8471,7 @@ namespace Cryo::Codegen
                     auto type_it = _variable_types.find(array_var_name);
                     if (type_it != _variable_types.end() && type_it->second)
                     {
-                        ("DEBUG: Found variable type for %s\n", array_var_name.c_str());
                         Cryo::Type *var_type = type_it->second;
-                        ("DEBUG: Variable type string: %s, kind: %d\n", var_type->to_string().c_str(), (int)var_type->kind());
 
                         // Check for both direct Array type and Array<T> template types
                         std::string type_str = var_type->to_string();
@@ -8481,7 +8480,6 @@ namespace Cryo::Codegen
 
                         if (is_array_type)
                         {
-                            ("DEBUG: Variable type is Array\n");
                             Cryo::Type *cryo_element_type = nullptr;
 
                             // Handle different array type representations
