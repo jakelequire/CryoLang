@@ -8430,6 +8430,7 @@ namespace Cryo::Codegen
             }
             else if (auto arrayAccessNode = dynamic_cast<Cryo::ArrayAccessNode *>(operand))
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Handling address-of array access");
                 // Handle &arr[index] - need to get the element pointer, not the value
                 // We need to manually generate the array access to get the pointer
 
@@ -8439,10 +8440,85 @@ namespace Cryo::Codegen
                 llvm::Value *array_alloca = nullptr;
                 std::string array_var_name;
 
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array expression type: {}", typeid(*arrayAccessNode->array()).name());
                 if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(arrayAccessNode->array()))
                 {
                     array_var_name = identifier->name();
                     array_alloca = _value_context->get_alloca(array_var_name);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found identifier: {}, alloca: {}", array_var_name, (void*)array_alloca);
+                }
+                else if (auto *innerArrayAccess = dynamic_cast<Cryo::ArrayAccessNode *>(arrayAccessNode->array()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array expression is another ArrayAccessNode - handling nested array access like matrix[1][0]");
+                    // This handles cases like matrix[1][0] where matrix[1] is an ArrayAccessNode
+                    // We need to generate the inner array access first, then get the address of the result
+                    arrayAccessNode->array()->accept(*this);
+                    llvm::Value *inner_array_ptr = get_generated_value(arrayAccessNode->array());
+                    
+                    if (!inner_array_ptr) {
+                        report_error("Failed to generate inner array access in nested array address-of", operand);
+                        return nullptr;
+                    }
+                    
+                    // Generate the index for the outer access
+                    arrayAccessNode->index()->accept(*this);
+                    llvm::Value *index_val = get_generated_value(arrayAccessNode->index());
+                    
+                    if (!index_val) {
+                        report_error("Failed to generate index for nested array access in address-of", operand);
+                        return nullptr;
+                    }
+                    
+                    // Create GEP to get the element address
+                    std::vector<llvm::Value *> indices = {llvm::ConstantInt::get(llvm::Type::getInt32Ty(builder.getContext()), 0), index_val};
+                    
+                    // For nested array access, we need the element type of the inner array
+                    // This is a simplified approach - we'll use a generic type for now
+                    llvm::Type *element_type = llvm::Type::getInt32Ty(builder.getContext()); // Default to int for now
+                    
+                    llvm::Value *element_ptr = builder.CreateGEP(element_type, inner_array_ptr, indices, "nested_array_elem_addr");
+                    return element_ptr;
+                }
+                else if (auto *memberAccessNode = dynamic_cast<Cryo::MemberAccessNode *>(arrayAccessNode->array()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array expression is MemberAccessNode - handling member.field[index] pattern");
+                    // This handles cases like arr.elements[index] where we're accessing an array that's a member field
+                    
+                    // First generate the member access to get the array pointer
+                    memberAccessNode->accept(*this);
+                    llvm::Value *member_array_ptr = get_generated_value(memberAccessNode);
+                    
+                    if (!member_array_ptr) {
+                        report_error("Failed to generate member access for array in address-of", operand);
+                        return nullptr;
+                    }
+                    
+                    // Generate the index for the array access
+                    arrayAccessNode->index()->accept(*this);
+                    llvm::Value *index_val = get_generated_value(arrayAccessNode->index());
+                    
+                    if (!index_val) {
+                        report_error("Failed to generate index for member array access in address-of", operand);
+                        return nullptr;
+                    }
+                    
+                    // Create GEP to get the element address
+                    // For member arrays, we typically need to GEP into the array data
+                    std::vector<llvm::Value *> indices;
+                    
+                    // If the member is already a pointer to an array, just use the index
+                    if (member_array_ptr->getType()->isPointerTy()) {
+                        indices = {index_val};
+                    } else {
+                        // If it's a struct/array, add the base offset first
+                        indices = {llvm::ConstantInt::get(llvm::Type::getInt32Ty(builder.getContext()), 0), index_val};
+                    }
+                    
+                    // Determine element type - use int32 as default for now
+                    llvm::Type *element_type = llvm::Type::getInt32Ty(builder.getContext());
+                    
+                    llvm::Value *element_ptr = builder.CreateGEP(element_type, member_array_ptr, indices, "member_array_elem_addr");
+                    return element_ptr;
                 }
 
                 // Generate the index
@@ -8451,6 +8527,11 @@ namespace Cryo::Codegen
 
                 if (!array_alloca)
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Address-of array access: array_var_name='{}', node_type={}", array_var_name, typeid(*arrayAccessNode->array()).name());
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "arrayAccessNode->array() is MemberAccessNode: {}", dynamic_cast<Cryo::MemberAccessNode*>(arrayAccessNode->array()) != nullptr);
+                    if (auto* memberAccess = dynamic_cast<Cryo::MemberAccessNode*>(arrayAccessNode->array())) {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "MemberAccess object: {}, member: {}", typeid(*memberAccess->object()).name(), memberAccess->member());
+                    }
                     std::string err_msg = "Failed to generate array alloca in address-of for variable: " + array_var_name + ", Node type: " + typeid(*arrayAccessNode->array()).name();
                     report_error(err_msg, operand);
                     return nullptr;
