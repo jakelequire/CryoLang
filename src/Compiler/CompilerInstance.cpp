@@ -1685,6 +1685,7 @@ namespace Cryo
                 process_struct_declarations_recursive(statement.get());
             }
         }
+        
         // If this is a block statement, process its statements
         else if (auto block = dynamic_cast<BlockStatementNode *>(node))
         {
