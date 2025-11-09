@@ -1,78 +1,101 @@
-#include <gtest/gtest.h>
 #include "test_utils.hpp"
 #include "Lexer/lexer.hpp"
+#include <sstream>
+#include <memory>
 
 namespace CryoTest {
 
-class LexerTest : public LexerTestFixture {
+// Helper class for lexer testing
+class LexerTestHelper : public CryoTestBase {
+public:
+    std::unique_ptr<Cryo::Lexer> create_lexer(const std::string& source) {
+        return std::make_unique<Cryo::Lexer>(source);
+    }
+    
+    void expect_token_kind(const std::string& source, Cryo::TokenKind expected_kind) {
+        auto lexer = create_lexer(source);
+        auto token = lexer->next_token();
+        CRYO_ASSERT_EQ(static_cast<int>(expected_kind), static_cast<int>(token.kind()));
+    }
+    
+    void expect_token_sequence(const std::string& source, const std::vector<Cryo::TokenKind>& expected_tokens) {
+        auto lexer = create_lexer(source);
+        for (size_t i = 0; i < expected_tokens.size(); ++i) {
+            auto token = lexer->next_token();
+            CRYO_ASSERT_EQ(static_cast<int>(expected_tokens[i]), static_cast<int>(token.kind()));
+        }
+    }
 };
 
 // ============================================================================
 // Basic Token Recognition Tests
 // ============================================================================
 
-TEST_F(LexerTest, TokenizeKeywords) {
-    expect_token_sequence("function", {Cryo::TokenKind::TK_KW_FUNCTION});
-    expect_token_sequence("return", {Cryo::TokenKind::TK_KW_RETURN});
-    expect_token_sequence("const", {Cryo::TokenKind::TK_KW_CONST});
-    expect_token_sequence("mut", {Cryo::TokenKind::TK_KW_MUT});
-    expect_token_sequence("if", {Cryo::TokenKind::TK_KW_IF});
-    expect_token_sequence("else", {Cryo::TokenKind::TK_KW_ELSE});
-    expect_token_sequence("while", {Cryo::TokenKind::TK_KW_WHILE});
-    expect_token_sequence("for", {Cryo::TokenKind::TK_KW_FOR});
-    expect_token_sequence("struct", {Cryo::TokenKind::TK_KW_STRUCT});
-    expect_token_sequence("class", {Cryo::TokenKind::TK_KW_CLASS});
-    expect_token_sequence("enum", {Cryo::TokenKind::TK_KW_ENUM});
-    expect_token_sequence("impl", {Cryo::TokenKind::TK_KW_IMPL});
-    expect_token_sequence("type", {Cryo::TokenKind::TK_KW_TYPE});
-    expect_token_sequence("new", {Cryo::TokenKind::TK_KW_NEW});
-    expect_token_sequence("import", {Cryo::TokenKind::TK_KW_IMPORT});
-    expect_token_sequence("namespace", {Cryo::TokenKind::TK_KW_NAMESPACE});
-    expect_token_sequence("public", {Cryo::TokenKind::TK_KW_PUBLIC});
-    expect_token_sequence("private", {Cryo::TokenKind::TK_KW_PRIVATE});
-    expect_token_sequence("true", {Cryo::TokenKind::TK_KW_TRUE});
-    expect_token_sequence("false", {Cryo::TokenKind::TK_KW_FALSE});
+CRYO_TEST(LexerTests, TokenizeKeywords) {
+    LexerTestHelper helper;
+    helper.expect_token_kind("function", Cryo::TokenKind::TK_KW_FUNCTION);
+    helper.expect_token_kind("return", Cryo::TokenKind::TK_KW_RETURN);
+    helper.expect_token_kind("const", Cryo::TokenKind::TK_KW_CONST);
+    helper.expect_token_kind("mut", Cryo::TokenKind::TK_KW_MUT);
+    helper.expect_token_kind("if", Cryo::TokenKind::TK_KW_IF);
+    helper.expect_token_kind("else", Cryo::TokenKind::TK_KW_ELSE);
+    helper.expect_token_kind("while", Cryo::TokenKind::TK_KW_WHILE);
+    helper.expect_token_kind("for", Cryo::TokenKind::TK_KW_FOR);
+    helper.expect_token_kind("struct", Cryo::TokenKind::TK_KW_STRUCT);
+    helper.expect_token_kind("class", Cryo::TokenKind::TK_KW_CLASS);
+    helper.expect_token_kind("enum", Cryo::TokenKind::TK_KW_ENUM);
+    helper.expect_token_kind("impl", Cryo::TokenKind::TK_KW_IMPL);
+    helper.expect_token_kind("type", Cryo::TokenKind::TK_KW_TYPE);
+    helper.expect_token_kind("new", Cryo::TokenKind::TK_KW_NEW);
+    helper.expect_token_kind("import", Cryo::TokenKind::TK_KW_IMPORT);
+    helper.expect_token_kind("namespace", Cryo::TokenKind::TK_KW_NAMESPACE);
+    helper.expect_token_kind("public", Cryo::TokenKind::TK_KW_PUBLIC);
+    helper.expect_token_kind("private", Cryo::TokenKind::TK_KW_PRIVATE);
+    helper.expect_token_kind("true", Cryo::TokenKind::TK_KW_TRUE);
+    helper.expect_token_kind("false", Cryo::TokenKind::TK_KW_FALSE);
 }
 
-TEST_F(LexerTest, TokenizeOperators) {
-    expect_token_sequence("+", {Cryo::TokenKind::TK_PLUS});
-    expect_token_sequence("-", {Cryo::TokenKind::TK_MINUS});
-    expect_token_sequence("*", {Cryo::TokenKind::TK_MULTIPLY});
-    expect_token_sequence("/", {Cryo::TokenKind::TK_DIVIDE});
-    expect_token_sequence("=", {Cryo::TokenKind::TK_ASSIGN});
-    expect_token_sequence("==", {Cryo::TokenKind::TK_EQ});
-    expect_token_sequence("!=", {Cryo::TokenKind::TK_NE});
-    expect_token_sequence("<", {Cryo::TokenKind::TK_LT});
-    expect_token_sequence(">", {Cryo::TokenKind::TK_GT});
-    expect_token_sequence("<=", {Cryo::TokenKind::TK_LE});
-    expect_token_sequence(">=", {Cryo::TokenKind::TK_GE});
-    expect_token_sequence("&&", {Cryo::TokenKind::TK_AND});
-    expect_token_sequence("||", {Cryo::TokenKind::TK_OR});
-    expect_token_sequence("!", {Cryo::TokenKind::TK_NOT});
-    expect_token_sequence("++", {Cryo::TokenKind::TK_INCREMENT});
-    expect_token_sequence("--", {Cryo::TokenKind::TK_DECREMENT});
-    expect_token_sequence("->", {Cryo::TokenKind::TK_ARROW});
-    expect_token_sequence("::", {Cryo::TokenKind::TK_SCOPE});
+CRYO_TEST(LexerTests, TokenizeOperators) {
+    LexerTestHelper helper;
+    helper.expect_token_kind("+", Cryo::TokenKind::TK_PLUS);
+    helper.expect_token_kind("-", Cryo::TokenKind::TK_MINUS);
+    helper.expect_token_kind("*", Cryo::TokenKind::TK_MULTIPLY);
+    helper.expect_token_kind("/", Cryo::TokenKind::TK_DIVIDE);
+    helper.expect_token_kind("=", Cryo::TokenKind::TK_ASSIGN);
+    helper.expect_token_kind("==", Cryo::TokenKind::TK_EQ);
+    helper.expect_token_kind("!=", Cryo::TokenKind::TK_NE);
+    helper.expect_token_kind("<", Cryo::TokenKind::TK_LT);
+    helper.expect_token_kind(">", Cryo::TokenKind::TK_GT);
+    helper.expect_token_kind("<=", Cryo::TokenKind::TK_LE);
+    helper.expect_token_kind(">=", Cryo::TokenKind::TK_GE);
+    helper.expect_token_kind("&&", Cryo::TokenKind::TK_AND);
+    helper.expect_token_kind("||", Cryo::TokenKind::TK_OR);
+    helper.expect_token_kind("!", Cryo::TokenKind::TK_NOT);
+    helper.expect_token_kind("++", Cryo::TokenKind::TK_INCREMENT);
+    helper.expect_token_kind("--", Cryo::TokenKind::TK_DECREMENT);
+    helper.expect_token_kind("->", Cryo::TokenKind::TK_ARROW);
+    helper.expect_token_kind("::", Cryo::TokenKind::TK_SCOPE);
 }
 
-TEST_F(LexerTest, TokenizePunctuation) {
-    expect_token_sequence("(", {Cryo::TokenKind::TK_LPAREN});
-    expect_token_sequence(")", {Cryo::TokenKind::TK_RPAREN});
-    expect_token_sequence("{", {Cryo::TokenKind::TK_LBRACE});
-    expect_token_sequence("}", {Cryo::TokenKind::TK_RBRACE});
-    expect_token_sequence("[", {Cryo::TokenKind::TK_LBRACKET});
-    expect_token_sequence("]", {Cryo::TokenKind::TK_RBRACKET});
-    expect_token_sequence(";", {Cryo::TokenKind::TK_SEMICOLON});
-    expect_token_sequence(":", {Cryo::TokenKind::TK_COLON});
-    expect_token_sequence(",", {Cryo::TokenKind::TK_COMMA});
-    expect_token_sequence(".", {Cryo::TokenKind::TK_DOT});
+CRYO_TEST(LexerTests, TokenizePunctuation) {
+    LexerTestHelper helper;
+    helper.expect_token_kind("(", Cryo::TokenKind::TK_LPAREN);
+    helper.expect_token_kind(")", Cryo::TokenKind::TK_RPAREN);
+    helper.expect_token_kind("{", Cryo::TokenKind::TK_LBRACE);
+    helper.expect_token_kind("}", Cryo::TokenKind::TK_RBRACE);
+    helper.expect_token_kind("[", Cryo::TokenKind::TK_LBRACKET);
+    helper.expect_token_kind("]", Cryo::TokenKind::TK_RBRACKET);
+    helper.expect_token_kind(";", Cryo::TokenKind::TK_SEMICOLON);
+    helper.expect_token_kind(":", Cryo::TokenKind::TK_COLON);
+    helper.expect_token_kind(",", Cryo::TokenKind::TK_COMMA);
+    helper.expect_token_kind(".", Cryo::TokenKind::TK_DOT);
 }
 
 // ============================================================================
 // Identifier and Literal Tests
 // ============================================================================
 
-TEST_F(LexerTest, TokenizeIdentifiers) {
+CRYO_TEST(LexerTest, TokenizeIdentifiers) {
     auto lexer = create_lexer("variable_name camelCase PascalCase _underscore");
     
     auto token1 = lexer->next_token();
@@ -92,7 +115,7 @@ TEST_F(LexerTest, TokenizeIdentifiers) {
     EXPECT_EQ(token4.lexeme(), "_underscore");
 }
 
-TEST_F(LexerTest, TokenizeIntegerLiterals) {
+CRYO_TEST(LexerTest, TokenizeIntegerLiterals) {
     auto lexer = create_lexer("42 0 123456 -789");
     
     auto token1 = lexer->next_token();
@@ -115,7 +138,7 @@ TEST_F(LexerTest, TokenizeIntegerLiterals) {
     EXPECT_EQ(token5.lexeme(), "789");
 }
 
-TEST_F(LexerTest, TokenizeFloatLiterals) {
+CRYO_TEST(LexerTest, TokenizeFloatLiterals) {
     auto lexer = create_lexer("3.14 0.5 123.456 .5 5.");
     
     auto token1 = lexer->next_token();
@@ -131,7 +154,7 @@ TEST_F(LexerTest, TokenizeFloatLiterals) {
     EXPECT_EQ(token3.lexeme(), "123.456");
 }
 
-TEST_F(LexerTest, TokenizeStringLiterals) {
+CRYO_TEST(LexerTest, TokenizeStringLiterals) {
     auto lexer = create_lexer(R"("hello world" "escape \"quote\"" "")");
     
     auto token1 = lexer->next_token();
@@ -147,7 +170,7 @@ TEST_F(LexerTest, TokenizeStringLiterals) {
     EXPECT_EQ(token3.lexeme(), "\"\"");
 }
 
-TEST_F(LexerTest, TokenizeCharacterLiterals) {
+CRYO_TEST(LexerTest, TokenizeCharacterLiterals) {
     auto lexer = create_lexer(R"('a' 'Z' '1' '\n' '\t' '\'')");
     
     auto token1 = lexer->next_token();
@@ -167,7 +190,7 @@ TEST_F(LexerTest, TokenizeCharacterLiterals) {
 // Complex Expression Tests
 // ============================================================================
 
-TEST_F(LexerTest, TokenizeArithmeticExpression) {
+CRYO_TEST(LexerTest, TokenizeArithmeticExpression) {
     std::string source = "x + y * 2 - (a / b)";
     std::vector<Cryo::TokenKind> expected = {
         Cryo::TokenKind::TK_IDENTIFIER,    // x
@@ -186,7 +209,7 @@ TEST_F(LexerTest, TokenizeArithmeticExpression) {
     expect_token_sequence(source, expected);
 }
 
-TEST_F(LexerTest, TokenizeFunctionDeclaration) {
+CRYO_TEST(LexerTest, TokenizeFunctionDeclaration) {
     std::string source = "function add(x: int, y: int) -> int { return x + y; }";
     std::vector<Cryo::TokenKind> expected = {
         Cryo::TokenKind::TK_KW_FUNCTION,
@@ -218,7 +241,7 @@ TEST_F(LexerTest, TokenizeFunctionDeclaration) {
 // Comment and Whitespace Tests
 // ============================================================================
 
-TEST_F(LexerTest, IgnoreLineComments) {
+CRYO_TEST(LexerTest, IgnoreLineComments) {
     auto lexer = create_lexer("x // This is a comment\ny");
     
     auto token1 = lexer->next_token();
@@ -230,7 +253,7 @@ TEST_F(LexerTest, IgnoreLineComments) {
     EXPECT_EQ(token2.lexeme(), "y");
 }
 
-TEST_F(LexerTest, IgnoreBlockComments) {
+CRYO_TEST(LexerTest, IgnoreBlockComments) {
     auto lexer = create_lexer("x /* This is a\n   multi-line comment */ y");
     
     auto token1 = lexer->next_token();
@@ -242,7 +265,7 @@ TEST_F(LexerTest, IgnoreBlockComments) {
     EXPECT_EQ(token2.lexeme(), "y");
 }
 
-TEST_F(LexerTest, IgnoreWhitespace) {
+CRYO_TEST(LexerTest, IgnoreWhitespace) {
     auto lexer = create_lexer("  \t\n  x   \n\t  y  ");
     
     auto token1 = lexer->next_token();
@@ -258,7 +281,7 @@ TEST_F(LexerTest, IgnoreWhitespace) {
 // Error Handling Tests
 // ============================================================================
 
-TEST_F(LexerTest, HandleInvalidCharacters) {
+CRYO_TEST(LexerTest, HandleInvalidCharacters) {
     auto lexer = create_lexer("x @ y");
     
     auto token1 = lexer->next_token();
@@ -273,7 +296,7 @@ TEST_F(LexerTest, HandleInvalidCharacters) {
     EXPECT_EQ(token3.lexeme(), "y");
 }
 
-TEST_F(LexerTest, HandleUnterminatedString) {
+CRYO_TEST(LexerTest, HandleUnterminatedString) {
     auto lexer = create_lexer(R"("unterminated string)");
     
     auto token = lexer->next_token();
@@ -284,7 +307,7 @@ TEST_F(LexerTest, HandleUnterminatedString) {
 // Source Location Tests
 // ============================================================================
 
-TEST_F(LexerTest, CorrectSourceLocations) {
+CRYO_TEST(LexerTest, CorrectSourceLocations) {
     auto lexer = create_lexer("x\ny\n  z");
     
     auto token1 = lexer->next_token();
@@ -304,7 +327,7 @@ TEST_F(LexerTest, CorrectSourceLocations) {
 // Performance Tests
 // ============================================================================
 
-TEST_F(LexerTest, LexLargeFile) {
+CRYO_TEST(LexerTest, LexLargeFile) {
     // Generate a large source file for performance testing
     std::string large_source;
     for (int i = 0; i < 1000; ++i) {

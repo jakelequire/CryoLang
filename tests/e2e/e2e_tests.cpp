@@ -1,16 +1,15 @@
-#include <gtest/gtest.h>
 #include "test_utils.hpp"
 #include <filesystem>
 #include <fstream>
 
 namespace CryoTest {
 
-class E2ELanguageTest : public CryoTestBase {
-protected:
+class E2ELanguageTestHelper : public CryoTestBase {
+public:
     std::filesystem::path test_programs_dir;
     
-    void SetUp() override {
-        CryoTestBase::SetUp();
+    void setup() {
+        CryoTestBase::setup();
         test_programs_dir = get_test_data_dir() / "fixtures";
     }
     
@@ -56,7 +55,7 @@ protected:
     void expect_compilation_success(const std::filesystem::path& source_file) {
         auto result = compile_program(source_file);
         
-        EXPECT_TRUE(result.success) 
+        CRYO_EXPECT_TRUE(result.success) 
             << "Expected successful compilation of " << source_file.filename()
             << "\nErrors: " << join_strings(result.errors, "\n");
     }
@@ -64,7 +63,7 @@ protected:
     void expect_compilation_failure(const std::filesystem::path& source_file) {
         auto result = compile_program(source_file);
         
-        EXPECT_FALSE(result.success) 
+        CRYO_EXPECT_FALSE(result.success) 
             << "Expected compilation failure for " << source_file.filename()
             << " but compilation succeeded";
     }
@@ -86,52 +85,72 @@ protected:
 
 class E2EValidProgramsTest : public E2ELanguageTest {};
 
-TEST_F(E2EValidProgramsTest, SimpleFunction) {
+CRYO_TEST(E2EValidProgramsTest, SimpleFunction) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "simple_function.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, BasicStruct) {
+CRYO_TEST(E2EValidProgramsTest, BasicStruct) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "struct_basic.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, Variables) {
+CRYO_TEST(E2EValidProgramsTest, Variables) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "variables.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, ArithmeticOperations) {
+CRYO_TEST(E2EValidProgramsTest, ArithmeticOperations) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "arithmetic.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, ConditionalStatements) {
+CRYO_TEST(E2EValidProgramsTest, ConditionalStatements) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "conditionals.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, LoopConstructs) {
+CRYO_TEST(E2EValidProgramsTest, LoopConstructs) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "loops.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, ArrayOperations) {
+CRYO_TEST(E2EValidProgramsTest, ArrayOperations) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "arrays.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, FunctionParameters) {
+CRYO_TEST(E2EValidProgramsTest, FunctionParameters) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "function_params.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, StringHandling) {
+CRYO_TEST(E2EValidProgramsTest, StringHandling) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "strings.cryo";
     expect_compilation_success(source_file);
 }
 
-TEST_F(E2EValidProgramsTest, NestedStructures) {
+CRYO_TEST(E2EValidProgramsTest, NestedStructures) { 
+    E2EValidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "valid_programs" / "nested_structs.cryo";
     expect_compilation_success(source_file);
 }
@@ -142,52 +161,72 @@ TEST_F(E2EValidProgramsTest, NestedStructures) {
 
 class E2EInvalidProgramsTest : public E2ELanguageTest {};
 
-TEST_F(E2EInvalidProgramsTest, MissingBrace) {
+CRYO_TEST(E2EInvalidProgramsTest, MissingBrace) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "missing_brace.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, TypeMismatch) {
+CRYO_TEST(E2EInvalidProgramsTest, TypeMismatch) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "type_error.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, UndeclaredVariable) {
+CRYO_TEST(E2EInvalidProgramsTest, UndeclaredVariable) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "undeclared_var.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, InvalidSyntax) {
+CRYO_TEST(E2EInvalidProgramsTest, InvalidSyntax) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "syntax_error.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, DuplicateFunction) {
+CRYO_TEST(E2EInvalidProgramsTest, DuplicateFunction) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "duplicate_function.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, WrongReturnType) {
+CRYO_TEST(E2EInvalidProgramsTest, WrongReturnType) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "wrong_return.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, InvalidArrayAccess) {
+CRYO_TEST(E2EInvalidProgramsTest, InvalidArrayAccess) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "invalid_array.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, UnknownFunction) {
+CRYO_TEST(E2EInvalidProgramsTest, UnknownFunction) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "unknown_function.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, InvalidStructField) {
+CRYO_TEST(E2EInvalidProgramsTest, InvalidStructField) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "invalid_field.cryo";
     expect_compilation_failure(source_file);
 }
 
-TEST_F(E2EInvalidProgramsTest, ConstantReassignment) {
+CRYO_TEST(E2EInvalidProgramsTest, ConstantReassignment) { 
+    E2EInvalidProgramsTestHelper helper; 
+    helper.setup();
     auto source_file = test_programs_dir / "invalid_programs" / "const_reassign.cryo";
     expect_compilation_failure(source_file);
 }
@@ -205,7 +244,7 @@ protected:
         auto temp_file = std::filesystem::temp_directory_path() / ("test_" + feature_name + ".cryo");
         
         std::ofstream file(temp_file);
-        ASSERT_TRUE(file.good()) << "Failed to create temporary test file";
+        CRYO_ASSERT_TRUE(file.good()) << "Failed to create temporary test file";
         file << source_code;
         file.close();
         
@@ -220,7 +259,9 @@ protected:
     }
 };
 
-TEST_F(E2ELanguageFeaturesTest, BasicTypes) {
+CRYO_TEST(E2ELanguageFeaturesTest, BasicTypes) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const i: int = 42;
@@ -234,7 +275,9 @@ TEST_F(E2ELanguageFeaturesTest, BasicTypes) {
     test_language_feature("basic_types", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, ArithmeticExpressions) {
+CRYO_TEST(E2ELanguageFeaturesTest, ArithmeticExpressions) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const a: int = 10;
@@ -251,7 +294,9 @@ TEST_F(E2ELanguageFeaturesTest, ArithmeticExpressions) {
     test_language_feature("arithmetic", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, ComparisonOperators) {
+CRYO_TEST(E2ELanguageFeaturesTest, ComparisonOperators) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const a: int = 10;
@@ -269,7 +314,9 @@ TEST_F(E2ELanguageFeaturesTest, ComparisonOperators) {
     test_language_feature("comparisons", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, LogicalOperators) {
+CRYO_TEST(E2ELanguageFeaturesTest, LogicalOperators) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const a: boolean = true;
@@ -284,7 +331,9 @@ TEST_F(E2ELanguageFeaturesTest, LogicalOperators) {
     test_language_feature("logical_ops", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, ConditionalStatements) {
+CRYO_TEST(E2ELanguageFeaturesTest, ConditionalStatements) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -299,7 +348,9 @@ TEST_F(E2ELanguageFeaturesTest, ConditionalStatements) {
     test_language_feature("conditionals", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, WhileLoops) {
+CRYO_TEST(E2ELanguageFeaturesTest, WhileLoops) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             mut i: int = 0;
@@ -313,7 +364,9 @@ TEST_F(E2ELanguageFeaturesTest, WhileLoops) {
     test_language_feature("while_loop", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, ForLoops) {
+CRYO_TEST(E2ELanguageFeaturesTest, ForLoops) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             mut sum: int = 0;
@@ -327,7 +380,9 @@ TEST_F(E2ELanguageFeaturesTest, ForLoops) {
     test_language_feature("for_loop", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, Arrays) {
+CRYO_TEST(E2ELanguageFeaturesTest, Arrays) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const numbers: int[] = [1, 2, 3, 4, 5];
@@ -340,7 +395,9 @@ TEST_F(E2ELanguageFeaturesTest, Arrays) {
     test_language_feature("arrays", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, Structs) {
+CRYO_TEST(E2ELanguageFeaturesTest, Structs) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         type struct Point {
             x: int;
@@ -356,7 +413,9 @@ TEST_F(E2ELanguageFeaturesTest, Structs) {
     test_language_feature("structs", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, Functions) {
+CRYO_TEST(E2ELanguageFeaturesTest, Functions) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function add(a: int, b: int) -> int {
             return a + b;
@@ -370,7 +429,9 @@ TEST_F(E2ELanguageFeaturesTest, Functions) {
     test_language_feature("functions", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, MutableVariables) {
+CRYO_TEST(E2ELanguageFeaturesTest, MutableVariables) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             mut x: int = 10;
@@ -383,7 +444,9 @@ TEST_F(E2ELanguageFeaturesTest, MutableVariables) {
     test_language_feature("mutable_vars", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, ConstantVariables) {
+CRYO_TEST(E2ELanguageFeaturesTest, ConstantVariables) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = 42;
@@ -394,7 +457,9 @@ TEST_F(E2ELanguageFeaturesTest, ConstantVariables) {
     test_language_feature("const_vars", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, NestedFunctions) {
+CRYO_TEST(E2ELanguageFeaturesTest, NestedFunctions) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function outer(x: int) -> int {
             return inner(x * 2);
@@ -412,7 +477,9 @@ TEST_F(E2ELanguageFeaturesTest, NestedFunctions) {
     test_language_feature("nested_functions", source, true);
 }
 
-TEST_F(E2ELanguageFeaturesTest, RecursiveFunctions) {
+CRYO_TEST(E2ELanguageFeaturesTest, RecursiveFunctions) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function factorial(n: int) -> int {
             if (n <= 1) {
@@ -433,7 +500,9 @@ TEST_F(E2ELanguageFeaturesTest, RecursiveFunctions) {
 // Error Detection Tests
 // ============================================================================
 
-TEST_F(E2ELanguageFeaturesTest, TypeMismatchError) {
+CRYO_TEST(E2ELanguageFeaturesTest, TypeMismatchError) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = "not a number";
@@ -444,7 +513,9 @@ TEST_F(E2ELanguageFeaturesTest, TypeMismatchError) {
     test_language_feature("type_mismatch", source, false);
 }
 
-TEST_F(E2ELanguageFeaturesTest, UndeclaredVariableError) {
+CRYO_TEST(E2ELanguageFeaturesTest, UndeclaredVariableError) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             return undeclared_variable;
@@ -454,7 +525,9 @@ TEST_F(E2ELanguageFeaturesTest, UndeclaredVariableError) {
     test_language_feature("undeclared_var", source, false);
 }
 
-TEST_F(E2ELanguageFeaturesTest, ConstantReassignmentError) {
+CRYO_TEST(E2ELanguageFeaturesTest, ConstantReassignmentError) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -466,7 +539,9 @@ TEST_F(E2ELanguageFeaturesTest, ConstantReassignmentError) {
     test_language_feature("const_reassign", source, false);
 }
 
-TEST_F(E2ELanguageFeaturesTest, InvalidReturnTypeError) {
+CRYO_TEST(E2ELanguageFeaturesTest, InvalidReturnTypeError) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function get_string() -> string {
             return 42;
@@ -480,7 +555,9 @@ TEST_F(E2ELanguageFeaturesTest, InvalidReturnTypeError) {
     test_language_feature("invalid_return", source, false);
 }
 
-TEST_F(E2ELanguageFeaturesTest, MissingReturnError) {
+CRYO_TEST(E2ELanguageFeaturesTest, MissingReturnError) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function get_value() -> int {
             // Missing return statement
@@ -494,7 +571,9 @@ TEST_F(E2ELanguageFeaturesTest, MissingReturnError) {
     test_language_feature("missing_return", source, false);
 }
 
-TEST_F(E2ELanguageFeaturesTest, InvalidArrayIndexError) {
+CRYO_TEST(E2ELanguageFeaturesTest, InvalidArrayIndexError) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const numbers: int[] = [1, 2, 3];
@@ -506,7 +585,9 @@ TEST_F(E2ELanguageFeaturesTest, InvalidArrayIndexError) {
     test_language_feature("invalid_array_index", source, false);
 }
 
-TEST_F(E2ELanguageFeaturesTest, UnknownFunctionError) {
+CRYO_TEST(E2ELanguageFeaturesTest, UnknownFunctionError) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             return unknown_function(42);
@@ -516,7 +597,9 @@ TEST_F(E2ELanguageFeaturesTest, UnknownFunctionError) {
     test_language_feature("unknown_function", source, false);
 }
 
-TEST_F(E2ELanguageFeaturesTest, InvalidStructFieldError) {
+CRYO_TEST(E2ELanguageFeaturesTest, InvalidStructFieldError) { 
+    E2ELanguageFeaturesTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         type struct Point {
             x: int;
@@ -549,13 +632,13 @@ protected:
                            ("bench_" + test_name + "_" + std::to_string(i) + ".cryo");
             
             std::ofstream file(temp_file);
-            ASSERT_TRUE(file.good());
+            CRYO_ASSERT_TRUE(file.good());
             file << source_code;
             file.close();
             
             // Compile and measure
             auto result = compile_program(temp_file);
-            EXPECT_TRUE(result.success) << "Benchmark compilation failed for " << test_name;
+            CRYO_EXPECT_TRUE(result.success) << "Benchmark compilation failed for " << test_name;
             
             // Clean up
             std::filesystem::remove(temp_file);
@@ -571,7 +654,9 @@ protected:
     }
 };
 
-TEST_F(E2EPerformanceTest, SimpleProgram) {
+CRYO_TEST(E2EPerformanceTest, SimpleProgram) { 
+    E2EPerformanceTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             return 42;
@@ -581,7 +666,9 @@ TEST_F(E2EPerformanceTest, SimpleProgram) {
     benchmark_compilation("simple_program", source, 100);
 }
 
-TEST_F(E2EPerformanceTest, ComplexProgram) {
+CRYO_TEST(E2EPerformanceTest, ComplexProgram) { 
+    E2EPerformanceTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         type struct Point {
             x: int;
@@ -611,6 +698,268 @@ TEST_F(E2EPerformanceTest, ComplexProgram) {
     )";
     
     benchmark_compilation("complex_program", source, 50);
+}
+
+// ============================================================================
+// New E2E Language Feature Tests Using Test Fixtures
+// ============================================================================
+
+CRYO_TEST(E2ELanguageTest, ArithmeticOperations) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "arithmetic.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, BooleanOperations) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "boolean_ops.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, ConditionalStatements) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "conditional.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, LoopConstructs) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "loops.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, FunctionDeclarations) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "functions.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, EnumDefinitions) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "enum_test.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, StructMethods) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "struct_methods.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, ArrayAccess) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "array_access.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, PointerReferences) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "pointer_ref.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, SwitchStatements) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "switch_cases.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, LiteralTypes) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "literals.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, GenericTypes) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "generics.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+CRYO_TEST(E2ELanguageTest, TraitDefinitions) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "valid_programs" / "traits.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_TRUE(result.success);
+    CRYO_EXPECT_EQ(result.exit_code, 0);
+}
+
+// ============================================================================
+// Error Handling E2E Tests Using Invalid Program Fixtures  
+// ============================================================================
+
+CRYO_TEST(E2ELanguageTest, TypeErrorDetection) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "invalid_programs" / "type_error_arith.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_FALSE(result.success);
+    CRYO_EXPECT_TRUE(!result.errors.empty());
+    
+    // Check that we get a meaningful error message about type mismatch
+    bool found_type_error = false;
+    for (const auto& error : result.errors) {
+        if (error.find("type") != std::string::npos || 
+            error.find("arithmetic") != std::string::npos) {
+            found_type_error = true;
+            break;
+        }
+    }
+    CRYO_EXPECT_TRUE(found_type_error);
+}
+
+CRYO_TEST(E2ELanguageTest, UndefinedVariableDetection) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "invalid_programs" / "undefined_var.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_FALSE(result.success);
+    CRYO_EXPECT_TRUE(!result.errors.empty());
+    
+    // Check for undefined variable error
+    bool found_undefined_error = false;
+    for (const auto& error : result.errors) {
+        if (error.find("undefined") != std::string::npos || 
+            error.find("variable") != std::string::npos) {
+            found_undefined_error = true;
+            break;
+        }
+    }
+    CRYO_EXPECT_TRUE(found_undefined_error);
+}
+
+CRYO_TEST(E2ELanguageTest, FunctionArgumentErrors) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "invalid_programs" / "function_args.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_FALSE(result.success);
+    CRYO_EXPECT_TRUE(!result.errors.empty());
+    
+    // Check for argument mismatch errors
+    bool found_arg_error = false;
+    for (const auto& error : result.errors) {
+        if (error.find("argument") != std::string::npos || 
+            error.find("parameter") != std::string::npos) {
+            found_arg_error = true;
+            break;
+        }
+    }
+    CRYO_EXPECT_TRUE(found_arg_error);
+}
+
+CRYO_TEST(E2ELanguageTest, SyntaxErrorDetection) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "invalid_programs" / "missing_semicolons.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_FALSE(result.success);
+    CRYO_EXPECT_TRUE(!result.errors.empty());
+    
+    // Check for syntax errors
+    bool found_syntax_error = false;
+    for (const auto& error : result.errors) {
+        if (error.find("semicolon") != std::string::npos || 
+            error.find("syntax") != std::string::npos || 
+            error.find("expected") != std::string::npos) {
+            found_syntax_error = true;
+            break;
+        }
+    }
+    CRYO_EXPECT_TRUE(found_syntax_error);
+}
+
+CRYO_TEST(E2ELanguageTest, ScopeViolationDetection) {
+    E2ELanguageTestHelper helper;
+    helper.setup();
+    
+    auto fixture_path = helper.test_programs_dir / "invalid_programs" / "scope_violation.cryo";
+    auto result = helper.compile_program(fixture_path);
+    
+    CRYO_ASSERT_FALSE(result.success);
+    CRYO_EXPECT_TRUE(!result.errors.empty());
+    
+    // Check for scope errors
+    bool found_scope_error = false;
+    for (const auto& error : result.errors) {
+        if (error.find("scope") != std::string::npos || 
+            error.find("undefined") != std::string::npos) {
+            found_scope_error = true;
+            break;
+        }
+    }
+    CRYO_EXPECT_TRUE(found_scope_error);
 }
 
 } // namespace CryoTest

@@ -31,7 +31,7 @@ int TestRegistry::run_all_tests() {
     int passed = 0;
     int failed = 0;
     
-    std::cout << "\n🚀 Starting CryoLang Test Suite (Self-Contained)\n" << std::endl;
+    std::cout << "\n🚀 CryoLang Test Suite\n" << std::endl;
     std::cout << "Running " << tests.size() << " tests..." << std::endl;
     std::cout << "========================================\n" << std::endl;
     
@@ -54,7 +54,7 @@ int TestRegistry::run_all_tests() {
     }
     
     std::cout << "\n========================================" << std::endl;
-    std::cout << "Test Results Summary:" << std::endl;
+    std::cout << "Test Results:" << std::endl;
     std::cout << "  Total: " << (passed + failed) << std::endl;
     std::cout << "  Passed: " << passed << std::endl;
     std::cout << "  Failed: " << failed << std::endl;

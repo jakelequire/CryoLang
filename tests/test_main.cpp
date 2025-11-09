@@ -18,11 +18,11 @@ namespace CryoTest {
 } // namespace CryoTest
 
 /**
- * @brief Main test runner entry point
+ * @brief Main test runner entry point - simple and clean
  */
 int main(int argc, char** argv) {
-    std::cout << "CryoLang Self-Contained Test Framework" << std::endl;
-    std::cout << "=======================================" << std::endl;
+    std::cout << "CryoLang Test Suite" << std::endl;
+    std::cout << "===================" << std::endl;
     
     // Initialize test environment
     CryoTest::initialize_test_environment();

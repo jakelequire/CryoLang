@@ -1,4 +1,3 @@
-#include <gtest/gtest.h>
 #include "test_utils.hpp"
 #include "Compiler/CompilerInstance.hpp"
 
@@ -23,7 +22,9 @@ protected:
 // Basic Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileSimpleProgram) {
+CRYO_TEST(CompilationTest, CompileSimpleProgram) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         import IO from <io/stdio>;
         
@@ -36,7 +37,9 @@ TEST_F(CompilationTest, CompileSimpleProgram) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileWithArithmetic) {
+CRYO_TEST(CompilationTest, CompileWithArithmetic) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function add(x: int, y: int) -> int {
             return x + y;
@@ -51,7 +54,9 @@ TEST_F(CompilationTest, CompileWithArithmetic) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileWithVariables) {
+CRYO_TEST(CompilationTest, CompileWithVariables) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = 42;
@@ -68,7 +73,9 @@ TEST_F(CompilationTest, CompileWithVariables) {
 // Control Flow Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileIfStatement) {
+CRYO_TEST(CompilationTest, CompileIfStatement) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -83,7 +90,9 @@ TEST_F(CompilationTest, CompileIfStatement) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileWhileLoop) {
+CRYO_TEST(CompilationTest, CompileWhileLoop) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             mut counter: int = 0;
@@ -97,7 +106,9 @@ TEST_F(CompilationTest, CompileWhileLoop) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileForLoop) {
+CRYO_TEST(CompilationTest, CompileForLoop) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             mut sum: int = 0;
@@ -115,7 +126,9 @@ TEST_F(CompilationTest, CompileForLoop) {
 // Struct Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileStructDeclaration) {
+CRYO_TEST(CompilationTest, CompileStructDeclaration) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         type struct Point {
             x: int;
@@ -131,7 +144,9 @@ TEST_F(CompilationTest, CompileStructDeclaration) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileStructWithMethods) {
+CRYO_TEST(CompilationTest, CompileStructWithMethods) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         type struct Point {
             x: int;
@@ -165,7 +180,9 @@ TEST_F(CompilationTest, CompileStructWithMethods) {
 // Array Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileArrayOperations) {
+CRYO_TEST(CompilationTest, CompileArrayOperations) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const numbers: int[] = [1, 2, 3, 4, 5];
@@ -182,7 +199,9 @@ TEST_F(CompilationTest, CompileArrayOperations) {
 // Function Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileRecursiveFunction) {
+CRYO_TEST(CompilationTest, CompileRecursiveFunction) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function factorial(n: int) -> int {
             if (n <= 1) {
@@ -199,7 +218,9 @@ TEST_F(CompilationTest, CompileRecursiveFunction) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileOverloadedFunctions) {
+CRYO_TEST(CompilationTest, CompileOverloadedFunctions) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function add(x: int, y: int) -> int {
             return x + y;
@@ -223,7 +244,9 @@ TEST_F(CompilationTest, CompileOverloadedFunctions) {
 // Enum Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileSimpleEnum) {
+CRYO_TEST(CompilationTest, CompileSimpleEnum) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         enum Color {
             RED,
@@ -240,7 +263,9 @@ TEST_F(CompilationTest, CompileSimpleEnum) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileComplexEnum) {
+CRYO_TEST(CompilationTest, CompileComplexEnum) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         enum Shape {
             Circle(float),
@@ -276,7 +301,9 @@ TEST_F(CompilationTest, CompileComplexEnum) {
 // Generic Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileGenericStruct) {
+CRYO_TEST(CompilationTest, CompileGenericStruct) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         type struct Box<T> {
             value: T;
@@ -309,7 +336,9 @@ TEST_F(CompilationTest, CompileGenericStruct) {
 // Error Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, RejectUndeclaredVariable) {
+CRYO_TEST(CompilationTest, RejectUndeclaredVariable) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             return undeclared_variable;
@@ -319,7 +348,9 @@ TEST_F(CompilationTest, RejectUndeclaredVariable) {
     expect_compilation_error(source, "undeclared");
 }
 
-TEST_F(CompilationTest, RejectTypeMismatch) {
+CRYO_TEST(CompilationTest, RejectTypeMismatch) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = "hello";
@@ -330,7 +361,9 @@ TEST_F(CompilationTest, RejectTypeMismatch) {
     expect_compilation_error(source, "type");
 }
 
-TEST_F(CompilationTest, RejectInvalidFunctionCall) {
+CRYO_TEST(CompilationTest, RejectInvalidFunctionCall) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function add(x: int, y: int) -> int {
             return x + y;
@@ -348,7 +381,9 @@ TEST_F(CompilationTest, RejectInvalidFunctionCall) {
 // Module System Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileWithNamespace) {
+CRYO_TEST(CompilationTest, CompileWithNamespace) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         namespace MyModule;
         
@@ -364,7 +399,9 @@ TEST_F(CompilationTest, CompileWithNamespace) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileWithImports) {
+CRYO_TEST(CompilationTest, CompileWithImports) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         import IO from <io/stdio>;
         import <core/types>;
@@ -382,7 +419,9 @@ TEST_F(CompilationTest, CompileWithImports) {
 // Memory Management Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileWithPointers) {
+CRYO_TEST(CompilationTest, CompileWithPointers) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             mut x: int = 42;
@@ -395,7 +434,9 @@ TEST_F(CompilationTest, CompileWithPointers) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileWithReferences) {
+CRYO_TEST(CompilationTest, CompileWithReferences) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function modify(ref: int&) -> void {
             ref = ref + 10;
@@ -415,7 +456,9 @@ TEST_F(CompilationTest, CompileWithReferences) {
 // Performance Compilation Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileLargeProgram) {
+CRYO_TEST(CompilationTest, CompileLargeProgram) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     // Generate a large program to test compilation performance
     std::string large_source = R"(
         namespace PerformanceTest;
@@ -467,7 +510,9 @@ TEST_F(CompilationTest, CompileLargeProgram) {
 // Stress Tests
 // ============================================================================
 
-TEST_F(CompilationTest, CompileDeepNestedStructures) {
+CRYO_TEST(CompilationTest, CompileDeepNestedStructures) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function deeply_nested() -> int {
             if (true) {
@@ -492,7 +537,9 @@ TEST_F(CompilationTest, CompileDeepNestedStructures) {
     expect_compilation_success(source);
 }
 
-TEST_F(CompilationTest, CompileComplexExpressions) {
+CRYO_TEST(CompilationTest, CompileComplexExpressions) { 
+    CompilationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function complex_calculation() -> int {
             const a: int = 1;
