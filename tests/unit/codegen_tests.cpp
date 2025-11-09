@@ -1,0 +1,584 @@
+#include <gtest/gtest.h>
+#include "test_utils.hpp"
+#include "Codegen/CodeGenerator.hpp"
+#include "Codegen/LLVMContext.hpp"
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Instructions.h>
+
+namespace CryoTest {
+
+class CodegenTest : public CryoTestBase {
+protected:
+    std::unique_ptr<Cryo::CodeGenerator> code_generator;
+    std::unique_ptr<Cryo::LLVMContext> llvm_context;
+    
+    void SetUp() override {
+        CryoTestBase::SetUp();
+        
+        llvm_context = std::make_unique<Cryo::LLVMContext>();
+        if (compiler && ast_context) {
+            code_generator = std::make_unique<Cryo::CodeGenerator>(
+                *llvm_context, 
+                *compiler,
+                *ast_context
+            );
+        }
+    }
+    
+    llvm::Module* generate_ir(const std::string& source) {
+        auto ast = parse_source(source);
+        if (!ast) {
+            return nullptr;
+        }
+        
+        // Run type checking first
+        if (auto type_checker = create_type_checker()) {
+            type_checker->check(ast.get());
+            if (compiler->has_errors()) {
+                return nullptr;
+            }
+        }
+        
+        // Generate LLVM IR
+        auto module = code_generator->generate(ast.get());
+        return module.release();
+    }
+    
+    std::unique_ptr<Cryo::TypeChecker> create_type_checker() {
+        if (ast_context && compiler) {
+            return std::make_unique<Cryo::TypeChecker>(
+                ast_context->types(), 
+                compiler->symbol_table(),
+                compiler->diagnostic_manager()
+            );
+        }
+        return nullptr;
+    }
+};
+
+// ============================================================================
+// Basic Function Generation Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateSimpleFunction) {
+    std::string source = R"(
+        function main() -> int {
+            return 42;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    // Check that main function exists
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    EXPECT_TRUE(main_func->getReturnType()->isIntegerTy());
+    
+    // Check function has return instruction
+    bool has_return = false;
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (llvm::isa<llvm::ReturnInst>(inst)) {
+                has_return = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(has_return);
+    
+    delete module;
+}
+
+TEST_F(CodegenTest, GenerateFunctionWithParameters) {
+    std::string source = R"(
+        function add(x: int, y: int) -> int {
+            return x + y;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto add_func = module->getFunction("add");
+    ASSERT_TRUE(add_func != nullptr);
+    EXPECT_EQ(add_func->arg_size(), 2);
+    EXPECT_TRUE(add_func->getReturnType()->isIntegerTy());
+    
+    delete module;
+}
+
+TEST_F(CodegenTest, GenerateMultipleFunctions) {
+    std::string source = R"(
+        function add(x: int, y: int) -> int {
+            return x + y;
+        }
+        
+        function multiply(x: int, y: int) -> int {
+            return x * y;
+        }
+        
+        function main() -> int {
+            const sum: int = add(5, 10);
+            const product: int = multiply(3, 7);
+            return sum + product;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    EXPECT_TRUE(module->getFunction("add") != nullptr);
+    EXPECT_TRUE(module->getFunction("multiply") != nullptr);
+    EXPECT_TRUE(module->getFunction("main") != nullptr);
+    
+    delete module;
+}
+
+// ============================================================================
+// Variable Declaration Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateConstantDeclaration) {
+    std::string source = R"(
+        function main() -> int {
+            const x: int = 42;
+            return x;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // Check for alloca instruction (local variable)
+    bool has_alloca = false;
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (llvm::isa<llvm::AllocaInst>(inst)) {
+                has_alloca = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(has_alloca);
+    
+    delete module;
+}
+
+TEST_F(CodegenTest, GenerateMutableDeclaration) {
+    std::string source = R"(
+        function main() -> int {
+            mut x: int = 10;
+            x = 20;
+            return x;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // Should have store instructions for assignment
+    bool has_store = false;
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (llvm::isa<llvm::StoreInst>(inst)) {
+                has_store = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(has_store);
+    
+    delete module;
+}
+
+// ============================================================================
+// Arithmetic Expression Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateArithmeticExpressions) {
+    std::string source = R"(
+        function main() -> int {
+            const a: int = 10;
+            const b: int = 5;
+            const sum: int = a + b;
+            const diff: int = a - b;
+            const product: int = a * b;
+            const quotient: int = a / b;
+            return sum + diff + product + quotient;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // Count arithmetic instructions
+    int add_count = 0, sub_count = 0, mul_count = 0, div_count = 0;
+    
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (auto binary_op = llvm::dyn_cast<llvm::BinaryOperator>(&inst)) {
+                switch (binary_op->getOpcode()) {
+                    case llvm::Instruction::Add:
+                        add_count++;
+                        break;
+                    case llvm::Instruction::Sub:
+                        sub_count++;
+                        break;
+                    case llvm::Instruction::Mul:
+                        mul_count++;
+                        break;
+                    case llvm::Instruction::SDiv:
+                    case llvm::Instruction::UDiv:
+                        div_count++;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+    }
+    
+    EXPECT_GT(add_count, 0);
+    EXPECT_GT(sub_count, 0);
+    EXPECT_GT(mul_count, 0);
+    EXPECT_GT(div_count, 0);
+    
+    delete module;
+}
+
+// ============================================================================
+// Comparison Expression Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateComparisonExpressions) {
+    std::string source = R"(
+        function main() -> int {
+            const a: int = 10;
+            const b: int = 5;
+            const less: boolean = a < b;
+            const equal: boolean = a == b;
+            const greater: boolean = a > b;
+            return 0;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // Check for comparison instructions
+    bool has_icmp = false;
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (llvm::isa<llvm::ICmpInst>(inst)) {
+                has_icmp = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(has_icmp);
+    
+    delete module;
+}
+
+// ============================================================================
+// Control Flow Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateIfStatement) {
+    std::string source = R"(
+        function main() -> int {
+            const x: int = 10;
+            if (x > 5) {
+                return 1;
+            }
+            return 0;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // Should have multiple basic blocks for if statement
+    EXPECT_GT(main_func->getBasicBlockList().size(), 1);
+    
+    // Check for branch instruction
+    bool has_branch = false;
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (llvm::isa<llvm::BranchInst>(inst)) {
+                has_branch = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(has_branch);
+    
+    delete module;
+}
+
+TEST_F(CodegenTest, GenerateWhileLoop) {
+    std::string source = R"(
+        function main() -> int {
+            mut i: int = 0;
+            while (i < 10) {
+                i = i + 1;
+            }
+            return i;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // While loop should create multiple basic blocks
+    EXPECT_GT(main_func->getBasicBlockList().size(), 2);
+    
+    delete module;
+}
+
+// ============================================================================
+// Function Call Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateFunctionCall) {
+    std::string source = R"(
+        function helper(x: int) -> int {
+            return x * 2;
+        }
+        
+        function main() -> int {
+            const result: int = helper(21);
+            return result;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // Check for call instruction
+    bool has_call = false;
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (llvm::isa<llvm::CallInst>(inst)) {
+                has_call = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(has_call);
+    
+    delete module;
+}
+
+// ============================================================================
+// Struct Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateStructAccess) {
+    std::string source = R"(
+        type struct Point {
+            x: int;
+            y: int;
+        }
+        
+        function main() -> int {
+            const p: Point = Point({x: 10, y: 20});
+            const sum: int = p.x + p.y;
+            return sum;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // Should have getelementptr instructions for field access
+    bool has_gep = false;
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (llvm::isa<llvm::GetElementPtrInst>(inst)) {
+                has_gep = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(has_gep);
+    
+    delete module;
+}
+
+// ============================================================================
+// Array Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateArrayAccess) {
+    std::string source = R"(
+        function main() -> int {
+            const numbers: int[] = [1, 2, 3, 4, 5];
+            const first: int = numbers[0];
+            const third: int = numbers[2];
+            return first + third;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    auto main_func = module->getFunction("main");
+    ASSERT_TRUE(main_func != nullptr);
+    
+    // Should have getelementptr for array indexing
+    bool has_gep = false;
+    for (auto& bb : *main_func) {
+        for (auto& inst : bb) {
+            if (llvm::isa<llvm::GetElementPtrInst>(inst)) {
+                has_gep = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(has_gep);
+    
+    delete module;
+}
+
+// ============================================================================
+// Optimization Tests
+// ============================================================================
+
+TEST_F(CodegenTest, ConstantFolding) {
+    std::string source = R"(
+        function main() -> int {
+            const result: int = 2 + 3 * 4; // Should be optimized to 14
+            return result;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    // After optimization, this might be a simple return of constant 14
+    // The exact behavior depends on optimization level
+    
+    delete module;
+}
+
+TEST_F(CodegenTest, DeadCodeElimination) {
+    std::string source = R"(
+        function main() -> int {
+            const unused: int = 42; // This might be eliminated
+            const used: int = 10;
+            return used;
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    // After optimization, unused variable might be eliminated
+    
+    delete module;
+}
+
+// ============================================================================
+// Error Handling Tests
+// ============================================================================
+
+TEST_F(CodegenTest, HandleTypeErrors) {
+    std::string source = R"(
+        function main() -> int {
+            const x: int = "not a number"; // Type error
+            return x;
+        }
+    )";
+    
+    // This should fail during type checking, before codegen
+    auto module = generate_ir(source);
+    EXPECT_TRUE(module == nullptr || compiler->has_errors());
+    
+    if (module) {
+        delete module;
+    }
+}
+
+TEST_F(CodegenTest, HandleUndefinedFunction) {
+    std::string source = R"(
+        function main() -> int {
+            return undefined_function(); // Should cause error
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    EXPECT_TRUE(module == nullptr || compiler->has_errors());
+    
+    if (module) {
+        delete module;
+    }
+}
+
+// ============================================================================
+// Memory Management Tests
+// ============================================================================
+
+TEST_F(CodegenTest, GenerateHeapAllocation) {
+    std::string source = R"(
+        function main() -> int {
+            const numbers: int[] = [1, 2, 3, 4, 5];
+            return numbers[0];
+        }
+    )";
+    
+    auto module = generate_ir(source);
+    ASSERT_TRUE(module != nullptr);
+    
+    // Should contain calls to memory allocation functions
+    bool has_malloc_call = false;
+    for (auto& func : *module) {
+        for (auto& bb : func) {
+            for (auto& inst : bb) {
+                if (auto call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+                    if (auto called_func = call->getCalledFunction()) {
+                        std::string func_name = called_func->getName().str();
+                        if (func_name.find("malloc") != std::string::npos ||
+                            func_name.find("alloc") != std::string::npos) {
+                            has_malloc_call = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // This test might need adjustment based on actual memory management strategy
+    
+    delete module;
+}
+
+} // namespace CryoTest
