@@ -22,6 +22,9 @@
 # Include shared configuration
 include makefile.config
 
+# Include test framework configuration
+include test.makefile.config
+
 # Determine number of CPU cores
 ifeq ($(OS), Windows_NT)
     NUM_CORES = $(NUMBER_OF_PROCESSORS)
