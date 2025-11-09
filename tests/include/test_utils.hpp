@@ -1,6 +1,5 @@
 #pragma once
 
-#include <gtest/gtest.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,7 +25,7 @@ namespace CryoTest {
  * Provides common utilities and setup/teardown for compiler component testing.
  * All test classes should inherit from this to get access to compiler infrastructure.
  */
-class CryoTestBase : public ::testing::Test {
+class CryoTestBase {
 protected:
     std::unique_ptr<Cryo::CompilerInstance> compiler;
     std::unique_ptr<Cryo::ASTContext> ast_context;

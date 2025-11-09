@@ -403,31 +403,27 @@ else
 	@rm -rf $(RUNTIME_BUILD_DIR)
 endif
 
-# Test targets
-.PHONY: test test-quick test-verbose test-category test-file
-test: $(MAIN_BIN)
-	@echo "Running CryoLang test suite..."
-	@$(PYTHON) test/test_runner.py
+# Test targets - Simple and clean (no external scripts)
+.PHONY: test test-clean
+test: $(MAIN_BIN) $(TEST_BIN_DIR)/cryo_tests$(EXE_SUFFIX)
+	@echo "🧪 Running CryoLang Test Suite..."
+	@$(TEST_BIN_DIR)/cryo_tests$(EXE_SUFFIX)
 
-test-quick: $(MAIN_BIN)
-	@echo "Running CryoLang test suite (fail-fast mode)..."
-	@$(PYTHON) test/test_runner.py --fail-fast
-
-test-verbose: $(MAIN_BIN)
-	@echo "Running CryoLang test suite (verbose)..."
-	@$(PYTHON) test/test_runner.py --verbose --show-failures
-
-test-category: $(MAIN_BIN)
-	@echo "Usage: make test-category CATEGORIES='functions control-flow'"
-	@echo "Available categories: functions variables control-flow data-types generics memory"
-ifdef CATEGORIES
-	@$(PYTHON) test/test_runner.py --categories $(CATEGORIES)
+test-clean:
+	@echo "🧹 Cleaning test artifacts..."
+ifeq ($(OS), Windows_NT)
+	@if exist "$(subst /,\,$(TEST_BIN_DIR))" rmdir /s /q "$(subst /,\,$(TEST_BIN_DIR))"
+	@if exist "$(subst /,\,$(BIN_DIR))\.o\tests" rmdir /s /q "$(subst /,\,$(BIN_DIR))\.o\tests"
 else
-	@echo "Please specify CATEGORIES variable"
+	@rm -rf $(TEST_BIN_DIR)
+	@rm -rf $(BIN_DIR)/.o/tests
 endif
+	@echo "✅ Test cleanup complete"
 
-test-file: $(MAIN_BIN)
-	@echo "Usage: make test-file FILE='test/test-cases/functions/basic_functions.cryo'"
+# Single unified test executable (combines all test types)
+$(TEST_BIN_DIR)/cryo_tests$(EXE_SUFFIX): $(TEST_ALL_OBJECTS) | test-dirs
+	@echo "🔨 Building unified test executable..."
+	@$(CXX) $(TEST_CXXFLAGS) $^ -o $@ $(TEST_LDFLAGS) $(LIBS)
 ifdef FILE
 	@$(PYTHON) test/test_runner.py --file $(FILE)
 else

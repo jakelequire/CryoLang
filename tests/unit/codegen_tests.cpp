@@ -1,4 +1,3 @@
-#include <gtest/gtest.h>
 #include "test_utils.hpp"
 #include "Codegen/CodeGenerator.hpp"
 #include "Codegen/LLVMContext.hpp"
@@ -9,13 +8,13 @@
 
 namespace CryoTest {
 
-class CodegenTest : public CryoTestBase {
-protected:
+class CodegenTestHelper : public CryoTestBase {
+public:
     std::unique_ptr<Cryo::CodeGenerator> code_generator;
     std::unique_ptr<Cryo::LLVMContext> llvm_context;
     
-    void SetUp() override {
-        CryoTestBase::SetUp();
+    void setup() {
+        CryoTestBase::setup();
         
         llvm_context = std::make_unique<Cryo::LLVMContext>();
         if (compiler && ast_context) {
@@ -27,14 +26,14 @@ protected:
         }
     }
     
-    llvm::Module* generate_ir(const std::string& source) {
-        auto ast = parse_source(source);
+    llvm::Module* helper.generate_ir(const std::string& source) {
+        auto ast = helper.parse_source(source);
         if (!ast) {
             return nullptr;
         }
         
         // Run type checking first
-        if (auto type_checker = create_type_checker()) {
+        if (auto type_checker = helper.create_type_checker()) {
             type_checker->check(ast.get());
             if (compiler->has_errors()) {
                 return nullptr;
@@ -46,7 +45,7 @@ protected:
         return module.release();
     }
     
-    std::unique_ptr<Cryo::TypeChecker> create_type_checker() {
+    std::unique_ptr<Cryo::TypeChecker> helper.create_type_checker() {
         if (ast_context && compiler) {
             return std::make_unique<Cryo::TypeChecker>(
                 ast_context->types(), 
@@ -62,20 +61,23 @@ protected:
 // Basic Function Generation Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateSimpleFunction) {
+CRYO_TEST(CodegenTest, GenerateSimpleFunction) {
+    CodegenTestHelper helper;
+    helper.setup();
+    
     std::string source = R"(
         function main() -> int {
             return 42;
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     // Check that main function exists
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
-    EXPECT_TRUE(main_func->getReturnType()->isIntegerTy());
+    CRYO_ASSERT_TRUE(main_func != nullptr);
+    CRYO_EXPECT_TRUE(main_func->getReturnType()->isIntegerTy());
     
     // Check function has return instruction
     bool has_return = false;
@@ -87,30 +89,36 @@ TEST_F(CodegenTest, GenerateSimpleFunction) {
             }
         }
     }
-    EXPECT_TRUE(has_return);
+    CRYO_EXPECT_TRUE(has_return);
     
     delete module;
 }
 
-TEST_F(CodegenTest, GenerateFunctionWithParameters) {
+CRYO_TEST(CodegenTest, GenerateFunctionWithParameters) {
+    CodegenTestHelper helper;
+    helper.setup();
+    
     std::string source = R"(
         function add(x: int, y: int) -> int {
             return x + y;
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto add_func = module->getFunction("add");
-    ASSERT_TRUE(add_func != nullptr);
-    EXPECT_EQ(add_func->arg_size(), 2);
-    EXPECT_TRUE(add_func->getReturnType()->isIntegerTy());
+    CRYO_ASSERT_TRUE(add_func != nullptr);
+    CRYO_EXPECT_EQ(add_func->arg_size(), 2);
+    CRYO_EXPECT_TRUE(add_func->getReturnType()->isIntegerTy());
     
     delete module;
 }
 
-TEST_F(CodegenTest, GenerateMultipleFunctions) {
+CRYO_TEST(CodegenTest, GenerateMultipleFunctions) {
+    CodegenTestHelper helper;
+    helper.setup();
+    
     std::string source = R"(
         function add(x: int, y: int) -> int {
             return x + y;
@@ -127,12 +135,12 @@ TEST_F(CodegenTest, GenerateMultipleFunctions) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
-    EXPECT_TRUE(module->getFunction("add") != nullptr);
-    EXPECT_TRUE(module->getFunction("multiply") != nullptr);
-    EXPECT_TRUE(module->getFunction("main") != nullptr);
+    CRYO_EXPECT_TRUE(module->getFunction("add") != nullptr);
+    CRYO_EXPECT_TRUE(module->getFunction("multiply") != nullptr);
+    CRYO_EXPECT_TRUE(module->getFunction("main") != nullptr);
     
     delete module;
 }
@@ -141,7 +149,10 @@ TEST_F(CodegenTest, GenerateMultipleFunctions) {
 // Variable Declaration Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateConstantDeclaration) {
+CRYO_TEST(CodegenTest, GenerateConstantDeclaration) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const x: int = 42;
@@ -149,11 +160,11 @@ TEST_F(CodegenTest, GenerateConstantDeclaration) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // Check for alloca instruction (local variable)
     bool has_alloca = false;
@@ -165,12 +176,15 @@ TEST_F(CodegenTest, GenerateConstantDeclaration) {
             }
         }
     }
-    EXPECT_TRUE(has_alloca);
+    CRYO_EXPECT_TRUE(has_alloca);
     
     delete module;
 }
 
-TEST_F(CodegenTest, GenerateMutableDeclaration) {
+CRYO_TEST(CodegenTest, GenerateMutableDeclaration) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             mut x: int = 10;
@@ -179,11 +193,11 @@ TEST_F(CodegenTest, GenerateMutableDeclaration) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // Should have store instructions for assignment
     bool has_store = false;
@@ -195,7 +209,7 @@ TEST_F(CodegenTest, GenerateMutableDeclaration) {
             }
         }
     }
-    EXPECT_TRUE(has_store);
+    CRYO_EXPECT_TRUE(has_store);
     
     delete module;
 }
@@ -204,7 +218,10 @@ TEST_F(CodegenTest, GenerateMutableDeclaration) {
 // Arithmetic Expression Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateArithmeticExpressions) {
+CRYO_TEST(CodegenTest, GenerateArithmeticExpressions) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const a: int = 10;
@@ -217,11 +234,11 @@ TEST_F(CodegenTest, GenerateArithmeticExpressions) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // Count arithmetic instructions
     int add_count = 0, sub_count = 0, mul_count = 0, div_count = 0;
@@ -262,7 +279,10 @@ TEST_F(CodegenTest, GenerateArithmeticExpressions) {
 // Comparison Expression Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateComparisonExpressions) {
+CRYO_TEST(CodegenTest, GenerateComparisonExpressions) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const a: int = 10;
@@ -274,11 +294,11 @@ TEST_F(CodegenTest, GenerateComparisonExpressions) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // Check for comparison instructions
     bool has_icmp = false;
@@ -290,7 +310,7 @@ TEST_F(CodegenTest, GenerateComparisonExpressions) {
             }
         }
     }
-    EXPECT_TRUE(has_icmp);
+    CRYO_EXPECT_TRUE(has_icmp);
     
     delete module;
 }
@@ -299,7 +319,10 @@ TEST_F(CodegenTest, GenerateComparisonExpressions) {
 // Control Flow Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateIfStatement) {
+CRYO_TEST(CodegenTest, GenerateIfStatement) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -310,11 +333,11 @@ TEST_F(CodegenTest, GenerateIfStatement) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // Should have multiple basic blocks for if statement
     EXPECT_GT(main_func->getBasicBlockList().size(), 1);
@@ -329,12 +352,15 @@ TEST_F(CodegenTest, GenerateIfStatement) {
             }
         }
     }
-    EXPECT_TRUE(has_branch);
+    CRYO_EXPECT_TRUE(has_branch);
     
     delete module;
 }
 
-TEST_F(CodegenTest, GenerateWhileLoop) {
+CRYO_TEST(CodegenTest, GenerateWhileLoop) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             mut i: int = 0;
@@ -345,11 +371,11 @@ TEST_F(CodegenTest, GenerateWhileLoop) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // While loop should create multiple basic blocks
     EXPECT_GT(main_func->getBasicBlockList().size(), 2);
@@ -361,7 +387,10 @@ TEST_F(CodegenTest, GenerateWhileLoop) {
 // Function Call Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateFunctionCall) {
+CRYO_TEST(CodegenTest, GenerateFunctionCall) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function helper(x: int) -> int {
             return x * 2;
@@ -373,11 +402,11 @@ TEST_F(CodegenTest, GenerateFunctionCall) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // Check for call instruction
     bool has_call = false;
@@ -389,7 +418,7 @@ TEST_F(CodegenTest, GenerateFunctionCall) {
             }
         }
     }
-    EXPECT_TRUE(has_call);
+    CRYO_EXPECT_TRUE(has_call);
     
     delete module;
 }
@@ -398,7 +427,10 @@ TEST_F(CodegenTest, GenerateFunctionCall) {
 // Struct Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateStructAccess) {
+CRYO_TEST(CodegenTest, GenerateStructAccess) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         type struct Point {
             x: int;
@@ -412,11 +444,11 @@ TEST_F(CodegenTest, GenerateStructAccess) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // Should have getelementptr instructions for field access
     bool has_gep = false;
@@ -428,7 +460,7 @@ TEST_F(CodegenTest, GenerateStructAccess) {
             }
         }
     }
-    EXPECT_TRUE(has_gep);
+    CRYO_EXPECT_TRUE(has_gep);
     
     delete module;
 }
@@ -437,7 +469,10 @@ TEST_F(CodegenTest, GenerateStructAccess) {
 // Array Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateArrayAccess) {
+CRYO_TEST(CodegenTest, GenerateArrayAccess) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const numbers: int[] = [1, 2, 3, 4, 5];
@@ -447,11 +482,11 @@ TEST_F(CodegenTest, GenerateArrayAccess) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     auto main_func = module->getFunction("main");
-    ASSERT_TRUE(main_func != nullptr);
+    CRYO_ASSERT_TRUE(main_func != nullptr);
     
     // Should have getelementptr for array indexing
     bool has_gep = false;
@@ -463,7 +498,7 @@ TEST_F(CodegenTest, GenerateArrayAccess) {
             }
         }
     }
-    EXPECT_TRUE(has_gep);
+    CRYO_EXPECT_TRUE(has_gep);
     
     delete module;
 }
@@ -472,7 +507,10 @@ TEST_F(CodegenTest, GenerateArrayAccess) {
 // Optimization Tests
 // ============================================================================
 
-TEST_F(CodegenTest, ConstantFolding) {
+CRYO_TEST(CodegenTest, ConstantFolding) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const result: int = 2 + 3 * 4; // Should be optimized to 14
@@ -480,8 +518,8 @@ TEST_F(CodegenTest, ConstantFolding) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     // After optimization, this might be a simple return of constant 14
     // The exact behavior depends on optimization level
@@ -489,7 +527,10 @@ TEST_F(CodegenTest, ConstantFolding) {
     delete module;
 }
 
-TEST_F(CodegenTest, DeadCodeElimination) {
+CRYO_TEST(CodegenTest, DeadCodeElimination) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const unused: int = 42; // This might be eliminated
@@ -498,8 +539,8 @@ TEST_F(CodegenTest, DeadCodeElimination) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     // After optimization, unused variable might be eliminated
     
@@ -510,7 +551,10 @@ TEST_F(CodegenTest, DeadCodeElimination) {
 // Error Handling Tests
 // ============================================================================
 
-TEST_F(CodegenTest, HandleTypeErrors) {
+CRYO_TEST(CodegenTest, HandleTypeErrors) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const x: int = "not a number"; // Type error
@@ -519,23 +563,26 @@ TEST_F(CodegenTest, HandleTypeErrors) {
     )";
     
     // This should fail during type checking, before codegen
-    auto module = generate_ir(source);
-    EXPECT_TRUE(module == nullptr || compiler->has_errors());
+    auto module = helper.generate_ir(source);
+    CRYO_EXPECT_TRUE(module == nullptr || compiler->has_errors());
     
     if (module) {
         delete module;
     }
 }
 
-TEST_F(CodegenTest, HandleUndefinedFunction) {
+CRYO_TEST(CodegenTest, HandleUndefinedFunction) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             return undefined_function(); // Should cause error
         }
     )";
     
-    auto module = generate_ir(source);
-    EXPECT_TRUE(module == nullptr || compiler->has_errors());
+    auto module = helper.generate_ir(source);
+    CRYO_EXPECT_TRUE(module == nullptr || compiler->has_errors());
     
     if (module) {
         delete module;
@@ -546,7 +593,10 @@ TEST_F(CodegenTest, HandleUndefinedFunction) {
 // Memory Management Tests
 // ============================================================================
 
-TEST_F(CodegenTest, GenerateHeapAllocation) {
+CRYO_TEST(CodegenTest, GenerateHeapAllocation) {
+    CodegenTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const numbers: int[] = [1, 2, 3, 4, 5];
@@ -554,8 +604,8 @@ TEST_F(CodegenTest, GenerateHeapAllocation) {
         }
     )";
     
-    auto module = generate_ir(source);
-    ASSERT_TRUE(module != nullptr);
+    auto module = helper.generate_ir(source);
+    CRYO_ASSERT_TRUE(module != nullptr);
     
     // Should contain calls to memory allocation functions
     bool has_malloc_call = false;

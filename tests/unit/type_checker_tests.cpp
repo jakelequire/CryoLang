@@ -1,4 +1,3 @@
-#include <gtest/gtest.h>
 #include "test_utils.hpp"
 #include "AST/TypeChecker.hpp"
 
@@ -8,8 +7,8 @@ class TypeCheckerTest : public CryoTestBase {
 protected:
     std::unique_ptr<Cryo::TypeChecker> type_checker;
     
-    void SetUp() override {
-        CryoTestBase::SetUp();
+    void setup() override {
+        CryoTestBase::setup();
         if (ast_context) {
             type_checker = std::make_unique<Cryo::TypeChecker>(
                 ast_context->types(), 
@@ -24,110 +23,140 @@ protected:
 // Basic Type Inference Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, InferIntegerLiteralType) {
+CRYO_TEST(TypeCheckerTest, InferIntegerLiteralType) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = "const x: int = 42;";
-    auto ast = parse_source(source);
+    auto ast = helper.parse_source(source);
     
-    ASSERT_TRUE(ast != nullptr);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     
     // Run type checker
     type_checker->check(ast.get());
     
     // Verify no type errors
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, InferFloatLiteralType) {
+CRYO_TEST(TypeCheckerTest, InferFloatLiteralType) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = "const pi: float = 3.14;";
-    auto ast = parse_source(source);
+    auto ast = helper.parse_source(source);
     
-    ASSERT_TRUE(ast != nullptr);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, InferStringLiteralType) {
+CRYO_TEST(TypeCheckerTest, InferStringLiteralType) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(const message: string = "Hello, World!";)";
-    auto ast = parse_source(source);
+    auto ast = helper.parse_source(source);
     
-    ASSERT_TRUE(ast != nullptr);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, InferBooleanLiteralType) {
+CRYO_TEST(TypeCheckerTest, InferBooleanLiteralType) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = "const flag: boolean = true;";
-    auto ast = parse_source(source);
+    auto ast = helper.parse_source(source);
     
-    ASSERT_TRUE(ast != nullptr);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
 // ============================================================================
 // Type Mismatch Detection Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, DetectIntegerStringMismatch) {
+CRYO_TEST(TypeCheckerTest, DetectIntegerStringMismatch) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(const x: int = "not a number";)";
-    auto ast = parse_source(source);
+    auto ast = helper.parse_source(source);
     
-    ASSERT_TRUE(ast != nullptr);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, DetectFloatIntegerMismatch) {
+CRYO_TEST(TypeCheckerTest, DetectFloatIntegerMismatch) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = "const x: float = 42;"; // Should be 42.0
-    auto ast = parse_source(source);
+    auto ast = helper.parse_source(source);
     
-    ASSERT_TRUE(ast != nullptr);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
     
     // This might pass if implicit conversion is allowed
     // Adjust expectation based on language design
 }
 
-TEST_F(TypeCheckerTest, DetectBooleanIntegerMismatch) {
+CRYO_TEST(TypeCheckerTest, DetectBooleanIntegerMismatch) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = "const x: boolean = 1;"; // Should be true/false
-    auto ast = parse_source(source);
+    auto ast = helper.parse_source(source);
     
-    ASSERT_TRUE(ast != nullptr);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
 // ============================================================================
 // Function Type Checking Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, CheckFunctionReturnType) {
+CRYO_TEST(TypeCheckerTest, CheckFunctionReturnType) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function add(x: int, y: int) -> int {
             return x + y;
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, DetectWrongReturnType) {
+CRYO_TEST(TypeCheckerTest, DetectWrongReturnType) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function get_message() -> string {
             return 42; // Wrong return type
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, CheckFunctionParameterTypes) {
+CRYO_TEST(TypeCheckerTest, CheckFunctionParameterTypes) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function multiply(x: int, y: int) -> int {
             return x * y;
@@ -138,13 +167,16 @@ TEST_F(TypeCheckerTest, CheckFunctionParameterTypes) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, DetectWrongParameterTypes) {
+CRYO_TEST(TypeCheckerTest, DetectWrongParameterTypes) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function multiply(x: int, y: int) -> int {
             return x * y;
@@ -155,17 +187,20 @@ TEST_F(TypeCheckerTest, DetectWrongParameterTypes) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
 // ============================================================================
 // Binary Expression Type Checking Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, CheckArithmeticExpressions) {
+CRYO_TEST(TypeCheckerTest, CheckArithmeticExpressions) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const a: int = 5;
@@ -178,13 +213,16 @@ TEST_F(TypeCheckerTest, CheckArithmeticExpressions) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, CheckComparisonExpressions) {
+CRYO_TEST(TypeCheckerTest, CheckComparisonExpressions) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const a: int = 5;
@@ -196,13 +234,16 @@ TEST_F(TypeCheckerTest, CheckComparisonExpressions) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, CheckLogicalExpressions) {
+CRYO_TEST(TypeCheckerTest, CheckLogicalExpressions) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const a: boolean = true;
@@ -214,17 +255,20 @@ TEST_F(TypeCheckerTest, CheckLogicalExpressions) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
 // ============================================================================
 // Struct Type Checking Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, CheckStructFieldAccess) {
+CRYO_TEST(TypeCheckerTest, CheckStructFieldAccess) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         type struct Point {
             x: int;
@@ -239,13 +283,16 @@ TEST_F(TypeCheckerTest, CheckStructFieldAccess) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, DetectInvalidFieldAccess) {
+CRYO_TEST(TypeCheckerTest, DetectInvalidFieldAccess) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         type struct Point {
             x: int;
@@ -259,17 +306,20 @@ TEST_F(TypeCheckerTest, DetectInvalidFieldAccess) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
 // ============================================================================
 // Array Type Checking Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, CheckArrayAccess) {
+CRYO_TEST(TypeCheckerTest, CheckArrayAccess) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const numbers: int[] = [1, 2, 3, 4, 5];
@@ -279,13 +329,16 @@ TEST_F(TypeCheckerTest, CheckArrayAccess) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, DetectArrayTypeMismatch) {
+CRYO_TEST(TypeCheckerTest, DetectArrayTypeMismatch) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const numbers: int[] = ["one", "two", "three"]; // String array assigned to int array
@@ -293,17 +346,20 @@ TEST_F(TypeCheckerTest, DetectArrayTypeMismatch) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
 // ============================================================================
 // Control Flow Type Checking Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, CheckIfConditionType) {
+CRYO_TEST(TypeCheckerTest, CheckIfConditionType) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -314,13 +370,16 @@ TEST_F(TypeCheckerTest, CheckIfConditionType) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, DetectNonBooleanCondition) {
+CRYO_TEST(TypeCheckerTest, DetectNonBooleanCondition) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -331,8 +390,8 @@ TEST_F(TypeCheckerTest, DetectNonBooleanCondition) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
     // This might pass if implicit conversion is allowed
 }
@@ -341,7 +400,10 @@ TEST_F(TypeCheckerTest, DetectNonBooleanCondition) {
 // Variable Scope Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, CheckVariableScope) {
+CRYO_TEST(TypeCheckerTest, CheckVariableScope) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -353,30 +415,36 @@ TEST_F(TypeCheckerTest, CheckVariableScope) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, DetectUndeclaredVariable) {
+CRYO_TEST(TypeCheckerTest, DetectUndeclaredVariable) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             return undeclared_variable; // Should cause error
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
 // ============================================================================
 // Generic Type Checking Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, CheckGenericInstantiation) {
+CRYO_TEST(TypeCheckerTest, CheckGenericInstantiation) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         type struct Container<T> {
             value: T;
@@ -389,17 +457,20 @@ TEST_F(TypeCheckerTest, CheckGenericInstantiation) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
 // ============================================================================
 // Mutability Checking Tests
 // ============================================================================
 
-TEST_F(TypeCheckerTest, CheckConstantMutability) {
+CRYO_TEST(TypeCheckerTest, CheckConstantMutability) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -408,13 +479,16 @@ TEST_F(TypeCheckerTest, CheckConstantMutability) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors()); // No assignment, so no error
+    CRYO_EXPECT_FALSE(compiler->has_errors()); // No assignment, so no error
 }
 
-TEST_F(TypeCheckerTest, DetectConstantAssignment) {
+CRYO_TEST(TypeCheckerTest, DetectConstantAssignment) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -423,13 +497,16 @@ TEST_F(TypeCheckerTest, DetectConstantAssignment) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
-TEST_F(TypeCheckerTest, CheckMutableAssignment) {
+CRYO_TEST(TypeCheckerTest, CheckMutableAssignment) {
+    TypeCheckerTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             mut x: int = 10;
@@ -438,10 +515,10 @@ TEST_F(TypeCheckerTest, CheckMutableAssignment) {
         }
     )";
     
-    auto ast = parse_source(source);
-    ASSERT_TRUE(ast != nullptr);
+    auto ast = helper.parse_source(source);
+    CRYO_ASSERT_TRUE(ast != nullptr);
     type_checker->check(ast.get());
-    EXPECT_FALSE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compiler->has_errors());
 }
 
 } // namespace CryoTest

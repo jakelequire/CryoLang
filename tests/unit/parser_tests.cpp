@@ -1,4 +1,3 @@
-#include <gtest/gtest.h>
 #include "test_utils.hpp"
 #include "Parser/Parser.hpp"
 #include "AST/ASTNode.hpp"
@@ -12,62 +11,74 @@ class ParserTest : public ParserTestFixture {
 // Basic Statement Parsing Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseVariableDeclaration) {
+CRYO_TEST(ParserTest, ParseVariableDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "const x: int = 42;";
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
-    EXPECT_EQ(ast->statements().size(), 1);
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
+    CRYO_EXPECT_EQ(ast->statements().size(), 1);
     
     auto stmt = ast->statements()[0].get();
-    EXPECT_EQ(stmt->kind(), Cryo::NodeKind::VariableDeclaration);
+    CRYO_EXPECT_EQ(stmt->kind(), Cryo::NodeKind::VariableDeclaration);
     
     auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(stmt);
-    ASSERT_TRUE(var_decl != nullptr);
-    EXPECT_EQ(var_decl->name(), "x");
-    EXPECT_EQ(var_decl->type_annotation(), "int");
-    EXPECT_TRUE(var_decl->initializer() != nullptr);
+    CRYO_ASSERT_TRUE(var_decl != nullptr);
+    CRYO_EXPECT_EQ(var_decl->name(), "x");
+    CRYO_EXPECT_EQ(var_decl->type_annotation(), "int");
+    CRYO_EXPECT_TRUE(var_decl->initializer() != nullptr);
 }
 
-TEST_F(ParserTest, ParseMutableVariableDeclaration) {
+CRYO_TEST(ParserTest, ParseMutableVariableDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "mut y: float = 3.14;";
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto stmt = ast->statements()[0].get();
     auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(stmt);
-    ASSERT_TRUE(var_decl != nullptr);
-    EXPECT_EQ(var_decl->name(), "y");
-    EXPECT_EQ(var_decl->type_annotation(), "float");
-    EXPECT_TRUE(var_decl->is_mutable());
+    CRYO_ASSERT_TRUE(var_decl != nullptr);
+    CRYO_EXPECT_EQ(var_decl->name(), "y");
+    CRYO_EXPECT_EQ(var_decl->type_annotation(), "float");
+    CRYO_EXPECT_TRUE(var_decl->is_mutable());
 }
 
-TEST_F(ParserTest, ParseVariableWithoutInitializer) {
+CRYO_TEST(ParserTest, ParseVariableWithoutInitializer) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "mut z: string;";
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto stmt = ast->statements()[0].get();
     auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(stmt);
-    ASSERT_TRUE(var_decl != nullptr);
-    EXPECT_EQ(var_decl->name(), "z");
-    EXPECT_EQ(var_decl->type_annotation(), "string");
-    EXPECT_TRUE(var_decl->initializer() == nullptr);
+    CRYO_ASSERT_TRUE(var_decl != nullptr);
+    CRYO_EXPECT_EQ(var_decl->name(), "z");
+    CRYO_EXPECT_EQ(var_decl->type_annotation(), "string");
+    CRYO_EXPECT_TRUE(var_decl->initializer() == nullptr);
 }
 
 // ============================================================================
 // Function Declaration Parsing Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseSimpleFunctionDeclaration) {
+CRYO_TEST(ParserTest, ParseSimpleFunctionDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function add(x: int, y: int) -> int {
             return x + y;
@@ -77,28 +88,31 @@ TEST_F(ParserTest, ParseSimpleFunctionDeclaration) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
-    EXPECT_EQ(ast->statements().size(), 1);
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
+    CRYO_EXPECT_EQ(ast->statements().size(), 1);
     
     auto stmt = ast->statements()[0].get();
-    EXPECT_EQ(stmt->kind(), Cryo::NodeKind::FunctionDeclaration);
+    CRYO_EXPECT_EQ(stmt->kind(), Cryo::NodeKind::FunctionDeclaration);
     
     auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(stmt);
-    ASSERT_TRUE(func_decl != nullptr);
-    EXPECT_EQ(func_decl->name(), "add");
-    EXPECT_EQ(func_decl->parameters().size(), 2);
-    EXPECT_EQ(func_decl->return_type()->name(), "int");
-    EXPECT_TRUE(func_decl->body() != nullptr);
+    CRYO_ASSERT_TRUE(func_decl != nullptr);
+    CRYO_EXPECT_EQ(func_decl->name(), "add");
+    CRYO_EXPECT_EQ(func_decl->parameters().size(), 2);
+    CRYO_EXPECT_EQ(func_decl->return_type()->name(), "int");
+    CRYO_EXPECT_TRUE(func_decl->body() != nullptr);
     
     // Check parameters
-    EXPECT_EQ(func_decl->parameters()[0]->name(), "x");
-    EXPECT_EQ(func_decl->parameters()[0]->type_annotation(), "int");
-    EXPECT_EQ(func_decl->parameters()[1]->name(), "y");
-    EXPECT_EQ(func_decl->parameters()[1]->type_annotation(), "int");
+    CRYO_EXPECT_EQ(func_decl->parameters()[0]->name(), "x");
+    CRYO_EXPECT_EQ(func_decl->parameters()[0]->type_annotation(), "int");
+    CRYO_EXPECT_EQ(func_decl->parameters()[1]->name(), "y");
+    CRYO_EXPECT_EQ(func_decl->parameters()[1]->type_annotation(), "int");
 }
 
-TEST_F(ParserTest, ParseFunctionWithNoParameters) {
+CRYO_TEST(ParserTest, ParseFunctionWithNoParameters) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function main() -> int {
             return 0;
@@ -108,16 +122,19 @@ TEST_F(ParserTest, ParseFunctionWithNoParameters) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(func_decl != nullptr);
-    EXPECT_EQ(func_decl->name(), "main");
-    EXPECT_EQ(func_decl->parameters().size(), 0);
+    CRYO_ASSERT_TRUE(func_decl != nullptr);
+    CRYO_EXPECT_EQ(func_decl->name(), "main");
+    CRYO_EXPECT_EQ(func_decl->parameters().size(), 0);
 }
 
-TEST_F(ParserTest, ParseFunctionWithVoidReturn) {
+CRYO_TEST(ParserTest, ParseFunctionWithVoidReturn) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function print_hello() -> void {
             return;
@@ -127,91 +144,106 @@ TEST_F(ParserTest, ParseFunctionWithVoidReturn) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(func_decl != nullptr);
-    EXPECT_EQ(func_decl->name(), "print_hello");
-    EXPECT_EQ(func_decl->return_type()->name(), "void");
+    CRYO_ASSERT_TRUE(func_decl != nullptr);
+    CRYO_EXPECT_EQ(func_decl->name(), "print_hello");
+    CRYO_EXPECT_EQ(func_decl->return_type()->name(), "void");
 }
 
 // ============================================================================
 // Expression Parsing Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseBinaryExpression) {
+CRYO_TEST(ParserTest, ParseBinaryExpression) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "const result: int = x + y * 2;";
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(var_decl != nullptr);
-    ASSERT_TRUE(var_decl->initializer() != nullptr);
+    CRYO_ASSERT_TRUE(var_decl != nullptr);
+    CRYO_ASSERT_TRUE(var_decl->initializer() != nullptr);
     
     auto binary_expr = dynamic_cast<Cryo::BinaryExpressionNode*>(var_decl->initializer());
-    ASSERT_TRUE(binary_expr != nullptr);
-    EXPECT_EQ(binary_expr->operator_token().kind(), Cryo::TokenKind::TK_PLUS);
+    CRYO_ASSERT_TRUE(binary_expr != nullptr);
+    CRYO_EXPECT_EQ(binary_expr->operator_token().kind(), Cryo::TokenKind::TK_PLUS);
 }
 
-TEST_F(ParserTest, ParseUnaryExpression) {
+CRYO_TEST(ParserTest, ParseUnaryExpression) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "const negative: int = -x;";
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(var_decl != nullptr);
-    ASSERT_TRUE(var_decl->initializer() != nullptr);
+    CRYO_ASSERT_TRUE(var_decl != nullptr);
+    CRYO_ASSERT_TRUE(var_decl->initializer() != nullptr);
     
     auto unary_expr = dynamic_cast<Cryo::UnaryExpressionNode*>(var_decl->initializer());
-    ASSERT_TRUE(unary_expr != nullptr);
-    EXPECT_EQ(unary_expr->operator_token().kind(), Cryo::TokenKind::TK_MINUS);
+    CRYO_ASSERT_TRUE(unary_expr != nullptr);
+    CRYO_EXPECT_EQ(unary_expr->operator_token().kind(), Cryo::TokenKind::TK_MINUS);
 }
 
-TEST_F(ParserTest, ParseTernaryExpression) {
+CRYO_TEST(ParserTest, ParseTernaryExpression) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "const result: int = x > 0 ? 1 : 0;";
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(var_decl != nullptr);
-    ASSERT_TRUE(var_decl->initializer() != nullptr);
+    CRYO_ASSERT_TRUE(var_decl != nullptr);
+    CRYO_ASSERT_TRUE(var_decl->initializer() != nullptr);
     
     auto ternary_expr = dynamic_cast<Cryo::TernaryExpressionNode*>(var_decl->initializer());
-    ASSERT_TRUE(ternary_expr != nullptr);
+    CRYO_ASSERT_TRUE(ternary_expr != nullptr);
 }
 
-TEST_F(ParserTest, ParseFunctionCall) {
+CRYO_TEST(ParserTest, ParseFunctionCall) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "const result: int = add(5, 10);";
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(var_decl != nullptr);
-    ASSERT_TRUE(var_decl->initializer() != nullptr);
+    CRYO_ASSERT_TRUE(var_decl != nullptr);
+    CRYO_ASSERT_TRUE(var_decl->initializer() != nullptr);
     
     auto call_expr = dynamic_cast<Cryo::CallExpressionNode*>(var_decl->initializer());
-    ASSERT_TRUE(call_expr != nullptr);
-    EXPECT_EQ(call_expr->arguments().size(), 2);
+    CRYO_ASSERT_TRUE(call_expr != nullptr);
+    CRYO_EXPECT_EQ(call_expr->arguments().size(), 2);
 }
 
 // ============================================================================
 // Control Flow Parsing Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseIfStatement) {
+CRYO_TEST(ParserTest, ParseIfStatement) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function test() -> void {
             if (x > 0) {
@@ -223,24 +255,27 @@ TEST_F(ParserTest, ParseIfStatement) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(func_decl != nullptr);
+    CRYO_ASSERT_TRUE(func_decl != nullptr);
     
     auto block = func_decl->body();
-    ASSERT_TRUE(block != nullptr);
-    EXPECT_EQ(block->statements().size(), 1);
+    CRYO_ASSERT_TRUE(block != nullptr);
+    CRYO_EXPECT_EQ(block->statements().size(), 1);
     
     auto if_stmt = dynamic_cast<Cryo::IfStatementNode*>(block->statements()[0].get());
-    ASSERT_TRUE(if_stmt != nullptr);
-    EXPECT_TRUE(if_stmt->condition() != nullptr);
-    EXPECT_TRUE(if_stmt->then_branch() != nullptr);
-    EXPECT_TRUE(if_stmt->else_branch() == nullptr);
+    CRYO_ASSERT_TRUE(if_stmt != nullptr);
+    CRYO_EXPECT_TRUE(if_stmt->condition() != nullptr);
+    CRYO_EXPECT_TRUE(if_stmt->then_branch() != nullptr);
+    CRYO_EXPECT_TRUE(if_stmt->else_branch() == nullptr);
 }
 
-TEST_F(ParserTest, ParseIfElseStatement) {
+CRYO_TEST(ParserTest, ParseIfElseStatement) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function test() -> void {
             if (x > 0) {
@@ -254,20 +289,23 @@ TEST_F(ParserTest, ParseIfElseStatement) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(ast->statements()[0].get());
     auto if_stmt = dynamic_cast<Cryo::IfStatementNode*>(
         func_decl->body()->statements()[0].get());
     
-    ASSERT_TRUE(if_stmt != nullptr);
-    EXPECT_TRUE(if_stmt->condition() != nullptr);
-    EXPECT_TRUE(if_stmt->then_branch() != nullptr);
-    EXPECT_TRUE(if_stmt->else_branch() != nullptr);
+    CRYO_ASSERT_TRUE(if_stmt != nullptr);
+    CRYO_EXPECT_TRUE(if_stmt->condition() != nullptr);
+    CRYO_EXPECT_TRUE(if_stmt->then_branch() != nullptr);
+    CRYO_EXPECT_TRUE(if_stmt->else_branch() != nullptr);
 }
 
-TEST_F(ParserTest, ParseWhileLoop) {
+CRYO_TEST(ParserTest, ParseWhileLoop) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function test() -> void {
             while (x < 10) {
@@ -279,19 +317,22 @@ TEST_F(ParserTest, ParseWhileLoop) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(ast->statements()[0].get());
     auto while_stmt = dynamic_cast<Cryo::WhileStatementNode*>(
         func_decl->body()->statements()[0].get());
     
-    ASSERT_TRUE(while_stmt != nullptr);
-    EXPECT_TRUE(while_stmt->condition() != nullptr);
-    EXPECT_TRUE(while_stmt->body() != nullptr);
+    CRYO_ASSERT_TRUE(while_stmt != nullptr);
+    CRYO_EXPECT_TRUE(while_stmt->condition() != nullptr);
+    CRYO_EXPECT_TRUE(while_stmt->body() != nullptr);
 }
 
-TEST_F(ParserTest, ParseForLoop) {
+CRYO_TEST(ParserTest, ParseForLoop) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function test() -> void {
             for (mut i: int = 0; i < 10; i++) {
@@ -303,25 +344,28 @@ TEST_F(ParserTest, ParseForLoop) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(ast->statements()[0].get());
     auto for_stmt = dynamic_cast<Cryo::ForStatementNode*>(
         func_decl->body()->statements()[0].get());
     
-    ASSERT_TRUE(for_stmt != nullptr);
-    EXPECT_TRUE(for_stmt->initializer() != nullptr);
-    EXPECT_TRUE(for_stmt->condition() != nullptr);
-    EXPECT_TRUE(for_stmt->increment() != nullptr);
-    EXPECT_TRUE(for_stmt->body() != nullptr);
+    CRYO_ASSERT_TRUE(for_stmt != nullptr);
+    CRYO_EXPECT_TRUE(for_stmt->initializer() != nullptr);
+    CRYO_EXPECT_TRUE(for_stmt->condition() != nullptr);
+    CRYO_EXPECT_TRUE(for_stmt->increment() != nullptr);
+    CRYO_EXPECT_TRUE(for_stmt->body() != nullptr);
 }
 
 // ============================================================================
 // Struct Declaration Parsing Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseStructDeclaration) {
+CRYO_TEST(ParserTest, ParseStructDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         type struct Point {
             x: int;
@@ -332,26 +376,29 @@ TEST_F(ParserTest, ParseStructDeclaration) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
-    EXPECT_EQ(ast->statements().size(), 1);
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
+    CRYO_EXPECT_EQ(ast->statements().size(), 1);
     
     auto stmt = ast->statements()[0].get();
-    EXPECT_EQ(stmt->kind(), Cryo::NodeKind::StructDeclaration);
+    CRYO_EXPECT_EQ(stmt->kind(), Cryo::NodeKind::StructDeclaration);
     
     auto struct_decl = dynamic_cast<Cryo::StructDeclarationNode*>(stmt);
-    ASSERT_TRUE(struct_decl != nullptr);
-    EXPECT_EQ(struct_decl->name(), "Point");
-    EXPECT_EQ(struct_decl->fields().size(), 2);
+    CRYO_ASSERT_TRUE(struct_decl != nullptr);
+    CRYO_EXPECT_EQ(struct_decl->name(), "Point");
+    CRYO_EXPECT_EQ(struct_decl->fields().size(), 2);
     
     // Check fields
-    EXPECT_EQ(struct_decl->fields()[0]->name(), "x");
-    EXPECT_EQ(struct_decl->fields()[0]->type_annotation(), "int");
-    EXPECT_EQ(struct_decl->fields()[1]->name(), "y");
-    EXPECT_EQ(struct_decl->fields()[1]->type_annotation(), "int");
+    CRYO_EXPECT_EQ(struct_decl->fields()[0]->name(), "x");
+    CRYO_EXPECT_EQ(struct_decl->fields()[0]->type_annotation(), "int");
+    CRYO_EXPECT_EQ(struct_decl->fields()[1]->name(), "y");
+    CRYO_EXPECT_EQ(struct_decl->fields()[1]->type_annotation(), "int");
 }
 
-TEST_F(ParserTest, ParseStructWithMethods) {
+CRYO_TEST(ParserTest, ParseStructWithMethods) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         type struct Point {
             x: int;
@@ -365,21 +412,24 @@ TEST_F(ParserTest, ParseStructWithMethods) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto struct_decl = dynamic_cast<Cryo::StructDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(struct_decl != nullptr);
-    EXPECT_EQ(struct_decl->name(), "Point");
-    EXPECT_EQ(struct_decl->fields().size(), 2);
-    EXPECT_EQ(struct_decl->methods().size(), 2);
+    CRYO_ASSERT_TRUE(struct_decl != nullptr);
+    CRYO_EXPECT_EQ(struct_decl->name(), "Point");
+    CRYO_EXPECT_EQ(struct_decl->fields().size(), 2);
+    CRYO_EXPECT_EQ(struct_decl->methods().size(), 2);
 }
 
 // ============================================================================
 // Class Declaration Parsing Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseClassDeclaration) {
+CRYO_TEST(ParserTest, ParseClassDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         type class Circle {
         public:
@@ -396,20 +446,23 @@ TEST_F(ParserTest, ParseClassDeclaration) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
-    EXPECT_EQ(ast->statements().size(), 1);
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
+    CRYO_EXPECT_EQ(ast->statements().size(), 1);
     
     auto class_decl = dynamic_cast<Cryo::ClassDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(class_decl != nullptr);
-    EXPECT_EQ(class_decl->name(), "Circle");
+    CRYO_ASSERT_TRUE(class_decl != nullptr);
+    CRYO_EXPECT_EQ(class_decl->name(), "Circle");
 }
 
 // ============================================================================
 // Enum Declaration Parsing Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseSimpleEnum) {
+CRYO_TEST(ParserTest, ParseSimpleEnum) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         enum Color {
             RED,
@@ -421,16 +474,19 @@ TEST_F(ParserTest, ParseSimpleEnum) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto enum_decl = dynamic_cast<Cryo::EnumDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(enum_decl != nullptr);
-    EXPECT_EQ(enum_decl->name(), "Color");
-    EXPECT_EQ(enum_decl->variants().size(), 3);
+    CRYO_ASSERT_TRUE(enum_decl != nullptr);
+    CRYO_EXPECT_EQ(enum_decl->name(), "Color");
+    CRYO_EXPECT_EQ(enum_decl->variants().size(), 3);
 }
 
-TEST_F(ParserTest, ParseComplexEnum) {
+CRYO_TEST(ParserTest, ParseComplexEnum) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         enum Shape {
             Circle(float),
@@ -442,20 +498,23 @@ TEST_F(ParserTest, ParseComplexEnum) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     auto enum_decl = dynamic_cast<Cryo::EnumDeclarationNode*>(ast->statements()[0].get());
-    ASSERT_TRUE(enum_decl != nullptr);
-    EXPECT_EQ(enum_decl->name(), "Shape");
-    EXPECT_EQ(enum_decl->variants().size(), 3);
+    CRYO_ASSERT_TRUE(enum_decl != nullptr);
+    CRYO_EXPECT_EQ(enum_decl->name(), "Shape");
+    CRYO_EXPECT_EQ(enum_decl->variants().size(), 3);
 }
 
 // ============================================================================
 // Namespace and Import Parsing Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseNamespaceDeclaration) {
+CRYO_TEST(ParserTest, ParseNamespaceDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         namespace MyModule;
         
@@ -467,12 +526,15 @@ TEST_F(ParserTest, ParseNamespaceDeclaration) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
-    EXPECT_EQ(parser->current_namespace(), "MyModule");
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
+    CRYO_EXPECT_EQ(parser->current_namespace(), "MyModule");
 }
 
-TEST_F(ParserTest, ParseImportDeclaration) {
+CRYO_TEST(ParserTest, ParseImportDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         import IO from <io/stdio>;
         import <core/types>;
@@ -485,30 +547,36 @@ TEST_F(ParserTest, ParseImportDeclaration) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
     
     // First two statements should be imports
     auto import1 = dynamic_cast<Cryo::ImportDeclarationNode*>(ast->statements()[0].get());
     auto import2 = dynamic_cast<Cryo::ImportDeclarationNode*>(ast->statements()[1].get());
     
-    ASSERT_TRUE(import1 != nullptr);
-    ASSERT_TRUE(import2 != nullptr);
+    CRYO_ASSERT_TRUE(import1 != nullptr);
+    CRYO_ASSERT_TRUE(import2 != nullptr);
 }
 
 // ============================================================================
 // Error Handling Tests
 // ============================================================================
 
-TEST_F(ParserTest, HandleMissingSemicolon) {
+CRYO_TEST(ParserTest, HandleMissingSemicolon) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "const x: int = 42"; // Missing semicolon
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    EXPECT_TRUE(parser->has_errors());
+    CRYO_EXPECT_TRUE(parser->has_errors());
 }
 
-TEST_F(ParserTest, HandleMissingClosingBrace) {
+CRYO_TEST(ParserTest, HandleMissingClosingBrace) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         function test() -> void {
             return;
@@ -518,22 +586,28 @@ TEST_F(ParserTest, HandleMissingClosingBrace) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    EXPECT_TRUE(parser->has_errors());
+    CRYO_EXPECT_TRUE(parser->has_errors());
 }
 
-TEST_F(ParserTest, HandleInvalidExpression) {
+CRYO_TEST(ParserTest, HandleInvalidExpression) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = "const x: int = + + +;"; // Invalid expression
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    EXPECT_TRUE(parser->has_errors());
+    CRYO_EXPECT_TRUE(parser->has_errors());
 }
 
 // ============================================================================
 // Complex Program Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseCompleteProgram) {
+CRYO_TEST(ParserTest, ParseCompleteProgram) {
+    ParserTestHelper helper;
+    helper.setup();
+
     std::string source = R"(
         namespace TestModule;
         
@@ -566,9 +640,9 @@ TEST_F(ParserTest, ParseCompleteProgram) {
     auto parser = create_parser(source);
     auto ast = parser->parse_program();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
-    EXPECT_EQ(parser->current_namespace(), "TestModule");
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
+    CRYO_EXPECT_EQ(parser->current_namespace(), "TestModule");
     EXPECT_GT(ast->statements().size(), 3); // Import, struct, functions
 }
 
@@ -576,7 +650,10 @@ TEST_F(ParserTest, ParseCompleteProgram) {
 // Performance Tests
 // ============================================================================
 
-TEST_F(ParserTest, ParseLargeProgram) {
+CRYO_TEST(ParserTest, ParseLargeProgram) {
+    ParserTestHelper helper;
+    helper.setup();
+
     // Generate a large program for performance testing
     std::string large_source = "namespace TestModule;\n";
     
@@ -597,9 +674,9 @@ TEST_F(ParserTest, ParseLargeProgram) {
     
     double elapsed = timer.elapsed_ms();
     
-    ASSERT_TRUE(ast != nullptr);
-    EXPECT_FALSE(parser->has_errors());
-    EXPECT_EQ(ast->statements().size(), 100); // 100 functions
+    CRYO_ASSERT_TRUE(ast != nullptr);
+    CRYO_EXPECT_FALSE(parser->has_errors());
+    CRYO_EXPECT_EQ(ast->statements().size(), 100); // 100 functions
     EXPECT_LT(elapsed, 5000.0) << "Parsing should complete within 5 seconds";
     
     std::cout << "Parsed large program (" << ast->statements().size() 

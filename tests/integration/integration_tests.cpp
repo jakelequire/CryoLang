@@ -1,17 +1,16 @@
-#include <gtest/gtest.h>
 #include "test_utils.hpp"
 #include <filesystem>
 #include <fstream>
 
 namespace CryoTest {
 
-class IntegrationTest : public CryoTestBase {
-protected:
+class IntegrationTestHelper : public CryoTestBase {
+public:
     std::filesystem::path temp_dir;
     std::filesystem::path exe_path;
     
-    void SetUp() override {
-        CryoTestBase::SetUp();
+    void setup() {
+        CryoTestBase::setup();
         
         // Create temporary directory for integration tests
         temp_dir = std::filesystem::temp_directory_path() / "cryo_integration_tests";
@@ -23,12 +22,12 @@ protected:
         #endif
     }
     
-    void TearDown() override {
+    void teardown() {
         // Clean up temporary files
         if (std::filesystem::exists(temp_dir)) {
             std::filesystem::remove_all(temp_dir);
         }
-        CryoTestBase::TearDown();
+        CryoTestBase::teardown();
     }
     
     bool compile_and_run(const std::string& source, std::string& output, int& exit_code) {
@@ -95,10 +94,15 @@ protected:
 // Basic Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunHelloWorld) {
+CRYO_TEST(IntegrationTest, CompileAndRunHelloWorld) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
+        namespace Main;
+        import IO from <io/stdio>;
+        
         function main() -> int {
-            printf("Hello, World!\n");
+            IO::println("Hello, World!");
             return 0;
         }
     )";
@@ -106,12 +110,16 @@ TEST_F(IntegrationTest, CompileAndRunHelloWorld) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 0);
-    EXPECT_TRUE(output.find("Hello, World!") != std::string::npos);
+    CRYO_ASSERT_TRUE(helper.compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 0);
+    CRYO_EXPECT_TRUE(output.find("Hello, World!") != std::string::npos);
+    
+    helper.teardown();
 }
 
-TEST_F(IntegrationTest, CompileAndRunArithmetic) {
+CRYO_TEST(IntegrationTest, CompileAndRunArithmetic) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const a: int = 10;
@@ -125,12 +133,14 @@ TEST_F(IntegrationTest, CompileAndRunArithmetic) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 15); // Return value should be 15
-    EXPECT_TRUE(output.find("Sum: 15") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 15); // Return value should be 15
+    CRYO_EXPECT_TRUE(output.find("Sum: 15") != std::string::npos);
 }
 
-TEST_F(IntegrationTest, CompileAndRunFunctionCall) {
+CRYO_TEST(IntegrationTest, CompileAndRunFunctionCall) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function multiply(x: int, y: int) -> int {
             return x * y;
@@ -146,16 +156,18 @@ TEST_F(IntegrationTest, CompileAndRunFunctionCall) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 42);
-    EXPECT_TRUE(output.find("Result: 42") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 42);
+    CRYO_EXPECT_TRUE(output.find("Result: 42") != std::string::npos);
 }
 
 // ============================================================================
 // Control Flow Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunIfStatement) {
+CRYO_TEST(IntegrationTest, CompileAndRunIfStatement) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = 10;
@@ -172,12 +184,14 @@ TEST_F(IntegrationTest, CompileAndRunIfStatement) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 1);
-    EXPECT_TRUE(output.find("x is greater than 5") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 1);
+    CRYO_EXPECT_TRUE(output.find("x is greater than 5") != std::string::npos);
 }
 
-TEST_F(IntegrationTest, CompileAndRunWhileLoop) {
+CRYO_TEST(IntegrationTest, CompileAndRunWhileLoop) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             mut i: int = 0;
@@ -196,12 +210,14 @@ TEST_F(IntegrationTest, CompileAndRunWhileLoop) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 10); // 0+1+2+3+4 = 10
-    EXPECT_TRUE(output.find("Sum: 10") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 10); // 0+1+2+3+4 = 10
+    CRYO_EXPECT_TRUE(output.find("Sum: 10") != std::string::npos);
 }
 
-TEST_F(IntegrationTest, CompileAndRunForLoop) {
+CRYO_TEST(IntegrationTest, CompileAndRunForLoop) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             mut total: int = 0;
@@ -218,16 +234,18 @@ TEST_F(IntegrationTest, CompileAndRunForLoop) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 15); // 1+2+3+4+5 = 15
-    EXPECT_TRUE(output.find("Total: 15") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 15); // 1+2+3+4+5 = 15
+    CRYO_EXPECT_TRUE(output.find("Total: 15") != std::string::npos);
 }
 
 // ============================================================================
 // Data Structure Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunStruct) {
+CRYO_TEST(IntegrationTest, CompileAndRunStruct) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         type struct Point {
             x: int;
@@ -244,12 +262,14 @@ TEST_F(IntegrationTest, CompileAndRunStruct) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 30);
-    EXPECT_TRUE(output.find("Point: (10, 20)") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 30);
+    CRYO_EXPECT_TRUE(output.find("Point: (10, 20)") != std::string::npos);
 }
 
-TEST_F(IntegrationTest, CompileAndRunArray) {
+CRYO_TEST(IntegrationTest, CompileAndRunArray) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const numbers: int[] = [1, 2, 3, 4, 5];
@@ -267,16 +287,18 @@ TEST_F(IntegrationTest, CompileAndRunArray) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 15); // 1+2+3+4+5 = 15
-    EXPECT_TRUE(output.find("Array sum: 15") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 15); // 1+2+3+4+5 = 15
+    CRYO_EXPECT_TRUE(output.find("Array sum: 15") != std::string::npos);
 }
 
 // ============================================================================
 // String Handling Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunStringOperations) {
+CRYO_TEST(IntegrationTest, CompileAndRunStringOperations) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const greeting: string = "Hello";
@@ -289,16 +311,18 @@ TEST_F(IntegrationTest, CompileAndRunStringOperations) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 0);
-    EXPECT_TRUE(output.find("Hello, World!") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 0);
+    CRYO_EXPECT_TRUE(output.find("Hello, World!") != std::string::npos);
 }
 
 // ============================================================================
 // Error Handling Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompilationErrorHandling) {
+CRYO_TEST(IntegrationTest, CompilationErrorHandling) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const x: int = "this is wrong"; // Type error
@@ -309,21 +333,23 @@ TEST_F(IntegrationTest, CompilationErrorHandling) {
     // Write source to temporary file
     auto source_file = temp_dir / "error_test.cryo";
     std::ofstream file(source_file);
-    ASSERT_TRUE(file.good());
+    CRYO_ASSERT_TRUE(file.good());
     file << source;
     file.close();
     
     // Attempt compilation - should fail
     bool compilation_success = compile_file(source_file.string(), exe_path.string());
-    EXPECT_FALSE(compilation_success);
-    EXPECT_TRUE(compiler->has_errors());
+    CRYO_EXPECT_FALSE(compilation_success);
+    CRYO_EXPECT_TRUE(compiler->has_errors());
 }
 
 // ============================================================================
 // Memory Management Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunMemoryAllocation) {
+CRYO_TEST(IntegrationTest, CompileAndRunMemoryAllocation) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function main() -> int {
             const large_array: int[] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
@@ -341,16 +367,18 @@ TEST_F(IntegrationTest, CompileAndRunMemoryAllocation) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 55); // Sum of 1-10
-    EXPECT_TRUE(output.find("Large array sum: 55") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 55); // Sum of 1-10
+    CRYO_EXPECT_TRUE(output.find("Large array sum: 55") != std::string::npos);
 }
 
 // ============================================================================
 // Recursive Function Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunRecursion) {
+CRYO_TEST(IntegrationTest, CompileAndRunRecursion) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function factorial(n: int) -> int {
             if (n <= 1) {
@@ -369,12 +397,14 @@ TEST_F(IntegrationTest, CompileAndRunRecursion) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 120); // 5! = 120
-    EXPECT_TRUE(output.find("Factorial of 5: 120") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 120); // 5! = 120
+    CRYO_EXPECT_TRUE(output.find("Factorial of 5: 120") != std::string::npos);
 }
 
-TEST_F(IntegrationTest, CompileAndRunFibonacci) {
+CRYO_TEST(IntegrationTest, CompileAndRunFibonacci) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function fibonacci(n: int) -> int {
             if (n <= 1) {
@@ -393,16 +423,18 @@ TEST_F(IntegrationTest, CompileAndRunFibonacci) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 55); // Fib(10) = 55
-    EXPECT_TRUE(output.find("Fibonacci of 10: 55") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 55); // Fib(10) = 55
+    CRYO_EXPECT_TRUE(output.find("Fibonacci of 10: 55") != std::string::npos);
 }
 
 // ============================================================================
 // Complex Algorithm Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunBubbleSort) {
+CRYO_TEST(IntegrationTest, CompileAndRunBubbleSort) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function bubble_sort(arr: int[], size: int) {
             for (mut i: int = 0; i < size - 1; i = i + 1) {
@@ -440,17 +472,19 @@ TEST_F(IntegrationTest, CompileAndRunBubbleSort) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 0);
-    EXPECT_TRUE(output.find("Original array:") != std::string::npos);
-    EXPECT_TRUE(output.find("Sorted array:") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 0);
+    CRYO_EXPECT_TRUE(output.find("Original array:") != std::string::npos);
+    CRYO_EXPECT_TRUE(output.find("Sorted array:") != std::string::npos);
 }
 
 // ============================================================================
 // Multi-file Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunMultipleFiles) {
+CRYO_TEST(IntegrationTest, CompileAndRunMultipleFiles) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     // This test would require implementing module system
     // For now, we'll create a placeholder
     
@@ -483,14 +517,16 @@ TEST_F(IntegrationTest, CompileAndRunMultipleFiles) {
     int exit_code;
     
     // This might not work until module system is implemented
-    // ASSERT_TRUE(compile_and_run(combined_source, output, exit_code));
+    // CRYO_ASSERT_TRUE(compile_and_run(combined_source, output, exit_code));
 }
 
 // ============================================================================
 // Performance Integration Tests
 // ============================================================================
 
-TEST_F(IntegrationTest, CompileAndRunPerformanceTest) {
+CRYO_TEST(IntegrationTest, CompileAndRunPerformanceTest) { 
+    IntegrationTestHelper helper; 
+    helper.setup();
     std::string source = R"(
         function compute_intensive() -> int {
             mut result: int = 0;
@@ -515,9 +551,9 @@ TEST_F(IntegrationTest, CompileAndRunPerformanceTest) {
     std::string output;
     int exit_code;
     
-    ASSERT_TRUE(compile_and_run(source, output, exit_code));
-    EXPECT_EQ(exit_code, 0);
-    EXPECT_TRUE(output.find("Computation result:") != std::string::npos);
+    CRYO_ASSERT_TRUE(compile_and_run(source, output, exit_code));
+    CRYO_EXPECT_EQ(exit_code, 0);
+    CRYO_EXPECT_TRUE(output.find("Computation result:") != std::string::npos);
 }
 
 } // namespace CryoTest
