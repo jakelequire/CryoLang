@@ -7,7 +7,7 @@ using namespace CryoTest;
 // Integration Tests - Full Compilation Pipeline
 // ============================================================================
 
-CRYO_TEST(Integration, SimpleProgram) {
+CRYO_TEST_DESC(Integration, SimpleProgram, "End-to-end compilation of a simple program with variable declaration and return statement") {
     IntegrationTestHelper helper;
     helper.setup();
 
@@ -23,11 +23,11 @@ CRYO_TEST(Integration, SimpleProgram) {
     CRYO_EXPECT_FALSE(helper.has_errors());
 }
 
-CRYO_TEST(Integration, ArithmeticOperations) {
+CRYO_TEST_DESC(Integration, ArithmeticOperations, "End-to-end compilation of arithmetic operations and expression evaluation") {
     IntegrationTestHelper helper;
     helper.setup();
 
-    std::string source = R"(
+    std::string source = R"(";
         function calculate() -> int {
             const a: int = 10;
             const b: int = 5;

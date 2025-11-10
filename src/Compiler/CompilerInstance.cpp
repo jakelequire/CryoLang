@@ -1395,7 +1395,7 @@ namespace Cryo
         // Note: We don't pre-load stdlib symbols here anymore since they're loaded on-demand
         // through the import system. This allows for better modularity and avoids duplicate definitions.
 
-        LOG_INFO(Cryo::LogComponent::GENERAL, "Standard library initialized from libcryo");
+        // LOG_INFO(Cryo::LogComponent::GENERAL, "Standard library initialized from libcryo");
     }
 
     void CompilerInstance::inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name)
