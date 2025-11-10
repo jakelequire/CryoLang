@@ -20,14 +20,26 @@ CRYO_TEST(TypeChecker, BasicIntegerLiteral) {
 }
 
 CRYO_TEST(TypeChecker, BasicStringLiteral) {
-    TypeCheckerTestHelper helper;
-    helper.setup();
+    try {
+        TypeCheckerTestHelper helper;
+        helper.setup();
 
-    std::string source = R"(const test_str_)" + std::to_string(rand()) + R"(: string = "Hello, World!";)";
-    bool success = helper.parse_and_type_check(source);
-    
-    CRYO_EXPECT_TRUE(success);
-    CRYO_EXPECT_FALSE(helper.has_errors());
+        std::string source = R"(const test_str_)" + std::to_string(rand()) + R"(: string = "Hello, World!";)";
+        
+        // Debug: print the source we're testing
+        std::cout << "\n[DEBUG] Testing source: " << source << std::endl;
+        
+        bool success = helper.parse_and_type_check(source);
+        
+        CRYO_EXPECT_TRUE(success);
+        CRYO_EXPECT_FALSE(helper.has_errors());
+    } catch (const std::exception& e) {
+        std::cout << "\n[ERROR] Exception in BasicStringLiteral test: " << e.what() << std::endl;
+        throw; // Re-throw to let the test framework handle it
+    } catch (...) {
+        std::cout << "\n[ERROR] Unknown exception in BasicStringLiteral test" << std::endl;
+        throw;
+    }
 }
 
 CRYO_TEST(TypeChecker, BasicBooleanLiteral) {

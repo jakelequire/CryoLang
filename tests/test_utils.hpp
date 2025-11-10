@@ -21,11 +21,39 @@
 namespace CryoTest {
 
 /**
- * @brief Custom assertion error for test failures
+ * @brief Enhanced assertion error with detailed context
  */
 class AssertionError : public std::runtime_error {
 public:
+    std::string file_name;
+    int line_number;
+    std::string condition;
+    std::string expected_value;
+    std::string actual_value;
+    std::string context;
+    
     AssertionError(const std::string& message) : std::runtime_error(message) {}
+    
+    AssertionError(const std::string& file, int line, const std::string& cond, 
+                   const std::string& expected = "", const std::string& actual = "",
+                   const std::string& ctx = "") 
+        : std::runtime_error("Assertion failed"), file_name(file), line_number(line), 
+          condition(cond), expected_value(expected), actual_value(actual), context(ctx) {}
+    
+    std::string get_detailed_message() const {
+        std::stringstream ss;
+        ss << "Assertion Failed\n";
+        ss << "  Location: " << file_name << ":" << line_number << "\n";
+        ss << "  Condition: " << condition << "\n";
+        if (!expected_value.empty() && !actual_value.empty()) {
+            ss << "  Expected: " << expected_value << "\n";
+            ss << "  Actual:   " << actual_value << "\n";
+        }
+        if (!context.empty()) {
+            ss << "  Context: " << context << "\n";
+        }
+        return ss.str();
+    }
 };
 
 /**
@@ -90,33 +118,66 @@ public:
         buffer << file.rdbuf();
         return buffer.str();
     }
+    
+    /**
+     * @brief Get source code context around a specific line
+     */
+    std::string get_source_context(const std::string& filename, int line_number, int context_lines = 2) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            return "Source file not available";
+        }
+        
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(file, line)) {
+            lines.push_back(line);
+        }
+        
+        if (line_number <= 0 || line_number > static_cast<int>(lines.size())) {
+            return "Invalid line number";
+        }
+        
+        std::stringstream ss;
+        int start = std::max(1, line_number - context_lines);
+        int end = std::min(static_cast<int>(lines.size()), line_number + context_lines);
+        
+        for (int i = start; i <= end; ++i) {
+            if (i == line_number) {
+                ss << "  > " << i << " | " << lines[i-1] << "\n";  // Highlight failure line
+            } else {
+                ss << "    " << i << " | " << lines[i-1] << "\n";
+            }
+        }
+        
+        return ss.str();
+    }
 };
 
 // Assertion macros (replacing Google Test assertions)
 #define CRYO_ASSERT_TRUE(condition) \
     do { \
         if (!(condition)) { \
-            std::stringstream ss; \
-            ss << "Assertion failed: " << #condition << " at " << __FILE__ << ":" << __LINE__; \
-            throw CryoTest::AssertionError(ss.str()); \
+            throw CryoTest::AssertionError(__FILE__, __LINE__, #condition, "true", "false"); \
         } \
     } while(0)
 
 #define CRYO_ASSERT_FALSE(condition) \
     do { \
         if (condition) { \
-            std::stringstream ss; \
-            ss << "Assertion failed: expected false but got true for " << #condition << " at " << __FILE__ << ":" << __LINE__; \
-            throw CryoTest::AssertionError(ss.str()); \
+            throw CryoTest::AssertionError(__FILE__, __LINE__, #condition, "false", "true"); \
         } \
     } while(0)
 
 #define CRYO_ASSERT_EQ(expected, actual) \
     do { \
-        if ((expected) != (actual)) { \
-            std::stringstream ss; \
-            ss << "Assertion failed: expected " << (expected) << " but got " << (actual) << " at " << __FILE__ << ":" << __LINE__; \
-            throw CryoTest::AssertionError(ss.str()); \
+        auto exp_val = (expected); \
+        auto act_val = (actual); \
+        if (exp_val != act_val) { \
+            std::stringstream exp_ss, act_ss; \
+            exp_ss << exp_val; \
+            act_ss << act_val; \
+            throw CryoTest::AssertionError(__FILE__, __LINE__, #expected " == " #actual, exp_ss.str(), act_ss.str()); \
         } \
     } while(0)
 
@@ -134,9 +195,7 @@ public:
         std::string exp_str = (expected); \
         std::string act_str = (actual); \
         if (exp_str != act_str) { \
-            std::stringstream ss; \
-            ss << "String assertion failed: expected \"" << exp_str << "\" but got \"" << act_str << "\" at " << __FILE__ << ":" << __LINE__; \
-            throw CryoTest::AssertionError(ss.str()); \
+            throw CryoTest::AssertionError(__FILE__, __LINE__, #expected " == " #actual, "\"" + exp_str + "\"", "\"" + act_str + "\""); \
         } \
     } while(0)
 
