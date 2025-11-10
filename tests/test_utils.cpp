@@ -149,7 +149,7 @@ int TestRegistry::run_all_tests() {
             passed++;
 #endif
         } catch (const AssertionError& e) {
-            // Handle assertion failures
+            // Handle assertion failures with enhanced context
             std::cout << "\033[31m  [FAIL]\033[0m" << std::endl;
             
             if (!e.file_name.empty()) {
@@ -161,39 +161,40 @@ int TestRegistry::run_all_tests() {
                     std::cout << "    \033[90m+-- \033[31mActual:\033[0m   " << e.actual_value << std::endl;
                 }
                 
-                CryoTest::CryoTestBase helper;
-                std::string context = helper.get_source_context(e.file_name, e.line_number);
-                if (!context.empty() && context != "Source file not available" && context != "Invalid line number") {
-                    std::cout << "    \033[90m+-- \033[36mSource Context:\033[0m" << std::endl;
-                    std::istringstream context_stream(context);
+                // Show compilation stage if available
+                if (!e.compilation_stage.empty()) {
+                    std::cout << "    \033[90m+-- \033[33mStage:\033[0m " << e.compilation_stage << std::endl;
+                }
+                
+                // Show Cryo diagnostics if available
+                if (!e.cryo_diagnostics.empty() && e.cryo_diagnostics != "No errors or warnings") {
+                    std::cout << "    \033[90m+-- \033[35mCryo Diagnostics:\033[0m" << std::endl;
+                    std::istringstream diag_stream(e.cryo_diagnostics);
                     std::string line;
-                    while (std::getline(context_stream, line)) {
-                        std::cout << "    \033[90m    " << line << "\033[0m" << std::endl;
+                    while (std::getline(diag_stream, line)) {
+                        if (!line.empty()) {
+                            std::cout << "    \033[90m    " << line << "\033[0m" << std::endl;
+                        }
                     }
                 }
-            } else {
-                std::cout << "    \033[90m+-- \033[31mError:\033[0m " << e.what() << std::endl;
-            }
-            std::cout << std::endl;
-            failed++;
-        } catch (const AssertionError& e) {
-            std::cout << "\033[31m  [FAIL]\033[0m" << std::endl;
-            
-            // Check if it's an enhanced assertion error
-            if (!e.file_name.empty()) {
-                std::cout << "    \033[90m+-- \033[31mLocation:\033[0m " << e.file_name << ":" << e.line_number << std::endl;
-                std::cout << "    \033[90m+-- \033[31mCondition:\033[0m " << e.condition << std::endl;
                 
-                if (!e.expected_value.empty() && !e.actual_value.empty()) {
-                    std::cout << "    \033[90m+-- \033[32mExpected:\033[0m " << e.expected_value << std::endl;
-                    std::cout << "    \033[90m+-- \033[31mActual:\033[0m   " << e.actual_value << std::endl;
+                // Show Cryo source context if available
+                if (!e.cryo_source.empty() && e.cryo_source != "Source context unavailable") {
+                    std::cout << "    \033[90m+-- \033[36mCryo Source Context:\033[0m" << std::endl;
+                    std::istringstream source_stream(e.cryo_source);
+                    std::string line;
+                    while (std::getline(source_stream, line)) {
+                        if (!line.empty()) {
+                            std::cout << "    \033[90m    " << line << "\033[0m" << std::endl;
+                        }
+                    }
                 }
                 
-                // Show source context for better debugging
+                // Show C++ source context for better debugging
                 CryoTest::CryoTestBase helper;
                 std::string context = helper.get_source_context(e.file_name, e.line_number);
                 if (!context.empty() && context != "Source file not available" && context != "Invalid line number") {
-                    std::cout << "    \033[90m+-- \033[36mSource Context:\033[0m" << std::endl;
+                    std::cout << "    \033[90m+-- \033[37mC++ Source Context:\033[0m" << std::endl;
                     std::istringstream context_stream(context);
                     std::string line;
                     while (std::getline(context_stream, line)) {

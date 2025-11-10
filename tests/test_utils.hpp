@@ -31,6 +31,9 @@ public:
     std::string expected_value;
     std::string actual_value;
     std::string context;
+    std::string cryo_source;
+    std::string cryo_diagnostics;
+    std::string compilation_stage;
     
     AssertionError(const std::string& message) : std::runtime_error(message) {}
     
@@ -39,6 +42,15 @@ public:
                    const std::string& ctx = "") 
         : std::runtime_error("Assertion failed"), file_name(file), line_number(line), 
           condition(cond), expected_value(expected), actual_value(actual), context(ctx) {}
+    
+    // Enhanced constructor with Cryo-specific context
+    AssertionError(const std::string& file, int line, const std::string& cond,
+                   const std::string& expected, const std::string& actual,
+                   const std::string& ctx, const std::string& cryo_src,
+                   const std::string& cryo_diag, const std::string& stage)
+        : std::runtime_error("Assertion failed"), file_name(file), line_number(line),
+          condition(cond), expected_value(expected), actual_value(actual), context(ctx),
+          cryo_source(cryo_src), cryo_diagnostics(cryo_diag), compilation_stage(stage) {}
     
     std::string get_detailed_message() const {
         std::stringstream ss;
@@ -51,6 +63,15 @@ public:
         }
         if (!context.empty()) {
             ss << "  Context: " << context << "\n";
+        }
+        if (!compilation_stage.empty()) {
+            ss << "  Stage: " << compilation_stage << "\n";
+        }
+        if (!cryo_diagnostics.empty()) {
+            ss << "\n" << cryo_diagnostics << "\n";
+        }
+        if (!cryo_source.empty()) {
+            ss << "\n" << cryo_source << "\n";
         }
         return ss.str();
     }
@@ -154,7 +175,20 @@ public:
     }
 };
 
-// Assertion macros (replacing Google Test assertions)
+// Enhanced assertion macros with Cryo context support
+#define CRYO_ASSERT_TRUE_WITH_CONTEXT(condition, helper, source) \
+    do { \
+        if (!(condition)) { \
+            std::string diagnostics = (helper).get_diagnostic_summary(); \
+            std::string context = ""; \
+            if (!diagnostics.empty() && diagnostics != "No errors or warnings") { \
+                context = (helper).get_source_context((source), 1, 2); \
+            } \
+            throw CryoTest::AssertionError(__FILE__, __LINE__, #condition, "true", "false", \
+                                           "", context, diagnostics, "compilation"); \
+        } \
+    } while(0)
+
 #define CRYO_ASSERT_TRUE(condition) \
     do { \
         if (!(condition)) { \

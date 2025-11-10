@@ -15,7 +15,10 @@ CRYO_TEST_DESC(TypeChecker, BasicIntegerLiteral, "Tests type checking of integer
     std::string source = "const test_var_" + std::to_string(rand()) + ": int = 42;";
     bool success = helper.parse_and_type_check(source);
     
-    CRYO_EXPECT_TRUE(success);
+    if (!success) {
+        throw CryoTest::AssertionError(__FILE__, __LINE__, "helper.parse_and_type_check(source)", "true", "false",
+                                     "", helper.get_source_context(source, 1, 2), helper.get_diagnostic_summary(), "type checking");
+    }
     CRYO_EXPECT_FALSE(helper.has_errors());
 }
 
@@ -31,8 +34,13 @@ CRYO_TEST_DESC(TypeChecker, BasicStringLiteral, "Tests type checking of string l
         
         bool success = helper.parse_and_type_check(source);
         
-        CRYO_EXPECT_TRUE(success);
+        if (!success) {
+            throw CryoTest::AssertionError(__FILE__, __LINE__, "helper.parse_and_type_check(source)", "true", "false",
+                                         "", helper.get_source_context(source, 1, 2), helper.get_diagnostic_summary(), "type checking");
+        }
         CRYO_EXPECT_FALSE(helper.has_errors());
+    } catch (const CryoTest::AssertionError& e) {
+        throw; // Re-throw assertion errors as-is
     } catch (const std::exception& e) {
         std::cout << "\n[ERROR] Exception in BasicStringLiteral test: " << e.what() << std::endl;
         throw; // Re-throw to let the test framework handle it

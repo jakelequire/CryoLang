@@ -15,7 +15,10 @@ CRYO_TEST_DESC(Parser, BasicVariableDeclaration, "Tests parsing of simple consta
     std::string source = "const x: int = 42;";
     bool success = helper.parses_successfully(source);
 
-    CRYO_EXPECT_TRUE(success);
+    if (!success) {
+        throw CryoTest::AssertionError(__FILE__, __LINE__, "helper.parses_successfully(source)", "true", "false",
+                                     "", helper.get_source_context(source, 1, 2), helper.get_diagnostic_summary(), "parsing");
+    }
     CRYO_EXPECT_FALSE(helper.has_errors());
     CRYO_EXPECT_TRUE(helper.get_ast() != nullptr);
 }
@@ -32,7 +35,10 @@ CRYO_TEST_DESC(Parser, FunctionDeclaration, "Tests parsing of basic function dec
     )";
 
     bool success = helper.parses_successfully(source);
-    CRYO_EXPECT_TRUE(success);
+    if (!success) {
+        throw CryoTest::AssertionError(__FILE__, __LINE__, "helper.parses_successfully(source)", "true", "false",
+                                     "", helper.get_source_context(source, 2, 2), helper.get_diagnostic_summary(), "parsing");
+    }
     CRYO_EXPECT_FALSE(helper.has_errors());
     CRYO_EXPECT_TRUE(helper.get_ast() != nullptr);
 }
@@ -49,7 +55,10 @@ CRYO_TEST_DESC(Parser, FunctionWithParameters, "Tests parsing of functions with 
     )";
 
     bool success = helper.parses_successfully(source);
-    CRYO_EXPECT_TRUE(success);
+    if (!success) {
+        throw CryoTest::AssertionError(__FILE__, __LINE__, "helper.parses_successfully(source)", "true", "false",
+                                     "", helper.get_source_context(source, 2, 2), helper.get_diagnostic_summary(), "parsing");
+    }
     CRYO_EXPECT_FALSE(helper.has_errors());
 }
 

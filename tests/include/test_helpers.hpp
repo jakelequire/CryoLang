@@ -10,6 +10,8 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <sstream>
+#include <iomanip>
 
 #include "Compiler/CompilerInstance.hpp"
 #include "AST/ASTContext.hpp"
@@ -83,6 +85,105 @@ public:
     }
     
     /**
+     * @brief Get formatted diagnostics for test output
+     */
+    std::string get_diagnostic_summary() const {
+        if (!compiler || !compiler->diagnostic_manager()) {
+            return "No diagnostic information available";
+        }
+        
+        auto* diag_manager = compiler->diagnostic_manager();
+        if (!diag_manager->has_errors() && !diag_manager->has_warnings()) {
+            return "No errors or warnings";
+        }
+        
+        std::stringstream ss;
+        ss << "Compilation diagnostics:\n";
+        
+        // Get all diagnostics and format them concisely
+        const auto& diagnostics = diag_manager->diagnostics();
+        size_t error_count = 0, warning_count = 0;
+        size_t displayed_count = 0;
+        const size_t max_errors_to_show = 10; // Limit output
+        
+        for (const auto& diag : diagnostics) {
+            // Skip stdlib diagnostics to reduce noise
+            if (diag_manager->is_stdlib_diagnostic(diag)) {
+                continue;
+            }
+            
+            // Stop showing errors after a reasonable number to avoid overwhelming output
+            if (displayed_count >= max_errors_to_show) {
+                ss << "  ... and " << (diagnostics.size() - displayed_count) << " more errors\n";
+                break;
+            }
+            
+            std::string severity;
+            switch (diag.severity()) {
+                case Cryo::DiagnosticSeverity::Error:
+                case Cryo::DiagnosticSeverity::Fatal:
+                    severity = "error";
+                    error_count++;
+                    break;
+                case Cryo::DiagnosticSeverity::Warning:
+                    severity = "warning";
+                    warning_count++;
+                    break;
+                case Cryo::DiagnosticSeverity::Note:
+                    severity = "note";
+                    break;
+            }
+            
+            // Format location if available
+            std::string location = "";
+            if (diag.range().is_valid()) {
+                location = " at line " + std::to_string(diag.range().start.line()) + 
+                          ", column " + std::to_string(diag.range().start.column());
+            }
+            
+            ss << "  " << severity << location << ": " << diag.message() << "\n";
+            displayed_count++;
+        }
+        
+        // Add summary
+        if (error_count > 0 || warning_count > 0) {
+            ss << "Summary: " << error_count << " error(s), " << warning_count << " warning(s)";
+        }
+        
+        return ss.str();
+    }
+    
+    /**
+     * @brief Get Cryo source context around error location
+     */
+    std::string get_source_context(const std::string& source, size_t error_line, size_t context_lines = 2) const {
+        std::istringstream iss(source);
+        std::vector<std::string> lines;
+        std::string line;
+        
+        while (std::getline(iss, line)) {
+            lines.push_back(line);
+        }
+        
+        if (error_line == 0 || error_line > lines.size()) {
+            return "Source context unavailable";
+        }
+        
+        std::stringstream ss;
+        ss << "Cryo source context:\n";
+        
+        size_t start_line = (error_line > context_lines) ? error_line - context_lines : 1;
+        size_t end_line = std::min(error_line + context_lines, lines.size());
+        
+        for (size_t i = start_line; i <= end_line; ++i) {
+            std::string prefix = (i == error_line) ? " -> " : "    ";
+            ss << prefix << std::setw(3) << i << " | " << lines[i-1] << "\n";
+        }
+        
+        return ss.str();
+    }
+    
+    /**
      * @brief Get compiler components for advanced testing
      */
     Cryo::CompilerInstance* get_compiler() const { return compiler.get(); }
@@ -95,6 +196,9 @@ public:
  * @brief Helper class for type checker testing
  */
 class TypeCheckerTestHelper : public CompilerTestHelper {
+private:
+    std::string _last_source;
+    
 public:
     /**
      * @brief Setup with fresh compiler and clear TypeChecker symbols
@@ -113,6 +217,7 @@ public:
      * @brief Parse source and run type checking
      */
     bool parse_and_type_check(const std::string& source) {
+        _last_source = source;
         if (!parse_source(source)) {
             return false;
         }
@@ -138,12 +243,16 @@ public:
     }
     
     /**
-     * @brief Parse source and expect type checking to succeed
+     * @brief Parse source and expect type checking to succeed with enhanced error reporting
      */
     void expect_type_check_success(const std::string& source) {
+        _last_source = source;
         bool success = parse_and_type_check(source);
         if (!success || has_errors()) {
-            throw TestSetupError("Expected type checking to succeed, but got errors");
+            std::string diagnostics = get_diagnostic_summary();
+            std::string context = get_source_context(source, 1, 3);
+            throw TestSetupError("Expected type checking to succeed, but got errors.\n" + 
+                               diagnostics + "\n" + context);
         }
     }
     
@@ -151,10 +260,18 @@ public:
      * @brief Parse source and expect type checking to fail
      */
     void expect_type_check_failure(const std::string& source) {
+        _last_source = source;
         parse_and_type_check(source);
         if (!has_errors()) {
             throw TestSetupError("Expected type checking to fail, but no errors were found");
         }
+    }
+    
+    /**
+     * @brief Get the last tested source code
+     */
+    const std::string& get_last_source() const {
+        return _last_source;
     }
 };
 
@@ -216,21 +333,29 @@ public:
  * @brief Helper class for parser testing
  */
 class ParserTestHelper : public CompilerTestHelper {
+private:
+    std::string _last_source;
+    
 public:
     /**
      * @brief Test that source parses successfully
      */
     bool parses_successfully(const std::string& source) {
+        _last_source = source;
         bool success = parse_source(source);
         return success && !has_errors() && get_ast() != nullptr;
     }
     
     /**
-     * @brief Parse source and expect success
+     * @brief Parse source and expect success with enhanced error reporting
      */
     void expect_parse_success(const std::string& source) {
+        _last_source = source;
         if (!parses_successfully(source)) {
-            throw TestSetupError("Expected parsing to succeed, but failed");
+            std::string diagnostics = get_diagnostic_summary();
+            std::string context = get_source_context(source, 1, 3);
+            throw TestSetupError("Expected parsing to succeed, but failed.\n" + 
+                               diagnostics + "\n" + context);
         }
     }
     
@@ -238,10 +363,18 @@ public:
      * @brief Parse source and expect failure
      */
     void expect_parse_failure(const std::string& source) {
+        _last_source = source;
         bool success = parse_source(source);
         if (success && !has_errors()) {
             throw TestSetupError("Expected parsing to fail, but succeeded");
         }
+    }
+    
+    /**
+     * @brief Get the last tested source code
+     */
+    const std::string& get_last_source() const {
+        return _last_source;
     }
 };
 
@@ -249,11 +382,15 @@ public:
  * @brief Helper class for integration testing
  */
 class IntegrationTestHelper : public CompilerTestHelper {
+private:
+    std::string _last_source;
+    
 public:
     /**
      * @brief Test full compilation pipeline up to IR generation
      */
     bool compiles_to_ir(const std::string& source) {
+        _last_source = source;
         if (!parse_source(source)) {
             return false;
         }
@@ -282,11 +419,16 @@ public:
     }
     
     /**
-     * @brief Test that source compiles without errors
+     * @brief Test that source compiles without errors with enhanced error reporting
      */
     void expect_compilation_success(const std::string& source) {
+        _last_source = source;
         if (!compiles_to_ir(source)) {
-            throw TestSetupError("Expected compilation to succeed, but failed");
+            std::string diagnostics = get_diagnostic_summary();
+            std::string context = get_source_context(source, 1, 3);
+            std::string stage = has_errors() ? "compilation" : "IR generation";
+            throw TestSetupError("Expected compilation to succeed, but failed at " + stage + ".\n" +
+                               diagnostics + "\n" + context);
         }
     }
     
@@ -294,10 +436,18 @@ public:
      * @brief Test that source fails compilation
      */
     void expect_compilation_failure(const std::string& source) {
+        _last_source = source;
         bool success = compiles_to_ir(source);
         if (success && !has_errors()) {
             throw TestSetupError("Expected compilation to fail, but succeeded");
         }
+    }
+    
+    /**
+     * @brief Get the last tested source code
+     */
+    const std::string& get_last_source() const {
+        return _last_source;
     }
 };
 
