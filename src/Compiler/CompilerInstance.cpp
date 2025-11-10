@@ -12,7 +12,7 @@
 namespace Cryo
 {
     CompilerInstance::CompilerInstance()
-        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _current_namespace("")
+        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _auto_imports_enabled(true), _current_namespace("")
     {
         initialize_components();
     }
@@ -1450,6 +1450,12 @@ namespace Cryo
         if (_stdlib_compilation_mode)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports in stdlib compilation mode");
+            return;
+        }
+        
+        if (!_auto_imports_enabled)
+        {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imports disabled");
             return;
         }
 

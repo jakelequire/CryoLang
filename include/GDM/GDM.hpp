@@ -456,6 +456,7 @@ namespace Cryo
         void add_file(const std::string &filename, std::shared_ptr<File> file);
         std::shared_ptr<File> get_file(const std::string &filename) const;
         bool has_file(const std::string &filename) const;
+        void clear(); // Clear all cached files and lines
 
         // Basic source line access (legacy compatibility)
         std::string get_source_line(const std::string &filename, size_t line_number) const;

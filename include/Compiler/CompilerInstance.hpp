@@ -69,6 +69,7 @@ namespace Cryo
         bool _show_ast_before_ir;
         bool _stdlib_linking_enabled;                  // Control whether to link libcryo.a by default
         bool _stdlib_compilation_mode;                 // Control whether to generate full implementations for stdlib compilation
+        bool _auto_imports_enabled;                    // Control whether to automatically import core types
         std::string _current_namespace;                // Current namespace context
         std::vector<std::string> _imported_namespaces; // Track imported namespaces for enhanced resolution
 
@@ -125,6 +126,9 @@ namespace Cryo
         // Standard library compilation mode (generates full implementations)
         void set_stdlib_compilation_mode(bool enable) { _stdlib_compilation_mode = enable; }
         bool stdlib_compilation_mode() const { return _stdlib_compilation_mode; }
+        
+        void set_auto_imports_enabled(bool enable) { _auto_imports_enabled = enable; }
+        bool auto_imports_enabled() const { return _auto_imports_enabled; }
 
         // Namespace context
         void set_namespace_context(const std::string &namespace_name);
