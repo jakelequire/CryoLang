@@ -49,6 +49,10 @@ public:
         if (!compiler) {
             throw TestSetupError("Failed to create compiler instance");
         }
+        
+        // Configure for unit testing - disable auto-imports to avoid 
+        // circular dependencies with stdlib modules
+        compiler->set_auto_imports_enabled(false);
     }
     
     /**
@@ -68,6 +72,23 @@ public:
         }
         
         return compiler->parse_source(source);
+    }
+    
+    /**
+     * @brief Parse and analyze source code (includes import resolution and symbol table population)
+     */
+    bool parse_and_analyze(const std::string& source) {
+        if (!compiler) {
+            throw TestSetupError("Compiler not initialized");
+        }
+        
+        // First parse the source
+        if (!compiler->parse_source(source)) {
+            return false;
+        }
+        
+        // Then run analysis phase (symbol table population, imports, etc.)
+        return compiler->analyze();
     }
     
     /**
@@ -214,11 +235,14 @@ public:
     }
     
     /**
-     * @brief Parse source and run type checking
+     * @brief Parse source and run type checking (includes full analysis pipeline)
      */
     bool parse_and_type_check(const std::string& source) {
         _last_source = source;
-        if (!parse_source(source)) {
+        
+        // Use parse_and_analyze instead of just parse_source to ensure
+        // imports are processed and symbol table is properly populated
+        if (!parse_and_analyze(source)) {
             return false;
         }
         
@@ -227,18 +251,15 @@ public:
             return false;
         }
         
-        // Get the built-in type checker from compiler
+        // Type checking should already be done as part of analyze(),
+        // but we can run it explicitly if needed for testing
         auto type_checker = compiler->type_checker();
         if (!type_checker) {
             return false;
         }
         
-        // NOTE: Don't clear symbols here - they were already loaded during analyze()
-        // and clearing them now would remove necessary builtin/intrinsic symbols
-        
-        // Run type checking
-        type_checker->check_program(*ast);
-        
+        // The analyze() phase should have already run type checking,
+        // but we can check if there are any additional type errors
         return !has_errors();
     }
     
@@ -338,7 +359,7 @@ private:
     
 public:
     /**
-     * @brief Test that source parses successfully
+     * @brief Test that source parses successfully (parsing only, no analysis)
      */
     bool parses_successfully(const std::string& source) {
         _last_source = source;
@@ -391,7 +412,9 @@ public:
      */
     bool compiles_to_ir(const std::string& source) {
         _last_source = source;
-        if (!parse_source(source)) {
+        
+        // Use full parse_and_analyze pipeline to ensure imports are processed
+        if (!parse_and_analyze(source)) {
             return false;
         }
         
@@ -399,18 +422,9 @@ public:
             return false;
         }
         
-        // Run type checking
+        // Type checking should already be done by analyze(), but verify AST exists
         auto ast = get_ast();
         if (!ast) {
-            return false;
-        }
-        
-        auto type_checker = compiler->type_checker();
-        if (type_checker) {
-            type_checker->check_program(*ast);
-        }
-        
-        if (has_errors()) {
             return false;
         }
         

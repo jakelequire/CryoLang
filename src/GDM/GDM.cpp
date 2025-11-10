@@ -316,6 +316,12 @@ namespace Cryo
         return _files.find(filename) != _files.end();
     }
 
+    void SourceManager::clear()
+    {
+        _files.clear();
+        _file_lines.clear();
+    }
+
     std::string SourceManager::get_source_line(const std::string &filename, size_t line_number) const
     {
         ensure_file_lines_cached(filename);
@@ -1035,6 +1041,9 @@ namespace Cryo
         _error_count = 0;
         _warning_count = 0;
         _note_count = 0;
+        
+        // Clear source manager to prevent stale file references
+        _source_manager.clear();
     }
 
     bool DiagnosticManager::should_continue_compilation() const
