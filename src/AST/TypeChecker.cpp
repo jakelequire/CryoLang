@@ -1817,43 +1817,39 @@ namespace Cryo
 
         if (!declare_variable(var_name, final_type, node.location(), node.is_mutable()))
         {
-            // Check if we're in stdlib compilation mode and if this is a compatible redefinition
+            // Check if this is a compatible redefinition (handles double processing from symbol population)
             bool should_report_error = true;
-            if (_stdlib_compilation_mode)
+            
+            // Check for compatible redefinition (applies to all compilation modes)
+            TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(var_name);
+            if (existing_symbol && existing_symbol->type && final_type)
             {
-                // In stdlib compilation mode, check if this is a compatible redefinition
-                TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(var_name);
-                if (existing_symbol && existing_symbol->type && final_type)
+                // Allow redefinition if the types are the same
+                bool types_match = (existing_symbol->type == final_type) ||
+                                   (existing_symbol->type->name() == final_type->name());
+
+                // Check mutability compatibility
+                bool mutability_compatible = (existing_symbol->is_mutable == node.is_mutable()) ||
+                                             (_stdlib_compilation_mode && node.is_mutable() && !existing_symbol->is_mutable);
+
+                if (types_match && mutability_compatible)
                 {
-                    // Allow redefinition if the types are the same
-                    bool types_match = (existing_symbol->type == final_type) ||
-                                       (existing_symbol->type->name() == final_type->name());
+                    should_report_error = false;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Allowing compatible redefinition of variable '{}' (type: {}, mutable: {}) - likely from symbol population phase",
+                              var_name, final_type->name(), node.is_mutable());
 
-                    // In stdlib compilation mode, be more lenient with mutability:
-                    // Allow if current declaration is mutable (which is the intended state)
-                    // or if both have the same mutability
-                    bool mutability_compatible = (existing_symbol->is_mutable == node.is_mutable()) ||
-                                                 (node.is_mutable() && !existing_symbol->is_mutable);
-
-                    if (types_match && mutability_compatible)
+                    // Update the existing symbol with the correct mutability if needed (in stdlib mode only)
+                    if (_stdlib_compilation_mode && !existing_symbol->is_mutable && node.is_mutable())
                     {
-                        should_report_error = false;
-                        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Allowing compatible redefinition of variable '{}' (type: {}, mutable: {}) in stdlib compilation mode",
-                                  var_name, final_type->name(), node.is_mutable());
-
-                        // Update the existing symbol with the correct mutability if needed
-                        if (!existing_symbol->is_mutable && node.is_mutable())
-                        {
-                            existing_symbol->is_mutable = true;
-                            LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Updated mutability for variable '{}' to mutable in stdlib compilation mode", var_name);
-                        }
+                        existing_symbol->is_mutable = true;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Updated mutability for variable '{}' to mutable in stdlib compilation mode", var_name);
                     }
-                    else
-                    {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Incompatible redefinition of variable '{}' - existing: {} ({}), new: {} ({}), existing_mutable: {}, new_mutable: {}",
-                                  var_name, existing_symbol->type->name(), static_cast<void *>(existing_symbol->type),
-                                  final_type->name(), static_cast<void *>(final_type), existing_symbol->is_mutable, node.is_mutable());
-                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Incompatible redefinition of variable '{}' - existing: {} ({}), new: {} ({}), existing_mutable: {}, new_mutable: {}",
+                              var_name, existing_symbol->type->name(), static_cast<void *>(existing_symbol->type),
+                              final_type->name(), static_cast<void *>(final_type), existing_symbol->is_mutable, node.is_mutable());
                 }
             }
 

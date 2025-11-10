@@ -238,8 +238,12 @@ public:
 
 } // namespace CryoTest
 
-// Macro to define tests (similar to Google Test's TEST macro)
+// Macro to define tests
 #define CRYO_TEST(suite_name, test_name) \
     void suite_name##_##test_name##_Test(); \
     static CryoTest::TestRegistrar suite_name##_##test_name##_registrar(#suite_name, #test_name, suite_name##_##test_name##_Test); \
     void suite_name##_##test_name##_Test()
+
+// Include test helpers (compiler component helpers)
+// Note: This is included separately to avoid circular dependencies
+// Include test_helpers.hpp directly in test files that need it
