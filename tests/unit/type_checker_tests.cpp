@@ -8,7 +8,7 @@ using namespace CryoTest;
 // Type Checker Tests
 // ============================================================================
 
-CRYO_TEST(TypeChecker, BasicIntegerLiteral) {
+CRYO_TEST_DESC(TypeChecker, BasicIntegerLiteral, "Tests type checking of integer literal assignments to int variables") {
     TypeCheckerTestHelper helper;
     helper.setup();
 
@@ -19,7 +19,7 @@ CRYO_TEST(TypeChecker, BasicIntegerLiteral) {
     CRYO_EXPECT_FALSE(helper.has_errors());
 }
 
-CRYO_TEST(TypeChecker, BasicStringLiteral) {
+CRYO_TEST_DESC(TypeChecker, BasicStringLiteral, "Tests type checking of string literal assignments to string variables") {
     try {
         TypeCheckerTestHelper helper;
         helper.setup();

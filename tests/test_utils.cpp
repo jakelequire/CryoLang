@@ -127,6 +127,9 @@ int TestRegistry::run_all_tests() {
                   << std::string(48 - test.suite.length() - test.name.length(), '-') << "+\033[0m" << std::endl;
         
         std::cout << "\033[2m|\033[0m \033[1;36m" << test.suite << "::" << test.name << "\033[0m" << std::endl;
+        if (!test.description.empty()) {
+            std::cout << "\033[2m|\033[0m \033[90m" << test.description << "\033[0m" << std::endl;
+        }
         std::cout << "\033[2m+" << std::string(61, '-') << "+\033[0m" << std::endl;
         
         try {

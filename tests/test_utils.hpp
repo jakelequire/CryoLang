@@ -268,6 +268,7 @@ public:
 struct TestCase {
     std::string name;
     std::string suite;
+    std::string description;
     std::function<void()> test_function;
 };
 
@@ -278,8 +279,8 @@ public:
         return registry;
     }
     
-    void register_test(const std::string& suite, const std::string& name, std::function<void()> test_func) {
-        tests.push_back({name, suite, test_func});
+    void register_test(const std::string& suite, const std::string& name, std::function<void()> test_func, const std::string& description = "") {
+        tests.push_back({name, suite, description, test_func});
     }
     
     int run_all_tests();
@@ -290,8 +291,8 @@ private:
 
 class TestRegistrar {
 public:
-    TestRegistrar(const std::string& suite, const std::string& name, std::function<void()> test_func) {
-        TestRegistry::instance().register_test(suite, name, test_func);
+    TestRegistrar(const std::string& suite, const std::string& name, std::function<void()> test_func, const std::string& description = "") {
+        TestRegistry::instance().register_test(suite, name, test_func, description);
     }
 };
 
@@ -301,6 +302,12 @@ public:
 #define CRYO_TEST(suite_name, test_name) \
     void suite_name##_##test_name##_Test(); \
     static CryoTest::TestRegistrar suite_name##_##test_name##_registrar(#suite_name, #test_name, suite_name##_##test_name##_Test); \
+    void suite_name##_##test_name##_Test()
+
+// Macro to define tests with descriptions
+#define CRYO_TEST_DESC(suite_name, test_name, description) \
+    void suite_name##_##test_name##_Test(); \
+    static CryoTest::TestRegistrar suite_name##_##test_name##_registrar(#suite_name, #test_name, suite_name##_##test_name##_Test, description); \
     void suite_name##_##test_name##_Test()
 
 // Include test helpers (compiler component helpers)

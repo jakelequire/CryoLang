@@ -7,7 +7,7 @@ using namespace CryoTest;
 // Parser Tests
 // ============================================================================
 
-CRYO_TEST(Parser, BasicVariableDeclaration) {
+CRYO_TEST_DESC(Parser, BasicVariableDeclaration, "Tests parsing of simple constant variable declarations with type annotations") {
     ParserTestHelper helper;
     helper.setup();
 
@@ -19,7 +19,7 @@ CRYO_TEST(Parser, BasicVariableDeclaration) {
     CRYO_EXPECT_TRUE(helper.get_ast() != nullptr);
 }
 
-CRYO_TEST(Parser, FunctionDeclaration) {
+CRYO_TEST_DESC(Parser, FunctionDeclaration, "Tests parsing of basic function declarations with return types and empty parameter lists") {
     ParserTestHelper helper;
     helper.setup();
 
@@ -35,7 +35,7 @@ CRYO_TEST(Parser, FunctionDeclaration) {
     CRYO_EXPECT_TRUE(helper.get_ast() != nullptr);
 }
 
-CRYO_TEST(Parser, FunctionWithParameters) {
+CRYO_TEST_DESC(Parser, FunctionWithParameters, "Tests parsing of functions with typed parameters and arithmetic expressions in return statements") {
     ParserTestHelper helper;
     helper.setup();
 
