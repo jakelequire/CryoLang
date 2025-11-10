@@ -1,0 +1,87 @@
+#include "test_utils.hpp"
+#include "include/test_helpers.hpp"
+
+using namespace CryoTest;
+
+// ============================================================================
+// Parser Tests
+// ============================================================================
+
+CRYO_TEST(Parser, BasicVariableDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
+    std::string source = "const x: int = 42;";
+    bool success = helper.parses_successfully(source);
+    
+    CRYO_EXPECT_TRUE(success);
+    CRYO_EXPECT_FALSE(helper.has_errors());
+    CRYO_EXPECT_TRUE(helper.get_ast() != nullptr);
+}
+
+CRYO_TEST(Parser, FunctionDeclaration) {
+    ParserTestHelper helper;
+    helper.setup();
+
+    std::string source = R"(
+        function main() -> int {
+            return 0;
+        }
+    )";
+    
+    bool success = helper.parses_successfully(source);
+    CRYO_EXPECT_TRUE(success);
+    CRYO_EXPECT_FALSE(helper.has_errors());
+    CRYO_EXPECT_TRUE(helper.get_ast() != nullptr);
+}
+
+CRYO_TEST(Parser, FunctionWithParameters) {
+    ParserTestHelper helper;
+    helper.setup();
+
+    std::string source = R"(
+        function add(x: int, y: int) -> int {
+            return x + y;
+        }
+    )";
+    
+    bool success = helper.parses_successfully(source);
+    CRYO_EXPECT_TRUE(success);
+    CRYO_EXPECT_FALSE(helper.has_errors());
+}
+
+CRYO_TEST(Parser, NestedExpressions) {
+    ParserTestHelper helper;
+    helper.setup();
+
+    std::string source = R"(
+        const result: int = (2 + 3) * (4 - 1);
+    )";
+    
+    bool success = helper.parses_successfully(source);
+    CRYO_EXPECT_TRUE(success);
+    CRYO_EXPECT_FALSE(helper.has_errors());
+}
+
+CRYO_TEST(Parser, InvalidSyntaxHandling) {
+    ParserTestHelper helper;
+    helper.setup();
+
+    std::string source = "const x: int = ;"; // Missing value
+    bool success = helper.parses_successfully(source);
+    
+    // This should fail to parse
+    CRYO_EXPECT_FALSE(success);
+}
+
+CRYO_TEST(Parser, MissingSemicolon) {
+    ParserTestHelper helper;
+    helper.setup();
+
+    std::string source = "const x: int = 42"; // Missing semicolon
+    bool success = helper.parses_successfully(source);
+    
+    // This might fail depending on language design
+    // Adjust expectation based on your parser's behavior
+    CRYO_EXPECT_FALSE(success);
+}

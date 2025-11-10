@@ -150,6 +150,9 @@ namespace Cryo
 
         // Access symbols for detailed inspection
         const std::unordered_map<std::string, TypedSymbol> &get_symbols() const { return _symbols; }
+        
+        // Clear all symbols (useful for testing)
+        void clear() { _symbols.clear(); }
 
         // Type table display
         void print_type_table(std::ostream &os = std::cout) const;
@@ -322,6 +325,16 @@ namespace Cryo
 
         // Type table access
         void print_type_table(std::ostream &os = std::cout) const { _symbol_table->print_type_table(os); }
+        
+        // Clear symbol table (useful for testing)
+        void clear_symbols() { 
+            _symbol_table->clear(); 
+            // Reset symbol loading flags to allow fresh loading
+            _builtin_symbols_loaded = false;
+            _intrinsic_symbols_loaded = false;
+            _user_symbols_loaded = false;
+            _runtime_symbols_loaded = false;
+        }
 
         // Symbol table access for LSP
         TypedSymbol *lookup_symbol(const std::string &name) { return _symbol_table->lookup_symbol(name); }
