@@ -6,6 +6,68 @@
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <functional>
+
+// Test framework macros (self-contained, no external dependencies)
+namespace CryoTest {
+
+class AssertionError : public std::runtime_error {
+public:
+    AssertionError(const std::string& message) : std::runtime_error(message) {}
+};
+
+}
+
+// Simple assertion macros
+#define CRYO_ASSERT(condition, message) \
+    do { \
+        if (!(condition)) { \
+            throw CryoTest::AssertionError("ASSERTION FAILED: " + std::string(message) + \
+                                         " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
+        } \
+    } while(0)
+
+#define CRYO_ASSERT_EQ(expected, actual) \
+    do { \
+        if ((expected) != (actual)) { \
+            std::ostringstream oss; \
+            oss << "ASSERTION FAILED: Expected equality but values differ at " << __FILE__ << ":" << __LINE__; \
+            throw CryoTest::AssertionError(oss.str()); \
+        } \
+    } while(0)
+
+#define CRYO_ASSERT_NE(expected, actual) \
+    do { \
+        if ((expected) == (actual)) { \
+            std::ostringstream oss; \
+            oss << "ASSERTION FAILED: Values should not be equal at " << __FILE__ << ":" << __LINE__; \
+            throw CryoTest::AssertionError(oss.str()); \
+        } \
+    } while(0)
+
+#define CRYO_ASSERT_TRUE(condition) CRYO_ASSERT(condition, "Condition should be true")
+#define CRYO_ASSERT_FALSE(condition) CRYO_ASSERT(!(condition), "Condition should be false")
+
+// String equality macro
+#define CRYO_ASSERT_STREQ(expected, actual) \
+    do { \
+        if (std::string(expected) != std::string(actual)) { \
+            throw CryoTest::AssertionError("ASSERTION FAILED: String mismatch - Expected: '" + \
+                                         std::string(expected) + "', Got: '" + std::string(actual) + "'" + \
+                                         " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
+        } \
+    } while(0)
+
+// Test registration and execution macros
+#define CRYO_TEST(test_class, test_name) \
+    class test_class##_##test_name : public test_class { \
+    public: \
+        void run_test(); \
+    }; \
+    void test_class##_##test_name::run_test()
 
 // CryoLang includes
 #include "Compiler/CompilerInstance.hpp"
@@ -31,7 +93,7 @@ protected:
     std::unique_ptr<Cryo::ASTContext> ast_context;
     std::filesystem::path temp_dir;
     
-    void SetUp() override {
+    void SetUp() {
         // Create temporary directory for test files
         temp_dir = std::filesystem::temp_directory_path() / "cryo_tests" / 
                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -45,7 +107,7 @@ protected:
         ast_context = std::make_unique<Cryo::ASTContext>();
     }
     
-    void TearDown() override {
+    void TearDown() {
         // Clean up temporary files
         if (std::filesystem::exists(temp_dir)) {
             std::filesystem::remove_all(temp_dir);
@@ -112,7 +174,7 @@ protected:
      */
     void expect_compilation_error(const std::string& source, const std::string& expected_error = "") {
         bool compiled = compile_source(source);
-        EXPECT_FALSE(compiled) << "Expected compilation to fail, but it succeeded";
+        CRYO_ASSERT(!compiled, "Expected compilation to fail, but it succeeded");
         
         if (!expected_error.empty() && compiler->diagnostic_manager()) {
             bool found_error = false;
@@ -122,7 +184,7 @@ protected:
                     break;
                 }
             }
-            EXPECT_TRUE(found_error) << "Expected error message containing: " << expected_error;
+            CRYO_ASSERT(found_error, "Expected error message containing: " + expected_error);
         }
     }
     
@@ -131,7 +193,7 @@ protected:
      */
     void expect_compilation_success(const std::string& source) {
         bool compiled = compile_source(source);
-        EXPECT_TRUE(compiled) << "Expected compilation to succeed, but it failed";
+        CRYO_ASSERT(compiled, "Expected compilation to succeed, but it failed");
         
         if (!compiled && compiler->diagnostic_manager()) {
             std::cout << "Compilation errors:\n";
@@ -157,12 +219,9 @@ protected:
         auto lexer = create_lexer(source);
         
         for (size_t i = 0; i < expected_tokens.size(); ++i) {
-            ASSERT_TRUE(lexer->has_more_tokens()) << "Expected more tokens at position " << i;
+            CRYO_ASSERT(lexer->has_more_tokens(), "Expected more tokens at position " + std::to_string(i));
             auto token = lexer->next_token();
-            EXPECT_EQ(token.kind(), expected_tokens[i]) 
-                << "Token mismatch at position " << i 
-                << ": expected " << static_cast<int>(expected_tokens[i])
-                << ", got " << static_cast<int>(token.kind());
+            CRYO_ASSERT_EQ(token.kind(), expected_tokens[i]);
         }
     }
 };
@@ -181,14 +240,14 @@ protected:
     void expect_parse_success(const std::string& source) {
         auto parser = create_parser(source);
         auto ast = parser->parse_program();
-        EXPECT_TRUE(ast != nullptr) << "Parsing failed for: " << source;
-        EXPECT_FALSE(parser->has_errors()) << "Parser reported errors";
+        CRYO_ASSERT(ast != nullptr, "Parsing failed for: " + source);
+        CRYO_ASSERT(!parser->has_errors(), "Parser reported errors");
     }
     
     void expect_parse_error(const std::string& source) {
         auto parser = create_parser(source);
         auto ast = parser->parse_program();
-        EXPECT_TRUE(parser->has_errors()) << "Expected parse error for: " << source;
+        CRYO_ASSERT(parser->has_errors(), "Expected parse error for: " + source);
     }
 };
 
@@ -234,10 +293,10 @@ protected:
         double lower_bound = expected_ms * (1.0 - tolerance);
         double upper_bound = expected_ms * (1.0 + tolerance);
         
-        EXPECT_GE(actual_ms, lower_bound) 
-            << "Performance better than expected (might indicate measurement error)";
-        EXPECT_LE(actual_ms, upper_bound) 
-            << "Performance worse than expected";
+        CRYO_ASSERT(actual_ms >= lower_bound, 
+            "Performance better than expected (might indicate measurement error)");
+        CRYO_ASSERT(actual_ms <= upper_bound, 
+            "Performance worse than expected");
     }
 };
 
@@ -248,18 +307,18 @@ class MemoryTestFixture : public CryoTestBase {
 protected:
     size_t initial_memory_usage = 0;
     
-    void SetUp() override {
+    void SetUp() {
         CryoTestBase::SetUp();
         initial_memory_usage = get_memory_usage();
     }
     
-    void TearDown() override {
+    void TearDown() {
         size_t final_memory_usage = get_memory_usage();
         size_t memory_diff = final_memory_usage - initial_memory_usage;
         
         // Allow some tolerance for normal allocations
-        EXPECT_LT(memory_diff, 1024 * 1024) // 1MB tolerance
-            << "Potential memory leak detected: " << memory_diff << " bytes";
+        CRYO_ASSERT(memory_diff < 1024 * 1024, // 1MB tolerance
+            "Potential memory leak detected: " + std::to_string(memory_diff) + " bytes");
             
         CryoTestBase::TearDown();
     }
@@ -328,18 +387,18 @@ namespace TestData {
                 {
                     Cryo::TokenKind::TK_KW_FUNCTION,
                     Cryo::TokenKind::TK_IDENTIFIER,
-                    Cryo::TokenKind::TK_LPAREN,
+                    Cryo::TokenKind::TK_L_PAREN,
                     Cryo::TokenKind::TK_IDENTIFIER,
                     Cryo::TokenKind::TK_COLON,
                     Cryo::TokenKind::TK_IDENTIFIER,
-                    Cryo::TokenKind::TK_RPAREN,
+                    Cryo::TokenKind::TK_R_PAREN,
                     Cryo::TokenKind::TK_ARROW,
                     Cryo::TokenKind::TK_IDENTIFIER,
-                    Cryo::TokenKind::TK_LBRACE,
+                    Cryo::TokenKind::TK_L_BRACE,
                     Cryo::TokenKind::TK_KW_RETURN,
                     Cryo::TokenKind::TK_IDENTIFIER,
                     Cryo::TokenKind::TK_SEMICOLON,
-                    Cryo::TokenKind::TK_RBRACE
+                    Cryo::TokenKind::TK_R_BRACE
                 }
             }
         };

@@ -239,11 +239,12 @@ build: $(MAIN_BIN)
 # Clean all components
 clean:
 	@$(PYTHON) ./scripts/clean.py
-	@$(MAKE) -C tools/CryoLSP clean 2>/dev/null || true
 ifeq ($(OS), Windows_NT)
+	@$(MAKE) -C tools/CryoLSP clean >nul 2>nul || cd .
 	@if exist "$(subst /,\,$(STDLIB_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(STDLIB_BUILD_DIR))"
 	@if exist "$(subst /,\,$(RUNTIME_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(RUNTIME_BUILD_DIR))"
 else
+	@$(MAKE) -C tools/CryoLSP clean 2>/dev/null || true
 	@rm -rf $(STDLIB_BUILD_DIR)
 	@rm -rf $(RUNTIME_BUILD_DIR)
 endif
@@ -405,18 +406,18 @@ endif
 
 # Test targets - Simple and clean (no external scripts)
 .PHONY: test test-clean
-test: $(MAIN_BIN) $(TEST_BIN_DIR)/cryo_tests$(EXE_SUFFIX)
-	@echo "🧪 Running CryoLang Test Suite..."
-	@$(TEST_BIN_DIR)/cryo_tests$(EXE_SUFFIX)
+test: $(MAIN_BIN) $(TEST_ALL_EXECUTABLE)
+	@echo "Running CryoLang Test Suite..."
+	@$(TEST_ALL_EXECUTABLE)
 
 test-clean:
-	@echo "🧹 Cleaning test artifacts..."
+	@echo "Cleaning test artifacts..."
 ifeq ($(OS), Windows_NT)
 	@if exist "$(subst /,\,$(TEST_BIN_DIR))" rmdir /s /q "$(subst /,\,$(TEST_BIN_DIR))"
-	@if exist "$(subst /,\,$(BIN_DIR))\.o\tests" rmdir /s /q "$(subst /,\,$(BIN_DIR))\.o\tests"
+	@if exist "$(subst /,\,$(BIN_DIR)).o\tests" rmdir /s /q "$(subst /,\,$(BIN_DIR)).o\tests"
 else
 	@rm -rf $(TEST_BIN_DIR)
-	@rm -rf $(BIN_DIR)/.o/tests
+	@rm -rf $(BIN_DIR).o/tests
 endif
 	@echo "✅ Test cleanup complete"
 
