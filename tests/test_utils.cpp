@@ -424,7 +424,15 @@ int TestRegistry::run_all_tests() {
         try {
             test_name = test.suite + "::" + test.name;
         } catch (const std::length_error& e) {
-            std::cout << "\033[33m  [STRING-ERROR]\033[0m Test name creation failed: " << e.what() << std::endl;
+            std::cout << "\n\033[1;41m\033[97m" << std::string(65, ' ') << "\033[0m" << std::endl;
+            std::cout << "\033[1;41m\033[97m  🚨 FATAL: TEST NAME CONSTRUCTION FAILED 🚨  \033[0m" << std::endl;
+            std::cout << "\033[1;41m\033[97m" << std::string(65, ' ') << "\033[0m" << std::endl;
+            std::cout << "\033[1;43m\033[30m Test #" << std::setfill('0') << std::setw(2) << (i + 1) 
+                      << ": Cannot create test identifier string \033[0m" << std::endl;
+            std::cout << "\033[1;31m ► Error: \033[0m" << e.what() << std::endl;
+            std::cout << "\033[1;33m ► Cause: \033[0mTest suite/name combination exceeds string limits" << std::endl;
+            std::cout << "\033[1;32m ► Status: \033[0mTest skipped, continuing with next test (framework protected)" << std::endl;
+            std::cout << "\033[2m" << std::string(65, '=') << "\033[0m\n" << std::endl;
             crashed++;
             continue;
         }
@@ -442,7 +450,13 @@ int TestRegistry::run_all_tests() {
             }
             std::cout << "\033[2m+" << std::string(61, '-') << "+\033[0m" << std::endl;
         } catch (const std::length_error& e) {
-            std::cout << "\033[33m  [HEADER-ERROR]\033[0m Test " << (i + 1) << " header creation failed: " << e.what() << std::endl;
+            std::cout << "\n\033[1;41m\033[97m" << std::string(65, ' ') << "\033[0m" << std::endl;
+            std::cout << "\033[1;41m\033[97m    CRITICAL MEMORY ERROR    \033[0m" << std::endl;
+            std::cout << "\033[1;41m\033[97m" << std::string(65, ' ') << "\033[0m" << std::endl;
+            std::cout << "\033[1;43m\033[30m Test #" << std::setfill('0') << std::setw(2) << (i + 1) 
+                      << ": String allocation failure in parent process \033[0m" << std::endl;
+            std::cout << "\033[1;31m Error: \033[0m" << e.what() << std::endl;
+            std::cout << "\033[2m" << std::string(65, '=') << "\033[0m\n" << std::endl;
             crashed++;
             continue;
         }
