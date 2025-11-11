@@ -278,6 +278,7 @@ public:
  */
 void initialize_test_environment();
 void cleanup_test_environment();
+void set_test_executable_path(const std::string& path);
 
 /**
  * @brief Memory usage tracking for performance tests
@@ -318,6 +319,7 @@ public:
     }
     
     int run_all_tests();
+    int run_single_test(const std::string& test_name);
     
 private:
     std::vector<TestCase> tests;
