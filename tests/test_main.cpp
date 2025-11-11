@@ -27,18 +27,15 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "--run-single-test") {
         std::string test_name = argv[2];
         
-        // NUCLEAR OPTION: Completely suppress ALL output and terminate handling
+        // SELECTIVE SUPPRESSION: Only suppress stderr (terminate messages), keep stdout for test output
         #ifdef _WIN32
-        freopen("NUL", "w", stderr);
-        freopen("NUL", "w", stdout);  // Also suppress stdout just in case
+        freopen("NUL", "w", stderr);  // Suppress std::terminate messages only
         #else
         freopen("/dev/null", "w", stderr);
-        freopen("/dev/null", "w", stdout);
         #endif
         
-        // ULTIMATE NUCLEAR: Set custom terminate handler that does absolutely nothing
+        // SILENT TERMINATE: Set custom terminate handler that exits quietly
         std::set_terminate([]() {
-            // SILENT TERMINATION - no output, no crash messages, just exit
             exit(999);  // Use distinctive exit code for terminated processes
         });
         

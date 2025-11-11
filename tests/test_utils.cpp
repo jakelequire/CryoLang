@@ -424,15 +424,11 @@ int TestRegistry::run_all_tests() {
         try {
             test_name = test.suite + "::" + test.name;
         } catch (const std::length_error& e) {
-            std::cout << "\n\033[1;41m\033[97m" << std::string(65, ' ') << "\033[0m" << std::endl;
-            std::cout << "\033[1;41m\033[97m  🚨 FATAL: TEST NAME CONSTRUCTION FAILED 🚨  \033[0m" << std::endl;
-            std::cout << "\033[1;41m\033[97m" << std::string(65, ' ') << "\033[0m" << std::endl;
-            std::cout << "\033[1;43m\033[30m Test #" << std::setfill('0') << std::setw(2) << (i + 1) 
-                      << ": Cannot create test identifier string \033[0m" << std::endl;
-            std::cout << "\033[1;31m ► Error: \033[0m" << e.what() << std::endl;
-            std::cout << "\033[1;33m ► Cause: \033[0mTest suite/name combination exceeds string limits" << std::endl;
-            std::cout << "\033[1;32m ► Status: \033[0mTest skipped, continuing with next test (framework protected)" << std::endl;
-            std::cout << "\033[2m" << std::string(65, '=') << "\033[0m\n" << std::endl;
+            std::cout << "\033[31m[FRAMEWORK ERROR]\033[0m Test " << (i + 1) << " name construction failed" << std::endl;
+            std::cout << "\033[33mException:\033[0m " << e.what() << std::endl;
+            std::cout << "\033[33mSuite:\033[0m " << test.suite << " (" << test.suite.length() << " chars)" << std::endl;
+            std::cout << "\033[33mName:\033[0m " << test.name << " (" << test.name.length() << " chars)" << std::endl;
+            std::cout << "\033[33mAction:\033[0m Skipped, continuing\n" << std::endl;
             crashed++;
             continue;
         }
@@ -450,13 +446,14 @@ int TestRegistry::run_all_tests() {
             }
             std::cout << "\033[2m+" << std::string(61, '-') << "+\033[0m" << std::endl;
         } catch (const std::length_error& e) {
-            std::cout << "\n\033[1;41m\033[97m" << std::string(65, ' ') << "\033[0m" << std::endl;
-            std::cout << "\033[1;41m\033[97m    CRITICAL MEMORY ERROR    \033[0m" << std::endl;
-            std::cout << "\033[1;41m\033[97m" << std::string(65, ' ') << "\033[0m" << std::endl;
-            std::cout << "\033[1;43m\033[30m Test #" << std::setfill('0') << std::setw(2) << (i + 1) 
-                      << ": String allocation failure in parent process \033[0m" << std::endl;
-            std::cout << "\033[1;31m Error: \033[0m" << e.what() << std::endl;
-            std::cout << "\033[2m" << std::string(65, '=') << "\033[0m\n" << std::endl;
+            std::cout << "+-- Test " << std::setfill('0') << std::setw(2) << (i + 1) 
+                      << "/" << std::setfill('0') << std::setw(2) << tests.size() << " " 
+                      << std::string(25, '-') << "+\033[0m" << std::endl;
+            std::cout << "\033[31m[FRAMEWORK ERROR]\033[0m std::length_error in test header generation" << std::endl;
+            std::cout << "\033[33mException:\033[0m " << e.what() << std::endl;
+            std::cout << "\033[33mLocation:\033[0m Parent process string allocation (suite: " 
+                      << test.suite.length() << " chars, name: " << test.name.length() << " chars)" << std::endl;
+            std::cout << "\033[33mAction:\033[0m Test skipped, execution continues\n" << std::endl;
             crashed++;
             continue;
         }
@@ -500,30 +497,107 @@ int TestRegistry::run_all_tests() {
             passed++;
         } else if (result.crashed) {
             std::cout << "\033[33m  [CRASH]\033[0m" << std::endl;
-            std::cout << "    \033[90m+-- \033[33mCrash Type:\033[0m Process terminated unexpectedly" << std::endl;
+            
+            // Analyze exit code for technical insights
+            std::cout << "\033[33mExit Code:\033[0m " << result.exit_code;
+            if (result.exit_code == -1073741819) {
+                std::cout << " (0xC0000005 - Access Violation)";
+            } else if (result.exit_code == -1073741571) {
+                std::cout << " (0xC00000FD - Stack Overflow)";
+            } else if (result.exit_code == 999) {
+                std::cout << " (Force Terminated - Timeout)";
+            } else if (result.exit_code == 1) {
+                std::cout << " (Assertion Failure)";
+            }
+            std::cout << std::endl;
+            
             if (!result.output.empty()) {
-                // Show first few lines of output
                 std::istringstream output_stream(result.output);
                 std::string line;
-                int line_count = 0;
-                while (std::getline(output_stream, line) && line_count < 3) {
-                    if (!line.empty() && line != "CRASH") {
-                        std::cout << "    \033[90m+-- \033[33mOutput:\033[0m " << line << std::endl;
-                        line_count++;
+                std::vector<std::string> errors;
+                std::vector<std::string> debug_info;
+                std::string assertion_detail;
+                
+                // Parse output for different types of information
+                while (std::getline(output_stream, line)) {
+                    if (line.empty()) continue;
+                    
+                    // Compiler/Codegen errors
+                    if (line.find("[ERROR]") != std::string::npos) {
+                        errors.push_back(line);
+                    }
+                    // Assertion failures with details
+                    else if (line.find("FAIL: Assertion failed") != std::string::npos) {
+                        assertion_detail = line;
+                    }
+                    // Debug information
+                    else if (line.find("[DEBUG]") != std::string::npos) {
+                        debug_info.push_back(line);
+                    }
+                    // IR generation failures
+                    else if (line.find("IR generation") != std::string::npos || 
+                             line.find("verification") != std::string::npos ||
+                             line.find("CallExpression") != std::string::npos) {
+                        errors.push_back(line);
+                    }
+                    // Template/Generic errors
+                    else if (line.find("Cannot find generic template") != std::string::npos ||
+                             line.find("MonomorphizationPass") != std::string::npos) {
+                        errors.push_back(line);
+                    }
+                }
+                
+                // Display categorized information
+                if (!errors.empty()) {
+                    for (const auto& error : errors) {
+                        std::cout << "\033[31mError:\033[0m " << error << std::endl;
+                    }
+                }
+                if (!assertion_detail.empty()) {
+                    std::cout << "\033[33mAssertion:\033[0m " << assertion_detail << std::endl;
+                }
+                if (!debug_info.empty() && errors.empty() && assertion_detail.empty()) {
+                    // Only show debug info if no errors/assertions found
+                    std::cout << "\033[36mDebug:\033[0m " << debug_info[0] << std::endl;
+                }
+                
+                // If nothing specific found, show raw output
+                if (errors.empty() && assertion_detail.empty() && debug_info.empty()) {
+                    std::istringstream stream(result.output);
+                    std::string first_line;
+                    while (std::getline(stream, first_line) && first_line.empty()) {}
+                    if (!first_line.empty()) {
+                        std::cout << "\033[37mOutput:\033[0m " << first_line << std::endl;
                     }
                 }
             }
-            std::cout << "    \033[90m+-- \033[33mNote:\033[0m Test crashed but suite continues\n" << std::endl;
+            std::cout << std::endl;
             crashed++;
         } else {
             std::cout << "\033[31m  [FAIL]\033[0m" << std::endl;
+            std::cout << "\033[33mExit Code:\033[0m " << result.exit_code << std::endl;
             if (!result.output.empty()) {
-                // Show failure details
                 std::istringstream output_stream(result.output);
                 std::string line;
-                std::getline(output_stream, line); // Skip "FAIL:" prefix
-                if (std::getline(output_stream, line) && !line.empty()) {
-                    std::cout << "    \033[90m+-- \033[31mError:\033[0m " << line << std::endl;
+                std::string failure_reason;
+                
+                while (std::getline(output_stream, line)) {
+                    if (line.find("FAIL:") != std::string::npos) {
+                        failure_reason = line.substr(line.find("FAIL:") + 5);
+                        break;
+                    }
+                }
+                
+                if (!failure_reason.empty()) {
+                    std::cout << "\033[31mReason:\033[0m" << failure_reason << std::endl;
+                } else if (!result.output.empty()) {
+                    // Show first meaningful line
+                    std::istringstream stream(result.output);
+                    std::string first_line;
+                    while (std::getline(stream, first_line) && first_line.empty()) {}
+                    if (!first_line.empty()) {
+                        std::cout << "\033[31mOutput:\033[0m " << first_line << std::endl;
+                    }
                 }
             }
             std::cout << std::endl;
