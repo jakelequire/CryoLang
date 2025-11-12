@@ -4,7 +4,7 @@
 
 <var-declaration> ::= ("const" | "mut") <identifier> ":" <type> ["=" <expression>] ";"
 
-<function-declaration>  ::=  <visibility> "function" <identifier> "(" [<param-list>] ")" ["->" <type>] <block>
+<function-declaration>  ::=  "function" <identifier> "(" [<param-list>] ")" ["->" <type>] <block>
 <param-list>            ::=  <param> { "," <param> }
 <param>                 ::=  <identifier> ":" <type>
 <block>                 ::=  "{" { <statement> } "}"
