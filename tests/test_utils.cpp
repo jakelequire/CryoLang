@@ -439,6 +439,7 @@ int TestRegistry::run_all_tests() {
             std::cout << "\033[2m+-- Test " << std::setfill('0') << std::setw(2) << (i + 1) 
                       << "/" << std::setfill('0') << std::setw(2) << tests.size() << " " 
                       << std::string(48 - test.suite.length() - test.name.length(), '-') << "+\033[0m" << std::endl;
+
             
             std::cout << "\033[2m|\033[0m \033[1;36m" << test_name << "\033[0m" << std::endl;
             if (!test.description.empty()) {

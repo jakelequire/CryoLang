@@ -18,7 +18,7 @@ using namespace CryoTest;
 CRYO_TEST_DESC(PointerArithmetic, basic_addition_with_integer_array, 
     "Test pointer addition with integer array elements") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -43,7 +43,7 @@ CRYO_TEST_DESC(PointerArithmetic, basic_addition_with_integer_array,
 CRYO_TEST_DESC(PointerArithmetic, basic_subtraction_with_integer_array,
     "Test pointer subtraction with integer array elements") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -68,7 +68,7 @@ CRYO_TEST_DESC(PointerArithmetic, basic_subtraction_with_integer_array,
 CRYO_TEST_DESC(PointerArithmetic, pre_increment_with_dereference,
     "Test pre-increment operator on pointers with immediate dereference") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -93,7 +93,7 @@ CRYO_TEST_DESC(PointerArithmetic, pre_increment_with_dereference,
 CRYO_TEST_DESC(PointerArithmetic, post_increment_with_dereference,
     "Test post-increment operator on pointers with value capture") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -118,7 +118,7 @@ CRYO_TEST_DESC(PointerArithmetic, post_increment_with_dereference,
 CRYO_TEST_DESC(PointerArithmetic, pre_decrement_with_dereference,
     "Test pre-decrement operator on pointers") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -142,7 +142,7 @@ CRYO_TEST_DESC(PointerArithmetic, pre_decrement_with_dereference,
 CRYO_TEST_DESC(PointerArithmetic, post_decrement_with_dereference,
     "Test post-decrement operator on pointers") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -170,7 +170,7 @@ CRYO_TEST_DESC(PointerArithmetic, post_decrement_with_dereference,
 CRYO_TEST_DESC(PointerArithmetic, chained_arithmetic_operations,
     "Test multiple pointer arithmetic operations in sequence") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -200,7 +200,7 @@ CRYO_TEST_DESC(PointerArithmetic, chained_arithmetic_operations,
 CRYO_TEST_DESC(PointerArithmetic, mixed_increment_decrement_operations,
     "Test mixing increment and decrement operations on same pointer") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -236,7 +236,7 @@ CRYO_TEST_DESC(PointerArithmetic, mixed_increment_decrement_operations,
 CRYO_TEST_DESC(PointerArithmetic, float_array_pointer_operations,
     "Test pointer arithmetic with float arrays") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -260,7 +260,7 @@ CRYO_TEST_DESC(PointerArithmetic, float_array_pointer_operations,
 CRYO_TEST_DESC(PointerArithmetic, boolean_array_pointer_operations,
     "Test pointer arithmetic with boolean arrays") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -290,7 +290,7 @@ CRYO_TEST_DESC(PointerArithmetic, boolean_array_pointer_operations,
 CRYO_TEST_DESC(PointerArithmetic, zero_offset_operations,
     "Test pointer arithmetic with zero offset (should be no-op)") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
@@ -314,7 +314,7 @@ CRYO_TEST_DESC(PointerArithmetic, zero_offset_operations,
 CRYO_TEST_DESC(PointerArithmetic, single_element_array_operations,
     "Test pointer operations on single-element arrays") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(

@@ -537,7 +537,7 @@ CRYO_TEST_DESC(ClassPointers, pointer_to_class_method_calls,
 CRYO_TEST_DESC(ComplexStructs, array_of_structs_operations,
     "Test operations on arrays containing struct instances") {
     
-    IntegrationTestHelper helper;
+    StdlibIntegrationTestHelper helper;
     helper.setup();
 
     std::string source = R"(
