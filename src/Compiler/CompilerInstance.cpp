@@ -1586,6 +1586,45 @@ namespace Cryo
         {
             LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import runtime: {}", runtime_result.error_message);
         }
+
+        // Auto-import IO functions (printf, etc.)
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: io/stdio");
+
+        // Create a synthetic ImportDeclarationNode for io/stdio
+        // This simulates: import <io/stdio>;
+        auto io_import = std::make_unique<ImportDeclarationNode>(
+            SourceLocation(0, 0),                       // synthetic location
+            "io/stdio",                                 // path
+            ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
+        );
+
+        // Load the io/stdio import
+        auto io_result = _module_loader->load_import(*io_import);
+
+        if (io_result.success)
+        {
+            // Register the namespace and symbols (wildcard import behavior)
+            if (!io_result.symbol_map.empty())
+            {
+                current_scope->register_namespace(io_result.module_name, io_result.symbol_map);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported IO: registered namespace '{}' with {} symbols",
+                          io_result.module_name, io_result.symbol_map.size());
+
+                // Also register under the short name "IO" for convenience
+                // This allows both IO::printf and std::IO::printf to work
+                current_scope->register_namespace("IO", io_result.symbol_map);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported IO: also registered under short name 'IO' with {} symbols",
+                          io_result.symbol_map.size());
+            }
+            else
+            {
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in io/stdio");
+            }
+        }
+        else
+        {
+            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import io/stdio: {}", io_result.error_message);
+        }
     }
 
     void CompilerInstance::process_struct_declarations_for_preregistration(ASTNode *node)

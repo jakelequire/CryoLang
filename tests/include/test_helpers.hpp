@@ -408,6 +408,23 @@ private:
     
 public:
     /**
+     * @brief Setup for integration tests with stdlib support
+     */
+    void setup() override {
+        CompilerTestHelper::setup();
+        
+        // Enable auto-imports for integration tests that need stdlib
+        compiler->set_auto_imports_enabled(true);
+        
+        // Set stdlib root to ensure imports work
+        if (auto* module_loader = compiler->module_loader()) {
+            if (!module_loader->auto_detect_stdlib_root()) {
+                module_loader->set_stdlib_root("./stdlib");
+            }
+        }
+    }
+    
+    /**
      * @brief Test full compilation pipeline up to IR generation
      */
     bool compiles_to_ir(const std::string& source) {
@@ -462,6 +479,57 @@ public:
      */
     const std::string& get_last_source() const {
         return _last_source;
+    }
+};
+
+/**
+ * @brief Specialized helper for tests requiring standard library generics (Array<T>, etc.)
+ */
+class StdlibIntegrationTestHelper : public IntegrationTestHelper {
+public:
+    /**
+     * @brief Setup with full stdlib support including generics
+     */
+    void setup() override {
+        // Call parent setup first
+        IntegrationTestHelper::setup();
+        
+        // Ensure stdlib compilation is NOT enabled (we want to use stdlib, not compile it)
+        compiler->set_stdlib_compilation_mode(false);
+        
+        // Enable stdlib linking for final executable generation
+        compiler->set_stdlib_linking(true);
+        
+        // Pre-load core modules to avoid import issues during testing
+        preload_stdlib_modules();
+    }
+
+private:
+    /**
+     * @brief Pre-load essential stdlib modules for testing
+     */
+    void preload_stdlib_modules() {
+        // This method can be used to explicitly load stdlib modules if needed
+        // For now, we rely on auto-imports during compilation
+        // Updated: Force recompilation
+    }
+};
+
+/**
+ * @brief Helper for unit tests that should NOT use stdlib (pure unit testing)
+ */
+class UnitTestHelper : public CompilerTestHelper {
+public:
+    /**
+     * @brief Setup with minimal configuration (no stdlib imports)
+     */
+    void setup() override {
+        CompilerTestHelper::setup();
+        
+        // Explicitly disable auto-imports for pure unit tests
+        compiler->set_auto_imports_enabled(false);
+        compiler->set_stdlib_compilation_mode(false);
+        compiler->set_stdlib_linking(false);
     }
 };
 
