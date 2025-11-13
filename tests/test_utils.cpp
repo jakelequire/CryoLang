@@ -9,14 +9,14 @@
 #include <exception>
 #include <string>
 #include <vector>
-#include <unistd.h>      // For fork(), pipe(), dup2(), execvp(), close()
-#include <sys/types.h>   // For pid_t
-#include <sys/wait.h>    // For waitpid()
-#include <signal.h>      // For kill(), SIGKILL
-#include <errno.h>       // For errno
-#include <cstring>       // For strerror()
-#include <fcntl.h>       // For file control options (optional for pipe flags)
-#include <cstdlib>       // For _exit()
+#include <unistd.h>      // fork(), pipe(), dup2(), execvp(), close()
+#include <sys/types.h>   // pid_t
+#include <sys/wait.h>    // waitpid()
+#include <signal.h>      // kill(), SIGKILL
+#include <errno.h>       // errno
+#include <cstring>       // strerror()
+#include <fcntl.h>       // file control options (optional for pipe flags)
+#include <cstdlib>       // _exit()
 
 #ifdef _WIN32
 #include <windows.h>
