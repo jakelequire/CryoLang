@@ -7,13 +7,12 @@ Cryo is a statically typed, OOP, manual memory managed, systems programming lang
 - [Basic Variables](#basic-variables)
 - [Basic Functions](#basic-functions)
 
-# Data Types
+## Data Types
 
 In the Cryo stdlib, there is a file called `types.cryo` which shows all of the primitive types defined as well as more complex fundamental types such as `Array<T>`. 
 
 ### Primitives
 
--------------------------------------------------------
 |             |              |              |         |
 |-------------|--------------|--------------|---------|
 | i8          | u8           | f32 (float)  |         |
@@ -24,7 +23,7 @@ In the Cryo stdlib, there is a file called `types.cryo` which shows all of the p
 |             |              |              |         |
 
 
-# Basic Variables
+## Basic Variables
 
 In Cryo, there are two types of variables; `const` variables and `mut` variables. When declaring a variable, either `const` or `mut` is required when defining a variable. Here is a basic example:
 
@@ -43,7 +42,7 @@ Variable Declarations follow this grammar rule:
 
 ---
 
-# Basic Functions
+## Basic Functions
 
 Functions in Cryo are defined using the `function` keyword followed by the function name, parameters, return type, and body. The 
 

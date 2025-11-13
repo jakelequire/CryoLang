@@ -7,6 +7,16 @@
 #include <functional>
 #include <stdexcept>
 #include <exception>
+#include <string>
+#include <vector>
+#include <unistd.h>      // For fork(), pipe(), dup2(), execvp(), close()
+#include <sys/types.h>   // For pid_t
+#include <sys/wait.h>    // For waitpid()
+#include <signal.h>      // For kill(), SIGKILL
+#include <errno.h>       // For errno
+#include <cstring>       // For strerror()
+#include <fcntl.h>       // For file control options (optional for pipe flags)
+#include <cstdlib>       // For _exit()
 
 #ifdef _WIN32
 #include <windows.h>
@@ -14,11 +24,15 @@
 #include <setjmp.h>
 #include <process.h>
 #include <io.h>
+#else
+#include <csignal>
+#include <csetjmp>
 #endif
 
 // Global flag to handle main process crashes
 static volatile bool main_process_crash_protection = false;
 static jmp_buf crash_recovery_point;
+static std::string current_test_executable;
 
 // Signal handler for main process protection
 void main_process_signal_handler(int sig) {
@@ -48,7 +62,6 @@ static std::terminate_handler old_terminate_handler = nullptr;
 
 // Process isolation variables
 static bool use_process_isolation = true;
-static std::string current_test_executable;
 
 void crash_signal_handler(int sig) {
     crash_detected = true;
@@ -173,7 +186,6 @@ int execute_test_with_seh_protection(std::function<void()> test_function) {
 }
 #endif
 
-#ifdef _WIN32
 // Run a single test in an isolated process
 struct ProcessTestResult {
     bool success = false;
@@ -183,195 +195,199 @@ struct ProcessTestResult {
     int exit_code = 0;
 };
 
+// Helper function for filtering output (same logic as original)
+std::string filter_output(const std::string& raw_output) {
+    std::istringstream output_stream(raw_output);
+    std::string filtered_output;
+    std::string line;
+    bool found_result = false;
+
+    while (std::getline(output_stream, line)) {
+        if (line.find("[INFO]") != std::string::npos ||
+            line.find("[DONE]") != std::string::npos ||
+            line.find("Test environment") != std::string::npos ||
+            line.find("Initializing") != std::string::npos ||
+            line.find("initialized") != std::string::npos ||
+            line.empty()) {
+            continue;
+        }
+        if (line.find("PASS") != std::string::npos) {
+            filtered_output = "PASS";
+            found_result = true;
+            break;
+        } else if (line.find("FAIL") != std::string::npos ||
+                   line.find("CRASH") != std::string::npos ||
+                   line.find("ERROR") != std::string::npos) {
+            filtered_output = line;
+            found_result = true;
+            break;
+        }
+    }
+
+    if (!found_result) {
+        std::istringstream stream2(raw_output);
+        while (std::getline(stream2, line)) {
+            if (line.find("[INFO]") == std::string::npos &&
+                line.find("[DONE]") == std::string::npos &&
+                line.find("Test environment") == std::string::npos &&
+                line.find("initialized") == std::string::npos &&
+                !line.empty()) {
+                filtered_output += line + "\n";
+            }
+        }
+    }
+    return filtered_output;
+}
+
 ProcessTestResult run_test_in_process(const std::string& test_name, size_t test_index) {
     ProcessTestResult result;
     result.success = false;
     result.failed = false;
-    result.crashed = true; // Default to crashed - prove otherwise
+    result.crashed = true; // Default to crashed
     result.exit_code = -1;
     result.output = "Process isolation failed";
-    
-    // BULLETPROOF: Even if something fails here, we return a crashed result
+
     try {
-        // Create command line for isolated test execution
         std::string cmd_line = "\"" + current_test_executable + "\" --run-single-test \"" + test_name + "\"";
-        
-        // Create pipes for capturing output
+
+#ifdef _WIN32
+        // ---------------- WINDOWS IMPLEMENTATION ----------------
         HANDLE hReadPipe, hWritePipe;
         SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
-        
+
         if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
             result.output = "Failed to create pipe for test communication";
-            return result; // Returns crashed=true
+            return result;
         }
-    
-    // Create NULL handles for COMPLETE suppression of all child output
-    HANDLE hNullHandle = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
-    if (hNullHandle == INVALID_HANDLE_VALUE) {
-        hNullHandle = hWritePipe;  // Fallback to using the same pipe
-    }
-    
-    // Create another NULL handle for stdin to ensure complete isolation
-    HANDLE hNullInput = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ, &sa, OPEN_EXISTING, 0, NULL);
-    if (hNullInput == INVALID_HANDLE_VALUE) {
-        hNullInput = GetStdHandle(STD_INPUT_HANDLE);
-    }
-    
-    // CRITICAL: Make these handles inheritable for child process isolation
-    SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    SetHandleInformation(hNullHandle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    SetHandleInformation(hNullInput, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    
-    // Set up process startup info with complete isolation
-    STARTUPINFOA si = {sizeof(STARTUPINFOA)};
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;  // Hide child process window
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hNullHandle;  // Suppress all error output including std::terminate messages
-    si.hStdInput = hNullInput;   // Use null input handle
-    
-    PROCESS_INFORMATION pi = {0};
-    
-    // ULTIMATE ISOLATION: Use DETACHED_PROCESS + pipe redirection for complete isolation  
-    DWORD creationFlags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-    
-    // Create the child process with ABSOLUTE isolation - use pipe redirection only
-    if (!CreateProcessA(
-        NULL,                           // Application name
-        const_cast<char*>(cmd_line.c_str()), // Command line
-        NULL,                           // Process security attributes
-        NULL,                           // Thread security attributes
-        TRUE,                           // Inherit handles for our pipes only
-        creationFlags,                  // Isolation flags
-        NULL,                           // Environment
-        NULL,                           // Current directory
-        &si,                            // Startup info
-        &pi                             // Process info
-    )) {
-        CloseHandle(hReadPipe);
+
+        HANDLE hNullHandle = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+        if (hNullHandle == INVALID_HANDLE_VALUE) hNullHandle = hWritePipe;
+
+        HANDLE hNullInput = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ, &sa, OPEN_EXISTING, 0, NULL);
+        if (hNullInput == INVALID_HANDLE_VALUE) hNullInput = GetStdHandle(STD_INPUT_HANDLE);
+
+        SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(hNullHandle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(hNullInput, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+        STARTUPINFOA si = {sizeof(STARTUPINFOA)};
+        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        si.hStdOutput = hWritePipe;
+        si.hStdError = hNullHandle;
+        si.hStdInput = hNullInput;
+
+        PROCESS_INFORMATION pi = {0};
+        DWORD creationFlags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+        if (!CreateProcessA(NULL, const_cast<char*>(cmd_line.c_str()), NULL, NULL, TRUE,
+                            creationFlags, NULL, NULL, &si, &pi)) {
+            CloseHandle(hReadPipe);
+            CloseHandle(hWritePipe);
+            result.output = "Failed to create test process";
+            return result;
+        }
+
         CloseHandle(hWritePipe);
-        result.output = "Failed to create test process";
-        return result;
-    }
-    
-    // Close write handle in parent process
-    CloseHandle(hWritePipe);
-    
-    // Read output from child process
-    char buffer[4096];
-    DWORD bytesRead;
-    std::string output;
-    
-    while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-        buffer[bytesRead] = '\0';
-        output += buffer;
-    }
-    
-    // Wait for process to complete (with aggressive timeout)
-    DWORD waitResult = WaitForSingleObject(pi.hProcess, 5000); // 5 second timeout - aggressive termination
-    
-    if (waitResult == WAIT_TIMEOUT) {
-        // FORCE TERMINATION - no mercy for hanging tests
-        TerminateProcess(pi.hProcess, 999);
-        WaitForSingleObject(pi.hProcess, 1000); // Wait for termination to complete
-        result.crashed = true;
-        result.output = "Test forcibly terminated after 5 seconds (hung/infinite loop)";
-    } else if (waitResult == WAIT_OBJECT_0) {
-        // Get exit code
-        DWORD exitCode;
-        GetExitCodeProcess(pi.hProcess, &exitCode);
-        result.exit_code = exitCode;
-        
-        if (exitCode == 0) {
-            result.success = true;
-        } else if (exitCode == 1) {
-            result.failed = true;  // Test assertion failure
+        char buffer[4096];
+        DWORD bytesRead;
+        std::string output;
+        while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+            buffer[bytesRead] = '\0';
+            output += buffer;
+        }
+
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 5000);
+        if (waitResult == WAIT_TIMEOUT) {
+            TerminateProcess(pi.hProcess, 999);
+            WaitForSingleObject(pi.hProcess, 1000);
+            result.crashed = true;
+            result.output = "Test forcibly terminated after 5 seconds (hung/infinite loop)";
+        } else if (waitResult == WAIT_OBJECT_0) {
+            DWORD exitCode;
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+            result.exit_code = exitCode;
+            if (exitCode == 0) result.success = true;
+            else if (exitCode == 1) result.failed = true;
+            else result.crashed = true;
+            if (result.output.empty()) result.output = "Process crashed with exit code: " + std::to_string(exitCode);
+            result.output = filter_output(output);
         } else {
-            result.crashed = true;  // Any other exit code (including std::terminate)
-            // Log the actual exit code for debugging
-            if (result.output.empty()) {
-                result.output = "Process crashed with exit code: " + std::to_string(exitCode);
-            }
+            result.output = "Process wait failed";
         }
-        
-        // Filter out initialization messages and keep only the test result
-        std::istringstream output_stream(output);
-        std::string filtered_output;
-        std::string line;
-        bool found_result = false;
-        
-        while (std::getline(output_stream, line)) {
-            // Skip initialization and cleanup messages
-            if (line.find("[INFO]") != std::string::npos ||
-                line.find("[DONE]") != std::string::npos ||
-                line.find("Test environment") != std::string::npos ||
-                line.find("Initializing") != std::string::npos ||
-                line.find("initialized") != std::string::npos ||
-                line.empty()) {
-                continue;
-            }
-            
-            // Look for result lines (PASS, FAIL, CRASH, ERROR)
-            if (line.find("PASS") != std::string::npos) {
-                filtered_output = "PASS";
-                found_result = true;
-                break;
-            } else if (line.find("FAIL") != std::string::npos) {
-                filtered_output = line; // Keep full failure message
-                found_result = true;
-                break;
-            } else if (line.find("CRASH") != std::string::npos) {
-                filtered_output = line; // Keep full crash message
-                found_result = true;
-                break;
-            } else if (line.find("ERROR") != std::string::npos) {
-                filtered_output = line; // Keep full error message
-                found_result = true;
-                break;
-            }
-        }
-        
-        // If no clear result found, use original output but filter noise
-        if (!found_result) {
-            std::istringstream stream2(output);
-            while (std::getline(stream2, line)) {
-                if (line.find("[INFO]") == std::string::npos &&
-                    line.find("[DONE]") == std::string::npos &&
-                    line.find("Test environment") == std::string::npos &&
-                    line.find("initialized") == std::string::npos &&
-                    !line.empty()) {
-                    filtered_output += line + "\n";
-                }
-            }
-        }
-        
-        result.output = filtered_output;
-    } else {
-        result.crashed = true;
-        result.output = "Process wait failed";
-    }
-    
-        // Cleanup
+
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         CloseHandle(hReadPipe);
-        if (hNullHandle != INVALID_HANDLE_VALUE) {
-            CloseHandle(hNullHandle);
-        }
-        if (hNullInput != INVALID_HANDLE_VALUE && hNullInput != GetStdHandle(STD_INPUT_HANDLE)) {
-            CloseHandle(hNullInput);
+        if (hNullHandle != INVALID_HANDLE_VALUE) CloseHandle(hNullHandle);
+        if (hNullInput != INVALID_HANDLE_VALUE && hNullInput != GetStdHandle(STD_INPUT_HANDLE)) CloseHandle(hNullInput);
+
+#else
+        // ---------------- LINUX IMPLEMENTATION ----------------
+        int pipefd[2];
+        if (pipe(pipefd) == -1) {
+            result.output = "Failed to create pipe";
+            return result;
         }
 
-        return result;
-        
-    } catch (...) {
-        // BULLETPROOF: Any exception in process creation/management
-        result.crashed = true;
-        result.output = "Exception in process isolation - test marked as crashed";
-        return result;
-    }
-}
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child process
+            dup2(pipefd[1], STDOUT_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            execl("/bin/sh", "sh", "-c", cmd_line.c_str(), (char*)NULL);
+            _exit(127);
+        } else if (pid > 0) {
+            // Parent process
+            close(pipefd[1]);
+            char buffer[4096];
+            ssize_t bytesRead;
+            std::string output;
+            while ((bytesRead = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+                buffer[bytesRead] = '\0';
+                output += buffer;
+            }
+            close(pipefd[0]);
+
+            int status;
+            int waited = 0;
+            while (waited < 5) {
+                pid_t res = waitpid(pid, &status, WNOHANG);
+                if (res == pid) break;
+                sleep(1);
+                waited++;
+            }
+            if (waited >= 5) {
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);
+                result.crashed = true;
+                result.output = "Test forcibly terminated after 5 seconds (hung/infinite loop)";
+            } else {
+                if (WIFEXITED(status)) {
+                    int exitCode = WEXITSTATUS(status);
+                    result.exit_code = exitCode;
+                    if (exitCode == 0) result.success = true;
+                    else if (exitCode == 1) result.failed = true;
+                    else result.crashed = true;
+                    result.output = filter_output(output);
+                } else {
+                    result.output = "Process crashed";
+                }
+            }
+        } else {
+            result.output = "Fork failed";
+        }
 #endif
+    } catch (...) {
+        result.output = "Exception occurred during test execution";
+    }
+
+    return result;
+}
+
+
 
 void set_test_executable_path(const std::string& path) {
     current_test_executable = path;
