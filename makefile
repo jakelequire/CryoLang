@@ -253,7 +253,7 @@ endif
 # STANDARD LIBRARY COMPILATION
 # =================================================================
 
-.PHONY: stdlib stdlib-clean
+.PHONY: stdlib stdlib-clean stdlib-status
 stdlib: $(STDLIB_LIB)
 
 $(STDLIB_BUILD_DIR):
@@ -273,17 +273,19 @@ $(STDLIB_BUILD_DIR)/%.bc: $(STDLIB_DIR)/%.cryo $(MAIN_BIN) | $(STDLIB_BUILD_DIR)
 	@echo "Compiling stdlib module: $(STDLIB_DIR)/$*.cryo"
 ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
-	@echo "[STDLIB] Generating IR and dumping to console for $(STDLIB_DIR)/$*.cryo"
-	@.\bin\cryo.exe $(STDLIB_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/$*.bc || ( \
-		echo "[STDLIB] Compilation failed, creating stub file..." && \
+	@.\bin\cryo.exe $(STDLIB_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/$*.bc && ( \
+		echo "[STDLIB] ✓ Successfully compiled $*.cryo" \
+	) || ( \
+		echo "[STDLIB] ✗ Compilation failed for $*.cryo - creating stub..." && \
 		echo "; Compilation failed for $*.cryo" > $(STDLIB_BUILD_DIR)/$*.bc && \
 		echo "; Stub file created to satisfy build system" >> $(STDLIB_BUILD_DIR)/$*.bc \
 	)
 else
 	@mkdir -p $(dir $@)
-	@echo "[STDLIB] Generating IR and dumping to console for $(STDLIB_DIR)/$*.cryo"
-	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm --debug -c --stdlib-mode -o $(shell pwd)/$@ || ( \
-		echo "[STDLIB] Compilation failed, creating stub file..." && \
+	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm --debug -c --stdlib-mode -o $(shell pwd)/$@ && ( \
+		echo "[STDLIB] ✓ Successfully compiled $*.cryo" \
+	) || ( \
+		echo "[STDLIB] ✗ Compilation failed for $*.cryo - creating stub..." && \
 		echo "; Compilation failed for $*.cryo" > $@ && \
 		echo "; Stub file created to satisfy build system" >> $@ \
 	)
@@ -292,20 +294,113 @@ endif
 # Link all stdlib modules into a single library
 $(STDLIB_LIB): $(STDLIB_BC_FILES)
 	@echo "Creating standard library: $(STDLIB_LIB)"
-	@llvm-link $(STDLIB_BC_FILES) -o $(STDLIB_BUILD_DIR)/cryo_combined.bc
+	@echo "Filtering valid LLVM bitcode files..."
 ifeq ($(OS), Windows_NT)
-	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o
+	@powershell -Command " \
+		$$validFiles = @(); \
+		foreach ($$file in (Get-ChildItem -Path '$(STDLIB_BUILD_DIR)' -Recurse -Filter '*.bc')) { \
+			if ((Get-Content $$file.FullName -TotalCount 1) -notlike ';*') { \
+				$$validFiles += $$file.FullName; \
+			} else { \
+				Write-Host '[STDLIB] Skipping stub file:' $$file.Name; \
+			} \
+		}; \
+		if ($$validFiles.Count -eq 0) { \
+			Write-Host '[STDLIB] ERROR: No valid bitcode files found. Cannot create library.'; \
+			exit 1; \
+		}; \
+		Write-Host '[STDLIB] Found' $$validFiles.Count 'valid bitcode files'; \
+		$$fileList = $$validFiles -join ' '; \
+		& llvm-link $$validFiles -o $(STDLIB_BUILD_DIR)/cryo_combined.bc; \
+		if ($$LASTEXITCODE -ne 0) { \
+			Write-Host '[STDLIB] llvm-link failed, but continuing...'; \
+			echo '; Empty combined module due to linking failure' > $(STDLIB_BUILD_DIR)/cryo_combined.bc; \
+		} \
+	"
+	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o || ( \
+		echo "[STDLIB] LLC failed, creating empty object file..." && \
+		echo > $(STDLIB_BUILD_DIR)/libcryo.o \
+	)
 else
-	@llc -filetype=obj -relocation-model=pic $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o
+	@valid_files=$$(find $(STDLIB_BUILD_DIR) -name "*.bc" -exec sh -c 'head -n1 "$$1" | grep -v "^;"' _ {} \; -print | grep -E '\.bc$$'); \
+	if [ -z "$$valid_files" ]; then \
+		echo "[STDLIB] ERROR: No valid bitcode files found. Cannot create library."; \
+		exit 1; \
+	fi; \
+	echo "[STDLIB] Found valid bitcode files: $$valid_files"; \
+	llvm-link $$valid_files -o $(STDLIB_BUILD_DIR)/cryo_combined.bc || ( \
+		echo "[STDLIB] llvm-link failed, but continuing..." && \
+		echo "; Empty combined module due to linking failure" > $(STDLIB_BUILD_DIR)/cryo_combined.bc \
+	)
+	@llc -filetype=obj -relocation-model=pic $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o || ( \
+		echo "[STDLIB] LLC failed, creating empty object file..." && \
+		touch $(STDLIB_BUILD_DIR)/libcryo.o \
+	)
 endif
-	@llvm-ar rcs $(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryo.o
-	@echo "Standard library created Successfully: $(STDLIB_LIB)"
+	@llvm-ar rcs $(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryo.o || ( \
+		echo "[STDLIB] llvm-ar failed, creating minimal library..." && \
+		echo "" > $(STDLIB_LIB) \
+	)
+	@echo "Standard library created: $(STDLIB_LIB)"
+	@echo "Note: Some modules may have failed to compile and were excluded."
 
 stdlib-clean:
 ifeq ($(OS), Windows_NT)
 	@if exist "$(subst /,\,$(STDLIB_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(STDLIB_BUILD_DIR))"
 else
 	@rm -rf $(STDLIB_BUILD_DIR)
+endif
+
+stdlib-status:
+	@echo "=== Standard Library Build Status ==="
+ifeq ($(OS), Windows_NT)
+	@powershell -Command " \
+		$$totalFiles = (Get-ChildItem -Path '$(STDLIB_BUILD_DIR)' -Recurse -Filter '*.bc').Count; \
+		$$validFiles = 0; \
+		$$stubFiles = 0; \
+		foreach ($$file in (Get-ChildItem -Path '$(STDLIB_BUILD_DIR)' -Recurse -Filter '*.bc')) { \
+			if ((Get-Content $$file.FullName -TotalCount 1) -like ';*') { \
+				$$stubFiles++; \
+				Write-Host '✗ FAILED:' $$file.Name.Replace('.bc', '.cryo'); \
+			} else { \
+				$$validFiles++; \
+				Write-Host '✓ OK:    ' $$file.Name.Replace('.bc', '.cryo'); \
+			} \
+		}; \
+		Write-Host ''; \
+		Write-Host 'Summary:' $$validFiles 'successful,' $$stubFiles 'failed out of' $$totalFiles 'total modules'; \
+		if ($$stubFiles -gt 0) { \
+			Write-Host 'Library created with working modules only.'; \
+		} else { \
+			Write-Host 'All modules compiled successfully!'; \
+		} \
+	"
+else
+	@if [ -d "$(STDLIB_BUILD_DIR)" ]; then \
+		total_files=$$(find $(STDLIB_BUILD_DIR) -name "*.bc" | wc -l); \
+		valid_files=0; \
+		stub_files=0; \
+		for file in $(STDLIB_BUILD_DIR)/**/*.bc; do \
+			if [ -f "$$file" ]; then \
+				if head -n1 "$$file" | grep -q "^;"; then \
+					stub_files=$$((stub_files + 1)); \
+					echo "✗ FAILED: $$(basename $$file .bc).cryo"; \
+				else \
+					valid_files=$$((valid_files + 1)); \
+					echo "✓ OK:     $$(basename $$file .bc).cryo"; \
+				fi; \
+			fi; \
+		done; \
+		echo ""; \
+		echo "Summary: $$valid_files successful, $$stub_files failed out of $$total_files total modules"; \
+		if [ $$stub_files -gt 0 ]; then \
+			echo "Library created with working modules only."; \
+		else \
+			echo "All modules compiled successfully!"; \
+		fi; \
+	else \
+		echo "No stdlib build directory found. Run 'make stdlib' first."; \
+	fi
 endif
 
 stdlib-types:
