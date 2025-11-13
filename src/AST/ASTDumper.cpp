@@ -1358,6 +1358,16 @@ namespace Cryo
         if (_use_colors)
             _output << Colors::RESET;
 
+        // Show explicit value if present
+        if (node.has_explicit_value())
+        {
+            if (_use_colors)
+                _output << Colors::LITERAL;
+            _output << " = " << node.explicit_value();
+            if (_use_colors)
+                _output << Colors::RESET;
+        }
+
         if (!node.is_simple_variant())
         {
             _output << " (";

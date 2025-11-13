@@ -3402,8 +3402,25 @@ namespace Cryo
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected enum variant name");
         std::string variant_name = std::string(name_token.text());
 
-        // Check if this is a simple variant (C-style) or complex variant (Rust-style)
-        if (_current_token.is(TokenKind::TK_L_PAREN))
+        // Check for explicit value assignment (C-style enum with values)
+        if (_current_token.is(TokenKind::TK_EQUAL))
+        {
+            advance(); // consume '='
+            
+            if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+            {
+                int64_t explicit_value = std::stoll(std::string(_current_token.text()));
+                advance(); // consume the number
+                return _builder.create_enum_variant_with_value(start_loc, variant_name, explicit_value);
+            }
+            else
+            {
+                error("Expected integer value after '=' in enum variant");
+                return _builder.create_enum_variant(start_loc, variant_name);
+            }
+        }
+        // Check if this is a complex variant with associated data
+        else if (_current_token.is(TokenKind::TK_L_PAREN))
         {
             // Complex variant with associated data: Bar(Baz)
             consume(TokenKind::TK_L_PAREN, "Expected '('");

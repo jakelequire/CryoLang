@@ -1429,6 +1429,7 @@ namespace Cryo
     private:
         std::string _name;
         std::vector<std::string> _associated_types; // Empty for simple variants like NAME_1
+        std::optional<int64_t> _explicit_value;     // For C-style enums with explicit values
 
     public:
         EnumVariantNode(SourceLocation loc, std::string name)
@@ -1438,13 +1439,24 @@ namespace Cryo
             : DeclarationNode(NodeKind::Declaration, loc), _name(std::move(name)),
               _associated_types(std::move(associated_types)) {}
 
+        EnumVariantNode(SourceLocation loc, std::string name, int64_t explicit_value)
+            : DeclarationNode(NodeKind::Declaration, loc), _name(std::move(name)), _explicit_value(explicit_value) {}
+
         const std::string &name() const { return _name; }
         const std::vector<std::string> &associated_types() const { return _associated_types; }
         bool is_simple_variant() const { return _associated_types.empty(); }
+        bool has_explicit_value() const { return _explicit_value.has_value(); }
+        int64_t explicit_value() const { return _explicit_value.value_or(0); }
+
+        void set_explicit_value(int64_t value) { _explicit_value = value; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "EnumVariant: " << _name;
+            if (has_explicit_value())
+            {
+                os << " = " << explicit_value();
+            }
             if (!_associated_types.empty())
             {
                 os << "(";

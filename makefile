@@ -282,7 +282,7 @@ ifeq ($(OS), Windows_NT)
 else
 	@mkdir -p $(dir $@)
 	@echo "[STDLIB] Generating IR and dumping to console for $(STDLIB_DIR)/$*.cryo"
-	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(shell pwd)/$@ || ( \
+	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm --debug -c --stdlib-mode -o $(shell pwd)/$@ || ( \
 		echo "[STDLIB] Compilation failed, creating stub file..." && \
 		echo "; Compilation failed for $*.cryo" > $@ && \
 		echo "; Stub file created to satisfy build system" >> $@ \
@@ -361,7 +361,7 @@ $(RUNTIME_BUILD_DIR)/%.bc: $(RUNTIME_DIR)/%.cryo $(MAIN_BIN) | $(RUNTIME_BUILD_D
 ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
 	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
-	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
+	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --debug --stdlib-mode -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
 		echo "[RUNTIME] Compilation failed for $*.cryo" && \
 		exit 1 \
 	)
