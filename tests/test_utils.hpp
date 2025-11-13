@@ -17,6 +17,7 @@
 #include <fstream>
 #include <vector>
 #include <functional>
+#include <iomanip>
 
 namespace CryoTest {
 
@@ -239,12 +240,19 @@ public:
 #define CRYO_EXPECT_NE(expected, actual) CRYO_ASSERT_NE(expected, actual)
 #define CRYO_EXPECT_STREQ(expected, actual) CRYO_ASSERT_STREQ(expected, actual)
 
-// Production-level CRYO_ASSERT macro with detailed messaging
+// Production-level CRYO_ASSERT macro with enhanced detailed messaging
 #define CRYO_ASSERT(condition, message) \
     do { \
         if (!(condition)) { \
             std::ostringstream __oss; \
-            __oss << "ASSERTION FAILURE: " << (message) << " at " << __FILE__ << ":" << __LINE__; \
+            __oss << "\n+==============================================================================+\n"; \
+            __oss << "|                              ASSERTION FAILURE                              |\n"; \
+            __oss << "+==============================================================================+\n"; \
+            __oss << "| Expression: " << std::left << std::setw(64) << #condition << "|\n"; \
+            __oss << "| Message: " << std::left << std::setw(67) << (message) << "|\n"; \
+            __oss << "| Location: " << std::left << std::setw(66) << (__FILE__ ":" + std::to_string(__LINE__)) << "|\n"; \
+            __oss << "| Function: " << std::left << std::setw(66) << __FUNCTION__ << "|\n"; \
+            __oss << "+==============================================================================+"; \
             throw CryoTest::AssertionError(__oss.str()); \
         } \
     } while(0)
