@@ -239,6 +239,16 @@ public:
 #define CRYO_EXPECT_NE(expected, actual) CRYO_ASSERT_NE(expected, actual)
 #define CRYO_EXPECT_STREQ(expected, actual) CRYO_ASSERT_STREQ(expected, actual)
 
+// Production-level CRYO_ASSERT macro with detailed messaging
+#define CRYO_ASSERT(condition, message) \
+    do { \
+        if (!(condition)) { \
+            std::ostringstream __oss; \
+            __oss << "ASSERTION FAILURE: " << (message) << " at " << __FILE__ << ":" << __LINE__; \
+            throw CryoTest::AssertionError(__oss.str()); \
+        } \
+    } while(0)
+
 // Compatibility aliases for existing tests
 #define ASSERT_TRUE(condition) CRYO_ASSERT_TRUE(condition)
 #define ASSERT_FALSE(condition) CRYO_ASSERT_FALSE(condition)

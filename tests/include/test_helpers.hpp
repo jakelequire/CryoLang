@@ -533,4 +533,69 @@ public:
     }
 };
 
+/**
+ * @brief Helper class for testing code generation and LLVM IR
+ */
+class CodegenTestHelper : public CompilerTestHelper {
+public:
+    /**
+     * @brief Setup with codegen testing configuration
+     */
+    void setup() override {
+        CompilerTestHelper::setup();
+        
+        // Enable debug mode for better error reporting
+        compiler->set_debug_mode(true);
+        
+        // Disable stdlib for isolated codegen testing
+        compiler->set_auto_imports_enabled(false);
+        compiler->set_stdlib_compilation_mode(false);
+        compiler->set_stdlib_linking(false);
+    }
+    
+    /**
+     * @brief Compile source and generate IR (full compilation pipeline)
+     */
+    bool compile_source(const std::string& source) {
+        try {
+            if (!compiler) {
+                setup();
+            }
+            
+            // Parse the source
+            bool parse_success = compiler->parse_source(source);
+            if (!parse_success) {
+                return false;
+            }
+            
+            // Analyze (type checking, etc.)
+            bool analyze_success = compiler->analyze();
+            if (!analyze_success) {
+                return false;
+            }
+            
+            // Generate IR
+            bool ir_success = compiler->generate_ir();
+            if (!ir_success) {
+                return false;
+            }
+            
+            return true;
+        } catch (const std::exception& e) {
+            std::cout << "[CODEGEN TEST ERROR] " << e.what() << std::endl;
+            return false;
+        } catch (...) {
+            std::cout << "[CODEGEN TEST ERROR] Unknown exception during compilation" << std::endl;
+            return false;
+        }
+    }
+    
+    /**
+     * @brief Test that source compiles without any errors
+     */
+    bool compiles_without_errors(const std::string& source) {
+        return compile_source(source) && !has_errors();
+    }
+};
+
 } // namespace CryoTest

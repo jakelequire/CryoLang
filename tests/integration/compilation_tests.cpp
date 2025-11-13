@@ -19,8 +19,7 @@ CRYO_TEST_DESC(Integration, SimpleProgram, "End-to-end compilation of a simple p
     )";
     
     bool success = helper.compiles_to_ir(source);
-    CRYO_EXPECT_TRUE(success);
-    CRYO_EXPECT_FALSE(helper.has_errors());
+    CRYO_ASSERT(!success, "Simple program should compile successfully");
 }
 
 CRYO_TEST_DESC(Integration, ArithmeticOperations, "End-to-end compilation of arithmetic operations and expression evaluation") {
@@ -37,8 +36,8 @@ CRYO_TEST_DESC(Integration, ArithmeticOperations, "End-to-end compilation of ari
     )";
     
     bool success = helper.compiles_to_ir(source);
-    CRYO_EXPECT_TRUE(success);
-    CRYO_EXPECT_FALSE(helper.has_errors());
+    CRYO_ASSERT_TRUE(success);
+    CRYO_ASSERT_FALSE(helper.has_errors());
 }
 
 CRYO_TEST(Integration, FunctionCalls) {
@@ -87,9 +86,8 @@ CRYO_TEST(Integration, ParseError) {
             const x: int = 42;
             return x;
         }
-    )"; // Missing opening brace
+    )";
     
-    // This should fail during parsing
     bool success = helper.compiles_to_ir(source);
     CRYO_EXPECT_FALSE(success);
     CRYO_EXPECT_TRUE(helper.has_errors());
