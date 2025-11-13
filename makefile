@@ -194,6 +194,7 @@ rebuild:
 STDLIB_DIR = ./stdlib
 STDLIB_BUILD_DIR = $(BIN_DIR)stdlib
 STDLIB_LIB = $(STDLIB_BUILD_DIR)/libcryo.a
+STDLIB_FLAGS ?= # Additional flags for stdlib compilation (e.g., --debug --verbose)
 
 # Find all stdlib source files - using dynamic discovery for both Windows and Linux
 # Exclude the runtime directory from stdlib compilation
@@ -263,86 +264,29 @@ ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$@)\io" mkdir "$(subst /,\,$@)\io"
 	@if not exist "$(subst /,\,$@)\strings" mkdir "$(subst /,\,$@)\strings"
 	@if not exist "$(subst /,\,$@)\collections" mkdir "$(subst /,\,$@)\collections"
+	@if not exist "$(subst /,\,$@)\net" mkdir "$(subst /,\,$@)\net"
 else
 	@mkdir -p $@
-	@mkdir -p $@/core $@/io $@/strings $@/collections
+	@mkdir -p $@/core $@/io $@/strings $@/collections $@/net
 endif
 
-# Compile individual stdlib modules to LLVM bitcode
-$(STDLIB_BUILD_DIR)/%.bc: $(STDLIB_DIR)/%.cryo $(MAIN_BIN) | $(STDLIB_BUILD_DIR)
-	@echo "Compiling stdlib module: $(STDLIB_DIR)/$*.cryo"
+# Use Python script to build the standard library
+$(STDLIB_LIB): $(MAIN_BIN) | $(STDLIB_BUILD_DIR)
 ifeq ($(OS), Windows_NT)
-	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
-	@.\bin\cryo.exe $(STDLIB_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/$*.bc && ( \
-		echo "[STDLIB] ✓ Successfully compiled $*.cryo" \
-	) || ( \
-		echo "[STDLIB] ✗ Compilation failed for $*.cryo - creating stub..." && \
-		echo "; Compilation failed for $*.cryo" > $(STDLIB_BUILD_DIR)/$*.bc && \
-		echo "; Stub file created to satisfy build system" >> $(STDLIB_BUILD_DIR)/$*.bc \
-	)
+	@python scripts\build-stdlib.py .\bin\cryo.exe $(STDLIB_DIR) $(STDLIB_BUILD_DIR) $(STDLIB_LIB) $(STDLIB_FLAGS)
 else
-	@mkdir -p $(dir $@)
-	@$(MAIN_BIN) $(STDLIB_DIR)/$*.cryo --emit-llvm --debug -c --stdlib-mode -o $(shell pwd)/$@ && ( \
-		echo "[STDLIB] ✓ Successfully compiled $*.cryo" \
-	) || ( \
-		echo "[STDLIB] ✗ Compilation failed for $*.cryo - creating stub..." && \
-		echo "; Compilation failed for $*.cryo" > $@ && \
-		echo "; Stub file created to satisfy build system" >> $@ \
-	)
+	@python3 scripts/build-stdlib.py $(MAIN_BIN) $(STDLIB_DIR) $(STDLIB_BUILD_DIR) $(STDLIB_LIB) $(STDLIB_FLAGS)
 endif
 
-# Link all stdlib modules into a single library
-$(STDLIB_LIB): $(STDLIB_BC_FILES)
-	@echo "Creating standard library: $(STDLIB_LIB)"
-	@echo "Filtering valid LLVM bitcode files..."
-ifeq ($(OS), Windows_NT)
-	@powershell -Command " \
-		$$validFiles = @(); \
-		foreach ($$file in (Get-ChildItem -Path '$(STDLIB_BUILD_DIR)' -Recurse -Filter '*.bc')) { \
-			if ((Get-Content $$file.FullName -TotalCount 1) -notlike ';*') { \
-				$$validFiles += $$file.FullName; \
-			} else { \
-				Write-Host '[STDLIB] Skipping stub file:' $$file.Name; \
-			} \
-		}; \
-		if ($$validFiles.Count -eq 0) { \
-			Write-Host '[STDLIB] ERROR: No valid bitcode files found. Cannot create library.'; \
-			exit 1; \
-		}; \
-		Write-Host '[STDLIB] Found' $$validFiles.Count 'valid bitcode files'; \
-		$$fileList = $$validFiles -join ' '; \
-		& llvm-link $$validFiles -o $(STDLIB_BUILD_DIR)/cryo_combined.bc; \
-		if ($$LASTEXITCODE -ne 0) { \
-			Write-Host '[STDLIB] llvm-link failed, but continuing...'; \
-			echo '; Empty combined module due to linking failure' > $(STDLIB_BUILD_DIR)/cryo_combined.bc; \
-		} \
-	"
-	@llc -filetype=obj $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o || ( \
-		echo "[STDLIB] LLC failed, creating empty object file..." && \
-		echo > $(STDLIB_BUILD_DIR)/libcryo.o \
-	)
-else
-	@valid_files=$$(find $(STDLIB_BUILD_DIR) -name "*.bc" -exec sh -c 'head -n1 "$$1" | grep -v "^;"' _ {} \; -print | grep -E '\.bc$$'); \
-	if [ -z "$$valid_files" ]; then \
-		echo "[STDLIB] ERROR: No valid bitcode files found. Cannot create library."; \
-		exit 1; \
-	fi; \
-	echo "[STDLIB] Found valid bitcode files: $$valid_files"; \
-	llvm-link $$valid_files -o $(STDLIB_BUILD_DIR)/cryo_combined.bc || ( \
-		echo "[STDLIB] llvm-link failed, but continuing..." && \
-		echo "; Empty combined module due to linking failure" > $(STDLIB_BUILD_DIR)/cryo_combined.bc \
-	)
-	@llc -filetype=obj -relocation-model=pic $(STDLIB_BUILD_DIR)/cryo_combined.bc -o $(STDLIB_BUILD_DIR)/libcryo.o || ( \
-		echo "[STDLIB] LLC failed, creating empty object file..." && \
-		touch $(STDLIB_BUILD_DIR)/libcryo.o \
-	)
-endif
-	@llvm-ar rcs $(STDLIB_LIB) $(STDLIB_BUILD_DIR)/libcryo.o || ( \
-		echo "[STDLIB] llvm-ar failed, creating minimal library..." && \
-		echo "" > $(STDLIB_LIB) \
-	)
-	@echo "Standard library created: $(STDLIB_LIB)"
-	@echo "Note: Some modules may have failed to compile and were excluded."
+# Convenience targets for stdlib with different flag combinations
+stdlib-debug:
+	@$(MAKE) stdlib STDLIB_FLAGS="--debug"
+
+stdlib-verbose:
+	@$(MAKE) stdlib STDLIB_FLAGS="--verbose"
+
+stdlib-debug-verbose:
+	@$(MAKE) stdlib STDLIB_FLAGS="--debug --verbose"
 
 stdlib-clean:
 ifeq ($(OS), Windows_NT)
