@@ -240,7 +240,7 @@ namespace Cryo::Codegen
             // Report the detailed LLVM verification error to the GDM
             if (_gdm)
             {
-                std::string full_message = "Generated IR failed verification";
+                std::string full_message = "Generated IR failed verification in module '" + _module_name + "'";
                 if (!context_info.empty())
                 {
                     full_message += " " + context_info;

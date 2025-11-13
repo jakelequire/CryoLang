@@ -244,6 +244,11 @@ namespace Cryo
         return std::make_unique<EnumVariantNode>(loc, std::move(name), std::move(associated_types));
     }
 
+    std::unique_ptr<EnumVariantNode> ASTBuilder::create_enum_variant_with_value(SourceLocation loc, std::string name, int64_t explicit_value)
+    {
+        return std::make_unique<EnumVariantNode>(loc, std::move(name), explicit_value);
+    }
+
     std::unique_ptr<ImplementationBlockNode> ASTBuilder::create_implementation_block(SourceLocation loc, std::string target_type)
     {
         return std::make_unique<ImplementationBlockNode>(loc, std::move(target_type));

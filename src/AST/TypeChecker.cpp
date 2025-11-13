@@ -5036,6 +5036,12 @@ namespace Cryo
                         std::string variant_name = variant->name();
                         Type *int_type = _type_context.get_int_type();
 
+                        // Use explicit value if provided, otherwise use auto-incrementing value
+                        if (variant->has_explicit_value())
+                        {
+                            variant_value = static_cast<int>(variant->explicit_value());
+                        }
+
                         // In stdlib compilation mode, always skip enum variant redeclarations
                         // since they're often processed multiple times during compilation
                         if (_stdlib_compilation_mode)
@@ -5044,7 +5050,10 @@ namespace Cryo
                             if (existing_variant)
                             {
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Enum variant '{}' already exists in stdlib compilation mode, skipping redeclaration", variant_name);
-                                variant_value++;
+                                if (!variant->has_explicit_value())
+                                {
+                                    variant_value++;
+                                }
                                 continue;
                             }
                         }
@@ -5060,7 +5069,12 @@ namespace Cryo
                             }
                             // In stdlib mode, silently skip all redefinition errors for enum variants
                         }
-                        variant_value++;
+                        
+                        // Only auto-increment if no explicit value was provided
+                        if (!variant->has_explicit_value())
+                        {
+                            variant_value++;
+                        }
                     }
                 }
             }
@@ -5134,10 +5148,21 @@ namespace Cryo
             {
                 if (variant)
                 {
+                    // Use explicit value if provided, otherwise use auto-incrementing value
+                    if (variant->has_explicit_value())
+                    {
+                        variant_value = static_cast<int>(variant->explicit_value());
+                    }
+
                     // Simple variants are essentially integer constants
                     Type *int_type = _type_context.get_int_type();
                     _symbol_table->declare_symbol(variant->name(), int_type, variant->location(), false);
-                    variant_value++;
+                    
+                    // Only auto-increment if no explicit value was provided
+                    if (!variant->has_explicit_value())
+                    {
+                        variant_value++;
+                    }
                 }
             }
         }
