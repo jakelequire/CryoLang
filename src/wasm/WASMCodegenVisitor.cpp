@@ -1,9 +1,15 @@
 #include "wasm/WASMCodegenVisitor.hpp"
 #include "AST/ASTNode.hpp"
 #include "Utils/Logger.hpp"
+
+// For WASM builds, we generate JavaScript instead of LLVM IR
+#ifdef WASM_BUILD
+// No LLVM dependencies for WASM builds
+#else
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/InlineAsm.h>
+#endif
 
 namespace Cryo::WASM
 {
