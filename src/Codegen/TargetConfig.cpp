@@ -82,7 +82,15 @@ namespace Cryo::Codegen
     {
         parse_target_triple();
         return _cached_arch == "x86_64" || _cached_arch == "aarch64" ||
-               _cached_arch == "ppc64" || _cached_arch == "s390x";
+               _cached_arch == "ppc64" || _cached_arch == "s390x" ||
+               _cached_arch == "wasm64";
+    }
+
+    bool TargetConfig::is_wasm() const
+    {
+        parse_target_triple();
+        return _cached_arch == "wasm32" || _cached_arch == "wasm64" ||
+               _target_triple.find("wasm") != std::string::npos;
     }
 
     bool TargetConfig::is_msvc() const
@@ -172,6 +180,26 @@ namespace Cryo::Codegen
     {
         auto config = std::make_unique<TargetConfig>("aarch64-apple-macosx");
         config->set_cpu("apple-m1");
+        return config;
+    }
+
+    std::unique_ptr<TargetConfig> TargetConfig::create_wasm32()
+    {
+        auto config = std::make_unique<TargetConfig>("wasm32-unknown-emscripten");
+        config->set_cpu("generic");
+        config->set_code_model(CodeModel::Small);
+        config->set_relocation_model(RelocationModel::PIC);
+        config->set_static_linking(true); // WASM uses static linking
+        return config;
+    }
+
+    std::unique_ptr<TargetConfig> TargetConfig::create_wasm64()
+    {
+        auto config = std::make_unique<TargetConfig>("wasm64-unknown-emscripten");
+        config->set_cpu("generic");
+        config->set_code_model(CodeModel::Small);
+        config->set_relocation_model(RelocationModel::PIC);
+        config->set_static_linking(true); // WASM uses static linking
         return config;
     }
 
