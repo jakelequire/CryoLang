@@ -655,14 +655,12 @@ namespace Cryo
         void set_resolved_return_type(Cryo::Type *type) { _resolved_return_type = type; }
         bool has_resolved_return_type() const { return _resolved_return_type != nullptr; }
 
-        // DEPRECATED: String-based type operations - REMOVE THESE
-        [[deprecated("Use get_resolved_return_type() instead - string operations being eliminated")]]
         const std::string return_type_annotation() const
         {
-            return _resolved_return_type ? _resolved_return_type->to_string() : "void";
+            return _resolved_return_type ? _resolved_return_type->to_string() : "undefined";
         }
 
-        [[deprecated("Use set_resolved_return_type() instead - string operations being eliminated")]]
+        [[deprecated("Use set_resolved_return_type() instead - this will not do anything when called.")]]
         void set_return_type(const std::string &return_type)
         {
             // This should not be used - parser must resolve to Type* directly
