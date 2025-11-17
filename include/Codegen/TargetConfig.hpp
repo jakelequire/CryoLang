@@ -175,6 +175,11 @@ namespace Cryo::Codegen
         bool is_64bit() const;
 
         /**
+         * @brief Check if target is WebAssembly
+         */
+        bool is_wasm() const;
+
+        /**
          * @brief Check if target uses MSVC ABI
          */
         bool is_msvc() const;
@@ -270,6 +275,16 @@ namespace Cryo::Codegen
          * @brief Create configuration for macOS ARM64
          */
         static std::unique_ptr<TargetConfig> create_macos_arm64();
+
+        /**
+         * @brief Create configuration for WebAssembly (WASM32)
+         */
+        static std::unique_ptr<TargetConfig> create_wasm32();
+
+        /**
+         * @brief Create configuration for WebAssembly (WASM64)
+         */
+        static std::unique_ptr<TargetConfig> create_wasm64();
 
         //===================================================================
         // Validation

@@ -95,6 +95,10 @@ namespace Cryo::CLI::Commands
         argument(CLIArgument("symbols", "Display symbol table after compilation", false).flag());
         argument(CLIArgument("types", "Display type table after compilation", false).flag());
         argument(CLIArgument("emit-llvm", "Emit LLVM bitcode (.bc) instead of executable", false).flag());
+        argument(CLIArgument("target", "Target triple (e.g., wasm32-unknown-emscripten)", false));
+        argument(CLIArgument("emit-wasm", "Compile to WebAssembly (.wasm)", false).flag());
+        argument(CLIArgument("wasm-exports", "Comma-separated list of functions to export to JavaScript", false));
+        argument(CLIArgument("enable-js-interop", "Enable JavaScript interoperability", false).flag());
     }
 
     int CompileCommand::execute(const ParsedArgs &args)
