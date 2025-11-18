@@ -82,8 +82,8 @@ ifeq ($(OS), Windows_NT)
     CPP_SRCS := $(shell C:/msys64/usr/bin/find $(SRC_DIR) -name "*.cpp" -type f)
 else
     # Linux - native find
-    C_SRCS := $(shell find $(SRC_DIR) -name "*.c" -type f)
-    CPP_SRCS := $(shell find $(SRC_DIR) -name "*.cpp" -type f)
+	C_SRCS := $(shell find $(SRC_DIR) -name "*.c" -type f ! -path "$(SRC_DIR)wasm/*")
+	CPP_SRCS := $(shell find $(SRC_DIR) -name "*.cpp" -type f ! -path "$(SRC_DIR)wasm/*")
 endif
 
 # ---------------------------------------------

@@ -8963,7 +8963,7 @@ namespace Cryo::Codegen
             return builder.CreateLoad(elementType, operandValue, "deref");
         }
 
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unsupported unary operator: %s", operator_str.c_str());
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unsupported unary operator: {} in expression {}", operator_str, NodeKindToString(node->kind()));
         return nullptr;
     }
     llvm::Value *Cryo::Codegen::CodegenVisitor::generate_function_call(Cryo::CallExpressionNode *node)
