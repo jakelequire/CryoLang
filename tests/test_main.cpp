@@ -23,6 +23,9 @@ namespace CryoTest {
  * @brief Main test runner entry point - supports both full suite and single test execution
  */
 int main(int argc, char** argv) {
+    // Always use the comprehensive technical reporter
+    bool use_technical_reporter = true;
+    
     // Check if we're running a single test (for process isolation)
     if (argc >= 3 && std::string(argv[1]) == "--run-single-test") {
         std::string test_name = argv[2];
@@ -61,8 +64,8 @@ int main(int argc, char** argv) {
     // Initialize test environment
     CryoTest::initialize_test_environment();
     
-    // Run ALL tests - no exceptions allowed to stop this
-    int result = CryoTest::TestRegistry::instance().run_all_tests();
+    // Run comprehensive technical test analysis
+    int result = CryoTest::TestRegistry::instance().run_all_tests_enhanced();
     
     // Cleanup
     CryoTest::cleanup_test_environment();

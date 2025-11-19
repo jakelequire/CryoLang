@@ -337,6 +337,7 @@ public:
     }
     
     int run_all_tests();
+    int run_all_tests_enhanced(); // Technical test analysis and reporting
     int run_single_test(const std::string& test_name);
     
 private:

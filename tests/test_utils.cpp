@@ -1,4 +1,5 @@
 #include "test_utils.hpp"
+#include "technical_test_reporter.hpp"
 #include "Utils/OS.hpp"
 #include <filesystem>
 #include <iostream>
@@ -9,6 +10,8 @@
 #include <exception>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <algorithm>
 #ifdef __unix__ 
 #include <unistd.h>      // fork(), pipe(), dup2(), execvp(), close()
 #include <sys/types.h>   // pid_t
@@ -651,6 +654,145 @@ int TestRegistry::run_all_tests() {
     
     // Always return 0 to ensure all tests run to completion
     // Individual test results are reported above
+    return 0;
+}
+
+int TestRegistry::run_all_tests_enhanced() {
+    // Implementation of comprehensive technical test analysis
+    if (tests.empty()) {
+        std::cout << "No tests registered.\n";
+        return 0;
+    }
+    
+    // Initialize technical reporter
+    TechnicalTestReporter technical_reporter;
+    
+    std::cout << "\n";
+    std::cout << "================================================================================\n";
+    std::cout << "                            CryoLang Test Suite                               \n";
+    std::cout << "                         Compiler Analysis & Testing                           \n";
+    std::cout << "================================================================================\n";
+    std::cout << "\n";
+    
+    int passed = 0, failed = 0, crashed = 0;
+    size_t current_test = 0;
+    size_t total_tests = tests.size();
+    auto start_time = std::chrono::steady_clock::now();
+    
+    // Pre-analyze all tests for technical metadata
+    std::cout << "Analyzing test technical characteristics...\n";
+    for (const auto& test : tests) {
+        std::string full_test_name = test.suite + "::" + test.name;
+        technical_reporter.analyze_test_source(test.name, test.suite, test.description, full_test_name);
+    }
+    
+    std::cout << "\nExecuting tests with technical monitoring:\n";
+    std::cout << std::string(80, '=') << "\n\n";
+    
+    for (const auto& test : tests) {
+        current_test++;
+        
+        // Progress indicator
+        std::cout << "Test " << std::setfill('0') << std::setw(2) << current_test 
+                  << "/" << std::setw(2) << total_tests << " ";
+        
+        // Technical categorization
+        std::string phase_indicator = "[?]";
+        if (test.suite.find("Parser") != std::string::npos || test.suite.find("Lexer") != std::string::npos) 
+            phase_indicator = "[PARSE]";
+        else if (test.suite.find("Type") != std::string::npos) 
+            phase_indicator = "[TYPE]";
+        else if (test.suite.find("Codegen") != std::string::npos) 
+            phase_indicator = "[CODEGEN]";
+        else if (test.suite.find("StdLib") != std::string::npos) 
+            phase_indicator = "[STDLIB]";
+        else if (test.suite.find("Integration") != std::string::npos) 
+            phase_indicator = "[PIPELINE]";
+        
+        std::cout << phase_indicator << " " << test.suite << "::" << test.name;
+        
+        // Show test description for context
+        if (!test.description.empty()) {
+            std::cout << "\n    >> " << test.description;
+        }
+        std::cout << "\n";
+        
+        // Run the test with timing
+        auto test_start = std::chrono::steady_clock::now();
+        std::string test_name = test.suite + "::" + test.name;
+        ProcessTestResult result;
+        
+        try {
+            result = run_test_in_process(test_name, current_test - 1);
+        } catch (const std::length_error& e) {
+            result.crashed = true;
+            result.output = std::string("Parent process error: ") + e.what();
+        } catch (...) {
+            result.crashed = true;
+            result.output = "Unknown parent process exception";
+        }
+        
+        auto test_end = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(test_end - test_start);
+        
+        // Record results in technical reporter
+        if (!result.success || result.crashed) {
+            technical_reporter.record_test_failure(test.name, result.output);
+        }
+        
+        // Display immediate result with technical context
+        if (result.success) {
+            std::cout << "    ✓ PASS (" << duration.count() << "ms)\n";
+            passed++;
+        } else if (result.crashed) {
+            std::cout << "    ✗ CRASH - ";
+            
+            // Technical failure analysis
+            if (result.output.find("Function return type does not match") != std::string::npos) {
+                std::cout << "IR Verification Error (Backend Issue)";
+            } else if (result.output.find("Failed to resolve type") != std::string::npos) {
+                std::cout << "Type Resolution Failure (Frontend Issue)";
+            } else if (result.output.find("Access Violation") != std::string::npos || 
+                       result.exit_code == -1073741819) {
+                std::cout << "Memory Access Violation (Runtime Safety Issue)";
+            } else if (result.output.find("std::length_error") != std::string::npos) {
+                std::cout << "Memory Management Error";
+            } else {
+                std::cout << "Unknown System Failure";
+            }
+            
+            std::cout << " (" << duration.count() << "ms)\n";
+            
+            // Show critical error excerpt
+            if (result.output.find("Function return type") != std::string::npos) {
+                size_t pos = result.output.find("Function return type");
+                std::string error_line = result.output.substr(pos, std::min((size_t)80, result.output.length() - pos));
+                std::cout << "      Error: " << error_line << "\n";
+            }
+            
+            crashed++;
+        } else {
+            std::cout << "    ✗ FAIL (" << duration.count() << "ms)\n";
+            failed++;
+        }
+        
+        std::cout << "\n";
+    }
+    
+    // Generate comprehensive technical analysis
+    auto end_time = std::chrono::steady_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    double pass_rate = total_tests > 0 ? (double)passed / total_tests * 100.0 : 0.0;
+    
+    std::cout << "\n" << std::string(80, '=') << "\n";
+    std::cout << "Test execution completed in " << (total_duration.count() / 1000.0) << " seconds\n";
+    std::cout << "Pass Rate: " << std::fixed << std::setprecision(1) << pass_rate 
+              << "% (" << passed << "/" << total_tests << " tests)\n";
+    std::cout << "Crashes: " << crashed << " | Failures: " << failed << "\n\n";
+    
+    // Generate the comprehensive technical report
+    technical_reporter.generate_technical_report();
+    
     return 0;
 }
 
