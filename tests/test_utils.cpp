@@ -9,9 +9,11 @@
 #include <exception>
 #include <string>
 #include <vector>
+#ifdef __unix__ 
 #include <unistd.h>      // fork(), pipe(), dup2(), execvp(), close()
 #include <sys/types.h>   // pid_t
 #include <sys/wait.h>    // waitpid()
+#endif
 #include <signal.h>      // kill(), SIGKILL
 #include <errno.h>       // errno
 #include <cstring>       // strerror()
