@@ -359,6 +359,10 @@ stdlib-stdio:
 stdlib-memory:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/core/memory.cryo --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/core/memory.bc
 
+stdlib-http:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/net/http.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/net/http.bc
+
+
 # =================================================================
 # RUNTIME COMPILATION
 # =================================================================

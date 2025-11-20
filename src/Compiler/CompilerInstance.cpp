@@ -495,6 +495,11 @@ namespace Cryo
                 if (_debug_mode)
                 {
                     LOG_ERROR(Cryo::LogComponent::GENERAL, "Type checking failed with {} errors", _type_checker->error_count());
+                    // Print type errors for debugging
+                    for (const auto &type_error : _type_checker->errors())
+                    {
+                        LOG_ERROR(Cryo::LogComponent::GENERAL, "Type Error: {}", type_error.to_string());
+                    }
                 }
                 return false;
             }
