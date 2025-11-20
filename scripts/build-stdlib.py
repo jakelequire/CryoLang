@@ -85,27 +85,34 @@ def compile_module(cryo_exe, source_file, output_file, extra_flags=None, stdlib_
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
     module_name = os.path.basename(source_file)
+    rel_path = os.path.relpath(source_file)
     log(f"Compiling {Colors.BOLD}{module_name}{Colors.ENDC}")
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            log(f"✓ {Colors.OKGREEN}Successfully compiled{Colors.ENDC} {module_name}", "SUCCESS")
+            log(f"✓ {Colors.OKGREEN}Successfully compiled{Colors.ENDC} {rel_path}", "SUCCESS")
             return True
         else:
-            log(f"✗ {Colors.FAIL}Compilation failed{Colors.ENDC} for {module_name}", "ERROR")
+            log(f"✗ {Colors.FAIL}Compilation failed{Colors.ENDC} for {rel_path}", "ERROR")
+            # Show the error details from the compiler even if not in debug mode
+            log(f"Error details: {result.stderr}", "ERROR")
             if extra_flags and '--debug' in extra_flags:
                 log(f"Error details: {result.stderr}", "ERROR")
             # Create stub file
             with open(output_file, 'w') as f:
                 f.write(f'"; Compilation failed for {os.path.relpath(source_file)}\n')
+                # Print the error message from the compiler
+                f.write(f'"; Error: {result.stderr.strip()}\n')
                 f.write('"; Stub file created to satisfy build system\n')
             return False
     except Exception as e:
-        log(f"✗ {Colors.FAIL}Exception{Colors.ENDC} compiling {module_name}: {e}", "ERROR")
+        log(f"✗ {Colors.FAIL}Exception{Colors.ENDC} compiling {rel_path}: {e}", "ERROR")
         # Create stub file
         with open(output_file, 'w') as f:
-            f.write(f'"; Compilation failed for {os.path.relpath(source_file)}\n')
+            f.write(f'"; Compilation failed for {rel_path}\n')
+            # Print the error message that caused the exception
+            f.write(f'"; Exception: {e}\n')
             f.write('"; Stub file created to satisfy build system\n')
         return False
 
