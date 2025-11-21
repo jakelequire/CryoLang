@@ -1023,6 +1023,15 @@ namespace Cryo::Codegen
         NodeTracker tracker(this, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating struct declaration: {}", node.name());
 
+        // Skip IR generation for declarations from imported modules
+        if (node.is_from_import())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping struct '{}' (from imported module '{}')", 
+                      node.name(), node.source_module());
+            register_value(&node, nullptr);
+            return;
+        }
+
         // Register AST node with TypeMapper for field metadata
         _type_mapper->register_struct_ast_node(&node);
 

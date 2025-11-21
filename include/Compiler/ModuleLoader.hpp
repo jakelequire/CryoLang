@@ -142,6 +142,13 @@ namespace Cryo
         void register_templates_from_ast(const ProgramNode &ast, const std::string &module_name);
 
         /**
+         * @brief Mark all declarations in an imported AST with their source module
+         * @param ast The parsed AST of the imported module
+         * @param module_name Name of the source module
+         */
+        void mark_declarations_as_imported(ProgramNode &ast, const std::string &module_name);
+
+        /**
          * @brief Create a FunctionType from a FunctionDeclarationNode
          * @param func_decl The function declaration node
          * @param type_context TypeContext for creating type objects

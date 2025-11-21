@@ -341,6 +341,10 @@ namespace Cryo
 
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Detected module namespace: {}", result.module_name);
 
+            // Mark all declarations in the imported AST with their source module
+            // This prevents duplicate IR generation when these declarations are encountered during codegen
+            mark_declarations_as_imported(*ast, result.module_name);
+
             // Do ALL processing on the original AST and keep it alive
             // 1. Register generic templates from the original AST
             register_templates_from_ast(*ast, result.module_name);
@@ -719,6 +723,45 @@ namespace Cryo
         }
 
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Finished registering templates from module: {}", module_name);
+    }
+
+    void ModuleLoader::mark_declarations_as_imported(ProgramNode &ast, const std::string &module_name)
+    {
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Marking declarations from module '{}' as imported", module_name);
+
+        // Iterate through all top-level statements and mark declarations
+        for (const auto &statement : ast.statements())
+        {
+            if (auto decl = dynamic_cast<DeclarationNode *>(statement.get()))
+            {
+                // Set the source module for this declaration
+                decl->set_source_module(module_name);
+
+                // Log the marking for debugging
+                if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
+                {
+                    LOG_TRACE(LogComponent::GENERAL, "  Marked function '{}' as from module '{}'", func_decl->name(), module_name);
+                }
+                else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
+                {
+                    LOG_TRACE(LogComponent::GENERAL, "  Marked struct '{}' as from module '{}'", struct_decl->name(), module_name);
+                }
+                else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
+                {
+                    LOG_TRACE(LogComponent::GENERAL, "  Marked class '{}' as from module '{}'", class_decl->name(), module_name);
+                }
+                else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
+                {
+                    LOG_TRACE(LogComponent::GENERAL, "  Marked enum '{}' as from module '{}'", enum_decl->name(), module_name);
+                }
+                else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(decl))
+                {
+                    LOG_TRACE(LogComponent::GENERAL, "  Marked variable '{}' as from module '{}'", var_decl->name(), module_name);
+                }
+            }
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Finished marking declarations from module '{}'", module_name);
     }
 
     const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &ModuleLoader::get_imported_asts() const
