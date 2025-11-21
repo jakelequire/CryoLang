@@ -275,6 +275,15 @@ namespace Cryo::Codegen
         NodeTracker tracker(this, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Visiting FunctionDeclarationNode: {}", node.name());
 
+        // Skip IR generation for declarations from imported modules
+        if (node.is_from_import())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping function '{}' (from imported module '{}')", 
+                      node.name(), node.source_module());
+            register_value(&node, nullptr);
+            return;
+        }
+
         // Check if this is a StructMethodNode that was already processed as a primitive method
         if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(&node))
         {
@@ -1095,6 +1104,14 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating struct method: {}::{}",
                           node.name(), method->name());
 
+                // Skip methods from imported modules
+                if (method->is_from_import())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping struct method '{}::{}' (from imported module '{}')",
+                              node.name(), method->name(), method->source_module());
+                    continue;
+                }
+
                 std::string method_name = method->name();
                 std::string qualified_name;
 
@@ -1351,6 +1368,15 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Visiting ClassDeclarationNode: {}", node.name());
 
+        // Skip IR generation for declarations from imported modules
+        if (node.is_from_import())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping class '{}' (from imported module '{}')", 
+                      node.name(), node.source_module());
+            register_value(&node, nullptr);
+            return;
+        }
+
         // Check if this is a generic class template
         if (!node.generic_parameters().empty())
         {
@@ -1398,6 +1424,14 @@ namespace Cryo::Codegen
             for (const auto &method : node.methods())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating method declaration: {}::{}", class_name, method->name());
+
+                // Skip methods from imported modules
+                if (method->is_from_import())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping class method '{}::{}' (from imported module '{}')",
+                              class_name, method->name(), method->source_module());
+                    continue;
+                }
 
                 std::string method_name = method->name();
                 std::string qualified_name;
@@ -1528,6 +1562,14 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Generating function bodies for all methods in {}", class_name);
             for (const auto &method : node.methods())
             {
+                // Skip methods from imported modules
+                if (method->is_from_import())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping class method body '{}::{}' (from imported module '{}')",
+                              class_name, method->name(), method->source_module());
+                    continue;
+                }
+
                 std::string method_name = method->name();
                 std::string qualified_name;
 
@@ -1755,6 +1797,15 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::EnumDeclarationNode &node)
     {
+        // Skip IR generation for declarations from imported modules
+        if (node.is_from_import())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping enum '{}' (from imported module '{}')", 
+                      node.name(), node.source_module());
+            register_value(&node, nullptr);
+            return;
+        }
+
         // Skip generic enums for now - they should be handled as ParameterizedType instances
         // when actually instantiated, not as generic templates
         if (!node.generic_parameters().empty())

@@ -745,10 +745,32 @@ namespace Cryo
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
                 {
                     LOG_TRACE(LogComponent::GENERAL, "  Marked struct '{}' as from module '{}'", struct_decl->name(), module_name);
+                    
+                    // Also mark all methods (including constructors) within the struct
+                    for (const auto &method : struct_decl->methods())
+                    {
+                        if (method)
+                        {
+                            method->set_source_module(module_name);
+                            LOG_TRACE(LogComponent::GENERAL, "    Marked struct method '{}::{}' as from module '{}'", 
+                                     struct_decl->name(), method->name(), module_name);
+                        }
+                    }
                 }
                 else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
                 {
                     LOG_TRACE(LogComponent::GENERAL, "  Marked class '{}' as from module '{}'", class_decl->name(), module_name);
+                    
+                    // Also mark all methods (including constructors) within the class
+                    for (const auto &method : class_decl->methods())
+                    {
+                        if (method)
+                        {
+                            method->set_source_module(module_name);
+                            LOG_TRACE(LogComponent::GENERAL, "    Marked class method '{}::{}' as from module '{}'", 
+                                     class_decl->name(), method->name(), module_name);
+                        }
+                    }
                 }
                 else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
                 {
