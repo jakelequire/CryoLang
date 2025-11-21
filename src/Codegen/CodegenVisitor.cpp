@@ -2404,16 +2404,8 @@ namespace Cryo::Codegen
                     // Direct return
                     builder.CreateRet(return_value);
 
-                    // After creating a return instruction, any subsequent code in this function
-                    // will be unreachable. Create a new unreachable basic block for any remaining instructions.
-                    if (_current_function && _current_function->function)
-                    {
-                        llvm::BasicBlock *unreachable_block = llvm::BasicBlock::Create(
-                            _context_manager.get_context(), "unreachable", _current_function->function);
-                        builder.SetInsertPoint(unreachable_block);
-                        // Add an unreachable instruction to properly terminate this block
-                        builder.CreateUnreachable();
-                    }
+                    // After a return instruction, don't create unreachable blocks immediately.
+                    // They will be created lazily if needed when subsequent instructions are added.
                 }
             }
             else
@@ -2421,17 +2413,8 @@ namespace Cryo::Codegen
                 // Void return
                 builder.CreateRetVoid();
 
-                // After creating a return instruction, any subsequent code in this function
-                // will be unreachable. To avoid "terminator in middle of basic block" errors,
-                // we create a new unreachable basic block for any remaining instructions.
-                if (_current_function && _current_function->function)
-                {
-                    llvm::BasicBlock *unreachable_block = llvm::BasicBlock::Create(
-                        _context_manager.get_context(), "unreachable", _current_function->function);
-                    builder.SetInsertPoint(unreachable_block);
-                    // Add an unreachable instruction to properly terminate this block
-                    builder.CreateUnreachable();
-                }
+                // After a return instruction, don't create unreachable blocks immediately.
+                // They will be created lazily if needed when subsequent instructions are added.
             }
 
             register_value(&node, nullptr);
@@ -2589,14 +2572,8 @@ namespace Cryo::Codegen
         // Create branch to the break block
         builder.CreateBr(breakable_context.break_block);
 
-        // Create a new basic block for any unreachable code after break
-        // This is needed because LLVM requires all basic blocks to end with a terminator
-        llvm::Function *function = builder.GetInsertBlock()->getParent();
-        llvm::BasicBlock *unreachableBlock = llvm::BasicBlock::Create(_context_manager.get_context(), "after.break", function);
-        builder.SetInsertPoint(unreachableBlock);
-
-        // Add unreachable terminator since this code should never be reached
-        builder.CreateUnreachable();
+        // Don't create unreachable blocks immediately after break.
+        // They will be created lazily if needed when subsequent instructions are added.
 
         register_value(&node, nullptr);
     }
@@ -2626,14 +2603,8 @@ namespace Cryo::Codegen
         // Create branch to the loop continue block (increment in for loop, condition in while loop)
         builder.CreateBr(breakable_context.continue_block);
 
-        // Create a new basic block for any unreachable code after continue
-        // This is needed because LLVM requires all basic blocks to end with a terminator
-        llvm::Function *function = builder.GetInsertBlock()->getParent();
-        llvm::BasicBlock *unreachableBlock = llvm::BasicBlock::Create(_context_manager.get_context(), "after.continue", function);
-        builder.SetInsertPoint(unreachableBlock);
-
-        // Add unreachable terminator since this code should never be reached
-        builder.CreateUnreachable();
+        // Don't create unreachable blocks immediately after continue.
+        // They will be created lazily if needed when subsequent instructions are added.
 
         register_value(&node, nullptr);
     }

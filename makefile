@@ -362,6 +362,11 @@ stdlib-memory:
 stdlib-http:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/net/http.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/net/http.bc
 
+stdlib-tcp:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/net/tcp.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/net/tcp.bc
+
+stdlib-signal:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/net/signal.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/net/signal.bc
 
 # =================================================================
 # RUNTIME COMPILATION

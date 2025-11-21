@@ -534,6 +534,7 @@ namespace Cryo::Codegen
         llvm::Value *cast_value(llvm::Value *value, llvm::Type *target_type);
         bool is_lvalue(Cryo::ExpressionNode *expr);
         bool is_primitive_type(const std::string &type_name);
+        void ensure_valid_insertion_point();
 
         // Destructor management
         bool has_destructor(const std::string &type_name);
