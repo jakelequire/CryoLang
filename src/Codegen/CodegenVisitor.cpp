@@ -246,8 +246,9 @@ namespace Cryo::Codegen
             auto &stmt = node.statements()[i];
             if (stmt)
             {
-                // Skip variable declarations, enum, struct and class declarations (already processed)
-                if (stmt->kind() == NodeKind::VariableDeclaration ||
+                // Skip import, variable, enum, struct and class declarations (already processed)
+                if (stmt->kind() == NodeKind::ImportDeclaration ||
+                    stmt->kind() == NodeKind::VariableDeclaration ||
                     stmt->kind() == NodeKind::EnumDeclaration ||
                     stmt->kind() == NodeKind::StructDeclaration ||
                     stmt->kind() == NodeKind::ClassDeclaration)
@@ -1476,6 +1477,8 @@ namespace Cryo::Codegen
                 // Constructors must always return void regardless of their resolved type
                 if (!is_constructor && cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method '{}' return type: name='{}', kind={}",
+                             method_name, cryo_return_type->to_string(), static_cast<int>(cryo_return_type->kind()));
                     llvm::Type *mapped_return_type = _type_mapper->map_type(cryo_return_type);
                     if (mapped_return_type)
                     {
@@ -5390,6 +5393,8 @@ namespace Cryo::Codegen
             Cryo::Type *cryo_return_type = node->get_resolved_return_type();
             if (cryo_return_type && cryo_return_type->kind() != Cryo::TypeKind::Void)
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function '{}' return type: name='{}', kind={}",
+                         node->name(), cryo_return_type->to_string(), static_cast<int>(cryo_return_type->kind()));
                 return_type = _type_mapper->map_type(cryo_return_type);
             }
             else

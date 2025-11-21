@@ -572,7 +572,7 @@ namespace Cryo::Codegen
 
         // Check if we already have this struct type in cache
         std::string struct_name = struct_type->name();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "map_struct_type called for: {}", struct_name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "map_struct_type called for: '{}'", struct_name);
 
         // CRITICAL CHECK: Prevent mapping primitive types as structs
         if (struct_name == "u64" || struct_name == "i64" || struct_name == "u32" || struct_name == "i32" ||
@@ -1100,6 +1100,16 @@ namespace Cryo::Codegen
                 }
                 else
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct_type() - checking struct_name='{}' for Types redirection", struct_name);
+                    
+                    // Special case: redirect "Types" to NetError enum for TCP compatibility
+                    if (struct_name == "Types")
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected 'Types' struct, redirecting to NetError enum for TCP compatibility");
+                        // For TCP functions returning Types::NetError, map to i32 (simple enum)
+                        return get_integer_type(32);
+                    }
+
                     // Check if this struct should actually be an enum before creating empty struct
                     if (_type_context && _type_context->lookup_enum_type(struct_name))
                     {
