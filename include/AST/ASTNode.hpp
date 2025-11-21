@@ -312,6 +312,7 @@ namespace Cryo
     {
     private:
         std::string _documentation; // Documentation comment associated with this declaration
+        std::string _source_module; // Track which module this declaration originated from (empty = current module)
 
     public:
         DeclarationNode(NodeKind kind, SourceLocation loc) : ASTNode(kind, loc) {}
@@ -320,6 +321,11 @@ namespace Cryo
         const std::string &documentation() const { return _documentation; }
         void set_documentation(const std::string &doc) { _documentation = doc; }
         bool has_documentation() const { return !_documentation.empty(); }
+
+        // Source module tracking
+        const std::string &source_module() const { return _source_module; }
+        void set_source_module(const std::string &module) { _source_module = module; }
+        bool is_from_import() const { return !_source_module.empty(); }
 
         void print(std::ostream &os, int indent = 0) const override
         {
