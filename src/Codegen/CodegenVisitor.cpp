@@ -4016,14 +4016,66 @@ namespace Cryo::Codegen
                                 {index_val},
                                 "array.element.ptr");
 
-                            // Load the element value
-                            llvm::Value *element_value = builder.CreateLoad(
-                                llvm_element_type,
-                                element_ptr,
-                                "array.element.load");
-
-                            register_value(&node, element_value);
-                            set_current_value(element_value);
+                            // For struct elements, return the pointer for method calls
+                            // For primitive elements, load the value
+                            if (llvm_element_type->isStructTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array element is struct type, returning pointer for method calls");
+                                register_value(&node, element_ptr);
+                                set_current_value(element_ptr);
+                                
+                                // Set the resolved type for the array access so method calls can be resolved
+                                Cryo::Type *element_type = nullptr;
+                                
+                                // Get T from Array<T>
+                                if (auto *param_type = dynamic_cast<const Cryo::ParameterizedType*>(resolved_type)) {
+                                    if (param_type->parameter_count() > 0) {
+                                        auto type_params = param_type->type_parameters();
+                                        if (!type_params.empty()) {
+                                            element_type = type_params[0].get(); // First type parameter is T
+                                        }
+                                    }
+                                } else if (auto *array_type = dynamic_cast<const Cryo::ArrayType*>(resolved_type)) {
+                                    element_type = array_type->element_type().get();
+                                }
+                                
+                                if (element_type) {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Setting resolved type for array element: {}", element_type->to_string());
+                                    node.set_resolved_type(element_type);
+                                }
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array element is primitive type, loading value");
+                                // Load the element value for primitive types
+                                llvm::Value *element_value = builder.CreateLoad(
+                                    llvm_element_type,
+                                    element_ptr,
+                                    "array.element.load");
+                                
+                                register_value(&node, element_value);
+                                set_current_value(element_value);
+                                
+                                // Set the resolved type for the array access so method calls can be resolved
+                                Cryo::Type *element_type = nullptr;
+                                
+                                // Get T from Array<T>
+                                if (auto *param_type = dynamic_cast<const Cryo::ParameterizedType*>(resolved_type)) {
+                                    if (param_type->parameter_count() > 0) {
+                                        auto type_params = param_type->type_parameters();
+                                        if (!type_params.empty()) {
+                                            element_type = type_params[0].get(); // First type parameter is T
+                                        }
+                                    }
+                                } else if (auto *array_type = dynamic_cast<const Cryo::ArrayType*>(resolved_type)) {
+                                    element_type = array_type->element_type().get();
+                                }
+                                
+                                if (element_type) {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Setting resolved type for array element: {}", element_type->to_string());
+                                    node.set_resolved_type(element_type);
+                                }
+                            }
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated Array<T> member field element access successfully");
                             return;
                         }
@@ -9876,6 +9928,98 @@ namespace Cryo::Codegen
                     {
                         LOG_ERROR(Cryo::LogComponent::CODEGEN, "Could not evaluate pointer expression for dereference");
                     }
+                }
+
+                // Fall back to function name extraction
+                function_name = extract_function_name_from_member_access(member_access);
+                resolved_function_name = function_name;
+            }
+            else if (auto *array_access = dynamic_cast<ArrayAccessNode *>(member_access->object()))
+            {
+                // Handle method calls on array elements like this.headers[i].get_name()
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found ArrayAccessNode in member access for method: {}", member_access->member());
+
+                // Generate the array access to get the element pointer
+                array_access->accept(*this);
+                llvm::Value *element_ptr = get_current_value();
+
+                if (element_ptr)
+                {
+                    // Get the type of the array element from ArrayAccessNode's resolved type
+                    Cryo::Type *element_type = array_access->get_resolved_type();
+                    if (element_type)
+                    {
+                        std::string type_name = element_type->to_string();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Array element type: '{}'", type_name);
+
+                        // Strip pointer asterisk if present for method lookup
+                        if (!type_name.empty() && type_name.back() == '*')
+                        {
+                            type_name.pop_back();
+                        }
+
+                        // Build method name with namespace context
+                        std::string method_name;
+                        if (!_namespace_context.empty() && !is_primitive_type(type_name))
+                        {
+                            method_name = _namespace_context + "::" + type_name + "::" + member_access->member();
+                        }
+                        else
+                        {
+                            method_name = type_name + "::" + member_access->member();
+                        }
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up array element method: '{}'", method_name);
+                        auto method_it = _functions.find(method_name);
+
+                        if (method_it != _functions.end())
+                        {
+                            llvm::Function *method_func = method_it->second;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found method for array element: {}", method_name);
+
+                            // Prepare arguments: this pointer + method arguments
+                            std::vector<llvm::Value *> args;
+                            args.push_back(element_ptr); // Use the element pointer as 'this'
+
+                            // Generate method arguments
+                            for (const auto &arg : node->arguments())
+                            {
+                                if (arg)
+                                {
+                                    arg->accept(*this);
+                                    llvm::Value *arg_value = get_current_value();
+                                    if (arg_value)
+                                    {
+                                        args.push_back(arg_value);
+                                    }
+                                }
+                            }
+
+                            // Call the method
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling array element method with {} arguments", args.size());
+                            return builder.CreateCall(method_func, args);
+                        }
+                        else
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Method not found for array element type: {}", method_name);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available methods for debugging:");
+                            for (const auto &[func_name, func] : _functions)
+                            {
+                                if (func_name.find(type_name) != std::string::npos)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - {}", func_name);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Array element type not resolved");
+                    }
+                }
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Could not generate array element pointer");
                 }
 
                 // Fall back to function name extraction
