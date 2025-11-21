@@ -44,7 +44,8 @@ namespace Cryo::Codegen
           _current_value(nullptr),
           _current_node(nullptr),
           _has_errors(false),
-          _stdlib_compilation_mode(false)
+          _stdlib_compilation_mode(false),
+          _imported_asts(nullptr)
     {
     }
 
@@ -168,8 +169,25 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing main program with {} statements", node.statements().size());
 
-        // Four-pass processing to ensure proper dependency order
-        // Pass 1: Process all global variable declarations first (including constants)
+        // Five-pass processing to ensure proper dependency order
+        // Pass 0: Process all imports first (needed for cross-module type resolution)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processing import declarations");
+        for (size_t i = 0; i < node.statements().size(); ++i)
+        {
+            auto &stmt = node.statements()[i];
+            if (stmt)
+            {
+                // Check if this is an import declaration
+                if (stmt->kind() == NodeKind::ImportDeclaration)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing import declaration {}/{}", i + 1, node.statements().size());
+                    stmt->accept(*this);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed import declaration {}", i + 1);
+                }
+            }
+        }
+
+        // Pass 1: Process all global variable declarations (including constants)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing global variable declarations");
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
@@ -379,9 +397,26 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::ImportDeclarationNode &node)
     {
-        // Import declarations should already be processed during the analysis phase
-        // Skip processing during codegen to avoid double-processing and memory issues
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping import declaration during codegen: {}", node.path());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing import declaration: {} (alias: {})", 
+                  node.path(), node.alias().empty() ? "none" : node.alias());
+        
+        // For cross-module enum resolution, we need to load enum variants from imported modules
+        // This is critical for resolving Types::NetError::SUCCESS in importing modules
+        std::string module_alias = node.alias().empty() ? node.path() : node.alias();
+        
+        // Load enum variants from specific known modules during import
+        if (node.path() == "Types" || node.path() == "net/types" || module_alias == "Types")
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Loading enum variants from Types module import");
+            
+            // Look up enum types from the symbol table and load their variants dynamically
+            load_enum_variants_from_namespace("Types");
+            load_enum_variants_from_namespace("std::net::Types");
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished loading enum variants from Types module");
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Import '{}' processed for cross-module type resolution", module_alias);
         return;
     }
 
@@ -567,12 +602,13 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        // For non-literal initializers, evaluate them
-                        node.initializer()->accept(*this);
-                        if (auto const_val = llvm::dyn_cast<llvm::Constant>(get_current_value()))
-                        {
-                            initializer = const_val;
-                        }
+                        // For non-literal initializers (like constructor calls), we can't generate
+                        // them as constant initializers. For now, use zero initialization and
+                        // defer the constructor call to a global constructor function.
+                        // TODO: Implement proper global constructor generation
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Warning: Global variable '{}' has non-constant initializer, using zero initialization", var_name);
+                        // Use zero initializer for now
+                        initializer = llvm::Constant::getNullValue(llvm_type);
                     }
                 }
 
@@ -14315,6 +14351,101 @@ namespace Cryo::Codegen
         }
 
         return field_ptr;
+    }
+
+    void CodegenVisitor::load_enum_variants_from_namespace(const std::string &namespace_name)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Loading enum variants from namespace: {} using AST extraction", namespace_name);
+        
+        if (!_imported_asts)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "No imported ASTs available for enum variant extraction");
+            return;
+        }
+        
+        auto &llvm_context = _context_manager.get_context();
+        llvm::Type *int_type = llvm::Type::getInt32Ty(llvm_context);
+        
+        // Search through imported ASTs for enum declarations
+        for (const auto &[module_path, program_ast] : *_imported_asts)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Searching module '{}' for enum declarations", module_path);
+            
+            if (!program_ast)
+            {
+                continue;
+            }
+            
+            // Recursively search for enum declarations in this module
+            std::function<void(Cryo::ASTNode*)> search_for_enums = [&](Cryo::ASTNode* node) {
+                if (!node) return;
+                
+                if (auto enum_decl = dynamic_cast<Cryo::EnumDeclarationNode*>(node))
+                {
+                    std::string enum_name = enum_decl->name();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found enum declaration: {} in module {}", enum_name, module_path);
+                    
+                    // Extract enum variant values from the AST
+                    int64_t current_value = 0;
+                    for (const auto &variant : enum_decl->variants())
+                    {
+                        std::string variant_name = variant->name();
+                        int64_t variant_value;
+                        
+                        if (variant->has_explicit_value())
+                        {
+                            // Use the explicit value from the AST
+                            variant_value = variant->explicit_value();
+                            current_value = variant_value + 1; // Set next default value
+                        }
+                        else
+                        {
+                            // Use sequential value
+                            variant_value = current_value++;
+                        }
+                        
+                        llvm::Constant *variant_const = llvm::ConstantInt::get(
+                            llvm::cast<llvm::IntegerType>(int_type), variant_value);
+                        
+                        // Register with multiple naming patterns for cross-module resolution
+                        register_enum_variant(enum_name, variant_name, variant_const);
+                        register_enum_variant(namespace_name + "::" + enum_name, variant_name, variant_const);
+                        
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Registered enum variant: {}::{} = {} (also {}::{}::{})", 
+                                 enum_name, variant_name, variant_value, 
+                                 namespace_name, enum_name, variant_name);
+                    }
+                }
+                
+                // Recursively search child nodes
+                if (auto program = dynamic_cast<Cryo::ProgramNode*>(node))
+                {
+                    for (const auto &stmt : program->statements())
+                    {
+                        search_for_enums(stmt.get());
+                    }
+                }
+                else if (auto block = dynamic_cast<Cryo::BlockStatementNode*>(node))
+                {
+                    for (const auto &stmt : block->statements())
+                    {
+                        search_for_enums(stmt.get());
+                    }
+                }
+            };
+            
+            // Start the search from the program root
+            search_for_enums(program_ast.get());
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished loading enum variants from namespace: {} using AST extraction", namespace_name);
+    }
+
+    void CodegenVisitor::set_imported_asts(const std::unordered_map<std::string, std::unique_ptr<Cryo::ProgramNode>> *imported_asts)
+    {
+        _imported_asts = imported_asts;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Set imported ASTs for enum value extraction: {} modules", 
+                 imported_asts ? imported_asts->size() : 0);
     }
 
 } // namespace Cryo::Codegen

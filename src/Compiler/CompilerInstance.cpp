@@ -590,6 +590,13 @@ namespace Cryo
                 _codegen->get_visitor()->import_specialized_methods(*_type_checker);
             }
 
+            // Pass imported ASTs to CodegenVisitor for dynamic enum variant extraction
+            if (_codegen->get_visitor() && _module_loader)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Setting imported ASTs for dynamic enum variant extraction...");
+                _codegen->get_visitor()->set_imported_asts(&_module_loader->get_imported_asts());
+            }
+
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Starting IR generation...");
             bool success = _codegen->generate_ir(_ast_root.get());
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "IR generation completed with result: {}", (success ? "success" : "failure"));

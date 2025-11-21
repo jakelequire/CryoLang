@@ -98,6 +98,12 @@ namespace Cryo::Codegen
          */
         void set_stdlib_compilation_mode(bool enable) { _stdlib_compilation_mode = enable; }
 
+        /**
+         * @brief Set imported ASTs for dynamic enum variant extraction
+         * @param imported_asts Pointer to map of imported AST nodes
+         */
+        void set_imported_asts(const std::unordered_map<std::string, std::unique_ptr<Cryo::ProgramNode>> *imported_asts);
+
         //===================================================================
         // AST Visitor Implementation - Declarations
         //===================================================================
@@ -319,6 +325,9 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Value *> _enum_variants; // Track enum variants for scope resolution
         std::unordered_map<std::string, Cryo::Type *> _variable_types; // Track variable name -> resolved type object
 
+        // Imported ASTs for cross-module enum value extraction
+        const std::unordered_map<std::string, std::unique_ptr<Cryo::ProgramNode>> *_imported_asts;
+
         // Current value being generated (for expressions)
         llvm::Value *_current_value;
 
@@ -417,6 +426,9 @@ namespace Cryo::Codegen
                                                   Cryo::EnumVariantNode *variant,
                                                   int discriminant);
         void register_enum_variant(const std::string &enum_name, const std::string &variant_name, llvm::Value *value);
+        
+        // Cross-module enum loading
+        void load_enum_variants_from_namespace(const std::string &namespace_name);
 
         // Parameterized enum helpers
         void ensure_parameterized_enum_constructors(const std::string &instantiated_name,
