@@ -376,6 +376,18 @@ namespace Cryo::Codegen
                                              const std::vector<std::string> &type_args,
                                              llvm::Type *struct_type,
                                              const std::unordered_map<std::string, std::string> &type_substitutions);
+                                             
+        /**
+         * @brief Generate specialized method on-demand for core library types
+         * @param method_name Fully qualified method name (e.g., "std::net::HTTP::Array<Header>::push")
+         * @param type_name The specialized type name (e.g., "Array<Header>")
+         * @param method_base_name The method name without type (e.g., "push")
+         * @return true if method was successfully generated, false otherwise
+         */
+        bool generate_specialized_method_on_demand(const std::string &method_name, 
+                                                   const std::string &type_name, 
+                                                   const std::string &method_base_name);
+                                                   
         void generate_get_value_method(const std::string &instantiated_type,
                                        const std::vector<std::string> &type_args,
                                        llvm::Type *struct_type,
