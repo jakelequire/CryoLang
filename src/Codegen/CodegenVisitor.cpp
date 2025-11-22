@@ -11193,6 +11193,19 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Enhanced import resolution for '{}': {}", c_name, (symbol ? "FOUND" : "NOT FOUND"));
         }
 
+        // Check if this is a type constructor call (e.g., "MyClass()")
+        if (!symbol)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking for type constructor call...");
+            Symbol *sym = _symbol_table.lookup_symbol(symbol_name);
+            if (sym)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found type for constructor call: {}", c_name);
+                symbol = _symbol_table.lookup_symbol(c_name); // Look for constructor symbol
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor symbol lookup for '{}': {}", c_name, (symbol ? "FOUND" : "NOT FOUND"));
+            }
+        }
+
         // Debug symbol properties if found
         if (symbol)
         {
