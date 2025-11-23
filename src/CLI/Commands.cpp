@@ -769,16 +769,58 @@ namespace Cryo::CLI::Commands
             return 1;
         }
 
+        // Check for debug flag in config args array
+        bool config_has_debug = config.debug;
+        for (const auto &arg : config.args)
+        {
+            if (arg == "--debug" || arg == "-d")
+            {
+                config_has_debug = true;
+                break;
+            }
+        }
+
+        // Determine final debug/verbose state (CLI flags override config)
+        bool use_debug = debug || config_has_debug;
+        bool use_verbose = verbose || use_debug;  // Debug implies verbose
+
+        // Configure logger based on debug/verbose flags
+        if (use_debug || use_verbose)
+        {
+            Cryo::LogLevel log_level = use_debug ? Cryo::LogLevel::DEBUG : Cryo::LogLevel::INFO;
+
+            Cryo::LoggerConfig logger_config;
+            logger_config.console_level = log_level;
+            logger_config.file_level = log_level;
+            logger_config.log_file_path = ""; // No file logging by default
+            logger_config.enable_colors = true;
+            logger_config.enable_timestamps = true;
+            logger_config.enable_component_tags = true;
+
+            Cryo::Logger::instance().initialize(logger_config);
+
+            // Test that logging is working
+            if (use_debug)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CLI, "Debug logging enabled for build command!");
+            }
+            else
+            {
+                LOG_INFO(Cryo::LogComponent::CLI, "Verbose logging enabled for build command!");
+            }
+        }
+
         // Set default main file if not specified
         std::string main_file = "src/main.cryo";
         std::string exe_name = config.project_name.empty() ? "app" : config.project_name;
 
-        if (verbose)
+        if (use_verbose)
         {
             std::cout << "Project name: " << exe_name << std::endl;
             std::cout << "Main file: " << main_file << std::endl;
             std::cout << "Output directory: " << config.output_dir << std::endl;
-            std::cout << "Debug mode: " << (config.debug ? "enabled" : "disabled") << std::endl;
+            std::cout << "Debug mode: " << (use_debug ? "enabled" : "disabled") << std::endl;
+            std::cout << "Config debug: " << (config.debug ? "enabled" : "disabled") << std::endl;
             std::cout << "Optimization: " << (config.optimize ? "enabled" : "disabled") << std::endl;
             if (!config.args.empty())
             {
@@ -816,7 +858,7 @@ namespace Cryo::CLI::Commands
         // Clean if requested
         if (clean && os.path_exists(config.output_dir))
         {
-            if (verbose)
+            if (use_verbose)
             {
                 std::cout << "Cleaning " << config.output_dir << " directory..." << std::endl;
             }
@@ -838,7 +880,6 @@ namespace Cryo::CLI::Commands
         auto compiler = Cryo::create_compiler_instance();
 
         // Use config settings for debug mode (but allow CLI override)
-        bool use_debug = debug || config.debug;
         compiler->set_debug_mode(use_debug);
 
         // Enable standard library linking by default
@@ -851,7 +892,7 @@ namespace Cryo::CLI::Commands
         }
 
         compiler->module_loader()->set_current_file(std::filesystem::absolute(main_file).string());
-        if (verbose)
+        if (use_verbose)
         {
             std::cout << "Compiling " << main_file << " -> " << output_path << std::endl;
         }
@@ -885,7 +926,7 @@ namespace Cryo::CLI::Commands
         {
             std::string bc_path = os.join_path(config.output_dir, exe_name + ".bc");
 
-            if (verbose)
+            if (use_verbose)
             {
                 std::cout << "Emitting LLVM IR files to " << config.output_dir << " directory..." << std::endl;
             }
