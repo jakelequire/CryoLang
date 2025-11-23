@@ -341,6 +341,56 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &CodegenDiagnosticBuilder::report_error(ErrorCode error_code, ASTNode *node, 
+                                                       const std::string &message)
+    {
+        // Check if we should skip error reporting for this node to prevent duplicates
+        if (should_skip_error_reporting(node))
+        {
+            // Return a dummy/placeholder diagnostic to maintain interface compatibility
+            static Diagnostic dummy_diagnostic(ErrorCode::E0101_UNEXPECTED_TOKEN, DiagnosticSeverity::Error,
+                                               DiagnosticCategory::CodeGen, "duplicate error suppressed",
+                                               SourceRange{}, "");
+            return dummy_diagnostic;
+        }
+
+        // Create source span from node or default location
+        SourceSpan span = create_node_span(node);
+        SourceRange range(span.start(), span.end());
+
+        // Use custom message if provided, otherwise use error code's default message
+        std::string final_message = message.empty() ? 
+            ErrorRegistry::get_error_info(error_code).short_description : message;
+
+        // Create the diagnostic using the diagnostic manager
+        Diagnostic &diagnostic = _diagnostic_manager->create_diagnostic(
+            error_code, range, _source_file, final_message
+        );
+
+        // Add contextual information based on the node
+        if (node)
+        {
+            std::string context = get_node_context(node);
+            if (!context.empty())
+            {
+                diagnostic.add_note("in " + context);
+            }
+            node->mark_error(); // Mark node as having an error
+        }
+
+        // Add common help based on error code patterns
+        add_common_help(diagnostic, error_code);
+
+        return diagnostic;
+    }
+
+    Diagnostic &CodegenDiagnosticBuilder::report_error(ErrorCode error_code, const std::string &message, 
+                                                       ASTNode *node)
+    {
+        // Delegate to the primary report_error method
+        return report_error(error_code, node, message);
+    }
+
     Diagnostic &CodegenDiagnosticBuilder::create_type_mapping_error(Type *cryo_type,
                                                                     ASTNode *node,
                                                                     const std::string &reason)

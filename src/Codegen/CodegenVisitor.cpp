@@ -57,7 +57,11 @@ namespace Cryo::Codegen
     {
         if (!program)
         {
-            report_error("Cannot generate IR for null program");
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED, 
+                                                 "Cannot generate IR for null program");
+            }
             return false;
         }
 
@@ -70,7 +74,11 @@ namespace Cryo::Codegen
         }
         catch (const std::exception &e)
         {
-            report_error("Exception during IR generation: " + std::string(e.what()));
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED,
+                                                 "Exception during IR generation: " + std::string(e.what()));
+            }
             return false;
         }
     }
@@ -157,7 +165,11 @@ namespace Cryo::Codegen
 
         if (!module)
         {
-            report_error("Failed to create LLVM module");
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0601_LLVM_ERROR,
+                                                 "Failed to create LLVM module");
+            }
             return;
         }
 
@@ -313,7 +325,11 @@ namespace Cryo::Codegen
             llvm::Function *function = generate_function_declaration(&node);
             if (!function)
             {
-                report_error("Failed to generate function declaration: " + node.name());
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0202_UNDEFINED_FUNCTION, &node,
+                                                     "Failed to generate function declaration: " + node.name());
+                }
                 return;
             }
 
@@ -371,7 +387,11 @@ namespace Cryo::Codegen
                 bool body_success = generate_function_body(&node, function);
                 if (!body_success)
                 {
-                    report_error("Failed to generate function body: " + node.name());
+                    if (_diagnostic_builder)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED, &node,
+                                                         "Failed to generate function body: " + node.name());
+                    }
                 }
             }
             else
@@ -381,7 +401,11 @@ namespace Cryo::Codegen
         }
         catch (const std::exception &e)
         {
-            report_error("Exception in function declaration: " + std::string(e.what()), &node);
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0606_FUNCTION_GENERATION_ERROR, &node,
+                                                 "Exception in function declaration: " + std::string(e.what()));
+            }
         }
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed FunctionDeclarationNode: {}", node.name());
     }
@@ -401,7 +425,11 @@ namespace Cryo::Codegen
         }
         catch (const std::exception &e)
         {
-            report_error("Exception in intrinsic declaration: " + std::string(e.what()), &node);
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0608_INTRINSIC_GENERATION_ERROR, &node,
+                                                 "Exception in intrinsic declaration: " + std::string(e.what()));
+            }
         }
     }
 
@@ -459,7 +487,11 @@ namespace Cryo::Codegen
 
             if (!cryo_type)
             {
-                report_error("Variable declaration missing resolved type: " + var_name);
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                     "Variable declaration missing resolved type: " + var_name);
+                }
                 return;
             }
 
@@ -487,20 +519,32 @@ namespace Cryo::Codegen
             // Check for auto type that needs inference
             if (cryo_type->kind() == TypeKind::Auto)
             {
-                report_error("Variable declaration requires explicit type or initializer for auto inference: " + var_name);
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0219_UNINITIALIZED_VAR, &node,
+                                                     "Variable declaration requires explicit type or initializer for auto inference: " + var_name);
+                }
                 return;
             }
 
             // Type* object is already resolved, no need to parse
             if (!cryo_type || cryo_type->kind() == TypeKind::Unknown)
             {
-                report_error("Invalid type for variable: " + var_name);
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                     "Invalid type for variable: " + var_name);
+                }
                 return;
             }
             llvm::Type *llvm_type = _type_mapper->map_type(cryo_type);
             if (!llvm_type)
             {
-                report_error("Failed to map type for variable: " + var_name + " (type: " + cryo_type->to_string() + ")");
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0602_INVALID_LLVM_TYPE, &node,
+                                                     "Failed to map type for variable: " + var_name + " (type: " + cryo_type->to_string() + ")");
+                }
                 return;
             }
 
@@ -514,7 +558,11 @@ namespace Cryo::Codegen
                 auto module = _context_manager.get_module();
                 if (!module)
                 {
-                    report_error("No module available for global variable: " + var_name);
+                    if (_diagnostic_builder)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED, &node,
+                                                         "No module available for global variable: " + var_name);
+                    }
                     return;
                 }
 
@@ -650,7 +698,11 @@ namespace Cryo::Codegen
 
                 if (!alloca)
                 {
-                    report_error("Failed to create alloca for variable: " + var_name);
+                    if (_diagnostic_builder)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0603_INVALID_LLVM_VALUE, &node,
+                                                         "Failed to create alloca for variable: " + var_name);
+                    }
                     return;
                 }
 
@@ -1026,7 +1078,11 @@ namespace Cryo::Codegen
         }
         catch (const std::exception &e)
         {
-            report_error("Exception in variable declaration: " + std::string(e.what()), &node);
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, &node,
+                                                 "Exception in variable declaration: " + std::string(e.what()));
+            }
         }
     }
 
@@ -1075,7 +1131,11 @@ namespace Cryo::Codegen
 
         if (!module)
         {
-            report_error("No module available for struct generation", &node);
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED, &node,
+                                                 "No module available for struct generation");
+            }
             return;
         }
 
@@ -1085,7 +1145,11 @@ namespace Cryo::Codegen
 
         if (!struct_type)
         {
-            report_error("Failed to map struct type: " + node.name(), &node);
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0602_INVALID_LLVM_TYPE, &node,
+                                                 "Failed to map struct type: " + node.name());
+            }
             return;
         }
 
@@ -1173,7 +1237,11 @@ namespace Cryo::Codegen
                         Cryo::Type *cryo_param_type = param->get_resolved_type();
                         if (!cryo_param_type)
                         {
-                            report_error("Parameter missing resolved type: " + param->name(), method.get());
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, method.get(),
+                                                                 "Parameter missing resolved type: " + param->name());
+                            }
                             continue;
                         }
 
@@ -1184,7 +1252,11 @@ namespace Cryo::Codegen
                         }
                         else
                         {
-                            report_error("Failed to map parameter type: " + cryo_param_type->to_string(), method.get());
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->report_error(ErrorCode::E0602_INVALID_LLVM_TYPE, method.get(),
+                                                                 "Failed to map parameter type: " + cryo_param_type->to_string());
+                            }
                             continue;
                         }
                     }
@@ -1400,7 +1472,7 @@ namespace Cryo::Codegen
         llvm::Type *class_type = _type_mapper->map_class_type(cryo_class_type);
         if (!class_type)
         {
-            report_error("Failed to map class type for " + node.name(), &node);
+            _diagnostic_builder->report_error(ErrorCode::E0610_CLASS_GENERATION_ERROR, &node, "Failed to map class type for " + node.name());
             register_value(&node, nullptr);
             return;
         }
@@ -1506,7 +1578,7 @@ namespace Cryo::Codegen
                         }
                         else
                         {
-                            report_error("Failed to map parameter type: " + param->name(), method.get());
+                            _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, method.get(), "Failed to map parameter type: " + param->name());
                             continue;
                         }
                     }
@@ -1846,7 +1918,7 @@ namespace Cryo::Codegen
         llvm::Type *enum_type = _type_mapper->map_enum_type(cryo_enum_type);
         if (!enum_type)
         {
-            report_error("Failed to generate LLVM type for enum: " + node.name());
+            _diagnostic_builder->report_error(ErrorCode::E0611_ENUM_GENERATION_ERROR, &node, "Failed to generate LLVM type for enum: " + node.name());
             register_value(&node, nullptr);
             return;
         }
@@ -2075,7 +2147,7 @@ namespace Cryo::Codegen
 
         if (!module)
         {
-            report_error("No module available for implementation block generation", &node);
+            _diagnostic_builder->report_error(ErrorCode::E0620_MODULE_CONTEXT_ERROR, &node, "No module available for implementation block generation");
             return;
         }
 
@@ -2198,7 +2270,7 @@ namespace Cryo::Codegen
                 return;
             }
 
-            report_error("Unknown struct/enum type in implementation block: " + target_type_name + " (node kind: " + std::to_string(static_cast<int>(node.kind())) + ")", &node);
+            _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, &node, "Unknown struct/enum type in implementation block: " + target_type_name + " (node kind: " + std::to_string(static_cast<int>(node.kind())) + ")");
             return;
         }
 
@@ -2269,7 +2341,7 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        report_error("Failed to map parameter type: " + param->name(), method.get());
+                        _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, method.get(), "Failed to map parameter type: " + param->name());
                         continue;
                     }
                 }
@@ -2463,7 +2535,7 @@ namespace Cryo::Codegen
                 if (!return_value)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Return value is NULL - creating default value");
-                    report_error("Failed to generate return value");
+                    _diagnostic_builder->report_error(ErrorCode::E0606_FUNCTION_GENERATION_ERROR, &node, "Failed to generate return value");
                     return;
                 }
 
@@ -2931,7 +3003,11 @@ namespace Cryo::Codegen
             }
 
             // If not found, report error
-            report_error("Undefined identifier: " + identifier, &node);
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0201_UNDEFINED_VARIABLE, &node,
+                                                 "Undefined identifier: " + identifier);
+            }
 
             // Create placeholder to continue compilation
             auto &llvm_ctx = _context_manager.get_context();
@@ -3210,7 +3286,7 @@ namespace Cryo::Codegen
 
         if (!module)
         {
-            report_error("No module available for new expression", &node);
+            _diagnostic_builder->report_error(ErrorCode::E0620_MODULE_CONTEXT_ERROR, &node, "No module available for new expression");
             return;
         }
 
@@ -3246,7 +3322,11 @@ namespace Cryo::Codegen
             }
             else
             {
-                report_error("Unknown type in new expression: " + full_type_name, &node);
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                     "Unknown type in new expression: " + full_type_name);
+                }
                 return;
             }
         }
@@ -3259,7 +3339,7 @@ namespace Cryo::Codegen
         llvm::Function *cryo_alloc_func = module->getFunction("cryo_alloc");
         if (!cryo_alloc_func)
         {
-            report_error("cryo_alloc function not found for heap allocation", &node);
+            _diagnostic_builder->report_error(ErrorCode::E0617_MEMORY_OPERATION_ERROR, &node, "cryo_alloc function not found for heap allocation");
             return;
         }
 
@@ -3426,13 +3506,21 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        report_error("Failed to generate generic constructor for type: " + full_type_name, &node);
+                        if (_diagnostic_builder)
+                        {
+                            _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED, &node,
+                                                             "Failed to generate generic constructor for type: " + full_type_name);
+                        }
                         return;
                     }
                 }
                 else
                 {
-                    report_error("Constructor not found for type: " + full_type_name, &node);
+                    if (_diagnostic_builder)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0352_CONSTRUCTOR_NOT_FOUND, &node,
+                                                         "Constructor not found for type: " + full_type_name);
+                    }
                     return;
                 }
             }
@@ -3523,7 +3611,11 @@ namespace Cryo::Codegen
             }
             else
             {
-                report_error("Unknown type in sizeof expression: " + type_name, &node);
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                     "Unknown type in sizeof expression: " + type_name);
+                }
                 // Return 0 as fallback
                 size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
             }
@@ -5450,7 +5542,7 @@ namespace Cryo::Codegen
             auto module = _context_manager.get_module();
             if (!module)
             {
-                report_error("No module available for function: " + node->name());
+                _diagnostic_builder->report_error(ErrorCode::E0620_MODULE_CONTEXT_ERROR, node, "No module available for function: " + node->name());
                 return nullptr;
             }
 
@@ -5470,7 +5562,7 @@ namespace Cryo::Codegen
 
             if (!return_type)
             {
-                report_error("Failed to map return type for function: " + node->name() + " (type: " + (cryo_return_type ? cryo_return_type->to_string() : "unknown") + ")");
+                _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, node, "Failed to map return type for function: " + node->name() + " (type: " + (cryo_return_type ? cryo_return_type->to_string() : "unknown") + ")");
                 return nullptr;
             }
 
@@ -5497,7 +5589,7 @@ namespace Cryo::Codegen
                     llvm::Type *param_type = cryo_param_type ? _type_mapper->map_type(cryo_param_type) : nullptr;
                     if (!param_type)
                     {
-                        report_error("Failed to map parameter type: " + param->name() + " (type: " + param_type_annotation + ")");
+                        _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, node, "Failed to map parameter type: " + param->name() + " (type: " + param_type_annotation + ")");
                         return nullptr;
                     }
                     param_types.push_back(param_type);
@@ -5809,7 +5901,7 @@ namespace Cryo::Codegen
 
         if (!module)
         {
-            report_error("No module available for primitive method generation");
+            _diagnostic_builder->report_error(ErrorCode::E0620_MODULE_CONTEXT_ERROR, node, "No module available for primitive method generation");
             return;
         }
 
@@ -6490,7 +6582,7 @@ namespace Cryo::Codegen
 
                     if (!var_alloca)
                     {
-                        report_error("Assignment to undefined variable: " + var_name);
+                        _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, "Assignment to undefined variable: " + var_name);
                         return nullptr;
                     }
 
@@ -6500,7 +6592,7 @@ namespace Cryo::Codegen
 
                     if (!right_val)
                     {
-                        report_error("Failed to generate right operand of assignment");
+                        _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, "Failed to generate right operand of assignment");
                         return nullptr;
                     }
 
@@ -7958,7 +8050,7 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    report_error("Bitwise OR operation requires integer operands");
+                    _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise OR operation requires integer operands");
                     return nullptr;
                 }
                 break;
@@ -7983,7 +8075,7 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    report_error("Bitwise AND operation requires integer operands");
+                    _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise AND operation requires integer operands");
                     return nullptr;
                 }
                 break;
@@ -8008,7 +8100,7 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    report_error("Bitwise XOR operation requires integer operands");
+                    _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise XOR operation requires integer operands");
                     return nullptr;
                 }
                 break;
@@ -11587,7 +11679,7 @@ namespace Cryo::Codegen
 
         if (!condition_val)
         {
-            report_error("Failed to generate if condition");
+            _diagnostic_builder->report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, static_cast<ASTNode*>(node), "Failed to generate if condition");
             return;
         }
 
@@ -11606,7 +11698,7 @@ namespace Cryo::Codegen
             }
             else
             {
-                report_error("Invalid condition type in if statement");
+                _diagnostic_builder->report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, static_cast<ASTNode*>(node), "Invalid condition type in if statement");
                 return;
             }
         }
@@ -11736,7 +11828,7 @@ namespace Cryo::Codegen
 
         if (!condition_val)
         {
-            report_error("Failed to generate while loop condition");
+            _diagnostic_builder->report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, static_cast<ASTNode*>(node), "Failed to generate while loop condition");
             return;
         }
 
@@ -11750,7 +11842,7 @@ namespace Cryo::Codegen
             }
             else
             {
-                report_error("Invalid condition type in while loop");
+                _diagnostic_builder->report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, static_cast<ASTNode*>(node), "Invalid condition type in while loop");
                 return;
             }
         }
@@ -11887,7 +11979,7 @@ namespace Cryo::Codegen
 
         if (!switch_value)
         {
-            report_error("Failed to generate switch expression");
+            _diagnostic_builder->report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, static_cast<ASTNode*>(node), "Failed to generate switch expression");
             _breakable_stack.pop(); // Clean up context on error
             return;
         }
@@ -13711,7 +13803,7 @@ namespace Cryo::Codegen
             llvm::Value *arg_value = get_current_value();
             if (!arg_value)
             {
-                report_error("Failed to generate argument for intrinsic: " + intrinsic_name);
+                _diagnostic_builder->report_error(ErrorCode::E0608_INTRINSIC_GENERATION_ERROR, node, "Failed to generate argument for intrinsic: " + intrinsic_name);
                 return nullptr;
             }
             args.push_back(arg_value);
@@ -13722,7 +13814,7 @@ namespace Cryo::Codegen
 
         if (_intrinsics->has_errors())
         {
-            report_error("Intrinsic generation failed: " + _intrinsics->get_last_error());
+            _diagnostic_builder->report_error(ErrorCode::E0608_INTRINSIC_GENERATION_ERROR, node, "Intrinsic generation failed: " + _intrinsics->get_last_error());
             return nullptr;
         }
 
@@ -13767,7 +13859,7 @@ namespace Cryo::Codegen
 
         if (_intrinsics->has_errors())
         {
-            report_error("Intrinsic generation failed: " + _intrinsics->get_last_error());
+            _diagnostic_builder->report_error(ErrorCode::E0608_INTRINSIC_GENERATION_ERROR, node, "Intrinsic generation failed: " + _intrinsics->get_last_error());
             return nullptr;
         }
 
@@ -13863,13 +13955,13 @@ namespace Cryo::Codegen
     {
         if (!node || node->arguments().empty())
         {
-            report_error("Primitive constructor requires exactly one argument", node);
+            _diagnostic_builder->report_error(ErrorCode::E0618_CONSTRUCTOR_GENERATION_ERROR, node, "Primitive constructor requires exactly one argument");
             return nullptr;
         }
 
         if (node->arguments().size() != 1)
         {
-            report_error("Primitive constructor requires exactly one argument", node);
+            _diagnostic_builder->report_error(ErrorCode::E0618_CONSTRUCTOR_GENERATION_ERROR, node, "Primitive constructor requires exactly one argument");
             return nullptr;
         }
 
