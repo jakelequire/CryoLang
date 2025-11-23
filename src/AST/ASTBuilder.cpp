@@ -90,7 +90,16 @@ namespace Cryo
                                                                                      bool is_mutable,
                                                                                      bool is_global)
     {
-        return std::make_unique<VariableDeclarationNode>(loc, std::move(name), resolved_type, std::move(init), is_mutable, is_global);
+        // Debug: Log variable declaration creation
+        LOG_DEBUG(Cryo::LogComponent::AST, "ASTBUILDER_DEBUG: Creating VariableDeclarationNode with name='{}', location={}:{}", 
+                  name, loc.line(), loc.column());
+        
+        auto node = std::make_unique<VariableDeclarationNode>(loc, std::move(name), resolved_type, std::move(init), is_mutable, is_global);
+        
+        LOG_DEBUG(Cryo::LogComponent::AST, "ASTBUILDER_DEBUG: Created VariableDeclarationNode node_ptr={}, stored_name='{}'", 
+                  static_cast<void*>(node.get()), node->name());
+        
+        return node;
     }
 
     std::unique_ptr<FunctionDeclarationNode> ASTBuilder::create_function_declaration(SourceLocation loc,
