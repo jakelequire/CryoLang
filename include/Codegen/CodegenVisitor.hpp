@@ -10,6 +10,8 @@
 #include "Codegen/FunctionRegistry.hpp"
 #include "Compiler/ModuleLoader.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
+#include "Utils/ASTNodeSRMExtensions.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>
@@ -214,6 +216,16 @@ namespace Cryo::Codegen
          */
         Cryo::ASTNode *get_current_node() const { return _current_node; }
 
+        /**
+         * @brief Get Symbol Resolution Manager for identifier generation
+         */
+        Cryo::SRM::SymbolResolutionManager *get_srm_manager() const { return _srm_manager.get(); }
+
+        /**
+         * @brief Get Symbol Resolution Context for namespace management
+         */
+        Cryo::SRM::SymbolResolutionContext *get_srm_context() const { return _srm_context.get(); }
+
     private:
         //===================================================================
         // Context Management
@@ -307,6 +319,10 @@ namespace Cryo::Codegen
         std::unique_ptr<TypeMapper> _type_mapper;
         std::unique_ptr<Intrinsics> _intrinsics;
         std::unique_ptr<FunctionRegistry> _function_registry;
+
+        // Symbol Resolution Manager for standardized naming
+        std::unique_ptr<Cryo::SRM::SymbolResolutionContext> _srm_context;
+        std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _srm_manager;
 
         //===================================================================
         // Generation State
