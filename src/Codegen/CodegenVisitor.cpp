@@ -5369,14 +5369,7 @@ namespace Cryo::Codegen
                     std::string type_param = struct_name.substr(6); // Remove "Array_" prefix
                     std::string generic_name = base_name + "<" + type_param + ">";
                     
-                    if (!_namespace_context.empty())
-                    {
-                        generic_lookup_name = _namespace_context + "::" + generic_name + "::" + method_name;
-                    }
-                    else
-                    {
-                        generic_lookup_name = generic_name + "::" + method_name;
-                    }
+                    generic_lookup_name = generate_method_name(generic_name, method_name);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created Array generic lookup alias: {} -> {}", generic_lookup_name, fully_qualified_name);
                 }
 
@@ -9674,15 +9667,7 @@ namespace Cryo::Codegen
                                 // (the global variable itself is the pointer, we don't need to load it)
 
                                 // Build method name with namespace
-                                std::string method_name;
-                                if (!_namespace_context.empty())
-                                {
-                                    method_name = _namespace_context + "::" + base_type_name + "::" + member_access->member();
-                                }
-                                else
-                                {
-                                    method_name = base_type_name + "::" + member_access->member();
-                                }
+                                std::string method_name = generate_method_name(base_type_name, member_access->member());
 
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up global variable method: '{}'", method_name);
 
@@ -9839,7 +9824,7 @@ namespace Cryo::Codegen
                     if (nested_type_name.find("::") != std::string::npos)
                     {
                         // Type already has a full namespace path, use it as-is
-                        method_name = nested_type_name + "::" + member_access->member();
+                        method_name = generate_method_name(nested_type_name, member_access->member());
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fully qualified nested type: {}", nested_type_name);
                     }
                     else
@@ -9874,25 +9859,14 @@ namespace Cryo::Codegen
                         if (is_core_library_type)
                         {
                             // Generate specialized methods locally in the current module instead of looking in core types
-                            if (!_namespace_context.empty())
-                            {
-                                method_name = _namespace_context + "::" + nested_type_name + "::" + member_access->member();
-                            }
-                            else
-                            {
-                                method_name = nested_type_name + "::" + member_access->member();
-                            }
+                            method_name = generate_method_name(nested_type_name, member_access->member());
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using local specialization for core library type: {} -> {}", nested_type_name, method_name);
-                        }
-                        else if (!_namespace_context.empty())
-                        {
-                            // Type doesn't have namespace, prepend current context
-                            method_name = _namespace_context + "::" + nested_type_name + "::" + member_access->member();
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Prepending namespace context to nested type: {} -> {}", nested_type_name, _namespace_context + "::" + nested_type_name);
                         }
                         else
                         {
-                            method_name = nested_type_name + "::" + member_access->member();
+                            // Type doesn't have namespace, use SRM to build qualified name
+                            method_name = generate_method_name(nested_type_name, member_access->member());
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated method name with SRM: {}", method_name);
                         }
                     }
 
@@ -10086,15 +10060,7 @@ namespace Cryo::Codegen
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Dereferenced object type: '{}'", type_name);
 
                             // Build method name
-                            std::string method_name;
-                            if (!_namespace_context.empty())
-                            {
-                                method_name = _namespace_context + "::" + type_name + "::" + member_access->member();
-                            }
-                            else
-                            {
-                                method_name = type_name + "::" + member_access->member();
-                            }
+                            std::string method_name = generate_method_name(type_name, member_access->member());
 
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up dereferenced method: '{}'", method_name);
                             auto method_it = _functions.find(method_name);
@@ -10171,15 +10137,7 @@ namespace Cryo::Codegen
                         }
 
                         // Build method name with namespace context
-                        std::string method_name;
-                        if (!_namespace_context.empty() && !is_primitive_type(type_name))
-                        {
-                            method_name = _namespace_context + "::" + type_name + "::" + member_access->member();
-                        }
-                        else
-                        {
-                            method_name = type_name + "::" + member_access->member();
-                        }
+                        std::string method_name = generate_method_name(type_name, member_access->member());
 
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up array element method: '{}'", method_name);
                         auto method_it = _functions.find(method_name);

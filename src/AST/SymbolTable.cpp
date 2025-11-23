@@ -101,7 +101,7 @@ namespace Cryo
                 std::string parent_namespace = current_namespace.substr(0, last_scope - 1);
 
                 // Try parent::namespace_name (e.g., "std" + "::" + "Syscall" = "std::Syscall")
-                std::string qualified_namespace = parent_namespace + "::" + namespace_name;
+                std::string qualified_namespace = Cryo::Utils::build_qualified_name({parent_namespace}, namespace_name);
                 result = lookup_namespaced_symbol(qualified_namespace, symbol_name);
 
                 LOG_TRACE(Cryo::LogComponent::AST, "Trying relative resolution: {}::{} (from context {})",

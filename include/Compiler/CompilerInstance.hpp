@@ -13,6 +13,7 @@
 #include "AST/DirectiveProcessors.hpp"
 #include "GDM/GDM.hpp"
 #include "Codegen/CodeGenerator.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 #include "Linker/CryoLinker.hpp"
 #include "Utils/File.hpp"
 #include "Compiler/ModuleLoader.hpp"
@@ -48,6 +49,7 @@ namespace Cryo
         std::unique_ptr<ASTContext> _ast_context;
         std::unique_ptr<SymbolTable> _symbol_table;
         std::unique_ptr<DiagnosticManager> _diagnostic_manager;
+        std::unique_ptr<SymbolResolutionManager> _symbol_resolution_manager;
         // TypeChecker must come AFTER ASTContext since it holds a reference to ast_context->types()
         std::unique_ptr<TypeChecker> _type_checker;
         std::unique_ptr<MonomorphizationPass> _monomorphization_pass;
@@ -162,6 +164,9 @@ namespace Cryo
         void process_struct_declarations_recursive(ASTNode *node);
         std::string build_function_signature(FunctionDeclarationNode *func_decl);
         void inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name); // Auto-import core types
+        
+        // SRM helper methods
+        std::string generate_method_name(const std::string &scope_name, const std::string &class_name, const std::string &method_name);
 
         // Directive system
         void initialize_directive_system();

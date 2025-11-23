@@ -5,6 +5,7 @@
 #include "AST/DirectiveWalker.hpp"
 #include "Utils/File.hpp"
 #include "Utils/Logger.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -25,6 +26,17 @@ namespace Cryo
 
         // Set the type context in symbol table so it can create proper function types
         _symbol_table->set_type_context(&_ast_context->types());
+
+        // Initialize Symbol Resolution Manager
+        try
+        {
+            _symbol_resolution_manager = std::make_unique<SymbolResolutionManager>(*_symbol_table);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN(Cryo::LogComponent::COMPILER, "Failed to initialize Symbol Resolution Manager: {}", e.what());
+            _symbol_resolution_manager = nullptr;
+        }
 
         // Create type checker with the AST context's type context and diagnostic manager
         _type_checker = std::make_unique<TypeChecker>(_ast_context->types(), _diagnostic_manager.get());
@@ -996,7 +1008,7 @@ namespace Cryo
             {
                 if (method)
                 {
-                    std::string method_name = scope_name + "::" + struct_decl->name() + "::" + method->name();
+                    std::string method_name = generate_method_name(scope_name, struct_decl->name(), method->name());
                     LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Found struct method: {}", method_name);
 
                     // Create function type for the method
@@ -1059,7 +1071,7 @@ namespace Cryo
             {
                 if (method)
                 {
-                    std::string method_name = scope_name + "::" + class_decl->name() + "::" + method->name();
+                    std::string method_name = generate_method_name(scope_name, class_decl->name(), method->name());
                     LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Found class method: {}", method_name);
 
                     // Create function type for the method
@@ -1826,6 +1838,21 @@ namespace Cryo
         }
 
         return all_valid;
+    }
+
+    std::string CompilerInstance::generate_method_name(const std::string &scope_name, const std::string &class_name, const std::string &method_name)
+    {
+        if (_symbol_resolution_manager)
+        {
+            // Use SRM to generate qualified method name
+            QualifiedIdentifier qualified_id(scope_name, class_name + "::" + method_name);
+            return qualified_id.get_qualified_name();
+        }
+        else
+        {
+            // Fallback to manual concatenation
+            return scope_name + "::" + class_name + "::" + method_name;
+        }
     }
 
     std::unique_ptr<CompilerInstance> create_compiler_instance()
