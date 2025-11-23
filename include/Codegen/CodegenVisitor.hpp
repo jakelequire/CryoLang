@@ -566,6 +566,13 @@ namespace Cryo::Codegen
         bool is_lvalue(Cryo::ExpressionNode *expr);
         bool is_primitive_type(const std::string &type_name);
         void ensure_valid_insertion_point();
+        
+        // SRM Helper methods for standardized naming
+        std::string generate_function_name(const std::string& function_name, const std::vector<Cryo::Type*>& parameter_types = {});
+        std::string generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types = {});
+        std::string generate_constructor_name(const std::string& type_name, const std::vector<Cryo::Type*>& parameter_types);
+        std::string generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind = Cryo::SymbolKind::Function);
+        std::vector<std::string> get_current_namespace_parts() const;
 
         // Destructor management
         bool has_destructor(const std::string &type_name);

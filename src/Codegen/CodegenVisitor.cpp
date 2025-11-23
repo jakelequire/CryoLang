@@ -512,6 +512,11 @@ namespace Cryo::Codegen
 
             if (!cryo_type)
             {
+                // Enhanced debugging for the variable name corruption issue
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "UNDEFINED_TYPE ERROR: node.name()='{}', var_name='{}', node_ptr={}, location={}:{}",
+                          node.name(), var_name, static_cast<const void*>(&node), 
+                          node.location().line(), node.location().column());
+                
                 if (_diagnostic_builder)
                 {
                     _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
@@ -1708,17 +1713,19 @@ namespace Cryo::Codegen
                 }
 
                 std::string method_name = method->name();
-                std::string qualified_name;
+                
+                // Extract parameter types for SRM naming
+                std::vector<Cryo::Type*> parameter_types;
+                for (const auto &param : method->parameters())
+                {
+                    if (param && param->get_resolved_type())
+                    {
+                        parameter_types.push_back(param->get_resolved_type());
+                    }
+                }
 
-                // Build the same qualified name as in pass 1
-                if (!_namespace_context.empty())
-                {
-                    qualified_name = _namespace_context + "::" + class_name + "::" + method_name;
-                }
-                else
-                {
-                    qualified_name = class_name + "::" + method_name;
-                }
+                // Use SRM helper to generate standardized qualified method name
+                std::string qualified_name = generate_method_name(class_name, method_name, parameter_types);
 
                 // For constructors, include parameter signature in the LLVM IR function name to prevent conflicts
                 bool is_constructor = (method_name == class_name);
@@ -2306,15 +2313,19 @@ namespace Cryo::Codegen
                         continue;
 
                     std::string method_name = method->name();
-                    std::string qualified_name;
-                    if (!_namespace_context.empty())
+                    
+                    // Extract parameter types for SRM naming
+                    std::vector<Cryo::Type*> parameter_types;
+                    for (const auto &param : method->parameters())
                     {
-                        qualified_name = _namespace_context + "::" + target_type_name + "::" + method_name;
+                        if (param && param->get_resolved_type())
+                        {
+                            parameter_types.push_back(param->get_resolved_type());
+                        }
                     }
-                    else
-                    {
-                        qualified_name = target_type_name + "::" + method_name;
-                    }
+
+                    // Use SRM helper to generate standardized qualified enum method name
+                    std::string qualified_name = generate_method_name(target_type_name, method_name, parameter_types);
 
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating enum method: {}", qualified_name);
 
@@ -2349,15 +2360,19 @@ namespace Cryo::Codegen
                 continue;
 
             std::string method_name = method->name();
-            std::string qualified_name;
-            if (!_namespace_context.empty())
+            
+            // Extract parameter types for SRM naming
+            std::vector<Cryo::Type*> parameter_types;
+            for (const auto &param : method->parameters())
             {
-                qualified_name = _namespace_context + "::" + target_type_name + "::" + method_name;
+                if (param && param->get_resolved_type())
+                {
+                    parameter_types.push_back(param->get_resolved_type());
+                }
             }
-            else
-            {
-                qualified_name = target_type_name + "::" + method_name;
-            }
+
+            // Use SRM helper to generate standardized qualified struct method name
+            std::string qualified_name = generate_method_name(target_type_name, method_name, parameter_types);
 
             // For constructors, include parameter signature in the LLVM IR function name to match declaration
             bool is_constructor = (method_name == target_type_name); // Constructor has same name as struct
@@ -2532,7 +2547,7 @@ namespace Cryo::Codegen
         }
 
         // Clear struct type context
-        current_struct_type.clear();
+        this->current_struct_type.clear();
 
         register_value(&node, nullptr);
     }
@@ -3417,52 +3432,19 @@ namespace Cryo::Codegen
         // If there are constructor arguments, call the constructor
         if (!node.arguments().empty())
         {
-            // Look up the constructor function - need to determine correct namespace
-            std::string constructor_name;
-            std::string constructor_signature_name;
-            std::string target_namespace;
-
-            // Use the current namespace context for constructor lookup
-            target_namespace = _namespace_context;
-
-            // Generate constructor name with correct namespace
-            if (!target_namespace.empty())
+            // Extract parameter types from constructor arguments
+            std::vector<Cryo::Type*> parameter_types;
+            for (const auto &arg : node.arguments())
             {
-                constructor_name = target_namespace + "::" + full_type_name + "::" + base_type_name;
-                constructor_signature_name = target_namespace + "::" + full_type_name + "::" + base_type_name + "(";
-            }
-            else
-            {
-                constructor_name = full_type_name + "::" + base_type_name;
-                constructor_signature_name = full_type_name + "::" + base_type_name + "(";
-            }
-
-            // Add parameter types to signature
-            for (size_t i = 0; i < node.arguments().size(); ++i)
-            {
-                if (i > 0)
-                    constructor_signature_name += ",";
-                auto arg = node.arguments()[i].get();
                 if (arg && arg->get_resolved_type())
                 {
-                    std::string arg_type_name = arg->get_resolved_type()->to_string();
-                    // Normalize common type aliases for signature matching
-                    if (arg_type_name == "int")
-                    {
-                        arg_type_name = "i32";
-                    }
-                    else if (arg_type_name == "uint")
-                    {
-                        arg_type_name = "u32";
-                    }
-                    constructor_signature_name += arg_type_name;
-                }
-                else
-                {
-                    constructor_signature_name += "unknown";
+                    parameter_types.push_back(arg->get_resolved_type());
                 }
             }
-            constructor_signature_name += ")";
+
+            // Use SRM helper to generate standardized constructor name and signature
+            std::string constructor_name = generate_constructor_name(base_type_name, parameter_types);
+            std::string constructor_signature_name = constructor_name;
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for constructor: {}", constructor_name);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for signature-based constructor: {}", constructor_signature_name);
@@ -5065,7 +5047,7 @@ namespace Cryo::Codegen
         // Handle scope resolution like Color::RED
         std::string scope_name = node.scope_name();
         std::string member_name = node.member_name();
-        std::string qualified_name = scope_name + "::" + member_name;
+        std::string qualified_name = generate_qualified_name(scope_name + "::" + member_name, Cryo::SymbolKind::Type);
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ScopeResolutionNode: Looking for '{}' (scope='{}', member='{}')",
                   qualified_name, scope_name, member_name);
@@ -5206,7 +5188,7 @@ namespace Cryo::Codegen
             {
                 if (symbol.kind == Cryo::SymbolKind::Function && symbol.data_type)
                 {
-                    std::string qualified_name = namespace_name + "::" + symbol_name;
+                    std::string qualified_name = generate_qualified_name(namespace_name + "::" + symbol_name, Cryo::SymbolKind::Function);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pre-registering namespaced function: {}", qualified_name);
 
                     // Check if this function is already registered in LLVM
@@ -5347,20 +5329,23 @@ namespace Cryo::Codegen
             }
             for (const auto &[method_name, method_type] : methods)
             {
-                // Create fully qualified name with namespace context to match lookup expectations
+                // Use SRM helper to generate standardized method registration name
+                // For imported methods, we don't have parameter types available, so use empty vector
+                std::vector<Cryo::Type*> empty_param_types;
                 std::string fully_qualified_name;
+                
                 if (is_primitive_type)
                 {
                     // For primitive types, use the stdlib namespace where the actual implementations exist
-                    fully_qualified_name = "std::core::Types::" + struct_name + "::" + method_name;
-                }
-                else if (!_namespace_context.empty())
-                {
-                    fully_qualified_name = _namespace_context + "::" + struct_name + "::" + method_name;
+                    // Create a temporary namespace context for stdlib
+                    auto saved_namespace = _namespace_context;
+                    _namespace_context = "std::core::Types";
+                    fully_qualified_name = generate_method_name(struct_name, method_name, empty_param_types);
+                    _namespace_context = saved_namespace;
                 }
                 else
                 {
-                    fully_qualified_name = struct_name + "::" + method_name;
+                    fully_qualified_name = generate_method_name(struct_name, method_name, empty_param_types);
                 }
 
                 // For specialized types, also create a generic lookup alias
@@ -6015,11 +6000,11 @@ namespace Cryo::Codegen
         std::string func_name;
         if (current_primitive_type && is_primitive_type(primitive_type_name))
         {
-            func_name = "std::core::Types::" + primitive_type_name + "::" + node->name();
+            func_name = generate_qualified_name("std::core::Types::" + primitive_type_name + "::" + node->name(), Cryo::SymbolKind::Function);
         }
         else
         {
-            func_name = primitive_type_name + "::" + node->name();
+            func_name = generate_qualified_name(primitive_type_name + "::" + node->name(), Cryo::SymbolKind::Function);
         }
         llvm::Function *func = llvm::Function::Create(
             func_type,
@@ -6150,7 +6135,7 @@ namespace Cryo::Codegen
         _functions[func_name] = func;
         
         // Also register with simpler names for lookup flexibility
-        std::string simple_name = primitive_type_name + "::" + node->name();
+        std::string simple_name = generate_qualified_name(primitive_type_name + "::" + node->name(), Cryo::SymbolKind::Function);
         _functions[simple_name] = func;
 
         // Clean up
@@ -6206,16 +6191,18 @@ namespace Cryo::Codegen
 
         llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
 
-        // Create function with qualified name
-        std::string qualified_name;
-        if (!_namespace_context.empty())
+        // Extract parameter types for SRM naming
+        std::vector<Cryo::Type*> parameter_types;
+        for (const auto &param : node.parameters())
         {
-            qualified_name = _namespace_context + "::" + enum_type_name + "::" + node.name();
+            if (param && param->get_resolved_type())
+            {
+                parameter_types.push_back(param->get_resolved_type());
+            }
         }
-        else
-        {
-            qualified_name = enum_type_name + "::" + node.name();
-        }
+
+        // Use SRM helper to generate standardized enum constructor name
+        std::string qualified_name = generate_method_name(enum_type_name, node.name(), parameter_types);
 
         // Check if function already exists (from import phase)
         llvm::Function *func = module->getFunction(qualified_name);
@@ -6411,7 +6398,7 @@ namespace Cryo::Codegen
         auto *module = _context_manager.get_module();
 
         llvm::Type *enum_type = _type_mapper->lookup_type(enum_decl->name());
-        std::string constructor_name = enum_decl->name() + "::" + variant->name();
+        std::string constructor_name = generate_qualified_name(enum_decl->name() + "::" + variant->name(), Cryo::SymbolKind::Function);
 
         // Create function type: () -> EnumType
         llvm::FunctionType *func_type = llvm::FunctionType::get(enum_type, {}, false);
@@ -6453,7 +6440,7 @@ namespace Cryo::Codegen
         Cryo::EnumType *cryo_enum_type = static_cast<Cryo::EnumType *>(
             _symbol_table.get_type_context()->get_enum_type(enum_decl->name(), variant_names, enum_decl->is_simple_enum()));
         llvm::Type *enum_type = _type_mapper->map_enum_type(cryo_enum_type);
-        std::string constructor_name = enum_decl->name() + "::" + variant->name();
+        std::string constructor_name = generate_qualified_name(enum_decl->name() + "::" + variant->name(), Cryo::SymbolKind::Function);
 
         // Build parameter types for associated data
         std::vector<llvm::Type *> param_types;
@@ -9515,17 +9502,18 @@ namespace Cryo::Codegen
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Stripped pointer asterisk: '{}' -> '{}'", type_name, base_type_name);
                         }
 
-                        // Look up the method function - for primitive types, don't use namespace context
-                        // since primitive methods are defined globally in stdlib
-                        std::string method_name;
-                        if (!_namespace_context.empty() && !is_primitive_type(base_type_name))
+                        // Extract parameter types from the function call arguments
+                        std::vector<Cryo::Type*> parameter_types;
+                        for (const auto &arg : node->arguments())
                         {
-                            method_name = _namespace_context + "::" + base_type_name + "::" + member_access->member();
+                            if (arg && arg->get_resolved_type())
+                            {
+                                parameter_types.push_back(arg->get_resolved_type());
+                            }
                         }
-                        else
-                        {
-                            method_name = base_type_name + "::" + member_access->member();
-                        }
+
+                        // Use SRM helper to generate standardized method name
+                        std::string method_name = generate_method_name(base_type_name, member_access->member(), parameter_types);
 
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Built method name: '{}'", method_name);
                         auto method_it = _functions.find(method_name);
@@ -9554,23 +9542,15 @@ namespace Cryo::Codegen
                                 std::replace(type_params.begin(), type_params.end(), ' ', '_');
                                 monomorphized_name = monomorphized_name.substr(0, angle_start) + "_" + type_params;
                             }
-                            // Include namespace context to match how methods are stored
-                            std::string monomorphized_method_name;
-                            if (!_namespace_context.empty())
-                            {
-                                monomorphized_method_name = _namespace_context + "::" + monomorphized_name + "::" + member_access->member();
-                            }
-                            else
-                            {
-                                monomorphized_method_name = monomorphized_name + "::" + member_access->member();
-                            }
+                            // Use SRM helper to generate standardized monomorphized method name
+                            std::string monomorphized_method_name = generate_method_name(monomorphized_name, member_access->member(), parameter_types);
                             method_it = _functions.find(monomorphized_method_name);
 
                             // Second try: Extract base type name for generic instantiation lookup fallback
                             if (method_it == _functions.end())
                             {
                                 std::string base_name = base_type_name.substr(0, base_type_name.find('<'));
-                                std::string fallback_method_name = base_name + "::" + member_access->member();
+                                std::string fallback_method_name = generate_qualified_name(base_name + "::" + member_access->member(), Cryo::SymbolKind::Function);
                                 method_it = _functions.find(fallback_method_name);
                             }
                         }
@@ -9811,7 +9791,7 @@ namespace Cryo::Codegen
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up field '{}' in type '{}'", field_name, base_type_name);
 
                             // Look up the field in the symbol table
-                            std::string qualified_field_name = base_type_name + "::" + field_name;
+                            std::string qualified_field_name = generate_qualified_name(base_type_name + "::" + field_name, Cryo::SymbolKind::Variable);
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying qualified lookup: '{}'", qualified_field_name);
 
                             auto field_symbol = _symbol_table.lookup_symbol(qualified_field_name);
@@ -10300,7 +10280,18 @@ namespace Cryo::Codegen
                 return generate_intrinsic_call(node, member_name);
             }
 
-            function_name = scope_resolution->scope_name() + "::" + scope_resolution->member_name();
+            // Extract parameter types from function call arguments
+            std::vector<Cryo::Type*> parameter_types;
+            for (const auto &arg : node->arguments())
+            {
+                if (arg && arg->get_resolved_type())
+                {
+                    parameter_types.push_back(arg->get_resolved_type());
+                }
+            }
+            
+            // Use SRM helper to generate qualified function name
+            function_name = generate_qualified_name(scope_resolution->scope_name() + "::" + scope_resolution->member_name(), Cryo::SymbolKind::Function);
             resolved_function_name = function_name;
         }
         else
@@ -10371,7 +10362,7 @@ namespace Cryo::Codegen
 
                     // Prevent infinite recursion with a generation guard
                     static std::set<std::string> generating;
-                    std::string guard_key = base_name + "::" + variant_name;
+                    std::string guard_key = generate_qualified_name(base_name + "::" + variant_name, Cryo::SymbolKind::Function);
 
                     if (generating.find(guard_key) != generating.end())
                     {
@@ -10432,7 +10423,7 @@ namespace Cryo::Codegen
 
                                         // Now try to find the constructor again
                                         std::string instantiated_name = (base_return_type == "AllocResult") ? "Result<void*, AllocError>" : return_type_str;
-                                        std::string qualified_variant_name = instantiated_name + "::" + variant_name;
+                                        std::string qualified_variant_name = generate_qualified_name(instantiated_name + "::" + variant_name, Cryo::SymbolKind::Function);
                                         auto variant_it = _enum_variants.find(qualified_variant_name);
                                         if (variant_it != _enum_variants.end())
                                         {
@@ -10692,8 +10683,8 @@ namespace Cryo::Codegen
                 return call_result;
             }
 
-            // Try the fully qualified name with current namespace
-            std::string full_qualified_name = _namespace_context + "::" + function_name;
+            // Use SRM helper to generate fully qualified name with current namespace
+            std::string full_qualified_name = generate_qualified_name(function_name, Cryo::SymbolKind::Function);
             auto primitive_func_it = _functions.find(full_qualified_name);
             if (primitive_func_it != _functions.end())
             {
@@ -11500,7 +11491,7 @@ namespace Cryo::Codegen
             // try common prefixes (especially std:: for standard library)
             if (c_name.find("::") != std::string::npos && c_name.find("std::") != 0)
             {
-                search_variations.push_back("std::" + c_name);
+                search_variations.push_back(generate_qualified_name("std::" + c_name, Cryo::SymbolKind::Function));
             }
 
             // Try all variations
@@ -12436,7 +12427,7 @@ namespace Cryo::Codegen
             // Look up the enum variant to get its discriminant value
             std::string enum_name = enum_pattern->enum_name();
             std::string variant_name = enum_pattern->variant_name();
-            std::string full_name = enum_name + "::" + variant_name;
+            std::string full_name = generate_qualified_name(enum_name + "::" + variant_name, Cryo::SymbolKind::Type);
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Getting discriminant for pattern: {}", full_name);
 
@@ -12903,7 +12894,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::register_enum_variant(const std::string &enum_name, const std::string &variant_name, llvm::Value *value)
     {
-        std::string qualified_name = enum_name + "::" + variant_name;
+        std::string qualified_name = generate_qualified_name(enum_name + "::" + variant_name, Cryo::SymbolKind::Type);
         _enum_variants[qualified_name] = value;
 
         // Also register with just the variant name for unqualified access
@@ -12915,7 +12906,7 @@ namespace Cryo::Codegen
                                                                 const std::vector<std::string> &type_args)
     {
         // Check if constructors are already generated for this instantiation
-        std::string first_variant_name = instantiated_name + "::";
+        std::string first_variant_name = instantiated_name + "::";  // Prefix for variant lookups
         bool already_generated = false;
         for (const auto &[variant_key, variant_func] : _enum_variants)
         {
@@ -13251,7 +13242,7 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got LLVM context and module");
 
-        std::string constructor_name = instantiated_name + "::" + variant_name;
+        std::string constructor_name = generate_qualified_name(instantiated_name + "::" + variant_name, Cryo::SymbolKind::Function);
 
         // Extract base enum name from instantiated name (e.g., "Result<void*, AllocError>" -> "Result")
         std::string base_enum_name = instantiated_name;
@@ -13429,7 +13420,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
 
         // Create the function
-        std::string func_name = instantiated_type + "::" + base_type;
+        std::string func_name = generate_qualified_name(instantiated_type + "::" + base_type, Cryo::SymbolKind::Function);
         llvm::Function *constructor_func = llvm::Function::Create(
             func_type, llvm::Function::ExternalLinkage, func_name, module);
 
@@ -14773,7 +14764,7 @@ namespace Cryo::Codegen
                          struct_name, source_namespace);
 
                 // Create constructor function declaration (not definition)
-                std::string constructor_name = source_namespace + "::" + struct_name + "::" + struct_name;
+                std::string constructor_name = generate_qualified_name(source_namespace + "::" + struct_name + "::" + struct_name, Cryo::SymbolKind::Function);
                 
                 // Also register simple name for direct lookup
                 std::string simple_constructor_name = struct_name;
@@ -14851,7 +14842,7 @@ namespace Cryo::Codegen
                 }
                 parameter_signature += ")";
                 
-                std::string stdlib_constructor_name = struct_name + "::" + struct_name + parameter_signature;
+                std::string stdlib_constructor_name = generate_qualified_name(struct_name + "::" + struct_name, Cryo::SymbolKind::Function) + parameter_signature;
                 
                 llvm::Function *constructor_func = llvm::Function::Create(
                     constructor_func_type, 
@@ -14883,6 +14874,173 @@ namespace Cryo::Codegen
         search_for_structs(program_ast.get());
         
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished declaring constructors from imported module: {}", import_path);
+    }
+
+    //===================================================================
+    // SRM Helper Methods
+    //===================================================================
+
+    std::string CodegenVisitor::generate_function_name(const std::string& function_name, const std::vector<Cryo::Type*>& parameter_types)
+    {
+        if (!_srm_manager) 
+        {
+            // Fallback to simple name if SRM is not available
+            return function_name;
+        }
+
+        try
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            
+            if (parameter_types.empty())
+            {
+                // Simple function without parameters
+                auto identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                    namespace_parts, function_name, Cryo::SymbolKind::Function);
+                return identifier->to_string();
+            }
+            else
+            {
+                // Function with parameters - create function identifier
+                auto identifier = std::make_unique<Cryo::SRM::FunctionIdentifier>(
+                    namespace_parts, function_name, parameter_types);
+                return identifier->to_overload_key();
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM function name generation failed: {}, using fallback", e.what());
+            return function_name;
+        }
+    }
+
+    std::string CodegenVisitor::generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types)
+    {
+        if (!_srm_manager) 
+        {
+            // Fallback to manual concatenation
+            auto namespace_parts = get_current_namespace_parts();
+            if (namespace_parts.empty())
+                return type_name + "::" + method_name;
+            else
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, type_name + "::" + method_name);
+        }
+
+        try
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            // Add the type name to the namespace parts for method scoping
+            namespace_parts.push_back(type_name);
+            
+            if (parameter_types.empty())
+            {
+                // Simple method without parameters
+                auto identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                    namespace_parts, method_name, Cryo::SymbolKind::Function);
+                return identifier->to_string();
+            }
+            else
+            {
+                // Method with parameters - create method identifier  
+                auto identifier = std::make_unique<Cryo::SRM::FunctionIdentifier>(
+                    namespace_parts, method_name, parameter_types);
+                return identifier->to_overload_key();
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM method name generation failed: {}, using fallback", e.what());
+            auto namespace_parts = get_current_namespace_parts();
+            if (namespace_parts.empty())
+                return type_name + "::" + method_name;
+            else
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, type_name + "::" + method_name);
+        }
+    }
+
+    std::string CodegenVisitor::generate_constructor_name(const std::string& type_name, const std::vector<Cryo::Type*>& parameter_types)
+    {
+        if (!_srm_manager) 
+        {
+            // Fallback to manual constructor naming
+            std::string signature = "(";
+            for (size_t i = 0; i < parameter_types.size(); ++i)
+            {
+                if (i > 0) signature += ",";
+                signature += normalize_type_for_signature(parameter_types[i]->to_string());
+            }
+            signature += ")";
+            return type_name + "::" + type_name + signature;
+        }
+
+        try
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            
+            // For constructors, the constructor name is the same as the type name
+            auto identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
+                namespace_parts, type_name, parameter_types);
+            return identifier->to_overload_key();
+        }
+        catch (const std::exception& e)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM constructor name generation failed: {}, using fallback", e.what());
+            std::string signature = "(";
+            for (size_t i = 0; i < parameter_types.size(); ++i)
+            {
+                if (i > 0) signature += ",";
+                signature += normalize_type_for_signature(parameter_types[i]->to_string());
+            }
+            signature += ")";
+            return type_name + "::" + type_name + signature;
+        }
+    }
+
+    std::string CodegenVisitor::generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind)
+    {
+        if (!_srm_manager) 
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            if (namespace_parts.empty())
+                return base_name;
+            else
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, base_name);
+        }
+
+        try
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            auto identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                namespace_parts, base_name, symbol_kind);
+            return identifier->to_string();
+        }
+        catch (const std::exception& e)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM qualified name generation failed: {}, using fallback", e.what());
+            auto namespace_parts = get_current_namespace_parts();
+            if (namespace_parts.empty())
+                return base_name;
+            else
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, base_name);
+        }
+    }
+
+    std::vector<std::string> CodegenVisitor::get_current_namespace_parts() const
+    {
+        std::vector<std::string> namespace_parts;
+        if (!_namespace_context.empty()) 
+        {
+            std::istringstream iss(_namespace_context);
+            std::string part;
+            while (std::getline(iss, part, ':')) 
+            {
+                if (!part.empty() && part != ":") 
+                {
+                    namespace_parts.push_back(part);
+                }
+            }
+        }
+        return namespace_parts;
     }
 
 } // namespace Cryo::Codegen

@@ -846,11 +846,10 @@ namespace Cryo::SRM {
           enable_implicit_std_import_(true),
           enable_namespace_fallback_(true) {
         
-        if (!symbol_table_) {
-            throw std::invalid_argument("SymbolTable cannot be null");
-        }
+        // Allow nullptr SymbolTable for cases where SRM is used without full symbol table integration
+        // (e.g., in TypeChecker during initial phases)
         
-        // Add standard search paths and imports
+        // Add standard search paths and imports only if we have std import enabled
         if (enable_implicit_std_import_) {
             add_imported_namespace("std");
         }

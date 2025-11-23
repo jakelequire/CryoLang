@@ -11,6 +11,19 @@ namespace Cryo
     Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context)
         : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(nullptr), _diagnostic_builder(nullptr)
     {
+        // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
+        try {
+            if (&context.symbols()) {
+                _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&context.symbols(), &context.types());
+                _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
+            }
+        } catch (const std::exception& e) {
+            // SRM initialization failed, continue without it (fallback to manual naming)
+            _srm_context.reset();
+            _srm_manager.reset();
+            LOG_WARN(LogComponent::PARSER, "Symbol Resolution Manager (SRM) initialization failed: {}", e.what());
+        }
+
         // Initialize by getting the first token
         advance();
     }
@@ -18,6 +31,19 @@ namespace Cryo
     Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file)
         : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
+        // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
+        try {
+            if (&context.symbols()) {
+                _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&context.symbols(), &context.types());
+                _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
+            }
+        } catch (const std::exception& e) {
+            // SRM initialization failed, continue without it (fallback to manual naming)
+            _srm_context.reset();
+            _srm_manager.reset();
+            LOG_WARN(LogComponent::PARSER, "Symbol Resolution Manager (SRM) initialization failed: {}", e.what());
+        }
+        
         // Initialize diagnostic builder if diagnostic manager is available
         if (_diagnostic_manager)
         {
@@ -272,6 +298,21 @@ namespace Cryo
         {
             std::string namespace_name = parse_namespace();
             _current_namespace = namespace_name; // Store the namespace in parser state
+            
+            // Update SRM context with the new namespace
+            if (_srm_context) {
+                // Clear and rebuild namespace stack from the full namespace name
+                // First, clear existing stack
+                while (!_srm_context->get_namespace_stack().empty()) {
+                    _srm_context->pop_namespace();
+                }
+                
+                // Parse and push each part of the namespace
+                auto parts = get_current_namespace_parts();
+                for (const auto& part : parts) {
+                    _srm_context->push_namespace(part);
+                }
+            }
         }
 
         // Parse statements until EOF
@@ -621,7 +662,7 @@ namespace Cryo
             std::string member_name = std::string(_current_token.text());
             advance();
 
-            base_type += "::" + member_name;
+            base_type = generate_scope_resolution_name(base_type, member_name);
         }
 
         // Handle generic instantiation (e.g., SimpleGeneric<int>)
@@ -714,7 +755,7 @@ namespace Cryo
                 advance(); // consume '::'
                 if (_current_token.is(TokenKind::TK_IDENTIFIER))
                 {
-                    namespace_name += "::" + std::string(_current_token.text());
+                    namespace_name = generate_scope_resolution_name(namespace_name, std::string(_current_token.text()));
                     advance();
                 }
                 else
@@ -902,6 +943,10 @@ namespace Cryo
         // Parse variable name first (correct syntax: const identifier: type)
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected variable name");
         std::string var_name = std::string(name_token.text());
+        
+        // Debug: Log variable name parsing
+        LOG_DEBUG(Cryo::LogComponent::PARSER, "VARDECL_DEBUG: Parsing variable declaration for name='{}', location={}:{}", 
+                  var_name, name_token.location().line(), name_token.location().column());
 
         // Parse required colon and type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after variable name");
@@ -921,6 +966,10 @@ namespace Cryo
         bool is_global = is_global_scope();
 
         auto var_decl = _builder.create_variable_declaration(start_loc, var_name, var_type, std::move(initializer), is_mutable, is_global);
+
+        // Debug: Log created variable declaration
+        LOG_DEBUG(Cryo::LogComponent::PARSER, "VARDECL_DEBUG: Created VariableDeclarationNode for name='{}', node_ptr={}, stored_name='{}'", 
+                  var_name, static_cast<void*>(var_decl.get()), var_decl->name());
 
         return var_decl;
     }
@@ -949,8 +998,16 @@ namespace Cryo
         std::string func_name = std::string(name_token.text());
 
         // Runtime function name transformation: main -> _user_main_
-        // Only transform if this is not a stdlib module (no "std::" in current namespace)
-        if (func_name == "main" && _current_namespace.find("std::") == std::string::npos)
+        // Only transform if this is not a stdlib module (not in "std" namespace)
+        bool is_in_std_namespace = false;
+        if (_srm_context) {
+            is_in_std_namespace = _srm_context->is_in_namespace("std");
+        } else {
+            // Fallback to manual check
+            is_in_std_namespace = _current_namespace.find("std::") != std::string::npos;
+        }
+        
+        if (func_name == "main" && !is_in_std_namespace)
         {
             func_name = "_user_main_";
             if (_diagnostic_manager)
@@ -1905,7 +1962,7 @@ namespace Cryo
                 {
                     // For multi-level resolution like Std::Runtime::function
                     // Combine the existing scope with the new member
-                    std::string full_scope = scope_node->scope_name() + "::" + scope_node->member_name();
+                    std::string full_scope = generate_scope_resolution_name(scope_node->scope_name(), scope_node->member_name());
                     loc = scope_node->location();
                     expr = _builder.create_scope_resolution(loc, full_scope, member_name);
                 }
@@ -4453,5 +4510,84 @@ namespace Cryo
     bool Parser::is_parser_at_end() const
     {
         return is_at_end();
+    }
+
+    // ========================================
+    // Symbol Resolution Manager (SRM) Helper Methods
+    // ========================================
+
+    std::string Parser::generate_qualified_namespace_name(const std::string& namespace_name)
+    {
+        if (!_srm_manager) {
+            return namespace_name;
+        }
+
+        // Convert single namespace name to parts and generate qualified name
+        auto namespace_parts = get_current_namespace_parts();
+        
+        auto qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
+            namespace_parts, namespace_name, Cryo::SymbolKind::Type
+        );
+        
+        return qualified_id->to_string();
+    }
+
+    std::string Parser::generate_qualified_type_name(const std::string& base_name, const std::string& member_name)
+    {
+        if (!_srm_manager) {
+            return base_name + "::" + member_name;
+        }
+
+        auto namespace_parts = get_current_namespace_parts();
+        namespace_parts.push_back(base_name);
+        
+        auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
+            namespace_parts, member_name, Cryo::TypeKind::Struct
+        );
+        
+        return type_id->to_string();
+    }
+
+    std::string Parser::generate_scope_resolution_name(const std::string& scope_name, const std::string& member_name)
+    {
+        if (!_srm_manager) {
+            return scope_name + "::" + member_name;
+        }
+
+        // Create a qualified identifier for scope resolution
+        std::vector<std::string> parts = {scope_name};
+        auto qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
+            parts, member_name, Cryo::SymbolKind::Variable
+        );
+        
+        return qualified_id->to_string();
+    }
+
+    std::vector<std::string> Parser::get_current_namespace_parts() const
+    {
+        if (!_srm_context) {
+            // Fallback to manual namespace tracking if SRM is not available
+            std::vector<std::string> parts;
+            if (!_current_namespace.empty()) {
+                // Simple split by "::" - this is a fallback for legacy compatibility
+                std::string delimiter = "::";
+                std::string ns = _current_namespace;
+                size_t pos = 0;
+                std::string token;
+                while ((pos = ns.find(delimiter)) != std::string::npos) {
+                    token = ns.substr(0, pos);
+                    if (!token.empty()) {
+                        parts.push_back(token);
+                    }
+                    ns.erase(0, pos + delimiter.length());
+                }
+                if (!ns.empty()) {
+                    parts.push_back(ns);
+                }
+            }
+            return parts;
+        }
+        
+        return _srm_context->get_namespace_stack();
     }
 }

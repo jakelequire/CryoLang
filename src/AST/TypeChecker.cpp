@@ -624,6 +624,11 @@ namespace Cryo
         // before the standard library is fully loaded
         register_builtin_generic_types();
 
+        // Initialize Symbol Resolution Manager (SRM)
+        // Note: We don't have a main SymbolTable yet, so we'll initialize with nullptr for now
+        _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(nullptr, &_type_context);
+        _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
+
         // Generic types will be discovered dynamically from standard library parsing
         // No hardcoded type registrations here
     }
@@ -649,6 +654,11 @@ namespace Cryo
         {
             _diagnostic_builder = std::make_unique<TypeCheckerDiagnosticBuilder>(_diagnostic_manager, _source_file);
         }
+
+        // Initialize Symbol Resolution Manager (SRM)
+        // Note: We don't have a main SymbolTable yet, so we'll initialize with nullptr for now
+        _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(nullptr, &_type_context);
+        _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
 
         // Generic types will be discovered dynamically from standard library parsing
         // No hardcoded type registrations here
@@ -1660,7 +1670,19 @@ namespace Cryo
                         if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(stmt.get()))
                         {
                             std::string func_name = func_decl->name();
-                            std::string qualified_name = module_name + "::" + func_name;
+                            
+                            // Extract parameter types for SRM naming
+                            std::vector<Cryo::Type*> parameter_types;
+                            for (const auto &param : func_decl->parameters())
+                            {
+                                if (param && param->get_resolved_type())
+                                {
+                                    parameter_types.push_back(param->get_resolved_type());
+                                }
+                            }
+                            
+                            // Use SRM helper to generate standardized qualified function name
+                            std::string qualified_name = generate_function_name(module_name + "::" + func_name, parameter_types);
 
                             // Try multiple lookup strategies for imported module functions
                             TypedSymbol *existing_symbol = nullptr;
@@ -1725,7 +1747,9 @@ namespace Cryo
         Type *declared_type = nullptr;
         Type *inferred_type = nullptr;
 
-        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Processing variable '{}' is_mutable={}, stdlib_compilation_mode={}", var_name, node.is_mutable(), _stdlib_compilation_mode);
+        // Enhanced debugging for variable name corruption issue
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Processing variable '{}' is_mutable={}, stdlib_compilation_mode={}, node_ptr={}, location={}:{}", 
+                  var_name, node.is_mutable(), _stdlib_compilation_mode, static_cast<const void*>(&node), node.location().line(), node.location().column());
 
         // Parse type annotation from node
         if (!node.type_annotation().empty() && node.type_annotation() != "auto")
@@ -1806,6 +1830,16 @@ namespace Cryo
 
         // Declare the variable in symbol table
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Attempting to declare variable '{}' with type '{}' (kind={})", var_name, final_type ? final_type->name() : "null", final_type ? TypeKindToString(final_type->kind()) : "null");
+
+        // Enhanced debugging for type resolution failures
+        if (!final_type || final_type->kind() == TypeKind::Unknown) {
+            LOG_ERROR(Cryo::LogComponent::AST, "TYPE RESOLUTION FAILURE: Variable '{}' has null/unknown type! declared_type={}, inferred_type={}, node_ptr={}, location={}:{}",
+                      var_name, 
+                      declared_type ? declared_type->name() : "null",
+                      inferred_type ? inferred_type->name() : "null",
+                      static_cast<const void*>(&node),
+                      node.location().line(), node.location().column());
+        }
 
         // Extra debug for Array types being declared
         if (final_type && final_type->name().find("Array") != std::string::npos)
@@ -3050,7 +3084,9 @@ namespace Cryo
                 IdentifierNode *identifier = static_cast<IdentifierNode *>(member_access->object());
                 std::string base_name = identifier->name();
                 std::string variant_name = member_access->member();
-                std::string full_name = base_name + "::" + variant_name;
+                
+                // Use SRM helper to generate standardized enum variant name
+                std::string full_name = generate_qualified_name(base_name + "::" + variant_name, Cryo::SymbolKind::Type);
 
                 LOG_DEBUG(Cryo::LogComponent::AST, "Checking for template enum constructor: {} (base: {}, variant: {})", full_name, base_name, variant_name);
 
@@ -4602,7 +4638,9 @@ namespace Cryo
         if (!scope_symbol)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Scope symbol '{}' not found", base_scope_name);
-            std::string qualified_name = scope_name + "::" + member_name;
+            
+            // Use SRM helper to generate standardized qualified name
+            std::string qualified_name = generate_qualified_name(scope_name + "::" + member_name, Cryo::SymbolKind::Type);
             _diagnostic_builder->create_undefined_symbol_error(qualified_name, NodeKind::Declaration, node.location());
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
@@ -5690,8 +5728,18 @@ namespace Cryo
                         LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
                         _private_struct_methods[_current_struct_name][method_name] = func_type;
                         
-                        // Also declare the method in the main symbol table for CodeGen lookup
-                        std::string full_method_name = _current_struct_name + "::" + method_name;
+                        // Extract parameter types for SRM naming
+                        std::vector<Cryo::Type*> parameter_types;
+                        for (const auto &param : node.parameters())
+                        {
+                            if (param && param->get_resolved_type())
+                            {
+                                parameter_types.push_back(param->get_resolved_type());
+                            }
+                        }
+
+                        // Use SRM helper to generate standardized private method name
+                        std::string full_method_name = generate_method_name(_current_struct_name, method_name, parameter_types);
                         declare_function(full_method_name, func_type, node.location(), nullptr);
                         LOG_DEBUG(Cryo::LogComponent::AST, "Declared private method '{}' in symbol table as '{}'", method_name, full_method_name);
                     }
@@ -5700,8 +5748,18 @@ namespace Cryo
                         LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method '{}' for struct '{}'", method_name, _current_struct_name);
                         _struct_methods[_current_struct_name][method_name] = func_type;
                         
-                        // Also declare the method in the main symbol table for CodeGen lookup
-                        std::string full_method_name = _current_struct_name + "::" + method_name;
+                        // Extract parameter types for SRM naming (reuse from above if this is duplicate code)
+                        std::vector<Cryo::Type*> parameter_types;
+                        for (const auto &param : node.parameters())
+                        {
+                            if (param && param->get_resolved_type())
+                            {
+                                parameter_types.push_back(param->get_resolved_type());
+                            }
+                        }
+
+                        // Use SRM helper to generate standardized public method name
+                        std::string full_method_name = generate_method_name(_current_struct_name, method_name, parameter_types);
                         declare_function(full_method_name, func_type, node.location(), nullptr);
                         LOG_DEBUG(Cryo::LogComponent::AST, "Declared method '{}' in symbol table as '{}'", method_name, full_method_name);
                     }
@@ -6929,8 +6987,18 @@ namespace Cryo
                       method_name, _current_struct_name);
             _private_struct_methods[_current_struct_name][method_name] = func_type;
             
-            // Also declare the method in the main symbol table for CodeGen lookup
-            std::string full_method_name = _current_struct_name + "::" + method_name;
+            // Extract parameter types for SRM naming
+            std::vector<Cryo::Type*> parameter_types;
+            for (const auto &param : node.parameters())
+            {
+                if (param && param->get_resolved_type())
+                {
+                    parameter_types.push_back(param->get_resolved_type());
+                }
+            }
+
+            // Use SRM helper to generate standardized private method signature name
+            std::string full_method_name = generate_method_name(_current_struct_name, method_name, parameter_types);
             declare_function(full_method_name, func_type, node.location(), nullptr);
             LOG_DEBUG(Cryo::LogComponent::AST, "Declared private method '{}' in symbol table as '{}'", method_name, full_method_name);
         }
@@ -6952,8 +7020,18 @@ namespace Cryo
                       method_name, _current_struct_name);
             _struct_methods[_current_struct_name][method_name] = func_type;
             
-            // Also declare the method in the main symbol table for CodeGen lookup
-            std::string full_method_name = _current_struct_name + "::" + method_name;
+            // Extract parameter types for SRM naming
+            std::vector<Cryo::Type*> parameter_types;
+            for (const auto &param : node.parameters())
+            {
+                if (param && param->get_resolved_type())
+                {
+                    parameter_types.push_back(param->get_resolved_type());
+                }
+            }
+
+            // Use SRM helper to generate standardized public method signature name
+            std::string full_method_name = generate_method_name(_current_struct_name, method_name, parameter_types);
             declare_function(full_method_name, func_type, node.location(), nullptr);
             LOG_DEBUG(Cryo::LogComponent::AST, "Declared method '{}' in symbol table as '{}'", method_name, full_method_name);
         }
@@ -7308,4 +7386,134 @@ namespace Cryo
         // Return the original type if no substitution was needed
         return type;
     }
+
+    //===================================================================
+    // SRM Helper Methods
+    //===================================================================
+
+    std::string TypeChecker::generate_function_name(const std::string& function_name, const std::vector<Cryo::Type*>& parameter_types)
+    {
+        if (!_srm_manager) 
+        {
+            // Fallback to simple name if SRM is not available
+            return function_name;
+        }
+
+        try
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            
+            if (parameter_types.empty())
+            {
+                // Simple function without parameters
+                auto identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                    namespace_parts, function_name, Cryo::SymbolKind::Function);
+                return identifier->to_string();
+            }
+            else
+            {
+                // Function with parameters - create function identifier
+                auto identifier = std::make_unique<Cryo::SRM::FunctionIdentifier>(
+                    namespace_parts, function_name, parameter_types);
+                return identifier->to_overload_key();
+            }
+        }
+        catch (const std::exception& e)
+        {
+            // Fallback to simple name if SRM fails
+            return function_name;
+        }
+    }
+
+    std::string TypeChecker::generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types)
+    {
+        if (!_srm_manager) 
+        {
+            // Fallback to manual concatenation
+            auto namespace_parts = get_current_namespace_parts();
+            if (namespace_parts.empty())
+                return type_name + "::" + method_name;
+            else
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, type_name + "::" + method_name);
+        }
+
+        try
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            // Add the type name to the namespace parts for method scoping
+            namespace_parts.push_back(type_name);
+            
+            if (parameter_types.empty())
+            {
+                // Simple method without parameters
+                auto identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                    namespace_parts, method_name, Cryo::SymbolKind::Function);
+                return identifier->to_string();
+            }
+            else
+            {
+                // Method with parameters - create method identifier  
+                auto identifier = std::make_unique<Cryo::SRM::FunctionIdentifier>(
+                    namespace_parts, method_name, parameter_types);
+                return identifier->to_overload_key();
+            }
+        }
+        catch (const std::exception& e)
+        {
+            // Fallback to manual concatenation
+            auto namespace_parts = get_current_namespace_parts();
+            if (namespace_parts.empty())
+                return type_name + "::" + method_name;
+            else
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, type_name + "::" + method_name);
+        }
+    }
+
+    std::string TypeChecker::generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind)
+    {
+        if (!_srm_manager) 
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            if (namespace_parts.empty())
+                return base_name;
+            else
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, base_name);
+        }
+
+        try
+        {
+            auto namespace_parts = get_current_namespace_parts();
+            auto identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                namespace_parts, base_name, symbol_kind);
+            return identifier->to_string();
+        }
+        catch (const std::exception& e)
+        {
+            // Fallback to manual concatenation
+            auto namespace_parts = get_current_namespace_parts();
+            if (namespace_parts.empty())
+                return base_name;
+            else
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, base_name);
+        }
+    }
+
+    std::vector<std::string> TypeChecker::get_current_namespace_parts() const
+    {
+        std::vector<std::string> namespace_parts;
+        if (!_current_namespace.empty()) 
+        {
+            std::istringstream iss(_current_namespace);
+            std::string part;
+            while (std::getline(iss, part, ':')) 
+            {
+                if (!part.empty() && part != ":") 
+                {
+                    namespace_parts.push_back(part);
+                }
+            }
+        }
+        return namespace_parts;
+    }
+
 }

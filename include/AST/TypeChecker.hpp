@@ -6,6 +6,7 @@
 #include "AST/GenericInstantiation.hpp"
 #include "AST/SymbolTable.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 #include "Lexer/lexer.hpp"
 #include <vector>
 #include <string>
@@ -267,6 +268,10 @@ namespace Cryo
         // Diagnostic builder for enhanced error reporting
         std::unique_ptr<TypeCheckerDiagnosticBuilder> _diagnostic_builder;
 
+        // Symbol Resolution Manager (SRM) for standardized naming
+        std::unique_ptr<Cryo::SRM::SymbolResolutionContext> _srm_context;
+        std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _srm_manager;
+
     public:
         TypeChecker(TypeContext &type_ctx);
         TypeChecker(TypeContext &type_ctx, DiagnosticManager *diagnostic_manager, const std::string &source_file = "");
@@ -342,6 +347,12 @@ namespace Cryo
 
         // Symbol table access for LSP
         TypedSymbol *lookup_symbol(const std::string &name) const { return _symbol_table->lookup_symbol(name); }
+
+        // SRM Helper Methods for standardized naming
+        std::string generate_function_name(const std::string& function_name, const std::vector<Cryo::Type*>& parameter_types);
+        std::string generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types);
+        std::string generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind);
+        std::vector<std::string> get_current_namespace_parts() const;
 
         // Visitor methods - Program
         void visit(ProgramNode &node) override;

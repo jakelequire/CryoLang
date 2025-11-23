@@ -351,7 +351,7 @@ else
 endif
 
 stdlib-types:
-	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/core/types.cryo --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/core/types.bc
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/core/types.cryo --debug --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/core/types.bc
 
 stdlib-stdio:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/io/stdio.cryo --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/io/stdio.bc

@@ -8,6 +8,7 @@
 #include "AST/DirectiveSystem.hpp"
 #include "GDM/GDM.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 #include <memory>
 #include <vector>
 #include <stdexcept>
@@ -49,6 +50,10 @@ namespace Cryo
         // Directive system
         DirectiveRegistry *_directive_registry = nullptr; // Will be set during initialization
 
+        // Symbol Resolution Manager (SRM) for standardized naming
+        std::unique_ptr<Cryo::SRM::SymbolResolutionContext> _srm_context;
+        std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _srm_manager;
+
     public:
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file);
@@ -74,6 +79,12 @@ namespace Cryo
 
         // Directive system
         void set_directive_registry(DirectiveRegistry *registry) { _directive_registry = registry; }
+
+        // SRM Helper Methods for standardized naming during parsing
+        std::string generate_qualified_namespace_name(const std::string& namespace_name);
+        std::string generate_qualified_type_name(const std::string& base_name, const std::string& member_name);
+        std::string generate_scope_resolution_name(const std::string& scope_name, const std::string& member_name);
+        std::vector<std::string> get_current_namespace_parts() const;
 
     private:
         // Diagnostic reporting
