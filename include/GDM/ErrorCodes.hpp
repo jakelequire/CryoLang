@@ -132,6 +132,21 @@ namespace Cryo
     X(E0603_INVALID_LLVM_VALUE, 603)             \
     X(E0604_UNIMPLEMENTED_INTRINSIC, 604)        \
     X(E0605_OPTIMIZATION_FAILED, 605)            \
+    X(E0606_FUNCTION_GENERATION_ERROR, 606)      \
+    X(E0607_VARIABLE_GENERATION_ERROR, 607)      \
+    X(E0608_INTRINSIC_GENERATION_ERROR, 608)     \
+    X(E0609_TYPE_MAPPING_ERROR, 609)             \
+    X(E0610_CLASS_GENERATION_ERROR, 610)         \
+    X(E0611_ENUM_GENERATION_ERROR, 611)          \
+    X(E0612_STRUCT_GENERATION_ERROR, 612)        \
+    X(E0613_CONTROL_FLOW_ERROR, 613)             \
+    X(E0614_ASSIGNMENT_ERROR, 614)               \
+    X(E0615_BINARY_OPERATION_ERROR, 615)         \
+    X(E0616_UNARY_OPERATION_ERROR, 616)          \
+    X(E0617_MEMORY_OPERATION_ERROR, 617)         \
+    X(E0618_CONSTRUCTOR_GENERATION_ERROR, 618)   \
+    X(E0619_METHOD_GENERATION_ERROR, 619)        \
+    X(E0620_MODULE_CONTEXT_ERROR, 620)           \
                                                  \
     /* Linker Errors (E0700-E0799) */            \
     X(E0700_LINK_ERROR, 700)                     \

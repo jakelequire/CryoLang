@@ -79,8 +79,13 @@ namespace Cryo
         Diagnostic &create_llvm_error(const std::string &operation, ASTNode *node,
                                       const std::string &llvm_message = "");
         
-        // [TODO]: Create a single method which will pass the error code, message, node, etc.
-        Diagnostic &report_error();
+        // Primary error reporting method with error code support
+        Diagnostic &report_error(ErrorCode error_code, ASTNode *node = nullptr, 
+                                const std::string &message = "");
+        
+        // Overload for custom message with error code
+        Diagnostic &report_error(ErrorCode error_code, const std::string &message, 
+                                ASTNode *node = nullptr);
 
         Diagnostic &create_type_mapping_error(Type *cryo_type, ASTNode *node,
                                               const std::string &reason = "");
