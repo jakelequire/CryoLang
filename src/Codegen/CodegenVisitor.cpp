@@ -41,6 +41,8 @@ namespace Cryo::Codegen
           _type_mapper(std::make_unique<TypeMapper>(context_manager, symbol_table.get_type_context())),
           _intrinsics(std::make_unique<Intrinsics>(context_manager, gdm)),
           _function_registry(std::make_unique<FunctionRegistry>(symbol_table, *symbol_table.get_type_context())),
+          _srm_context(std::make_unique<Cryo::SRM::SymbolResolutionContext>(&symbol_table, symbol_table.get_type_context())),
+          _srm_manager(std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get())),
           _current_value(nullptr),
           _current_node(nullptr),
           _has_errors(false),
@@ -300,7 +302,16 @@ namespace Cryo::Codegen
         if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(&node))
         {
             // Check if this method was already processed by looking for the generated function
-            std::string potential_scoped_name = (current_primitive_type ? current_primitive_type->to_string() : "") + "::" + node.name();
+            std::string potential_scoped_name;
+            if (current_primitive_type) {
+                // Create scoped identifier using namespace parts 
+                std::vector<std::string> scope_parts = {current_primitive_type->to_string()};
+                auto scoped_identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                    scope_parts, node.name(), Cryo::SymbolKind::Function);
+                potential_scoped_name = scoped_identifier->to_string();
+            } else {
+                potential_scoped_name = node.name();
+            }
             auto module = _context_manager.get_module();
             if (module && module->getFunction(potential_scoped_name))
             {
@@ -369,12 +380,26 @@ namespace Cryo::Codegen
             // Also register with namespace-qualified name if we're in a namespace
             if (!_namespace_context.empty())
             {
-                qualified_registration_key = _namespace_context + "::" + registration_key;
+                // Use SRM for qualified name generation
+                std::vector<std::string> namespace_parts;
+                if (!_namespace_context.empty()) {
+                    std::istringstream iss(_namespace_context);
+                    std::string part;
+                    while (std::getline(iss, part, ':')) {
+                        if (!part.empty() && part != ":") {
+                            namespace_parts.push_back(part);
+                        }
+                    }
+                }
+                
+                qualified_registration_key = Cryo::SRM::Utils::build_qualified_name(namespace_parts, registration_key);
                 _functions[qualified_registration_key] = function;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered function with qualified signature-based key: {}", qualified_registration_key);
 
-                // Also register the simple qualified name for backward compatibility
-                std::string simple_qualified_name = _namespace_context + "::" + node.name();
+                // Also register the simple qualified name for backward compatibility using SRM
+                auto simple_qualified_identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                    namespace_parts, node.name(), Cryo::SymbolKind::Function);
+                std::string simple_qualified_name = simple_qualified_identifier->to_string();
                 _functions[simple_qualified_name] = function;
             }
 
@@ -855,38 +880,48 @@ namespace Cryo::Codegen
                                     return;
                                 }
                             }
+                            // Use SRM to generate monomorphized array type names - fallback to manual naming for now
                             std::string monomorphized_name = "Array_" + element_type_name;
 
-                            // Find the constructor function - include namespace context
-                            // After MonomorphizationPass, constructors are named after the specialized class name
-                            std::string constructor_name;
-                            std::string constructor_signature_name;
-                            if (!_namespace_context.empty())
-                            {
-                                constructor_name = _namespace_context + "::" + monomorphized_name + "::" + monomorphized_name;
-                                // For array literals, we specifically want Array_int(elements: T*, length: u64)
-                                constructor_signature_name = _namespace_context + "::" + monomorphized_name + "::" + monomorphized_name + "(" + element_type_name + "*,u64)";
+                            // Parse namespace context into components for SRM
+                            std::vector<std::string> namespace_parts;
+                            if (!_namespace_context.empty()) {
+                                std::istringstream iss(_namespace_context);
+                                std::string part;
+                                while (std::getline(iss, part, ':')) {
+                                    if (!part.empty() && part != ":") {
+                                        namespace_parts.push_back(part);
+                                    }
+                                }
                             }
-                            else
-                            {
-                                constructor_name = monomorphized_name + "::" + monomorphized_name;
-                                constructor_signature_name = monomorphized_name + "::" + monomorphized_name + "(" + element_type_name + "*,u64)";
-                            }
+
+                            // Generate constructor identifiers using SRM
+                            auto element_type_obj = _symbol_table.get_type_context()->get_i32_type(); // Use int as placeholder
+                            std::vector<Cryo::Type*> param_types = {
+                                _symbol_table.get_type_context()->create_pointer_type(element_type_obj),
+                                _symbol_table.get_type_context()->get_u64_type()
+                            };
+                            
+                            auto constructor_identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
+                                namespace_parts, monomorphized_name, param_types);
+                            
+                            std::string constructor_signature_name = constructor_identifier->to_overload_key();
+                            std::string constructor_name = constructor_identifier->get_simple_name();
 
                             // Try to find the specific constructor overload first
                             auto constructor_it = _functions.find(constructor_signature_name);
                             if (constructor_it == _functions.end())
                             {
                                 // Try alternative signature with generic T* instead of concrete type
-                                std::string alt_signature_name;
-                                if (!_namespace_context.empty())
-                                {
-                                    alt_signature_name = _namespace_context + "::" + monomorphized_name + "::" + monomorphized_name + "(T*,u64)";
-                                }
-                                else
-                                {
-                                    alt_signature_name = monomorphized_name + "::" + monomorphized_name + "(T*,u64)";
-                                }
+                                std::vector<Cryo::Type*> generic_param_types = {
+                                    _symbol_table.get_type_context()->get_generic_type("T"),
+                                    _symbol_table.get_type_context()->get_u64_type()
+                                };
+                                
+                                auto alt_constructor_identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
+                                    namespace_parts, monomorphized_name, generic_param_types);
+                                
+                                std::string alt_signature_name = alt_constructor_identifier->to_overload_key();
                                 constructor_it = _functions.find(alt_signature_name);
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying alternative constructor signature: {}", alt_signature_name);
                             }
@@ -1180,41 +1215,54 @@ namespace Cryo::Codegen
                 }
 
                 std::string method_name = method->name();
-                std::string qualified_name;
-
-                // Include full namespace in qualified name for proper symbol lookup
-                if (!_namespace_context.empty())
-                {
-                    qualified_name = _namespace_context + "::" + node.name() + "::" + method_name;
+                
+                // Parse namespace context into components for SRM
+                std::vector<std::string> namespace_parts;
+                if (!_namespace_context.empty()) {
+                    std::istringstream iss(_namespace_context);
+                    std::string part;
+                    while (std::getline(iss, part, ':')) {
+                        if (!part.empty() && part != ":") {
+                            namespace_parts.push_back(part);
+                        }
+                    }
                 }
-                else
-                {
-                    qualified_name = node.name() + "::" + method_name;
-                }
 
-                // For constructors, include parameter signature in the LLVM IR function name to prevent conflicts
+                // For constructors, use FunctionIdentifier to properly handle parameter signatures
                 bool is_constructor = (method_name == node.name()); // Constructor has same name as struct
+                std::string qualified_name;
+                
                 if (is_constructor)
                 {
-                    std::string param_signature = "(";
-                    for (size_t i = 0; i < method->parameters().size(); ++i)
+                    // Build parameter types for constructor signature
+                    std::vector<Cryo::Type*> param_types;
+                    for (const auto& param : method->parameters())
                     {
-                        if (i > 0)
-                            param_signature += ",";
-                        auto param = method->parameters()[i].get();
                         if (param && param->get_resolved_type())
                         {
-                            std::string param_type_str = param->get_resolved_type()->to_string();
-                            param_signature += normalize_type_for_signature(param_type_str);
+                            param_types.push_back(param->get_resolved_type());
                         }
                         else
                         {
-                            param_signature += "unknown";
+                            // Use a placeholder type for unknown parameters
+                            param_types.push_back(_symbol_table.get_type_context()->get_unknown_type());
                         }
                     }
-                    param_signature += ")";
-                    qualified_name += param_signature;
+                    
+                    auto constructor_identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
+                        namespace_parts, node.name(), param_types);
+                    
+                    qualified_name = constructor_identifier->to_overload_key();
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor LLVM IR name with signature: {}", qualified_name);
+                }
+                else
+                {
+                    // For regular methods, use QualifiedIdentifier - add parent type to namespace
+                    std::vector<std::string> method_namespace_parts = namespace_parts;
+                    method_namespace_parts.push_back(node.name());
+                    auto method_identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                        method_namespace_parts, method_name, Cryo::SymbolKind::Function);
+                    qualified_name = method_identifier->to_string();
                 }
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Full qualified struct method name: {}", qualified_name);
@@ -1509,49 +1557,63 @@ namespace Cryo::Codegen
                 }
 
                 std::string method_name = method->name();
-                std::string qualified_name;
-
-                // Include full namespace in qualified name for proper symbol lookup
-                if (!_namespace_context.empty())
-                {
-                    qualified_name = _namespace_context + "::" + class_name + "::" + method_name;
+                
+                // Parse namespace context into components for SRM
+                std::vector<std::string> namespace_parts;
+                if (!_namespace_context.empty()) {
+                    std::istringstream iss(_namespace_context);
+                    std::string part;
+                    while (std::getline(iss, part, ':')) {
+                        if (!part.empty() && part != ":") {
+                            namespace_parts.push_back(part);
+                        }
+                    }
                 }
-                else
-                {
-                    qualified_name = class_name + "::" + method_name;
-                }
 
-                // For constructors, include parameter signature in the LLVM IR function name to prevent conflicts
+                // For constructors, use FunctionIdentifier to properly handle parameter signatures  
                 bool is_constructor = (method_name == class_name);
+                std::string qualified_name;
+                
                 if (is_constructor)
                 {
-                    std::string param_signature = "(";
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Building signature for constructor {}, {} parameters",
                               method_name, method->parameters().size());
+                              
+                    // Build parameter types for constructor signature
+                    std::vector<Cryo::Type*> param_types;
                     for (size_t i = 0; i < method->parameters().size(); ++i)
                     {
-                        if (i > 0)
-                            param_signature += ",";
                         auto param = method->parameters()[i].get();
                         if (param && param->get_resolved_type())
                         {
-                            std::string param_type_str = param->get_resolved_type()->to_string();
-                            std::string normalized_type = normalize_type_for_signature(param_type_str);
-                            param_signature += normalized_type;
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: {} -> normalized: {})",
-                                      i, param->name(), param_type_str, normalized_type);
+                            param_types.push_back(param->get_resolved_type());
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: {})",
+                                      i, param->name(), param->get_resolved_type()->to_string());
                         }
                         else
                         {
-                            param_signature += "unknown";
+                            // Use a placeholder type for unknown parameters
+                            param_types.push_back(_symbol_table.get_type_context()->get_unknown_type());
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: UNKNOWN - param={}, resolved_type={})",
                                       i, param ? param->name() : "null", param ? "non-null" : "null",
                                       (param && param->get_resolved_type()) ? "non-null" : "null");
                         }
                     }
-                    param_signature += ")";
-                    qualified_name += param_signature;
+                    
+                    auto constructor_identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
+                        namespace_parts, class_name, param_types);
+                    
+                    qualified_name = constructor_identifier->to_overload_key();
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class constructor LLVM IR name with signature: {}", qualified_name);
+                }
+                else
+                {
+                    // For regular methods, use QualifiedIdentifier - add parent type to namespace
+                    std::vector<std::string> method_namespace_parts = namespace_parts;
+                    method_namespace_parts.push_back(class_name);
+                    auto method_identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                        method_namespace_parts, method_name, Cryo::SymbolKind::Function);
+                    qualified_name = method_identifier->to_string();
                 }
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Full qualified method name: {}", qualified_name);

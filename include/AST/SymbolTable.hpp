@@ -34,6 +34,13 @@ namespace Cryo
             : name(n), kind(k), declaration_location(loc), data_type(type), scope(sc), enhanced_display(enhanced) {}
     };
 
+    // Forward declarations for SRM integration
+    namespace SRM {
+        class SymbolResolutionContext;
+        class SymbolResolutionManager;
+        class SymbolIdentifier;
+    }
+
     class SymbolTable
     {
     private:
@@ -41,10 +48,15 @@ namespace Cryo
         std::unordered_map<std::string, std::unordered_map<std::string, Symbol>> namespaces_; // namespace_name -> symbols
         std::unique_ptr<SymbolTable> parent_scope_;
         TypeContext *type_context_; // Add TypeContext for creating function types
+        
+        // SRM integration - lazy initialization to maintain compatibility
+        mutable std::unique_ptr<SRM::SymbolResolutionContext> srm_context_;
+        mutable std::unique_ptr<SRM::SymbolResolutionManager> srm_manager_;
 
     public:
-        SymbolTable(std::unique_ptr<SymbolTable> parent = nullptr, TypeContext *type_context = nullptr)
-            : parent_scope_(std::move(parent)), type_context_(type_context) {}
+        // Constructor and destructor declarations - implementations in .cpp file to handle forward declarations
+        SymbolTable(std::unique_ptr<SymbolTable> parent = nullptr, TypeContext *type_context = nullptr);
+        ~SymbolTable();
 
         // Symbol management
         bool declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type = nullptr, const std::string &scope = "Global", const std::string &enhanced_display = "");
@@ -78,9 +90,32 @@ namespace Cryo
         std::unique_ptr<SymbolTable> enter_scope();
         std::unique_ptr<SymbolTable> exit_scope();
 
+        // SRM integration methods
+        SRM::SymbolResolutionContext* get_srm_context() const;
+        SRM::SymbolResolutionManager* get_srm_manager() const;
+        void initialize_srm() const;
+        
+        // Enhanced symbol lookup using SRM
+        Symbol* lookup_symbol_srm(const SRM::SymbolIdentifier& identifier) const;
+        std::vector<Symbol*> find_symbol_overloads(const std::string& base_name, const std::vector<Type*>& arg_types) const;
+        Symbol* find_best_function_overload(const std::string& base_name, const std::vector<Type*>& arg_types) const;
+        
+        // SRM-based symbol registration
+        bool declare_symbol_srm(std::unique_ptr<SRM::SymbolIdentifier> identifier, 
+                               SymbolKind kind, 
+                               SourceLocation loc, 
+                               Type* data_type = nullptr, 
+                               const std::string& scope = "Global");
+        
+        // SRM configuration
+        void configure_srm(bool enable_implicit_std = true, bool enable_namespace_fallback = true) const;
+        void add_srm_namespace_alias(const std::string& alias, const std::string& full_namespace) const;
+        void add_srm_imported_namespace(const std::string& namespace_name) const;
+        
         // Debug/Pretty printing
         void dump(std::ostream &os = std::cout, int indent_level = 0) const;
         void print_pretty(std::ostream &os = std::cout) const;
+        void dump_srm_state(std::ostream &os = std::cout) const;
 
     private:
         std::string get_symbol_kind_string(SymbolKind kind) const;

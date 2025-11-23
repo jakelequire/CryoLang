@@ -1,4 +1,5 @@
 #include "AST/SymbolTable.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 #include "Utils/Logger.hpp"
 #include <iostream>
 #include <algorithm>
@@ -6,6 +7,24 @@
 
 namespace Cryo
 {
+    // ============================================================================
+    // Constructor/Destructor
+    // ============================================================================
+    
+    SymbolTable::SymbolTable(std::unique_ptr<SymbolTable> parent, TypeContext *type_context)
+        : parent_scope_(std::move(parent)), type_context_(type_context) {
+        // Implementation in .cpp file to ensure SRM types are complete when unique_ptr destructors are instantiated
+    }
+    
+    SymbolTable::~SymbolTable() {
+        // Default destructor - unique_ptr will handle cleanup automatically
+        // The SRM headers are included in this .cpp file so destructor can access complete types
+    }
+    
+    // ============================================================================
+    // Symbol Management
+    // ============================================================================
+    
     bool SymbolTable::declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type, const std::string &scope, const std::string &enhanced_display)
     {
         // Check if symbol already exists in current scope
@@ -511,6 +530,115 @@ namespace Cryo
             return "";
         size_t last = str.find_last_not_of(' ');
         return str.substr(first, (last - first + 1));
+    }
+
+    // SRM integration methods implementation
+    
+    SRM::SymbolResolutionContext* SymbolTable::get_srm_context() const {
+        initialize_srm();
+        return srm_context_.get();
+    }
+    
+    SRM::SymbolResolutionManager* SymbolTable::get_srm_manager() const {
+        initialize_srm();
+        return srm_manager_.get();
+    }
+    
+    void SymbolTable::initialize_srm() const {
+        if (!srm_context_) {
+            // Initialize SRM context with current symbol table
+            srm_context_ = std::make_unique<SRM::SymbolResolutionContext>(
+                const_cast<SymbolTable*>(this), type_context_);
+            
+            // Configure default settings
+            srm_context_->set_enable_implicit_std_import(true);
+            srm_context_->set_enable_namespace_fallback(true);
+        }
+        
+        if (!srm_manager_) {
+            // Initialize SRM manager with the context
+            srm_manager_ = std::make_unique<SRM::SymbolResolutionManager>(srm_context_.get());
+        }
+    }
+    
+    Symbol* SymbolTable::lookup_symbol_srm(const SRM::SymbolIdentifier& identifier) const {
+        auto result = get_srm_manager()->resolve_symbol(identifier);
+        return result.is_valid() ? result.symbol : nullptr;
+    }
+    
+    std::vector<Symbol*> SymbolTable::find_symbol_overloads(
+        const std::string& base_name, const std::vector<Type*>& arg_types) const {
+        
+        auto results = get_srm_manager()->resolve_function_overloads(base_name, arg_types);
+        
+        std::vector<Symbol*> symbols;
+        for (const auto& result : results) {
+            if (result.is_valid()) {
+                symbols.push_back(result.symbol);
+            }
+        }
+        
+        return symbols;
+    }
+    
+    Symbol* SymbolTable::find_best_function_overload(
+        const std::string& base_name, const std::vector<Type*>& arg_types) const {
+        
+        auto result = get_srm_manager()->resolve_best_function_overload(base_name, arg_types);
+        return result.is_valid() ? result.symbol : nullptr;
+    }
+    
+    bool SymbolTable::declare_symbol_srm(
+        std::unique_ptr<SRM::SymbolIdentifier> identifier, 
+        SymbolKind kind, 
+        SourceLocation loc, 
+        Type* data_type, 
+        const std::string& scope) {
+        
+        if (!identifier) return false;
+        
+        // Use the SRM identifier's canonical name for registration
+        std::string canonical_name = identifier->to_string();
+        
+        // Register with traditional symbol table
+        bool success = declare_symbol(canonical_name, kind, loc, data_type, scope);
+        
+        if (success) {
+            // Also register with SRM for enhanced resolution
+            get_srm_manager()->register_generated_symbol(std::move(identifier), lookup_symbol(canonical_name));
+        }
+        
+        return success;
+    }
+    
+    void SymbolTable::configure_srm(bool enable_implicit_std, bool enable_namespace_fallback) const {
+        initialize_srm();
+        srm_context_->set_enable_implicit_std_import(enable_implicit_std);
+        srm_context_->set_enable_namespace_fallback(enable_namespace_fallback);
+    }
+    
+    void SymbolTable::add_srm_namespace_alias(const std::string& alias, const std::string& full_namespace) const {
+        initialize_srm();
+        srm_context_->register_namespace_alias(alias, full_namespace);
+    }
+    
+    void SymbolTable::add_srm_imported_namespace(const std::string& namespace_name) const {
+        initialize_srm();
+        srm_context_->add_imported_namespace(namespace_name);
+    }
+    
+    void SymbolTable::dump_srm_state(std::ostream& os) const {
+        if (srm_context_) {
+            os << "=== SRM Context State ===" << std::endl;
+            srm_context_->dump_context(os);
+            os << std::endl;
+        }
+        
+        if (srm_manager_) {
+            os << "=== SRM Manager State ===" << std::endl;
+            os << srm_manager_->to_debug_string() << std::endl;
+            os << srm_manager_->get_performance_report() << std::endl;
+        }
     }
 
 }
