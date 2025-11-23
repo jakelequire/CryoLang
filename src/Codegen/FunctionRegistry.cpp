@@ -3,6 +3,7 @@
 #include "AST/Type.hpp"
 #include "AST/TypeChecker.hpp"
 #include "Utils/Logger.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -18,6 +19,17 @@ namespace Cryo::Codegen
     FunctionRegistry::FunctionRegistry(const Cryo::SymbolTable &symbol_table, Cryo::TypeContext &type_context)
         : _symbol_table(symbol_table), _type_context(type_context)
     {
+        // Initialize Symbol Resolution Manager
+        try
+        {
+            _symbol_resolution_manager = std::make_unique<SymbolResolutionManager>(const_cast<SymbolTable&>(symbol_table));
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to initialize Symbol Resolution Manager in FunctionRegistry: {}", e.what());
+            _symbol_resolution_manager = nullptr;
+        }
+        
         initialize_pattern_matchers();
     }
 
@@ -25,7 +37,7 @@ namespace Cryo::Codegen
                                                              const std::string &resolved_namespace) const
     {
         // Check cache first
-        std::string cache_key = resolved_namespace.empty() ? function_name : resolved_namespace + "::" + function_name;
+        std::string cache_key = generate_qualified_function_name(resolved_namespace, function_name);
         auto cache_it = _metadata_cache.find(cache_key);
         if (cache_it != _metadata_cache.end())
         {
@@ -260,7 +272,7 @@ namespace Cryo::Codegen
         }
 
         // Use symbol table lookup to get actual function information instead of hardcoded patterns
-        std::string qualified_name = resolved_namespace + "::" + function_name;
+        std::string qualified_name = generate_qualified_function_name(resolved_namespace, function_name);
         auto symbol = _symbol_table.lookup_symbol(qualified_name);
         if (!symbol)
         {
@@ -453,6 +465,21 @@ namespace Cryo::Codegen
         case FunctionCategory::Unknown:
         default:
             return llvm::Type::getInt32Ty(context); // Safe default
+        }
+    }
+
+    std::string FunctionRegistry::generate_qualified_function_name(const std::string &resolved_namespace, const std::string &function_name) const
+    {
+        if (_symbol_resolution_manager && !resolved_namespace.empty())
+        {
+            // Use SRM to generate qualified function name
+            QualifiedIdentifier qualified_id(resolved_namespace, function_name);
+            return qualified_id.get_qualified_name();
+        }
+        else
+        {
+            // Fallback to manual concatenation
+            return resolved_namespace.empty() ? function_name : resolved_namespace + "::" + function_name;
         }
     }
 

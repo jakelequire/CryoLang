@@ -20,6 +20,7 @@ namespace Cryo
     class TypeContext;
     class Type;
     class FunctionType;
+    class SymbolResolutionManager;
 }
 
 namespace Cryo::Codegen
@@ -109,6 +110,7 @@ namespace Cryo::Codegen
     private:
         const Cryo::SymbolTable &_symbol_table;
         Cryo::TypeContext &_type_context;
+        std::unique_ptr<Cryo::SymbolResolutionManager> _symbol_resolution_manager;
 
         // Pattern matchers for different function types
         std::vector<std::function<FunctionMetadata(const std::string &)>> _pattern_matchers;
@@ -153,6 +155,11 @@ namespace Cryo::Codegen
          * @brief Convert function category to LLVM type
          */
         llvm::Type *category_to_llvm_type(FunctionCategory category, llvm::LLVMContext &context) const;
+
+        /**
+         * @brief Generate qualified function name using SRM when available
+         */
+        std::string generate_qualified_function_name(const std::string &resolved_namespace, const std::string &function_name) const;
     };
 
 } // namespace Cryo::Codegen
