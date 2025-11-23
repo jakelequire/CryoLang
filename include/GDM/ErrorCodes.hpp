@@ -147,6 +147,17 @@ namespace Cryo
     X(E0618_CONSTRUCTOR_GENERATION_ERROR, 618)   \
     X(E0619_METHOD_GENERATION_ERROR, 619)        \
     X(E0620_MODULE_CONTEXT_ERROR, 620)           \
+    X(E0621_ARRAY_OPERATION_ERROR, 621)          \
+    X(E0622_MEMBER_ACCESS_ERROR, 622)            \
+    X(E0623_SCOPE_RESOLUTION_ERROR, 623)         \
+    X(E0624_EXCEPTION_HANDLER_ERROR, 624)        \
+    X(E0625_LITERAL_GENERATION_ERROR, 625)       \
+    X(E0626_CAST_OPERATION_ERROR, 626)           \
+    X(E0627_LOOP_GENERATION_ERROR, 627)          \
+    X(E0628_PATTERN_MATCHING_ERROR, 628)         \
+    X(E0629_TEMPLATE_INSTANTIATION_ERROR, 629)   \
+    X(E0630_OPTIMIZATION_ERROR, 630)             \
+    X(E0631_ENUM_OPERATION_ERROR, 631)           \
                                                  \
     /* Linker Errors (E0700-E0799) */            \
     X(E0700_LINK_ERROR, 700)                     \
