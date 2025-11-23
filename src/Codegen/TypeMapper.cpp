@@ -2447,6 +2447,16 @@ namespace Cryo::Codegen
         }
     }
 
+    Cryo::StructDeclarationNode *TypeMapper::get_struct_ast_node(const std::string &struct_name) const
+    {
+        auto it = _struct_ast_nodes.find(struct_name);
+        if (it != _struct_ast_nodes.end())
+        {
+            return it->second;
+        }
+        return nullptr;
+    }
+
     std::string TypeMapper::generate_mangled_name(const std::string &base_name,
                                                   const std::vector<std::shared_ptr<Type>> &type_params)
     {

@@ -396,6 +396,13 @@ namespace Cryo::Codegen
          */
         void register_struct_ast_node(Cryo::StructDeclarationNode *struct_node);
 
+        /**
+         * @brief Get AST struct declaration node by name
+         * @param struct_name Name of the struct
+         * @return Pointer to struct declaration node or nullptr if not found
+         */
+        Cryo::StructDeclarationNode *get_struct_ast_node(const std::string &struct_name) const;
+
         //===================================================================
         // Generic Type Definition System
         //===================================================================

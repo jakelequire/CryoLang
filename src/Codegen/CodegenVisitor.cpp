@@ -426,6 +426,9 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished loading enum variants from Types module");
         }
         
+        // Declare constructors for imported structs to make them callable
+        declare_imported_constructors(node);
+        
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Import '{}' processed for cross-module type resolution", module_alias);
         return;
     }
@@ -3272,26 +3275,23 @@ namespace Cryo::Codegen
         // If there are constructor arguments, call the constructor
         if (!node.arguments().empty())
         {
-            // Look up the constructor function - need to include namespace context
+            // Look up the constructor function - need to determine correct namespace
             std::string constructor_name;
             std::string constructor_signature_name;
+            std::string target_namespace;
 
-            if (!_namespace_context.empty())
+            // Use the current namespace context for constructor lookup
+            target_namespace = _namespace_context;
+
+            // Generate constructor name with correct namespace
+            if (!target_namespace.empty())
             {
-                constructor_name = _namespace_context + "::" + full_type_name + "::" + base_type_name;
+                constructor_name = target_namespace + "::" + full_type_name + "::" + base_type_name;
+                constructor_signature_name = target_namespace + "::" + full_type_name + "::" + base_type_name + "(";
             }
             else
             {
                 constructor_name = full_type_name + "::" + base_type_name;
-            }
-
-            // Generate signature-based constructor name for overload resolution
-            if (!_namespace_context.empty())
-            {
-                constructor_signature_name = _namespace_context + "::" + full_type_name + "::" + base_type_name + "(";
-            }
-            else
-            {
                 constructor_signature_name = full_type_name + "::" + base_type_name + "(";
             }
 
@@ -3340,6 +3340,12 @@ namespace Cryo::Codegen
             {
                 // Fallback to old naming scheme for compatibility
                 constructor_it = _functions.find(constructor_name);
+            }
+            
+            // If still not found, try simple name (for imported constructors)
+            if (constructor_it == _functions.end())
+            {
+                constructor_it = _functions.find(base_type_name);
             }
 
             if (constructor_it != _functions.end())
@@ -14524,6 +14530,205 @@ namespace Cryo::Codegen
         _imported_asts = imported_asts;
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Set imported ASTs for enum value extraction: {} modules", 
                  imported_asts ? imported_asts->size() : 0);
+    }
+
+    void CodegenVisitor::declare_imported_constructors(const Cryo::ImportDeclarationNode &import_node)
+    {
+        // std::cerr << "=== CONSTRUCTOR DECLARATION METHOD CALLED FOR MODULE: " << import_node.path() << " ===" << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Declaring constructors from imported module: {}", import_node.path());
+        
+        if (!_imported_asts)
+        {
+            std::cerr << "ERROR: No imported ASTs available!" << std::endl;
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "No imported ASTs available for constructor declaration");
+            return;
+        }
+
+        auto &context = _context_manager.get_context();
+        auto module = _context_manager.get_module();
+        
+        if (!module)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "No LLVM module available for constructor declaration");
+            return;
+        }
+
+        // Find the AST for this imported module
+        std::string import_path = import_node.path();
+
+        
+        auto ast_it = _imported_asts->find(import_path);
+        if (ast_it == _imported_asts->end())
+        {
+            // Try alternative path formats (e.g., "net/types" vs just "types")
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Direct path '{}' not found, searching all imported modules", import_path);
+            for (const auto &[module_path, program_ast] : *_imported_asts)
+            {
+                // Try multiple match patterns
+                std::vector<std::string> match_patterns;
+                
+                // Simple containment check
+                if (module_path.find("net") != std::string::npos && import_path.find("net") != std::string::npos) {
+                    match_patterns.push_back("net match");
+                }
+                if (module_path.find("IO") != std::string::npos && import_path.find("io") != std::string::npos) {
+                    match_patterns.push_back("io match");
+                }
+                if (module_path.find("Types") != std::string::npos && import_path.find("types") != std::string::npos) {
+                    match_patterns.push_back("types match");
+                }
+                
+                // For net/types -> std::net::Types
+                if (import_path == "net/types" && module_path == "std::net::Types") {
+                    match_patterns.push_back("exact net/types match");
+                }
+                
+                if (!match_patterns.empty())
+                {
+                    ast_it = _imported_asts->find(module_path);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found matching module: '{}' for import '{}'", module_path, import_path);
+                    break;
+                }
+            }
+        }
+        
+        if (ast_it == _imported_asts->end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No AST found for imported module: {}", import_path);
+            return;
+        }
+
+        const auto &program_ast = ast_it->second;
+        if (!program_ast)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "AST is null for imported module: {}", import_path);
+            return;
+        }
+
+        // Search through the imported AST for struct declarations and declare their constructors
+        std::function<void(Cryo::ASTNode*)> search_for_structs = [&](Cryo::ASTNode* node) {
+            if (!node) return;
+            
+            if (auto struct_decl = dynamic_cast<Cryo::StructDeclarationNode*>(node))
+            {
+                std::string struct_name = struct_decl->name();
+                std::string source_namespace = struct_decl->source_module().empty() ? 
+                    "std::" + import_path : struct_decl->source_module();
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found struct '{}' in imported module '{}', declaring constructor", 
+                         struct_name, source_namespace);
+
+                // Create constructor function declaration (not definition)
+                std::string constructor_name = source_namespace + "::" + struct_name + "::" + struct_name;
+                
+                // Also register simple name for direct lookup
+                std::string simple_constructor_name = struct_name;
+                
+                // Check if constructor already exists
+                if (module->getFunction(constructor_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor '{}' already declared", constructor_name);
+                    return;
+                }
+
+                // Get the struct type to determine constructor signature
+                llvm::Type *struct_type = _type_mapper->lookup_type(struct_name);
+                if (!struct_type)
+                {
+                    // Try to map the struct type from the imported module
+                    Cryo::StructType *cryo_struct_type = 
+                        static_cast<Cryo::StructType*>(_symbol_table.get_type_context()->get_struct_type(struct_name));
+                    if (cryo_struct_type)
+                    {
+                        struct_type = _type_mapper->map_struct_type(cryo_struct_type);
+                    }
+                }
+
+                if (!struct_type)
+                {
+                    LOG_WARN(Cryo::LogComponent::CODEGEN, "Could not resolve struct type for constructor: {}", struct_name);
+                    return;
+                }
+
+                // Create constructor function signature based on struct fields
+                std::vector<llvm::Type*> param_types;
+                param_types.push_back(llvm::PointerType::get(struct_type, 0)); // 'this' pointer
+
+                // Add parameter types based on struct fields or constructor parameters
+                // For now, we'll create a generic constructor that matches the struct's constructor signature
+                // In a full implementation, we'd parse the constructor parameters from the AST
+                
+                // Look for existing constructor in the struct to get parameter types
+                bool found_constructor = false;
+                std::vector<std::string> param_type_names;
+                
+                for (const auto &method : struct_decl->methods())
+                {
+                    if (method->name() == struct_name) // Constructor has same name as struct
+                    {
+                        for (const auto &param : method->parameters())
+                        {
+                            Cryo::Type* param_cryo_type = param->get_resolved_type();
+                            if (param_cryo_type)
+                            {
+                                llvm::Type* param_llvm_type = _type_mapper->map_type(param_cryo_type);
+                                if (param_llvm_type)
+                                {
+                                    param_types.push_back(param_llvm_type);
+                                    param_type_names.push_back(param_cryo_type->name());
+                                }
+                            }
+                        }
+                        found_constructor = true;
+                        break;
+                    }
+                }
+
+                // Create function type and declare the function
+                llvm::FunctionType *constructor_func_type = 
+                    llvm::FunctionType::get(llvm::Type::getVoidTy(context), param_types, false);
+                
+                // Create constructor name with full signature to match stdlib format
+                std::string parameter_signature = "(";
+                for (size_t i = 0; i < param_type_names.size(); ++i) // Parameters (excluding 'this' pointer)
+                {
+                    if (i > 0) parameter_signature += ",";
+                    parameter_signature += param_type_names[i];
+                }
+                parameter_signature += ")";
+                
+                std::string stdlib_constructor_name = struct_name + "::" + struct_name + parameter_signature;
+                
+                llvm::Function *constructor_func = llvm::Function::Create(
+                    constructor_func_type, 
+                    llvm::Function::ExternalLinkage, 
+                    stdlib_constructor_name, // Use full stdlib signature format
+                    *module
+                );
+
+                // Store the function for lookup - both full name and simple name
+                _functions[constructor_name] = constructor_func;
+                _functions[simple_constructor_name] = constructor_func; // Allow lookup by simple name
+                
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Declared imported constructor: '{}' with {} parameters", 
+                         constructor_name, param_types.size() - 1); // -1 for 'this' pointer
+            }
+
+            // Search through statements in this AST node
+            if (auto program_node = dynamic_cast<Cryo::ProgramNode*>(node))
+            {
+                for (const auto &stmt : program_node->statements())
+                {
+                    search_for_structs(stmt.get());
+                }
+            }
+        };
+
+        // Start the recursive search from the program root
+        search_for_structs(program_ast.get());
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished declaring constructors from imported module: {}", import_path);
     }
 
 } // namespace Cryo::Codegen
