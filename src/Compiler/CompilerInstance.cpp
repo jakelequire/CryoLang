@@ -347,6 +347,12 @@ namespace Cryo
         {
             _ast_root = _parser->parse_program();
 
+            // Immediately discover and register generic types from the AST 
+            // This must happen before any type resolution attempts
+            if (_ast_root) {
+                _type_checker->discover_generic_types_from_ast(*_ast_root);
+            }
+
             // Capture namespace context from parser after successful parsing
             if (_ast_root && !_parser->current_namespace().empty() && _parser->current_namespace() != "Global")
             {

@@ -13,12 +13,15 @@ namespace Cryo::Codegen
     //===================================================================
 
     TypeMapper::TypeMapper(LLVMContextManager &context_manager, Cryo::TypeContext *type_context)
-        : _context_manager(context_manager), _type_context(type_context), _has_errors(false)
+        : _context_manager(context_manager), _type_context(type_context), _has_errors(false), _parameterized_types_registered(false)
     {
         if (!_type_context)
         {
             report_error("TypeContext is required for TypeMapper");
         }
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper constructor - registering parameterized types");
+        // Note: SRM context will be set later via set_srm_context, then we'll register types
     }
 
     //===================================================================
@@ -1465,6 +1468,37 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "All Array<T> fallbacks failed for: {}", instantiated_name);
         }
 
+        // General fallback: try alternate naming for any generic struct
+        if (!type_args.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying general fallback for generic type: {} -> {}", base_name, instantiated_name);
+
+            // Check if the monomorphized struct is already cached under the instantiated name
+            auto cache_it = _struct_cache.find(instantiated_name);
+            if (cache_it != _struct_cache.end())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found cached monomorphized type: {}", instantiated_name);
+                return cache_it->second;
+            }
+
+            // Try alternate naming conventions (SomeStruct_int instead of SomeStruct<int>)
+            // Only for simple types, not for nested parameterized types
+            if (type_args[0]->to_string().find('<') == std::string::npos)
+            {
+                std::string alternate_name = base_name + "_" + type_args[0]->to_string();
+                cache_it = _struct_cache.find(alternate_name);
+                if (cache_it != _struct_cache.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found generic struct with alternate name: {} -> {}", alternate_name, instantiated_name);
+                    _struct_cache[instantiated_name] = cache_it->second; // Cache under original name too
+                    return cache_it->second;
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic struct not found with alternate name: {}", alternate_name);
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "All generic type fallbacks failed for: {}", instantiated_name);
+        }
+
         report_error("Failed to create parameterized type using enhanced type system: " + base_name);
         return nullptr;
     }
@@ -2469,6 +2503,81 @@ namespace Cryo::Codegen
         }
 
         return mangled.str();
+    }
+
+    void TypeMapper::register_parameterized_types_from_context(Cryo::SRM::SymbolResolutionContext* srm_context)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::register_parameterized_types_from_context called");
+        
+        if (!_type_context || !srm_context)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Cannot register parameterized types: null context");
+            return;
+        }
+
+        // Get TypeRegistry from TypeContext
+        auto* type_registry = _type_context->get_type_registry();
+        if (!type_registry)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No TypeRegistry available, skipping parameterized type registration");
+            return;
+        }
+
+        // Get all instantiations from TypeRegistry
+        const auto& instantiations = type_registry->get_all_instantiations();
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registering {} parameterized type instantiations with TypeMapper", instantiations.size());
+
+        for (const auto& [type_string, param_type_ptr] : instantiations)
+        {
+            if (!param_type_ptr)
+                continue;
+
+            auto* param_type = param_type_ptr.get();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing instantiation: {}", type_string);
+            
+            // Create TypeIdentifier using SRM for consistent naming
+            std::vector<Cryo::Type*> template_params;
+            for (const auto& shared_param : param_type->type_parameters())
+            {
+                template_params.push_back(shared_param.get());
+            }
+            
+            auto type_identifier = srm_context->create_type_identifier(
+                param_type->base_name(), 
+                Cryo::TypeKind::Struct, 
+                template_params);
+            
+            // Get SRM-generated canonical name
+            std::string srm_name = type_identifier->to_string();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM canonical name: {}", srm_name);
+            
+            // Map the ParameterizedType to LLVM type
+            llvm::Type* llvm_type = map_type(param_type);
+            
+            if (llvm_type)
+            {
+                // Register under SRM canonical name
+                register_type(srm_name, llvm_type);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered LLVM type for: {}", srm_name);
+                
+                // Also register under original type string for backwards compatibility
+                if (srm_name != type_string)
+                {
+                    register_type(type_string, llvm_type);
+                }
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered ParameterizedType: '{}' -> SRM name: '{}'", 
+                         type_string, srm_name);
+            }
+            else
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to map ParameterizedType to LLVM: '{}'", type_string);
+            }
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed parameterized type registration");
+        _parameterized_types_registered = true;
     }
 
 } // namespace Cryo::Codegen

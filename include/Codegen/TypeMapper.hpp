@@ -3,6 +3,7 @@
 #include "AST/Type.hpp"
 #include "AST/ASTNode.hpp"
 #include "Codegen/LLVMContext.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -276,9 +277,22 @@ namespace Cryo::Codegen
          */
         void clear_cache();
 
+        /**
+         * @brief Register all ParameterizedType objects from TypeContext using SRM-generated names
+         * @param srm_context SRM context for generating canonical type names
+         * @note This should be called after TypeChecker completes to ensure all generic instantiations are registered
+         */
+        void register_parameterized_types_from_context(Cryo::SRM::SymbolResolutionContext* srm_context);
+        
+        /**
+         * @brief Check if parameterized types have been registered
+         * @return true if registration has occurred
+         */
+        bool are_parameterized_types_registered() const { return _parameterized_types_registered; }
+
         //===================================================================
         // Type-Safe Caching (Migration Enhancement)
-        //===================================================================
+        //==================================================================="
 
         /**
          * @brief Register type by Type object (preferred over string-based registration)
@@ -509,6 +523,11 @@ namespace Cryo::Codegen
         // Error state
         bool _has_errors;
         std::string _last_error;
+        
+        // Lazy initialization flag for parameterized types
+        bool _parameterized_types_registered;
+        
+
 
         //===================================================================
         // Private Methods

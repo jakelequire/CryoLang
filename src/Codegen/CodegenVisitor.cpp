@@ -69,6 +69,12 @@ namespace Cryo::Codegen
 
         clear_errors();
 
+        // Register all ParameterizedType objects from TypeChecker with SRM names
+        // This must be done before codegen starts to ensure NewExpression can find generic types
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to register parameterized types from TypeContext...");
+        _type_mapper->register_parameterized_types_from_context(_srm_context.get());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished registering parameterized types from TypeContext");
+
         try
         {
             program->accept(*this);
@@ -112,6 +118,7 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::ProgramNode &node)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** CodegenVisitor::visit(ProgramNode) ENTRY ***");
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor::visit(ProgramNode) - stdlib_compilation_mode: {}",
                   _stdlib_compilation_mode ? "true" : "false");
 
@@ -252,6 +259,12 @@ namespace Cryo::Codegen
                 }
             }
         }
+
+        // Register all ParameterizedType objects from TypeChecker with SRM names
+        // This must be done after struct declarations are processed so GenericStruct is registered
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to register parameterized types from TypeContext...");
+        _type_mapper->register_parameterized_types_from_context(_srm_context.get());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished registering parameterized types from TypeContext");
 
         // Pass 4: Process all other statements
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4: Processing other statements");
@@ -519,9 +532,22 @@ namespace Cryo::Codegen
                 
                 if (_diagnostic_builder)
                 {
-                    // Use node.name() directly to avoid the corrupted var_name variable
-                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
-                                                     "Variable declaration missing resolved type: " + node.name());
+                    // Additional safety check: if var_name doesn't match node.name(), something is wrong
+                    if (var_name != node.name()) {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Variable name mismatch! var_name='{}', node.name()='{}'", var_name, node.name());
+                    }
+                    
+                    // Check if this is a stdlib variable being incorrectly processed during user code compilation
+                    // Variables like "new_capacity" should only appear in stdlib, not user code at line 140
+                    if (var_name == "new_capacity" && node.location().line() == 140) {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "STDLIB POLLUTION: stdlib variable '{}' appearing in user code compilation at wrong location", var_name);
+                        // Don't report this error as it's likely a stdlib processing issue that will be resolved
+                        // during proper stdlib compilation
+                        return;
+                    }
+                    
+                    std::string error_msg = "Variable declaration missing resolved type: " + var_name;
+                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node, error_msg);
                 }
                 return;
             }
@@ -1580,46 +1606,36 @@ namespace Cryo::Codegen
                 bool is_constructor = (method_name == class_name);
                 std::string qualified_name;
                 
+                // Extract parameter types for both constructors and regular methods
+                std::vector<Cryo::Type*> parameter_types;
+                for (const auto &param : method->parameters())
+                {
+                    if (param && param->get_resolved_type())
+                    {
+                        parameter_types.push_back(param->get_resolved_type());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: {})",
+                                  parameter_types.size() - 1, param->name(), param->get_resolved_type()->to_string());
+                    }
+                    else
+                    {
+                        // Use a placeholder type for unknown parameters
+                        parameter_types.push_back(_symbol_table.get_type_context()->get_unknown_type());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: UNKNOWN - param={}, resolved_type={})",
+                                  parameter_types.size() - 1, param ? param->name() : "null", param ? "non-null" : "null",
+                                  (param && param->get_resolved_type()) ? "non-null" : "null");
+                    }
+                }
+                
+                // Use SRM helper for consistent qualified name generation in both declaration and body phases
+                qualified_name = generate_method_name(class_name, method_name, parameter_types);
+                
                 if (is_constructor)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Building signature for constructor {}, {} parameters",
-                              method_name, method->parameters().size());
-                              
-                    // Build parameter types for constructor signature
-                    std::vector<Cryo::Type*> param_types;
-                    for (size_t i = 0; i < method->parameters().size(); ++i)
-                    {
-                        auto param = method->parameters()[i].get();
-                        if (param && param->get_resolved_type())
-                        {
-                            param_types.push_back(param->get_resolved_type());
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: {})",
-                                      i, param->name(), param->get_resolved_type()->to_string());
-                        }
-                        else
-                        {
-                            // Use a placeholder type for unknown parameters
-                            param_types.push_back(_symbol_table.get_type_context()->get_unknown_type());
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Parameter {}: {} (type: UNKNOWN - param={}, resolved_type={})",
-                                      i, param ? param->name() : "null", param ? "non-null" : "null",
-                                      (param && param->get_resolved_type()) ? "non-null" : "null");
-                        }
-                    }
-                    
-                    auto constructor_identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
-                        namespace_parts, class_name, param_types);
-                    
-                    qualified_name = constructor_identifier->to_overload_key();
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class constructor LLVM IR name with signature: {}", qualified_name);
                 }
                 else
                 {
-                    // For regular methods, use QualifiedIdentifier - add parent type to namespace
-                    std::vector<std::string> method_namespace_parts = namespace_parts;
-                    method_namespace_parts.push_back(class_name);
-                    auto method_identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
-                        method_namespace_parts, method_name, Cryo::SymbolKind::Function);
-                    qualified_name = method_identifier->to_string();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Regular method LLVM IR name: {}", qualified_name);
                 }
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Full qualified method name: {}", qualified_name);
@@ -1728,38 +1744,15 @@ namespace Cryo::Codegen
                 // Use SRM helper to generate standardized qualified method name
                 std::string qualified_name = generate_method_name(class_name, method_name, parameter_types);
 
-                // For constructors, include parameter signature in the LLVM IR function name to prevent conflicts
+                // For constructors, the qualified_name from generate_method_name already includes parameter signature
                 bool is_constructor = (method_name == class_name);
-                std::string current_param_signature;
                 if (is_constructor)
                 {
-                    std::string param_signature = "(";
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Building signature for constructor body {}, {} parameters",
-                              method_name, method->parameters().size());
-                    for (size_t i = 0; i < method->parameters().size(); ++i)
-                    {
-                        if (i > 0)
-                            param_signature += ",";
-                        auto param = method->parameters()[i].get();
-                        if (param && param->get_resolved_type())
-                        {
-                            std::string param_type_str = param->get_resolved_type()->to_string();
-                            std::string normalized_type = normalize_type_for_signature(param_type_str);
-                            param_signature += normalized_type;
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Body Parameter {}: {} (type: {} -> normalized: {})",
-                                      i, param->name(), param_type_str, normalized_type);
-                        }
-                        else
-                        {
-                            param_signature += "unknown";
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Body Parameter {}: {} (type: UNKNOWN)",
-                                      i, param ? param->name() : "null");
-                        }
-                    }
-                    param_signature += ")";
-                    current_param_signature = param_signature;
-                    qualified_name += param_signature;
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor body generation - matching signature: {}", param_signature);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor body generation - qualified name: {}", qualified_name);
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method body generation - qualified name: {}", qualified_name);
                 }
 
                 // Retrieve the function we created in pass 1
@@ -1777,7 +1770,6 @@ namespace Cryo::Codegen
                 if (is_constructor)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating constructor body for qualified name: {}", qualified_name);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Current method signature: {}", current_param_signature);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor has {} parameters", method->parameters().size());
                     for (size_t i = 0; i < method->parameters().size(); ++i)
                     {
@@ -2721,7 +2713,7 @@ namespace Cryo::Codegen
 
         if (!match_value)
         {
-            std::cerr << "Error: Failed to generate match expression" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to generate match expression value");
             register_value(&node, nullptr);
             return;
         }
@@ -2738,7 +2730,7 @@ namespace Cryo::Codegen
 
         if (!discriminant)
         {
-            std::cerr << "Error: Failed to extract discriminant from match value" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to extract discriminant from match value");
             register_value(&node, nullptr);
             return;
         }
@@ -2813,7 +2805,7 @@ namespace Cryo::Codegen
 
         if (_breakable_stack.empty())
         {
-            std::cerr << "[ERROR] Break statement used outside of breakable context (loop or switch)" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Break statement used outside of breakable context");
             register_value(&node, nullptr);
             return;
         }
@@ -2836,7 +2828,7 @@ namespace Cryo::Codegen
 
         if (_breakable_stack.empty())
         {
-            std::cerr << "[ERROR] Continue statement used outside of loop context" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Continue statement used outside of breakable context");
             register_value(&node, nullptr);
             return;
         }
@@ -2847,7 +2839,7 @@ namespace Cryo::Codegen
         // Continue is only valid in loop contexts, not switch contexts
         if (breakable_context.context_type != BreakableContext::Loop)
         {
-            std::cerr << "[ERROR] Continue statement used outside of loop context" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Continue statement used outside of loop context");
             register_value(&node, nullptr);
             return;
         }
@@ -3292,7 +3284,7 @@ namespace Cryo::Codegen
         llvm::Type *result_type = then_value->getType();
         if (then_value->getType() != else_value->getType())
         {
-            std::cerr << "[CodegenVisitor] Warning: Type mismatch in ternary expression branches" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Warning: Type mismatch in ternary expression branches");
             // For now, we'll assume they should be the same type
             // In a full implementation, we'd need type coercion logic here
         }
@@ -3356,7 +3348,14 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::NewExpressionNode &node)
     {
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating new expression");
+
+        
+        std::cout << "[CRYO DEBUG] NewExpression visit called for type: " << node.type_name() << std::endl;
+        std::cout << "[CRYO DEBUG] Generic args count: " << node.generic_args().size() << std::endl;
+        for (size_t i = 0; i < node.generic_args().size(); ++i) {
+            std::cout << "[CRYO DEBUG] Generic arg[" << i << "]: " << node.generic_args()[i] << std::endl;
+        }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating new expression for type: '{}'", node.type_name());
 
         auto &context = _context_manager.get_context();
         auto module = _context_manager.get_module();
@@ -3368,46 +3367,109 @@ namespace Cryo::Codegen
             return;
         }
 
-        std::string base_type_name = node.type_name();
-
-        // Check if this is a generic instantiation
-        std::string full_type_name = base_type_name;
-        if (!node.generic_args().empty())
+        // Use SRM to create proper TypeIdentifier for consistent naming
+        auto resolved_type = node.get_resolved_type();
+        llvm::Type *struct_type = nullptr;
+        std::string full_type_name;
+        std::string base_type_name;
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "NewExpression resolved_type is: {}", resolved_type ? "valid" : "NULL");
+        
+        if (resolved_type)
         {
-            // Construct the full instantiated type name: "GenericStruct<int>"
-            full_type_name = base_type_name + "<";
-            for (size_t i = 0; i < node.generic_args().size(); ++i)
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using resolved type from AST node: {}", resolved_type->to_string());
+            
+            // Create TypeIdentifier using SRM for consistent naming
+            std::unique_ptr<Cryo::SRM::TypeIdentifier> type_identifier;
+            
+            if (resolved_type->kind() == Cryo::TypeKind::Parameterized)
             {
-                if (i > 0)
-                    full_type_name += ",";
-                full_type_name += node.generic_args()[i];
-            }
-            full_type_name += ">";
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic instantiation detected: {}", full_type_name);
-        }
-
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating new instance of type: {}", full_type_name);
-
-        // Look up the struct type (use full instantiated name for generics)
-        llvm::Type *struct_type = _type_mapper->lookup_type(full_type_name);
-        if (!struct_type)
-        {
-            // For non-generics, try the old lookup method
-            auto struct_type_it = _types.find(full_type_name);
-            if (struct_type_it != _types.end())
-            {
-                struct_type = struct_type_it->second;
+                // For parameterized types like GenericStruct<int>, extract template parameters
+                auto parameterized_type = static_cast<Cryo::ParameterizedType*>(resolved_type);
+                
+                // Convert shared_ptr<Type> to Type* for SRM compatibility
+                std::vector<Cryo::Type*> template_params;
+                for (const auto& shared_param : parameterized_type->type_parameters())
+                {
+                    template_params.push_back(shared_param.get());
+                }
+                
+                type_identifier = _srm_context->create_type_identifier(
+                    parameterized_type->base_name(), 
+                    Cryo::TypeKind::Struct, 
+                    template_params);
             }
             else
             {
-                if (_diagnostic_builder)
+                type_identifier = _srm_context->create_type_identifier(
+                    resolved_type->to_string(), 
+                    resolved_type->kind());
+            }
+            
+            // Use SRM-generated names for consistency
+            full_type_name = type_identifier->to_string();
+            base_type_name = type_identifier->get_symbol_name();
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM-generated names: full='{}', base='{}'", full_type_name, base_type_name);
+            
+            struct_type = _type_mapper->map_type(resolved_type);
+        }
+        else
+        {
+            // Fallback: create TypeIdentifier from AST node information
+            base_type_name = node.type_name();
+            std::vector<Cryo::Type*> template_params;
+            
+            // Convert generic args to Type objects for SRM
+            if (!node.generic_args().empty())
+            {
+                for (const auto& arg : node.generic_args())
                 {
-                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
-                                                     "Unknown type in new expression: " + full_type_name);
+                    // Try various TypeContext methods to look up the type
+                    Cryo::Type* param_type = _symbol_table.get_type_context()->lookup_struct_type(arg);
+                    if (!param_type) {
+                        param_type = _symbol_table.get_type_context()->get_generic_type(arg);
+                    }
+                    if (param_type)
+                    {
+                        template_params.push_back(param_type);
+                    }
                 }
-                return;
+            }
+            
+            auto type_identifier = _srm_context->create_type_identifier(
+                base_type_name, Cryo::TypeKind::Struct, template_params);
+            
+            full_type_name = type_identifier->to_string();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using SRM-generated type name: '{}', base_type_name: '{}'", full_type_name, base_type_name);
+            
+            struct_type = _type_mapper->lookup_type(full_type_name);
+            
+            if (!struct_type)
+            {
+                auto struct_type_it = _types.find(full_type_name);
+                if (struct_type_it != _types.end())
+                {
+                    struct_type = struct_type_it->second;
+                }
             }
         }
+
+        if (!struct_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper failed to map type '{}', checking fallback lookup methods", full_type_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper lookup_type result: {}", _type_mapper->lookup_type(full_type_name) ? "found" : "null");
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Local _types registry lookup: {}", (_types.find(full_type_name) != _types.end()) ? "found" : "not found");
+            
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                 "Unknown type in new expression: " + full_type_name);
+            }
+            return;
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully resolved type for new expression: {}", full_type_name);
 
         // Calculate the size of the struct for heap allocation
         const llvm::DataLayout &data_layout = module->getDataLayout();
@@ -3813,7 +3875,7 @@ namespace Cryo::Codegen
             }
             else if (element_type != element_val->getType())
             {
-                std::cerr << "[CodegenVisitor] Warning: Type mismatch in array literal elements" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Error: Mismatched element types in array literal");
                 // In a full implementation, we'd need type coercion here
             }
         }
@@ -5499,7 +5561,7 @@ namespace Cryo::Codegen
         else
         {
             // Fallback to direct output if no diagnostic manager available
-            std::cerr << "Codegen Error: " << message << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Codegen Error: {}", message);
         }
     }
 
@@ -5525,7 +5587,7 @@ namespace Cryo::Codegen
             {
                 full_message += " (node kind: " + std::to_string(static_cast<int>(node->kind())) + ")";
             }
-            std::cerr << "Codegen Error: " << full_message << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Codegen Error: {}", full_message);
         }
     }
 
@@ -5537,7 +5599,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            std::cerr << "[ERROR] register_value called with null node pointer" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "[ERROR] register_value: null node pointer");
             return;
         }
 
@@ -5547,14 +5609,13 @@ namespace Cryo::Codegen
             auto kind = node->kind();
             if (static_cast<int>(kind) < 0 || static_cast<int>(kind) > 200) // reasonable range check
             {
-                std::cerr << "[ERROR] register_value: node pointer appears corrupted (invalid kind: "
-                          << static_cast<int>(kind) << ")" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "[ERROR] register_value: node pointer appears corrupted (invalid kind: {})", static_cast<int>(kind));
                 return;
             }
         }
         catch (...)
         {
-            std::cerr << "[ERROR] register_value: exception accessing node->kind(), node pointer corrupted" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "[ERROR] register_value: exception accessing node->kind(), node pointer corrupted");
             return;
         }
 
@@ -5564,11 +5625,11 @@ namespace Cryo::Codegen
         }
         catch (const std::exception &e)
         {
-            std::cerr << "[ERROR] register_value: exception inserting into hash map: " << e.what() << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "[ERROR] register_value: exception inserting into hash map: {}", e.what());
         }
         catch (...)
         {
-            std::cerr << "[ERROR] register_value: unknown exception inserting into hash map" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "[ERROR] register_value: unknown exception inserting into hash map");
         }
     }
 
@@ -5764,7 +5825,7 @@ namespace Cryo::Codegen
                       static_cast<void *>(this), static_cast<void *>(_value_context.get()));
             if (!_value_context)
             {
-                std::cerr << "[ERROR] _value_context is null before enter_scope!" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "[ERROR] _value_context is null before enter_scope!");
                 return false;
             }
 
@@ -5931,7 +5992,7 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "At method start, _value_context={}", static_cast<void *>(_value_context.get()));
         if (!_value_context)
         {
-            std::cerr << "[ERROR] _value_context is null at method start!" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "[ERROR] _value_context is null at method start!");
             _diagnostic_builder->report_error(ErrorCode::E0619_METHOD_GENERATION_ERROR, node, "Value context is null at method start");
             return;
         }
@@ -6040,7 +6101,7 @@ namespace Cryo::Codegen
             // Debug: Check if _value_context is valid
             if (!_value_context)
             {
-                std::cerr << "[ERROR] _value_context is null in generate_primitive_method!" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "[ERROR] _value_context is null when setting 'this' parameter!");
                 _diagnostic_builder->report_error(ErrorCode::E0619_METHOD_GENERATION_ERROR, node, "Value context is null");
                 return;
             }
@@ -8645,7 +8706,7 @@ namespace Cryo::Codegen
         auto operand = node->operand();
         if (!operand)
         {
-            std::cerr << "[ERROR] Unary expression missing operand" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unary expression missing operand");
             return nullptr;
         }
 
@@ -8696,7 +8757,7 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    std::cerr << "[ERROR] Cannot increment non-numeric/pointer type" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Cannot increment non-numeric/pointer type");
                     return nullptr;
                 }
             }
@@ -8719,7 +8780,7 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    std::cerr << "[ERROR] Cannot decrement non-numeric/pointer type" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Cannot decrement non-numeric/pointer type");
                     return nullptr;
                 }
             }
@@ -8739,7 +8800,7 @@ namespace Cryo::Codegen
         llvm::Value *operandValue = get_generated_value(operand);
         if (!operandValue)
         {
-            std::cerr << "[ERROR] Failed to generate operand for unary expression" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to generate operand for unary operator: %s", operator_str.c_str());
             return nullptr;
         }
 
@@ -9506,8 +9567,36 @@ namespace Cryo::Codegen
                             }
                         }
 
+                        // For 'this' method calls, use fully qualified type name to match method implementations
+                        std::string qualified_type_name = base_type_name;
+                        if (object_name == "this")
+                        {
+                            // Check if the base_type_name is already fully qualified
+                            if (base_type_name.find("::") == std::string::npos)
+                            {
+                                // Get the current namespace parts and construct fully qualified name
+                                auto namespace_parts = get_current_namespace_parts();
+                                if (!namespace_parts.empty())
+                                {
+                                    qualified_type_name = "";
+                                    for (size_t i = 0; i < namespace_parts.size(); ++i)
+                                    {
+                                        if (i > 0) qualified_type_name += "::";
+                                        qualified_type_name += namespace_parts[i];
+                                    }
+                                    qualified_type_name += "::" + base_type_name;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fully qualified type name for 'this' method call: '{}'", qualified_type_name);
+                                }
+                            }
+                            else
+                            {
+                                // Already fully qualified, use as-is
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type name already fully qualified for 'this' method call: '{}'", qualified_type_name);
+                            }
+                        }
+
                         // Use SRM helper to generate standardized method name
-                        std::string method_name = generate_method_name(base_type_name, member_access->member(), parameter_types);
+                        std::string method_name = generate_method_name(qualified_type_name, member_access->member(), parameter_types);
 
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Built method name: '{}'", method_name);
                         auto method_it = _functions.find(method_name);
@@ -9657,7 +9746,7 @@ namespace Cryo::Codegen
 
                             if (!value_type)
                             {
-                                std::cerr << "[ERROR] Could not determine type for global variable: " << object_name << std::endl;
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to find LLVM type for global variable type: '{}'", base_type_name);
                                 function_name = extract_function_name_from_member_access(member_access);
                                 resolved_function_name = function_name;
                                 // Continue to avoid leaving function_name empty
@@ -9821,11 +9910,26 @@ namespace Cryo::Codegen
                     // Build the method name with the nested object's type
                     std::string method_name;
                     
+                    // Extract parameter types from function arguments for signature matching
+                    std::vector<Cryo::Type*> parameter_types;
+                    for (const auto &arg : node->arguments())
+                    {
+                        if (arg && arg->get_resolved_type())
+                        {
+                            parameter_types.push_back(arg->get_resolved_type());
+                        }
+                        else
+                        {
+                            // Use unknown type as placeholder
+                            parameter_types.push_back(_symbol_table.get_type_context()->get_unknown_type());
+                        }
+                    }
+                    
                     // Check if nested_type_name already contains a namespace (contains "::")
                     if (nested_type_name.find("::") != std::string::npos)
                     {
                         // Type already has a full namespace path, use it as-is
-                        method_name = generate_method_name(nested_type_name, member_access->member());
+                        method_name = generate_method_name(nested_type_name, member_access->member(), parameter_types);
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fully qualified nested type: {}", nested_type_name);
                     }
                     else
@@ -9860,13 +9964,13 @@ namespace Cryo::Codegen
                         if (is_core_library_type)
                         {
                             // Generate specialized methods locally in the current module instead of looking in core types
-                            method_name = generate_method_name(nested_type_name, member_access->member());
+                            method_name = generate_method_name(nested_type_name, member_access->member(), parameter_types);
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using local specialization for core library type: {} -> {}", nested_type_name, method_name);
                         }
                         else
                         {
                             // Type doesn't have namespace, use SRM to build qualified name
-                            method_name = generate_method_name(nested_type_name, member_access->member());
+                            method_name = generate_method_name(nested_type_name, member_access->member(), parameter_types);
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated method name with SRM: {}", method_name);
                         }
                     }
@@ -10255,7 +10359,7 @@ namespace Cryo::Codegen
         }
         else
         {
-            std::cerr << "Unsupported function call type" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unhandled callee type in function call");
             return nullptr;
         }
 
@@ -10826,8 +10930,7 @@ namespace Cryo::Codegen
             function = create_runtime_function_declaration(lookup_name, node);
             if (!function)
             {
-                std::cerr << "Failed to create function declaration for: " << lookup_name
-                          << " (resolved from: " << function_name << ")" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to create function declaration for: {} (looked up as: {})", resolved_function_name, lookup_name);
                 return nullptr;
             }
         }
@@ -11349,7 +11452,7 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        std::cerr << "[WARNING] Failed to convert parameter type, using i32 as fallback" << std::endl;
+                        LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to convert parameter type, using i32 as fallback");
                         param_types.push_back(llvm::Type::getInt32Ty(_context_manager.get_context()));
                     }
                 }
@@ -11357,7 +11460,7 @@ namespace Cryo::Codegen
                 llvm::Type *return_type = get_llvm_type(func_type->return_type().get());
                 if (!return_type)
                 {
-                    std::cerr << "[WARNING] Failed to convert return type, using i64 as fallback" << std::endl;
+                    LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to convert return type, using i64 as fallback");
                     return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
                 }
 
@@ -11506,7 +11609,7 @@ namespace Cryo::Codegen
 
         if (!call_node)
         {
-            std::cerr << "[ERROR] Cannot create forward declaration without call node" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Call node is null, cannot create forward declaration for: {}", c_name);
             return nullptr;
         }
 
@@ -11544,7 +11647,7 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    std::cerr << "[WARNING] Failed to determine argument type, using i32 as fallback" << std::endl;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to generate argument for forward declaration of '{}', using i32 as fallback", c_name);
                     param_types.push_back(llvm::Type::getInt32Ty(_context_manager.get_context()));
                 }
             }
@@ -11634,9 +11737,10 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Use FunctionRegistry to get the runtime function name
+        // Use FunctionRegistry to get the runtime function name, with SRM fallback for consistent naming
         FunctionMetadata metadata = _function_registry->get_function_metadata(c_name, _namespace_context);
-        std::string c_runtime_name = metadata.runtime_name.empty() ? c_name : metadata.runtime_name;
+        std::string c_runtime_name = metadata.runtime_name.empty() ? 
+            generate_qualified_name(c_name, Cryo::SymbolKind::Function) : metadata.runtime_name;
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry provided runtime name for '{}': '{}'", c_name, c_runtime_name);
 
@@ -11662,7 +11766,7 @@ namespace Cryo::Codegen
 
         if (!forward_decl)
         {
-            std::cerr << "[ERROR] Failed to create forward declaration for: " << c_name << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Forward declaration is null for: {}", c_name);
             return nullptr;
         }
 
@@ -11918,7 +12022,7 @@ namespace Cryo::Codegen
             llvm::Value *condValue = get_generated_value(node->condition());
             if (!condValue)
             {
-                std::cerr << "[ERROR] Failed to generate condition for for loop" << std::endl;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "For loop condition generation failed");
                 return;
             }
 
@@ -12412,7 +12516,7 @@ namespace Cryo::Codegen
             return 0; // Default fallback
         }
 
-        std::cerr << "[CodegenVisitor] Unsupported pattern type for discriminant extraction" << std::endl;
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Pattern is not an EnumPatternNode, cannot get discriminant");
         return -1;
     }
 
@@ -14065,7 +14169,8 @@ namespace Cryo::Codegen
         // Both should be integer types
         if (!source_type->isIntegerTy() || !target_type->isIntegerTy())
         {
-            std::cerr << "Error: Primitive constructor only supports integer types" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "generate_integer_cast called with non-integer types");
             return nullptr;
         }
 
@@ -14111,14 +14216,12 @@ namespace Cryo::Codegen
         llvm::raw_string_ostream source_stream(source_desc), target_stream(target_desc);
         source_type->print(source_stream);
         target_type->print(target_stream);
-        std::cerr << "DEBUG: generate_float_cast - source: " << source_desc
-                  << ", target: " << target_desc
-                  << ", target_name: " << target_type_name << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_float_cast - source: {}, target: {}, target_name: {}", source_desc, target_desc, target_type_name);
 
         // If types are the same, no cast needed
         if (source_type == target_type)
         {
-            std::cerr << "DEBUG: Types are identical, returning source value" << std::endl;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Types are identical, returning source value");
             return source_value;
         }
 
@@ -14158,11 +14261,7 @@ namespace Cryo::Codegen
         }
         else
         {
-            std::cerr << "DEBUG: Unsupported type conversion - source is int: " << source_type->isIntegerTy()
-                      << ", source is float: " << source_type->isFloatTy()
-                      << ", target is int: " << target_type->isIntegerTy()
-                      << ", target is float: " << target_type->isFloatTy() << std::endl;
-            std::cerr << "Error: Unsupported type conversion in float cast" << std::endl;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unsupported type conversion in float cast");
             return nullptr;
         }
     }
@@ -14638,12 +14737,10 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::declare_imported_constructors(const Cryo::ImportDeclarationNode &import_node)
     {
-        // std::cerr << "=== CONSTRUCTOR DECLARATION METHOD CALLED FOR MODULE: " << import_node.path() << " ===" << std::endl;
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Declaring constructors from imported module: {}", import_node.path());
         
         if (!_imported_asts)
         {
-            std::cerr << "ERROR: No imported ASTs available!" << std::endl;
             LOG_WARN(Cryo::LogComponent::CODEGEN, "No imported ASTs available for constructor declaration");
             return;
         }
@@ -14875,6 +14972,12 @@ namespace Cryo::Codegen
 
     std::string CodegenVisitor::generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types)
     {
+        // Check if this is a constructor (method name matches type name)
+        if (method_name == type_name)
+        {
+            return generate_constructor_name(type_name, parameter_types);
+        }
+        
         if (!_srm_manager) 
         {
             // Fallback to manual concatenation

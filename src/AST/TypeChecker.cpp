@@ -832,12 +832,16 @@ namespace Cryo
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "resolve_type_with_generic_context: '{}'", type_string);
 
+
         // First check if this is a generic parameter
+
         if (is_generic_parameter(type_string))
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "'{}' is a generic parameter, creating generic type", type_string);
+
             return _type_context.get_generic_type(type_string);
         }
+
 
         // Check for tuple types first (before checking for generic syntax)
         if (type_string.front() == '(' && type_string.back() == ')')
@@ -911,6 +915,7 @@ namespace Cryo
         }
 
         // Check for parameterized types like ptr<T>, Option<T>, Iterator<T>
+
         if (clean_type_string.find('<') != std::string::npos)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type syntax in '{}'", clean_type_string);
@@ -940,6 +945,12 @@ namespace Cryo
                 if (alias_symbol && alias_symbol->type)
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Symbol type kind: {}", static_cast<int>(alias_symbol->type->kind()));
+                }
+                else if (alias_symbol)
+                {
+                }
+                else
+                {
                 }
                 if (alias_symbol && alias_symbol->type && alias_symbol->type->kind() == TypeKind::TypeAlias)
                 {
@@ -1039,9 +1050,14 @@ namespace Cryo
 
         // For simple identifiers that are NOT primitive types, check the symbol table first for correct type
         // This ensures that the correct type (struct vs class) is returned based on the actual declaration
+        // Check for generic type (e.g., "Array<int>", "GenericStruct<T>")
+        size_t open_bracket_pos = type_string.find('<');
+        size_t close_bracket_pos = type_string.find('>');
+
+        
         // First check if this is a generic type (e.g., "Array<int>")
         // This must happen before other type lookups to ensure proper parameterized type creation
-        if (type_string.find('<') != std::string::npos && type_string.find('>') != std::string::npos)
+        if (open_bracket_pos != std::string::npos && close_bracket_pos != std::string::npos)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Detected generic type syntax in '{}', trying generic type resolution", type_string);
             ParameterizedType *generic_type = resolve_generic_type(type_string);
@@ -1465,7 +1481,14 @@ namespace Cryo
 
     ParameterizedType *TypeChecker::resolve_generic_type(const std::string &type_string)
     {
-        return _type_registry->parse_and_instantiate(type_string);
+
+        auto result = _type_registry->parse_and_instantiate(type_string);
+        if (result) {
+
+        } else {
+
+        }
+        return result;
     }
 
     void TypeChecker::discover_generic_types_from_ast(ProgramNode &program)
