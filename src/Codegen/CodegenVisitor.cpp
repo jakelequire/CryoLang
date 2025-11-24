@@ -5124,6 +5124,24 @@ namespace Cryo::Codegen
         // Handle scope resolution like Color::RED
         std::string scope_name = node.scope_name();
         std::string member_name = node.member_name();
+        
+        // Validate scope and member names before concatenation
+        if (scope_name.empty()) {
+            if (_diagnostic_builder) {
+                _diagnostic_builder->report_error(Cryo::ErrorCode::E0906_SRM_TYPE_RESOLUTION_FAILED,
+                                                "Empty scope name in scope resolution", &node);
+            }
+            return;
+        }
+        if (member_name.empty()) {
+            if (_diagnostic_builder) {
+                _diagnostic_builder->report_error(Cryo::ErrorCode::E0906_SRM_TYPE_RESOLUTION_FAILED,
+                                                "Empty member name in scope resolution", &node);
+            }
+            return;
+        }
+        
+        // Use SRM-based qualified name generation (already has fallback logic)
         std::string qualified_name = generate_qualified_name(scope_name + "::" + member_name, Cryo::SymbolKind::Type);
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ScopeResolutionNode: Looking for '{}' (scope='{}', member='{}')",
@@ -6067,6 +6085,23 @@ namespace Cryo::Codegen
 
         // Create function with fully qualified name for primitive methods
         std::string func_name;
+        
+        // Validate inputs before string concatenation  
+        if (primitive_type_name.empty()) {
+            if (_diagnostic_builder) {
+                _diagnostic_builder->report_error(Cryo::ErrorCode::E0908_SRM_METHOD_RESOLUTION_FAILED,
+                                                "Empty primitive type name in method generation", node);
+            }
+            return;
+        }
+        if (node->name().empty()) {
+            if (_diagnostic_builder) {
+                _diagnostic_builder->report_error(Cryo::ErrorCode::E0908_SRM_METHOD_RESOLUTION_FAILED,
+                                                "Empty method name in primitive method generation", node);
+            }
+            return;
+        }
+        
         if (current_primitive_type && is_primitive_type(primitive_type_name))
         {
             func_name = generate_qualified_name("std::core::Types::" + primitive_type_name + "::" + node->name(), Cryo::SymbolKind::Function);
@@ -6467,6 +6502,23 @@ namespace Cryo::Codegen
         auto *module = _context_manager.get_module();
 
         llvm::Type *enum_type = _type_mapper->lookup_type(enum_decl->name());
+        
+        // Validate inputs before constructor name generation
+        if (enum_decl->name().empty()) {
+            if (_diagnostic_builder) {
+                _diagnostic_builder->report_error(Cryo::ErrorCode::E0909_SRM_CONSTRUCTOR_GENERATION_FAILED,
+                                                "Empty enum name in constructor generation", enum_decl);
+            }
+            return;
+        }
+        if (variant->name().empty()) {
+            if (_diagnostic_builder) {
+                _diagnostic_builder->report_error(Cryo::ErrorCode::E0909_SRM_CONSTRUCTOR_GENERATION_FAILED,
+                                                "Empty variant name in constructor generation", variant);
+            }
+            return;
+        }
+        
         std::string constructor_name = generate_qualified_name(enum_decl->name() + "::" + variant->name(), Cryo::SymbolKind::Function);
 
         // Create function type: () -> EnumType
@@ -6509,6 +6561,23 @@ namespace Cryo::Codegen
         Cryo::EnumType *cryo_enum_type = static_cast<Cryo::EnumType *>(
             _symbol_table.get_type_context()->get_enum_type(enum_decl->name(), variant_names, enum_decl->is_simple_enum()));
         llvm::Type *enum_type = _type_mapper->map_enum_type(cryo_enum_type);
+        
+        // Validate inputs before complex constructor name generation
+        if (enum_decl->name().empty()) {
+            if (_diagnostic_builder) {
+                _diagnostic_builder->report_error(Cryo::ErrorCode::E0909_SRM_CONSTRUCTOR_GENERATION_FAILED,
+                                                "Empty enum name in complex constructor generation", enum_decl);
+            }
+            return;
+        }
+        if (variant->name().empty()) {
+            if (_diagnostic_builder) {
+                _diagnostic_builder->report_error(Cryo::ErrorCode::E0909_SRM_CONSTRUCTOR_GENERATION_FAILED,
+                                                "Empty variant name in complex constructor generation", variant);
+            }
+            return;
+        }
+        
         std::string constructor_name = generate_qualified_name(enum_decl->name() + "::" + variant->name(), Cryo::SymbolKind::Function);
 
         // Build parameter types for associated data
@@ -15057,9 +15126,16 @@ namespace Cryo::Codegen
     {
         if (!_srm_manager) 
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, "SRM Manager not available for constructor name generation. This is required. Symbol: {}", type_name);
-            _diagnostic_builder->report_error(ErrorCode::E0905_SRM_MANAGER_UNAVAILABLE, "SRM Manager (Codegen) not available for constructor name generation: " + type_name, nullptr);
-        }   
+            // Fallback to manual constructor naming
+            std::string signature = "(";
+            for (size_t i = 0; i < parameter_types.size(); ++i)
+            {
+                if (i > 0) signature += ",";
+                signature += normalize_type_for_signature(parameter_types[i]->to_string());
+            }
+            signature += ")";
+            return type_name + "::" + type_name + signature;
+        }
 
         try
         {
