@@ -15057,16 +15057,9 @@ namespace Cryo::Codegen
     {
         if (!_srm_manager) 
         {
-            // Fallback to manual constructor naming
-            std::string signature = "(";
-            for (size_t i = 0; i < parameter_types.size(); ++i)
-            {
-                if (i > 0) signature += ",";
-                signature += normalize_type_for_signature(parameter_types[i]->to_string());
-            }
-            signature += ")";
-            return type_name + "::" + type_name + signature;
-        }
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "SRM Manager not available for constructor name generation. This is required. Symbol: {}", type_name);
+            _diagnostic_builder->report_error(ErrorCode::E0905_SRM_MANAGER_UNAVAILABLE, "SRM Manager (Codegen) not available for constructor name generation: " + type_name, nullptr);
+        }   
 
         try
         {

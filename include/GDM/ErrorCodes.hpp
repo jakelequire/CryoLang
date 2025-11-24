@@ -174,6 +174,14 @@ namespace Cryo
     X(E0804_OUT_OF_MEMORY, 804)                  \
     X(E0805_INTERNAL_ERROR, 805)                 \
                                                  \
+    /* Internal Compiler Errors (E0900-E0999) */ \
+    X(E0900_INTERNAL_COMPILER_ERROR, 900)        \
+    X(E0901_UNEXPECTED_COMPILER_STATE, 901)      \
+    X(E0902_COMPILER_ASSERTION_FAILED, 902)      \
+    X(E0903_UNHANDLED_EXCEPTION, 903)            \
+    X(E0904_COMPILER_CONFIGURATION_ERROR, 904)   \
+    X(E0905_SRM_MANAGER_UNAVAILABLE, 905)        \
+                                                 \
     /* Warning Codes (W0001-W9999) */            \
     X(W0001_UNUSED_VARIABLE, 10001)              \
     X(W0002_UNUSED_FUNCTION, 10002)              \
