@@ -6,6 +6,7 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include "Utils/SymbolResolutionManager.hpp"
 
 // Forward declarations
 namespace llvm
@@ -20,7 +21,6 @@ namespace Cryo
     class TypeContext;
     class Type;
     class FunctionType;
-    class SymbolResolutionManager;
 }
 
 namespace Cryo::Codegen
@@ -110,7 +110,7 @@ namespace Cryo::Codegen
     private:
         const Cryo::SymbolTable &_symbol_table;
         Cryo::TypeContext &_type_context;
-        std::unique_ptr<Cryo::SymbolResolutionManager> _symbol_resolution_manager;
+        std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _symbol_resolution_manager;
 
         // Pattern matchers for different function types
         std::vector<std::function<FunctionMetadata(const std::string &)>> _pattern_matchers;

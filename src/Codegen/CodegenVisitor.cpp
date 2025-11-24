@@ -519,8 +519,9 @@ namespace Cryo::Codegen
                 
                 if (_diagnostic_builder)
                 {
+                    // Use node.name() directly to avoid the corrupted var_name variable
                     _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
-                                                     "Variable declaration missing resolved type: " + var_name);
+                                                     "Variable declaration missing resolved type: " + node.name());
                 }
                 return;
             }
