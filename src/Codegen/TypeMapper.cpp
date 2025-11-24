@@ -2,6 +2,7 @@
 #include "AST/Type.hpp"
 #include "AST/TypeChecker.hpp"
 #include "Utils/Logger.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -1454,7 +1455,8 @@ namespace Cryo::Codegen
             // Only for simple types, not for nested parameterized types
             if (!type_args.empty() && type_args[0]->to_string().find('<') == std::string::npos)
             {
-                std::string alternate_name = base_name + "_" + type_args[0]->to_string();
+                std::string type_param = type_args[0]->to_string();
+                std::string alternate_name = base_name + "_" + type_param;
                 cache_it = _struct_cache.find(alternate_name);
                 if (cache_it != _struct_cache.end())
                 {
@@ -1485,7 +1487,8 @@ namespace Cryo::Codegen
             // Only for simple types, not for nested parameterized types
             if (type_args[0]->to_string().find('<') == std::string::npos)
             {
-                std::string alternate_name = base_name + "_" + type_args[0]->to_string();
+                std::string type_param = type_args[0]->to_string();
+                std::string alternate_name = base_name + "_" + type_param;
                 cache_it = _struct_cache.find(alternate_name);
                 if (cache_it != _struct_cache.end())
                 {

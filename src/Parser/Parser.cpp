@@ -1919,15 +1919,27 @@ namespace Cryo
                         else if (_current_token.is(TokenKind::TK_COLONCOLON))
                         {
                             // Generic type with scope resolution: Option<T>::None
-                            // Create a generic type identifier that can be used in scope resolution
-                            std::string generic_type_name = type_name + "<";
-                            for (size_t i = 0; i < generic_args.size(); ++i)
-                            {
-                                if (i > 0)
-                                    generic_type_name += ",";
-                                generic_type_name += generic_args[i];
+                            // Create a generic type identifier using SRM utilities for consistency
+                            std::string generic_type_name;
+                            if (_srm_manager) {
+                                auto namespace_parts = get_current_namespace_parts();
+                                // Convert string generic args to Type* for TypeIdentifier
+                                // Note: This is a simplification - in practice we'd need proper type resolution
+                                std::vector<Cryo::Type*> template_types; // Empty for now, proper resolution needed
+                                auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
+                                    namespace_parts, type_name, Cryo::TypeKind::Struct, template_types);
+                                generic_type_name = type_id->to_template_name();
+                            } else {
+                                // Fallback construction
+                                generic_type_name = type_name + "<";
+                                for (size_t i = 0; i < generic_args.size(); ++i)
+                                {
+                                    if (i > 0)
+                                        generic_type_name += ",";
+                                    generic_type_name += generic_args[i];
+                                }
+                                generic_type_name += ">";
                             }
-                            generic_type_name += ">";
 
                             // Create identifier with generic type name for scope resolution
                             Token generic_token(TokenKind::TK_IDENTIFIER, generic_type_name, type_location);

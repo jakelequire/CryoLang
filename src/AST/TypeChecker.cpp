@@ -1705,7 +1705,11 @@ namespace Cryo
                             }
                             
                             // Use SRM helper to generate standardized qualified function name
-                            std::string qualified_name = generate_function_name(module_name + "::" + func_name, parameter_types);
+                            // Build proper module context for function resolution
+                            std::vector<std::string> module_parts = {module_name};
+                            auto module_qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
+                                module_parts, func_name, Cryo::SymbolKind::Function);
+                            std::string qualified_name = generate_function_name(module_qualified_id->to_string(), parameter_types);
 
                             // Try multiple lookup strategies for imported module functions
                             TypedSymbol *existing_symbol = nullptr;
@@ -3109,7 +3113,11 @@ namespace Cryo
                 std::string variant_name = member_access->member();
                 
                 // Use SRM helper to generate standardized enum variant name
-                std::string full_name = generate_qualified_name(base_name + "::" + variant_name, Cryo::SymbolKind::Type);
+                auto namespace_parts = get_current_namespace_parts();
+                auto variant_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
+                    namespace_parts.empty() ? std::vector<std::string>{base_name} : namespace_parts,
+                    base_name + "::" + variant_name, Cryo::SymbolKind::Type);
+                std::string full_name = generate_qualified_name(variant_id->to_string(), Cryo::SymbolKind::Type);
 
                 LOG_DEBUG(Cryo::LogComponent::AST, "Checking for template enum constructor: {} (base: {}, variant: {})", full_name, base_name, variant_name);
 
@@ -4663,7 +4671,10 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Scope symbol '{}' not found", base_scope_name);
             
             // Use SRM helper to generate standardized qualified name
-            std::string qualified_name = generate_qualified_name(scope_name + "::" + member_name, Cryo::SymbolKind::Type);
+            std::vector<std::string> scope_parts = {scope_name};
+            auto member_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
+                scope_parts, member_name, Cryo::SymbolKind::Type);
+            std::string qualified_name = generate_qualified_name(member_id->to_string(), Cryo::SymbolKind::Type);
             _diagnostic_builder->create_undefined_symbol_error(qualified_name, NodeKind::Declaration, node.location());
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
@@ -5030,7 +5041,11 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Generic type alias: {}<{}> = {}", alias_name, param_list, node.target_type());
 
             // Create a generic type alias - we'll use the full signature as the alias name for now
-            std::string full_signature = alias_name + "<";
+            // Use SRM for consistent template signature generation
+            std::vector<std::string> empty_namespace;
+            auto alias_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
+                empty_namespace, alias_name, Cryo::TypeKind::TypeAlias);
+            std::string full_signature = alias_id->to_template_name().substr(0, alias_id->to_template_name().find('<')) + "<";
             for (size_t i = 0; i < params.size(); ++i)
             {
                 if (i > 0)
@@ -7452,12 +7467,15 @@ namespace Cryo
     {
         if (!_srm_manager) 
         {
-            // Fallback to manual concatenation
+            // Enhanced fallback using SRM utilities for consistency
             auto namespace_parts = get_current_namespace_parts();
-            if (namespace_parts.empty())
-                return type_name + "::" + method_name;
-            else
-                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, type_name + "::" + method_name);
+            namespace_parts.push_back(type_name);
+            
+            if (_diagnostic_builder) {
+                LOG_WARN(LogComponent::AST, "SRM manager not available for method name generation: {}::{}", type_name, method_name);
+            }
+            
+            return Cryo::SRM::Utils::build_qualified_name(namespace_parts, method_name);
         }
 
         try
@@ -7485,10 +7503,8 @@ namespace Cryo
         {
             // Fallback to manual concatenation
             auto namespace_parts = get_current_namespace_parts();
-            if (namespace_parts.empty())
-                return type_name + "::" + method_name;
-            else
-                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, type_name + "::" + method_name);
+            namespace_parts.push_back(type_name);
+            return Cryo::SRM::Utils::build_qualified_name(namespace_parts, method_name);
         }
     }
 

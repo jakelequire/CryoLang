@@ -2,6 +2,7 @@
 #include "AST/TemplateRegistry.hpp" // For TemplateRegistry in instantiate_generic
 #include "Lexer/lexer.hpp"          // For TokenKind enum
 #include "Utils/Logger.hpp"
+#include "Utils/SymbolResolutionManager.hpp" // For SRM utilities
 #include <sstream>
 #include <algorithm>
 #include <iostream>
@@ -2075,7 +2076,7 @@ namespace Cryo
         }
         key += ">";
 
-        // Check if we already have a deferred type for this signature
+        // Check if we already have a deferred type for this signatureS
         static std::unordered_map<std::string, std::unique_ptr<ParameterizedType>> deferred_types;
         auto it = deferred_types.find(key);
         if (it != deferred_types.end())
@@ -2143,8 +2144,9 @@ namespace Cryo
 
     Type *TypeContext::resolve_scoped_type(const std::string &scope, const std::string &type_name)
     {
-        // Handle scoped type resolution like "Std::Runtime::MemoryBlock"
-        std::string full_name = scope + "::" + type_name;
+        // Handle scoped type resolution like "Std::Runtime::MemoryBlock" using SRM
+        std::vector<std::string> scope_parts = {scope};
+        std::string full_name = Cryo::SRM::Utils::build_qualified_name(scope_parts, type_name);
 
         // First try to find it as a struct type
         Type *struct_type = get_struct_type(full_name);
