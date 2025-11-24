@@ -22,7 +22,10 @@ namespace Cryo::Codegen
         // Initialize Symbol Resolution Manager
         try
         {
-            _symbol_resolution_manager = std::make_unique<SymbolResolutionManager>(const_cast<SymbolTable&>(symbol_table));
+            auto context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(
+                const_cast<SymbolTable*>(&symbol_table), 
+                &type_context);
+            _symbol_resolution_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(context.release());
         }
         catch (const std::exception &e)
         {
@@ -473,7 +476,7 @@ namespace Cryo::Codegen
         if (_symbol_resolution_manager && !resolved_namespace.empty())
         {
             // Use SRM to generate qualified function name
-            QualifiedIdentifier qualified_id(resolved_namespace, function_name);
+            Cryo::SRM::QualifiedIdentifier qualified_id(function_name, Cryo::SymbolKind::Function);
             return qualified_id.get_qualified_name();
         }
         else

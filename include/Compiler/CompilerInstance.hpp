@@ -49,7 +49,7 @@ namespace Cryo
         std::unique_ptr<ASTContext> _ast_context;
         std::unique_ptr<SymbolTable> _symbol_table;
         std::unique_ptr<DiagnosticManager> _diagnostic_manager;
-        std::unique_ptr<SymbolResolutionManager> _symbol_resolution_manager;
+        std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _symbol_resolution_manager;
         // TypeChecker must come AFTER ASTContext since it holds a reference to ast_context->types()
         std::unique_ptr<TypeChecker> _type_checker;
         std::unique_ptr<MonomorphizationPass> _monomorphization_pass;

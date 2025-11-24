@@ -30,11 +30,14 @@ namespace Cryo
         // Initialize Symbol Resolution Manager
         try
         {
-            _symbol_resolution_manager = std::make_unique<SymbolResolutionManager>(*_symbol_table);
+            auto context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(
+                _symbol_table.get(), 
+                &_ast_context->types());
+            _symbol_resolution_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(context.release());
         }
         catch (const std::exception &e)
         {
-            LOG_WARN(Cryo::LogComponent::COMPILER, "Failed to initialize Symbol Resolution Manager: {}", e.what());
+            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to initialize Symbol Resolution Manager: {}", e.what());
             _symbol_resolution_manager = nullptr;
         }
 
@@ -1845,7 +1848,7 @@ namespace Cryo
         if (_symbol_resolution_manager)
         {
             // Use SRM to generate qualified method name
-            QualifiedIdentifier qualified_id(scope_name, class_name + "::" + method_name);
+            Cryo::SRM::QualifiedIdentifier qualified_id(class_name + "::" + method_name, Cryo::SymbolKind::Function);
             return qualified_id.get_qualified_name();
         }
         else
