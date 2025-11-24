@@ -181,6 +181,10 @@ namespace Cryo
     X(E0903_UNHANDLED_EXCEPTION, 903)            \
     X(E0904_COMPILER_CONFIGURATION_ERROR, 904)   \
     X(E0905_SRM_MANAGER_UNAVAILABLE, 905)        \
+    X(E0906_SRM_TYPE_RESOLUTION_FAILED, 906)     \
+    X(E0907_METHOD_NOT_FOUND, 907)               \
+    X(E0908_SRM_METHOD_RESOLUTION_FAILED, 908)   \
+    X(E0909_SRM_CONSTRUCTOR_GENERATION_FAILED, 909) \
                                                  \
     /* Warning Codes (W0001-W9999) */            \
     X(W0001_UNUSED_VARIABLE, 10001)              \
