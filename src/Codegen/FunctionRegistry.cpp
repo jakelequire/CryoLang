@@ -403,7 +403,9 @@ namespace Cryo::Codegen
         metadata.namespace_scope = enum_name;
         metadata.is_variadic = false;
         metadata.requires_this_pointer = false;
-        metadata.description = "Enum constructor for " + enum_name + "::" + variant_name;
+        std::vector<std::string> enum_parts = {enum_name};
+        std::string qualified_variant = Cryo::SRM::Utils::build_qualified_name(enum_parts, variant_name);
+        metadata.description = "Enum constructor for " + qualified_variant;
 
         return metadata;
     }
@@ -482,7 +484,12 @@ namespace Cryo::Codegen
         else
         {
             // Fallback to manual concatenation
-            return resolved_namespace.empty() ? function_name : resolved_namespace + "::" + function_name;
+            if (resolved_namespace.empty()) {
+                return function_name;
+            } else {
+                std::vector<std::string> namespace_parts = {resolved_namespace};
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, function_name);
+            }
         }
     }
 

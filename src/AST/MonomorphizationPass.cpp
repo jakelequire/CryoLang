@@ -1,4 +1,5 @@
 #include "AST/MonomorphizationPass.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 #include "AST/TemplateRegistry.hpp"
 #include "AST/TypeChecker.hpp"
 #include "AST/ASTNode.hpp"
@@ -822,9 +823,12 @@ namespace Cryo
     {
         std::string result = type_string;
 
-        // Handle array types first (T[] -> int[])
+        // Handle array types first (T[] -> int[]) using SRM for consistent naming
         for (const auto &[generic_param, concrete_type] : type_substitutions)
         {
+            // Use SRM for array type pattern construction
+            auto array_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
+                std::vector<std::string>{}, generic_param, Cryo::TypeKind::Array);
             std::string array_pattern = generic_param + "[]";
             if (result == array_pattern)
             {

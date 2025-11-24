@@ -1854,13 +1854,15 @@ namespace Cryo
         if (_symbol_resolution_manager)
         {
             // Use SRM to generate qualified method name
-            Cryo::SRM::QualifiedIdentifier qualified_id(class_name + "::" + method_name, Cryo::SymbolKind::Function);
+            std::vector<std::string> class_parts = {class_name};
+            Cryo::SRM::QualifiedIdentifier qualified_id(class_parts, method_name, Cryo::SymbolKind::Function);
             return qualified_id.get_qualified_name();
         }
         else
         {
             // Fallback to manual concatenation
-            return scope_name + "::" + class_name + "::" + method_name;
+            std::vector<std::string> scope_parts = {scope_name, class_name};
+            return Cryo::SRM::Utils::build_qualified_name(scope_parts, method_name);
         }
     }
 
