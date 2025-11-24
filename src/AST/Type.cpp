@@ -2705,10 +2705,21 @@ namespace Cryo
 
     ParameterizedType *TypeRegistry::parse_and_instantiate(const std::string &type_string)
     {
-        auto [base_name, param_strs] = parse_generic_syntax(type_string);
 
-        if (param_strs.empty() || !has_template(base_name))
-        {
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate('{}') - starting", type_string);
+        auto [base_name, param_strs] = parse_generic_syntax(type_string);
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - parsed base_name='{}', param_count={}", base_name, param_strs.size());
+
+        if (param_strs.empty()) {
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - no parameters found for '{}'", type_string);
+            return nullptr;
+        }
+        
+        if (!has_template(base_name)) {
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - no template found for base_name='{}', available templates:", base_name);
+            for (const auto& [name, tmpl] : _templates) {
+                LOG_DEBUG(Cryo::LogComponent::AST, "  - Available template: '{}'", name);
+            }
             return nullptr;
         }
 

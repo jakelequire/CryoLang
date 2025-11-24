@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <optional>
 #include <algorithm>
+#include <iostream>
 #include "Utils/Logger.hpp"
 
 // Forward declarations
@@ -718,6 +719,12 @@ namespace Cryo
             if (!is_template() || concrete_types.size() != _param_names.size())
                 return nullptr;
 
+            // For user-defined generic types (like GenericStruct), preserve the original base name
+            if (_param_type_kind == TypeKind::Parameterized) {
+                // Use the constructor that takes base_name directly to preserve "GenericStruct" instead of "Unknown"
+                return std::make_shared<ParameterizedType>(name(), concrete_types);
+            }
+            
             return std::make_shared<ParameterizedType>(_param_type_kind, concrete_types);
         }
 
@@ -1365,5 +1372,10 @@ namespace Cryo
         
         // Helper to parse template parameters respecting nested angle brackets
         std::vector<std::string> parse_template_parameters(const std::string &params_str);
+
+        // Access all instantiations for TypeMapper registration
+        const std::unordered_map<std::string, std::shared_ptr<ParameterizedType>>& get_all_instantiations() const {
+            return _instantiations;
+        }
     };
 }

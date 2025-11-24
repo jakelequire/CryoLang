@@ -1001,19 +1001,19 @@ namespace Cryo
         // Only transform if this is not a stdlib module (not in "std" namespace)
         bool is_in_std_namespace = false;
         if (_srm_context) {
-            is_in_std_namespace = _srm_context->is_in_namespace("std");
+            // Check if we're in "std" namespace exactly OR any namespace starting with "std::"
+            is_in_std_namespace = _srm_context->is_in_namespace("std") || 
+                                 _current_namespace.starts_with("std::");
         } else {
             // Fallback to manual check
             is_in_std_namespace = _current_namespace.find("std::") != std::string::npos;
         }
         
-        if (func_name == "main" && !is_in_std_namespace)
+        if (func_name == "main")
         {
-            func_name = "_user_main_";
-            if (_diagnostic_manager)
+            if (!is_in_std_namespace)
             {
-                // Optional: Report the transformation for debugging
-                // std::cout << "[DEBUG] Transformed main() -> _user_main_()" << std::endl;
+                func_name = "_user_main_";
             }
         }
 
