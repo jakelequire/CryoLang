@@ -368,6 +368,9 @@ stdlib-tcp:
 stdlib-signal:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/process/signal.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/process/signal.bc
 
+stdlib-runtime:
+	@$(MAKE) runtime
+
 # =================================================================
 # RUNTIME COMPILATION
 # =================================================================
@@ -412,7 +415,7 @@ $(RUNTIME_BUILD_DIR)/%.bc: $(RUNTIME_DIR)/%.cryo $(MAIN_BIN) | $(RUNTIME_BUILD_D
 ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
 	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
-	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
+	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --debug --emit-llvm -c --stdlib-mode -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
 		echo "[RUNTIME] Compilation failed for $*.cryo" && \
 		exit 1 \
 	)
