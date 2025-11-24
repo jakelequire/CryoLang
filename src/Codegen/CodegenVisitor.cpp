@@ -1303,9 +1303,11 @@ namespace Cryo::Codegen
                 std::vector<llvm::Type *> param_types;
 
                 bool is_static = method->is_static();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method {} is_static: {}", qualified_name, is_static);
                 if (!is_static)
                 {
                     param_types.push_back(struct_ptr_type); // 'this' pointer
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added 'this' pointer for non-static method: {}", qualified_name);
                 }
 
                 // Add other parameters
@@ -1644,9 +1646,11 @@ namespace Cryo::Codegen
                 std::vector<llvm::Type *> param_types;
 
                 bool is_static = method->is_static();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class method {} is_static: {}", qualified_name, is_static);
                 if (!is_static)
                 {
                     param_types.push_back(class_ptr_type); // 'this' pointer only for non-static methods
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Added 'this' pointer for non-static class method: {}", qualified_name);
                 }
 
                 // Add other parameters
@@ -2365,31 +2369,48 @@ namespace Cryo::Codegen
             }
 
             // Use SRM helper to generate standardized qualified struct method name
-            std::string qualified_name = generate_method_name(target_type_name, method_name, parameter_types);
-
-            // For constructors, include parameter signature in the LLVM IR function name to match declaration
+            std::string qualified_name;
             bool is_constructor = (method_name == target_type_name); // Constructor has same name as struct
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Implementation method_name='{}', target_type_name='{}', is_constructor={}", method_name, target_type_name, is_constructor);
+            
             if (is_constructor)
             {
-                std::string param_signature = "(";
-                for (size_t i = 0; i < method->parameters().size(); ++i)
+                // For constructor implementations, use the declaration format (without parameter encoding)
+                // to match what new expressions expect
+                if (!_srm_manager) 
                 {
-                    if (i > 0)
-                        param_signature += ",";
-                    auto param = method->parameters()[i].get();
-                    if (param && param->get_resolved_type())
-                    {
-                        std::string param_type_str = param->get_resolved_type()->to_string();
-                        param_signature += normalize_type_for_signature(param_type_str);
-                    }
+                    auto namespace_parts = get_current_namespace_parts();
+                    if (namespace_parts.empty())
+                        qualified_name = target_type_name + "::" + method_name;
                     else
+                        qualified_name = Cryo::SRM::Utils::build_qualified_name(namespace_parts, target_type_name + "::" + method_name);
+                }
+                else 
+                {
+                    try
                     {
-                        param_signature += "unknown";
+                        auto namespace_parts = get_current_namespace_parts();
+                        auto identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
+                            namespace_parts, target_type_name, parameter_types);
+                        // Use constructor name format, not overload key, to match what new expressions expect
+                        qualified_name = identifier->to_constructor_name();
+                    }
+                    catch (const std::exception& e)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM constructor declaration generation failed: {}, using fallback", e.what());
+                        auto namespace_parts = get_current_namespace_parts();
+                        if (namespace_parts.empty())
+                            qualified_name = target_type_name + "::" + method_name;
+                        else
+                            qualified_name = Cryo::SRM::Utils::build_qualified_name(namespace_parts, target_type_name + "::" + method_name);
                     }
                 }
-                param_signature += ")";
-                qualified_name += param_signature;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor implementation LLVM IR name with signature: {}", qualified_name);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructor implementation uses declaration format: {}", qualified_name);
+            }
+            else
+            {
+                qualified_name = generate_method_name(target_type_name, method_name, parameter_types);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Method generate_method_name returned: {}", qualified_name);
             }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating method: {}", qualified_name);
@@ -3348,13 +3369,6 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::NewExpressionNode &node)
     {
-
-        
-        std::cout << "[CRYO DEBUG] NewExpression visit called for type: " << node.type_name() << std::endl;
-        std::cout << "[CRYO DEBUG] Generic args count: " << node.generic_args().size() << std::endl;
-        for (size_t i = 0; i < node.generic_args().size(); ++i) {
-            std::cout << "[CRYO DEBUG] Generic arg[" << i << "]: " << node.generic_args()[i] << std::endl;
-        }
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating new expression for type: '{}'", node.type_name());
 
         auto &context = _context_manager.get_context();
@@ -9771,7 +9785,26 @@ namespace Cryo::Codegen
                                     }
                                 }
 
-                                auto method_it = _functions.find(method_name);
+                                // Try to find method with parameter signature first (preferred)
+                                auto method_it = _functions.end();
+                                
+                                // First, try to find a version with parameter signature (contains parentheses)
+                                for (auto it = _functions.begin(); it != _functions.end(); ++it)
+                                {
+                                    if (it->first.find(method_name) == 0)
+                                    {
+                                        // Prefer methods with parameter signatures over bare names
+                                        if (it->first.find('(') != std::string::npos || method_it == _functions.end())
+                                        {
+                                            method_it = it;
+                                            if (it->first.find('(') != std::string::npos)
+                                            {
+                                                // Found version with parameters, use this one
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
 
                                 if (method_it != _functions.end())
                                 {
@@ -14990,22 +15023,22 @@ namespace Cryo::Codegen
 
         try
         {
-            auto namespace_parts = get_current_namespace_parts();
-            // Add the type name to the namespace parts for method scoping
-            namespace_parts.push_back(type_name);
+            // Use SRM to properly parse the qualified type name
+            auto [type_namespaces, base_type_name] = Cryo::SRM::Utils::parse_qualified_name(type_name);
             
+            // For method calls, use just the class name + method name format (RuntimeManager::deallocate)
+            // This matches how methods are registered in the function registry
             if (parameter_types.empty())
             {
-                // Simple method without parameters
-                auto identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
-                    namespace_parts, method_name, Cryo::SymbolKind::Function);
-                return identifier->to_string();
+                // Simple method without parameters - just use ClassName::methodName format
+                return base_type_name + "::" + method_name;
             }
             else
             {
-                // Method with parameters - create method identifier  
+                // Method with parameters - create method identifier with just class namespace
+                std::vector<std::string> class_namespace = {base_type_name};
                 auto identifier = std::make_unique<Cryo::SRM::FunctionIdentifier>(
-                    namespace_parts, method_name, parameter_types);
+                    class_namespace, method_name, parameter_types);
                 return identifier->to_overload_key();
             }
         }
