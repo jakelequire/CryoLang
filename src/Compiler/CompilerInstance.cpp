@@ -576,10 +576,18 @@ namespace Cryo
 
             return true;
         }
+        catch (const std::invalid_argument &e)
+        {
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "Invalid argument in analyze(): {}", e.what());
+            _diagnostic_manager->create_error(ErrorCode::E0504_NAMESPACE_CONFLICT,
+                                              SourceRange{}, _source_file, e.what());
+            return false;
+        }
         catch (const std::exception &e)
         {
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "Exception caught in analyze(): {}", e.what());
             _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, _source_file);
+                                              SourceRange{}, _source_file, e.what());
             return false;
         }
     }
@@ -1240,9 +1248,40 @@ namespace Cryo
 
                     if (!result.symbol_map.empty())
                     {
+                        // Register namespace for qualified access (e.g., IO::println)
                         current_scope->register_namespace(namespace_name, result.symbol_map);
                         _imported_namespaces.push_back(namespace_name); // Track for enhanced resolution
-                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered namespace '{}' with {} symbols",
+                        
+                        // Also register in SRM context for proper wildcard import resolution
+                        if (_symbol_resolution_manager && _symbol_resolution_manager->get_context()) {
+                            _symbol_resolution_manager->get_context()->add_imported_namespace(namespace_name);
+                            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added '{}' to SRM imported namespaces", namespace_name);
+                        }
+                        
+                        // TODO: Re-enable TypeChecker SRM synchronization after fixing crashes
+                        // Temporarily disabled due to compilation issues
+                        /*
+                        // TODO: Re-enable TypeChecker SRM synchronization after fixing crashes
+                        // Temporarily disabled due to compilation issues
+                        /*
+                        // Also register in TypeChecker's SRM context for proper symbol resolution during type checking
+                        if (_type_checker && _type_checker->get_srm_context())
+                        {
+                            _type_checker->get_srm_context()->add_imported_namespace(namespace_name);
+                            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added '{}' to TypeChecker SRM imported namespaces", namespace_name);
+                        }
+                        */
+                        
+                        // Also register symbols directly in current scope for unqualified access (e.g., println)
+                        // This enables wildcard imports to work with direct function calls
+                        for (const auto &[symbol_name, symbol] : result.symbol_map)
+                        {
+                            // Register each symbol directly in the current scope for unqualified access
+                            current_scope->declare_symbol(symbol_name, symbol.kind, symbol.declaration_location, symbol.data_type, scope_name);
+                            LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered wildcard symbol for unqualified access: {}", symbol_name);
+                        }
+                        
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered namespace '{}' with {} symbols (qualified and unqualified access)",
                                   namespace_name, result.symbol_map.size());
                     }
                     else

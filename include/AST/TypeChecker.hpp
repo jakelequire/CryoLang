@@ -315,6 +315,9 @@ namespace Cryo
 
         // Access to TypeContext for monomorphization
         TypeContext &get_type_context() { return _type_context; }
+        
+        // Access to SRM context for import resolution
+        Cryo::SRM::SymbolResolutionContext *get_srm_context() { return _srm_context.get(); }
 
         // Error and warning handling
         const std::vector<TypeError> &errors() const { return _errors; }

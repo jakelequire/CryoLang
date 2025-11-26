@@ -1059,8 +1059,31 @@ namespace Cryo::SRM {
             throw std::invalid_argument("Namespace name cannot be empty");
         }
         
-        if (!Utils::is_valid_identifier(namespace_name)) {
-            throw std::invalid_argument("Invalid namespace name: " + namespace_name);
+        // Split namespace by :: and validate each part
+        std::vector<std::string> parts;
+        std::string current_part;
+        
+        for (size_t i = 0; i < namespace_name.length(); ++i) {
+            if (namespace_name[i] == ':' && i + 1 < namespace_name.length() && namespace_name[i + 1] == ':') {
+                if (!current_part.empty()) {
+                    parts.push_back(current_part);
+                    current_part.clear();
+                }
+                ++i; // Skip the second colon
+            } else {
+                current_part += namespace_name[i];
+            }
+        }
+        
+        if (!current_part.empty()) {
+            parts.push_back(current_part);
+        }
+        
+        // Each part must be a valid identifier
+        for (const auto& part : parts) {
+            if (!Utils::is_valid_identifier(part)) {
+                throw std::invalid_argument("Invalid namespace name: " + namespace_name + " (invalid part: " + part + ")");
+            }
         }
     }
     
