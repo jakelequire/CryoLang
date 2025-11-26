@@ -43,6 +43,12 @@ namespace Cryo
         bool _in_implementation_block = false;
         std::string _current_namespace = "Global"; // Current namespace context
         int _scope_depth = 0;                      // Track nesting depth (0 = global scope)
+        
+        // Bracket depth tracking for improved error recovery
+        int _brace_depth = 0;                      // Track { } nesting
+        int _paren_depth = 0;                      // Track ( ) nesting
+        int _bracket_depth = 0;                    // Track [ ] nesting
+        size_t _tokens_consumed = 0;               // Track total tokens processed for diagnostics
 
         // Documentation comment collection
         std::vector<std::string> _pending_doc_comments; // Collected doc comments waiting to be attached
@@ -76,6 +82,12 @@ namespace Cryo
             if (_scope_depth > 0)
                 _scope_depth--;
         }
+        
+        // Bracket depth tracking (for error recovery)
+        int brace_depth() const { return _brace_depth; }
+        int paren_depth() const { return _paren_depth; }
+        int bracket_depth() const { return _bracket_depth; }
+        size_t tokens_consumed() const { return _tokens_consumed; }
 
         // Directive system
         void set_directive_registry(DirectiveRegistry *registry) { _directive_registry = registry; }
@@ -246,5 +258,14 @@ namespace Cryo
         // Enhanced diagnostic helper methods
         bool is_delimiter_token(TokenKind kind) const;
         char get_delimiter_char(TokenKind kind) const;
+        
+        // Error recovery helper methods
+        bool is_top_level_declaration_start(TokenKind kind) const;
+        bool is_statement_start(TokenKind kind) const;
+        bool is_forced_recovery_point(TokenKind kind) const;
+        
+        // Bracket depth management
+        void update_bracket_depth(TokenKind kind);
+        void reset_parsing_state();
     };
 }

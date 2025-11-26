@@ -281,6 +281,9 @@ namespace Cryo
 
     std::unique_ptr<ProgramNode> Parser::parse_program()
     {
+        // Reset parser state for clean parsing session
+        reset_parsing_state();
+        
         auto program = _builder.create_program_node(SourceLocation{});
 
         // Parse file-level directives before anything else
@@ -362,13 +365,17 @@ namespace Cryo
         } while (_current_token.is(TokenKind::TK_COMMENT) ||
                  _current_token.is(TokenKind::TK_DOC_COMMENT_BLOCK) ||
                  _current_token.is(TokenKind::TK_DOC_COMMENT_LINE)); // Skip all comment tokens
+        
+        // Update bracket depth tracking and token count
+        update_bracket_depth(_current_token.kind());
+        _tokens_consumed++;
     }
 
     bool Parser::match(TokenKind kind)
     {
         if (_current_token.is(kind))
         {
-            advance();
+            advance(); // This will automatically update bracket depth
             return true;
         }
         return false;
@@ -534,26 +541,242 @@ namespace Cryo
     }
     void Parser::synchronize()
     {
-        // Skip tokens until we find a statement boundary
+        LOG_DEBUG(LogComponent::PARSER, "Parser synchronization initiated at {}:{} (brace_depth={}, paren_depth={}, bracket_depth={})", 
+                  _current_token.location().line(), _current_token.location().column(),
+                  _brace_depth, _paren_depth, _bracket_depth);
+        
+        // Track starting position for diagnostic purposes
+        SourceLocation sync_start = _current_token.location();
+        size_t tokens_skipped = 0;
+        size_t sync_start_token_count = _tokens_consumed;
+        
+        // Enhanced error recovery with context-aware synchronization
         while (!is_at_end())
         {
-            if (_current_token.is(TokenKind::TK_SEMICOLON))
+            TokenKind current_kind = _current_token.kind();
+            
+            // ================================================================
+            // Primary Recovery Points - Natural Statement Boundaries
+            // ================================================================
+            
+            // Statement terminators
+            if (current_kind == TokenKind::TK_SEMICOLON)
             {
-                advance();
+                advance(); // Consume the semicolon
+                LOG_DEBUG(LogComponent::PARSER, "Synchronized on semicolon after skipping {} tokens", tokens_skipped);
                 return;
             }
-
-            // Check for statement start tokens
-            if (match({TokenKind::TK_KW_FUNCTION, TokenKind::TK_KW_CONST, TokenKind::TK_KW_MUT,
-                       TokenKind::TK_KW_TYPE, TokenKind::TK_KW_CLASS, TokenKind::TK_KW_IMPLEMENT,
-                       TokenKind::TK_KW_IF, TokenKind::TK_KW_WHILE, TokenKind::TK_KW_FOR,
-                       TokenKind::TK_KW_RETURN, TokenKind::TK_KW_BREAK, TokenKind::TK_KW_CONTINUE}))
+            
+            // Block boundaries (only at balanced bracket depth)
+            if (current_kind == TokenKind::TK_R_BRACE && _brace_depth <= 0)
             {
+                // Don't consume the closing brace - let the calling context handle it
+                LOG_DEBUG(LogComponent::PARSER, "Synchronized on closing brace after skipping {} tokens", tokens_skipped);
                 return;
             }
-
+            
+            // ================================================================
+            // Declaration Recovery Points 
+            // ================================================================
+            
+            // Top-level declarations (safe recovery points)
+            if (is_top_level_declaration_start(current_kind))
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Synchronized on top-level declaration '{}' after skipping {} tokens", 
+                          std::string(_current_token.text()), tokens_skipped);
+                return;
+            }
+            
+            // ================================================================
+            // Statement Recovery Points (Context-Aware)
+            // ================================================================
+            
+            // Control flow statements (safe within blocks)
+            if (is_statement_start(current_kind))
+            {
+                // Only synchronize on statement starts if we're not deeply nested in expressions
+                if (_paren_depth <= 0 && _bracket_depth <= 0)
+                {
+                    LOG_DEBUG(LogComponent::PARSER, "Synchronized on statement start '{}' after skipping {} tokens", 
+                              std::string(_current_token.text()), tokens_skipped);
+                    return;
+                }
+            }
+            
+            // ================================================================
+            // Special Context Recovery
+            // ================================================================
+            
+            // Implementation block boundaries
+            if (_in_implementation_block && current_kind == TokenKind::TK_KW_IMPLEMENT)
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Synchronized on implement block boundary after skipping {} tokens", tokens_skipped);
+                return;
+            }
+            
+            // Namespace boundaries (global scope recovery)
+            if (is_global_scope() && current_kind == TokenKind::TK_KW_NAMESPACE)
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Synchronized on namespace declaration after skipping {} tokens", tokens_skipped);
+                return;
+            }
+            
+            // ================================================================
+            // Bracket Depth Recovery
+            // ================================================================
+            
+            // Check for negative bracket depth indicating structural boundary
+            if (_brace_depth < 0)
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Synchronized on structural boundary (negative brace depth) after skipping {} tokens", tokens_skipped);
+                return;
+            }
+            
+            // ================================================================
+            // Emergency Recovery - Prevent Infinite Loops
+            // ================================================================
+            
+            // Prevent excessive token skipping (likely indicates a deeper issue)
+            if (tokens_skipped > 50)
+            {
+                LOG_WARN(LogComponent::PARSER, "Emergency synchronization: skipped {} tokens without finding recovery point", tokens_skipped);
+                
+                // Report a diagnostic about potential structural issues
+                if (_diagnostic_manager)
+                {
+                    SourceRange error_range(sync_start, _current_token.location());
+                    auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0115_PARSE_RECOVERY_FAILED, error_range, _source_file);
+                    diagnostic.add_note("Parser unable to recover from syntax error - possible structural issue in code");
+                    diagnostic.add_note("Consider checking for unmatched braces, parentheses, or missing semicolons");
+                    diagnostic.add_note("Current nesting: " + std::to_string(_brace_depth) + " braces, " + 
+                                       std::to_string(_paren_depth) + " parentheses, " + 
+                                       std::to_string(_bracket_depth) + " brackets");
+                    diagnostic.add_note("Large-scale syntax errors may require manual review of the surrounding code");
+                }
+                
+                // Force recovery at next reasonable boundary
+                while (!is_at_end() && !is_forced_recovery_point(_current_token.kind()))
+                {
+                    advance();
+                }
+                return;
+            }
+            
+            // Continue advancing and tracking
             advance();
+            tokens_skipped++;
         }
+        
+        // EOF reached during synchronization
+        LOG_DEBUG(LogComponent::PARSER, "Synchronization reached EOF after skipping {} tokens (final depths: brace={}, paren={}, bracket={})", 
+                  tokens_skipped, _brace_depth, _paren_depth, _bracket_depth);
+    }
+
+    // ================================================================
+    // Bracket Depth Management Methods
+    // ================================================================
+
+    void Parser::update_bracket_depth(TokenKind kind)
+    {
+        switch (kind)
+        {
+            case TokenKind::TK_L_BRACE:
+                _brace_depth++;
+                break;
+            case TokenKind::TK_R_BRACE:
+                _brace_depth--;
+                break;
+            case TokenKind::TK_L_PAREN:
+                _paren_depth++;
+                break;
+            case TokenKind::TK_R_PAREN:
+                _paren_depth--;
+                break;
+            case TokenKind::TK_L_SQUARE:
+                _bracket_depth++;
+                break;
+            case TokenKind::TK_R_SQUARE:
+                _bracket_depth--;
+                break;
+            default:
+                // No bracket depth change for other tokens
+                break;
+        }
+        
+        // Log significant depth changes for debugging
+        if (kind == TokenKind::TK_L_BRACE || kind == TokenKind::TK_R_BRACE)
+        {
+            LOG_TRACE(LogComponent::PARSER, "Brace depth changed to {} at {}:{}", 
+                      _brace_depth, _current_token.location().line(), _current_token.location().column());
+        }
+    }
+
+    void Parser::reset_parsing_state()
+    {
+        _brace_depth = 0;
+        _paren_depth = 0;
+        _bracket_depth = 0;
+        _tokens_consumed = 0;
+        _scope_depth = 0;
+        _in_implementation_block = false;
+        
+        LOG_DEBUG(LogComponent::PARSER, "Parser state reset - all depths and counters cleared");
+    }
+
+    // ================================================================
+    // Error Recovery Helper Methods
+    // ================================================================
+
+    bool Parser::is_top_level_declaration_start(TokenKind kind) const
+    {
+        return kind == TokenKind::TK_KW_FUNCTION ||
+               kind == TokenKind::TK_KW_TYPE ||
+               kind == TokenKind::TK_KW_CLASS ||
+               kind == TokenKind::TK_KW_STRUCT ||
+               kind == TokenKind::TK_KW_ENUM ||
+               kind == TokenKind::TK_KW_TRAIT ||
+               kind == TokenKind::TK_KW_INTERFACE ||
+               kind == TokenKind::TK_KW_IMPLEMENT ||
+               kind == TokenKind::TK_KW_EXTERN ||
+               kind == TokenKind::TK_KW_INTRINSIC ||
+               kind == TokenKind::TK_KW_IMPORT ||
+               kind == TokenKind::TK_KW_NAMESPACE ||
+               kind == TokenKind::TK_KW_MODULE ||
+               kind == TokenKind::TK_KW_PUBLIC ||
+               kind == TokenKind::TK_KW_PRIVATE ||
+               kind == TokenKind::TK_KW_STATIC;
+    }
+    
+    bool Parser::is_statement_start(TokenKind kind) const
+    {
+        return kind == TokenKind::TK_KW_CONST ||
+               kind == TokenKind::TK_KW_MUT ||
+               kind == TokenKind::TK_KW_IF ||
+               kind == TokenKind::TK_KW_ELIF ||
+               kind == TokenKind::TK_KW_ELSE ||
+               kind == TokenKind::TK_KW_WHILE ||
+               kind == TokenKind::TK_KW_FOR ||
+               kind == TokenKind::TK_KW_MATCH ||
+               kind == TokenKind::TK_KW_SWITCH ||
+               kind == TokenKind::TK_KW_CASE ||
+               kind == TokenKind::TK_KW_DEFAULT ||
+               kind == TokenKind::TK_KW_RETURN ||
+               kind == TokenKind::TK_KW_BREAK ||
+               kind == TokenKind::TK_KW_CONTINUE ||
+               kind == TokenKind::TK_KW_TRY ||
+               kind == TokenKind::TK_KW_CATCH ||
+               kind == TokenKind::TK_KW_THROW ||
+               kind == TokenKind::TK_KW_WITH ||
+               kind == TokenKind::TK_KW_YIELD;
+    }
+    
+    bool Parser::is_forced_recovery_point(TokenKind kind) const
+    {
+        return kind == TokenKind::TK_KW_FUNCTION ||
+               kind == TokenKind::TK_KW_CLASS ||
+               kind == TokenKind::TK_KW_NAMESPACE ||
+               kind == TokenKind::TK_KW_IMPORT ||
+               kind == TokenKind::TK_EOF;
     }
 
     // Type parsing

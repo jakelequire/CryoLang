@@ -46,6 +46,7 @@ namespace Cryo
     X(E0112_UNEXPECTED_EOF, 112)                 \
     X(E0113_INVALID_PATTERN, 113)                \
     X(E0114_DUPLICATE_DEFAULT, 114)              \
+    X(E0115_PARSE_RECOVERY_FAILED, 115)          \
                                                  \
     /* Type Checking Errors (E0200-E0399) */     \
     X(E0200_TYPE_MISMATCH, 200)                  \
