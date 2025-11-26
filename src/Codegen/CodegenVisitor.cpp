@@ -9545,6 +9545,48 @@ namespace Cryo::Codegen
             // Handle simple function name
             function_name = identifier->name();
             resolved_function_name = function_name;
+            
+            // Try wildcard import resolution for unqualified function names
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Attempting wildcard import resolution for unqualified function: {}", function_name);
+            
+            // Get actual imported namespaces from SRM context instead of hardcoded list
+            const auto& imported_namespaces = _srm_context->get_imported_namespaces();
+            std::vector<std::string> wildcard_namespaces(imported_namespaces.begin(), imported_namespaces.end());
+            
+            // Add namespace aliases as well
+            const auto& namespace_aliases = _srm_context->get_namespace_aliases();
+            for (const auto& [alias, full_namespace] : namespace_aliases) {
+                wildcard_namespaces.push_back(alias);
+                wildcard_namespaces.push_back(full_namespace);
+            }
+            
+            // Log available namespaces for debugging
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available imported namespaces for wildcard resolution: [{}]", 
+                     [&wildcard_namespaces]() {
+                         std::string ns_list;
+                         for (size_t i = 0; i < wildcard_namespaces.size(); ++i) {
+                             if (i > 0) ns_list += ", ";
+                             ns_list += wildcard_namespaces[i];
+                         }
+                         return ns_list;
+                     }());
+            
+            if (!wildcard_namespaces.empty()) {
+                Symbol* resolved_symbol = _symbol_table.lookup_symbol_with_import_resolution(function_name, wildcard_namespaces);
+                if (resolved_symbol && resolved_symbol->kind == SymbolKind::Function) {
+                    // Found function through wildcard import resolution - construct qualified name
+                    if (resolved_symbol->scope != "Global" && !resolved_symbol->scope.empty()) {
+                        resolved_function_name = resolved_symbol->scope + "::" + resolved_symbol->name;
+                    } else {
+                        resolved_function_name = resolved_symbol->name;
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution succeeded: '{}' -> '{}'", function_name, resolved_function_name);
+                } else {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution failed for '{}'", function_name);
+                }
+            } else {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No imported namespaces available for wildcard resolution");
+            }
 
             // Check if this is a primitive type constructor (e.g., i64, i32, f64, etc.)
             if (is_primitive_constructor(function_name))
@@ -11542,6 +11584,41 @@ namespace Cryo::Codegen
 
             symbol = _symbol_table.lookup_qualified_symbol_with_import_shortcuts(c_name, imported_namespaces);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Enhanced import resolution for '{}': {}", c_name, (symbol ? "FOUND" : "NOT FOUND"));
+        }
+
+        // Try wildcard import resolution - check if symbol is available through imported namespaces
+        if (!symbol)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying wildcard import resolution...");
+            
+            // Get actual imported namespaces from SRM context instead of hardcoded list
+            const auto& imported_namespaces = _srm_context->get_imported_namespaces();
+            std::vector<std::string> wildcard_namespaces(imported_namespaces.begin(), imported_namespaces.end());
+            
+            // Add namespace aliases as well
+            const auto& namespace_aliases = _srm_context->get_namespace_aliases();
+            for (const auto& [alias, full_namespace] : namespace_aliases) {
+                wildcard_namespaces.push_back(alias);
+                wildcard_namespaces.push_back(full_namespace);
+            }
+            
+            // Log available namespaces for debugging
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Available imported namespaces for wildcard resolution: [{}]", 
+                     [&wildcard_namespaces]() {
+                         std::string ns_list;
+                         for (size_t i = 0; i < wildcard_namespaces.size(); ++i) {
+                             if (i > 0) ns_list += ", ";
+                             ns_list += wildcard_namespaces[i];
+                         }
+                         return ns_list;
+                     }());
+            
+            if (!wildcard_namespaces.empty()) {
+                symbol = _symbol_table.lookup_symbol_with_import_resolution(symbol_name, wildcard_namespaces);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution for '{}': {}", symbol_name, (symbol ? "FOUND" : "NOT FOUND"));
+            } else {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No imported namespaces available for wildcard resolution");
+            }
         }
 
         // Check if this is a type constructor call (e.g., "MyClass()")
