@@ -335,8 +335,27 @@ namespace Cryo::SRM {
     }
     
     std::string SymbolResolutionContext::resolve_namespace_alias(const std::string& alias) const {
+        // First check explicit aliases
         auto it = namespace_aliases_.find(alias);
-        return (it != namespace_aliases_.end()) ? it->second : alias;
+        if (it != namespace_aliases_.end()) {
+            return it->second;
+        }
+        
+        // Check if this is an imported namespace that should be treated as an alias
+        // For imports like "import Types from <net/types>", "Types" should resolve to "std::net::Types"
+        for (const auto& imported_ns : imported_namespaces_) {
+            // Extract the last part of the imported namespace
+            size_t last_colon = imported_ns.find_last_of("::");
+            std::string ns_suffix = (last_colon != std::string::npos) ? 
+                imported_ns.substr(last_colon + 2) : imported_ns;
+            
+            if (ns_suffix == alias) {
+                return imported_ns;
+            }
+        }
+        
+        // No resolution found
+        return alias;
     }
     
     bool SymbolResolutionContext::has_namespace_alias(const std::string& alias) const {
@@ -362,13 +381,34 @@ namespace Cryo::SRM {
         
         std::vector<std::unique_ptr<QualifiedIdentifier>> candidates;
         
-        // Add current namespace path
-        candidates.push_back(std::make_unique<QualifiedIdentifier>(namespace_stack_, symbol_name, kind));
-        
-        // Add imported namespaces
-        for (const auto& imported_ns : imported_namespaces_) {
-            auto ns_parts = Utils::parse_qualified_name(imported_ns).first;
-            candidates.push_back(std::make_unique<QualifiedIdentifier>(ns_parts, symbol_name, kind));
+        // Check if this is a qualified name (contains ::)
+        if (symbol_name.find("::") != std::string::npos) {
+            auto parsed = Utils::parse_qualified_name(symbol_name);
+            std::vector<std::string> ns_parts = parsed.first;
+            std::string simple_name = parsed.second;
+            
+            // Resolve the first namespace part if it's an alias
+            if (!ns_parts.empty()) {
+                std::string resolved_first = resolve_namespace_alias(ns_parts[0]);
+                if (resolved_first != ns_parts[0]) {
+                    // Replace the first part with the resolved namespace
+                    auto resolved_parts = Utils::parse_qualified_name(resolved_first).first;
+                    resolved_parts.insert(resolved_parts.end(), ns_parts.begin() + 1, ns_parts.end());
+                    candidates.push_back(std::make_unique<QualifiedIdentifier>(resolved_parts, simple_name, kind));
+                }
+            }
+            
+            // Also add the original qualified name as-is
+            candidates.push_back(std::make_unique<QualifiedIdentifier>(ns_parts, simple_name, kind));
+        } else {
+            // Add current namespace path
+            candidates.push_back(std::make_unique<QualifiedIdentifier>(namespace_stack_, symbol_name, kind));
+            
+            // Add imported namespaces
+            for (const auto& imported_ns : imported_namespaces_) {
+                auto ns_parts = Utils::parse_qualified_name(imported_ns).first;
+                candidates.push_back(std::make_unique<QualifiedIdentifier>(ns_parts, symbol_name, kind));
+            }
         }
         
         // Add parent namespace scopes
@@ -519,6 +559,29 @@ namespace Cryo::SRM {
     
     std::string SymbolResolutionManager::generate_template_name(const TypeIdentifier& identifier) const {
         return identifier.to_template_name();
+    }
+    
+    std::string SymbolResolutionManager::generate_constructor_name(
+        const TypeIdentifier& type_id,
+        const std::vector<Cryo::Type*>& param_types) const {
+        
+        // Build the constructor name with full namespace qualification
+        std::string type_name = type_id.to_string();
+        
+        // Constructor name is the same as the type name
+        std::string constructor_name = type_name + "(";
+        
+        for (size_t i = 0; i < param_types.size(); ++i) {
+            if (i > 0) constructor_name += ",";
+            constructor_name += param_types[i] ? param_types[i]->name() : "unknown";
+        }
+        constructor_name += ")";
+        
+        return constructor_name;
+    }
+    
+    std::string SymbolResolutionManager::generate_default_constructor_name(const TypeIdentifier& type_id) const {
+        return generate_constructor_name(type_id, {});
     }
     
     std::vector<std::string> SymbolResolutionManager::generate_lookup_candidates(
@@ -763,13 +826,24 @@ namespace Cryo::SRM {
                     current_part = qualified_name.substr(pos);
                     break;
                 } else {
-                    parts.push_back(qualified_name.substr(pos, next_pos - pos));
+                    std::string part = qualified_name.substr(pos, next_pos - pos);
+                    if (!part.empty()) {  // Only add non-empty parts
+                        parts.push_back(part);
+                    }
                     pos = next_pos + 2;
                 }
             }
             
-            // Last part is the symbol name
-            std::string symbol_name = current_part;
+            // Last part is the symbol name - use current_part if not empty, otherwise last part from vector
+            std::string symbol_name;
+            if (!current_part.empty()) {
+                symbol_name = current_part;
+            } else if (!parts.empty()) {
+                symbol_name = parts.back();
+                parts.pop_back();
+            } else {
+                symbol_name = qualified_name; // Fallback for malformed names
+            }
             
             return std::make_pair(parts, symbol_name);
         }

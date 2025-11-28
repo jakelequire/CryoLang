@@ -356,6 +356,7 @@ namespace Cryo
         std::string generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types);
         std::string generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind);
         std::vector<std::string> get_current_namespace_parts() const;
+        std::string resolve_module_path_to_namespace(const std::string& module_path) const;
 
         // Visitor methods - Program
         void visit(ProgramNode &node) override;
@@ -364,6 +365,7 @@ namespace Cryo
         void visit(VariableDeclarationNode &node) override;
         void visit(FunctionDeclarationNode &node) override;
         void visit(IntrinsicDeclarationNode &node) override;
+        void visit(ImportDeclarationNode &node) override;
         void visit(StructDeclarationNode &node) override;
         void visit(ClassDeclarationNode &node) override;
         void visit(TraitDeclarationNode &node) override;
