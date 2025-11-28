@@ -244,7 +244,7 @@ build: $(MAIN_BIN)
 clean:
 	@$(PYTHON) ./scripts/clean.py
 ifeq ($(OS), Windows_NT)
-	@$(MAKE) -C tools/CryoLSP clean >nul 2>nul || cd .
+	@$(MAKE) -C tools/CryoLSP clean || cd .
 	@if exist "$(subst /,\,$(STDLIB_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(STDLIB_BUILD_DIR))"
 	@if exist "$(subst /,\,$(RUNTIME_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(RUNTIME_BUILD_DIR))"
 else

@@ -82,10 +82,28 @@ namespace Cryo
 
     Symbol *SymbolTable::lookup_namespaced_symbol_with_context(const std::string &namespace_name, const std::string &symbol_name, const std::string &current_namespace) const
     {
-        // First try exact match
-        Symbol *result = lookup_namespaced_symbol(namespace_name, symbol_name);
+        // First check if namespace_name is an alias in SRM
+        std::string resolved_namespace = namespace_name;
+        auto srm_manager = get_srm_manager();
+        if (srm_manager) {
+            auto context = srm_manager->get_context();
+            if (context && context->has_namespace_alias(namespace_name)) {
+                resolved_namespace = context->resolve_namespace_alias(namespace_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved namespace alias '{}' -> '{}'", namespace_name, resolved_namespace);
+            }
+        }
+
+        // Try exact match with resolved namespace
+        Symbol *result = lookup_namespaced_symbol(resolved_namespace, symbol_name);
         if (result)
             return result;
+
+        // If that failed and we didn't resolve an alias, try the original namespace
+        if (resolved_namespace != namespace_name) {
+            result = lookup_namespaced_symbol(namespace_name, symbol_name);
+            if (result)
+                return result;
+        }
 
         // If in a namespace, try relative resolution
         if (!current_namespace.empty() && current_namespace != "Global")
@@ -101,7 +119,7 @@ namespace Cryo
                 std::string parent_namespace = current_namespace.substr(0, last_scope - 1);
 
                 // Try parent::namespace_name (e.g., "std" + "::" + "Syscall" = "std::Syscall")
-                std::string qualified_namespace = Cryo::SRM::Utils::build_qualified_name({parent_namespace}, namespace_name);
+                std::string qualified_namespace = Cryo::SRM::Utils::build_qualified_name({parent_namespace}, resolved_namespace);
                 result = lookup_namespaced_symbol(qualified_namespace, symbol_name);
 
                 LOG_TRACE(Cryo::LogComponent::AST, "Trying relative resolution: {}::{} (from context {})",

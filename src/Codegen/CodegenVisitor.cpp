@@ -15453,10 +15453,36 @@ namespace Cryo::Codegen
         {
             auto namespace_parts = get_current_namespace_parts();
             
-            // For constructors, the constructor name is the same as the type name
-            auto identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
-                namespace_parts, type_name, parameter_types);
-            return identifier->to_overload_key();
+            // Check if type_name is qualified (contains ::)
+            if (type_name.find("::") != std::string::npos) {
+                // Parse the qualified name to get namespace and type name
+                auto parsed = Cryo::SRM::Utils::parse_qualified_name(type_name);
+                std::vector<std::string> type_namespaces = parsed.first;
+                std::string simple_type_name = parsed.second;
+                
+                // Resolve namespace aliases through SRM context
+                if (!type_namespaces.empty() && _srm_context) {
+                    std::string first_ns = type_namespaces[0];
+                    std::string resolved_first = _srm_context->resolve_namespace_alias(first_ns);
+                    
+                    if (resolved_first != first_ns) {
+                        // Replace first namespace with resolved version
+                        auto resolved_parts = Cryo::SRM::Utils::parse_qualified_name(resolved_first).first;
+                        type_namespaces.erase(type_namespaces.begin());
+                        type_namespaces.insert(type_namespaces.begin(), resolved_parts.begin(), resolved_parts.end());
+                    }
+                }
+                
+                // Create constructor with resolved namespace
+                auto identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
+                    type_namespaces, simple_type_name, parameter_types);
+                return identifier->to_overload_key();
+            } else {
+                // For unqualified names, use current namespace
+                auto identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
+                    namespace_parts, type_name, parameter_types);
+                return identifier->to_overload_key();
+            }
         }
         catch (const std::exception& e)
         {

@@ -2415,6 +2415,62 @@ namespace Cryo
             node.declaration()->accept(*this);
         }
     }
+    
+    void TypeChecker::visit(ImportDeclarationNode &node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing import: {} (type: {})", 
+                  node.path(), node.has_alias() ? "with alias" : "standard");
+        
+        if (node.has_alias())
+        {
+            // Traditional import with alias: import <path> as alias;
+            std::string alias_name = node.alias();
+            std::string full_path = node.path();
+            
+            LOG_DEBUG(Cryo::LogComponent::AST, "Import with alias: {} as {}", full_path, alias_name);
+            
+            // Register the alias in symbol table and SRM
+            if (_srm_context) {
+                std::string namespace_path = resolve_module_path_to_namespace(full_path);
+                _srm_context->register_namespace_alias(alias_name, namespace_path);
+            }
+        }
+        else if (node.is_specific_import())
+        {
+            // Specific import: import IO from <path>; or import IO, Function from <path>;
+            auto specific_imports = node.specific_imports();
+            std::string module_path = node.path();
+            
+            LOG_DEBUG(Cryo::LogComponent::AST, "Specific imports from {}", module_path);
+            
+            // Convert module path to namespace (e.g., "net/types" -> "std::net::Types")
+            std::string namespace_path = resolve_module_path_to_namespace(module_path);
+            
+            for (const auto& import_name : specific_imports)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "  - {}", import_name);
+                
+                // Register each specific import as an alias to the target namespace
+                // For "import Types from <net/types>", register "Types" -> "std::net::Types"
+                if (_srm_context) {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Registering namespace alias: '{}' -> '{}'", import_name, namespace_path);
+                    _srm_context->register_namespace_alias(import_name, namespace_path);
+                }
+            }
+        }
+        else
+        {
+            // Wildcard import: import <path>;
+            std::string module_path = node.path();
+            LOG_DEBUG(Cryo::LogComponent::AST, "Wildcard import from {}", module_path);
+            
+            // Add the namespace to imported namespaces for wildcard resolution
+            if (_srm_context) {
+                std::string namespace_path = resolve_module_path_to_namespace(module_path);
+                _srm_context->add_imported_namespace(namespace_path);
+            }
+        }
+    }
 
     //===----------------------------------------------------------------------===//
     // Expression Visitors
@@ -2477,6 +2533,41 @@ namespace Cryo
             // TODO: Create proper function types for primitive constructors
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
+        }
+
+        // Check if this is a qualified name (contains ::) that needs namespace alias resolution
+        if (name.find("::") != std::string::npos && _srm_context)
+        {
+            auto parsed = Cryo::SRM::Utils::parse_qualified_name(name);
+            std::vector<std::string> ns_parts = parsed.first;
+            std::string simple_name = parsed.second;
+            
+            // Resolve the first namespace part if it's an alias
+            if (!ns_parts.empty())
+            {
+                std::string resolved_first = _srm_context->resolve_namespace_alias(ns_parts[0]);
+                if (resolved_first != ns_parts[0])
+                {
+                    // Replace the first part with the resolved namespace
+                    auto resolved_parts = Cryo::SRM::Utils::parse_qualified_name(resolved_first).first;
+                    resolved_parts.insert(resolved_parts.end(), ns_parts.begin() + 1, ns_parts.end());
+                    
+                    // Build the new qualified name
+                    std::string resolved_name = Cryo::SRM::Utils::build_qualified_name(resolved_parts, simple_name);
+                    
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Resolved alias '{}' -> '{}' for identifier '{}'", 
+                              ns_parts[0], resolved_first, resolved_name);
+                    
+                    // Try to look up the resolved qualified name
+                    TypedSymbol *symbol = _symbol_table->lookup_symbol(resolved_name);
+                    if (symbol && symbol->type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found qualified identifier '{}' with type '{}'", resolved_name, symbol->type->name());
+                        node.set_resolved_type(symbol->type);
+                        return;
+                    }
+                }
+            }
         }
 
         TypedSymbol *symbol = _symbol_table->lookup_symbol(name);
@@ -4487,10 +4578,22 @@ namespace Cryo
         const std::string &scope_name = node.scope_name();
         const std::string &member_name = node.member_name();
 
+        // Resolve namespace aliases if using SRM
+        std::string resolved_scope = scope_name;
+        if (_srm_context)
+        {
+            resolved_scope = _srm_context->resolve_namespace_alias(scope_name);
+            if (resolved_scope != scope_name)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved scope alias '{}' -> '{}' for member '{}'", 
+                          scope_name, resolved_scope, member_name);
+            }
+        }
+
         // Try namespace lookup first using our new namespace support with context
         if (_main_symbol_table)
         {
-            Symbol *symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(scope_name, member_name, _current_namespace);
+            Symbol *symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(resolved_scope, member_name, _current_namespace);
             if (symbol)
             {
                 // Found in namespace - this is what we want for imports like CryoTest::test_import_function
@@ -4510,19 +4613,19 @@ namespace Cryo
                     }
                     node.set_type(type_name);
                     LOG_DEBUG(Cryo::LogComponent::AST, "Resolved namespace symbol: {}::{} with generic type: {} (context: {})",
-                              scope_name, member_name, type_name, _current_namespace);
+                              resolved_scope, member_name, type_name, _current_namespace);
                 }
                 return;
             }
 
             // Check if this is a multi-level scope like "Syscall::IO" where we need to look up
             // the class "IO" within the namespace "Syscall" (with context resolution)
-            size_t last_scope = scope_name.find_last_of(':');
+            size_t last_scope = resolved_scope.find_last_of(':');
             if (last_scope != std::string::npos && last_scope >= 1)
             {
                 // Split "Syscall::IO" into namespace="Syscall" and class_name="IO"
-                std::string namespace_part = scope_name.substr(0, last_scope - 1); // "Syscall"
-                std::string class_name = scope_name.substr(last_scope + 1);        // "IO"
+                std::string namespace_part = resolved_scope.substr(0, last_scope - 1); // "Syscall"
+                std::string class_name = resolved_scope.substr(last_scope + 1);        // "IO"
 
                 // Trying multi-level resolution
 
@@ -7446,6 +7549,49 @@ namespace Cryo
             }
         }
         return namespace_parts;
+    }
+    
+    std::string TypeChecker::resolve_module_path_to_namespace(const std::string& module_path) const
+    {
+        // Handle special module path mappings first
+        if (module_path == "io/stdio") {
+            return "std::IO";
+        }
+        if (module_path == "net/types") {
+            return "std::net::Types";
+        }
+        if (module_path == "net/tcp") {
+            return "std::net::TCP";
+        }
+        if (module_path == "net/http") {
+            return "std::net::HTTP";
+        }
+        if (module_path == "core/types") {
+            return "std";  // Core types are in std namespace
+        }
+        
+        // Convert module path like "collections/vector" to "std::collections::Vector" 
+        std::string namespace_path = "std";
+        
+        std::string path = module_path;
+        size_t start = 0;
+        size_t end = path.find('/');
+        
+        while (end != std::string::npos) {
+            std::string segment = path.substr(start, end - start);
+            namespace_path += "::" + segment;
+            start = end + 1;
+            end = path.find('/', start);
+        }
+        
+        // Add the final segment with capitalized first letter
+        std::string final_segment = path.substr(start);
+        if (!final_segment.empty()) {
+            final_segment[0] = std::toupper(final_segment[0]);
+            namespace_path += "::" + final_segment;
+        }
+        
+        return namespace_path;
     }
 
 }
