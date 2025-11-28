@@ -446,6 +446,9 @@ namespace Cryo::Codegen
         // Cross-module enum loading
         void load_enum_variants_from_namespace(const std::string &namespace_name);
         
+        // Cross-module global constant loading
+        void load_global_constants_from_namespace(const std::string &namespace_name);
+        
         // Cross-module constructor declaration
         void declare_imported_constructors(const Cryo::ImportDeclarationNode &import_node);
 

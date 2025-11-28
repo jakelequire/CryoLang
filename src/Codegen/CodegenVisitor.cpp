@@ -489,6 +489,10 @@ namespace Cryo::Codegen
             load_enum_variants_from_namespace("Types");
             load_enum_variants_from_namespace("std::net::Types");
             
+            // Load global constants from the Types module
+            load_global_constants_from_namespace("Types");
+            load_global_constants_from_namespace("std::net::Types");
+            
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished loading enum variants from Types module");
         }
         
@@ -5170,6 +5174,81 @@ namespace Cryo::Codegen
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Enum variant '{}' NOT FOUND in _enum_variants", qualified_name);
+        
+        // If not found as enum variant, try to find as global constant
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Checking for global constant: '{}'", member_name);
+        auto module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+        
+        llvm::GlobalVariable* global_var = module->getNamedGlobal(member_name);
+        if (global_var) {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Found global constant '{}' in current module", member_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Global variable type: {}", global_var->getValueType()->getTypeID());
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Global variable has initializer: {}", global_var->hasInitializer());
+            
+            // Find the original Cryo type for this global constant from imported ASTs
+            Cryo::Type* cryo_type = nullptr;
+            if (_imported_asts) {
+                for (const auto &[module_path, program_ast] : *_imported_asts) {
+                    if (!program_ast) continue;
+                    
+                    std::function<void(Cryo::ASTNode*)> search_for_constant_type = [&](Cryo::ASTNode* ast_node) {
+                        if (!ast_node || cryo_type) return;
+                        
+                        if (auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(ast_node)) {
+                            if (!var_decl->is_mutable() && var_decl->is_global() && var_decl->name() == member_name) {
+                                cryo_type = var_decl->get_resolved_type();
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Found Cryo type for global constant '{}': {}", 
+                                         member_name, cryo_type ? cryo_type->to_string() : "null");
+                                return;
+                            }
+                        }
+                        
+                        // Recursively search child nodes based on node type
+                        if (auto program_node = dynamic_cast<Cryo::ProgramNode*>(ast_node)) {
+                            for (const auto& stmt : program_node->statements()) {
+                                search_for_constant_type(stmt.get());
+                            }
+                        } else if (auto block_node = dynamic_cast<Cryo::BlockStatementNode*>(ast_node)) {
+                            for (const auto& stmt : block_node->statements()) {
+                                search_for_constant_type(stmt.get());
+                            }
+                        } else if (auto decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode*>(ast_node)) {
+                            if (decl_stmt->declaration()) {
+                                search_for_constant_type(decl_stmt->declaration());
+                            }
+                        } else if (auto func_decl = dynamic_cast<Cryo::FunctionDeclarationNode*>(ast_node)) {
+                            if (func_decl->body()) {
+                                search_for_constant_type(func_decl->body());
+                            }
+                        }
+                    };
+                    
+                    search_for_constant_type(program_ast.get());
+                }
+            }
+            
+            // For global constants, load them regardless of whether they have initializers
+            // External constants won't have initializers in this module but should still be loadable
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Loading value from global constant (initialized={}, external={})", 
+                     global_var->hasInitializer(), global_var->hasExternalLinkage());
+            
+            // Load the value from the global constant
+            llvm::Value* loaded_value = builder.CreateLoad(global_var->getValueType(), global_var, member_name + ".load");
+            
+            // Set the Cryo type on the AST node if we found it
+            if (cryo_type) {
+                const_cast<Cryo::ScopeResolutionNode&>(node).set_resolved_type(cryo_type);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Set Cryo type '{}' on ScopeResolutionNode", cryo_type->to_string());
+            }
+            
+            set_current_value(loaded_value);
+            register_value(&node, loaded_value);
+            return;
+        } else {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Global constant '{}' NOT found in current module", member_name);
+        }
+        
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Available enum variants:");
         for (const auto &[key, value] : _enum_variants)
         {
@@ -14957,6 +15036,123 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished loading enum variants from namespace: {} using AST extraction", namespace_name);
     }
 
+    void CodegenVisitor::load_global_constants_from_namespace(const std::string &namespace_name)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Loading global constants from namespace: {} using AST extraction", namespace_name);
+        
+        if (!_imported_asts)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "No imported ASTs available for global constant extraction");
+            return;
+        }
+        
+        auto &llvm_context = _context_manager.get_context();
+        auto module = _context_manager.get_module();
+        
+        // Search through imported ASTs for global constant declarations
+        for (const auto &[module_path, program_ast] : *_imported_asts)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Searching module '{}' for global constant declarations", module_path);
+            
+            if (!program_ast)
+            {
+                continue;
+            }
+            
+            // First pass: Register struct definitions from imported module
+            std::function<void(Cryo::ASTNode*)> register_imported_structs = [&](Cryo::ASTNode* node) {
+                if (!node) return;
+                
+                if (auto struct_decl = dynamic_cast<Cryo::StructDeclarationNode*>(node))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registering imported struct definition: {} from module {}", 
+                             struct_decl->name(), module_path);
+                    
+                    // Register the struct AST node so TypeMapper can find it
+                    _type_mapper->register_struct_ast_node(struct_decl);
+                }
+                
+                // Recursively search child nodes for struct definitions
+                if (auto program = dynamic_cast<Cryo::ProgramNode*>(node))
+                {
+                    for (const auto &stmt : program->statements())
+                    {
+                        register_imported_structs(stmt.get());
+                    }
+                }
+                else if (auto block = dynamic_cast<Cryo::BlockStatementNode*>(node))
+                {
+                    for (const auto &stmt : block->statements())
+                    {
+                        register_imported_structs(stmt.get());
+                    }
+                }
+            };
+            
+            // Register struct definitions first
+            register_imported_structs(program_ast.get());
+            
+            // Second pass: Process global constant declarations
+            std::function<void(Cryo::ASTNode*)> search_for_constants = [&](Cryo::ASTNode* node) {
+                if (!node) return;
+                
+                if (auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode*>(node))
+                {
+                    // Check if this is a global constant (non-mutable variables at module level)
+                    if (!var_decl->is_mutable() && var_decl->is_global())
+                    {
+                        std::string const_name = var_decl->name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found global constant declaration: {} in module {}", const_name, module_path);
+                        
+                        // Get the constant's type
+                        auto cryo_type = var_decl->get_resolved_type();
+                        if (cryo_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Global constant '{}' type: {} (kind={})", 
+                                     const_name, cryo_type->to_string(), static_cast<int>(cryo_type->kind()));
+                            
+                            // Map the Cryo type to LLVM type
+                            llvm::Type* llvm_type = _type_mapper->map_type(cryo_type);
+                            
+                            // Create a global variable declaration in the current module for this imported constant
+                            llvm::GlobalVariable* global_var = new llvm::GlobalVariable(
+                                *module,
+                                llvm_type,
+                                true,  // isConstant
+                                llvm::GlobalValue::ExternalLinkage,
+                                nullptr,  // initializer (will be linked from other module)
+                                const_name
+                            );
+                            
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Declared external global constant '{}' in current module", const_name);
+                        }
+                    }
+                }
+                
+                // Recursively search child nodes
+                if (auto program = dynamic_cast<Cryo::ProgramNode*>(node))
+                {
+                    for (const auto &stmt : program->statements())
+                    {
+                        search_for_constants(stmt.get());
+                    }
+                }
+                else if (auto block = dynamic_cast<Cryo::BlockStatementNode*>(node))
+                {
+                    for (const auto &stmt : block->statements())
+                    {
+                        search_for_constants(stmt.get());
+                    }
+                }
+            };
+            
+            // Start the search from the program root
+            search_for_constants(program_ast.get());
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished loading global constants from namespace: {} using AST extraction", namespace_name);
+    }
+
     void CodegenVisitor::set_imported_asts(const std::unordered_map<std::string, std::unique_ptr<Cryo::ProgramNode>> *imported_asts)
     {
         _imported_asts = imported_asts;
@@ -15082,7 +15278,7 @@ namespace Cryo::Codegen
 
                 // Create constructor function signature based on struct fields
                 std::vector<llvm::Type*> param_types;
-                param_types.push_back(llvm::PointerType::get(struct_type, 0)); // 'this' pointer
+                // NOTE: Structs are value types - do NOT add 'this' pointer for struct constructors
 
                 // Add parameter types based on struct fields or constructor parameters
                 // For now, we'll create a generic constructor that matches the struct's constructor signature
@@ -15115,12 +15311,13 @@ namespace Cryo::Codegen
                 }
 
                 // Create function type and declare the function
+                // Struct constructors return the struct value, not void
                 llvm::FunctionType *constructor_func_type = 
-                    llvm::FunctionType::get(llvm::Type::getVoidTy(context), param_types, false);
+                    llvm::FunctionType::get(struct_type, param_types, false);
                 
                 // Create constructor name with full signature to match stdlib format
                 std::string parameter_signature = "(";
-                for (size_t i = 0; i < param_type_names.size(); ++i) // Parameters (excluding 'this' pointer)
+                for (size_t i = 0; i < param_type_names.size(); ++i) // All constructor parameters
                 {
                     if (i > 0) parameter_signature += ",";
                     parameter_signature += param_type_names[i];
@@ -15141,8 +15338,8 @@ namespace Cryo::Codegen
                 _functions[simple_constructor_name] = constructor_func; // Allow lookup by simple name
                 
                 
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Declared imported constructor: '{}' with {} parameters", 
-                         constructor_name, param_types.size() - 1); // -1 for 'this' pointer
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Declared imported struct constructor: '{}' with {} parameters", 
+                         constructor_name, param_types.size()); // No 'this' pointer for structs
             }
 
             // Search through statements in this AST node

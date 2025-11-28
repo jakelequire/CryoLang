@@ -368,6 +368,15 @@ stdlib-tcp:
 stdlib-signal:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/process/signal.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/process/signal.bc
 
+stdlib-tcp-gdb:
+	@echo "Building stdlib TCP module through gdb for debugging..."
+	@gdb -batch \
+		-ex "run" \
+		-ex "thread apply all bt full" \
+		-ex "info registers" \
+		-ex "quit" \
+		--args $(MAIN_BIN) $(STDLIB_DIR)/net/tcp.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/net/tcp.bc
+
 stdlib-runtime:
 	@$(MAKE) runtime
 
