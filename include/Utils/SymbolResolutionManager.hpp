@@ -46,6 +46,7 @@ namespace Cryo::SRM {
         // Core naming interface
         virtual std::string to_string() const = 0;
         virtual std::string to_debug_string() const = 0;
+        virtual std::string get_simple_name() const = 0;
         virtual Cryo::SymbolKind get_symbol_kind() const = 0;
         
         // Hash and equality for container usage
@@ -348,8 +349,7 @@ namespace Cryo::SRM {
         std::unordered_set<std::string> imported_namespaces_;
         std::vector<std::string> import_search_paths_;
         
-        // Integration with existing systems
-        Cryo::SymbolTable* symbol_table_;
+        // Integration with type system (for naming purposes)
         Cryo::TypeContext* type_context_;
         
         // Caching for performance
@@ -359,12 +359,9 @@ namespace Cryo::SRM {
         // Configuration
         bool enable_implicit_std_import_;
         bool enable_namespace_fallback_;
-        
+    
     public:
-        explicit SymbolResolutionContext(Cryo::SymbolTable* symbol_table, 
-                                       Cryo::TypeContext* type_context = nullptr);
-        
-        ~SymbolResolutionContext() = default;
+        explicit SymbolResolutionContext(Cryo::TypeContext* type_context = nullptr);        ~SymbolResolutionContext() = default;
         
         // Namespace management
         void push_namespace(const std::string& namespace_name);
@@ -415,9 +412,7 @@ namespace Cryo::SRM {
             const std::string& symbol_name, Cryo::SymbolKind kind) const;
             
         // Integration accessors
-        Cryo::SymbolTable* get_symbol_table() const { return symbol_table_; }
         Cryo::TypeContext* get_type_context() const { return type_context_; }
-        void set_symbol_table(Cryo::SymbolTable* symbol_table) { symbol_table_ = symbol_table; }
         void set_type_context(Cryo::TypeContext* type_context) { type_context_ = type_context; }
         
         // Cache management
@@ -444,71 +439,29 @@ namespace Cryo::SRM {
      */
     class SymbolResolutionManager {
     public:
-        // Resolution result information
-        struct ResolutionResult {
-            Cryo::Symbol* symbol;
-            std::unique_ptr<SymbolIdentifier> resolved_identifier;
-            std::string resolution_strategy;
-            int resolution_cost;
-            bool is_exact_match;
+        // Name generation result information
+        struct NameGenerationResult {
+            std::string canonical_name;
+            std::string llvm_name;
+            std::vector<std::string> lookup_candidates;
+            std::string generation_strategy;
             
-            ResolutionResult() : symbol(nullptr), resolution_cost(-1), is_exact_match(false) {}
+            NameGenerationResult() = default;
+            NameGenerationResult(const std::string& canonical, const std::string& llvm = "")
+                : canonical_name(canonical), llvm_name(llvm) {}
             
-            // Move constructor
-            ResolutionResult(ResolutionResult&& other) noexcept
-                : symbol(other.symbol),
-                  resolved_identifier(std::move(other.resolved_identifier)),
-                  resolution_strategy(std::move(other.resolution_strategy)),
-                  resolution_cost(other.resolution_cost),
-                  is_exact_match(other.is_exact_match) {
-                other.symbol = nullptr;
-                other.resolution_cost = -1;
-                other.is_exact_match = false;
-            }
-            
-            // Move assignment operator
-            ResolutionResult& operator=(ResolutionResult&& other) noexcept {
-                if (this != &other) {
-                    symbol = other.symbol;
-                    resolved_identifier = std::move(other.resolved_identifier);
-                    resolution_strategy = std::move(other.resolution_strategy);
-                    resolution_cost = other.resolution_cost;
-                    is_exact_match = other.is_exact_match;
-                    
-                    other.symbol = nullptr;
-                    other.resolution_cost = -1;
-                    other.is_exact_match = false;
-                }
-                return *this;
-            }
-            
-            // Delete copy constructor and copy assignment operator
-            ResolutionResult(const ResolutionResult&) = delete;
-            ResolutionResult& operator=(const ResolutionResult&) = delete;
-            
-            bool is_valid() const { return symbol != nullptr; }
-            bool is_ambiguous() const { return resolution_cost > 0; }
+            bool is_valid() const { return !canonical_name.empty(); }
         };
-        
-        // Resolution strategy function type
-        using ResolutionStrategy = std::function<ResolutionResult(const SymbolIdentifier&, const SymbolResolutionContext&)>;
         
     private:
         SymbolResolutionContext* context_;
         
-        // Resolution strategies in priority order
-        std::vector<std::pair<std::string, ResolutionStrategy>> resolution_strategies_;
-        
         // Caching for performance
-        mutable std::unordered_map<size_t, ResolutionResult> resolution_cache_;
-        mutable std::unordered_map<std::string, std::vector<Cryo::Symbol*>> overload_cache_;
-        
-        // LLVM integration tracking
-        std::unordered_map<size_t, llvm::Function*> llvm_function_registry_;
-        std::unordered_map<size_t, llvm::Type*> llvm_type_registry_;
+        mutable std::unordered_map<size_t, std::string> name_generation_cache_;
+        mutable std::unordered_map<std::string, std::vector<std::string>> lookup_candidates_cache_;
         
         // Statistics and debugging
-        mutable size_t resolution_attempts_;
+        mutable size_t name_generation_attempts_;
         mutable size_t cache_hits_;
         mutable size_t cache_misses_;
         
@@ -516,65 +469,59 @@ namespace Cryo::SRM {
         explicit SymbolResolutionManager(SymbolResolutionContext* context);
         ~SymbolResolutionManager() = default;
         
-        // Primary resolution interface
-        ResolutionResult resolve_symbol(const SymbolIdentifier& identifier) const;
-        ResolutionResult resolve_function(const FunctionIdentifier& identifier) const;
-        ResolutionResult resolve_type(const TypeIdentifier& identifier) const;
+        // Primary naming interface
+        std::string generate_canonical_name(const SymbolIdentifier& identifier) const;
+        std::string generate_llvm_name(const SymbolIdentifier& identifier) const;
+        std::string generate_overload_key(const FunctionIdentifier& identifier) const;
+        std::string generate_template_name(const TypeIdentifier& identifier) const;
         
-        // Overload resolution
-        std::vector<ResolutionResult> resolve_function_overloads(
+        // Name variation generation for lookup candidates
+        std::vector<std::string> generate_lookup_candidates(
             const std::string& base_name,
-            const std::vector<Cryo::Type*>& argument_types) const;
+            Cryo::SymbolKind kind) const;
             
-        ResolutionResult resolve_best_function_overload(
+        std::vector<std::string> generate_function_lookup_candidates(
             const std::string& base_name,
-            const std::vector<Cryo::Type*>& argument_types) const;
+            const std::vector<Cryo::Type*>& param_types) const;
             
-        // Constructor resolution
-        ResolutionResult resolve_constructor(
+        // Constructor naming
+        std::string generate_constructor_name(
             const TypeIdentifier& type_id,
-            const std::vector<Cryo::Type*>& argument_types) const;
+            const std::vector<Cryo::Type*>& param_types) const;
             
-        ResolutionResult resolve_default_constructor(const TypeIdentifier& type_id) const;
+        std::string generate_default_constructor_name(const TypeIdentifier& type_id) const;
         
-        // Batch resolution operations
-        std::vector<ResolutionResult> resolve_all_in_namespace(const std::string& namespace_name) const;
-        std::vector<ResolutionResult> resolve_imported_symbols() const;
+        // Namespace-aware name generation
+        std::vector<std::string> generate_all_namespace_variants(const std::string& base_name) const;
+        std::vector<std::string> generate_imported_namespace_variants(const std::string& base_name) const;
         
-        // Query operations
-        bool symbol_exists(const SymbolIdentifier& identifier) const;
-        std::vector<ResolutionResult> find_similar_symbols(const std::string& partial_name, 
-                                                          Cryo::SymbolKind kind = static_cast<Cryo::SymbolKind>(-1)) const;
-        std::vector<std::string> suggest_symbol_names(const std::string& typo_name) const;
+        // Name validation and suggestions
+        bool is_valid_identifier_name(const std::string& name) const;
+        std::vector<std::string> suggest_similar_names(const std::string& typo_name, 
+                                                      const std::vector<std::string>& candidates) const;
         
-        // LLVM integration
-        void register_llvm_function(const FunctionIdentifier& identifier, llvm::Function* function);
-        void register_llvm_type(const TypeIdentifier& identifier, llvm::Type* type);
-        llvm::Function* get_llvm_function(const FunctionIdentifier& identifier) const;
-        llvm::Type* get_llvm_type(const TypeIdentifier& identifier) const;
+        // LLVM name generation
+        std::string generate_llvm_function_name(const FunctionIdentifier& identifier) const;
+        std::string generate_llvm_type_name(const TypeIdentifier& identifier) const;
+        std::string generate_llvm_struct_name(const TypeIdentifier& identifier) const;
+        std::string generate_llvm_global_name(const std::string& name) const;
         
-        // Registration for generated symbols
-        void register_generated_symbol(std::unique_ptr<SymbolIdentifier> identifier, Cryo::Symbol* symbol);
-        void unregister_symbol(const SymbolIdentifier& identifier);
+        // Naming strategy management
+        void set_namespace_separator(const std::string& separator);
+        void set_template_parameter_format(const std::string& open, const std::string& close);
+        void set_llvm_prefix(const std::string& prefix);
         
-        // Strategy management
-        void add_resolution_strategy(const std::string& name, ResolutionStrategy strategy);
-        void remove_resolution_strategy(const std::string& name);
-        void clear_resolution_strategies();
-        void reset_to_default_strategies();
-        
-        // Cache management
-        void clear_resolution_cache() const;
-        void clear_overload_cache() const;
+        // Cache management for generated names
+        void clear_name_cache() const;
         void clear_all_caches() const;
         
         // Statistics and debugging
         struct Statistics {
-            size_t total_resolution_attempts;
+            size_t total_name_generations;
             size_t cache_hits;
             size_t cache_misses;
             double cache_hit_ratio;
-            std::unordered_map<std::string, size_t> strategy_usage;
+            std::unordered_map<std::string, size_t> name_type_usage;
         };
         
         Statistics get_statistics() const;
@@ -590,35 +537,29 @@ namespace Cryo::SRM {
         SymbolResolutionContext* get_context() const { return context_; }
         
     private:
-        // Default resolution strategies
-        ResolutionResult try_exact_match(const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const;
-        ResolutionResult try_namespace_qualified(const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const;
-        ResolutionResult try_imported_namespaces(const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const;
-        ResolutionResult try_current_namespace(const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const;
-        ResolutionResult try_parent_namespaces(const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const;
-        ResolutionResult try_implicit_conversions(const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const;
-        
-        // Function-specific resolution strategies
-        ResolutionResult try_function_overload_resolution(const FunctionIdentifier& identifier, const SymbolResolutionContext& context) const;
-        ResolutionResult try_constructor_resolution(const FunctionIdentifier& identifier, const SymbolResolutionContext& context) const;
-        ResolutionResult try_operator_resolution(const FunctionIdentifier& identifier, const SymbolResolutionContext& context) const;
-        
-        // Type-specific resolution strategies
-        ResolutionResult try_template_instantiation(const TypeIdentifier& identifier, const SymbolResolutionContext& context) const;
-        ResolutionResult try_type_alias_resolution(const TypeIdentifier& identifier, const SymbolResolutionContext& context) const;
+        // Name generation utilities
+        std::string build_qualified_name_impl(const SymbolIdentifier& identifier) const;
+        std::string build_namespace_qualified_name(const std::vector<std::string>& namespaces, const std::string& name) const;
+        std::string build_template_name_impl(const TypeIdentifier& identifier) const;
+        std::string escape_name_for_llvm(const std::string& name) const;
+        std::string normalize_identifier_name(const std::string& name) const;
+        std::vector<std::string> generate_parent_namespace_variants(const std::string& base_name) const;
         
         // Helper methods
-        void initialize_default_strategies();
         size_t calculate_identifier_hash(const SymbolIdentifier& identifier) const;
-        bool is_compatible_symbol(const Cryo::Symbol* symbol, const SymbolIdentifier& identifier) const;
-        int calculate_resolution_cost(const SymbolIdentifier& target, const SymbolIdentifier& candidate) const;
         
         // Cache key generation
         std::string generate_overload_cache_key(const std::string& base_name, const std::vector<Cryo::Type*>& types) const;
         
-        // Symbol lookup delegation to existing systems
-        Cryo::Symbol* lookup_in_symbol_table(const std::string& name) const;
-        Cryo::Symbol* lookup_in_namespace(const std::string& namespace_name, const std::string& symbol_name) const;
+        // Name caching and utilities
+        mutable std::unordered_map<size_t, std::string> canonical_name_cache_;
+        mutable std::unordered_map<size_t, std::string> llvm_name_cache_;
+        
+        // Configuration
+        std::string namespace_separator_ = "::";
+        std::string template_open_ = "<";
+        std::string template_close_ = ">";
+        std::string llvm_prefix_ = "cryo_";
     };
     
     /**
@@ -709,5 +650,43 @@ namespace Cryo::SRM {
         std::vector<std::string> generate_symbol_suggestions(
             const std::string& typo, const std::vector<std::string>& candidates, size_t max_suggestions = 5);
     }
+
+    /**
+     * @brief Utility functions for symbol name manipulation and validation
+     * 
+     * This namespace contains standalone utility functions used throughout
+     * the SRM system for name processing, validation, and formatting.
+     */
+    namespace Utils {
+        
+        /**
+         * @brief Build a qualified name from namespace parts and symbol name
+         */
+        std::string build_qualified_name(
+            const std::vector<std::string>& namespace_parts, 
+            const std::string& symbol_name);
+        
+        /**
+         * @brief Parse a qualified name into namespace parts and symbol name
+         */
+        std::pair<std::vector<std::string>, std::string> parse_qualified_name(
+            const std::string& qualified_name);
+        
+        /**
+         * @brief Escape a name for safe use in LLVM IR
+         */
+        std::string escape_for_llvm(const std::string& name);
+        
+        /**
+         * @brief Normalize a type name for consistent usage
+         */
+        std::string normalize_type_name(const std::string& type_name);
+        
+        /**
+         * @brief Check if a string is a valid identifier
+         */
+        bool is_valid_identifier(const std::string& name);
+        
+    } // namespace Utils
     
 } // namespace Cryo::SRM

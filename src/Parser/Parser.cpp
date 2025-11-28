@@ -14,7 +14,7 @@ namespace Cryo
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
         try {
             if (&context.symbols()) {
-                _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&context.symbols(), &context.types());
+                _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&context.types());
                 _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
             }
         } catch (const std::exception& e) {
@@ -34,7 +34,7 @@ namespace Cryo
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
         try {
             if (&context.symbols()) {
-                _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&context.symbols(), &context.types());
+                _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&context.types());
                 _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
             }
         } catch (const std::exception& e) {

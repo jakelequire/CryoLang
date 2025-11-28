@@ -31,7 +31,6 @@ namespace Cryo
         try
         {
             auto context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(
-                _symbol_table.get(), 
                 &_ast_context->types());
             _symbol_resolution_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(context.release());
         }

@@ -1,0 +1,1748 @@
+#include "Utils/SymbolResolutionManager.hpp"
+#include <sstream>
+#include <algorithm>
+#include <iomanip>
+
+namespace Cryo::SRM {
+
+    // QualifiedIdentifier Implementation
+    
+    QualifiedIdentifier::QualifiedIdentifier(const std::vector<std::string>& namespaces, 
+                                           const std::string& name, 
+                                           Cryo::SymbolKind kind)
+        : namespace_parts_(namespaces), symbol_name_(name), symbol_kind_(kind) {
+        
+        // Validate input
+        if (name.empty()) {
+            throw std::invalid_argument("Symbol name cannot be empty");
+        }
+        
+        // Validate namespace parts
+        for (const auto& ns : namespaces) {
+            if (ns.empty()) {
+                throw std::invalid_argument("Namespace parts cannot be empty");
+            }
+        }
+    }
+    
+    QualifiedIdentifier::QualifiedIdentifier(const std::string& name, Cryo::SymbolKind kind)
+        : QualifiedIdentifier({}, name, kind) {
+    }
+    
+    std::string QualifiedIdentifier::to_string() const {
+        if (!cached_string_.has_value()) {
+            cached_string_ = build_string_representation();
+        }
+        return cached_string_.value();
+    }
+    
+    std::string QualifiedIdentifier::to_debug_string() const {
+        if (!cached_debug_string_.has_value()) {
+            cached_debug_string_ = build_debug_representation();
+        }
+        return cached_debug_string_.value();
+    }
+    
+    size_t QualifiedIdentifier::hash() const {
+        if (!cached_hash_.has_value()) {
+            cached_hash_ = calculate_hash();
+        }
+        return cached_hash_.value();
+    }
+    
+    bool QualifiedIdentifier::equals(const SymbolIdentifier& other) const {
+        if (get_identifier_type() != other.get_identifier_type()) {
+            return false;
+        }
+        
+        const auto* other_qualified = dynamic_cast<const QualifiedIdentifier*>(&other);
+        if (!other_qualified) {
+            return false;
+        }
+        
+        return symbol_kind_ == other_qualified->symbol_kind_ &&
+               symbol_name_ == other_qualified->symbol_name_ &&
+               namespace_parts_ == other_qualified->namespace_parts_;
+    }
+    
+    std::string QualifiedIdentifier::get_namespace_path() const {
+        if (namespace_parts_.empty()) {
+            return "";
+        }
+        
+        std::ostringstream oss;
+        for (size_t i = 0; i < namespace_parts_.size(); ++i) {
+            if (i > 0) oss << "::";
+            oss << namespace_parts_[i];
+        }
+        return oss.str();
+    }
+    
+    std::unique_ptr<QualifiedIdentifier> QualifiedIdentifier::create_simple(
+        const std::string& name, Cryo::SymbolKind kind) {
+        return std::make_unique<QualifiedIdentifier>(name, kind);
+    }
+    
+    std::unique_ptr<QualifiedIdentifier> QualifiedIdentifier::create_qualified(
+        const std::vector<std::string>& namespaces, 
+        const std::string& name, 
+        Cryo::SymbolKind kind) {
+        return std::make_unique<QualifiedIdentifier>(namespaces, name, kind);
+    }
+    
+    void QualifiedIdentifier::invalidate_cache() const {
+        cached_string_.reset();
+        cached_debug_string_.reset();
+        cached_hash_.reset();
+    }
+    
+    std::string QualifiedIdentifier::build_string_representation() const {
+        if (namespace_parts_.empty()) {
+            return symbol_name_;
+        }
+        
+        std::ostringstream oss;
+        for (const auto& ns : namespace_parts_) {
+            oss << ns << "::";
+        }
+        oss << symbol_name_;
+        return oss.str();
+    }
+    
+    std::string QualifiedIdentifier::build_debug_representation() const {
+        std::ostringstream oss;
+        oss << "QualifiedIdentifier{";
+        oss << "kind=" << Utils::symbol_kind_to_string(symbol_kind_);
+        oss << ", name=" << to_string();
+        oss << "}";
+        return oss.str();
+    }
+    
+    size_t QualifiedIdentifier::calculate_hash() const {
+        std::vector<std::string> components = namespace_parts_;
+        components.push_back(symbol_name_);
+        components.push_back(std::to_string(static_cast<int>(symbol_kind_)));
+        return Utils::hash_combine(components);
+    }
+    
+    // FunctionIdentifier Implementation
+    
+    FunctionIdentifier::FunctionIdentifier(const std::vector<std::string>& namespaces,
+                                         const std::string& name,
+                                         const std::vector<Cryo::Type*>& params,
+                                         Cryo::Type* return_type,
+                                         FunctionType func_type,
+                                         bool is_variadic)
+        : QualifiedIdentifier(namespaces, name, Cryo::SymbolKind::Function),
+          parameter_types_(params),
+          return_type_(return_type),
+          function_type_(func_type),
+          is_variadic_(is_variadic) {
+    }
+    
+    FunctionIdentifier::FunctionIdentifier(const std::string& name,
+                                         const std::vector<Cryo::Type*>& params,
+                                         Cryo::Type* return_type,
+                                         FunctionType func_type,
+                                         bool is_variadic)
+        : FunctionIdentifier({}, name, params, return_type, func_type, is_variadic) {
+    }
+    
+    std::string FunctionIdentifier::to_string() const {
+        // For functions, we want the base qualified name without signature
+        // unless it's needed for disambiguation
+        return QualifiedIdentifier::to_string();
+    }
+    
+    std::string FunctionIdentifier::to_debug_string() const {
+        std::ostringstream oss;
+        oss << "FunctionIdentifier{";
+        oss << "name=" << QualifiedIdentifier::to_string();
+        oss << ", type=" << get_function_type_string();
+        oss << ", signature=" << to_signature_string();
+        oss << "}";
+        return oss.str();
+    }
+    
+    size_t FunctionIdentifier::hash() const {
+        size_t base_hash = QualifiedIdentifier::hash();
+        
+        // Combine with parameter types
+        for (const auto* param_type : parameter_types_) {
+            if (param_type) {
+                size_t type_hash = std::hash<std::string>{}(param_type->to_string());
+                base_hash ^= type_hash + 0x9e3779b9 + (base_hash << 6) + (base_hash >> 2);
+            }
+        }
+        
+        // Combine with function type
+        base_hash ^= std::hash<int>{}(static_cast<int>(function_type_)) + 0x9e3779b9;
+        
+        return base_hash;
+    }
+    
+    bool FunctionIdentifier::equals(const SymbolIdentifier& other) const {
+        if (get_identifier_type() != other.get_identifier_type()) {
+            return false;
+        }
+        
+        const auto* other_function = dynamic_cast<const FunctionIdentifier*>(&other);
+        if (!other_function) {
+            return false;
+        }
+        
+        // Check base qualified identifier
+        if (!QualifiedIdentifier::equals(other)) {
+            return false;
+        }
+        
+        // Check function-specific properties
+        if (function_type_ != other_function->function_type_ ||
+            is_variadic_ != other_function->is_variadic_ ||
+            parameter_types_.size() != other_function->parameter_types_.size()) {
+            return false;
+        }
+        
+        // Check parameter types
+        for (size_t i = 0; i < parameter_types_.size(); ++i) {
+            if (parameter_types_[i] != other_function->parameter_types_[i]) {
+                // For now, use pointer comparison. Later we might want deep type comparison
+                return false;
+            }
+        }
+        
+        // Check return type
+        if (return_type_ != other_function->return_type_) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    std::string FunctionIdentifier::to_signature_string() const {
+        if (!cached_signature_string_.has_value()) {
+            cached_signature_string_ = build_signature_string();
+        }
+        return cached_signature_string_.value();
+    }
+    
+    std::string FunctionIdentifier::to_llvm_name() const {
+        if (!cached_llvm_name_.has_value()) {
+            cached_llvm_name_ = build_llvm_name();
+        }
+        return cached_llvm_name_.value();
+    }
+    
+    std::string FunctionIdentifier::to_overload_key() const {
+        if (!cached_overload_key_.has_value()) {
+            cached_overload_key_ = build_overload_key();
+        }
+        return cached_overload_key_.value();
+    }
+    
+    std::string FunctionIdentifier::to_mangled_name() const {
+        if (!cached_mangled_name_.has_value()) {
+            cached_mangled_name_ = build_mangled_name();
+        }
+        return cached_mangled_name_.value();
+    }
+    
+    std::string FunctionIdentifier::to_constructor_name() const {
+        if (function_type_ != FunctionType::Constructor) {
+            throw std::logic_error("to_constructor_name() called on non-constructor function");
+        }
+        
+        std::string base_name = QualifiedIdentifier::to_string();
+        if (parameter_types_.empty()) {
+            return base_name;
+        }
+        
+        return base_name + to_signature_string();
+    }
+    
+    std::string FunctionIdentifier::to_destructor_name() const {
+        if (function_type_ != FunctionType::Destructor) {
+            throw std::logic_error("to_destructor_name() called on non-destructor function");
+        }
+        
+        return "~" + get_symbol_name();
+    }
+    
+    bool FunctionIdentifier::is_compatible_with_arguments(const std::vector<Cryo::Type*>& arg_types) const {
+        if (is_variadic_ && arg_types.size() >= parameter_types_.size()) {
+            return true;
+        }
+        
+        if (arg_types.size() != parameter_types_.size()) {
+            return false;
+        }
+        
+        // TODO: Implement proper type compatibility checking
+        // For now, we'll do a simple pointer comparison
+        for (size_t i = 0; i < parameter_types_.size(); ++i) {
+            if (parameter_types_[i] != arg_types[i]) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    int FunctionIdentifier::calculate_conversion_cost(const std::vector<Cryo::Type*>& arg_types) const {
+        if (!is_compatible_with_arguments(arg_types)) {
+            return -1; // Incompatible
+        }
+        
+        // TODO: Implement proper conversion cost calculation
+        // For now, exact matches have cost 0, everything else has cost 1
+        int cost = 0;
+        for (size_t i = 0; i < parameter_types_.size() && i < arg_types.size(); ++i) {
+            if (parameter_types_[i] != arg_types[i]) {
+                cost += 1;
+            }
+        }
+        
+        return cost;
+    }
+    
+    std::unique_ptr<FunctionIdentifier> FunctionIdentifier::create_constructor(
+        const std::vector<std::string>& namespaces,
+        const std::string& type_name,
+        const std::vector<Cryo::Type*>& params) {
+        
+        // Constructor name is the same as the type name
+        return std::make_unique<FunctionIdentifier>(
+            namespaces, type_name, params, nullptr, FunctionType::Constructor);
+    }
+    
+    std::unique_ptr<FunctionIdentifier> FunctionIdentifier::create_destructor(
+        const std::vector<std::string>& namespaces,
+        const std::string& type_name) {
+        
+        return std::make_unique<FunctionIdentifier>(
+            namespaces, type_name, std::vector<Cryo::Type*>{}, nullptr, FunctionType::Destructor);
+    }
+    
+    std::unique_ptr<FunctionIdentifier> FunctionIdentifier::create_method(
+        const std::vector<std::string>& namespaces,
+        const std::string& type_name,
+        const std::string& method_name,
+        const std::vector<Cryo::Type*>& params,
+        Cryo::Type* return_type,
+        bool is_static) {
+        
+        // Method names are qualified as Type::method_name
+        std::vector<std::string> method_namespaces = namespaces;
+        method_namespaces.push_back(type_name);
+        
+        FunctionType func_type = is_static ? FunctionType::StaticMethod : FunctionType::MemberMethod;
+        
+        return std::make_unique<FunctionIdentifier>(
+            method_namespaces, method_name, params, return_type, func_type);
+    }
+    
+    void FunctionIdentifier::invalidate_function_cache() const {
+        invalidate_cache(); // Base class cache
+        cached_signature_string_.reset();
+        cached_llvm_name_.reset();
+        cached_overload_key_.reset();
+        cached_mangled_name_.reset();
+    }
+    
+    std::string FunctionIdentifier::build_signature_string() const {
+        std::ostringstream oss;
+        oss << "(";
+        
+        for (size_t i = 0; i < parameter_types_.size(); ++i) {
+            if (i > 0) oss << ",";
+            if (parameter_types_[i]) {
+                oss << normalize_type_for_signature(parameter_types_[i]);
+            } else {
+                oss << "unknown";
+            }
+        }
+        
+        if (is_variadic_) {
+            if (!parameter_types_.empty()) oss << ",";
+            oss << "...";
+        }
+        
+        oss << ")";
+        return oss.str();
+    }
+    
+    std::string FunctionIdentifier::build_llvm_name() const {
+        std::string base_name = QualifiedIdentifier::to_string();
+        
+        // For LLVM IR, we need unique names to avoid conflicts
+        // Especially important for function overloads
+        if (function_type_ == FunctionType::Constructor || 
+            function_type_ == FunctionType::MemberMethod ||
+            parameter_types_.size() > 0) {
+            base_name += build_signature_string();
+        }
+        
+        return Utils::escape_for_llvm(base_name);
+    }
+    
+    std::string FunctionIdentifier::build_overload_key() const {
+        // Overload key includes the base name and parameter types for disambiguation
+        return QualifiedIdentifier::to_string() + build_signature_string();
+    }
+    
+    std::string FunctionIdentifier::build_mangled_name() const {
+        // TODO: Implement proper name mangling (Itanium ABI style)
+        // For now, use a simple scheme
+        std::ostringstream oss;
+        oss << "_Z";
+        
+        // Add namespace and name length encoding
+        std::string qualified_name = QualifiedIdentifier::to_string();
+        oss << qualified_name.length() << qualified_name;
+        
+        // Add parameter type encoding
+        for (const auto* param_type : parameter_types_) {
+            if (param_type) {
+                // Simple type encoding - this would need to be much more sophisticated
+                std::string type_str = param_type->to_string();
+                oss << type_str.length() << type_str;
+            }
+        }
+        
+        return oss.str();
+    }
+    
+    std::string FunctionIdentifier::get_function_type_string() const {
+        switch (function_type_) {
+            case FunctionType::Regular: return "Regular";
+            case FunctionType::Constructor: return "Constructor";
+            case FunctionType::Destructor: return "Destructor";
+            case FunctionType::StaticMethod: return "StaticMethod";
+            case FunctionType::MemberMethod: return "MemberMethod";
+            case FunctionType::Operator: return "Operator";
+            default: return "Unknown";
+        }
+    }
+    
+    std::string FunctionIdentifier::normalize_type_for_signature(Cryo::Type* type) const {
+        if (!type) return "void";
+        
+        std::string type_str = type->to_string();
+        
+        // Normalize common type variations
+        if (type_str == "i32") return "int";
+        if (type_str == "i64") return "long";
+        if (type_str == "f32") return "float";
+        if (type_str == "f64") return "double";
+        
+        return type_str;
+    }
+    
+    // TypeIdentifier Implementation
+    
+    TypeIdentifier::TypeIdentifier(const std::vector<std::string>& namespaces,
+                                 const std::string& name,
+                                 Cryo::TypeKind kind,
+                                 const std::vector<Cryo::Type*>& template_params)
+        : QualifiedIdentifier(namespaces, name, Cryo::SymbolKind::Type),
+          template_parameters_(template_params),
+          type_kind_(kind),
+          is_template_specialization_(!template_params.empty()) {
+    }
+    
+    TypeIdentifier::TypeIdentifier(const std::string& name,
+                                 Cryo::TypeKind kind,
+                                 const std::vector<Cryo::Type*>& template_params)
+        : TypeIdentifier({}, name, kind, template_params) {
+    }
+    
+    std::string TypeIdentifier::to_string() const {
+        std::string base_name = QualifiedIdentifier::to_string();
+        
+        if (has_template_parameters()) {
+            base_name += format_template_parameters();
+        }
+        
+        return base_name;
+    }
+    
+    std::string TypeIdentifier::to_debug_string() const {
+        std::ostringstream oss;
+        oss << "TypeIdentifier{";
+        oss << "name=" << to_string();
+        oss << ", kind=" << Utils::type_kind_to_string(type_kind_);
+        oss << ", template=" << (is_template_specialization_ ? "true" : "false");
+        oss << "}";
+        return oss.str();
+    }
+    
+    size_t TypeIdentifier::hash() const {
+        size_t base_hash = QualifiedIdentifier::hash();
+        
+        // Combine with type kind
+        base_hash ^= std::hash<int>{}(static_cast<int>(type_kind_)) + 0x9e3779b9;
+        
+        // Combine with template parameters
+        for (const auto* template_param : template_parameters_) {
+            if (template_param) {
+                size_t param_hash = std::hash<std::string>{}(template_param->to_string());
+                base_hash ^= param_hash + 0x9e3779b9 + (base_hash << 6) + (base_hash >> 2);
+            }
+        }
+        
+        return base_hash;
+    }
+    
+    bool TypeIdentifier::equals(const SymbolIdentifier& other) const {
+        if (get_identifier_type() != other.get_identifier_type()) {
+            return false;
+        }
+        
+        const auto* other_type = dynamic_cast<const TypeIdentifier*>(&other);
+        if (!other_type) {
+            return false;
+        }
+        
+        // Check base qualified identifier
+        if (!QualifiedIdentifier::equals(other)) {
+            return false;
+        }
+        
+        // Check type-specific properties
+        if (type_kind_ != other_type->type_kind_ ||
+            template_parameters_.size() != other_type->template_parameters_.size()) {
+            return false;
+        }
+        
+        // Check template parameters
+        for (size_t i = 0; i < template_parameters_.size(); ++i) {
+            if (template_parameters_[i] != other_type->template_parameters_[i]) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    std::string TypeIdentifier::to_canonical_name() const {
+        if (!cached_canonical_name_.has_value()) {
+            cached_canonical_name_ = build_canonical_name();
+        }
+        return cached_canonical_name_.value();
+    }
+    
+    std::string TypeIdentifier::to_template_name() const {
+        if (!cached_template_name_.has_value()) {
+            cached_template_name_ = build_template_name();
+        }
+        return cached_template_name_.value();
+    }
+    
+    std::string TypeIdentifier::to_constructor_name() const {
+        if (!cached_constructor_name_.has_value()) {
+            // Constructor name format: Namespace::Type::Type
+            std::string qualified_name = QualifiedIdentifier::to_string();
+            cached_constructor_name_ = qualified_name + "::" + get_symbol_name();
+        }
+        return cached_constructor_name_.value();
+    }
+    
+    std::string TypeIdentifier::to_destructor_name() const {
+        if (!cached_destructor_name_.has_value()) {
+            // Destructor name format: Namespace::Type::~Type
+            std::string qualified_name = QualifiedIdentifier::to_string();
+            cached_destructor_name_ = qualified_name + "::~" + get_symbol_name();
+        }
+        return cached_destructor_name_.value();
+    }
+    
+    std::string TypeIdentifier::to_llvm_struct_name() const {
+        return Utils::escape_for_llvm(to_canonical_name());
+    }
+    
+    std::unique_ptr<TypeIdentifier> TypeIdentifier::specialize(
+        const std::vector<Cryo::Type*>& concrete_types) const {
+        
+        return std::make_unique<TypeIdentifier>(
+            get_namespace_parts(), get_symbol_name(), type_kind_, concrete_types);
+    }
+    
+    std::unique_ptr<FunctionIdentifier> TypeIdentifier::create_constructor_identifier(
+        const std::vector<Cryo::Type*>& param_types) const {
+        
+        return FunctionIdentifier::create_constructor(
+            get_namespace_parts(), get_symbol_name(), param_types);
+    }
+    
+    std::unique_ptr<FunctionIdentifier> TypeIdentifier::create_destructor_identifier() const {
+        return FunctionIdentifier::create_destructor(
+            get_namespace_parts(), get_symbol_name());
+    }
+    
+    std::unique_ptr<FunctionIdentifier> TypeIdentifier::create_method_identifier(
+        const std::string& method_name,
+        const std::vector<Cryo::Type*>& param_types,
+        Cryo::Type* return_type,
+        bool is_static) const {
+        
+        return FunctionIdentifier::create_method(
+            get_namespace_parts(), get_symbol_name(), method_name, 
+            param_types, return_type, is_static);
+    }
+    
+    std::unique_ptr<TypeIdentifier> TypeIdentifier::create_simple_type(
+        const std::string& name, Cryo::TypeKind kind) {
+        return std::make_unique<TypeIdentifier>(name, kind);
+    }
+    
+    std::unique_ptr<TypeIdentifier> TypeIdentifier::create_template_type(
+        const std::vector<std::string>& namespaces,
+        const std::string& name,
+        Cryo::TypeKind kind,
+        const std::vector<Cryo::Type*>& template_params) {
+        return std::make_unique<TypeIdentifier>(namespaces, name, kind, template_params);
+    }
+    
+    void TypeIdentifier::invalidate_type_cache() const {
+        invalidate_cache(); // Base class cache
+        cached_canonical_name_.reset();
+        cached_template_name_.reset();
+        cached_constructor_name_.reset();
+        cached_destructor_name_.reset();
+    }
+    
+    std::string TypeIdentifier::build_canonical_name() const {
+        return to_string(); // For now, canonical name is the same as string representation
+    }
+    
+    std::string TypeIdentifier::build_template_name() const {
+        std::string base_name = QualifiedIdentifier::to_string();
+        
+        if (!has_template_parameters()) {
+            return base_name;
+        }
+        
+        return base_name + "<" + std::to_string(template_parameters_.size()) + ">";
+    }
+    
+    std::string TypeIdentifier::format_template_parameters() const {
+        if (template_parameters_.empty()) {
+            return "";
+        }
+        
+        std::ostringstream oss;
+        oss << "<";
+        
+        for (size_t i = 0; i < template_parameters_.size(); ++i) {
+            if (i > 0) oss << ",";
+            if (template_parameters_[i]) {
+                oss << template_parameters_[i]->to_string();
+            } else {
+                oss << "unknown";
+            }
+        }
+        
+        oss << ">";
+        return oss.str();
+    }
+    
+    std::string TypeIdentifier::get_type_kind_string() const {
+        return Utils::type_kind_to_string(type_kind_);
+    }
+    
+    // Utils namespace implementation
+    
+    namespace Utils {
+        
+        std::string normalize_type_name(const std::string& type_name) {
+            std::string normalized = type_name;
+            
+            // Remove extra whitespace
+            normalized.erase(std::remove_if(normalized.begin(), normalized.end(), ::isspace), normalized.end());
+            
+            // Normalize common type aliases
+            if (normalized == "i32") return "int";
+            if (normalized == "i64") return "long";
+            if (normalized == "f32") return "float";
+            if (normalized == "f64") return "double";
+            if (normalized == "bool") return "boolean";
+            
+            return normalized;
+        }
+        
+        std::pair<std::vector<std::string>, std::string> parse_qualified_name(const std::string& qualified_name) {
+            std::vector<std::string> parts;
+            std::string current_part;
+            
+            for (size_t i = 0; i < qualified_name.length(); ++i) {
+                if (i + 1 < qualified_name.length() && 
+                    qualified_name[i] == ':' && qualified_name[i + 1] == ':') {
+                    if (!current_part.empty()) {
+                        parts.push_back(current_part);
+                        current_part.clear();
+                    }
+                    ++i; // Skip the second ':'
+                } else {
+                    current_part += qualified_name[i];
+                }
+            }
+            
+            // The last part is the symbol name, everything else is namespace
+            std::string symbol_name = current_part;
+            return {parts, symbol_name};
+        }
+        
+        std::string build_qualified_name(const std::vector<std::string>& namespaces, const std::string& name) {
+            if (namespaces.empty()) {
+                return name;
+            }
+            
+            std::ostringstream oss;
+            for (const auto& ns : namespaces) {
+                oss << ns << "::";
+            }
+            oss << name;
+            return oss.str();
+        }
+        
+        bool is_valid_identifier(const std::string& name) {
+            if (name.empty()) return false;
+            
+            // Must start with letter or underscore
+            if (!std::isalpha(name[0]) && name[0] != '_') {
+                return false;
+            }
+            
+            // Rest must be alphanumeric or underscore
+            for (size_t i = 1; i < name.length(); ++i) {
+                if (!std::isalnum(name[i]) && name[i] != '_') {
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+        
+        std::string escape_for_llvm(const std::string& name) {
+            std::string escaped = name;
+            
+            // Replace :: with . for LLVM compatibility
+            size_t pos = 0;
+            while ((pos = escaped.find("::", pos)) != std::string::npos) {
+                escaped.replace(pos, 2, ".");
+                pos += 1;
+            }
+            
+            // Escape other special characters if needed
+            std::replace(escaped.begin(), escaped.end(), '<', '_');
+            std::replace(escaped.begin(), escaped.end(), '>', '_');
+            std::replace(escaped.begin(), escaped.end(), ',', '_');
+            std::replace(escaped.begin(), escaped.end(), ' ', '_');
+            
+            return escaped;
+        }
+        
+        size_t hash_combine(const std::vector<std::string>& components) {
+            size_t hash = 0;
+            std::hash<std::string> string_hash;
+            
+            for (const auto& component : components) {
+                hash ^= string_hash(component) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            }
+            
+            return hash;
+        }
+        
+        std::string symbol_kind_to_string(Cryo::SymbolKind kind) {
+            switch (kind) {
+                case Cryo::SymbolKind::Variable: return "Variable";
+                case Cryo::SymbolKind::Function: return "Function";
+                case Cryo::SymbolKind::Intrinsic: return "Intrinsic";
+                case Cryo::SymbolKind::Type: return "Type";
+                default: return "Unknown";
+            }
+        }
+        
+        std::string type_kind_to_string(Cryo::TypeKind kind) {
+            switch (kind) {
+                case Cryo::TypeKind::Void: return "Void";
+                case Cryo::TypeKind::Boolean: return "Boolean";
+                case Cryo::TypeKind::Integer: return "Integer";
+                case Cryo::TypeKind::Float: return "Float";
+                case Cryo::TypeKind::Char: return "Char";
+                case Cryo::TypeKind::String: return "String";
+                case Cryo::TypeKind::Array: return "Array";
+                case Cryo::TypeKind::Pointer: return "Pointer";
+                case Cryo::TypeKind::Reference: return "Reference";
+                case Cryo::TypeKind::Function: return "Function";
+                case Cryo::TypeKind::Struct: return "Struct";
+                case Cryo::TypeKind::Class: return "Class";
+                case Cryo::TypeKind::Enum: return "Enum";
+                case Cryo::TypeKind::Union: return "Union";
+                default: return "Unknown";
+            }
+        }
+        
+        double calculate_string_similarity(const std::string& a, const std::string& b) {
+            if (a == b) return 1.0;
+            if (a.empty() || b.empty()) return 0.0;
+            
+            // Simple Levenshtein distance-based similarity
+            size_t len_a = a.length();
+            size_t len_b = b.length();
+            
+            std::vector<std::vector<size_t>> matrix(len_a + 1, std::vector<size_t>(len_b + 1));
+            
+            for (size_t i = 0; i <= len_a; ++i) matrix[i][0] = i;
+            for (size_t j = 0; j <= len_b; ++j) matrix[0][j] = j;
+            
+            for (size_t i = 1; i <= len_a; ++i) {
+                for (size_t j = 1; j <= len_b; ++j) {
+                    size_t cost = (a[i-1] == b[j-1]) ? 0 : 1;
+                    matrix[i][j] = std::min({
+                        matrix[i-1][j] + 1,      // deletion
+                        matrix[i][j-1] + 1,      // insertion
+                        matrix[i-1][j-1] + cost  // substitution
+                    });
+                }
+            }
+            
+            size_t max_len = std::max(len_a, len_b);
+            return 1.0 - (static_cast<double>(matrix[len_a][len_b]) / max_len);
+        }
+        
+        std::vector<std::string> generate_symbol_suggestions(
+            const std::string& typo, const std::vector<std::string>& candidates, size_t max_suggestions) {
+            
+            std::vector<std::pair<double, std::string>> scored_candidates;
+            
+            for (const auto& candidate : candidates) {
+                double similarity = calculate_string_similarity(typo, candidate);
+                if (similarity > 0.3) { // Only consider reasonably similar names
+                    scored_candidates.emplace_back(similarity, candidate);
+                }
+            }
+            
+            // Sort by similarity (descending)
+            std::sort(scored_candidates.begin(), scored_candidates.end(),
+                     [](const auto& a, const auto& b) { return a.first > b.first; });
+            
+            std::vector<std::string> suggestions;
+            size_t count = std::min(max_suggestions, scored_candidates.size());
+            for (size_t i = 0; i < count; ++i) {
+                suggestions.push_back(scored_candidates[i].second);
+            }
+            
+            return suggestions;
+        }
+        
+    } // namespace Utils
+    
+    // SymbolResolutionContext Implementation
+    
+    SymbolResolutionContext::SymbolResolutionContext(Cryo::TypeContext* type_context)
+        : type_context_(type_context),
+          enable_implicit_std_import_(true),
+          enable_namespace_fallback_(true) {
+        
+        // Add standard search paths and imports only if we have std import enabled
+        if (enable_implicit_std_import_) {
+            add_imported_namespace("std");
+        }
+    }
+    
+    void SymbolResolutionContext::push_namespace(const std::string& namespace_name) {
+        validate_namespace_name(namespace_name);
+        namespace_stack_.push_back(namespace_name);
+        clear_namespace_cache();
+    }
+    
+    void SymbolResolutionContext::pop_namespace() {
+        if (!namespace_stack_.empty()) {
+            namespace_stack_.pop_back();
+            clear_namespace_cache();
+        }
+    }
+    
+    std::string SymbolResolutionContext::get_current_namespace_path() const {
+        return Utils::build_qualified_name(namespace_stack_, "");
+    }
+    
+    bool SymbolResolutionContext::is_in_namespace(const std::string& namespace_name) const {
+        return std::find(namespace_stack_.begin(), namespace_stack_.end(), namespace_name) != namespace_stack_.end();
+    }
+    
+    void SymbolResolutionContext::register_namespace_alias(const std::string& alias, const std::string& full_namespace) {
+        if (alias.empty() || full_namespace.empty()) {
+            throw std::invalid_argument("Alias and namespace cannot be empty");
+        }
+        
+        namespace_aliases_[alias] = full_namespace;
+        alias_resolution_cache_.clear();
+    }
+    
+    void SymbolResolutionContext::remove_namespace_alias(const std::string& alias) {
+        namespace_aliases_.erase(alias);
+        alias_resolution_cache_.clear();
+    }
+    
+    std::string SymbolResolutionContext::resolve_namespace_alias(const std::string& alias) const {
+        auto cache_it = alias_resolution_cache_.find(alias);
+        if (cache_it != alias_resolution_cache_.end()) {
+            return cache_it->second;
+        }
+        
+        auto alias_it = namespace_aliases_.find(alias);
+        std::string result = (alias_it != namespace_aliases_.end()) ? alias_it->second : alias;
+        
+        alias_resolution_cache_[alias] = result;
+        return result;
+    }
+    
+    bool SymbolResolutionContext::has_namespace_alias(const std::string& alias) const {
+        return namespace_aliases_.find(alias) != namespace_aliases_.end();
+    }
+    
+    void SymbolResolutionContext::add_imported_namespace(const std::string& namespace_name) {
+        validate_namespace_name(namespace_name);
+        imported_namespaces_.insert(namespace_name);
+        resolved_namespace_cache_.clear();
+    }
+    
+    void SymbolResolutionContext::remove_imported_namespace(const std::string& namespace_name) {
+        imported_namespaces_.erase(namespace_name);
+        resolved_namespace_cache_.clear();
+    }
+    
+    bool SymbolResolutionContext::is_namespace_imported(const std::string& namespace_name) const {
+        return imported_namespaces_.find(namespace_name) != imported_namespaces_.end();
+    }
+    
+    void SymbolResolutionContext::add_import_search_path(const std::string& path) {
+        if (std::find(import_search_paths_.begin(), import_search_paths_.end(), path) == import_search_paths_.end()) {
+            import_search_paths_.push_back(path);
+        }
+    }
+    
+    std::unique_ptr<QualifiedIdentifier> SymbolResolutionContext::create_qualified_identifier(
+        const std::string& name, Cryo::SymbolKind kind) const {
+        
+        return std::make_unique<QualifiedIdentifier>(namespace_stack_, name, kind);
+    }
+    
+    std::unique_ptr<FunctionIdentifier> SymbolResolutionContext::create_function_identifier(
+        const std::string& name,
+        const std::vector<Cryo::Type*>& params,
+        Cryo::Type* return_type,
+        FunctionIdentifier::FunctionType func_type) const {
+        
+        return std::make_unique<FunctionIdentifier>(namespace_stack_, name, params, return_type, func_type);
+    }
+    
+    std::unique_ptr<TypeIdentifier> SymbolResolutionContext::create_type_identifier(
+        const std::string& name,
+        Cryo::TypeKind kind,
+        const std::vector<Cryo::Type*>& template_params) const {
+        
+        return std::make_unique<TypeIdentifier>(namespace_stack_, name, kind, template_params);
+    }
+    
+    std::vector<std::string> SymbolResolutionContext::resolve_namespace_search_order(const std::string& partial_name) const {
+        auto cache_it = resolved_namespace_cache_.find(partial_name);
+        if (cache_it != resolved_namespace_cache_.end()) {
+            return cache_it->second;
+        }
+        
+        std::vector<std::string> search_order = build_namespace_search_order();
+        resolved_namespace_cache_[partial_name] = search_order;
+        return search_order;
+    }
+    
+    std::vector<std::unique_ptr<QualifiedIdentifier>> SymbolResolutionContext::generate_lookup_candidates(
+        const std::string& symbol_name, Cryo::SymbolKind kind) const {
+        
+        std::vector<std::unique_ptr<QualifiedIdentifier>> candidates;
+        
+        // Add current namespace path
+        candidates.push_back(std::make_unique<QualifiedIdentifier>(namespace_stack_, symbol_name, kind));
+        
+        // Add imported namespaces
+        for (const auto& imported_ns : imported_namespaces_) {
+            auto ns_parts = Utils::parse_qualified_name(imported_ns).first;
+            ns_parts.push_back(Utils::parse_qualified_name(imported_ns).second);
+            candidates.push_back(std::make_unique<QualifiedIdentifier>(ns_parts, symbol_name, kind));
+        }
+        
+        // Add parent namespace scopes
+        for (size_t i = namespace_stack_.size(); i > 0; --i) {
+            std::vector<std::string> parent_ns(namespace_stack_.begin(), namespace_stack_.begin() + i - 1);
+            candidates.push_back(std::make_unique<QualifiedIdentifier>(parent_ns, symbol_name, kind));
+        }
+        
+        // Add global scope (no namespace)
+        candidates.push_back(std::make_unique<QualifiedIdentifier>(symbol_name, kind));
+        
+        return candidates;
+    }
+    
+    void SymbolResolutionContext::clear_namespace_cache() const {
+        resolved_namespace_cache_.clear();
+    }
+    
+    void SymbolResolutionContext::clear_all_caches() const {
+        resolved_namespace_cache_.clear();
+        alias_resolution_cache_.clear();
+    }
+    
+    std::string SymbolResolutionContext::to_debug_string() const {
+        std::ostringstream oss;
+        oss << "SymbolResolutionContext{\n";
+        oss << "  current_namespace: " << get_current_namespace_path() << "\n";
+        oss << "  namespace_stack: [";
+        for (size_t i = 0; i < namespace_stack_.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << namespace_stack_[i];
+        }
+        oss << "]\n";
+        oss << "  imported_namespaces: [";
+        bool first = true;
+        for (const auto& ns : imported_namespaces_) {
+            if (!first) oss << ", ";
+            oss << ns;
+            first = false;
+        }
+        oss << "]\n";
+        oss << "  namespace_aliases: " << namespace_aliases_.size() << " entries\n";
+        oss << "  implicit_std_import: " << (enable_implicit_std_import_ ? "true" : "false") << "\n";
+        oss << "  namespace_fallback: " << (enable_namespace_fallback_ ? "true" : "false") << "\n";
+        oss << "}";
+        return oss.str();
+    }
+    
+    void SymbolResolutionContext::dump_context(std::ostream& os) const {
+        os << to_debug_string() << std::endl;
+    }
+    
+    std::vector<std::string> SymbolResolutionContext::build_namespace_search_order() const {
+        std::vector<std::string> search_order;
+        
+        // Current namespace first
+        if (!namespace_stack_.empty()) {
+            search_order.push_back(get_current_namespace_path());
+        }
+        
+        // Imported namespaces
+        for (const auto& imported_ns : imported_namespaces_) {
+            search_order.push_back(imported_ns);
+        }
+        
+        // Parent namespaces (from most specific to least specific)
+        for (size_t i = namespace_stack_.size(); i > 0; --i) {
+            std::vector<std::string> parent_ns(namespace_stack_.begin(), namespace_stack_.begin() + i - 1);
+            if (!parent_ns.empty()) {
+                search_order.push_back(Utils::build_qualified_name(parent_ns, ""));
+            }
+        }
+        
+        // Global namespace
+        search_order.push_back("");
+        
+        return search_order;
+    }
+    
+    void SymbolResolutionContext::validate_namespace_name(const std::string& namespace_name) const {
+        if (namespace_name.empty()) {
+            throw std::invalid_argument("Namespace name cannot be empty");
+        }
+        
+        // Split namespace by :: and validate each part
+        std::vector<std::string> parts;
+        std::string current_part;
+        
+        for (size_t i = 0; i < namespace_name.length(); ++i) {
+            if (namespace_name[i] == ':' && i + 1 < namespace_name.length() && namespace_name[i + 1] == ':') {
+                if (!current_part.empty()) {
+                    parts.push_back(current_part);
+                    current_part.clear();
+                }
+                ++i; // Skip the second colon
+            } else {
+                current_part += namespace_name[i];
+            }
+        }
+        
+        if (!current_part.empty()) {
+            parts.push_back(current_part);
+        }
+        
+        // Each part must be a valid identifier
+        for (const auto& part : parts) {
+            if (!Utils::is_valid_identifier(part)) {
+                throw std::invalid_argument("Invalid namespace name: " + namespace_name + " (invalid part: " + part + ")");
+            }
+        }
+    }
+    
+    std::string SymbolResolutionContext::normalize_namespace_path(const std::string& namespace_path) const {
+        if (namespace_path.empty()) return "";
+        
+        // Remove leading/trailing ::
+        std::string normalized = namespace_path;
+        if (normalized.substr(0, 2) == "::") {
+            normalized = normalized.substr(2);
+        }
+        if (normalized.length() >= 2 && normalized.substr(normalized.length() - 2) == "::") {
+            normalized = normalized.substr(0, normalized.length() - 2);
+        }
+        
+        return normalized;
+    }
+    
+    // SymbolResolutionManager Implementation
+    
+    SymbolResolutionManager::SymbolResolutionManager(SymbolResolutionContext* context)
+        : context_(context), name_generation_attempts_(0), cache_hits_(0), cache_misses_(0),
+          namespace_separator_("::"), template_open_("<"), template_close_(">"), llvm_prefix_("cryo_") {
+        
+        if (!context_) {
+            throw std::invalid_argument("SymbolResolutionContext cannot be null");
+        }
+    }
+    
+    std::string SymbolResolutionManager::generate_canonical_name(const SymbolIdentifier& identifier) const {
+        ++name_generation_attempts_;
+        
+        // Check cache first
+        size_t identifier_hash = calculate_identifier_hash(identifier);
+        auto cache_it = canonical_name_cache_.find(identifier_hash);
+        if (cache_it != canonical_name_cache_.end()) {
+            ++cache_hits_;
+            return cache_it->second;
+        }
+        
+        ++cache_misses_;
+        
+        // Generate canonical name based on identifier type
+        std::string canonical_name = build_qualified_name_impl(identifier);
+        
+        // Cache and return
+        canonical_name_cache_[identifier_hash] = canonical_name;
+        return canonical_name;
+    }
+    
+    std::string SymbolResolutionManager::generate_llvm_name(const SymbolIdentifier& identifier) const {
+        // Check cache first
+        size_t identifier_hash = calculate_identifier_hash(identifier);
+        auto cache_it = llvm_name_cache_.find(identifier_hash);
+        if (cache_it != llvm_name_cache_.end()) {
+            return cache_it->second;
+        }
+        
+        // Generate LLVM-compatible name
+        std::string canonical = generate_canonical_name(identifier);
+        std::string llvm_name = llvm_prefix_ + escape_name_for_llvm(canonical);
+        
+        // Cache and return
+        llvm_name_cache_[identifier_hash] = llvm_name;
+        return llvm_name;
+    }
+    
+    std::string SymbolResolutionManager::generate_overload_key(const FunctionIdentifier& identifier) const {
+        // Generate unique overload key based on function signature
+        std::string base_name = generate_canonical_name(identifier);
+        
+        // Add parameter types to create unique signature
+        std::ostringstream oss;
+        oss << base_name << "(";
+        
+        const auto& params = identifier.get_parameter_types();
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << (params[i] ? params[i]->to_string() : "unknown");
+        }
+        oss << ")";
+        
+        // Add return type if available
+        if (identifier.get_return_type()) {
+            oss << "->" << identifier.get_return_type()->to_string();
+        }
+        
+        return oss.str();
+    }
+    
+    std::string SymbolResolutionManager::generate_template_name(const TypeIdentifier& identifier) const {
+        return identifier.to_template_name();
+    }
+    
+    std::vector<std::string> SymbolResolutionManager::generate_lookup_candidates(
+        const std::string& base_name, Cryo::SymbolKind kind) const {
+        
+        auto candidates_ptr = context_->generate_lookup_candidates(base_name, kind);
+        std::vector<std::string> candidates;
+        
+        for (const auto& candidate_ptr : candidates_ptr) {
+            if (candidate_ptr) {
+                candidates.push_back(candidate_ptr->to_string());
+            }
+        }
+        
+        return candidates;
+    }
+    
+    std::vector<std::string> SymbolResolutionManager::generate_function_lookup_candidates(
+        const std::string& base_name, const std::vector<Cryo::Type*>& param_types) const {
+        
+        std::vector<std::string> candidates;
+        
+        // Generate base candidates
+        auto base_candidates = generate_lookup_candidates(base_name, Cryo::SymbolKind::Function);
+        
+        // Add parameter-specific variants
+        for (const auto& candidate : base_candidates) {
+            candidates.push_back(candidate);
+            
+            // Add overloaded variants with type info
+            if (!param_types.empty()) {
+                std::string overload_candidate = candidate + "_";
+                for (size_t i = 0; i < param_types.size(); ++i) {
+                    if (i > 0) overload_candidate += "_";
+                    if (param_types[i]) {
+                        overload_candidate += normalize_identifier_name(param_types[i]->to_string());
+                    }
+                }
+                candidates.push_back(overload_candidate);
+            }
+        }
+        
+        return candidates;
+    }
+    
+    std::string SymbolResolutionManager::generate_constructor_name(
+        const TypeIdentifier& type_id, const std::vector<Cryo::Type*>& param_types) const {
+        
+        std::string base_name = generate_canonical_name(type_id);
+        
+        // Constructor name pattern: TypeName::TypeName
+        std::string constructor_name = base_name + namespace_separator_ + type_id.get_simple_name();
+        
+        // Add parameter signature for overloading
+        if (!param_types.empty()) {
+            constructor_name += "_";
+            for (size_t i = 0; i < param_types.size(); ++i) {
+                if (i > 0) constructor_name += "_";
+                if (param_types[i]) {
+                    constructor_name += normalize_identifier_name(param_types[i]->to_string());
+                }
+            }
+        }
+        
+        return constructor_name;
+    }
+    
+    std::string SymbolResolutionManager::generate_default_constructor_name(const TypeIdentifier& type_id) const {
+        return generate_constructor_name(type_id, {});
+    }
+    
+    // LLVM name generation methods
+    std::string SymbolResolutionManager::generate_llvm_function_name(const FunctionIdentifier& identifier) const {
+        std::string canonical = generate_canonical_name(identifier);
+        return llvm_prefix_ + "func_" + escape_name_for_llvm(canonical);
+    }
+    
+    std::string SymbolResolutionManager::generate_llvm_type_name(const TypeIdentifier& identifier) const {
+        std::string canonical = generate_canonical_name(identifier);
+        return llvm_prefix_ + "type_" + escape_name_for_llvm(canonical);
+    }
+    
+    std::string SymbolResolutionManager::generate_llvm_struct_name(const TypeIdentifier& identifier) const {
+        std::string canonical = generate_canonical_name(identifier);
+        return "struct." + llvm_prefix_ + escape_name_for_llvm(canonical);
+    }
+    
+    std::string SymbolResolutionManager::generate_llvm_global_name(const std::string& name) const {
+        return llvm_prefix_ + "global_" + escape_name_for_llvm(name);
+    }
+    
+    // Configuration methods for naming
+    void SymbolResolutionManager::set_namespace_separator(const std::string& separator) {
+        namespace_separator_ = separator;
+    }
+    
+    void SymbolResolutionManager::set_template_parameter_format(const std::string& open, const std::string& close) {
+        template_open_ = open;
+        template_close_ = close;
+    }
+    
+    void SymbolResolutionManager::set_llvm_prefix(const std::string& prefix) {
+        llvm_prefix_ = prefix;
+    }
+    
+    // Additional naming utilities
+    std::vector<std::string> SymbolResolutionManager::generate_all_namespace_variants(const std::string& base_name) const {
+        return generate_parent_namespace_variants(base_name);
+    }
+    
+    std::vector<std::string> SymbolResolutionManager::generate_imported_namespace_variants(const std::string& base_name) const {
+        std::vector<std::string> variants;
+        
+        for (const auto& imported_ns : context_->get_imported_namespaces()) {
+            auto ns_parts = Utils::parse_qualified_name(imported_ns).first;
+            std::string qualified_name = build_namespace_qualified_name(ns_parts, base_name);
+            variants.push_back(qualified_name);
+        }
+        
+        return variants;
+    }
+    
+    bool SymbolResolutionManager::is_valid_identifier_name(const std::string& name) const {
+        return Utils::is_valid_identifier(name);
+    }
+    
+    std::vector<std::string> SymbolResolutionManager::suggest_similar_names(
+        const std::string& typo_name, const std::vector<std::string>& candidates) const {
+        
+        return Utils::generate_symbol_suggestions(typo_name, candidates);
+    }
+    
+    void SymbolResolutionManager::clear_name_cache() const {
+        canonical_name_cache_.clear();
+        llvm_name_cache_.clear();
+        name_generation_cache_.clear();
+        lookup_candidates_cache_.clear();
+    }
+    
+    void SymbolResolutionManager::clear_all_caches() const {
+        clear_name_cache();
+    }
+    
+    SymbolResolutionManager::Statistics SymbolResolutionManager::get_statistics() const {
+        Statistics stats;
+        stats.total_name_generations = name_generation_attempts_;
+        stats.cache_hits = cache_hits_;
+        stats.cache_misses = cache_misses_;
+        
+        if (stats.total_name_generations > 0) {
+            stats.cache_hit_ratio = static_cast<double>(stats.cache_hits) / stats.total_name_generations;
+        } else {
+            stats.cache_hit_ratio = 0.0;
+        }
+        
+        return stats;
+    }
+    
+    void SymbolResolutionManager::reset_statistics() const {
+        name_generation_attempts_ = 0;
+        cache_hits_ = 0;
+        cache_misses_ = 0;
+    }
+    
+    std::string SymbolResolutionManager::get_performance_report() const {
+        auto stats = get_statistics();
+        std::ostringstream oss;
+        oss << "  Total Name Generations: " << stats.total_name_generations << "\n";
+        oss << "  Cache Hits: " << stats.cache_hits << "\n";
+        oss << "  Cache Misses: " << stats.cache_misses << "\n";
+        oss << "  Name Cache Size: " << canonical_name_cache_.size() << "\n";
+        oss << "  LLVM Name Cache Size: " << llvm_name_cache_.size() << "\n";
+        return oss.str();
+    }
+    
+    std::string SymbolResolutionManager::to_debug_string() const {
+        std::ostringstream oss;
+        oss << "SymbolResolutionManager{\n";
+        oss << "  canonical_name_cache: " << canonical_name_cache_.size() << " entries\n";
+        oss << "  llvm_name_cache: " << llvm_name_cache_.size() << " entries\n";
+        oss << "  lookup_candidates_cache: " << lookup_candidates_cache_.size() << " entries\n";
+        oss << get_performance_report();
+        oss << "}";
+        return oss.str();
+    }
+    
+    size_t SymbolResolutionManager::calculate_identifier_hash(const SymbolIdentifier& identifier) const {
+        return identifier.hash();
+    }
+        const std::string& base_name,
+        const std::vector<Cryo::Type*>& argument_types) const {
+        
+        auto overloads = resolve_function_overloads(base_name, argument_types);
+        
+        ResolutionResult best_result;
+        for (auto& result : overloads) {
+            if (result.is_valid() && (!best_result.is_valid() || result.resolution_cost < best_result.resolution_cost)) {
+                best_result = std::move(result);
+            }
+        }
+        
+        return best_result;
+    }
+    
+    SymbolResolutionManager::ResolutionResult SymbolResolutionManager::resolve_constructor(
+        const TypeIdentifier& type_id,
+        const std::vector<Cryo::Type*>& argument_types) const {
+        
+        auto constructor_id = type_id.create_constructor_identifier(argument_types);
+        return resolve_function(*constructor_id);
+    }
+    
+    SymbolResolutionManager::ResolutionResult SymbolResolutionManager::resolve_default_constructor(const TypeIdentifier& type_id) const {
+        return resolve_constructor(type_id, {});
+    }
+    
+    bool SymbolResolutionManager::symbol_exists(const SymbolIdentifier& identifier) const {
+        ResolutionResult result = resolve_symbol(identifier);
+        return result.is_valid();
+    }
+    
+    void SymbolResolutionManager::register_llvm_function(const FunctionIdentifier& identifier, llvm::Function* function) {
+        if (function) {
+            size_t hash = calculate_identifier_hash(identifier);
+            llvm_function_registry_[hash] = function;
+        }
+    }
+    
+    void SymbolResolutionManager::register_llvm_type(const TypeIdentifier& identifier, llvm::Type* type) {
+        if (type) {
+            size_t hash = calculate_identifier_hash(identifier);
+            llvm_type_registry_[hash] = type;
+        }
+    }
+    
+    llvm::Function* SymbolResolutionManager::get_llvm_function(const FunctionIdentifier& identifier) const {
+        size_t hash = calculate_identifier_hash(identifier);
+        auto it = llvm_function_registry_.find(hash);
+        return (it != llvm_function_registry_.end()) ? it->second : nullptr;
+    }
+    
+    llvm::Type* SymbolResolutionManager::get_llvm_type(const TypeIdentifier& identifier) const {
+        size_t hash = calculate_identifier_hash(identifier);
+        auto it = llvm_type_registry_.find(hash);
+        return (it != llvm_type_registry_.end()) ? it->second : nullptr;
+    }
+    
+    void SymbolResolutionManager::register_generated_symbol(std::unique_ptr<SymbolIdentifier> identifier, Cryo::Symbol* symbol) {
+        if (identifier && symbol) {
+            size_t hash = calculate_identifier_hash(*identifier);
+            // Store the symbol in our internal registry for resolution
+            // For now, we'll delegate to the underlying symbol table lookup
+            // but this could be enhanced to maintain our own symbol registry
+        }
+    }
+    
+    void SymbolResolutionManager::unregister_symbol(const SymbolIdentifier& identifier) {
+        size_t hash = calculate_identifier_hash(identifier);
+        // Remove from caches to ensure the symbol is no longer resolved
+        resolution_cache_.erase(hash);
+        // Could also remove from a dedicated symbol registry if we had one
+    }
+    
+    void SymbolResolutionManager::clear_resolution_cache() const {
+        resolution_cache_.clear();
+    }
+    
+    void SymbolResolutionManager::clear_overload_cache() const {
+        overload_cache_.clear();
+    }
+    
+    void SymbolResolutionManager::clear_all_caches() const {
+        clear_resolution_cache();
+        clear_overload_cache();
+        context_->clear_all_caches();
+    }
+    
+    SymbolResolutionManager::Statistics SymbolResolutionManager::get_statistics() const {
+        Statistics stats;
+        stats.total_resolution_attempts = resolution_attempts_;
+        stats.cache_hits = cache_hits_;
+        stats.cache_misses = cache_misses_;
+        stats.cache_hit_ratio = resolution_attempts_ > 0 ? 
+            static_cast<double>(cache_hits_) / resolution_attempts_ : 0.0;
+        
+        // TODO: Populate strategy usage statistics
+        
+        return stats;
+    }
+    
+    void SymbolResolutionManager::reset_statistics() const {
+        resolution_attempts_ = 0;
+        cache_hits_ = 0;
+        cache_misses_ = 0;
+    }
+    
+    std::string SymbolResolutionManager::get_performance_report() const {
+        auto stats = get_statistics();
+        std::ostringstream oss;
+        oss << "Symbol Resolution Performance Report:\n";
+        oss << "  Total Resolution Attempts: " << stats.total_resolution_attempts << "\n";
+        oss << "  Cache Hits: " << stats.cache_hits << "\n";
+        oss << "  Cache Misses: " << stats.cache_misses << "\n";
+        oss << "  Cache Hit Ratio: " << std::fixed << std::setprecision(2) << (stats.cache_hit_ratio * 100) << "%\n";
+        oss << "  Resolution Cache Size: " << resolution_cache_.size() << "\n";
+        oss << "  Overload Cache Size: " << overload_cache_.size() << "\n";
+        return oss.str();
+    }
+    
+    std::string SymbolResolutionManager::to_debug_string() const {
+        std::ostringstream oss;
+        oss << "SymbolResolutionManager{\n";
+        oss << "  strategies: " << resolution_strategies_.size() << "\n";
+        oss << "  resolution_cache: " << resolution_cache_.size() << " entries\n";
+        oss << "  overload_cache: " << overload_cache_.size() << " entries\n";
+        oss << "  llvm_functions: " << llvm_function_registry_.size() << " entries\n";
+        oss << "  llvm_types: " << llvm_type_registry_.size() << " entries\n";
+        oss << get_performance_report();
+        oss << "}";
+        return oss.str();
+    }
+    
+    // Default resolution strategy implementations
+    
+    SymbolResolutionManager::ResolutionResult SymbolResolutionManager::try_exact_match(
+        const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const {
+        
+        ResolutionResult result;
+        
+        // Try exact lookup in symbol table
+        std::string symbol_name = identifier.to_string();
+        Cryo::Symbol* symbol = lookup_in_symbol_table(symbol_name);
+        
+        if (symbol && is_compatible_symbol(symbol, identifier)) {
+            result.symbol = symbol;
+            result.resolved_identifier = std::unique_ptr<SymbolIdentifier>(nullptr); // TODO: Clone identifier
+            result.resolution_cost = 0;
+            result.is_exact_match = true;
+        }
+        
+        return result;
+    }
+    
+    SymbolResolutionManager::ResolutionResult SymbolResolutionManager::try_namespace_qualified(
+        const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const {
+        
+        ResolutionResult result;
+        
+        // Try lookup with various namespace qualifications
+        auto candidates = context.generate_lookup_candidates(identifier.to_string(), identifier.get_symbol_kind());
+        
+        for (const auto& candidate : candidates) {
+            std::string candidate_name = candidate->to_string();
+            Cryo::Symbol* symbol = lookup_in_symbol_table(candidate_name);
+            
+            if (symbol && is_compatible_symbol(symbol, identifier)) {
+                result.symbol = symbol;
+                result.resolved_identifier = std::unique_ptr<SymbolIdentifier>(nullptr); // TODO: Clone candidate
+                result.resolution_cost = calculate_resolution_cost(identifier, *candidate);
+                result.is_exact_match = (result.resolution_cost == 0);
+                break; // Take first match for now
+            }
+        }
+        
+        return result;
+    }
+    
+    SymbolResolutionManager::ResolutionResult SymbolResolutionManager::try_imported_namespaces(
+        const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const {
+        
+        ResolutionResult result;
+        
+        // Try lookup in imported namespaces
+        for (const std::string& imported_ns : context.get_imported_namespaces()) {
+            Cryo::Symbol* symbol = lookup_in_namespace(imported_ns, identifier.to_string());
+            
+            if (symbol && is_compatible_symbol(symbol, identifier)) {
+                result.symbol = symbol;
+                result.resolution_cost = 1; // Imported symbols have cost 1
+                result.is_exact_match = false;
+                break;
+            }
+        }
+        
+        return result;
+    }
+    
+    SymbolResolutionManager::ResolutionResult SymbolResolutionManager::try_current_namespace(
+        const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const {
+        
+        ResolutionResult result;
+        
+        if (!context.get_namespace_stack().empty()) {
+            std::string current_ns = context.get_current_namespace_path();
+            Cryo::Symbol* symbol = lookup_in_namespace(current_ns, identifier.to_string());
+            
+            if (symbol && is_compatible_symbol(symbol, identifier)) {
+                result.symbol = symbol;
+                result.resolution_cost = 0;
+                result.is_exact_match = true;
+            }
+        }
+        
+        return result;
+    }
+    
+    SymbolResolutionManager::ResolutionResult SymbolResolutionManager::try_parent_namespaces(
+        const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const {
+        
+        ResolutionResult result;
+        
+        const auto& namespace_stack = context.get_namespace_stack();
+        
+        // Try parent namespaces from most specific to least specific
+        for (size_t i = namespace_stack.size(); i > 0; --i) {
+            std::vector<std::string> parent_ns(namespace_stack.begin(), namespace_stack.begin() + i - 1);
+            std::string parent_ns_path = Utils::build_qualified_name(parent_ns, "");
+            
+            Cryo::Symbol* symbol = lookup_in_namespace(parent_ns_path, identifier.to_string());
+            
+            if (symbol && is_compatible_symbol(symbol, identifier)) {
+                result.symbol = symbol;
+                result.resolution_cost = static_cast<int>(namespace_stack.size() - i + 1);
+                result.is_exact_match = false;
+                break;
+            }
+        }
+        
+        return result;
+    }
+    
+    SymbolResolutionManager::ResolutionResult SymbolResolutionManager::try_implicit_conversions(
+        const SymbolIdentifier& identifier, const SymbolResolutionContext& context) const {
+        
+        ResolutionResult result;
+        // TODO: Implement implicit conversion logic
+        return result;
+    }
+    
+    void SymbolResolutionManager::initialize_default_strategies() {
+        resolution_strategies_.clear();
+        
+        // Order matters - strategies are tried in the order they're added
+        resolution_strategies_.emplace_back("exact_match", 
+            [this](const SymbolIdentifier& id, const SymbolResolutionContext& ctx) {
+                return try_exact_match(id, ctx);
+            });
+            
+        resolution_strategies_.emplace_back("current_namespace",
+            [this](const SymbolIdentifier& id, const SymbolResolutionContext& ctx) {
+                return try_current_namespace(id, ctx);
+            });
+            
+        resolution_strategies_.emplace_back("namespace_qualified",
+            [this](const SymbolIdentifier& id, const SymbolResolutionContext& ctx) {
+                return try_namespace_qualified(id, ctx);
+            });
+            
+        resolution_strategies_.emplace_back("imported_namespaces",
+            [this](const SymbolIdentifier& id, const SymbolResolutionContext& ctx) {
+                return try_imported_namespaces(id, ctx);
+            });
+            
+        resolution_strategies_.emplace_back("parent_namespaces",
+            [this](const SymbolIdentifier& id, const SymbolResolutionContext& ctx) {
+                return try_parent_namespaces(id, ctx);
+            });
+            
+        resolution_strategies_.emplace_back("implicit_conversions",
+            [this](const SymbolIdentifier& id, const SymbolResolutionContext& ctx) {
+                return try_implicit_conversions(id, ctx);
+            });
+    }
+    
+    size_t SymbolResolutionManager::calculate_identifier_hash(const SymbolIdentifier& identifier) const {
+        return identifier.hash();
+    }
+    
+    bool SymbolResolutionManager::is_compatible_symbol(const Cryo::Symbol* symbol, const SymbolIdentifier& identifier) const {
+        if (!symbol) return false;
+        
+        // Check symbol kind compatibility
+        if (symbol->kind != identifier.get_symbol_kind()) {
+            return false;
+        }
+        
+        // TODO: Add more sophisticated compatibility checks
+        // - Type compatibility for functions
+        // - Template parameter matching
+        // - Accessibility checks
+        
+        return true;
+    }
+    
+    int SymbolResolutionManager::calculate_resolution_cost(const SymbolIdentifier& target, const SymbolIdentifier& candidate) const {
+        // Simple cost calculation based on string difference
+        std::string target_str = target.to_string();
+        std::string candidate_str = candidate.to_string();
+        
+        if (target_str == candidate_str) return 0;
+        
+        // TODO: Implement more sophisticated cost calculation
+        // - Namespace depth difference
+        // - Type conversion costs
+        // - Template specialization costs
+        
+        return 1;
+    }
+    
+    std::string SymbolResolutionManager::generate_overload_cache_key(
+        const std::string& base_name, const std::vector<Cryo::Type*>& types) const {
+        
+        std::ostringstream oss;
+        oss << base_name << "(";
+        for (size_t i = 0; i < types.size(); ++i) {
+            if (i > 0) oss << ",";
+            if (types[i]) {
+                oss << types[i]->to_string();
+            } else {
+                oss << "null";
+            }
+        }
+        oss << ")";
+        return oss.str();
+    }
+    
+    // Helper methods for name generation
+    std::string SymbolResolutionManager::build_qualified_name_impl(const SymbolIdentifier& identifier) const {
+        return identifier.to_string();
+    }
+    
+    std::string SymbolResolutionManager::build_namespace_qualified_name(
+        const std::vector<std::string>& namespaces, const std::string& name) const {
+        
+        if (namespaces.empty()) {
+            return name;
+        }
+        
+        std::ostringstream oss;
+        for (size_t i = 0; i < namespaces.size(); ++i) {
+            if (i > 0) oss << namespace_separator_;
+            oss << namespaces[i];
+        }
+        oss << namespace_separator_ << name;
+        return oss.str();
+    }
+    
+    std::string SymbolResolutionManager::escape_name_for_llvm(const std::string& name) const {
+        return Utils::escape_for_llvm(name);
+    }
+    
+    std::string SymbolResolutionManager::normalize_identifier_name(const std::string& name) const {
+        return Utils::normalize_type_name(name);
+    }
+    
+    std::vector<std::string> SymbolResolutionManager::generate_parent_namespace_variants(const std::string& base_name) const {
+        std::vector<std::string> variants;
+        
+        const auto& namespace_stack = context_->get_namespace_stack();
+        
+        // Generate variants for each parent namespace level
+        for (size_t i = namespace_stack.size(); i > 0; --i) {
+            std::vector<std::string> parent_ns(namespace_stack.begin(), namespace_stack.begin() + i - 1);
+            std::string qualified_name = build_namespace_qualified_name(parent_ns, base_name);
+            variants.push_back(qualified_name);
+        }
+        
+        // Add unqualified name
+        variants.push_back(base_name);
+        
+        return variants;
+    }
+    
+} // namespace Cryo::SRM

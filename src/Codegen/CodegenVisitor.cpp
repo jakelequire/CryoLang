@@ -41,7 +41,7 @@ namespace Cryo::Codegen
           _type_mapper(std::make_unique<TypeMapper>(context_manager, symbol_table.get_type_context())),
           _intrinsics(std::make_unique<Intrinsics>(context_manager, gdm)),
           _function_registry(std::make_unique<FunctionRegistry>(symbol_table, *symbol_table.get_type_context())),
-          _srm_context(std::make_unique<Cryo::SRM::SymbolResolutionContext>(&symbol_table, symbol_table.get_type_context())),
+          _srm_context(std::make_unique<Cryo::SRM::SymbolResolutionContext>(symbol_table.get_type_context())),
           _srm_manager(std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get())),
           _current_value(nullptr),
           _current_node(nullptr),
@@ -2390,8 +2390,8 @@ namespace Cryo::Codegen
                         auto namespace_parts = get_current_namespace_parts();
                         auto identifier = Cryo::SRM::FunctionIdentifier::create_constructor(
                             namespace_parts, target_type_name, parameter_types);
-                        // Use constructor name format, not overload key, to match what new expressions expect
-                        qualified_name = identifier->to_constructor_name();
+                        // Use overload key format to match the declaration phase naming
+                        qualified_name = identifier->to_overload_key();
                     }
                     catch (const std::exception& e)
                     {

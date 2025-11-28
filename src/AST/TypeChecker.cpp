@@ -624,9 +624,8 @@ namespace Cryo
         // before the standard library is fully loaded
         register_builtin_generic_types();
 
-        // Initialize Symbol Resolution Manager (SRM)
-        // Note: We don't have a main SymbolTable yet, so we'll initialize with nullptr for now
-        _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(nullptr, &_type_context);
+        // Initialize Symbol Resolution Manager (SRM) for naming purposes
+        _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&_type_context);
         _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
 
         // Generic types will be discovered dynamically from standard library parsing
@@ -655,9 +654,8 @@ namespace Cryo
             _diagnostic_builder = std::make_unique<TypeCheckerDiagnosticBuilder>(_diagnostic_manager, _source_file);
         }
 
-        // Initialize Symbol Resolution Manager (SRM)
-        // Note: We don't have a main SymbolTable yet, so we'll initialize with nullptr for now
-        _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(nullptr, &_type_context);
+        // Initialize Symbol Resolution Manager (SRM) for naming purposes
+        _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&_type_context);
         _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
 
         // Generic types will be discovered dynamically from standard library parsing
