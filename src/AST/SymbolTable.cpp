@@ -546,9 +546,8 @@ namespace Cryo
     
     void SymbolTable::initialize_srm() const {
         if (!srm_context_) {
-            // Initialize SRM context with current symbol table
-            srm_context_ = std::make_unique<SRM::SymbolResolutionContext>(
-                const_cast<SymbolTable*>(this), type_context_);
+            // Initialize SRM context for naming purposes only
+            srm_context_ = std::make_unique<SRM::SymbolResolutionContext>(type_context_);
             
             // Configure default settings
             srm_context_->set_enable_implicit_std_import(true);
@@ -556,25 +555,38 @@ namespace Cryo
         }
         
         if (!srm_manager_) {
-            // Initialize SRM manager with the context
+            // Initialize SRM manager for naming purposes
             srm_manager_ = std::make_unique<SRM::SymbolResolutionManager>(srm_context_.get());
         }
     }
     
     Symbol* SymbolTable::lookup_symbol_srm(const SRM::SymbolIdentifier& identifier) const {
-        auto result = get_srm_manager()->resolve_symbol(identifier);
-        return result.is_valid() ? result.symbol : nullptr;
+        // Use SRM to generate lookup candidates, then search using traditional lookup
+        auto candidates = get_srm_manager()->generate_lookup_candidates(
+            identifier.get_simple_name(), identifier.get_symbol_kind());
+            
+        // Try each candidate until we find a match
+        for (const auto& candidate_name : candidates) {
+            auto symbol = lookup_symbol(candidate_name);
+            if (symbol) {
+                return symbol;
+            }
+        }
+        
+        return nullptr;
     }
     
     std::vector<Symbol*> SymbolTable::find_symbol_overloads(
         const std::string& base_name, const std::vector<Type*>& arg_types) const {
         
-        auto results = get_srm_manager()->resolve_function_overloads(base_name, arg_types);
+        // Generate function lookup candidates based on the base name and parameter types
+        auto candidates = get_srm_manager()->generate_function_lookup_candidates(base_name, arg_types);
         
         std::vector<Symbol*> symbols;
-        for (const auto& result : results) {
-            if (result.is_valid()) {
-                symbols.push_back(result.symbol);
+        for (const auto& candidate_name : candidates) {
+            auto symbol = lookup_symbol(candidate_name);
+            if (symbol) {
+                symbols.push_back(symbol);
             }
         }
         
@@ -584,8 +596,12 @@ namespace Cryo
     Symbol* SymbolTable::find_best_function_overload(
         const std::string& base_name, const std::vector<Type*>& arg_types) const {
         
-        auto result = get_srm_manager()->resolve_best_function_overload(base_name, arg_types);
-        return result.is_valid() ? result.symbol : nullptr;
+        // Get all function overloads with the given name
+        auto overloads = find_symbol_overloads(base_name, arg_types);
+        
+        // Simple selection: return the first match (in a real implementation, 
+        // this would use type compatibility scoring)
+        return overloads.empty() ? nullptr : overloads[0];
     }
     
     bool SymbolTable::declare_symbol_srm(
@@ -604,8 +620,8 @@ namespace Cryo
         bool success = declare_symbol(canonical_name, kind, loc, data_type, scope);
         
         if (success) {
-            // Also register with SRM for enhanced resolution
-            get_srm_manager()->register_generated_symbol(std::move(identifier), lookup_symbol(canonical_name));
+            // SRM is now purely for naming, no symbol registration needed
+            // The canonical name generation is sufficient
         }
         
         return success;

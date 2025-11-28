@@ -23,7 +23,6 @@ namespace Cryo::Codegen
         try
         {
             auto context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(
-                const_cast<SymbolTable*>(&symbol_table), 
                 &type_context);
             _symbol_resolution_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(context.release());
         }
