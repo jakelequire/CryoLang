@@ -6479,14 +6479,32 @@ namespace Cryo
             return false;
 
         const auto &param_types = func_type->parameter_types();
-        LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: param_types.size()={}", param_types.size()); // For variadic functions, we need at least the required (non-variadic) parameters
+        LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: param_types.size()={}", param_types.size()); 
+        
+        // For variadic functions, param_types only contains the fixed parameters
+        // The variadic parameters are handled separately via the is_variadic flag
+        // However, there's a bug where some variadic functions (like printf) have is_variadic()=false
+        // but still have variadic type parameters. Check for this case as backup.
+        bool is_actually_variadic = func_type->is_variadic();
+        
+        // Backup check: if param_types contains a variadic type, treat as variadic
+        if (!is_actually_variadic) {
+            for (const auto& param_type : param_types) {
+                if (param_type && param_type->kind() == TypeKind::Variadic) {
+                    is_actually_variadic = true;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Detected variadic function via parameter type analysis");
+                    break;
+                }
+            }
+        }
+        
+        // For variadic functions, exclude the variadic parameter from required count
         size_t required_params = param_types.size();
-        if (func_type->is_variadic() && required_params > 0)
-        {
-            // For variadic functions, the last parameter represents the variadic part
-            // So we need at least (param_types.size() - 1) arguments for the fixed parameters
-            // But we allow equal to param_types.size() for the case where there's one variadic arg
-            required_params = param_types.size() - 1;
+        if (is_actually_variadic && required_params > 0) {
+            // Check if the last parameter is variadic
+            if (!param_types.empty() && param_types.back()->kind() == TypeKind::Variadic) {
+                required_params = param_types.size() - 1;
+            }
         }
 
         // Check minimum argument count
@@ -6501,13 +6519,13 @@ namespace Cryo
             }
             else
             {
-                _diagnostic_builder->create_too_many_args_error("function", required_params, arg_types.size(), loc);
+                _diagnostic_builder->create_function_call_error(func_name, required_params, arg_types.size(), loc);
             }
             return false;
         }
 
         // Check maximum argument count for non-variadic functions
-        if (arg_types.size() > param_types.size() && !func_type->is_variadic())
+        if (arg_types.size() > param_types.size() && !is_actually_variadic)
         {
             if (_diagnostic_manager)
             {
@@ -6516,13 +6534,13 @@ namespace Cryo
             }
             else
             {
-                _diagnostic_builder->create_too_many_args_error("function", param_types.size(), arg_types.size(), loc);
+                _diagnostic_builder->create_function_call_error(func_name, param_types.size(), arg_types.size(), loc);
             }
             return false;
         }
 
         // Check argument types for the fixed parameters
-        size_t fixed_params = func_type->is_variadic() ? param_types.size() - 1 : param_types.size();
+        size_t fixed_params = is_actually_variadic ? required_params : param_types.size();
         for (size_t i = 0; i < fixed_params && i < arg_types.size(); ++i)
         {
             if (!check_assignment_compatibility(param_types[i].get(), arg_types[i], loc))
