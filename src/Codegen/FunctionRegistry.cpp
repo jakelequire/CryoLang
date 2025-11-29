@@ -257,13 +257,19 @@ namespace Cryo::Codegen
     {
         FunctionMetadata metadata;
 
-        // Extract runtime name - for stdlib functions, use just the function name without namespace
+        // Extract runtime name - for stdlib functions, use the full qualified name 
         std::string runtime_name = function_name;
 
-        // Handle namespace-qualified function names like "std::String::_strlen" -> "_strlen"
-        if (function_name.find("::") != std::string::npos)
+        // For stdlib functions (starting with "std::"), use the full qualified name as runtime name
+        if (function_name.find("std::") == 0)
         {
-            // Extract the actual function name from the end
+            runtime_name = function_name; // Use full qualified name for stdlib functions
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using qualified runtime name '{}' for stdlib function",
+                      runtime_name);
+        }
+        // For other namespaced functions, extract just the function name
+        else if (function_name.find("::") != std::string::npos)
+        {
             size_t last_scope = function_name.rfind("::");
             if (last_scope != std::string::npos)
             {

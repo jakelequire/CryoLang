@@ -2574,42 +2574,56 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': symbol lookup result = {}", name, symbol ? "found" : "not found");
         if (!symbol)
         {
-            // TODO: Re-enable SRM-based wildcard import resolution after fixing crashes
-            // Temporarily disabled due to compilation issues
-            /*
             // Try to find the symbol in wildcard imported namespaces first (SRM-based resolution)
             if (_srm_context && _main_symbol_table)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Checking wildcard imports for identifier: {}", name);
                 
-                auto imported_namespaces = _srm_context->get_imported_namespaces();
-                auto namespace_aliases = _srm_context->get_namespace_aliases();
+                // Generate lookup candidates using SRM
+                auto candidates = _srm_context->generate_lookup_candidates(name, Cryo::SymbolKind::Variable);
                 
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found {} imported namespaces", imported_namespaces.size());
-                
-                // First try imported namespaces
-                for (const auto& ns : imported_namespaces)
+                for (const auto& candidate : candidates)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Checking namespace: {}", ns);
-                    Symbol *namespace_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(ns, name, _current_namespace);
-                    if (namespace_symbol && namespace_symbol->data_type)
+                    if (!candidate) continue;
+                    
+                    std::string qualified_name = candidate->to_string();
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Trying candidate: {}", qualified_name);
+                    
+                    // Try TypedSymbol lookup first
+                    TypedSymbol *typed_symbol = _symbol_table->lookup_symbol(qualified_name);
+                    if (typed_symbol && typed_symbol->type)
                     {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Found '{}' in wildcard imported namespace '{}'", name, ns);
-                        node.set_resolved_type(namespace_symbol->data_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found '{}' as qualified name '{}' in typed symbol table", name, qualified_name);
+                        node.set_resolved_type(typed_symbol->type);
                         return;
                     }
-                }
-                
-                // Also try namespace aliases
-                for (const auto& alias_pair : namespace_aliases)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Checking namespace alias: {} -> {}", alias_pair.first, alias_pair.second);
-                    Symbol *alias_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(alias_pair.second, name, _current_namespace);
-                    if (alias_symbol && alias_symbol->data_type)
+                    
+                    // Try main symbol table lookup
+                    Symbol *main_symbol = _main_symbol_table->lookup_symbol(qualified_name);
+                    if (main_symbol && main_symbol->data_type)
                     {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Found '{}' in namespace alias '{}' ({})", name, alias_pair.first, alias_pair.second);
-                        node.set_resolved_type(alias_symbol->data_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found '{}' as qualified name '{}' in main symbol table", name, qualified_name);
+                        node.set_resolved_type(main_symbol->data_type);
                         return;
+                    }
+                    
+                    // Try namespace resolution with context
+                    auto ns_parts = candidate->get_namespace_parts();
+                    if (!ns_parts.empty())
+                    {
+                        std::string namespace_path = "";
+                        for (size_t i = 0; i < ns_parts.size(); ++i) {
+                            if (i > 0) namespace_path += "::";
+                            namespace_path += ns_parts[i];
+                        }
+                        
+                        Symbol *ns_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(namespace_path, candidate->get_simple_name(), _current_namespace);
+                        if (ns_symbol && ns_symbol->data_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found '{}' in namespace '{}'", name, namespace_path);
+                            node.set_resolved_type(ns_symbol->data_type);
+                            return;
+                        }
                     }
                 }
             }
@@ -2621,21 +2635,25 @@ namespace Cryo
                 Symbol *runtime_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context("std::Runtime", name, _current_namespace);
                 if (runtime_symbol)
                 {
-                    // Found runtime function - for now set to unknown type
-                    // TODO: Create proper function types for runtime functions
-                    node.set_resolved_type(_type_context.get_unknown_type());
+                    // Found runtime function - use the actual function type if available
+                    if (runtime_symbol->data_type) {
+                        node.set_resolved_type(runtime_symbol->data_type);
+                    } else {
+                        node.set_resolved_type(_type_context.get_unknown_type());
+                    }
                     return;
                 }
 
-                // Try to find the symbol in the std::Intrinsics namespace as well
-                // This allows intrinsic functions like __printf__ to be used without qualification
-                Symbol *intrinsic_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context("std::Intrinsics", name, _current_namespace);
-                if (intrinsic_symbol)
+                // Try to find the symbol in std::Intrinsics namespace
+                // This allows intrinsic functions like __ptr_add__ to be used without qualification
+                Symbol *std_intrinsic_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context("std::Intrinsics", name, _current_namespace);
+                if (std_intrinsic_symbol)
                 {
                     // Found intrinsic function - use the actual function type
-                    if (intrinsic_symbol->data_type)
+                    if (std_intrinsic_symbol->data_type)
                     {
-                        node.set_resolved_type(intrinsic_symbol->data_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found intrinsic '{}' in std::Intrinsics", name);
+                        node.set_resolved_type(std_intrinsic_symbol->data_type);
                     }
                     else
                     {
@@ -2668,7 +2686,6 @@ namespace Cryo
                 report_undefined_symbol(node.location(), name);
                 node.set_resolved_type(_type_context.get_unknown_type());
             }
-            */
         }
         else
         {
@@ -4587,6 +4604,31 @@ namespace Cryo
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Resolved scope alias '{}' -> '{}' for member '{}'", 
                           scope_name, resolved_scope, member_name);
+            }
+            
+            // Also try generating lookup candidates if direct alias resolution fails
+            if (resolved_scope == scope_name)
+            {
+                auto candidates = _srm_context->generate_lookup_candidates(scope_name, Cryo::SymbolKind::Type);
+                for (const auto& candidate : candidates)
+                {
+                    if (!candidate) continue;
+                    auto ns_parts = candidate->get_namespace_parts();
+                    if (!ns_parts.empty())
+                    {
+                        std::string candidate_namespace = "";
+                        for (size_t i = 0; i < ns_parts.size(); ++i) {
+                            if (i > 0) candidate_namespace += "::";
+                            candidate_namespace += ns_parts[i];
+                        }
+                        if (candidate->get_simple_name() == scope_name)
+                        {
+                            resolved_scope = candidate_namespace + "::" + scope_name;
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Resolved scope '{}' via SRM candidates to '{}'", scope_name, resolved_scope);
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -7553,44 +7595,66 @@ namespace Cryo
     
     std::string TypeChecker::resolve_module_path_to_namespace(const std::string& module_path) const
     {
-        // Handle special module path mappings first
-        if (module_path == "io/stdio") {
-            return "std::IO";
-        }
-        if (module_path == "net/types") {
-            return "std::net::Types";
-        }
-        if (module_path == "net/tcp") {
-            return "std::net::TCP";
-        }
-        if (module_path == "net/http") {
-            return "std::net::HTTP";
-        }
+        // Handle special core module mappings first
         if (module_path == "core/types") {
             return "std";  // Core types are in std namespace
         }
+        if (module_path == "core/syscall") {
+            return "std::Syscall";
+        }
+        if (module_path == "core/intrinsics") {
+            return "std::Intrinsics";
+        }
         
-        // Convert module path like "collections/vector" to "std::collections::Vector" 
+        // Dynamic resolution: Convert module path like "io/stdio" to "std::IO"
+        // This creates a more predictable mapping pattern
         std::string namespace_path = "std";
         
         std::string path = module_path;
         size_t start = 0;
         size_t end = path.find('/');
         
+        // Special handling for certain patterns
+        if (module_path == "io/stdio") {
+            return "std::IO";  // Map io/stdio to std::IO
+        }
+        
+        // Process path segments
+        std::vector<std::string> segments;
         while (end != std::string::npos) {
             std::string segment = path.substr(start, end - start);
-            namespace_path += "::" + segment;
+            segments.push_back(segment);
             start = end + 1;
             end = path.find('/', start);
         }
         
-        // Add the final segment with capitalized first letter
+        // Add the final segment
         std::string final_segment = path.substr(start);
         if (!final_segment.empty()) {
-            final_segment[0] = std::toupper(final_segment[0]);
-            namespace_path += "::" + final_segment;
+            segments.push_back(final_segment);
         }
         
+        // Build namespace path
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (i == segments.size() - 1) {
+                // Last segment gets capitalized (e.g., "stdio" -> "IO" for special cases)
+                if (segments[i] == "stdio" && segments.size() >= 2 && segments[segments.size()-2] == "io") {
+                    namespace_path += "::IO";
+                } else {
+                    // Capitalize first letter of final segment
+                    std::string capitalized = segments[i];
+                    if (!capitalized.empty()) {
+                        capitalized[0] = std::toupper(capitalized[0]);
+                    }
+                    namespace_path += "::" + capitalized;
+                }
+            } else {
+                // Intermediate segments remain lowercase
+                namespace_path += "::" + segments[i];
+            }
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved module path '{}' to namespace '{}'", module_path, namespace_path);
         return namespace_path;
     }
 
