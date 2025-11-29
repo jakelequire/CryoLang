@@ -1004,10 +1004,12 @@ namespace Cryo
             Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
 
             // Add intrinsic function to current (global) scope with Intrinsic symbol kind
+            // Register intrinsics only in std::Intrinsics namespace for consistency
             current_scope->declare_symbol(intrinsic_decl->name(), SymbolKind::Intrinsic,
-                                          intrinsic_decl->location(), function_type, scope_name);
+                                          intrinsic_decl->location(), function_type, "std::Intrinsics");
 
-            LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered intrinsic function '{}' in symbol table", intrinsic_decl->name());
+            LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered intrinsic function '{}' in namespace 'std::Intrinsics'", 
+                     intrinsic_decl->name());
         }
         // Handle struct declarations
         else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))

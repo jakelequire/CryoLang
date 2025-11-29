@@ -476,6 +476,35 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing import declaration: {} (alias: {})", 
                   node.path(), node.alias().empty() ? "none" : node.alias());
         
+        // DEBUG: Check if we have specific imports and register namespace aliases
+        if (node.is_specific_import() && _srm_context)
+        {
+            auto specific_imports = node.specific_imports();
+            std::string module_path = node.path();
+            
+            printf("DEBUG: Specific imports from %s\n", module_path.c_str());
+            
+            // Convert module path to namespace (match TypeChecker logic)
+            std::string namespace_path;
+            if (module_path == "io/stdio") {
+                namespace_path = "std::IO";
+            } else if (module_path == "core/types") {
+                namespace_path = "std";
+            } else {
+                namespace_path = "std::" + module_path;  // fallback
+            }
+            
+            for (const auto& import_name : specific_imports)
+            {
+                printf("DEBUG: Registering namespace alias: '%s' -> '%s'\n", import_name.c_str(), namespace_path.c_str());
+                _srm_context->register_namespace_alias(import_name, namespace_path);
+                
+                // Verify registration
+                std::string resolved = _srm_context->resolve_namespace_alias(import_name);
+                printf("DEBUG: Verification - alias '%s' resolves to '%s'\n", import_name.c_str(), resolved.c_str());
+            }
+        }
+        
         // For cross-module enum resolution, we need to load enum variants from imported modules
         // This is critical for resolving Types::NetError::SUCCESS in importing modules
         std::string module_alias = node.alias().empty() ? node.path() : node.alias();
@@ -3490,11 +3519,27 @@ namespace Cryo::Codegen
         uint64_t struct_size = data_layout.getTypeAllocSize(struct_type);
 
         // Call cryo_alloc to allocate memory on the heap
-        llvm::Function *cryo_alloc_func = module->getFunction("cryo_alloc");
+        llvm::Function *cryo_alloc_func = module->getFunction("std::Runtime::cryo_alloc");
         if (!cryo_alloc_func)
         {
-            _diagnostic_builder->report_error(ErrorCode::E0617_MEMORY_OPERATION_ERROR, &node, "cryo_alloc function not found for heap allocation");
-            return;
+            // Create the function declaration since it's not pre-declared
+            // cryo_alloc signature: void* cryo_alloc(size_t size)
+            llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+            llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+            llvm::FunctionType *cryo_alloc_type = llvm::FunctionType::get(
+                void_ptr_type, {size_t_type}, false);
+            
+            cryo_alloc_func = llvm::Function::Create(
+                cryo_alloc_type,
+                llvm::Function::ExternalLinkage,
+                "std::Runtime::cryo_alloc",
+                module);
+            
+            if (!cryo_alloc_func)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0617_MEMORY_OPERATION_ERROR, &node, "Failed to create std::Runtime::cryo_alloc function declaration");
+                return;
+            }
         }
 
         // Create size argument for cryo_alloc (u64)
@@ -5827,12 +5872,44 @@ namespace Cryo::Codegen
             llvm::FunctionType *func_type = llvm::FunctionType::get(
                 return_type, param_types, is_variadic);
 
-            // Use simple function name in IR - namespace resolution handled by symbol table
-            std::string function_name = node->name();
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function name generation - using simple IR name: {} (namespace: '{}')",
-                      function_name, _namespace_context);
+            // Generate fully qualified function name using SRM for consistent IR symbols
+            std::string function_name;
+            
+            // Special case: _user_main_ should not be namespace-qualified for clean runtime calling
+            if (node->name() == "_user_main_") {
+                function_name = "_user_main_";
+            }
+            else if (!_namespace_context.empty()) {
+                // Use SRM to generate fully qualified name
+                // Parse namespace context like "std::IO" into parts ["std", "IO"]
+                std::vector<std::string> namespace_parts;
+                std::string ns = _namespace_context;
+                size_t pos = 0;
+                while ((pos = ns.find("::")) != std::string::npos) {
+                    std::string part = ns.substr(0, pos);
+                    if (!part.empty()) {
+                        namespace_parts.push_back(part);
+                    }
+                    ns.erase(0, pos + 2);
+                }
+                if (!ns.empty()) {
+                    namespace_parts.push_back(ns);
+                }
+                
+                auto qualified_identifier = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
+                    namespace_parts, node->name(), Cryo::SymbolKind::Function);
+                function_name = qualified_identifier->to_string();
+            } else {
+                // Use simple name if not in namespace
+                function_name = node->name();
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function name generation - using qualified IR name: {} (namespace: '{}', original: '{}')",
+                      function_name, _namespace_context, node->name());
+            std::cerr << "DEBUG: Function declaration - namespace_context='" << _namespace_context 
+                      << "', function_name='" << function_name << "', original='" << node->name() << "'" << std::endl;
 
             // Check if function already exists in the module (from pre-registration)
+            // Use only qualified names for consistency
             llvm::Function *existing_function = module->getFunction(function_name);
             if (existing_function)
             {
@@ -9619,11 +9696,35 @@ namespace Cryo::Codegen
         // Get the function name from the callee
         std::string function_name;
         std::string resolved_function_name; // Will be set after namespace alias resolution
+        std::cout << "DEBUG: Callee type check starting..." << std::endl;
         if (auto *identifier = dynamic_cast<IdentifierNode *>(node->callee()))
         {
+            std::cout << "DEBUG: Callee is IdentifierNode" << std::endl;
             // Handle simple function name
             function_name = identifier->name();
             resolved_function_name = function_name;
+            
+            std::cout << "DEBUG: Processing unqualified function call: " << function_name << std::endl;
+            
+            // First, try to resolve within current namespace
+            auto namespace_parts = get_current_namespace_parts();
+            std::cout << "DEBUG: Current namespace parts count: " << namespace_parts.size() << std::endl;
+            
+            if (!namespace_parts.empty()) {
+                std::string current_namespace_qualified = generate_qualified_name(function_name, Cryo::SymbolKind::Function);
+                std::cout << "DEBUG: Trying current namespace qualification: " << function_name << " -> " << current_namespace_qualified << std::endl;
+                
+                // Check if this qualified function exists
+                llvm::Function *current_ns_func = _context_manager.get_module()->getFunction(current_namespace_qualified);
+                if (current_ns_func) {
+                    resolved_function_name = current_namespace_qualified;
+                    std::cout << "DEBUG: Found function in current namespace: " << current_namespace_qualified << std::endl;
+                } else {
+                    std::cout << "DEBUG: Function not found in current namespace: " << current_namespace_qualified << std::endl;
+                }
+            } else {
+                std::cout << "DEBUG: No current namespace available for qualification" << std::endl;
+            }
             
             // Try wildcard import resolution for unqualified function names
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Attempting wildcard import resolution for unqualified function: {}", function_name);
@@ -9696,6 +9797,7 @@ namespace Cryo::Codegen
         }
         else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
         {
+            std::cout << "DEBUG: Callee is MemberAccessNode" << std::endl;
             // First check if this is an intrinsic call with qualified names
             std::string member_name = member_access->member();
             if (member_name.length() > 4 && member_name.substr(0, 2) == "__" && member_name.substr(member_name.length() - 2) == "__")
@@ -10581,22 +10683,63 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    // Fall back to handling namespaced calls like Std::Runtime::print_int
+                    // Fall back to handling namespaced calls like IO::printf or Std::Runtime::print_int
                     function_name = extract_function_name_from_member_access(member_access);
-                    resolved_function_name = function_name;
+                    
+                    // Check if this is a namespace-qualified function call
+                    if (auto *namespace_identifier = dynamic_cast<IdentifierNode *>(member_access->object()))
+                    {
+                        std::string namespace_name = namespace_identifier->name();
+                        std::string member_name = member_access->member();
+                        
+                        // Try to resolve namespace alias
+                        std::string resolved_namespace = namespace_name;
+                        if (_srm_context) {
+                            resolved_namespace = _srm_context->resolve_namespace_alias(namespace_name);
+                            if (resolved_namespace != namespace_name) {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved namespace alias '{}' -> '{}' for member '{}'", 
+                                          namespace_name, resolved_namespace, member_name);
+                            }
+                            std::cout << "DEBUG: SRM alias resolution: " << namespace_name << " -> " << resolved_namespace << std::endl;
+                        }
+                        
+                        // Generate qualified function name
+                        resolved_function_name = resolved_namespace + "::" + member_name;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Namespace-qualified function call: {} -> {}", 
+                                  namespace_name + "::" + member_name, resolved_function_name);
+                        std::cout << "DEBUG: Namespace call resolution: " << namespace_name << "::" << member_name 
+                                  << " -> " << resolved_function_name << std::endl;
+                    }
+                    else
+                    {
+                        resolved_function_name = function_name;
+                    }
                 }
             }
         }
         else if (auto *scope_resolution = dynamic_cast<ScopeResolutionNode *>(node->callee()))
         {
-            // Handle scope resolution like Std::Runtime::print_int
+            std::cout << "DEBUG: Callee is ScopeResolutionNode" << std::endl;
+            // Handle scope resolution like Std::Runtime::print_int or Types::SocketAddr
             std::string member_name = scope_resolution->member_name();
+            std::string scope_name = scope_resolution->scope_name();
 
             // Check if this is an intrinsic call with qualified names
             if (member_name.length() > 4 && member_name.substr(0, 2) == "__" && member_name.substr(member_name.length() - 2) == "__")
             {
                 // This is a qualified intrinsic call like std::Intrinsics::__printf__
                 return generate_intrinsic_call(node, member_name);
+            }
+            
+            // Resolve namespace aliases if using SRM (e.g., "Types" -> "std::net::Types")
+            std::string resolved_scope = scope_name;
+            if (_srm_context) {
+                resolved_scope = _srm_context->resolve_namespace_alias(scope_name);
+                if (resolved_scope != scope_name) {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved namespace alias '{}' -> '{}' for member '{}'", 
+                              scope_name, resolved_scope, member_name);
+                }
+                std::cout << "DEBUG: ScopeResolution alias resolution: " << scope_name << " -> " << resolved_scope << std::endl;
             }
 
             // Extract parameter types from function call arguments
@@ -10609,9 +10752,16 @@ namespace Cryo::Codegen
                 }
             }
             
-            // Use SRM helper to generate qualified function name
-            function_name = generate_qualified_name(scope_resolution->scope_name() + "::" + scope_resolution->member_name(), Cryo::SymbolKind::Function);
-            resolved_function_name = function_name;
+            // For namespace-qualified calls, use the resolved scope directly (don't prepend current namespace)
+            if (resolved_scope.find("std::") == 0) {
+                // This is a stdlib function, use the qualified name directly
+                resolved_function_name = resolved_scope + "::" + member_name;
+                function_name = resolved_function_name;
+            } else {
+                // This is a user-defined function, use qualified name generation
+                function_name = generate_qualified_name(resolved_scope + "::" + member_name, Cryo::SymbolKind::Function);
+                resolved_function_name = function_name;
+            }
         }
         else
         {
@@ -11166,8 +11316,86 @@ namespace Cryo::Codegen
         // Use FunctionRegistry to get the runtime function name
         FunctionMetadata metadata = _function_registry->get_function_metadata(resolved_function_name, _namespace_context);
         std::string lookup_name = metadata.runtime_name.empty() ? resolved_function_name : metadata.runtime_name;
+        
+        std::cout << "DEBUG: Function lookup - resolved_function_name: " << resolved_function_name 
+                  << ", runtime_name: " << metadata.runtime_name 
+                  << ", lookup_name: " << lookup_name << std::endl;
 
-        llvm::Function *function = module->getFunction(lookup_name);
+        // For imported stdlib functions, try qualified names first
+        llvm::Function *function = nullptr;
+        
+        // First, try to find the function with the qualified name if available
+        if (resolved_function_name.find("::") != std::string::npos) {
+            // This is already a qualified name, try to find it directly
+            function = module->getFunction(resolved_function_name);
+            std::cout << "DEBUG: Trying qualified lookup: " << resolved_function_name 
+                      << " -> " << (function ? "FOUND" : "NOT FOUND") << std::endl;
+            
+            // If we found it, use it and skip runtime fallback
+            if (function) {
+                std::cout << "DEBUG: Using qualified function: " << function->getName().str() << std::endl;
+            }
+        }
+        
+        // If not found and we have an unqualified name, try current namespace first
+        if (!function && resolved_function_name.find("::") == std::string::npos) {
+            std::cout << "DEBUG: Attempting current namespace resolution for unqualified name: " << resolved_function_name << std::endl;
+            
+            // Try to resolve within current namespace first
+            auto namespace_parts = get_current_namespace_parts();
+            std::cout << "DEBUG: Current namespace parts count: " << namespace_parts.size() << std::endl;
+            
+            if (!namespace_parts.empty()) {
+                std::string current_namespace_qualified = generate_qualified_name(resolved_function_name, Cryo::SymbolKind::Function);
+                function = module->getFunction(current_namespace_qualified);
+                std::cout << "DEBUG: Trying current namespace lookup: " << current_namespace_qualified 
+                          << " -> " << (function ? "FOUND" : "NOT FOUND") << std::endl;
+                
+                if (function) {
+                    std::cout << "DEBUG: Using current namespace function: " << function->getName().str() << std::endl;
+                    resolved_function_name = current_namespace_qualified; // Update for later use
+                }
+            } else {
+                std::cout << "DEBUG: No current namespace parts available for qualification" << std::endl;
+            }
+        }
+        
+        // If still not found and we have an unqualified name, try wildcard import resolution
+        if (!function && resolved_function_name.find("::") == std::string::npos) {
+            // Get actual imported namespaces from SRM context instead of hardcoded list
+            const auto& imported_namespaces = _srm_context->get_imported_namespaces();
+            std::vector<std::string> wildcard_namespaces(imported_namespaces.begin(), imported_namespaces.end());
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Trying wildcard import resolution for function call: {}", resolved_function_name);
+            
+            if (!wildcard_namespaces.empty()) {
+                Symbol* resolved_symbol = _symbol_table.lookup_symbol_with_import_resolution(resolved_function_name, wildcard_namespaces);
+                if (resolved_symbol && resolved_symbol->kind == SymbolKind::Function) {
+                    // Found function through wildcard import resolution - construct qualified name
+                    std::string qualified_function_name;
+                    if (resolved_symbol->scope != "Global" && !resolved_symbol->scope.empty()) {
+                        qualified_function_name = generate_qualified_name(resolved_symbol->scope + "::" + resolved_symbol->name, Cryo::SymbolKind::Function);
+                    } else {
+                        qualified_function_name = generate_qualified_name(resolved_symbol->name, Cryo::SymbolKind::Function);
+                    }
+                    function = module->getFunction(qualified_function_name);
+                    if (function) {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function with wildcard-resolved qualified name: {} -> {}", 
+                                  qualified_function_name, function->getName().str());
+                        std::cout << "DEBUG: Wildcard resolution found: " << qualified_function_name << std::endl;
+                    }
+                }
+            }
+        }
+        
+        // If still not found, fall back to the runtime name lookup
+        if (!function) {
+            // For stdlib functions, prefer the qualified name, otherwise use runtime name  
+            std::string final_lookup_name = (resolved_function_name.find("std::IO::") == 0) ? resolved_function_name : lookup_name;
+            function = module->getFunction(final_lookup_name);
+            std::cout << "DEBUG: Runtime fallback lookup: " << final_lookup_name 
+                      << " -> " << (function ? "FOUND" : "NOT FOUND") << std::endl;
+        }
         if (!function)
         {
             // Before trying to create a runtime declaration, check for primitive intrinsic fallbacks
@@ -11186,7 +11414,9 @@ namespace Cryo::Codegen
             }
             
             // Function not declared yet, create a declaration
-            function = create_runtime_function_declaration(lookup_name, node);
+            // For stdlib functions, use qualified name, otherwise use runtime name
+            std::string declaration_name = (resolved_function_name.find("std::IO::") == 0) ? resolved_function_name : lookup_name;
+            function = create_runtime_function_declaration(declaration_name, node);
             if (!function)
             {
                 LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to create function declaration for: {} (looked up as: {})", resolved_function_name, lookup_name);
@@ -11737,8 +11967,16 @@ namespace Cryo::Codegen
 
                 // Convert Cryo types to LLVM types
                 std::vector<llvm::Type *> param_types;
+                bool has_variadic = false;
                 for (const auto &param_type : func_type->parameter_types())
                 {
+                    // Skip variadic parameters - they don't have concrete LLVM types
+                    if (param_type->kind() == Cryo::TypeKind::Variadic)
+                    {
+                        has_variadic = true;
+                        continue;
+                    }
+
                     llvm::Type *llvm_param_type = get_llvm_type(param_type.get());
                     if (llvm_param_type)
                     {
@@ -11758,12 +11996,23 @@ namespace Cryo::Codegen
                     return_type = llvm::Type::getInt64Ty(_context_manager.get_context());
                 }
 
-                // Create function type and declaration using actual types
-                llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(return_type, param_types, false);
+                // Create function type and declaration using actual types with variadic flag
+                llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(return_type, param_types, has_variadic);
 
                 // Use FunctionRegistry to get the runtime function name
                 FunctionMetadata metadata_local = _function_registry->get_function_metadata(c_name, _namespace_context);
                 std::string c_runtime_name = metadata_local.runtime_name.empty() ? c_name : metadata_local.runtime_name;
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating runtime declaration: c_name='{}', runtime_name='{}', has_variadic={}", 
+                         c_name, c_runtime_name, has_variadic);
+
+                // Check if function already exists with this runtime name
+                if (llvm::Function *existing = _context_manager.get_module()->getFunction(c_runtime_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found existing function with runtime name '{}', reusing", c_runtime_name);
+                    _functions[c_name] = existing;
+                    return existing;
+                }
 
                 llvm::Function *forward_decl = llvm::Function::Create(
                     llvm_func_type,
@@ -11774,7 +12023,8 @@ namespace Cryo::Codegen
                 if (forward_decl)
                 {
                     _functions[c_name] = forward_decl;
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully created forward declaration using symbol table for: {}", c_name);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully created forward declaration using symbol table for: {} -> {}", 
+                             c_name, forward_decl->getName().str());
                     return forward_decl;
                 }
             }
@@ -13188,13 +13438,26 @@ namespace Cryo::Codegen
                             _context_manager.get_builder().CreateCall(destructor_fn, {heap_object_ptr});
 
                             // Free the heap memory
-                            llvm::Function *cryo_free_func = _context_manager.get_module()->getFunction("cryo_free");
-                            if (cryo_free_func)
+                            llvm::Function *cryo_free_func = _context_manager.get_module()->getFunction("std::Runtime::cryo_free");
+                            if (!cryo_free_func)
                             {
-                                llvm::Value *void_ptr = _context_manager.get_builder().CreateBitCast(
-                                    heap_object_ptr, llvm::PointerType::get(_context_manager.get_context(), 0), "void_ptr");
-                                _context_manager.get_builder().CreateCall(cryo_free_func, {void_ptr});
+                                // Declare the cryo_free function if it doesn't exist
+                                llvm::FunctionType *cryo_free_type = llvm::FunctionType::get(
+                                    llvm::Type::getVoidTy(_context_manager.get_context()), // return type: void
+                                    {llvm::PointerType::get(_context_manager.get_context(), 0)}, // param: void*
+                                    false // not variadic
+                                );
+                                cryo_free_func = llvm::Function::Create(
+                                    cryo_free_type, 
+                                    llvm::Function::ExternalLinkage, 
+                                    "std::Runtime::cryo_free", 
+                                    _context_manager.get_module()
+                                );
                             }
+                            
+                            llvm::Value *void_ptr = _context_manager.get_builder().CreateBitCast(
+                                heap_object_ptr, llvm::PointerType::get(_context_manager.get_context(), 0), "void_ptr");
+                            _context_manager.get_builder().CreateCall(cryo_free_func, {void_ptr});
                         }
                         else
                         {
