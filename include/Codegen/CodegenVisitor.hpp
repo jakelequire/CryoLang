@@ -568,6 +568,7 @@ namespace Cryo::Codegen
         llvm::Value *cast_value(llvm::Value *value, llvm::Type *target_type);
         bool is_lvalue(Cryo::ExpressionNode *expr);
         bool is_primitive_type(const std::string &type_name);
+        bool is_runtime_internal_function(const std::string &function_name);
         void ensure_valid_insertion_point();
         
         // SRM Helper methods for standardized naming
