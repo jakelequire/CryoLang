@@ -5876,8 +5876,14 @@ namespace Cryo::Codegen
             std::string function_name;
             
             // Special case: _user_main_ should not be namespace-qualified for clean runtime calling
+            // The parser transforms user's 'main' function to '_user_main_', which should remain unqualified
             if (node->name() == "_user_main_") {
                 function_name = "_user_main_";
+            }
+            // Special case: Runtime functions that need to be callable with unqualified names
+            // These are functions used internally by the runtime that need simple linkage
+            else if (is_runtime_internal_function(node->name())) {
+                function_name = node->name();
             }
             else if (!_namespace_context.empty()) {
                 // Use SRM to generate fully qualified name
@@ -11313,9 +11319,17 @@ namespace Cryo::Codegen
         }
 
         // Look up the function in the module using the C runtime name
-        // Use FunctionRegistry to get the runtime function name
+        // Use FunctionRegistry to get the runtime function name, but prioritize qualified names
         FunctionMetadata metadata = _function_registry->get_function_metadata(resolved_function_name, _namespace_context);
-        std::string lookup_name = metadata.runtime_name.empty() ? resolved_function_name : metadata.runtime_name;
+        std::string lookup_name;
+        
+        // If resolved_function_name is already qualified (contains ::), use it directly
+        // This ensures functions resolved within their own namespace use the qualified name
+        if (resolved_function_name.find("::") != std::string::npos) {
+            lookup_name = resolved_function_name;
+        } else {
+            lookup_name = metadata.runtime_name.empty() ? resolved_function_name : metadata.runtime_name;
+        }
         
         std::cout << "DEBUG: Function lookup - resolved_function_name: " << resolved_function_name 
                   << ", runtime_name: " << metadata.runtime_name 
@@ -11338,6 +11352,7 @@ namespace Cryo::Codegen
         }
         
         // If not found and we have an unqualified name, try current namespace first
+        // NOTE: Skip this if resolved_function_name was already updated to qualified name earlier
         if (!function && resolved_function_name.find("::") == std::string::npos) {
             std::cout << "DEBUG: Attempting current namespace resolution for unqualified name: " << resolved_function_name << std::endl;
             
@@ -11390,8 +11405,8 @@ namespace Cryo::Codegen
         
         // If still not found, fall back to the runtime name lookup
         if (!function) {
-            // For stdlib functions, prefer the qualified name, otherwise use runtime name  
-            std::string final_lookup_name = (resolved_function_name.find("std::IO::") == 0) ? resolved_function_name : lookup_name;
+            // For all qualified functions, prefer the qualified name, otherwise use runtime name  
+            std::string final_lookup_name = (resolved_function_name.find("::") != std::string::npos) ? resolved_function_name : lookup_name;
             function = module->getFunction(final_lookup_name);
             std::cout << "DEBUG: Runtime fallback lookup: " << final_lookup_name 
                       << " -> " << (function ? "FOUND" : "NOT FOUND") << std::endl;
@@ -11414,8 +11429,8 @@ namespace Cryo::Codegen
             }
             
             // Function not declared yet, create a declaration
-            // For stdlib functions, use qualified name, otherwise use runtime name
-            std::string declaration_name = (resolved_function_name.find("std::IO::") == 0) ? resolved_function_name : lookup_name;
+            // For all qualified functions, use the qualified name to ensure consistency
+            std::string declaration_name = (resolved_function_name.find("::") != std::string::npos) ? resolved_function_name : lookup_name;
             function = create_runtime_function_declaration(declaration_name, node);
             if (!function)
             {
@@ -12316,6 +12331,42 @@ namespace Cryo::Codegen
 
         // Store the forward declaration for future use
         _functions[c_name] = forward_decl;
+
+        // Create alias for namespaced functions to support both qualified and unqualified names
+        if (c_name.find("::") != std::string::npos && c_runtime_name.find("::") == std::string::npos)
+        {
+            // Extract the simple name from the qualified name
+            size_t last_scope_pos = c_name.rfind("::");
+            if (last_scope_pos != std::string::npos)
+            {
+                std::string simple_name = c_name.substr(last_scope_pos + 2);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating alias: '{}' -> '{}'", simple_name, c_runtime_name);
+                
+                // Check if an alias with the simple name already exists
+                if (!_context_manager.get_module()->getFunction(simple_name))
+                {
+                    // Create a GlobalAlias instead of a separate function
+                    llvm::GlobalAlias *alias = llvm::GlobalAlias::create(
+                        forward_decl->getFunctionType(),
+                        0, // Address space
+                        llvm::GlobalValue::ExternalLinkage,
+                        simple_name,
+                        forward_decl,
+                        _context_manager.get_module());
+                    
+                    if (alias)
+                    {
+                        // Store the alias in the functions map too (cast to Function*)
+                        _functions[simple_name] = forward_decl; // Point to the same function
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully created alias: {} -> {}", simple_name, c_runtime_name);
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Alias '{}' already exists, skipping", simple_name);
+                }
+            }
+        }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully created forward declaration for: {}", c_name);
         return forward_decl;
@@ -14545,6 +14596,25 @@ namespace Cryo::Codegen
         }
 
         return result;
+    }
+
+    bool CodegenVisitor::is_runtime_internal_function(const std::string &function_name)
+    {
+        // Functions that should use unqualified names for internal calls
+        static const std::set<std::string> runtime_internal_functions = {
+            "main",           // Runtime's main function must be unqualified for proper linking
+            "cryo_memcpy",
+            "cryo_malloc",
+            "cryo_free",
+            "cryo_realloc",
+            "cryo_strlen",
+            "cryo_strcmp",
+            "cryo_strcpy",
+            "cryo_strcat",
+            "get_reason_phrase"
+        };
+        
+        return runtime_internal_functions.find(function_name) != runtime_internal_functions.end();
     }
 
     bool CodegenVisitor::is_primitive_type(const std::string &type_name)
