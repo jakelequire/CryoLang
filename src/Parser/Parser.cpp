@@ -550,6 +550,9 @@ namespace Cryo
         size_t tokens_skipped = 0;
         size_t sync_start_token_count = _tokens_consumed;
         
+        // Prevent infinite loops by ensuring we always make progress
+        Token previous_token = _current_token;
+        
         // Enhanced error recovery with context-aware synchronization
         while (!is_at_end())
         {
@@ -567,12 +570,25 @@ namespace Cryo
                 return;
             }
             
-            // Block boundaries (only at balanced bracket depth)
-            if (current_kind == TokenKind::TK_R_BRACE && _brace_depth <= 0)
+            // Block boundaries - handle closing braces carefully to avoid infinite loops
+            if (current_kind == TokenKind::TK_R_BRACE)
             {
-                // Don't consume the closing brace - let the calling context handle it
-                LOG_DEBUG(LogComponent::PARSER, "Synchronized on closing brace after skipping {} tokens", tokens_skipped);
-                return;
+                if (tokens_skipped == 0)
+                {
+                    // We hit a closing brace immediately without consuming any tokens.
+                    // This means the calling parser can't handle this brace, so we must consume it
+                    // to prevent infinite loops, regardless of brace depth.
+                    advance();
+                    tokens_skipped++;
+                    LOG_DEBUG(LogComponent::PARSER, "Consumed problematic closing brace to prevent infinite loop after skipping {} tokens", tokens_skipped);
+                    continue;
+                }
+                else
+                {
+                    // We've consumed some tokens before hitting this brace - safe to return
+                    LOG_DEBUG(LogComponent::PARSER, "Synchronized on closing brace after skipping {} tokens", tokens_skipped);
+                    return;
+                }
             }
             
             // ================================================================
@@ -597,6 +613,21 @@ namespace Cryo
                 // Only synchronize on statement starts if we're not deeply nested in expressions
                 if (_paren_depth <= 0 && _bracket_depth <= 0)
                 {
+                    // Special case: don't synchronize on 'default' if it appears to be part of a destructor
+                    // or other declaration (i.e., followed by a semicolon)
+                    if (current_kind == TokenKind::TK_KW_DEFAULT)
+                    {
+                        // Look ahead to see if this is "default;" (part of destructor) vs standalone default
+                        Token next_token = peek_next();
+                        if (next_token.kind() == TokenKind::TK_SEMICOLON)
+                        {
+                            // This is likely "default;" in a destructor - don't synchronize here, keep advancing
+                            advance();
+                            tokens_skipped++;
+                            continue;
+                        }
+                    }
+                    
                     LOG_DEBUG(LogComponent::PARSER, "Synchronized on statement start '{}' after skipping {} tokens", 
                               std::string(_current_token.text()), tokens_skipped);
                     return;
@@ -625,12 +656,7 @@ namespace Cryo
             // Bracket Depth Recovery
             // ================================================================
             
-            // Check for negative bracket depth indicating structural boundary
-            if (_brace_depth < 0)
-            {
-                LOG_DEBUG(LogComponent::PARSER, "Synchronized on structural boundary (negative brace depth) after skipping {} tokens", tokens_skipped);
-                return;
-            }
+            // This check is now handled in the closing brace section above
             
             // ================================================================
             // Emergency Recovery - Prevent Infinite Loops
@@ -662,9 +688,32 @@ namespace Cryo
                 return;
             }
             
+            // ================================================================
+            // Ensure Progress to Prevent Infinite Loops
+            // ================================================================
+            
+            // Store current position before advancing
+            Token current_before_advance = _current_token;
+            
             // Continue advancing and tracking
             advance();
             tokens_skipped++;
+            
+            // Critical check: Ensure we're making progress compared to previous iteration
+            if (_current_token.location().line() == current_before_advance.location().line() && 
+                _current_token.location().column() == current_before_advance.location().column() &&
+                _current_token.kind() == current_before_advance.kind())
+            {
+                LOG_ERROR(LogComponent::PARSER, "CRITICAL: Parser synchronization stuck at same token - forcing emergency exit");
+                LOG_ERROR(LogComponent::PARSER, "Stuck token: '{}' at {}:{}", 
+                         std::string(_current_token.text()),
+                         _current_token.location().line(), 
+                         _current_token.location().column());
+                return; // Emergency exit to prevent infinite loop
+            }
+            
+            // Update previous token for next iteration
+            previous_token = current_before_advance;
         }
         
         // EOF reached during synchronization
