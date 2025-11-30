@@ -231,7 +231,6 @@ RUNTIME_BC_FILES := $(patsubst %.cryo,$(RUNTIME_BUILD_DIR)/%.bc,$(RUNTIME_SRCS))
 all: 
 	@$(MAKE) timed-build
 	@$(MAKE) stdlib
-	@$(MAKE) runtime
 	@$(MAKE) tools
 
 run: $(MAIN_BIN)
@@ -257,8 +256,10 @@ endif
 # STANDARD LIBRARY COMPILATION
 # =================================================================
 
-.PHONY: stdlib stdlib-clean stdlib-status
-stdlib: $(STDLIB_LIB)
+.PHONY: stdlib stdlib-clean
+stdlib: 
+	@$(MAKE) stdlib-clean
+	@$(MAKE) $(STDLIB_LIB)
 
 $(STDLIB_BUILD_DIR):
 ifeq ($(OS), Windows_NT)
@@ -281,16 +282,6 @@ else
 	@python3 scripts/build-stdlib.py $(MAIN_BIN) $(STDLIB_DIR) $(STDLIB_BUILD_DIR) $(STDLIB_LIB) $(STDLIB_FLAGS)
 endif
 
-# Convenience targets for stdlib with different flag combinations
-stdlib-debug:
-	@$(MAKE) stdlib STDLIB_FLAGS="--debug"
-
-stdlib-verbose:
-	@$(MAKE) stdlib STDLIB_FLAGS="--verbose"
-
-stdlib-debug-verbose:
-	@$(MAKE) stdlib STDLIB_FLAGS="--debug --verbose"
-
 stdlib-clean:
 ifeq ($(OS), Windows_NT)
 	@if exist "$(subst /,\,$(STDLIB_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(STDLIB_BUILD_DIR))"
@@ -298,57 +289,7 @@ else
 	@rm -rf $(STDLIB_BUILD_DIR)
 endif
 
-stdlib-status:
-	@echo "=== Standard Library Build Status ==="
-ifeq ($(OS), Windows_NT)
-	@powershell -Command " \
-		$$totalFiles = (Get-ChildItem -Path '$(STDLIB_BUILD_DIR)' -Recurse -Filter '*.bc').Count; \
-		$$validFiles = 0; \
-		$$stubFiles = 0; \
-		foreach ($$file in (Get-ChildItem -Path '$(STDLIB_BUILD_DIR)' -Recurse -Filter '*.bc')) { \
-			if ((Get-Content $$file.FullName -TotalCount 1) -like ';*') { \
-				$$stubFiles++; \
-				Write-Host '✗ FAILED:' $$file.Name.Replace('.bc', '.cryo'); \
-			} else { \
-				$$validFiles++; \
-				Write-Host '✓ OK:    ' $$file.Name.Replace('.bc', '.cryo'); \
-			} \
-		}; \
-		Write-Host ''; \
-		Write-Host 'Summary:' $$validFiles 'successful,' $$stubFiles 'failed out of' $$totalFiles 'total modules'; \
-		if ($$stubFiles -gt 0) { \
-			Write-Host 'Library created with working modules only.'; \
-		} else { \
-			Write-Host 'All modules compiled successfully!'; \
-		} \
-	"
-else
-	@if [ -d "$(STDLIB_BUILD_DIR)" ]; then \
-		total_files=$$(find $(STDLIB_BUILD_DIR) -name "*.bc" | wc -l); \
-		valid_files=0; \
-		stub_files=0; \
-		for file in $(STDLIB_BUILD_DIR)/**/*.bc; do \
-			if [ -f "$$file" ]; then \
-				if head -n1 "$$file" | grep -q "^;"; then \
-					stub_files=$$((stub_files + 1)); \
-					echo "✗ FAILED: $$(basename $$file .bc).cryo"; \
-				else \
-					valid_files=$$((valid_files + 1)); \
-					echo "✓ OK:     $$(basename $$file .bc).cryo"; \
-				fi; \
-			fi; \
-		done; \
-		echo ""; \
-		echo "Summary: $$valid_files successful, $$stub_files failed out of $$total_files total modules"; \
-		if [ $$stub_files -gt 0 ]; then \
-			echo "Library created with working modules only."; \
-		else \
-			echo "All modules compiled successfully!"; \
-		fi; \
-	else \
-		echo "No stdlib build directory found. Run 'make stdlib' first."; \
-	fi
-endif
+# stdlib individual module targets for debugging
 
 stdlib-types:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/core/types.cryo --debug --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/core/types.bc
@@ -377,25 +318,6 @@ stdlib-tcp-gdb:
 		-ex "quit" \
 		--args $(MAIN_BIN) $(STDLIB_DIR)/net/tcp.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/net/tcp.bc
 
-stdlib-runtime:
-	@$(MAKE) runtime
-
-# =================================================================
-# RUNTIME COMPILATION
-# =================================================================
-
-.PHONY: runtime runtime-clean
-runtime: 
-ifeq ($(OS), Windows_NT)
-	@if exist "$(subst /,\,$(RUNTIME_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(RUNTIME_BUILD_DIR))"
-else
-	@if [ -d "$(RUNTIME_BUILD_DIR)" ]; then \
-		echo "Cleaning existing runtime build directory..."; \
-		rm -rf $(RUNTIME_BUILD_DIR); \
-	fi
-endif
-	@$(MAKE) $(RUNTIME_LIB)
-
 gdb-runtime:
 	@echo "Building runtime through gdb for debugging..."
 	@echo "Creating GDB command script..."
@@ -418,54 +340,6 @@ else
 	@mkdir -p $@
 endif
 
-# Compile individual runtime modules to LLVM bitcode
-$(RUNTIME_BUILD_DIR)/%.bc: $(RUNTIME_DIR)/%.cryo $(MAIN_BIN) | $(RUNTIME_BUILD_DIR)
-	@echo "Compiling runtime module: $(RUNTIME_DIR)/$*.cryo"
-ifeq ($(OS), Windows_NT)
-	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
-	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
-	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
-		echo "[RUNTIME] Compilation failed for $*.cryo" && \
-		exit 1 \
-	)
-else
-	@mkdir -p $(dir $@)
-	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
-	@$(MAIN_BIN) $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(shell pwd)/$@ || ( \
-		echo "[RUNTIME] Compilation failed for $*.cryo" && \
-		exit 1 \
-	)
-endif
-
-# Link all runtime modules into a single library
-$(RUNTIME_LIB): $(RUNTIME_BC_FILES)
-	@echo "Creating runtime library: $(RUNTIME_LIB)"
-	@llvm-link $(RUNTIME_BC_FILES) -o $(RUNTIME_BUILD_DIR)/runtime_combined.bc
-ifeq ($(OS), Windows_NT)
-	@llc -filetype=obj $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
-else
-	@llc -filetype=obj -relocation-model=pic $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
-endif
-	@llvm-ar rcs $(RUNTIME_LIB) $(BIN_DIR)stdlib/runtime.o
-	@echo "Runtime library created successfully: $(RUNTIME_LIB)"
-
-# Create runtime object file directly (used for linking main executable)
-$(BIN_DIR)stdlib/runtime.o: $(RUNTIME_BC_FILES)
-	@echo "Creating runtime object: $(BIN_DIR)stdlib/runtime.o"
-	@llvm-link $(RUNTIME_BC_FILES) -o $(RUNTIME_BUILD_DIR)/runtime_combined.bc
-ifeq ($(OS), Windows_NT)
-	@llc -filetype=obj $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
-else
-	@llc -filetype=obj -relocation-model=pic $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
-endif
-	@echo "Runtime object created successfully: $(BIN_DIR)stdlib/runtime.o"
-
-runtime-clean:
-ifeq ($(OS), Windows_NT)
-	@if exist "$(subst /,\,$(RUNTIME_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(RUNTIME_BUILD_DIR))"
-else
-	@rm -rf $(RUNTIME_BUILD_DIR)
-endif
 
 # Test targets - Simple and clean (no external scripts)
 .PHONY: test test-clean
@@ -496,3 +370,20 @@ endif
 
 .PHONY: debug clean all lsp tools test test-quick test-verbose test-category test-file runtime runtime-clean
 .NOTPARALLEL: clean clean-% libs
+
+# Help command
+help:
+	@echo "CryoLang Makefile Commands:"
+	@echo "  make all            - Build the Cryo compiler"
+	@echo "  make run            - Run the Cryo compiler"
+	@echo "  make rebuild        - Clean and rebuild the Cryo compiler"
+	@echo "  make timed-build    - Build with timing information"
+	@echo "  make stdlib         - Build the standard library"
+	@echo "  make clean          - Clean all build artifacts"
+	@echo "  make tools          - Build all Cryo tools (e.g., CryoLSP)"
+	@echo "  make lsp            - Build the Cryo Language Server (CryoLSP)"
+	@echo "  make compiler-lib   - Build the Cryo compiler library for LSP integration"
+	@echo "  make test           - Run the full test suite"
+	@echo "  make test-clean     - Clean test artifacts"
+	@echo "  make runtime        - Build the runtime library"
+	@echo "  make runtime-clean  - Clean runtime build artifacts"
