@@ -4149,6 +4149,32 @@ namespace Cryo
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
+        // Parse constructor initialization list (for inheritance)
+        std::vector<std::string> base_constructor_args;
+        if (is_constructor && _current_token.is(TokenKind::TK_COLON))
+        {
+            advance(); // consume ':'
+            // Parse base class constructor call: BaseClass(args)
+            if (_current_token.is(TokenKind::TK_IDENTIFIER))
+            {
+                advance(); // consume base class name
+                if (_current_token.is(TokenKind::TK_L_PAREN))
+                {
+                    advance(); // consume '('
+                    // Skip over the arguments for now - we'll parse them properly later
+                    int paren_count = 1;
+                    while (paren_count > 0 && !is_at_end())
+                    {
+                        if (_current_token.is(TokenKind::TK_L_PAREN))
+                            paren_count++;
+                        else if (_current_token.is(TokenKind::TK_R_PAREN))
+                            paren_count--;
+                        advance();
+                    }
+                }
+            }
+        }
+
         // Parse return type (optional for constructors)
         Type *return_type = _context.types().get_void_type(); // Default to void
         if (_current_token.is(TokenKind::TK_ARROW))

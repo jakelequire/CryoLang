@@ -3053,6 +3053,21 @@ namespace Cryo
                         _diagnostic_builder->create_invalid_operation_error("decrement", operand_type, nullptr, node.location());
                     }
                 }
+                else if (op == TokenKind::TK_TILDE) // Bitwise NOT (~)
+                {
+                    if (is_integral_type(operand_type))
+                    {
+                        // Bitwise NOT returns the same integer type
+                        node.set_resolved_type(operand_type);
+                    }
+                    else
+                    {
+                        std::string type_name = operand_type ? operand_type->to_string() : "unknown";
+                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                     "Cannot apply bitwise NOT '~' to non-integer type '" + type_name + "'");
+                        node.set_resolved_type(_type_context.get_unknown_type());
+                    }
+                }
                 else
                 {
                     _diagnostic_builder->create_invalid_operation_error(node.operator_token().to_string(), operand_type, nullptr, node.location());
@@ -4580,6 +4595,61 @@ namespace Cryo
             for (const auto &method : type_methods.second)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "    Method: '{}'", method.first);
+            }
+        }
+
+        // Before failing, check base class methods for classes
+        if (effective_type && effective_type->kind() == TypeKind::Class)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Checking base class methods for class '{}'", lookup_type_name);
+            
+            // Look up the class definition to get its base class
+            TypedSymbol *class_symbol = _symbol_table->lookup_symbol(lookup_type_name);
+            if (class_symbol && class_symbol->class_node)
+            {
+                ClassDeclarationNode *class_decl = class_symbol->class_node;
+                if (class_decl && !class_decl->base_class().empty())
+                {
+                    std::string base_class_name = class_decl->base_class();
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Class '{}' inherits from base class '{}'", lookup_type_name, base_class_name);
+                    
+                    // Look up method in base class
+                    auto base_method_it = _struct_methods.find(base_class_name);
+                    if (base_method_it != _struct_methods.end())
+                    {
+                        auto method_it = base_method_it->second.find(member_name);
+                        if (method_it != base_method_it->second.end())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found inherited method '{}' from base class '{}'", member_name, base_class_name);
+                            node.set_resolved_type(method_it->second);
+                            return;
+                        }
+                    }
+                    
+                    // Recursively check base classes (for multi-level inheritance)
+                    TypedSymbol *base_symbol = _symbol_table->lookup_symbol(base_class_name);
+                    if (base_symbol && base_symbol->class_node)
+                    {
+                        ClassDeclarationNode *base_decl = base_symbol->class_node;
+                        if (base_decl && !base_decl->base_class().empty())
+                        {
+                            std::string grandparent_class_name = base_decl->base_class();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Checking grandparent class '{}' for method '{}'", grandparent_class_name, member_name);
+                            
+                            auto grandparent_method_it = _struct_methods.find(grandparent_class_name);
+                            if (grandparent_method_it != _struct_methods.end())
+                            {
+                                auto method_it = grandparent_method_it->second.find(member_name);
+                                if (method_it != grandparent_method_it->second.end())
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "Found inherited method '{}' from grandparent class '{}'", member_name, grandparent_class_name);
+                                    node.set_resolved_type(method_it->second);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

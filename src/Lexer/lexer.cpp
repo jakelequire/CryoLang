@@ -719,7 +719,51 @@ namespace Cryo
         }
         else
         {
-            advance(); // consume character
+            // Handle multi-byte UTF-8 characters
+            unsigned char first_byte = (unsigned char)peek();
+            if (first_byte < 0x80)
+            {
+                // ASCII character (0xxxxxxx)
+                advance();
+            }
+            else if ((first_byte & 0xE0) == 0xC0)
+            {
+                // 2-byte UTF-8 character (110xxxxx 10xxxxxx)
+                advance(); // first byte
+                if (!at_end() && ((unsigned char)peek() & 0xC0) == 0x80)
+                    advance(); // second byte
+            }
+            else if ((first_byte & 0xF0) == 0xE0)
+            {
+                // 3-byte UTF-8 character (1110xxxx 10xxxxxx 10xxxxxx)
+                advance(); // first byte
+                if (!at_end() && ((unsigned char)peek() & 0xC0) == 0x80)
+                {
+                    advance(); // second byte
+                    if (!at_end() && ((unsigned char)peek() & 0xC0) == 0x80)
+                        advance(); // third byte
+                }
+            }
+            else if ((first_byte & 0xF8) == 0xF0)
+            {
+                // 4-byte UTF-8 character (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
+                advance(); // first byte
+                if (!at_end() && ((unsigned char)peek() & 0xC0) == 0x80)
+                {
+                    advance(); // second byte
+                    if (!at_end() && ((unsigned char)peek() & 0xC0) == 0x80)
+                    {
+                        advance(); // third byte
+                        if (!at_end() && ((unsigned char)peek() & 0xC0) == 0x80)
+                            advance(); // fourth byte
+                    }
+                }
+            }
+            else
+            {
+                // Invalid UTF-8 sequence, just advance one byte
+                advance();
+            }
         }
 
         if (at_end() || peek() != '\'')
