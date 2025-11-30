@@ -482,8 +482,6 @@ namespace Cryo::Codegen
             auto specific_imports = node.specific_imports();
             std::string module_path = node.path();
             
-            printf("DEBUG: Specific imports from %s\n", module_path.c_str());
-            
             // Convert module path to namespace (match TypeChecker logic)
             std::string namespace_path;
             if (module_path == "io/stdio") {
@@ -496,12 +494,10 @@ namespace Cryo::Codegen
             
             for (const auto& import_name : specific_imports)
             {
-                printf("DEBUG: Registering namespace alias: '%s' -> '%s'\n", import_name.c_str(), namespace_path.c_str());
                 _srm_context->register_namespace_alias(import_name, namespace_path);
                 
                 // Verify registration
                 std::string resolved = _srm_context->resolve_namespace_alias(import_name);
-                printf("DEBUG: Verification - alias '%s' resolves to '%s'\n", import_name.c_str(), resolved.c_str());
             }
         }
         
@@ -5911,8 +5907,6 @@ namespace Cryo::Codegen
             }
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function name generation - using qualified IR name: {} (namespace: '{}', original: '{}')",
                       function_name, _namespace_context, node->name());
-            std::cerr << "DEBUG: Function declaration - namespace_context='" << _namespace_context 
-                      << "', function_name='" << function_name << "', original='" << node->name() << "'" << std::endl;
 
             // Check if function already exists in the module (from pre-registration)
             // Use only qualified names for consistency
@@ -9702,34 +9696,23 @@ namespace Cryo::Codegen
         // Get the function name from the callee
         std::string function_name;
         std::string resolved_function_name; // Will be set after namespace alias resolution
-        std::cout << "DEBUG: Callee type check starting..." << std::endl;
         if (auto *identifier = dynamic_cast<IdentifierNode *>(node->callee()))
         {
-            std::cout << "DEBUG: Callee is IdentifierNode" << std::endl;
             // Handle simple function name
             function_name = identifier->name();
             resolved_function_name = function_name;
             
-            std::cout << "DEBUG: Processing unqualified function call: " << function_name << std::endl;
-            
             // First, try to resolve within current namespace
             auto namespace_parts = get_current_namespace_parts();
-            std::cout << "DEBUG: Current namespace parts count: " << namespace_parts.size() << std::endl;
             
             if (!namespace_parts.empty()) {
                 std::string current_namespace_qualified = generate_qualified_name(function_name, Cryo::SymbolKind::Function);
-                std::cout << "DEBUG: Trying current namespace qualification: " << function_name << " -> " << current_namespace_qualified << std::endl;
                 
                 // Check if this qualified function exists
                 llvm::Function *current_ns_func = _context_manager.get_module()->getFunction(current_namespace_qualified);
                 if (current_ns_func) {
                     resolved_function_name = current_namespace_qualified;
-                    std::cout << "DEBUG: Found function in current namespace: " << current_namespace_qualified << std::endl;
-                } else {
-                    std::cout << "DEBUG: Function not found in current namespace: " << current_namespace_qualified << std::endl;
                 }
-            } else {
-                std::cout << "DEBUG: No current namespace available for qualification" << std::endl;
             }
             
             // Try wildcard import resolution for unqualified function names
@@ -9803,7 +9786,6 @@ namespace Cryo::Codegen
         }
         else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
         {
-            std::cout << "DEBUG: Callee is MemberAccessNode" << std::endl;
             // First check if this is an intrinsic call with qualified names
             std::string member_name = member_access->member();
             if (member_name.length() > 4 && member_name.substr(0, 2) == "__" && member_name.substr(member_name.length() - 2) == "__")
@@ -10706,15 +10688,12 @@ namespace Cryo::Codegen
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved namespace alias '{}' -> '{}' for member '{}'", 
                                           namespace_name, resolved_namespace, member_name);
                             }
-                            std::cout << "DEBUG: SRM alias resolution: " << namespace_name << " -> " << resolved_namespace << std::endl;
                         }
                         
                         // Generate qualified function name
                         resolved_function_name = resolved_namespace + "::" + member_name;
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Namespace-qualified function call: {} -> {}", 
                                   namespace_name + "::" + member_name, resolved_function_name);
-                        std::cout << "DEBUG: Namespace call resolution: " << namespace_name << "::" << member_name 
-                                  << " -> " << resolved_function_name << std::endl;
                     }
                     else
                     {
@@ -10725,7 +10704,6 @@ namespace Cryo::Codegen
         }
         else if (auto *scope_resolution = dynamic_cast<ScopeResolutionNode *>(node->callee()))
         {
-            std::cout << "DEBUG: Callee is ScopeResolutionNode" << std::endl;
             // Handle scope resolution like Std::Runtime::print_int or Types::SocketAddr
             std::string member_name = scope_resolution->member_name();
             std::string scope_name = scope_resolution->scope_name();
@@ -10745,7 +10723,6 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved namespace alias '{}' -> '{}' for member '{}'", 
                               scope_name, resolved_scope, member_name);
                 }
-                std::cout << "DEBUG: ScopeResolution alias resolution: " << scope_name << " -> " << resolved_scope << std::endl;
             }
 
             // Extract parameter types from function call arguments
@@ -11330,10 +11307,6 @@ namespace Cryo::Codegen
         } else {
             lookup_name = metadata.runtime_name.empty() ? resolved_function_name : metadata.runtime_name;
         }
-        
-        std::cout << "DEBUG: Function lookup - resolved_function_name: " << resolved_function_name 
-                  << ", runtime_name: " << metadata.runtime_name 
-                  << ", lookup_name: " << lookup_name << std::endl;
 
         // For imported stdlib functions, try qualified names first
         llvm::Function *function = nullptr;
@@ -11342,36 +11315,20 @@ namespace Cryo::Codegen
         if (resolved_function_name.find("::") != std::string::npos) {
             // This is already a qualified name, try to find it directly
             function = module->getFunction(resolved_function_name);
-            std::cout << "DEBUG: Trying qualified lookup: " << resolved_function_name 
-                      << " -> " << (function ? "FOUND" : "NOT FOUND") << std::endl;
-            
-            // If we found it, use it and skip runtime fallback
-            if (function) {
-                std::cout << "DEBUG: Using qualified function: " << function->getName().str() << std::endl;
-            }
         }
         
         // If not found and we have an unqualified name, try current namespace first
         // NOTE: Skip this if resolved_function_name was already updated to qualified name earlier
         if (!function && resolved_function_name.find("::") == std::string::npos) {
-            std::cout << "DEBUG: Attempting current namespace resolution for unqualified name: " << resolved_function_name << std::endl;
-            
             // Try to resolve within current namespace first
             auto namespace_parts = get_current_namespace_parts();
-            std::cout << "DEBUG: Current namespace parts count: " << namespace_parts.size() << std::endl;
             
             if (!namespace_parts.empty()) {
                 std::string current_namespace_qualified = generate_qualified_name(resolved_function_name, Cryo::SymbolKind::Function);
                 function = module->getFunction(current_namespace_qualified);
-                std::cout << "DEBUG: Trying current namespace lookup: " << current_namespace_qualified 
-                          << " -> " << (function ? "FOUND" : "NOT FOUND") << std::endl;
-                
                 if (function) {
-                    std::cout << "DEBUG: Using current namespace function: " << function->getName().str() << std::endl;
                     resolved_function_name = current_namespace_qualified; // Update for later use
                 }
-            } else {
-                std::cout << "DEBUG: No current namespace parts available for qualification" << std::endl;
             }
         }
         
@@ -11397,7 +11354,6 @@ namespace Cryo::Codegen
                     if (function) {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function with wildcard-resolved qualified name: {} -> {}", 
                                   qualified_function_name, function->getName().str());
-                        std::cout << "DEBUG: Wildcard resolution found: " << qualified_function_name << std::endl;
                     }
                 }
             }
@@ -11408,8 +11364,6 @@ namespace Cryo::Codegen
             // For all qualified functions, prefer the qualified name, otherwise use runtime name  
             std::string final_lookup_name = (resolved_function_name.find("::") != std::string::npos) ? resolved_function_name : lookup_name;
             function = module->getFunction(final_lookup_name);
-            std::cout << "DEBUG: Runtime fallback lookup: " << final_lookup_name 
-                      << " -> " << (function ? "FOUND" : "NOT FOUND") << std::endl;
         }
         if (!function)
         {
