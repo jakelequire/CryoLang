@@ -9743,6 +9743,19 @@ namespace Cryo::Codegen
 
             return builder.CreateLoad(elementType, operandValue, "deref");
         }
+        else if (operator_str == "~")
+        {
+            // Bitwise NOT operator
+            if (operandValue->getType()->isIntegerTy())
+            {
+                return builder.CreateNot(operandValue, "bitnot");
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Bitwise NOT operator (~) can only be applied to integer types");
+                return nullptr;
+            }
+        }
 
         LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unsupported unary operator: {} in expression {}", operator_str, NodeKindToString(node->kind()));
         return nullptr;
