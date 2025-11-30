@@ -181,6 +181,13 @@ namespace Cryo::Codegen
         else if (intrinsic_name == "__fork__")
             return generate_fork(args);
 
+        else if (intrinsic_name == "__maloc__")
+            return generate_maloc(args);
+        else if (intrinsic_name == "__mfree__")
+            return generate_mfree(args);
+        else if (intrinsic_name == "__msize__")
+            return generate_msize(args);
+
         else
         {
             report_unimplemented_intrinsic(intrinsic_name, node);
@@ -1670,6 +1677,95 @@ namespace Cryo::Codegen
 
         // Return null on overflow, pointer to result otherwise
         return builder.CreateSelect(overflow, null_ptr, result_ptr, "checked_result");
+    }
+
+    llvm::Value *Intrinsics::generate_maloc(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__maloc__ requires exactly 1 argument (size)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+
+        // Create malloc function type: void* malloc(size_t size)
+        llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+            char_ptr_type, {llvm::Type::getInt64Ty(context)}, false);
+
+        // Get or create malloc function
+        llvm::Function *malloc_func = get_or_create_libc_function("malloc", malloc_type);
+
+        llvm::Value *size_arg = args[0];
+        llvm::Value *size_arg_64 = ensure_type(size_arg, llvm::Type::getInt64Ty(context), "maloc.size");
+
+        // Call malloc
+        return builder.CreateCall(malloc_func, {size_arg_64}, "maloc.result");
+    }
+
+    llvm::Value *Intrinsics::generate_mfree(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__mfree__ requires exactly 1 argument (pointer)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create free function type: void free(void* ptr)
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *free_type = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(context), {char_ptr_type}, false);
+
+        // Get or create free function
+        llvm::Function *free_func = get_or_create_libc_function("free", free_type);
+
+        llvm::Value *ptr_arg = args[0];
+
+        if (!ptr_arg->getType()->isPointerTy())
+        {
+            report_error("__mfree__ argument must be a pointer");
+            return nullptr;
+        }
+
+        // Call free
+        return builder.CreateCall(free_func, {ptr_arg}, "mfree.result");
+    }
+
+    llvm::Value *Intrinsics::generate_msize(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__msize__ requires exactly 1 argument (pointer)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create malloc_usable_size function type: size_t malloc_usable_size(void* ptr)
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *msize_type = llvm::FunctionType::get(
+            llvm::Type::getInt64Ty(context), {char_ptr_type}, false);
+
+        // Get or create malloc_usable_size function
+        llvm::Function *msize_func = get_or_create_libc_function("malloc_usable_size", msize_type);
+
+        llvm::Value *ptr_arg = args[0];
+
+        if (!ptr_arg->getType()->isPointerTy())
+        {
+            report_error("__msize__ argument must be a pointer");
+            return nullptr;
+        }
+
+        // Call malloc_usable_size
+        return builder.CreateCall(msize_func, {ptr_arg}, "msize.result");
     }
 
 } // namespace Cryo::Codegen
