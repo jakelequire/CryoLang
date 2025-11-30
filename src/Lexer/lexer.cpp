@@ -111,7 +111,6 @@ namespace Cryo
         {"double", TokenKind::TK_KW_DOUBLE},
         {"char", TokenKind::TK_KW_CHAR},
         {"string", TokenKind::TK_KW_STRING},
-        {"array", TokenKind::TK_KW_ARRAY},
         {"list", TokenKind::TK_KW_LIST},
         {"map", TokenKind::TK_KW_MAP},
         {"dict", TokenKind::TK_KW_DICT},
