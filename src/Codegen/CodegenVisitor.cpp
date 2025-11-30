@@ -317,11 +317,21 @@ namespace Cryo::Codegen
             // Check if this method was already processed by looking for the generated function
             std::string potential_scoped_name;
             if (current_primitive_type) {
-                // Create scoped identifier using namespace parts 
-                std::vector<std::string> scope_parts = {current_primitive_type->to_string()};
-                auto scoped_identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
-                    scope_parts, node.name(), Cryo::SymbolKind::Function);
-                potential_scoped_name = scoped_identifier->to_string();
+                // Special case: If we're in the core types.cryo file (namespace std::core::Types),
+                // use simple naming for primitive method implementations (e.g., "string::to_upper")
+                if (_namespace_context == "std::core::Types") {
+                    // Simple naming for primitive implementations in core types file
+                    std::vector<std::string> scope_parts = {current_primitive_type->to_string()};
+                    auto scoped_identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                        scope_parts, node.name(), Cryo::SymbolKind::Function);
+                    potential_scoped_name = scoped_identifier->to_string(); // e.g., "string::to_upper"
+                } else {
+                    // Standard naming for primitive implementations elsewhere
+                    std::vector<std::string> scope_parts = {current_primitive_type->to_string()};
+                    auto scoped_identifier = Cryo::SRM::QualifiedIdentifier::create_qualified(
+                        scope_parts, node.name(), Cryo::SymbolKind::Function);
+                    potential_scoped_name = scoped_identifier->to_string();
+                }
             } else {
                 potential_scoped_name = node.name();
             }
@@ -3513,6 +3523,13 @@ namespace Cryo::Codegen
         // Calculate the size of the struct for heap allocation
         const llvm::DataLayout &data_layout = module->getDataLayout();
         uint64_t struct_size = data_layout.getTypeAllocSize(struct_type);
+        
+        // Ensure empty structs get at least 1 byte allocated
+        // This prevents null pointer allocation issues and ensures unique addresses
+        if (struct_size == 0) {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Empty struct '{}' detected, allocating minimum 1 byte", full_type_name);
+            struct_size = 1;
+        }
 
         // Call cryo_alloc to allocate memory on the heap
         llvm::Function *cryo_alloc_func = module->getFunction("std::Runtime::cryo_alloc");
@@ -6272,10 +6289,24 @@ namespace Cryo::Codegen
         
         if (current_primitive_type && is_primitive_type(primitive_type_name))
         {
-            std::vector<std::string> std_parts = {"std", "core", "Types", primitive_type_name};
-            auto primitive_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
-                std_parts, node->name(), Cryo::SymbolKind::Function);
-            func_name = generate_qualified_name(primitive_id->to_string(), Cryo::SymbolKind::Function);
+            // Special case: If we're in the core types.cryo file (namespace std::core::Types),
+            // use simple naming for primitive method implementations (e.g., "string::to_upper")
+            if (_namespace_context == "std::core::Types")
+            {
+                // Simple naming for primitive implementations in core types file
+                std::vector<std::string> simple_parts = {primitive_type_name};
+                auto primitive_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
+                    simple_parts, node->name(), Cryo::SymbolKind::Function);
+                func_name = primitive_id->to_string(); // Don't add namespace context
+            }
+            else
+            {
+                // Standard naming for primitive implementations elsewhere
+                std::vector<std::string> std_parts = {"std", "core", "Types", primitive_type_name};
+                auto primitive_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
+                    std_parts, node->name(), Cryo::SymbolKind::Function);
+                func_name = generate_qualified_name(primitive_id->to_string(), Cryo::SymbolKind::Function);
+            }
         }
         else
         {

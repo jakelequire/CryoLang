@@ -1105,15 +1105,6 @@ namespace Cryo::Codegen
                 else
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct_type() - checking struct_name='{}' for Types redirection", struct_name);
-                    
-                    // Special case: redirect "Types" to NetError enum for TCP compatibility
-                    if (struct_name == "Types")
-                    {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected 'Types' struct, redirecting to NetError enum for TCP compatibility");
-                        // For TCP functions returning Types::NetError, map to i32 (simple enum)
-                        return get_integer_type(32);
-                    }
-
                     // Check if this struct should actually be an enum before creating empty struct
                     if (_type_context && _type_context->lookup_enum_type(struct_name))
                     {
@@ -1141,6 +1132,20 @@ namespace Cryo::Codegen
         llvm_struct->setBody(field_types);
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created struct type '{}' with {} fields", struct_name, field_types.size());
+        
+        // CRITICAL DEBUG: Log if we're creating empty structs
+        if (field_types.empty()) {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "WARNING: Created struct '{}' with 0 fields - this will cause 0-byte allocations!", struct_name);
+            
+            // Check if AST node exists
+            auto ast_it = _struct_ast_nodes.find(struct_name);
+            if (ast_it != _struct_ast_nodes.end()) {
+                auto struct_node = ast_it->second;
+                LOG_WARN(Cryo::LogComponent::CODEGEN, "AST node exists with {} fields, but field_types is empty", struct_node->fields().size());
+            } else {
+                LOG_WARN(Cryo::LogComponent::CODEGEN, "No AST node found for struct: {}", struct_name);
+            }
+        }
 
         // Cache the created type for future lookups (use both Type*-based and string-based)
         register_type(struct_name, llvm_struct); // Legacy string-based caching
