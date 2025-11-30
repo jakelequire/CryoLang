@@ -11,6 +11,9 @@
 #include <vector>
 #include <unordered_map>
 
+// Forward declaration
+namespace llvm { class DICompileUnit; }
+
 namespace Cryo::Codegen
 {
     /**
@@ -186,6 +189,15 @@ namespace Cryo::Codegen
          */
         void set_module_metadata(const std::string& source_file, const std::string& compile_flags, 
                                 const std::string& module_name = "");
+
+        /**
+         * @brief Setup binary metadata for CryoLang identification
+         * @param source_file Original source file path
+         * @param module_name Specific module name (defaults to active module)
+         * @return DICompileUnit for further debug info generation
+         */
+        llvm::DICompileUnit* setup_binary_metadata(const std::string& source_file, 
+                                                   const std::string& module_name = "");
 
         /**
          * @brief Verify module integrity

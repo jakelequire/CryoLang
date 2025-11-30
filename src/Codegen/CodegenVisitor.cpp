@@ -186,6 +186,31 @@ namespace Cryo::Codegen
         if (!_source_file.empty())
         {
             module->setSourceFileName(_source_file);
+            
+            // Add simple CryoLang metadata for tools like Ghidra
+            auto &llvm_context = _context_manager.get_context();
+            
+            // Add CryoLang compiler identification
+            llvm::NamedMDNode *compiler_info = module->getOrInsertNamedMetadata("cryo.compiler.info");
+            llvm::Metadata *compiler_name = llvm::MDString::get(llvm_context, "CryoLang Compiler");
+            llvm::Metadata *compiler_version = llvm::MDString::get(llvm_context, "0.1.0");
+            llvm::Metadata *language_id = llvm::MDString::get(llvm_context, "Cryo");
+            
+            llvm::MDNode *compiler_node = llvm::MDNode::get(llvm_context, {compiler_name, compiler_version, language_id});
+            compiler_info->addOperand(compiler_node);
+            
+            // Add debug info for language identification
+            llvm::DIBuilder debug_builder(*module);
+            llvm::DIFile *di_file = debug_builder.createFile(_source_file, "");
+            llvm::DICompileUnit *compile_unit = debug_builder.createCompileUnit(
+                llvm::dwarf::DW_LANG_C, // Use C for now, but tools will see our metadata
+                di_file,
+                "CryoLang Compiler v0.1.0",
+                false, // not optimized
+                "",    // flags
+                0      // runtime version
+            );
+            debug_builder.finalize();
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing main program with {} statements", node.statements().size());

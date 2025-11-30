@@ -308,6 +308,40 @@ namespace Cryo::Codegen
         }
     }
 
+    llvm::DICompileUnit* LLVMContextManager::setup_binary_metadata(const std::string &source_file,
+                                                                   const std::string &module_name)
+    {
+        llvm::Module *target_module = module_name.empty() ? _active_module : get_module(module_name);
+        if (!target_module)
+        {
+            return nullptr;
+        }
+
+        // Get or create debug builder for this module
+        llvm::DIBuilder* debug_builder = get_debug_builder();
+        if (!debug_builder)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to create debug builder for binary metadata");
+            return nullptr;
+        }
+
+        // Simple CryoLang binary metadata setup
+        llvm::DIFile *di_file = debug_builder->createFile(source_file, "");
+        llvm::DICompileUnit *compile_unit = debug_builder->createCompileUnit(
+            llvm::dwarf::DW_LANG_C, // Use C for now, tools will see our metadata
+            di_file,
+            "CryoLang Compiler v0.1.0",
+            false, // not optimized
+            "",    // flags
+            0      // runtime version
+        );
+        
+        LOG_INFO(Cryo::LogComponent::CODEGEN, "Simple binary metadata setup completed for module '{}' with CryoLang identification", 
+                 target_module->getName().str());
+
+        return compile_unit;
+    }
+
     bool LLVMContextManager::verify_module(const std::string &module_name) const
     {
         std::string error_details;
