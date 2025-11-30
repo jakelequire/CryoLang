@@ -705,9 +705,33 @@ namespace Cryo::Codegen
                         }
                         else
                         {
-                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to parse field type: {}", field->type_annotation());
-                            // Use a placeholder pointer type for failed field parsing
-                            field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                            LOG_WARN(Cryo::LogComponent::CODEGEN, "Struct field '{}' has NULL resolved type, trying manual resolution for: {}", field->name(), field->type_annotation());
+                            
+                            // CRITICAL FIX: Try to resolve the type manually when resolved type is null
+                            std::string type_annotation = field->type_annotation();
+                            auto manually_resolved_type = lookup_type_by_name(type_annotation);
+                            
+                            if (manually_resolved_type && manually_resolved_type->kind() != Cryo::TypeKind::Unknown)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully resolved struct field '{}' type manually: {}", field->name(), type_annotation);
+                                llvm::Type *field_llvm_type = map_type(manually_resolved_type);
+                                if (field_llvm_type)
+                                {
+                                    field_types.push_back(field_llvm_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully mapped manually resolved struct field '{}'", field->name());
+                                }
+                                else
+                                {
+                                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Manual resolution succeeded but mapping failed for struct field '{}': {}", field->name(), type_annotation);
+                                    field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                                }
+                            }
+                            else
+                            {
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Manual resolution failed for struct field '{}' type: {}", field->name(), type_annotation);
+                                // Use a placeholder pointer type for failed field parsing
+                                field_types.push_back(llvm::PointerType::getUnqual(_context_manager.get_context()));
+                            }
                         }
                     }
                     else

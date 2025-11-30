@@ -204,6 +204,127 @@ def create_library(object_file, library_file):
         Path(library_file).touch()
         return False
 
+def build_runtime(cryo_exe, stdlib_dir, build_dir, extra_flags=None):
+    """Build the runtime library separately from the regular stdlib."""
+    runtime_dir = os.path.join(stdlib_dir, 'runtime')
+    runtime_build_dir = os.path.join(build_dir, 'runtime')
+    runtime_lib = os.path.join(build_dir, 'runtime.a')
+    runtime_obj = os.path.join(build_dir, 'runtime.o')
+    
+    # Check if runtime directory exists
+    if not os.path.exists(runtime_dir):
+        log(f"Runtime directory not found: {runtime_dir}", "WARNING")
+        return False
+    
+    log(f"{Colors.HEADER}Building Runtime Library{Colors.ENDC}", "HEADER")
+    log(f"Runtime dir: {Colors.BOLD}{runtime_dir}{Colors.ENDC}")
+    log(f"Runtime build dir: {Colors.BOLD}{runtime_build_dir}{Colors.ENDC}")
+    
+    # Clean existing runtime build directory
+    if os.path.exists(runtime_build_dir):
+        log("Cleaning existing runtime build directory...")
+        import shutil
+        shutil.rmtree(runtime_build_dir)
+    
+    # Ensure runtime build directory exists
+    os.makedirs(runtime_build_dir, exist_ok=True)
+    
+    # Find all .cryo files in runtime directory
+    runtime_files = []
+    for file in os.listdir(runtime_dir):
+        if file.endswith('.cryo'):
+            runtime_files.append(os.path.join(runtime_dir, file))
+    
+    if not runtime_files:
+        log("No runtime files found", "WARNING")
+        return False
+    
+    log(f"Found {Colors.BOLD}{len(runtime_files)}{Colors.ENDC} runtime modules to compile")
+    print()  # Empty line for better formatting
+    
+    # Compile all runtime modules
+    runtime_bc_files = []
+    success_count = 0
+    
+    for cryo_file in runtime_files:
+        filename = os.path.basename(cryo_file)
+        bc_filename = filename.replace('.cryo', '.bc')
+        output_file = os.path.join(runtime_build_dir, bc_filename)
+        
+        if compile_module(cryo_exe, cryo_file, output_file, extra_flags, stdlib_mode=True):
+            if not is_stub_file(output_file):
+                runtime_bc_files.append(output_file)
+                success_count += 1
+    
+    print()  # Empty line for better formatting
+    
+    if not runtime_bc_files:
+        log("No valid runtime modules compiled successfully", "ERROR")
+        return False
+    
+    log(f"Runtime compilation complete: {Colors.OKGREEN}{success_count} modules successful{Colors.ENDC}", "SUCCESS")
+    print()  # Empty line for better formatting
+    
+    # Link all runtime bitcode files into a combined module
+    combined_bc = os.path.join(runtime_build_dir, 'runtime_combined.bc')
+    log(f"Linking {Colors.BOLD}{len(runtime_bc_files)}{Colors.ENDC} runtime bitcode files")
+    
+    try:
+        cmd = ['llvm-link'] + runtime_bc_files + ['-o', combined_bc]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            log(f"llvm-link failed: {result.stderr}", "ERROR")
+            return False
+        
+        log(f"✓ {Colors.OKGREEN}Successfully linked{Colors.ENDC} runtime bitcode files", "SUCCESS")
+    except Exception as e:
+        log(f"Exception during runtime linking: {e}", "ERROR")
+        return False
+    
+    # Compile to object file using LLC
+    log(f"Compiling runtime to object file: {Colors.BOLD}runtime.o{Colors.ENDC}")
+    try:
+        if os.name == 'nt':
+            cmd = ['llc', '-filetype=obj', combined_bc, '-o', runtime_obj]
+        else:
+            cmd = ['llc', '-filetype=obj', '-relocation-model=pic', combined_bc, '-o', runtime_obj]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"LLC failed: {result.stderr}", "ERROR")
+            return False
+        
+        log(f"✓ {Colors.OKGREEN}Successfully created{Colors.ENDC} runtime object file", "SUCCESS")
+    except Exception as e:
+        log(f"Exception during runtime object compilation: {e}", "ERROR")
+        return False
+    
+    # Create runtime library
+    log(f"Creating runtime library: {Colors.BOLD}runtime.a{Colors.ENDC}")
+    try:
+        cmd = ['llvm-ar', 'rcs', runtime_lib, runtime_obj]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"llvm-ar failed: {result.stderr}", "ERROR")
+            return False
+        
+        log(f"✓ {Colors.OKGREEN}Successfully created{Colors.ENDC} runtime library", "SUCCESS")
+    except Exception as e:
+        log(f"Exception during runtime library creation: {e}", "ERROR")
+        return False
+    
+    print()  # Empty line for better formatting
+    
+    # Report runtime status
+    if os.path.exists(runtime_lib):
+        size = os.path.getsize(runtime_lib)
+        log(f"Runtime library: {Colors.BOLD}{runtime_lib}{Colors.ENDC} ({Colors.OKGREEN}{size} bytes{Colors.ENDC})", "SUCCESS")
+        return True
+    else:
+        log("Failed to create runtime library", "ERROR")
+        return False
+
 def main():
     if len(sys.argv) < 4:
         print("Usage: build-stdlib.py <cryo_exe> <stdlib_dir> <build_dir> [library_file] [extra_flags...]")
@@ -235,10 +356,10 @@ def main():
         log(f"Extra flags: {Colors.BOLD}{' '.join(extra_flags)}{Colors.ENDC}")
     print()  # Empty line for better formatting
     
-    # Find all .cryo files in stdlib (excluding runtime for now)
+    # Find all .cryo files in stdlib (excluding runtime directory)
     cryo_files = []
     for root, dirs, files in os.walk(stdlib_dir):
-        # Skip runtime directory
+        # Skip runtime directory - it will be handled separately
         if 'runtime' in root:
             continue
         for file in files:
@@ -292,8 +413,14 @@ def main():
     
     print()  # Empty line for better formatting
     
+    # Build runtime library
+    runtime_success = build_runtime(cryo_exe, stdlib_dir, build_dir, extra_flags)
+    
+    print()  # Empty line for better formatting
+    
     # Report final status
-    if os.path.exists(library_file):
+    stdlib_success = os.path.exists(library_file)
+    if stdlib_success:
         size = os.path.getsize(library_file)
         log(f"{Colors.HEADER}Build Complete!{Colors.ENDC}", "HEADER")
         log(f"Standard library: {Colors.BOLD}{library_file}{Colors.ENDC} ({Colors.OKGREEN}{size} bytes{Colors.ENDC})", "SUCCESS")
@@ -301,6 +428,18 @@ def main():
             log(f"Note: {Colors.WARNING}{failed_count} modules failed{Colors.ENDC} and were excluded", "WARNING")
     else:
         log("Failed to create standard library", "ERROR")
+    
+    # Report overall build status
+    if stdlib_success and runtime_success:
+        log(f"{Colors.HEADER}All components built successfully!{Colors.ENDC}", "HEADER")
+    elif stdlib_success and not runtime_success:
+        log(f"{Colors.WARNING}Standard library built, but runtime failed{Colors.ENDC}", "WARNING")
+        sys.exit(1)
+    elif not stdlib_success and runtime_success:
+        log(f"{Colors.WARNING}Runtime built, but standard library failed{Colors.ENDC}", "WARNING") 
+        sys.exit(1)
+    else:
+        log("Both standard library and runtime failed to build", "ERROR")
         sys.exit(1)
 
 if __name__ == "__main__":

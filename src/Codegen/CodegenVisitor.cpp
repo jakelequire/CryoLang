@@ -3549,11 +3549,14 @@ namespace Cryo::Codegen
         const llvm::DataLayout &data_layout = module->getDataLayout();
         uint64_t struct_size = data_layout.getTypeAllocSize(struct_type);
         
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "NEW EXPRESSION DEBUG: Type '{}' calculated size: {} bytes", full_type_name, struct_size);
+        
         // Ensure empty structs get at least 1 byte allocated
         // This prevents null pointer allocation issues and ensures unique addresses
         if (struct_size == 0) {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Empty struct '{}' detected, allocating minimum 1 byte", full_type_name);
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "CRITICAL: Empty struct '{}' detected, allocating minimum 1 byte", full_type_name);
             struct_size = 1;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "NEW EXPRESSION DEBUG: After fix, struct '{}' size: {} bytes", full_type_name, struct_size);
         }
 
         // Call cryo_alloc to allocate memory on the heap
@@ -3582,6 +3585,9 @@ namespace Cryo::Codegen
 
         // Create size argument for cryo_alloc (u64)
         llvm::Value *size_arg = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), struct_size);
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "NEW EXPRESSION DEBUG: Creating LLVM constant for size: {}", struct_size);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "NEW EXPRESSION DEBUG: About to call cryo_alloc with size_arg for type: {}", full_type_name);
 
         // Call cryo_alloc to get void* pointer
         llvm::Value *heap_ptr = builder.CreateCall(cryo_alloc_func, {size_arg}, "heap_alloc");
