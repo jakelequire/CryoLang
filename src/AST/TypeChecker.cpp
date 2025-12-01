@@ -1649,7 +1649,9 @@ namespace Cryo
                 // For stdlib paths like "core/types", construct the stdlib path
                 module_file = "stdlib/" + module_name + ".cryo";
             }
-            _source_file = module_file;
+            
+            // Use set_source_file to properly update both _source_file and _diagnostic_builder
+            set_source_file(module_file);
             LOG_DEBUG(Cryo::LogComponent::AST, "Set source context to: {}", _source_file);
 
             // Visit all top-level declarations in the imported module
@@ -1753,7 +1755,7 @@ namespace Cryo
         }
 
         // Restore the original source file context
-        _source_file = original_source_file;
+        set_source_file(original_source_file);
         LOG_DEBUG(Cryo::LogComponent::AST, "Restored source context to: {}", _source_file);
     }
 
