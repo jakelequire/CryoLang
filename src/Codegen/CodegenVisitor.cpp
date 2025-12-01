@@ -3637,6 +3637,30 @@ namespace Cryo::Codegen
             {
                 constructor_it = _functions.find(base_type_name);
             }
+            
+            // Additional fallback: try without namespace prefixes
+            if (constructor_it == _functions.end())
+            {
+                // Try to find constructor by examining all registered functions
+                for (const auto &[name, func] : _functions)
+                {
+                    // Look for constructors that end with the expected signature
+                    if (name.find(base_type_name) != std::string::npos && 
+                        name.find("(") != std::string::npos)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found potential constructor match: {} (looking for {})", name, constructor_name);
+                        
+                        // Check if parameter types match by examining the function signature
+                        llvm::FunctionType *func_type = func->getFunctionType();
+                        if (func_type && func_type->getNumParams() == (node.arguments().size() + 1)) // +1 for 'this'
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Parameter count matches, using constructor: {}", name);
+                            constructor_it = _functions.find(name);
+                            break;
+                        }
+                    }
+                }
+            }
 
             if (constructor_it != _functions.end())
             {
@@ -3728,8 +3752,34 @@ namespace Cryo::Codegen
                 {
                     if (_diagnostic_builder)
                     {
-                        _diagnostic_builder->report_error(ErrorCode::E0352_CONSTRUCTOR_NOT_FOUND, &node,
-                                                         "Constructor not found for type: " + full_type_name);
+                        // Provide detailed diagnostic information
+                        std::string error_message = "Constructor not found for type: " + full_type_name;
+                        
+                        // Add debug information about what was searched
+                        std::stringstream debug_info;
+                        debug_info << "\nSearched for constructors:\n";
+                        debug_info << "  - Primary: " << constructor_name << "\n";
+                        debug_info << "  - Signature: " << constructor_signature_name << "\n";
+                        debug_info << "  - Simple: " << base_type_name << "\n";
+                        debug_info << "\nAvailable functions (" << _functions.size() << " total):\n";
+                        
+                        int count = 0;
+                        for (const auto &[name, func] : _functions)
+                        {
+                            if (count < 10 || name.find(base_type_name) != std::string::npos)
+                            {
+                                debug_info << "  - " << name << "\n";
+                            }
+                            count++;
+                        }
+                        if (count > 10)
+                        {
+                            debug_info << "  ... and " << (count - 10) << " more functions\n";
+                        }
+                        
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, debug_info.str());
+                        
+                        _diagnostic_builder->report_error(ErrorCode::E0352_CONSTRUCTOR_NOT_FOUND, &node, error_message);
                     }
                     return;
                 }
@@ -5101,6 +5151,31 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member access resolution failed: struct_type={}, field_index={}, type_name='{}', member_name='{}', current_struct_type='{}'",
                       (struct_type ? "found" : "null"), field_index, type_name, member_name, current_struct_type);
+
+            // Enhanced diagnostic information for member access failures
+            std::stringstream debug_info;
+            debug_info << "\nMember access debug information:\n";
+            debug_info << "  - Object type: " << (node.object() && node.object()->has_resolved_type() ? node.object()->get_resolved_type()->name() : "unknown") << "\n";
+            debug_info << "  - Member name: " << member_name << "\n";
+            debug_info << "  - Resolved type name: '" << type_name << "'\n";
+            debug_info << "  - Current struct context: '" << current_struct_type << "'\n";
+            debug_info << "  - Available types (" << _types.size() << " total):\n";
+            
+            int count = 0;
+            for (const auto &[registered_name, registered_type] : _types)
+            {
+                if (count < 10 || registered_name.find(type_name) != std::string::npos)
+                {
+                    debug_info << "    * " << registered_name << "\n";
+                }
+                count++;
+            }
+            if (count > 10)
+            {
+                debug_info << "    ... and " << (count - 10) << " more types\n";
+            }
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, debug_info.str());
 
             // Use specialized field access error for better diagnostics
             if (_diagnostic_builder && !type_name.empty())
@@ -7247,6 +7322,47 @@ namespace Cryo::Codegen
                 // Handle assignment to member access: obj.field = value
                 else if (auto *left_member_access = dynamic_cast<Cryo::MemberAccessNode *>(node->left()))
                 {
+                    // First check if this is a nested member access (e.g., this.position.x)
+                    if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(left_member_access->object()))
+                    {
+                        // For nested member access, generate the field address of the nested access first
+                        llvm::Value *nested_field_ptr = generate_member_field_address(nested_member);
+                        if (!nested_field_ptr)
+                        {
+                            _diagnostic_builder->report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, 
+                                "Failed to generate address for nested member access", static_cast<ASTNode*>(node));
+                            return nullptr;
+                        }
+                        
+                        // Now get the final field using the nested field pointer
+                        std::string member_name = left_member_access->member();
+                        
+                        // Generate the final field pointer using the type information
+                        llvm::Value *final_field_ptr = generate_nested_member_field_ptr(nested_field_ptr, member_name, left_member_access);
+                        if (!final_field_ptr)
+                        {
+                            _diagnostic_builder->report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, 
+                                "Failed to generate final field pointer for nested member access", static_cast<ASTNode*>(node));
+                            return nullptr;
+                        }
+                        
+                        // Generate the right-hand side value
+                        node->right()->accept(*this);
+                        llvm::Value *rhs_value = get_current_value();
+                        if (!rhs_value)
+                        {
+                            _diagnostic_builder->report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, 
+                                "Failed to generate right-hand side for nested member assignment", static_cast<ASTNode*>(node));
+                            return nullptr;
+                        }
+                        
+                        // Store the value
+                        _context_manager.get_builder().CreateStore(rhs_value, final_field_ptr);
+                        register_value(node, rhs_value);
+                        return rhs_value;
+                    }
+                    
+                    // Handle simple member access (e.g., obj.field)
                     llvm::Value *object_ptr = nullptr;
 
                     // Check if the object is an identifier - get the pointer directly for globals
@@ -7269,14 +7385,30 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        // For complex expressions, generate normally
+                        // For other complex expressions, generate normally
                         left_member_access->object()->accept(*this);
                         object_ptr = get_generated_value(left_member_access->object());
                     }
 
-                    if (!object_ptr || !object_ptr->getType()->isPointerTy())
+                    if (!object_ptr)
                     {
-                        _diagnostic_builder->report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, "Invalid object in member assignment", static_cast<ASTNode*>(node));
+                        std::string error_msg = "Invalid object in member assignment: failed to generate pointer for ";
+                        if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(left_member_access->object()))
+                        {
+                            error_msg += "identifier '" + identifier->name() + "'";
+                        }
+                        else
+                        {
+                            error_msg += "complex expression";
+                        }
+                        _diagnostic_builder->report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, error_msg, static_cast<ASTNode*>(node));
+                        return nullptr;
+                    }
+                    
+                    if (!object_ptr->getType()->isPointerTy())
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, 
+                            "Invalid object in member assignment: object is not a pointer type", static_cast<ASTNode*>(node));
                         return nullptr;
                     }
 
@@ -8247,6 +8379,19 @@ namespace Cryo::Codegen
                     {
                         right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
                     }
+                    else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() && 
+                             left_val->getType() != right_val->getType())
+                    {
+                        // Handle different float types (f32 vs f64)
+                        if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                        {
+                            right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                        }
+                        else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                        {
+                            left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                        }
+                    }
                     result = builder.CreateFCmpOEQ(left_val, right_val, "feq.tmp");
                 }
                 else if (left_val->getType()->isPointerTy() || right_val->getType()->isPointerTy())
@@ -8361,6 +8506,19 @@ namespace Cryo::Codegen
                     {
                         right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
                     }
+                    else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() && 
+                             left_val->getType() != right_val->getType())
+                    {
+                        // Handle different float types (f32 vs f64)
+                        if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                        {
+                            right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                        }
+                        else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                        {
+                            left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                        }
+                    }
                     result = builder.CreateFCmpOLT(left_val, right_val, "flt.tmp");
                 }
                 break;
@@ -8392,6 +8550,19 @@ namespace Cryo::Codegen
                     else if (right_val->getType()->isIntegerTy())
                     {
                         right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() && 
+                             left_val->getType() != right_val->getType())
+                    {
+                        // Handle different float types (f32 vs f64)
+                        if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                        {
+                            right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                        }
+                        else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                        {
+                            left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                        }
                     }
                     result = builder.CreateFCmpOGT(left_val, right_val, "fgt.tmp");
                 }
@@ -8425,6 +8596,19 @@ namespace Cryo::Codegen
                     {
                         right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
                     }
+                    else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() && 
+                             left_val->getType() != right_val->getType())
+                    {
+                        // Handle different float types (f32 vs f64)
+                        if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                        {
+                            right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                        }
+                        else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                        {
+                            left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                        }
+                    }
                     result = builder.CreateFCmpOLE(left_val, right_val, "fle.tmp");
                 }
                 break;
@@ -8456,6 +8640,19 @@ namespace Cryo::Codegen
                     else if (right_val->getType()->isIntegerTy())
                     {
                         right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() && 
+                             left_val->getType() != right_val->getType())
+                    {
+                        // Handle different float types (f32 vs f64)
+                        if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                        {
+                            right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                        }
+                        else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                        {
+                            left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                        }
                     }
                     result = builder.CreateFCmpOGE(left_val, right_val, "fge.tmp");
                 }
@@ -9776,6 +9973,46 @@ namespace Cryo::Codegen
             // Handle simple function name
             function_name = identifier->name();
             resolved_function_name = function_name;
+            
+            // Check for built-in conversion functions first
+            if (function_name == "string")
+            {
+                // Handle string conversion function
+                if (!node->arguments().empty())
+                {
+                    // Generate the argument
+                    auto& arg = node->arguments()[0];
+                    arg->accept(*this);
+                    llvm::Value* arg_value = get_current_value();
+                    
+                    if (arg_value)
+                    {
+                        // For now, use a simple string conversion (this would need proper implementation)
+                        // Create a call to a runtime string conversion function
+                        llvm::Function* string_conv_func = module->getFunction("cryo_to_string");
+                        if (!string_conv_func)
+                        {
+                            // Create the function declaration
+                            llvm::Type* char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
+                            llvm::Type* i32_type = llvm::Type::getInt32Ty(_context_manager.get_context());
+                            llvm::FunctionType* func_type = llvm::FunctionType::get(char_ptr_type, {i32_type}, false);
+                            string_conv_func = llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, "cryo_to_string", *module);
+                        }
+                        
+                        // Cast argument to i32 if needed
+                        llvm::Value* i32_arg = arg_value;
+                        if (arg_value->getType() != llvm::Type::getInt32Ty(_context_manager.get_context()))
+                        {
+                            i32_arg = builder.CreateIntCast(arg_value, llvm::Type::getInt32Ty(_context_manager.get_context()), true, "string_conv_cast");
+                        }
+                        
+                        llvm::Value* result = builder.CreateCall(string_conv_func, {i32_arg}, "string_conv");
+                        register_value(node, result);
+                        set_current_value(result);
+                        return result;
+                    }
+                }
+            }
             
             // First, try to resolve within current namespace
             auto namespace_parts = get_current_namespace_parts();
@@ -15908,6 +16145,69 @@ namespace Cryo::Codegen
             }
         }
         return namespace_parts;
+    }
+
+    llvm::Value *CodegenVisitor::generate_nested_member_field_ptr(llvm::Value *nested_field_ptr, const std::string &member_name, Cryo::MemberAccessNode *node)
+    {
+        if (!nested_field_ptr || !node)
+            return nullptr;
+
+        auto &builder = _context_manager.get_builder();
+
+        // For nested member access, we need to determine the type of the field that nested_field_ptr points to
+        // For example, if we have this.position.x, nested_field_ptr points to the 'position' field (Vec3)
+        // and we need to get the 'x' field from that Vec3
+        
+        // First, let's check if we have the nested member's resolved type
+        if (node->object() && node->object()->has_resolved_type())
+        {
+            Cryo::Type *resolved_type = node->object()->get_resolved_type();
+            
+            // Handle pointer types - get the pointee
+            if (resolved_type->kind() == Cryo::TypeKind::Pointer)
+            {
+                Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
+                resolved_type = ptr_type->pointee_type().get();
+            }
+            
+            if (resolved_type->kind() == Cryo::TypeKind::Struct)
+            {
+                Cryo::StructType *struct_type = static_cast<Cryo::StructType *>(resolved_type);
+                std::string type_name = struct_type->name();
+                
+                // Get the LLVM struct type and field index
+                llvm::Type *llvm_struct_type = _type_mapper->map_type(resolved_type);
+                int field_index = _type_mapper->get_field_index(type_name, member_name);
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Nested member access: type='{}' member='{}' field_index={}", type_name, member_name, field_index);
+                
+                if (llvm_struct_type && field_index != -1)
+                {
+                    if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(llvm_struct_type))
+                    {
+                        // Generate the field pointer - nested_field_ptr already points to the struct
+                        return builder.CreateStructGEP(struct_llvm_type, nested_field_ptr, field_index, member_name + "_ptr");
+                    }
+                }
+            }
+        }
+        
+        // Fallback: try to infer the type from available type registrations
+        // Look through registered types to find one that has the requested member
+        for (const auto &[registered_name, registered_type] : _types)
+        {
+            if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(registered_type))
+            {
+                int field_index = _type_mapper->get_field_index(registered_name, member_name);
+                if (field_index != -1)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fallback nested member access: type='{}' member='{}' field_index={}", registered_name, member_name, field_index);
+                    return builder.CreateStructGEP(struct_llvm_type, nested_field_ptr, field_index, member_name + "_ptr");
+                }
+            }
+        }
+        
+        return nullptr;
     }
 
 } // namespace Cryo::Codegen

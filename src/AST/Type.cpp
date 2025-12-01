@@ -87,6 +87,17 @@ namespace Cryo
             if (is_floating_point() && other.is_integral())
                 return true; // int -> float
 
+            // Handle float-to-float compatibility
+            if (is_floating_point() && other.is_floating_point())
+            {
+                // Special case: f32 and float are equivalent (both 4 bytes)
+                if (size_bytes() == other.size_bytes())
+                    return true;
+                    
+                // Allow promotion from smaller to larger float types
+                return size_bytes() >= other.size_bytes();
+            }
+
             if (is_integral() && other.is_integral())
             {
                 // Allow promotion between integral types of same signedness

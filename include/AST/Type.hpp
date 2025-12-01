@@ -1206,7 +1206,7 @@ namespace Cryo
         Type *get_float_type(FloatKind kind);
         Type *get_f32_type() { return get_float_type(FloatKind::F32); }
         Type *get_f64_type() { return get_float_type(FloatKind::F64); }
-        Type *get_default_float_type() { return get_float_type(FloatKind::Float); }
+        Type *get_default_float_type() { return get_float_type(FloatKind::F32); }
 
         // Create complex types
         Type *create_array_type(Type *element_type, std::optional<size_t> size = std::nullopt);
