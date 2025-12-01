@@ -652,6 +652,11 @@ namespace Cryo
         if (_diagnostic_manager)
         {
             _diagnostic_builder = std::make_unique<TypeCheckerDiagnosticBuilder>(_diagnostic_manager, _source_file);
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Created diagnostic builder with source_file='{}'", _source_file);
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: No diagnostic manager provided, using legacy error reporting");
         }
 
         // Initialize Symbol Resolution Manager (SRM) for naming purposes
@@ -665,11 +670,17 @@ namespace Cryo
     void TypeChecker::set_source_file(const std::string &source_file)
     {
         _source_file = source_file;
+        LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Setting source file to '{}'", _source_file);
 
         // Recreate diagnostic builder with new source file
         if (_diagnostic_manager)
         {
             _diagnostic_builder = std::make_unique<TypeCheckerDiagnosticBuilder>(_diagnostic_manager, _source_file);
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Recreated diagnostic builder with new source file");
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: No diagnostic manager available for source file update");
         }
     }
 
@@ -2860,10 +2871,20 @@ namespace Cryo
                         }
                         else
                         {
-                            std::string left_name = left_type ? left_type->to_string() : "unknown";
-                            std::string right_name = right_type ? right_type->to_string() : "unknown";
-                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                         "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'");
+                            if (_diagnostic_builder)
+                            {
+                                LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Using diagnostic builder for arithmetic error");
+                                _diagnostic_builder->create_invalid_operation_error("arithmetic", left_type, right_type, node.location());
+                            }
+                            else
+                            {
+                                LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Using legacy error reporting for arithmetic error");
+                                // Fallback to legacy method if diagnostic builder not available
+                                std::string left_name = left_type ? left_type->to_string() : "unknown";
+                                std::string right_name = right_type ? right_type->to_string() : "unknown";
+                                report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
+                                             "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'");
+                            }
                             node.set_resolved_type(_type_context.get_unknown_type());
                         }
                     }
@@ -2878,11 +2899,8 @@ namespace Cryo
                         }
                         else
                         {
-                            std::string left_name = left_type ? left_type->to_string() : "unknown";
-                            std::string right_name = right_type ? right_type->to_string() : "unknown";
                             std::string op_str = (op == TokenKind::TK_LESSLESS) ? "<<" : ">>";
-                            report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                         "Cannot apply bit shift operation '" + op_str + "' to types '" + left_name + "' and '" + right_name + "' (both operands must be integral types)");
+                            _diagnostic_builder->create_invalid_operation_error(op_str, left_type, right_type, node.location());
                             node.set_resolved_type(_type_context.get_unknown_type());
                         }
                     }
@@ -2998,9 +3016,7 @@ namespace Cryo
                     }
                     else
                     {
-                        std::string type_name = operand_type ? operand_type->to_string() : "unknown";
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                     "Cannot dereference value of type '" + type_name + "'");
+                        _diagnostic_builder->create_invalid_operation_error("dereference", operand_type, nullptr, node.location());
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -3012,9 +3028,7 @@ namespace Cryo
                     }
                     else
                     {
-                        std::string type_name = operand_type ? operand_type->to_string() : "unknown";
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                     "Cannot apply unary minus to type '" + type_name + "'");
+                        _diagnostic_builder->create_invalid_operation_error("unary minus", operand_type, nullptr, node.location());
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -3062,9 +3076,7 @@ namespace Cryo
                     }
                     else
                     {
-                        std::string type_name = operand_type ? operand_type->to_string() : "unknown";
-                        report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                     "Cannot apply bitwise NOT '~' to non-integer type '" + type_name + "'");
+                        _diagnostic_builder->create_invalid_operation_error("bitwise NOT", operand_type, nullptr, node.location());
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -6871,9 +6883,32 @@ namespace Cryo
 
     void TypeChecker::report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context)
     {
-        // Simple fallback implementation for now
-        std::string message = "Type mismatch in " + context;
-        _errors.emplace_back(TypeError::ErrorKind::TypeMismatch, loc, message);
+        if (_diagnostic_builder)
+        {
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Using diagnostic builder for type mismatch in {}", context);
+            
+            // Use appropriate diagnostic builder method based on context
+            if (context == "arithmetic operation")
+            {
+                _diagnostic_builder->create_invalid_operation_error("arithmetic", expected, actual, loc);
+            }
+            else if (context == "assignment")
+            {
+                _diagnostic_builder->create_assignment_type_error(expected, actual, loc);
+            }
+            else
+            {
+                // Generic operation error for other contexts
+                _diagnostic_builder->create_invalid_operation_error(context, expected, actual, loc);
+            }
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Using legacy error reporting for type mismatch in {}", context);
+            // Fallback to legacy method if diagnostic builder not available
+            std::string message = "Type mismatch in " + context;
+            _errors.emplace_back(TypeError::ErrorKind::TypeMismatch, loc, message);
+        }
     }
 
     void TypeChecker::report_undefined_symbol(SourceLocation loc, const std::string &symbol_name)

@@ -329,7 +329,7 @@ gdb-runtime:
 	@echo "thread apply all bt full" >> /tmp/gdb_commands.txt
 	@echo "info registers" >> /tmp/gdb_commands.txt
 	@echo "quit" >> /tmp/gdb_commands.txt
-	@gdb -batch -x /tmp/gdb_commands.txt --args $(MAIN_BIN) $(RUNTIME_DIR)/runtime.cryo --emit-llvm -c --stdlib-mode --ir -o $(RUNTIME_BUILD_DIR)/runtime.bc
+	@gdb -batch -x /tmp/gdb_commands.txt --args $(MAIN_BIN) $(RUNTIME_DIR)/runtime.cryo  --debug --emit-llvm -c --stdlib-mode --ir -o $(RUNTIME_BUILD_DIR)/runtime.bc
 	@echo "GDB output saved to gdb_runtime.log"
 	@rm /tmp/gdb_commands.txt
 
