@@ -181,12 +181,24 @@ namespace Cryo
             // Phase 5: Semantic analysis (including symbol table population)
             if (!analyze())
             {
-                std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
-                std::string error_message = "Module contains: " + std::to_string(_diagnostic_manager->diagnostics().size()) + " errors in namespace '" + namespace_name + "'";
-                _diagnostic_manager->create_error(ErrorCode::E0805_INTERNAL_ERROR,
-                                                  SourceRange{}, file_path,
-                                                  error_message);
-                return false;
+                // If TypeChecker has its own diagnostic manager, the real errors are already reported
+                // Don't create a misleading E0805 error that hides the actual type errors
+                if (_type_checker && _type_checker->has_diagnostic_manager())
+                {
+                    // Real errors are already in the diagnostic manager, just return false
+                    return false;
+                }
+                else
+                {
+                    // Fallback: create E0805 error with correct error count if TypeChecker doesn't have diagnostic manager
+                    std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
+                    size_t user_errors = _diagnostic_manager->user_error_count();
+                    std::string error_message = "Module contains: " + std::to_string(user_errors) + " errors in namespace '" + namespace_name + "'";
+                    _diagnostic_manager->create_error(ErrorCode::E0805_INTERNAL_ERROR,
+                                                      SourceRange{}, file_path,
+                                                      error_message);
+                    return false;
+                }
             }
 
             // Phase 6: Generate IR (for testing and integration)
@@ -853,6 +865,20 @@ namespace Cryo
     {
         if (_diagnostic_manager)
         {
+            // Debug: Show what diagnostics we have
+            const auto &diagnostics = _diagnostic_manager->diagnostics();
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "DiagnosticManager has {} total diagnostics", diagnostics.size());
+                for (size_t i = 0; i < diagnostics.size(); ++i)
+                {
+                    const auto &diag = diagnostics[i];
+                    bool is_stdlib = _diagnostic_manager->is_stdlib_diagnostic(diag);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Diagnostic {}: severity={}, filename='{}', is_stdlib={}, message='{}'", 
+                              i, static_cast<int>(diag.severity()), diag.filename(), is_stdlib, diag.message());
+                }
+            }
+            
             if (_diagnostic_manager->total_count() > 0)
             {
                 _diagnostic_manager->print_all(os);
