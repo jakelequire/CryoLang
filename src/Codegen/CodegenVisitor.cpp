@@ -5629,11 +5629,12 @@ namespace Cryo::Codegen
                         // Create LLVM function type with variadic flag
                         llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(return_type, param_types, has_variadic);
 
-                        // Create LLVM function declaration using the unqualified name for LLVM linking
+                        // Create LLVM function declaration using the qualified name for correct linking
+                        // This ensures function declarations match the names used in function calls
                         llvm::Function *function = llvm::Function::Create(
                             llvm_func_type,
                             llvm::Function::ExternalLinkage,
-                            symbol_name, // Use unqualified name for runtime linking
+                            qualified_name, // Use qualified name for consistent linking
                             module);
 
                         if (function)
@@ -11490,13 +11491,31 @@ namespace Cryo::Codegen
         }
 
         // Check for namespace alias resolution first
-        resolved_function_name = function_name;
+        // NOTE: Don't reset resolved_function_name here! It may already contain the correct
+        // qualified name from wildcard import resolution above.
+        // Only set it if it hasn't been set yet (i.e., if it's still the original function_name)
+        if (resolved_function_name == function_name) {
+            // No previous resolution, keep the original function name
+            // resolved_function_name is already set to function_name at the start of the function
+        } else {
+            // Previous wildcard resolution found a qualified name, preserve it
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Preserving wildcard-resolved function name: '{}' instead of resetting to '{}'", 
+                      resolved_function_name, function_name);
+        }
 
         // Check for imported primitive methods first
         if (function_name.find("::") != std::string::npos)
         {
             // For primitive methods, check the stdlib namespace first
-            std::string stdlib_qualified_name = "std::core::Types::" + function_name;
+            // Only add std::core::Types prefix if function_name doesn't already start with std::
+            std::string stdlib_qualified_name;
+            if (function_name.find("std::") == 0) {
+                // function_name is already fully qualified with std::, use as-is
+                stdlib_qualified_name = function_name;
+            } else {
+                // function_name is qualified but not with std::, prepend std::core::Types
+                stdlib_qualified_name = "std::core::Types::" + function_name;
+            }
             auto stdlib_func_it = _functions.find(stdlib_qualified_name);
             if (stdlib_func_it != _functions.end())
             {
@@ -11659,7 +11678,14 @@ namespace Cryo::Codegen
         }
 
         // Check if this is a runtime function that should be available globally
-        std::string runtime_qualified_name = "std::Runtime::" + resolved_function_name;
+        std::string runtime_qualified_name;
+        if (resolved_function_name.find("std::") == 0) {
+            // resolved_function_name is already fully qualified with std::, use as-is
+            runtime_qualified_name = resolved_function_name;
+        } else {
+            // resolved_function_name is not qualified with std::, prepend std::Runtime
+            runtime_qualified_name = "std::Runtime::" + resolved_function_name;
+        }
         auto runtime_func_it = _functions.find(runtime_qualified_name);
         if (runtime_func_it != _functions.end())
         {
@@ -11753,6 +11779,8 @@ namespace Cryo::Codegen
                 function = module->getFunction(current_namespace_qualified);
                 if (function) {
                     resolved_function_name = current_namespace_qualified; // Update for later use
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function in current namespace: {} -> {}", 
+                              resolved_function_name, current_namespace_qualified);
                 }
             }
         }
@@ -11798,6 +11826,8 @@ namespace Cryo::Codegen
                     
                     function = module->getFunction(qualified_function_name);
                     if (function) {
+                        // Update resolved_function_name to the qualified name for consistency
+                        resolved_function_name = qualified_function_name;
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function with wildcard-resolved qualified name: {} -> {}", 
                                   qualified_function_name, function->getName().str());
                     }
@@ -16236,6 +16266,12 @@ namespace Cryo::Codegen
 
     std::string CodegenVisitor::generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind)
     {
+        // If base_name is already fully qualified (contains ::), don't add current namespace
+        if (base_name.find("::") != std::string::npos) {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Base name '{}' is already qualified, returning as-is", base_name);
+            return base_name;
+        }
+
         if (!_srm_manager) 
         {
             auto namespace_parts = get_current_namespace_parts();

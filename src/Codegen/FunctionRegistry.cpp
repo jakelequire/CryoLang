@@ -470,10 +470,19 @@ namespace Cryo::Codegen
 
     std::string FunctionRegistry::generate_qualified_function_name(const std::string &resolved_namespace, const std::string &function_name) const
     {
+        // If function_name is already fully qualified (contains ::), return it as-is
+        if (function_name.find("::") != std::string::npos) {
+            return function_name;
+        }
+
         if (_symbol_resolution_manager && !resolved_namespace.empty())
         {
-            // Use SRM to generate qualified function name
-            Cryo::SRM::QualifiedIdentifier qualified_id(function_name, Cryo::SymbolKind::Function);
+            // Use SRM to generate qualified function name with the provided namespace
+            std::vector<std::string> namespace_parts = Cryo::SRM::Utils::parse_qualified_name(resolved_namespace).first;
+            if (namespace_parts.empty()) {
+                namespace_parts.push_back(resolved_namespace);
+            }
+            Cryo::SRM::QualifiedIdentifier qualified_id(namespace_parts, function_name, Cryo::SymbolKind::Function);
             return qualified_id.get_qualified_name();
         }
         else
