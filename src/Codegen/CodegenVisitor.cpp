@@ -601,15 +601,6 @@ namespace Cryo::Codegen
                         LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Variable name mismatch! var_name='{}', node.name()='{}'", var_name, node.name());
                     }
                     
-                    // Check if this is a stdlib variable being incorrectly processed during user code compilation
-                    // Variables like "new_capacity" should only appear in stdlib, not user code at line 140
-                    if (var_name == "new_capacity" && node.location().line() == 140) {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "STDLIB POLLUTION: stdlib variable '{}' appearing in user code compilation at wrong location", var_name);
-                        // Don't report this error as it's likely a stdlib processing issue that will be resolved
-                        // during proper stdlib compilation
-                        return;
-                    }
-                    
                     std::string error_msg = "Variable declaration missing resolved type: " + var_name;
                     _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node, error_msg);
                 }

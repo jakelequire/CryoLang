@@ -245,6 +245,7 @@ def build_runtime(cryo_exe, stdlib_dir, build_dir, extra_flags=None):
     # Compile all runtime modules
     runtime_bc_files = []
     success_count = 0
+    runtime_errors = []
     
     for cryo_file in runtime_files:
         filename = os.path.basename(cryo_file)
@@ -255,11 +256,16 @@ def build_runtime(cryo_exe, stdlib_dir, build_dir, extra_flags=None):
             if not is_stub_file(output_file):
                 runtime_bc_files.append(output_file)
                 success_count += 1
+        else:
+            runtime_errors.append(f"Failed to compile {cryo_file}")
     
     print()  # Empty line for better formatting
     
     if not runtime_bc_files:
         log("No valid runtime modules compiled successfully", "ERROR")
+        log("Runtime Errors:")
+        for error in runtime_errors:
+            log(error, "ERROR")
         return False
     
     log(f"Runtime compilation complete: {Colors.OKGREEN}{success_count} modules successful{Colors.ENDC}", "SUCCESS")
