@@ -320,6 +320,7 @@ namespace Cryo
         
         // Access to SRM context for import resolution
         Cryo::SRM::SymbolResolutionContext *get_srm_context() { return _srm_context.get(); }
+        const Cryo::SRM::SymbolResolutionContext *get_srm_context() const { return _srm_context.get(); }
 
         // Error and warning handling
         const std::vector<TypeError> &errors() const { return _errors; }

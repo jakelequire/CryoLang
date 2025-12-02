@@ -207,6 +207,12 @@ namespace Cryo::Codegen
         void import_specialized_methods(const Cryo::TypeChecker &type_checker);
 
         /**
+         * @brief Import namespace aliases from TypeChecker after type checking
+         * @param type_checker Reference to TypeChecker containing namespace aliases
+         */
+        void import_namespace_aliases(const Cryo::TypeChecker &type_checker);
+
+        /**
          * @brief Get TypeMapper for manual AST node registration
          */
         TypeMapper *get_type_mapper() const { return _type_mapper.get(); }

@@ -5861,6 +5861,38 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Specialized method import complete. Methods imported: {}", imported_count);
     }
 
+    void CodegenVisitor::import_namespace_aliases(const Cryo::TypeChecker &type_checker)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Importing namespace aliases from TypeChecker...");
+        
+        // Get the TypeChecker's SRM context
+        const auto* type_checker_srm = type_checker.get_srm_context();
+        if (!type_checker_srm) {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeChecker has no SRM context, skipping namespace alias import");
+            return;
+        }
+        
+        // Get namespace aliases from TypeChecker's SRM context
+        const auto& source_aliases = type_checker_srm->get_namespace_aliases();
+        
+        if (source_aliases.empty()) {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No namespace aliases found in TypeChecker");
+            return;
+        }
+        
+        // Copy namespace aliases to CodegenVisitor's SRM context
+        int imported_count = 0;
+        for (const auto& [alias, full_namespace] : source_aliases) {
+            if (_srm_context) {
+                _srm_context->register_namespace_alias(alias, full_namespace);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported namespace alias: '{}' -> '{}'", alias, full_namespace);
+                imported_count++;
+            }
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Namespace alias import complete. Aliases imported: {}", imported_count);
+    }
+
     void CodegenVisitor::report_error(const std::string &message)
     {
         _has_errors = true;
@@ -10079,17 +10111,55 @@ namespace Cryo::Codegen
                      }());
             
             if (!wildcard_namespaces.empty()) {
-                Symbol* resolved_symbol = _symbol_table.lookup_symbol_with_import_resolution(function_name, wildcard_namespaces);
-                if (resolved_symbol && resolved_symbol->kind == SymbolKind::Function) {
-                    // Found function through wildcard import resolution - construct qualified name
-                    if (resolved_symbol->scope != "Global" && !resolved_symbol->scope.empty()) {
-                        resolved_function_name = resolved_symbol->scope + "::" + resolved_symbol->name;
-                    } else {
-                        resolved_function_name = resolved_symbol->name;
+                // Instead of relying on symbol instance matching, directly look up in imported namespaces
+                bool found_in_namespace = false;
+                
+                // Check each imported namespace directly for the symbol
+                const auto& all_namespaces = _symbol_table.get_namespaces();
+                for (const std::string& namespace_name : wildcard_namespaces) {
+                    // Try full namespace names like "std::IO"
+                    auto ns_it = all_namespaces.find(namespace_name);
+                    if (ns_it != all_namespaces.end()) {
+                        auto symbol_it = ns_it->second.find(function_name);
+                        if (symbol_it != ns_it->second.end() && symbol_it->second.kind == SymbolKind::Function) {
+                            resolved_function_name = namespace_name + "::" + function_name;
+                            found_in_namespace = true;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution succeeded: '{}' -> '{}' (found in imported namespace '{}')", 
+                                      function_name, resolved_function_name, namespace_name);
+                            break;
+                        }
                     }
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution succeeded: '{}' -> '{}'", function_name, resolved_function_name);
-                } else {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution failed for '{}'", function_name);
+                    
+                    // Also try looking for nested namespaces (e.g., if imported "std", look in "std::IO")
+                    for (const auto& [full_namespace_name, namespace_symbols] : all_namespaces) {
+                        if (full_namespace_name.starts_with(namespace_name + "::")) {
+                            auto symbol_it = namespace_symbols.find(function_name);
+                            if (symbol_it != namespace_symbols.end() && symbol_it->second.kind == SymbolKind::Function) {
+                                resolved_function_name = full_namespace_name + "::" + function_name;
+                                found_in_namespace = true;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution succeeded: '{}' -> '{}' (found in nested namespace '{}')", 
+                                          function_name, resolved_function_name, full_namespace_name);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (found_in_namespace) break;
+                }
+                
+                if (!found_in_namespace) {
+                    // Fallback: try the original resolution method
+                    Symbol* resolved_symbol = _symbol_table.lookup_symbol_with_import_resolution(function_name, wildcard_namespaces);
+                    if (resolved_symbol && resolved_symbol->kind == SymbolKind::Function) {
+                        if (resolved_symbol->scope != "Global" && !resolved_symbol->scope.empty()) {
+                            resolved_function_name = resolved_symbol->scope + "::" + resolved_symbol->name;
+                        } else {
+                            resolved_function_name = resolved_symbol->name;
+                        }
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution succeeded (fallback): '{}' -> '{}'", function_name, resolved_function_name);
+                    } else {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Wildcard import resolution failed for '{}'", function_name);
+                    }
                 }
             } else {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No imported namespaces available for wildcard resolution");
@@ -11057,10 +11127,16 @@ namespace Cryo::Codegen
             std::string resolved_scope = scope_name;
             if (_srm_context) {
                 resolved_scope = _srm_context->resolve_namespace_alias(scope_name);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Namespace alias resolution: '{}' -> '{}' for member '{}'", 
+                          scope_name, resolved_scope, member_name);
                 if (resolved_scope != scope_name) {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved namespace alias '{}' -> '{}' for member '{}'", 
                               scope_name, resolved_scope, member_name);
+                } else {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No alias found for namespace '{}' - using fallback qualified name generation", scope_name);
                 }
+            } else {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM context is null - cannot resolve namespace aliases");
             }
 
             // Extract parameter types from function call arguments
@@ -11649,10 +11725,21 @@ namespace Cryo::Codegen
         // For imported stdlib functions, try qualified names first
         llvm::Function *function = nullptr;
         
+        // Debug: Check what resolved_function_name contains at this point
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function lookup starting with resolved_function_name: '{}'", resolved_function_name);
+        
         // First, try to find the function with the qualified name if available
         if (resolved_function_name.find("::") != std::string::npos) {
             // This is already a qualified name, try to find it directly
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up qualified function name: '{}'", resolved_function_name);
             function = module->getFunction(resolved_function_name);
+            if (function) {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function with qualified name: {}", function->getName().str());
+            } else {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function not found with qualified name: '{}'", resolved_function_name);
+            }
+        } else {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolved_function_name is not qualified (no '::' found): '{}'", resolved_function_name);
         }
         
         // If not found and we have an unqualified name, try current namespace first
@@ -11682,12 +11769,33 @@ namespace Cryo::Codegen
                 Symbol* resolved_symbol = _symbol_table.lookup_symbol_with_import_resolution(resolved_function_name, wildcard_namespaces);
                 if (resolved_symbol && resolved_symbol->kind == SymbolKind::Function) {
                     // Found function through wildcard import resolution - construct qualified name
+                    // Check each namespace to see which one contains this symbol
                     std::string qualified_function_name;
-                    if (resolved_symbol->scope != "Global" && !resolved_symbol->scope.empty()) {
-                        qualified_function_name = generate_qualified_name(resolved_symbol->scope + "::" + resolved_symbol->name, Cryo::SymbolKind::Function);
-                    } else {
-                        qualified_function_name = generate_qualified_name(resolved_symbol->name, Cryo::SymbolKind::Function);
+                    bool found_in_namespace = false;
+                    
+                    // Get all registered namespaces and check each one for the symbol
+                    const auto& all_namespaces = _symbol_table.get_namespaces();
+                    for (const auto& [namespace_name, namespace_symbols] : all_namespaces) {
+                        auto symbol_it = namespace_symbols.find(resolved_function_name);
+                        if (symbol_it != namespace_symbols.end() && &symbol_it->second == resolved_symbol) {
+                            // Found the symbol in this namespace, construct qualified name
+                            qualified_function_name = namespace_name + "::" + resolved_symbol->name;
+                            found_in_namespace = true;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructing qualified name from namespace '{}': {}", namespace_name, qualified_function_name);
+                            break;
+                        }
                     }
+                    
+                    if (!found_in_namespace) {
+                        // Fallback to original logic if not found in any specific namespace
+                        if (resolved_symbol->scope != "Global" && !resolved_symbol->scope.empty()) {
+                            qualified_function_name = resolved_symbol->scope + "::" + resolved_symbol->name;
+                        } else {
+                            qualified_function_name = resolved_symbol->name;
+                        }
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fallback qualified name: {}", qualified_function_name);
+                    }
+                    
                     function = module->getFunction(qualified_function_name);
                     if (function) {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function with wildcard-resolved qualified name: {} -> {}", 
