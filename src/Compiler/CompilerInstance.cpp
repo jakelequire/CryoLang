@@ -628,6 +628,9 @@ namespace Cryo
             {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Importing specialized methods from TypeChecker to CodeGen...");
                 _codegen->get_visitor()->import_specialized_methods(*_type_checker);
+                
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Importing namespace aliases from TypeChecker to CodeGen...");
+                _codegen->get_visitor()->import_namespace_aliases(*_type_checker);
             }
 
             // Pass imported ASTs to CodegenVisitor for dynamic enum variant extraction
