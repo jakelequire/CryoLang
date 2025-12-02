@@ -3439,6 +3439,7 @@ namespace Cryo::Codegen
         std::string base_type_name;
         
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "NewExpression resolved_type is: {}", resolved_type ? "valid" : "NULL");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Node type_name(): '{}'", node.type_name());
         
         if (resolved_type)
         {
@@ -3475,12 +3476,33 @@ namespace Cryo::Codegen
             full_type_name = type_identifier->to_string();
             base_type_name = type_identifier->get_symbol_name();
             
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Resolved type kind: {} (Parameterized={})", 
+                      (int)resolved_type->kind(), (int)Cryo::TypeKind::Parameterized);
+            
+            // For parameterized types, we need to use the specialized name for constructor lookup
+            // The monomorphization pass creates constructors like "GenericStruct_int(int)"
+            if (resolved_type->kind() == Cryo::TypeKind::Parameterized)
+            {
+                auto parameterized_type = static_cast<Cryo::ParameterizedType*>(resolved_type);
+                
+                // Extract type parameter names and create specialized name
+                std::string specialized_name = parameterized_type->base_name();
+                for (const auto& param : parameterized_type->type_parameters())
+                {
+                    specialized_name += "_" + param->to_string();
+                }
+                base_type_name = specialized_name;
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using specialized base name for constructor lookup: '{}'", base_type_name);
+            }
+            
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SRM-generated names: full='{}', base='{}'", full_type_name, base_type_name);
             
             struct_type = _type_mapper->map_type(resolved_type);
         }
         else
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Taking fallback path due to NULL resolved_type");
             // Fallback: create TypeIdentifier from AST node information
             base_type_name = node.type_name();
             std::vector<Cryo::Type*> template_params;
@@ -3506,6 +3528,19 @@ namespace Cryo::Codegen
                 base_type_name, Cryo::TypeKind::Struct, template_params);
             
             full_type_name = type_identifier->to_string();
+            
+            // For parameterized types in fallback path, we also need specialized names for constructor lookup
+            if (!template_params.empty())
+            {
+                std::string specialized_name = base_type_name;
+                for (const auto& param : template_params)
+                {
+                    specialized_name += "_" + param->to_string();
+                }
+                base_type_name = specialized_name;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fallback path: Using specialized base name for constructor lookup: '{}'", base_type_name);
+            }
+            
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using SRM-generated type name: '{}', base_type_name: '{}'", full_type_name, base_type_name);
             
             struct_type = _type_mapper->lookup_type(full_type_name);

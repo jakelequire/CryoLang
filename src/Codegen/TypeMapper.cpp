@@ -1517,15 +1517,35 @@ namespace Cryo::Codegen
             if (type_args[0]->to_string().find('<') == std::string::npos)
             {
                 std::string type_param = type_args[0]->to_string();
-                std::string alternate_name = base_name + "_" + type_param;
-                cache_it = _struct_cache.find(alternate_name);
-                if (cache_it != _struct_cache.end())
-                {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found generic struct with alternate name: {} -> {}", alternate_name, instantiated_name);
-                    _struct_cache[instantiated_name] = cache_it->second; // Cache under original name too
-                    return cache_it->second;
+                
+                // Create a list of possible type parameter names to try
+                std::vector<std::string> type_param_variants = {type_param};
+                
+                // Add source-to-canonical type name mappings
+                if (type_param == "f32") {
+                    type_param_variants.push_back("float");
+                } else if (type_param == "f64") {
+                    type_param_variants.push_back("double");
+                } else if (type_param == "i8") {
+                    type_param_variants.push_back("byte");
+                } else if (type_param == "i32") {
+                    type_param_variants.push_back("int");
+                } else if (type_param == "i64") {
+                    type_param_variants.push_back("long");
                 }
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic struct not found with alternate name: {}", alternate_name);
+                
+                // Try each variant
+                for (const std::string& variant : type_param_variants) {
+                    std::string alternate_name = base_name + "_" + variant;
+                    cache_it = _struct_cache.find(alternate_name);
+                    if (cache_it != _struct_cache.end())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found generic struct with alternate name: {} -> {}", alternate_name, instantiated_name);
+                        _struct_cache[instantiated_name] = cache_it->second; // Cache under original name too
+                        return cache_it->second;
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic struct not found with alternate name: {}", alternate_name);
+                }
             }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "All generic type fallbacks failed for: {}", instantiated_name);
@@ -1726,7 +1746,57 @@ namespace Cryo::Codegen
     llvm::Type *TypeMapper::lookup_type(const std::string &name)
     {
         auto it = _type_cache.find(name);
-        return (it != _type_cache.end()) ? it->second : nullptr;
+        if (it != _type_cache.end()) {
+            return it->second;
+        }
+        
+        // Try alternate type name mappings for generic types (e.g., GenericStruct<f32> vs GenericStruct<float>)
+        if (name.find('<') != std::string::npos && name.find('>') != std::string::npos) {
+            auto parsed = parse_generic_type_string(name);
+            std::string base_name = parsed.first;
+            std::vector<std::string> type_args = parsed.second;
+            
+            if (!type_args.empty()) {
+                // Create variants with different type parameter names
+                std::vector<std::string> type_param_variants = {type_args[0]};
+                
+                // Add canonical-to-source type name mappings
+                if (type_args[0] == "f32") {
+                    type_param_variants.push_back("float");
+                } else if (type_args[0] == "f64") {
+                    type_param_variants.push_back("double");
+                } else if (type_args[0] == "i8") {
+                    type_param_variants.push_back("byte");
+                } else if (type_args[0] == "i32") {
+                    type_param_variants.push_back("int");
+                } else if (type_args[0] == "i64") {
+                    type_param_variants.push_back("long");
+                } else if (type_args[0] == "float") {
+                    type_param_variants.push_back("f32");
+                } else if (type_args[0] == "double") {
+                    type_param_variants.push_back("f64");
+                } else if (type_args[0] == "int") {
+                    type_param_variants.push_back("i32");
+                } else if (type_args[0] == "long") {
+                    type_param_variants.push_back("i64");
+                }
+                
+                // Try each variant
+                for (const std::string& variant : type_param_variants) {
+                    if (variant != type_args[0]) { // Skip the original we already tried
+                        std::string alternate_name = base_name + "<" + variant + ">";
+                        auto cache_it = _type_cache.find(alternate_name);
+                        if (cache_it != _type_cache.end()) {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found type with alternate name: {} -> {}", alternate_name, name);
+                            _type_cache[name] = cache_it->second; // Cache under original name too
+                            return cache_it->second;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return nullptr;
     }
 
     bool TypeMapper::has_type(const std::string &name)

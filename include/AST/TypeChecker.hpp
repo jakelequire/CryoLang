@@ -236,8 +236,7 @@ namespace Cryo
         // Helper method to parse comma-separated template arguments
         std::vector<std::string> parse_template_arguments(const std::string &args_str);
 
-        // Enhanced type resolution that considers generic context
-        Type *resolve_type_with_generic_context(const std::string &type_string);
+
 
         // NEW: Token-based type resolution (preferred)
         Type *resolve_type_from_tokens(Lexer &lexer);
@@ -297,6 +296,9 @@ namespace Cryo
         void discover_generic_type_from_struct(StructDeclarationNode &struct_node);
         void discover_generic_type_from_class(ClassDeclarationNode &class_node);
         void discover_generic_type_from_enum(EnumDeclarationNode &enum_node);
+
+        // Enhanced type resolution that considers generic context
+        Type *resolve_type_with_generic_context(const std::string &type_string);
 
         // Generic instantiation tracking - public access for monomorphization
         const std::vector<GenericInstantiation> &get_required_instantiations() const;
