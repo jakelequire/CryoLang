@@ -333,6 +333,17 @@ gdb-runtime:
 	@echo "GDB output saved to gdb_runtime.log"
 	@rm /tmp/gdb_commands.txt
 
+runtime: 
+ifeq ($(OS), Windows_NT)
+	@if exist "$(subst /,\,$(RUNTIME_BUILD_DIR))" rmdir /s /q "$(subst /,\,$(RUNTIME_BUILD_DIR))"
+else
+	@if [ -d "$(RUNTIME_BUILD_DIR)" ]; then \
+		echo "Cleaning existing runtime build directory..."; \
+		rm -rf $(RUNTIME_BUILD_DIR); \
+	fi
+endif
+	@$(MAKE) $(RUNTIME_LIB)
+
 $(RUNTIME_BUILD_DIR):
 ifeq ($(OS), Windows_NT)
 	@if not exist "$(subst /,\,$@)" mkdir "$(subst /,\,$@)"
@@ -340,6 +351,46 @@ else
 	@mkdir -p $@
 endif
 
+$(RUNTIME_BUILD_DIR)/%.bc: $(RUNTIME_DIR)/%.cryo $(MAIN_BIN) | $(RUNTIME_BUILD_DIR)
+	@echo "Compiling runtime module: $(RUNTIME_DIR)/$*.cryo"
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
+	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
+	@.\bin\cryo.exe $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode -o $(RUNTIME_BUILD_DIR)/$*.bc || ( \
+		echo "[RUNTIME] Compilation failed for $*.cryo" && \
+		exit 1 \
+	)
+else
+	@mkdir -p $(dir $@)
+	@echo "[RUNTIME] Generating IR and dumping to console for $(RUNTIME_DIR)/$*.cryo"
+	@$(MAIN_BIN) $(RUNTIME_DIR)/$*.cryo --emit-llvm -c --stdlib-mode --debug -o $(shell pwd)/$@ || ( \
+		echo "[RUNTIME] Compilation failed for $*.cryo" && \
+		exit 1 \
+	)
+endif
+
+# Link all runtime modules into a single library
+$(RUNTIME_LIB): $(RUNTIME_BC_FILES)
+	@echo "Creating runtime library: $(RUNTIME_LIB)"
+	@llvm-link $(RUNTIME_BC_FILES) -o $(RUNTIME_BUILD_DIR)/runtime_combined.bc
+ifeq ($(OS), Windows_NT)
+	@llc -filetype=obj $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
+else
+	@llc -filetype=obj -relocation-model=pic $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
+endif
+	@llvm-ar rcs $(RUNTIME_LIB) $(BIN_DIR)stdlib/runtime.o
+	@echo "Runtime library created successfully: $(RUNTIME_LIB)"
+
+# Create runtime object file directly (used for linking main executable)
+$(BIN_DIR)stdlib/runtime.o: $(RUNTIME_BC_FILES)
+	@echo "Creating runtime object: $(BIN_DIR)stdlib/runtime.o"
+	@llvm-link $(RUNTIME_BC_FILES) -o $(RUNTIME_BUILD_DIR)/runtime_combined.bc
+ifeq ($(OS), Windows_NT)
+	@llc -filetype=obj $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
+else
+	@llc -filetype=obj -relocation-model=pic $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
+endif
+	@echo "Runtime object created successfully: $(BIN_DIR)stdlib/runtime.o"
 
 # Test targets - Simple and clean (no external scripts)
 .PHONY: test test-clean
