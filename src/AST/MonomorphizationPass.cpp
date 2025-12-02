@@ -1053,14 +1053,28 @@ namespace Cryo
                 std::string original_type = var_decl->type_annotation();
                 std::string substituted_type = substitute_type_in_string(original_type, type_substitutions);
 
+                // CRITICAL FIX: Resolve the type properly
+                Type *resolved_type = nullptr;
+                if (_type_checker)
+                {
+                    resolved_type = _type_checker->resolve_type_with_generic_context(substituted_type);
+                }
+
+                // Copy initializer if present
+                std::unique_ptr<ExpressionNode> cloned_initializer = nullptr;
+                if (var_decl->initializer())
+                {
+                    cloned_initializer = clone_expression_with_substitution(var_decl->initializer(), type_substitutions);
+                }
+
                 auto cloned_var = std::make_unique<VariableDeclarationNode>(
                     var_decl->location(),
                     var_decl->name(),
-                    nullptr // Will use deprecated string method for now
+                    resolved_type,                          // Properly resolved type
+                    std::move(cloned_initializer),          // Cloned initializer
+                    var_decl->is_mutable(),                 // Copy mutability
+                    var_decl->is_global()                   // Copy global flag
                 );
-
-                // TEMPORARY: Use deprecated string method until this function is converted to Type*
-                cloned_var->set_type_annotation(substituted_type);
 
                 // Wrap in DeclarationStatementNode
                 auto cloned_decl_stmt = std::make_unique<DeclarationStatementNode>(
