@@ -1673,11 +1673,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: registered namespace '{}' with {} symbols",
                           runtime_result.module_name, runtime_result.symbol_map.size());
 
-                // Also register under the short name "Runtime" for convenience
-                // This allows both Runtime::cryo_alloc and std::Runtime::cryo_alloc to work
-                current_scope->register_namespace("Runtime", runtime_result.symbol_map);
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: also registered under short name 'Runtime' with {} symbols",
-                          runtime_result.symbol_map.size());
+                // Only use fully qualified std::Runtime namespace - no short names for consistency
             }
             else
             {

@@ -12,6 +12,7 @@
 #include <iostream>
 #include <algorithm>
 #include <regex>
+#include <set>
 
 namespace Cryo::Codegen
 {
@@ -38,8 +39,27 @@ namespace Cryo::Codegen
     FunctionMetadata FunctionRegistry::get_function_metadata(const std::string &function_name,
                                                              const std::string &resolved_namespace) const
     {
+        // Special handling for runtime internal functions that need namespace qualification
+        // when called from within the runtime namespace
+        std::string qualified_function_name = function_name;
+        if (resolved_namespace == "std::Runtime" && function_name.find("::") == std::string::npos)
+        {
+            // List of runtime functions that should be auto-qualified when called from within runtime namespace
+            static const std::set<std::string> runtime_functions = {
+                "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc", 
+                "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
+            };
+            
+            if (runtime_functions.find(function_name) != runtime_functions.end())
+            {
+                qualified_function_name = "std::Runtime::" + function_name;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Auto-qualifying runtime function '{}' to '{}'", 
+                          function_name, qualified_function_name);
+            }
+        }
+
         // Check cache first
-        std::string cache_key = generate_qualified_function_name(resolved_namespace, function_name);
+        std::string cache_key = generate_qualified_function_name(resolved_namespace, qualified_function_name);
         auto cache_it = _metadata_cache.find(cache_key);
         if (cache_it != _metadata_cache.end())
         {
@@ -49,7 +69,7 @@ namespace Cryo::Codegen
         FunctionMetadata metadata;
 
         // First, try to classify from symbol table
-        metadata = classify_from_symbol_table(function_name, resolved_namespace);
+        metadata = classify_from_symbol_table(qualified_function_name, resolved_namespace);
         if (metadata.category != FunctionCategory::Unknown)
         {
             _metadata_cache[cache_key] = metadata;
@@ -57,7 +77,7 @@ namespace Cryo::Codegen
         }
 
         // Try enum constructor classification before namespace-based classification
-        metadata = classify_enum_constructor(function_name, resolved_namespace);
+        metadata = classify_enum_constructor(qualified_function_name, resolved_namespace);
         if (metadata.category != FunctionCategory::Unknown)
         {
             _metadata_cache[cache_key] = metadata;
@@ -65,7 +85,7 @@ namespace Cryo::Codegen
         }
 
         // Then try namespace-based classification
-        metadata = classify_from_namespace(function_name, resolved_namespace);
+        metadata = classify_from_namespace(qualified_function_name, resolved_namespace);
         if (metadata.category != FunctionCategory::Unknown)
         {
             _metadata_cache[cache_key] = metadata;
@@ -73,7 +93,7 @@ namespace Cryo::Codegen
         }
 
         // Try intrinsic classification
-        metadata = classify_intrinsic_function(function_name);
+        metadata = classify_intrinsic_function(qualified_function_name);
         if (metadata.category != FunctionCategory::Unknown)
         {
             _metadata_cache[cache_key] = metadata;
@@ -83,7 +103,7 @@ namespace Cryo::Codegen
         // Finally, apply pattern matchers
         for (const auto &matcher : _pattern_matchers)
         {
-            metadata = matcher(function_name);
+            metadata = matcher(qualified_function_name);
             if (metadata.category != FunctionCategory::Unknown)
             {
                 _metadata_cache[cache_key] = metadata;
@@ -93,7 +113,7 @@ namespace Cryo::Codegen
 
         // Default fallback
         metadata.category = FunctionCategory::IntegerFunction; // Safe default
-        metadata.runtime_name = function_name;
+        metadata.runtime_name = qualified_function_name;
         _metadata_cache[cache_key] = metadata;
         return metadata;
     }

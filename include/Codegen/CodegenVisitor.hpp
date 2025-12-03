@@ -427,6 +427,10 @@ namespace Cryo::Codegen
                                             llvm::Type *struct_type,
                                             const std::unordered_map<std::string, std::string> &type_substitutions);
 
+        // Function interception for runtime function qualification
+        llvm::Function* get_qualified_function(const std::string& function_name);
+        bool is_runtime_function(const std::string& function_name) const;
+
         // Type generation
         llvm::Type *generate_struct_type(Cryo::StructDeclarationNode *node);
         llvm::Type *generate_class_type(Cryo::ClassDeclarationNode *node);
