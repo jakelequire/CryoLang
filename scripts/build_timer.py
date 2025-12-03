@@ -64,7 +64,8 @@ def get_compiler_version():
                     version = line.split()[2].strip('"')
                     return version
     except FileNotFoundError:
-        return "Unknown version"
+        return "0.1.0"  # Default version if file not found
+    return "0.1.0"  # Default version if not found
 
 def format_time(seconds):
     """Format seconds into a readable time string (HH:MM:SS.mmm)."""

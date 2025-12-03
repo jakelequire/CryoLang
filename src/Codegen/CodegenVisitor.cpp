@@ -100,6 +100,46 @@ namespace Cryo::Codegen
         return (it != _node_values.end()) ? it->second : nullptr;
     }
 
+    // LLVM function lookup interception to qualify unqualified runtime function names
+    llvm::Function* CodegenVisitor::get_qualified_function(const std::string& function_name)
+    {
+        llvm::Module* module = _context_manager.get_main_module();
+        if (!module) return nullptr;
+
+
+
+        // CRITICAL: For unqualified runtime functions, always redirect to qualified version
+        // This prevents unqualified declarations from ever being found or created
+        if (is_runtime_function(function_name))
+        {
+            std::string qualified_name = "std::Runtime::" + function_name;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "[FUNCTION INTERCEPTION] Redirecting unqualified '{}' to '{}'", 
+                      function_name, qualified_name);
+            
+            // First try the qualified version
+            llvm::Function* func = module->getFunction(qualified_name);
+            if (func) return func;
+            
+            // If qualified doesn't exist, DO NOT fall back to unqualified
+            // This forces creation of qualified declarations only
+            return nullptr;
+        }
+
+        // For non-runtime functions, try to find the function as-is
+        return module->getFunction(function_name);
+    }
+
+    // Helper to check if a function name is a runtime function that should be qualified
+    bool CodegenVisitor::is_runtime_function(const std::string& function_name) const
+    {
+        static const std::unordered_set<std::string> runtime_functions = {
+            "cryo_malloc", "cryo_free", "cryo_realloc", "cryo_memcpy", "cryo_memset",
+            "cryo_calloc", "cryo_strdup", "cryo_strlen", "cryo_strcmp", "cryo_strcpy",
+            "cryo_strcat", "cryo_memcmp", "cryo_memmove"
+        };
+        return runtime_functions.count(function_name) > 0;
+    }
+
     void CodegenVisitor::set_source_info(const std::string &source_file, const std::string &namespace_context)
     {
         _source_file = source_file;
@@ -361,7 +401,7 @@ namespace Cryo::Codegen
                 potential_scoped_name = node.name();
             }
             auto module = _context_manager.get_module();
-            if (module && module->getFunction(potential_scoped_name))
+            if (module && get_qualified_function(potential_scoped_name))
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping already processed primitive method: {}", potential_scoped_name);
                 register_value(&node, nullptr);
@@ -2968,8 +3008,18 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    // Default behavior - generate as i32
-                    literal_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
+                    // RUNTIME FUNCTION CALL FIX: For large values that might be size_t parameters,
+                    // default to u64 instead of i32 to prevent ABI mismatches
+                    if (int_val > INT32_MAX || int_val < INT32_MIN)
+                    {
+                        // Value is too large for i32, use i64
+                        literal_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx), int_val);
+                    }
+                    else
+                    {
+                        // Default behavior - generate as i32 for small values
+                        literal_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
+                    }
                 }
             }
             break;
@@ -3586,7 +3636,7 @@ namespace Cryo::Codegen
         }
 
         // Call cryo_alloc to allocate memory on the heap
-        llvm::Function *cryo_alloc_func = module->getFunction("std::Runtime::cryo_alloc");
+        llvm::Function *cryo_alloc_func = get_qualified_function("std::Runtime::cryo_alloc");
         if (!cryo_alloc_func)
         {
             // Create the function declaration since it's not pre-declared
@@ -5482,7 +5532,7 @@ namespace Cryo::Codegen
 
                 // Check if this function is already registered in LLVM
                 auto module = _context_manager.get_module();
-                if (module && module->getFunction(symbol_name))
+                if (module && get_qualified_function(symbol_name))
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function {} already exists in LLVM module, skipping", symbol_name);
                     continue;
@@ -5527,10 +5577,18 @@ namespace Cryo::Codegen
                     llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(return_type, param_types, has_variadic);
 
                     // Create LLVM function declaration
+                    // CRITICAL FIX: Use qualified names for runtime functions to match qualified definitions
+                    std::string ir_function_name = symbol_name;
+                    if (is_runtime_function(symbol_name)) {
+                        ir_function_name = "std::Runtime::" + symbol_name;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "[PRE-REGISTRATION] Force-qualifying runtime function '{}' -> '{}'", 
+                                  symbol_name, ir_function_name);
+                    }
+                    
                     llvm::Function *function = llvm::Function::Create(
                         llvm_func_type,
                         llvm::Function::ExternalLinkage,
-                        symbol_name,
+                        ir_function_name,
                         module);
 
                     if (function)
@@ -5565,7 +5623,7 @@ namespace Cryo::Codegen
 
                     // Check if this function is already registered in LLVM
                     auto module = _context_manager.get_module();
-                    if (module && module->getFunction(symbol_name)) // Use unqualified name for LLVM
+                    if (module && get_qualified_function(symbol_name)) // Use unqualified name for LLVM
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function {} already exists in LLVM module, skipping", symbol_name);
                         continue;
@@ -6058,10 +6116,22 @@ namespace Cryo::Codegen
             if (node->name() == "_user_main_") {
                 function_name = "_user_main_";
             }
-            // Special case: Runtime functions that need to be callable with unqualified names
-            // These are functions used internally by the runtime that need simple linkage
+            // Special case: Runtime functions need qualified names for proper linking
+            // Convert unqualified runtime function names to qualified names during definition
+            else if (is_runtime_internal_function(node->name()) && node->name().find("::") == std::string::npos) {
+                // Check if this is an unqualified runtime function that needs qualification
+                static const std::set<std::string> unqualified_runtime_functions = {
+                    "cryo_alloc", "cryo_memcpy", "cryo_malloc", "cryo_free", "cryo_realloc",
+                    "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
+                };
+                if (unqualified_runtime_functions.find(node->name()) != unqualified_runtime_functions.end()) {
+                    function_name = "std::Runtime::" + node->name();
+                } else {
+                    function_name = node->name();
+                }
+            }
             else if (is_runtime_internal_function(node->name())) {
-                function_name = node->name();
+                function_name = node->name(); // Already qualified
             }
             else if (!_namespace_context.empty()) {
                 // Use SRM to generate fully qualified name
@@ -6092,7 +6162,7 @@ namespace Cryo::Codegen
 
             // Check if function already exists in the module (from pre-registration)
             // Use only qualified names for consistency
-            llvm::Function *existing_function = module->getFunction(function_name);
+            llvm::Function *existing_function = get_qualified_function(function_name);
             if (existing_function)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function {} already exists in module, reusing pre-registered declaration", function_name);
@@ -6682,7 +6752,7 @@ namespace Cryo::Codegen
         std::string qualified_name = generate_method_name(enum_type_name, node.name(), parameter_types);
 
         // Check if function already exists (from import phase)
-        llvm::Function *func = module->getFunction(qualified_name);
+        llvm::Function *func = get_qualified_function(qualified_name);
         if (!func)
         {
             // Create new function if it doesn't exist
@@ -7802,8 +7872,26 @@ namespace Cryo::Codegen
                     auto &context = _context_manager.get_context();
                     llvm::Value *field_ptr = builder.CreateStructGEP(struct_type, struct_ptr, field_index, member_name + "_ptr");
 
+                    // Get the expected field type
+                    llvm::Type *field_type = struct_type->getStructElementType(field_index);
+                    
+                    // Check if we need to handle struct value vs pointer assignment
+                    llvm::Value *value_to_store = right_val;
+                    if (right_val->getType()->isPointerTy() && !field_type->isPointerTy())
+                    {
+                        // Right side is a pointer to struct, but field expects struct value
+                        // This happens with constructor calls like HeapManager() -> this.heap
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment: loading struct value from pointer for field '{}'", member_name);
+                        value_to_store = builder.CreateLoad(field_type, right_val, member_name + "_struct_load");
+                    }
+                    else if (!right_val->getType()->isPointerTy() && field_type->isPointerTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment: field '{}' expects pointer but got struct value", member_name);
+                        // This case might need special handling depending on the context
+                    }
+
                     // Store the value to the field
-                    create_store(right_val, field_ptr);
+                    create_store(value_to_store, field_ptr);
 
                     // The result of assignment is the assigned value
                     register_value(node, right_val); // Make sure the result is registered
@@ -10048,14 +10136,14 @@ namespace Cryo::Codegen
                     {
                         // For now, use a simple string conversion (this would need proper implementation)
                         // Create a call to a runtime string conversion function
-                        llvm::Function* string_conv_func = module->getFunction("cryo_to_string");
+                        llvm::Function* string_conv_func = get_qualified_function("cryo_to_string");
                         if (!string_conv_func)
                         {
-                            // Create the function declaration
+                            // Create the function declaration with qualified name
                             llvm::Type* char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(_context_manager.get_context()), 0);
                             llvm::Type* i32_type = llvm::Type::getInt32Ty(_context_manager.get_context());
                             llvm::FunctionType* func_type = llvm::FunctionType::get(char_ptr_type, {i32_type}, false);
-                            string_conv_func = llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, "cryo_to_string", *module);
+                            string_conv_func = llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, "std::Runtime::cryo_to_string", *module);
                         }
                         
                         // Cast argument to i32 if needed
@@ -11169,6 +11257,13 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing function call: {}", function_name);
 
+        // STDLIB FUNCTION INTRINSIC REDIRECTION: Handle problematic stdlib functions
+        // Redirect std::IO::printf directly to intrinsic to avoid variadic forwarding issues
+        if (function_name == "std::IO::printf" || resolved_function_name == "std::IO::printf") {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "[STDLIB REDIRECT] Redirecting {} to __printf__ intrinsic call", function_name);
+            return generate_intrinsic_call(node, "__printf__");
+        }
+
         // Check if this is a template enum constructor (e.g., Result::Ok) that needs instantiation
         // This must happen early, before any forward declarations are created
         size_t early_scope_pos = function_name.find("::");
@@ -11694,12 +11789,56 @@ namespace Cryo::Codegen
 
             // Generate arguments for the runtime function call
             std::vector<llvm::Value *> args;
-            for (const auto &arg : node->arguments())
+            llvm::FunctionType *func_type = runtime_function->getFunctionType();
+            
+            for (size_t i = 0; i < node->arguments().size(); ++i)
             {
+                const auto &arg = node->arguments()[i];
                 arg->accept(*this);
                 llvm::Value *arg_value = get_current_value();
                 if (arg_value)
                 {
+                    // Convert argument type to match function parameter type if needed
+                    if (i < func_type->getNumParams())
+                    {
+                        llvm::Type *expected_type = func_type->getParamType(i);
+                        llvm::Type *actual_type = arg_value->getType();
+                        
+                        if (actual_type != expected_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting argument {} from {} to {} for function {}", 
+                                     i, actual_type->getTypeID(), expected_type->getTypeID(), resolved_function_name);
+                            
+                            // Handle integer type conversions
+                            if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                            {
+                                unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                
+                                if (actual_bits < expected_bits)
+                                {
+                                    // Zero-extend for unsigned, sign-extend for signed (assuming unsigned for now)
+                                    arg_value = builder.CreateZExt(arg_value, expected_type);
+                                }
+                                else if (actual_bits > expected_bits)
+                                {
+                                    arg_value = builder.CreateTrunc(arg_value, expected_type);
+                                }
+                            }
+                            // Handle float type conversions
+                            else if (actual_type->isFloatingPointTy() && expected_type->isFloatingPointTy())
+                            {
+                                if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                {
+                                    arg_value = builder.CreateFPExt(arg_value, expected_type);
+                                }
+                                else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                {
+                                    arg_value = builder.CreateFPTrunc(arg_value, expected_type);
+                                }
+                            }
+                        }
+                    }
                     args.push_back(arg_value);
                 }
             }
@@ -11720,12 +11859,56 @@ namespace Cryo::Codegen
             {
                 // Generate arguments for the runtime function call
                 std::vector<llvm::Value *> args;
-                for (const auto &arg : node->arguments())
+                llvm::FunctionType *func_type = runtime_function->getFunctionType();
+                
+                for (size_t i = 0; i < node->arguments().size(); ++i)
                 {
+                    const auto &arg = node->arguments()[i];
                     arg->accept(*this);
                     llvm::Value *arg_value = get_current_value();
                     if (arg_value)
                     {
+                        // Convert argument type to match function parameter type if needed
+                        if (i < func_type->getNumParams())
+                        {
+                            llvm::Type *expected_type = func_type->getParamType(i);
+                            llvm::Type *actual_type = arg_value->getType();
+                            
+                            if (actual_type != expected_type)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting argument {} from {} to {} for function {}", 
+                                         i, actual_type->getTypeID(), expected_type->getTypeID(), resolved_function_name);
+                                
+                                // Handle integer type conversions
+                                if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                {
+                                    unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                    unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                    
+                                    if (actual_bits < expected_bits)
+                                    {
+                                        // Zero-extend for unsigned, sign-extend for signed (assuming unsigned for now)
+                                        arg_value = builder.CreateZExt(arg_value, expected_type);
+                                    }
+                                    else if (actual_bits > expected_bits)
+                                    {
+                                        arg_value = builder.CreateTrunc(arg_value, expected_type);
+                                    }
+                                }
+                                // Handle float type conversions
+                                else if (actual_type->isFloatingPointTy() && expected_type->isFloatingPointTy())
+                                {
+                                    if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                    {
+                                        arg_value = builder.CreateFPExt(arg_value, expected_type);
+                                    }
+                                    else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                    {
+                                        arg_value = builder.CreateFPTrunc(arg_value, expected_type);
+                                    }
+                                }
+                            }
+                        }
                         args.push_back(arg_value);
                     }
                 }
@@ -11737,6 +11920,20 @@ namespace Cryo::Codegen
 
         // Look up the function in the module using the C runtime name
         // Use FunctionRegistry to get the runtime function name, but prioritize qualified names
+        // Early runtime function qualification - handle runtime functions BEFORE any other resolution
+        static const std::set<std::string> runtime_functions = {
+            "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc", 
+            "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
+        };
+        
+        // Aggressively qualify ALL unqualified runtime function names to std::Runtime namespace
+        if (runtime_functions.find(resolved_function_name) != runtime_functions.end()) {
+            std::string qualified_name = "std::Runtime::" + resolved_function_name;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Early runtime function qualification: qualified '{}' to '{}'", 
+                      resolved_function_name, qualified_name);
+            resolved_function_name = qualified_name;
+        }
+        
         FunctionMetadata metadata = _function_registry->get_function_metadata(resolved_function_name, _namespace_context);
         std::string lookup_name;
         
@@ -11758,7 +11955,7 @@ namespace Cryo::Codegen
         if (resolved_function_name.find("::") != std::string::npos) {
             // This is already a qualified name, try to find it directly
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up qualified function name: '{}'", resolved_function_name);
-            function = module->getFunction(resolved_function_name);
+            function = get_qualified_function(resolved_function_name);
             if (function) {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function with qualified name: {}", function->getName().str());
             } else {
@@ -11776,7 +11973,7 @@ namespace Cryo::Codegen
             
             if (!namespace_parts.empty()) {
                 std::string current_namespace_qualified = generate_qualified_name(resolved_function_name, Cryo::SymbolKind::Function);
-                function = module->getFunction(current_namespace_qualified);
+                function = get_qualified_function(current_namespace_qualified);
                 if (function) {
                     resolved_function_name = current_namespace_qualified; // Update for later use
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function in current namespace: {} -> {}", 
@@ -11824,7 +12021,7 @@ namespace Cryo::Codegen
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fallback qualified name: {}", qualified_function_name);
                     }
                     
-                    function = module->getFunction(qualified_function_name);
+                    function = get_qualified_function(qualified_function_name);
                     if (function) {
                         // Update resolved_function_name to the qualified name for consistency
                         resolved_function_name = qualified_function_name;
@@ -11839,7 +12036,7 @@ namespace Cryo::Codegen
         if (!function) {
             // For all qualified functions, prefer the qualified name, otherwise use runtime name  
             std::string final_lookup_name = (resolved_function_name.find("::") != std::string::npos) ? resolved_function_name : lookup_name;
-            function = module->getFunction(final_lookup_name);
+            function = get_qualified_function(final_lookup_name);
         }
         if (!function)
         {
@@ -12448,6 +12645,25 @@ namespace Cryo::Codegen
                 FunctionMetadata metadata_local = _function_registry->get_function_metadata(c_name, _namespace_context);
                 std::string c_runtime_name = metadata_local.runtime_name.empty() ? c_name : metadata_local.runtime_name;
                 
+                // CRITICAL FIX: Always use qualified name for runtime function declarations
+                // This prevents unqualified cryo_memcpy declarations from being created
+                static const std::set<std::string> runtime_functions = {
+                    "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc", 
+                    "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
+                };
+                
+                // Check if this is an unqualified runtime function name, and if so, use the qualified version
+                if (runtime_functions.find(c_runtime_name) != runtime_functions.end()) {
+                    c_runtime_name = "std::Runtime::" + c_runtime_name;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Force-qualified runtime function declaration: '{}' -> '{}'", 
+                              c_name, c_runtime_name);
+                } else if (c_name.find("std::Runtime::") != std::string::npos && 
+                          runtime_functions.find(c_name.substr(14)) != runtime_functions.end()) {
+                    // If c_name is already qualified, ensure c_runtime_name is also qualified
+                    c_runtime_name = c_name;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using already-qualified runtime function name: '{}'", c_runtime_name);
+                }
+                
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating runtime declaration: c_name='{}', runtime_name='{}', has_variadic={}", 
                          c_name, c_runtime_name, has_variadic);
 
@@ -12726,10 +12942,22 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Use FunctionRegistry to get the runtime function name, with SRM fallback for consistent naming
-        FunctionMetadata metadata = _function_registry->get_function_metadata(c_name, _namespace_context);
-        std::string c_runtime_name = metadata.runtime_name.empty() ? 
-            generate_qualified_name(c_name, Cryo::SymbolKind::Function) : metadata.runtime_name;
+        // Special handling for runtime functions to ensure they get qualified names
+        static const std::set<std::string> runtime_functions = {
+            "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc", 
+            "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
+        };
+        
+        std::string c_runtime_name;
+        if (runtime_functions.find(c_name) != runtime_functions.end()) {
+            c_runtime_name = "std::Runtime::" + c_name;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Auto-qualifying runtime function '{}' to '{}'", c_name, c_runtime_name);
+        } else {
+            // Use FunctionRegistry to get the runtime function name, with SRM fallback for consistent naming
+            FunctionMetadata metadata = _function_registry->get_function_metadata(c_name, _namespace_context);
+            c_runtime_name = metadata.runtime_name.empty() ? 
+                generate_qualified_name(c_name, Cryo::SymbolKind::Function) : metadata.runtime_name;
+        }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry provided runtime name for '{}': '{}'", c_name, c_runtime_name);
 
@@ -15030,10 +15258,21 @@ namespace Cryo::Codegen
 
     bool CodegenVisitor::is_runtime_internal_function(const std::string &function_name)
     {
-        // Functions that should use unqualified names for internal calls
+        // Functions that should use qualified names for proper linking
         static const std::set<std::string> runtime_internal_functions = {
             "main",           // Runtime's main function must be unqualified for proper linking
-            "cryo_memcpy",
+            "std::Runtime::cryo_alloc",     // Memory allocation function
+            "std::Runtime::cryo_memcpy",
+            "std::Runtime::cryo_malloc",
+            "std::Runtime::cryo_free",
+            "std::Runtime::cryo_realloc",
+            "std::Runtime::cryo_strlen",
+            "std::Runtime::cryo_strcmp",
+            "std::Runtime::cryo_strcpy",
+            "std::Runtime::cryo_strcat",
+            // Also include unqualified names for auto-qualification
+            "cryo_alloc",
+            "cryo_memcpy", 
             "cryo_malloc",
             "cryo_free",
             "cryo_realloc",
@@ -16270,6 +16509,21 @@ namespace Cryo::Codegen
         if (base_name.find("::") != std::string::npos) {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Base name '{}' is already qualified, returning as-is", base_name);
             return base_name;
+        }
+        
+        // CRITICAL FIX: Always qualify runtime function names regardless of context
+        if (symbol_kind == Cryo::SymbolKind::Function) {
+            static const std::set<std::string> runtime_functions = {
+                "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc", 
+                "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
+            };
+            
+            if (runtime_functions.find(base_name) != runtime_functions.end()) {
+                std::string qualified = "std::Runtime::" + base_name;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Force-qualified runtime function in generate_qualified_name: '{}' -> '{}'", 
+                          base_name, qualified);
+                return qualified;
+            }
         }
 
         if (!_srm_manager) 

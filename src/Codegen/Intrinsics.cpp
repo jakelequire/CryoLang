@@ -11,6 +11,7 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Intrinsics.h>
 #include <iostream>
+#include <set>
 
 namespace Cryo::Codegen
 {
@@ -989,6 +990,12 @@ namespace Cryo::Codegen
         // Get or create the real printf function
         llvm::Function *real_printf_func = get_or_create_libc_function("printf", printf_type);
 
+        // WINDOWS x64 ABI FIX: Set the correct calling convention for Windows variadic functions
+        if (module->getTargetTriple().find("windows") != std::string::npos)
+        {
+            real_printf_func->setCallingConv(llvm::CallingConv::Win64);
+        }
+
         // Ensure format argument is a pointer
         if (!args[0]->getType()->isPointerTy())
         {
@@ -996,8 +1003,44 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Call printf directly with all provided arguments
-        return builder.CreateCall(real_printf_func, args, "printf.result");
+        // WINDOWS x64 ABI FIX: Convert arguments to ensure proper ABI compliance
+        std::vector<llvm::Value *> converted_args;
+        converted_args.reserve(args.size());
+        
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            llvm::Value *arg = args[i];
+            llvm::Type *arg_type = arg->getType();
+            
+            // For Windows x64 ABI: convert small integers to i32, keep i64 as i64
+            if (arg_type->isIntegerTy())
+            {
+                unsigned bit_width = arg_type->getIntegerBitWidth();
+                if (bit_width < 32)
+                {
+                    // Promote small integers to i32 for Windows ABI
+                    arg = builder.CreateZExt(arg, llvm::Type::getInt32Ty(context), "printf.arg.promote");
+                }
+            }
+            // For floating point: ensure f32 gets promoted to f64 in variadic calls
+            else if (arg_type->isFloatTy())
+            {
+                arg = builder.CreateFPExt(arg, llvm::Type::getDoubleTy(context), "printf.arg.fpext");
+            }
+            
+            converted_args.push_back(arg);
+        }
+
+        // Call printf with properly converted arguments for Windows ABI
+        llvm::CallInst *call = builder.CreateCall(real_printf_func, converted_args, "printf.result");
+        
+        // WINDOWS x64 ABI FIX: Ensure the call uses the correct calling convention
+        if (module->getTargetTriple().find("windows") != std::string::npos)
+        {
+            call->setCallingConv(llvm::CallingConv::Win64);
+        }
+        
+        return call;
     }
 
     llvm::Value *Intrinsics::generate_sprintf(const std::vector<llvm::Value *> &args)
@@ -1027,8 +1070,51 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Call sprintf
-        return builder.CreateCall(sprintf_func, args, "sprintf.result");
+        // WINDOWS x64 ABI FIX: Set the correct calling convention for Windows variadic functions
+        auto *module = _context_manager.get_module();
+        if (module->getTargetTriple().find("windows") != std::string::npos)
+        {
+            sprintf_func->setCallingConv(llvm::CallingConv::Win64);
+        }
+
+        // WINDOWS x64 ABI FIX: Convert arguments to ensure proper ABI compliance
+        std::vector<llvm::Value *> converted_args;
+        converted_args.reserve(args.size());
+        
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            llvm::Value *arg = args[i];
+            llvm::Type *arg_type = arg->getType();
+            
+            // For Windows x64 ABI: convert small integers to i32, keep i64 as i64
+            if (arg_type->isIntegerTy())
+            {
+                unsigned bit_width = arg_type->getIntegerBitWidth();
+                if (bit_width < 32)
+                {
+                    // Promote small integers to i32 for Windows ABI
+                    arg = builder.CreateZExt(arg, llvm::Type::getInt32Ty(context), "sprintf.arg.promote");
+                }
+            }
+            // For floating point: ensure f32 gets promoted to f64 in variadic calls
+            else if (arg_type->isFloatTy())
+            {
+                arg = builder.CreateFPExt(arg, llvm::Type::getDoubleTy(context), "sprintf.arg.fpext");
+            }
+            
+            converted_args.push_back(arg);
+        }
+
+        // Call sprintf with properly converted arguments for Windows ABI
+        llvm::CallInst *call = builder.CreateCall(sprintf_func, converted_args, "sprintf.result");
+        
+        // WINDOWS x64 ABI FIX: Ensure the call uses the correct calling convention
+        if (module->getTargetTriple().find("windows") != std::string::npos)
+        {
+            call->setCallingConv(llvm::CallingConv::Win64);
+        }
+        
+        return call;
     }
 
     llvm::Value *Intrinsics::generate_fprintf(const std::vector<llvm::Value *> &args)
@@ -1531,7 +1617,19 @@ namespace Cryo::Codegen
     llvm::Function *Intrinsics::get_or_create_libc_function(const std::string &name, llvm::FunctionType *type)
     {
         auto *module = _context_manager.get_module();
-        llvm::Function *func = module->getFunction(name);
+        
+        // Check if this is a runtime function that needs qualification
+        static const std::set<std::string> runtime_functions = {
+            "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc", 
+            "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
+        };
+        
+        std::string function_name = name;
+        if (runtime_functions.find(name) != runtime_functions.end()) {
+            function_name = "std::Runtime::" + name;
+        }
+        
+        llvm::Function *func = module->getFunction(function_name);
 
         if (!func)
         {
@@ -1539,7 +1637,7 @@ namespace Cryo::Codegen
             func = llvm::Function::Create(
                 type,
                 llvm::Function::ExternalLinkage,
-                name,
+                function_name,
                 module);
         }
 
