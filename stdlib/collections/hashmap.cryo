@@ -1,0 +1,609 @@
+namespace std::collections::HashMap;
+
+import IO from <io/stdio>;
+
+//===================================================================
+// CONSTANTS AND CONFIGURATION
+//===================================================================
+
+const DEFAULT_CAPACITY: u64 = 16;
+const MAX_LOAD_FACTOR: f64 = 0.75;
+const MIN_LOAD_FACTOR: f64 = 0.25;
+const MIN_CAPACITY: u64 = 8;
+const GROWTH_FACTOR: u64 = 2;
+const SHRINK_THRESHOLD: f64 = 0.125; // Shrink when load factor drops below this
+
+// Distance values for Robin Hood hashing
+const EMPTY_SLOT: u64 = 0xFFFFFFFFFFFFFFFF;
+const TOMBSTONE: u64 = 0xFFFFFFFFFFFFFFFE;
+
+//===================================================================
+// HASH BUCKET ENTRY
+//===================================================================
+
+type struct HashEntry<K, V> {
+    key: K;
+    value: V;
+    hash_code: u64;
+    distance: u64;  // Distance from ideal position (Robin Hood)
+    
+    HashEntry(key: K, value: V, hash_code: u64, distance: u64) {
+        this.key = key;
+        this.value = value;  
+        this.hash_code = hash_code;
+        this.distance = distance;
+    }
+    
+    // Check if this entry is empty
+    is_empty() -> boolean {
+        return this.distance == EMPTY_SLOT;
+    }
+    
+    // Check if this entry is a tombstone (deleted)
+    is_tombstone() -> boolean {
+        return this.distance == TOMBSTONE;
+    }
+    
+    // Check if this entry is occupied with valid data
+    is_occupied() -> boolean {
+        return this.distance != EMPTY_SLOT && this.distance != TOMBSTONE;
+    }
+    
+    // Mark entry as empty
+    mark_empty() -> void {
+        this.distance = EMPTY_SLOT;
+        return;
+    }
+    
+    // Mark entry as tombstone
+    mark_tombstone() -> void {
+        this.distance = TOMBSTONE;
+        return;
+    }
+}
+
+//===================================================================
+// HASHMAP ERROR TYPES
+//===================================================================
+
+enum HashMapError {
+    SUCCESS,
+    KEY_NOT_FOUND,
+    ALLOCATION_FAILED,
+    INVALID_CAPACITY,
+    HASH_COLLISION_LIMIT,
+    ITERATOR_INVALID
+}
+
+//===================================================================
+// HASHMAP ITERATOR
+//===================================================================
+
+type struct HashMapIterator<K, V> {
+    buckets: HashEntry<K, V>*;
+    capacity: u64;
+    current_index: u64;
+    
+    HashMapIterator(buckets: HashEntry<K, V>*, capacity: u64) {
+        this.buckets = buckets;
+        this.capacity = capacity;
+        this.current_index = u64(0);
+        // Advance to first occupied slot
+        this._advance_to_next_occupied();
+    }
+    
+    // Check if iterator has more elements
+    has_next() -> boolean {
+        return this.current_index < this.capacity;
+    }
+    
+    // Get current key-value pair
+    current() -> Result<Pair<K, V>, HashMapError> {
+        if (!this.has_next()) {
+            return Result::Err(HashMapError::ITERATOR_INVALID);
+        }
+        
+        const entry: HashEntry<K, V>* = &this.buckets[this.current_index];
+        const pair: Pair<K, V> = Pair<K, V>(entry.key, entry.value);
+        return Result::Ok(pair);
+    }
+    
+    // Advance to next element
+    next() -> void {
+        if (this.has_next()) {
+            this.current_index = this.current_index + u64(1);
+            this._advance_to_next_occupied();
+        }
+        return;
+    }
+    
+private:
+    // Helper to advance to next occupied slot
+    _advance_to_next_occupied() -> void {
+        while (this.current_index < this.capacity) {
+            const entry: HashEntry<K, V>* = &this.buckets[this.current_index];
+            if (entry.is_occupied()) {
+                break;
+            }
+            this.current_index = this.current_index + u64(1);
+        }
+        return;
+    }
+}
+
+//===================================================================
+// MAIN HASHMAP IMPLEMENTATION
+//===================================================================
+
+type class HashMap<K, V> {
+public:
+    buckets: HashEntry<K, V>*;
+    capacity: u64;
+    size: u64;
+    tombstone_count: u64;
+    
+    // Default constructor
+    HashMap() {
+        this.buckets = null;
+        this.capacity = u64(0);
+        this.size = u64(0);
+        this.tombstone_count = u64(0);
+        this._initialize_with_capacity(DEFAULT_CAPACITY);
+    }
+    
+    // Constructor with initial capacity
+    HashMap(initial_capacity: u64) {
+        this.buckets = null;
+        this.capacity = u64(0);
+        this.size = u64(0);
+        this.tombstone_count = u64(0);
+        
+        mut actual_capacity: u64 = initial_capacity;
+        if (actual_capacity < MIN_CAPACITY) {
+            actual_capacity = MIN_CAPACITY;
+        }
+        
+        // Round up to next power of 2 for efficient modulo operations
+        actual_capacity = this._next_power_of_two(actual_capacity);
+        this._initialize_with_capacity(actual_capacity);
+    }
+    
+    // Destructor - clean up allocated memory
+    ~HashMap() {
+        if (this.buckets != null) {
+            std::Runtime::cryo_free(this.buckets);
+            this.buckets = null;
+        }
+        this.capacity = u64(0);
+        this.size = u64(0);
+    }
+    
+    //===============================================================
+    // CORE OPERATIONS
+    //===============================================================
+    
+    // Insert or update key-value pair
+    insert(key: K, value: V) -> Result<Option<V>, HashMapError> {
+        // Check if resize needed before insertion
+        if (this._needs_resize_up()) {
+            const resize_result: HashMapError = this._resize(this.capacity * GROWTH_FACTOR);
+            if (resize_result != HashMapError::SUCCESS) {
+                return Result::Err(resize_result);
+            }
+        }
+        
+        const hash_code: u64 = this._hash_key(key);
+        mut index: u64 = hash_code % this.capacity;
+        mut distance: u64 = u64(0);
+        
+        // Robin Hood hashing: find insertion point
+        mut new_entry: HashEntry<K, V> = HashEntry<K, V>(key, value, hash_code, distance);
+        
+        for (mut probe_count: u64 = 0; probe_count < this.capacity; probe_count++) {
+            const current: HashEntry<K, V>* = &this.buckets[index];
+            
+            // Found empty slot or tombstone
+            if (current.is_empty() || current.is_tombstone()) {
+                if (current.is_tombstone()) {
+                    this.tombstone_count = this.tombstone_count - u64(1);
+                }
+                
+                this.buckets[index] = new_entry;
+                this.size = this.size + u64(1);
+                return Result::Ok(Option::None);
+            }
+            
+            // Found existing key - update value
+            if (this._keys_equal(current.key, key)) {
+                const old_value: V = current.value;
+                current.value = value;
+                return Result::Ok(Option::Some(old_value));
+            }
+            
+            // Robin Hood: if new entry has traveled further, swap with current
+            if (distance > current.distance) {
+                // Swap entries
+                const temp: HashEntry<K, V> = this.buckets[index];
+                this.buckets[index] = new_entry;
+                new_entry = temp;
+                distance = new_entry.distance;
+            }
+            
+            // Continue probing
+            index = (index + u64(1)) % this.capacity;
+            distance = distance + u64(1);
+            new_entry.distance = distance;
+        }
+        
+        // Should never reach here if resize logic is correct
+        return Result::Err(HashMapError::HASH_COLLISION_LIMIT);
+    }
+    
+    // Get value by key
+    get(key: K) -> Option<V> {
+        const hash_code: u64 = this._hash_key(key);
+        mut index: u64 = hash_code % this.capacity;
+        mut distance: u64 = u64(0);
+        
+        for (mut probe_count: u64 = 0; probe_count < this.capacity; probe_count++) {
+            const current: HashEntry<K, V>* = &this.buckets[index];
+            
+            // Empty slot means key not found
+            if (current.is_empty()) {
+                return Option::None;
+            }
+            
+            // Skip tombstones
+            if (current.is_tombstone()) {
+                index = (index + u64(1)) % this.capacity;
+                distance = distance + u64(1);
+                continue;
+            }
+            
+            // Check if we've gone past where the key could be (Robin Hood property)
+            if (distance > current.distance) {
+                return Option::None;
+            }
+            
+            // Found the key
+            if (this._keys_equal(current.key, key)) {
+                return Option::Some(current.value);
+            }
+            
+            index = (index + u64(1)) % this.capacity;
+            distance = distance + u64(1);
+        }
+        
+        return Option::None;
+    }
+    
+    // Check if key exists
+    contains_key(key: K) -> boolean {
+        const result: Option<V> = this.get(key);
+        return result.is_some();
+    }
+    
+    // Remove key-value pair
+    remove(key: K) -> Option<V> {
+        const hash_code: u64 = this._hash_key(key);
+        mut index: u64 = hash_code % this.capacity;
+        mut distance: u64 = u64(0);
+        
+        for (mut probe_count: u64 = 0; probe_count < this.capacity; probe_count++) {
+            const current: HashEntry<K, V>* = &this.buckets[index];
+            
+            // Empty slot means key not found
+            if (current.is_empty()) {
+                return Option::None;
+            }
+            
+            // Skip tombstones  
+            if (current.is_tombstone()) {
+                index = (index + u64(1)) % this.capacity;
+                distance = distance + u64(1);
+                continue;
+            }
+            
+            // Check if we've gone past where the key could be
+            if (distance > current.distance) {
+                return Option::None;
+            }
+            
+            // Found the key - perform backward shift deletion
+            if (this._keys_equal(current.key, key)) {
+                const removed_value: V = current.value;
+                this._backward_shift_delete(index);
+                this.size = this.size - u64(1);
+                
+                // Check if resize needed after deletion
+                if (this._needs_resize_down()) {
+                    this._resize(this.capacity / GROWTH_FACTOR);
+                }
+                
+                return Option::Some(removed_value);
+            }
+            
+            index = (index + u64(1)) % this.capacity;
+            distance = distance + u64(1);
+        }
+        
+        return Option::None;
+    }
+    
+    // Clear all entries
+    clear() -> void {
+        for (mut i: u64 = 0; i < this.capacity; i++) {
+            this.buckets[i].mark_empty();
+        }
+        this.size = u64(0);
+        this.tombstone_count = u64(0);
+        return;
+    }
+    
+    // Get number of elements
+    len() -> u64 {
+        return this.size;
+    }
+    
+    // Check if empty
+    is_empty() -> boolean {
+        return this.size == u64(0);
+    }
+    
+    // Get current load factor
+    load_factor() -> f64 {
+        if (this.capacity == u64(0)) {
+            return 0.0;
+        }
+        return f64(this.size + this.tombstone_count) / f64(this.capacity);
+    }
+    
+    // Get iterator for traversal
+    iter() -> HashMapIterator<K, V> {
+        return HashMapIterator<K, V>(this.buckets, this.capacity);
+    }
+    
+    // Reserve capacity for at least additional elements
+    reserve(additional: u64) -> HashMapError {
+        const required_size: u64 = this.size + additional;
+        const required_capacity: u64 = u64(f64(required_size) / MAX_LOAD_FACTOR) + u64(1);
+        
+        if (required_capacity > this.capacity) {
+            mut new_capacity: u64 = this._next_power_of_two(required_capacity);
+            return this._resize(new_capacity);
+        }
+        
+        return HashMapError::SUCCESS;
+    }
+    
+    // Shrink capacity to fit current size
+    shrink_to_fit() -> HashMapError {
+        const min_required: u64 = u64(f64(this.size) / MAX_LOAD_FACTOR) + u64(1);
+        mut new_capacity: u64 = this._next_power_of_two(min_required);
+        
+        if (new_capacity < MIN_CAPACITY) {
+            new_capacity = MIN_CAPACITY;
+        }
+        
+        if (new_capacity < this.capacity) {
+            return this._resize(new_capacity);
+        }
+        
+        return HashMapError::SUCCESS;
+    }
+
+private:
+    //===============================================================
+    // INTERNAL HELPER METHODS
+    //===============================================================
+    
+    // Initialize buckets with given capacity
+    _initialize_with_capacity(capacity: u64) -> HashMapError {
+        this.capacity = capacity;
+        const bucket_size: u64 = sizeof(HashEntry<K, V>) * capacity;
+        
+        this.buckets = std::Runtime::cryo_alloc(bucket_size);
+        if (this.buckets == null) {
+            this.capacity = u64(0);
+            return HashMapError::ALLOCATION_FAILED;
+        }
+        
+        // Initialize all buckets as empty
+        for (mut i: u64 = 0; i < capacity; i++) {
+            this.buckets[i].mark_empty();
+        }
+        
+        return HashMapError::SUCCESS;
+    }
+    
+    // Hash function for keys (FNV-1a variant)
+    _hash_key(key: K) -> u64 {
+        // This is a placeholder - in production, this would use
+        // the Hash trait implementation for type K
+        // For now, using a simple hash based on memory representation
+        const key_ptr: void* = &key;
+        const key_size: u64 = sizeof(K);
+        return this._fnv1a_hash(key_ptr, key_size);
+    }
+    
+    // FNV-1a hash algorithm  
+    _fnv1a_hash(data: void*, len: u64) -> u64 {
+        const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+        const FNV_PRIME: u64 = 1099511628211;
+        
+        mut hash: u64 = FNV_OFFSET_BASIS;
+        const bytes: u8* = data;
+        
+        for (mut i: u64 = 0; i < len; i++) {
+            hash = hash ^ u64(bytes[i]);
+            hash = hash * FNV_PRIME;
+        }
+        
+        return hash;
+    }
+    
+    // Key equality check
+    _keys_equal(key1: K, key2: K) -> boolean {
+        // This is a placeholder - in production, this would use
+        // the Eq trait implementation for type K
+        const key1_ptr: void* = &key1;
+        const key2_ptr: void* = &key2;
+        const key_size: u64 = sizeof(K);
+        return this._memory_equal(key1_ptr, key2_ptr, key_size);
+    }
+    
+    // Memory comparison helper
+    _memory_equal(ptr1: void*, ptr2: void*, size: u64) -> boolean {
+        const bytes1: u8* = ptr1;
+        const bytes2: u8* = ptr2;
+        
+        for (mut i: u64 = 0; i < size; i++) {
+            if (bytes1[i] != bytes2[i]) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    // Check if resize up is needed
+    _needs_resize_up() -> boolean {
+        if (this.capacity == u64(0)) {
+            return true;
+        }
+        return this.load_factor() > MAX_LOAD_FACTOR;
+    }
+    
+    // Check if resize down is needed
+    _needs_resize_down() -> boolean {
+        if (this.capacity <= MIN_CAPACITY) {
+            return false;
+        }
+        return this.load_factor() < SHRINK_THRESHOLD;
+    }
+    
+    // Resize hash table
+    _resize(new_capacity: u64) -> HashMapError {
+        if (new_capacity < MIN_CAPACITY) {
+            new_capacity = MIN_CAPACITY;
+        }
+        
+        // Save old state
+        const old_buckets: HashEntry<K, V>* = this.buckets;
+        const old_capacity: u64 = this.capacity;
+        
+        // Create new buckets
+        const init_result: HashMapError = this._initialize_with_capacity(new_capacity);
+        if (init_result != HashMapError::SUCCESS) {
+            this.buckets = old_buckets;
+            this.capacity = old_capacity;
+            return init_result;
+        }
+        
+        // Reset counters
+        const old_size: u64 = this.size;
+        this.size = u64(0);
+        this.tombstone_count = u64(0);
+        
+        // Rehash all entries
+        for (mut i: u64 = 0; i < old_capacity; i++) {
+            const entry: HashEntry<K, V>* = &old_buckets[i];
+            if (entry.is_occupied()) {
+                const insert_result: Result<Option<V>, HashMapError> = this.insert(entry.key, entry.value);
+                // In resize context, insertion should always succeed
+                // as we calculated capacity properly
+            }
+        }
+        
+        // Free old buckets
+        if (old_buckets != null) {
+            std::Runtime::cryo_free(old_buckets);
+        }
+        
+        return HashMapError::SUCCESS;
+    }
+    
+    // Backward shift deletion (Robin Hood)
+    _backward_shift_delete(start_index: u64) -> void {
+        mut current_index: u64 = start_index;
+        
+        while (true) {
+            const next_index: u64 = (current_index + u64(1)) % this.capacity;
+            const next_entry: HashEntry<K, V>* = &this.buckets[next_index];
+            
+            // If next slot is empty or has distance 0, we're done
+            if (next_entry.is_empty() || next_entry.distance == u64(0)) {
+                this.buckets[current_index].mark_empty();
+                break;
+            }
+            
+            // If next slot is tombstone, mark current as empty and continue
+            if (next_entry.is_tombstone()) {
+                this.buckets[current_index].mark_empty(); 
+                break;
+            }
+            
+            // Shift entry backward and decrease distance
+            this.buckets[current_index] = this.buckets[next_index];
+            this.buckets[current_index].distance = this.buckets[current_index].distance - u64(1);
+            
+            current_index = next_index;
+        }
+        
+        return;
+    }
+    
+    // Calculate next power of 2
+    _next_power_of_two(n: u64) -> u64 {
+        if (n <= u64(1)) {
+            return u64(1);
+        }
+        
+        mut result: u64 = u64(1);
+        while (result < n) {
+            result = result * u64(2);
+        }
+        
+        return result;
+    }
+}
+
+//===================================================================
+// TRAIT IMPLEMENTATIONS
+//===================================================================
+
+// Implement Debug trait for HashMap
+implement trait Debug<HashMap<K, V>> {
+    debug_string() -> string {
+        return "[HashMap Debug Not Implemented]";
+    }
+}
+
+// Implement Default trait for HashMap
+implement trait Default<HashMap<K, V>> {
+    get_default() -> HashMap<K, V> {
+        return HashMap<K, V>();
+    }
+}
+
+// Implement Iterator trait for HashMapIterator
+implement trait Iterator<Pair<K, V>> for HashMapIterator<K, V> {
+    next(self: &mut HashMapIterator<K, V>) -> Option<Pair<K, V>> {
+        if (!self.has_next()) {
+            return Option::None;
+        }
+        
+        const result: Result<Pair<K, V>, HashMapError> = self.current();
+        self.next();
+        
+        match result {
+            Result::Ok(pair) => return Option::Some(pair),
+            Result::Err(_) => return Option::None
+        }
+    }
+    
+    size_hint(self: &HashMapIterator<K, V>) -> u64 {
+        // This is an estimate - exact count would require traversing
+        return self.capacity - self.current_index;
+    }
+}

@@ -309,6 +309,9 @@ stdlib-tcp:
 stdlib-signal:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/process/signal.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/process/signal.bc
 
+stdlib-hashmap:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/collections/hashmap.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/collections/hashmap.bc
+
 stdlib-tcp-gdb:
 	@echo "Building stdlib TCP module through gdb for debugging..."
 	@gdb -batch \

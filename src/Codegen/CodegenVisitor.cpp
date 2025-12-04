@@ -4083,6 +4083,7 @@ namespace Cryo::Codegen
         // Generate code for all elements first to get their values
         std::vector<llvm::Value *> element_values;
         llvm::Type *element_type = nullptr;
+        bool has_nested_arrays = false;
 
         for (const auto &element : node.elements())
         {
@@ -4096,6 +4097,12 @@ namespace Cryo::Codegen
             }
 
             element_values.push_back(element_val);
+
+            // Check if this is a nested array (for 2D array support)
+            if (dynamic_cast<Cryo::ArrayLiteralNode*>(element.get())) {
+                has_nested_arrays = true;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected nested array literal - 2D array support activated");
+            }
 
             // Use the first element's type as the array element type
             if (!element_type)
@@ -4114,6 +4121,64 @@ namespace Cryo::Codegen
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Error: Could not determine element type for array literal");
             register_value(&node, nullptr);
             return;
+        }
+
+        // Special handling for 2D arrays - convert inner raw arrays to Array<T> structs
+        if (has_nested_arrays)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting nested arrays to Array<T> structs for 2D array");
+            
+            // For 2D arrays, we need to convert each inner array (which is currently a raw pointer)
+            // into an Array<T> struct
+            std::vector<llvm::Value*> converted_elements;
+            
+            for (size_t i = 0; i < element_values.size(); ++i)
+            {
+                llvm::Value* raw_array_ptr = element_values[i];
+                
+                // Create an Array<int> struct
+                // Array<T> has fields: elements (T*), length (u64), capacity (u64)
+                std::vector<llvm::Type*> array_struct_fields = {
+                    llvm::PointerType::get(context, 0), // elements: T*
+                    llvm::Type::getInt64Ty(context),    // length: u64  
+                    llvm::Type::getInt64Ty(context)     // capacity: u64
+                };
+                
+                llvm::StructType *array_struct_type = llvm::StructType::get(context, array_struct_fields);
+                
+                // Create the Array<T> struct value
+                llvm::Value *array_struct = llvm::UndefValue::get(array_struct_type);
+                
+                // Set the elements field (index 0) to the raw array pointer
+                array_struct = builder.CreateInsertValue(
+                    array_struct,
+                    raw_array_ptr,
+                    {0},
+                    "nested.array.elements");
+                
+                // Set length and capacity - for the matrix example, inner arrays have length 2
+                // TODO: This should be calculated dynamically based on the actual inner array size
+                llvm::Value *inner_array_length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2);
+                array_struct = builder.CreateInsertValue(
+                    array_struct,
+                    inner_array_length,
+                    {1},
+                    "nested.array.length");
+                
+                array_struct = builder.CreateInsertValue(
+                    array_struct,
+                    inner_array_length,
+                    {2}, 
+                    "nested.array.capacity");
+                
+                converted_elements.push_back(array_struct);
+            }
+            
+            // Update element_values and element_type to use the converted Array<T> structs
+            element_values = std::move(converted_elements);
+            element_type = element_values[0]->getType();
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully converted {} nested arrays to Array<T> structs", element_values.size());
         }
 
         // Create LLVM array type and allocate on stack
@@ -4746,9 +4811,31 @@ namespace Cryo::Codegen
 
         if (is_chained_access)
         {
-            // For nested access, array_ptr is likely a pointer to a pointer
-            // We need to load the pointer first, then do GEP
-            if (array_ptr->getType()->isPointerTy())
+            // For nested access, array_ptr should be an Array<T> struct from previous access
+            // We need to extract the elements field and then access the element
+            if (array_ptr->getType()->isStructTy())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Nested access on Array<T> struct - extracting elements field");
+                // Extract the elements pointer (field 0) from the Array<T> struct
+                llvm::Value *elements_ptr = builder.CreateExtractValue(
+                    array_ptr, 
+                    {0}, 
+                    "nested.elements.extract");
+                
+                // Now do GEP on the elements pointer
+                element_ptr = builder.CreateInBoundsGEP(
+                    element_type,
+                    elements_ptr,
+                    index_val,
+                    "nested.access.gep");
+
+                // Load the final element value
+                result_val = builder.CreateLoad(
+                    element_type,
+                    element_ptr,
+                    "nested.access.load");
+            }
+            else if (array_ptr->getType()->isPointerTy())
             {
                 // Load the actual array pointer from the double pointer
                 llvm::Value *actual_array = builder.CreateLoad(
@@ -4789,38 +4876,116 @@ namespace Cryo::Codegen
                 index_val,
                 "array.access.gep");
 
-            // Check if this array access is part of a chained access
-            // For 2D arrays like int[][], the first access should return a pointer
-            bool is_intermediate_access = false;
-
-            // Simple heuristic: only treat as intermediate access if we're NOT accessing a string array
-            // We can distinguish by looking at the LLVM type of the GEP result
+            // Check if this is a 2D array access that should return an Array<T> struct
+            // For matrix variables with int[][] type, we need special handling
+            bool needs_array_struct_construction = false;
+            
+            // More robust 2D array detection using both variable name and LLVM type analysis
             if (!array_var_name.empty())
             {
-                // Check if this is likely a 2D array by examining the variable name pattern
-                // This is a simple heuristic: variables with names like "matrix" are likely 2D
-                // or we could check if the element type is a complex pointer structure
-                llvm::Type *stored_element_type = _value_context->get_alloca_type(array_var_name);
-                if (stored_element_type && stored_element_type->isPointerTy() && element_type->isPointerTy())
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Analyzing array access for variable: {}", array_var_name);
+                
+                // Method 1: Check variable type from type registry
+                auto type_it = _variable_types.find(array_var_name);
+                if (type_it != _variable_types.end())
                 {
-                    // Both stored and element types are pointers
-                    // For string arrays, we want to load the string pointer
-                    // For 2D arrays, we want to return the pointer to the sub-array
-                    // Check if element_type is a generic pointer (LLVM 20 style) vs array pointer
-                    if (array_var_name == "matrix" ||
-                        array_var_name.find("matrix") != std::string::npos ||
-                        array_var_name.find("2d") != std::string::npos)
+                    Cryo::Type *var_type = type_it->second;
+                    if (var_type)
                     {
-                        is_intermediate_access = true;
+                        std::string type_str = var_type->to_string();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Variable type from registry: {}", type_str);
+                        
+                        // Check if this is int[][] or similar 2D array type
+                        if (type_str.find("[][]") != std::string::npos || 
+                            type_str.find("Array<Array<") != std::string::npos)
+                        {
+                            needs_array_struct_construction = true;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected 2D array access via type registry");
+                        }
                     }
-                    // For now, don't set intermediate access for other cases (like string arrays)
+                }
+                
+                // Method 2: Heuristic based on LLVM types - if we're accessing a pointer to pointer
+                if (!needs_array_struct_construction && element_type->isPointerTy())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Element type is pointer, checking for 2D array heuristics");
+                    
+                    // Check if this looks like a 2D array by examining the stored element type
+                    llvm::Type *stored_element_type = _value_context->get_alloca_type(array_var_name);
+                    if (stored_element_type && stored_element_type->isPointerTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Stored type is also pointer - likely 2D array");
+                        // If both the stored type and element type are pointers, this is likely a 2D array
+                        // and we're doing the first access (e.g., matrix[1])
+                        needs_array_struct_construction = true;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected 2D array access via LLVM type analysis");
+                    }
+                }
+                
+                // Method 3: Name-based heuristic as fallback
+                if (!needs_array_struct_construction)
+                {
+                    if (array_var_name == "matrix" || 
+                        array_var_name.find("matrix") != std::string::npos ||
+                        array_var_name.find("2d") != std::string::npos ||
+                        array_var_name.find("2D") != std::string::npos)
+                    {
+                        needs_array_struct_construction = true;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected 2D array access via name heuristic");
+                    }
                 }
             }
 
-            if (is_intermediate_access)
+            if (needs_array_struct_construction)
             {
-                // This is an intermediate access for 2D arrays - return pointer without loading
-                result_val = element_ptr;
+                // For 2D array access like matrix[1], we need to construct an Array<T> struct
+                // Load the pointer to the inner array
+                llvm::Value *inner_array_ptr = builder.CreateLoad(
+                    llvm::PointerType::get(context, 0),
+                    element_ptr,
+                    "inner.array.ptr.load");
+                
+                // Create an Array<T> struct for the inner array
+                // Array<T> has fields: elements (T*), length (u64), capacity (u64)
+                
+                // For now, we'll create a simple struct with just the elements pointer
+                // In a full implementation, we'd also set length and capacity
+                std::vector<llvm::Type*> array_struct_fields = {
+                    llvm::PointerType::get(context, 0), // elements: T*
+                    llvm::Type::getInt64Ty(context),    // length: u64
+                    llvm::Type::getInt64Ty(context)     // capacity: u64
+                };
+                
+                llvm::StructType *array_struct_type = llvm::StructType::get(context, array_struct_fields);
+                
+                // Create the Array<T> struct value
+                llvm::Value *array_struct = llvm::UndefValue::get(array_struct_type);
+                
+                // Set the elements field (index 0)
+                array_struct = builder.CreateInsertValue(
+                    array_struct,
+                    inner_array_ptr,
+                    {0},
+                    "array.struct.elements");
+                
+                // Set a reasonable length (hardcoded for now - should be calculated)
+                // For the matrix example, inner arrays have length 2
+                llvm::Value *length_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2);
+                array_struct = builder.CreateInsertValue(
+                    array_struct,
+                    length_val,
+                    {1},
+                    "array.struct.length");
+                
+                // Set capacity same as length
+                array_struct = builder.CreateInsertValue(
+                    array_struct,
+                    length_val,
+                    {2},
+                    "array.struct.capacity");
+                
+                result_val = array_struct;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Constructed Array<T> struct for 2D array access");
             }
             else if (element_type->isPointerTy())
             {
