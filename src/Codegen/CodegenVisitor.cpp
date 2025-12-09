@@ -2839,18 +2839,20 @@ namespace Cryo::Codegen
         llvm::BasicBlock *end_block = llvm::BasicBlock::Create(context, "match.end", current_function);
         llvm::BasicBlock *default_block = llvm::BasicBlock::Create(context, "match.default", current_function);
 
-        // For enum matching, we need to extract the discriminant
+        // Determine the switch value - for enums, extract discriminant; for primitives, use directly
+        llvm::Value *switch_value = match_value;
+        
+        // Try to extract enum discriminant first
         llvm::Value *discriminant = extract_enum_discriminant(match_value);
-
-        if (!discriminant)
+        if (discriminant)
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to extract discriminant from match value");
-            register_value(&node, nullptr);
-            return;
+            // This is an enum, use the discriminant
+            switch_value = discriminant;
         }
+        // If discriminant extraction fails, use the original value (for primitives like char, int, etc.)
 
         // Create switch instruction
-        llvm::SwitchInst *switch_inst = builder.CreateSwitch(discriminant, default_block, node.arms().size());
+        llvm::SwitchInst *switch_inst = builder.CreateSwitch(switch_value, default_block, node.arms().size());
 
         // Generate code for each match arm
         for (size_t i = 0; i < node.arms().size(); ++i)
@@ -2860,7 +2862,11 @@ namespace Cryo::Codegen
 
             // Extract discriminant value from the pattern
             int discriminant_value = get_pattern_discriminant(arm->pattern());
-            llvm::ConstantInt *case_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), discriminant_value);
+            
+            // Create case value with same type as switch value
+            llvm::Type *switch_type = switch_value->getType();
+            llvm::ConstantInt *case_value = llvm::cast<llvm::ConstantInt>(
+                llvm::ConstantInt::get(switch_type, discriminant_value));
             switch_inst->addCase(case_value, arm_block);
 
             // Generate arm code
@@ -14712,6 +14718,42 @@ namespace Cryo::Codegen
             return -1;
         }
 
+        // Handle different pattern types
+        if (pattern->pattern_type() == Cryo::PatternNode::PatternType::Literal)
+        {
+            // For literal patterns (like character literals), extract the literal value
+            if (pattern->literal_value())
+            {
+                auto *literal = pattern->literal_value();
+                TokenKind literal_kind = literal->literal_kind();
+                
+                if (literal_kind == TokenKind::TK_CHAR_CONSTANT)
+                {
+                    // Extract character value from string (remove quotes and get first char)
+                    const std::string &value_str = literal->value();
+                    if (value_str.length() >= 3 && value_str.front() == '\'' && value_str.back() == '\'')
+                    {
+                        char char_value = value_str[1]; // Character between quotes
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Literal pattern discriminant for '{}': {}", char_value, static_cast<int>(char_value));
+                        return static_cast<int>(char_value);
+                    }
+                }
+                else if (literal_kind == TokenKind::TK_NUMERIC_CONSTANT)
+                {
+                    // Handle integer literals - convert string to int
+                    const std::string &value_str = literal->value();
+                    try {
+                        int int_value = std::stoi(value_str);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Literal pattern discriminant for {}: {}", int_value, int_value);
+                        return int_value;
+                    } catch (const std::exception &e) {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to parse integer literal: {}", value_str);
+                        return -1;
+                    }
+                }
+            }
+        }
+
         // Try to cast to EnumPatternNode
         if (auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(pattern))
         {
@@ -14744,7 +14786,7 @@ namespace Cryo::Codegen
             return 0; // Default fallback
         }
 
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Pattern is not an EnumPatternNode, cannot get discriminant");
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unsupported pattern type for discriminant extraction: {}", static_cast<int>(pattern->pattern_type()));
         return -1;
     }
 
