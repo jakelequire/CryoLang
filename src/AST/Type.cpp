@@ -93,7 +93,7 @@ namespace Cryo
                 // Special case: f32 and float are equivalent (both 4 bytes)
                 if (size_bytes() == other.size_bytes())
                     return true;
-                    
+
                 // Allow promotion from smaller to larger float types
                 return size_bytes() >= other.size_bytes();
             }
@@ -830,7 +830,7 @@ namespace Cryo
             return nullptr;
         }
 
-        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - creating array of element_type: '{}' (kind: {})", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - creating array of element_type: '{}' (kind: {})",
                   element_type->to_string(), static_cast<int>(element_type->kind()));
 
         // For syntactic sugar Type[] -> Array<Type>, use modern parameterized types when registry is available
@@ -839,9 +839,9 @@ namespace Cryo
             // Create Array<ElementType> using the type registry
             // Use to_string() instead of name() to get full parameterized type names (e.g., "Array<int>" not "Array")
             std::string array_type_string = "Array<" + element_type->to_string() + ">";
-            
+
             ParameterizedType *parameterized_array = _type_registry->parse_and_instantiate(array_type_string);
-            
+
             if (parameterized_array)
             {
                 return parameterized_array;
@@ -1230,33 +1230,72 @@ namespace Cryo
                 return parse_generic_type_from_tokens(tokens, index);
             }
 
-            // First check if it's a primitive type (to avoid creating incorrect ClassType)
+            // Check if it's a primitive type and handle modifiers properly
+            Type *primitive_base = nullptr;
             if (type_name == "u8")
-                return get_u8_type();
-            if (type_name == "u16")
-                return get_u16_type();
-            if (type_name == "u32")
-                return get_u32_type();
-            if (type_name == "u64")
-                return get_u64_type();
-            if (type_name == "i8")
-                return get_i8_type();
-            if (type_name == "i16")
-                return get_i16_type();
-            if (type_name == "i32")
-                return get_i32_type();
-            if (type_name == "i64")
-                return get_i64_type();
-            if (type_name == "f32")
-                return get_f32_type();
-            if (type_name == "f64")
-                return get_f64_type();
-            if (type_name == "boolean")
-                return get_boolean_type();
-            if (type_name == "string")
-                return get_string_type();
-            if (type_name == "void")
-                return get_void_type();
+                primitive_base = get_u8_type();
+            else if (type_name == "u16")
+                primitive_base = get_u16_type();
+            else if (type_name == "u32")
+                primitive_base = get_u32_type();
+            else if (type_name == "u64")
+                primitive_base = get_u64_type();
+            else if (type_name == "i8")
+                primitive_base = get_i8_type();
+            else if (type_name == "i16")
+                primitive_base = get_i16_type();
+            else if (type_name == "i32")
+                primitive_base = get_i32_type();
+            else if (type_name == "i64")
+                primitive_base = get_i64_type();
+            else if (type_name == "f32")
+                primitive_base = get_f32_type();
+            else if (type_name == "f64")
+                primitive_base = get_f64_type();
+            else if (type_name == "boolean")
+                primitive_base = get_boolean_type();
+            else if (type_name == "string")
+                primitive_base = get_string_type();
+            else if (type_name == "void")
+                primitive_base = get_void_type();
+
+            if (primitive_base)
+            {
+                // Handle pointer and array modifiers for primitive types
+                Type *result_type = primitive_base;
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_STAR)
+                {
+                    ++index; // consume '*'
+                    result_type = create_pointer_type(result_type);
+                }
+
+                // Handle array modifiers
+                while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
+                {
+                    ++index; // consume '['
+
+                    std::optional<size_t> array_size;
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                    {
+                        std::string size_str = std::string(tokens[index].text());
+                        array_size = std::stoull(size_str);
+                        ++index; // consume size
+                    }
+
+                    // Expect ']'
+                    if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
+                    {
+                        ++index; // consume ']'
+                        result_type = create_array_type(result_type, array_size);
+                    }
+                    else
+                    {
+                        return nullptr; // Malformed array type
+                    }
+                }
+
+                return result_type;
+            }
 
             // Simple user-defined type
             // Try struct, class, enum, trait types
@@ -1270,7 +1309,7 @@ namespace Cryo
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
-                
+
                 // Handle array modifiers for user-defined types
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
                 {
@@ -1311,7 +1350,7 @@ namespace Cryo
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
-                
+
                 // Handle array modifiers for user-defined types
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
                 {
@@ -1349,7 +1388,7 @@ namespace Cryo
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
-                
+
                 // Handle array modifiers for user-defined types
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
                 {
@@ -1387,7 +1426,7 @@ namespace Cryo
                     ++index; // consume '*'
                     result_type = create_pointer_type(result_type);
                 }
-                
+
                 // Handle array modifiers for user-defined types
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
                 {
@@ -1423,7 +1462,7 @@ namespace Cryo
                 ++index; // consume '*'
                 result_type = create_pointer_type(result_type);
             }
-            
+
             // Handle array modifiers for generic types
             while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
             {
@@ -2723,14 +2762,17 @@ namespace Cryo
         auto [base_name, param_strs] = parse_generic_syntax(type_string);
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - parsed base_name='{}', param_count={}", base_name, param_strs.size());
 
-        if (param_strs.empty()) {
+        if (param_strs.empty())
+        {
             LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - no parameters found for '{}'", type_string);
             return nullptr;
         }
-        
-        if (!has_template(base_name)) {
+
+        if (!has_template(base_name))
+        {
             LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - no template found for base_name='{}', available templates:", base_name);
-            for (const auto& [name, tmpl] : _templates) {
+            for (const auto &[name, tmpl] : _templates)
+            {
                 LOG_DEBUG(Cryo::LogComponent::AST, "  - Available template: '{}'", name);
             }
             return nullptr;
@@ -2742,16 +2784,18 @@ namespace Cryo
         {
             // Try recursive parsing first for parameterized types
             Type *param_type = nullptr;
-            if (param_str.find('<') != std::string::npos) {
+            if (param_str.find('<') != std::string::npos)
+            {
                 // This looks like a parameterized type, try recursive parse_and_instantiate
                 param_type = parse_and_instantiate(param_str);
             }
-            
+
             // Fall back to token-based parsing if recursive parsing failed
-            if (!param_type) {
+            if (!param_type)
+            {
                 param_type = _type_context->parse_type_from_string_via_tokens(param_str);
             }
-            
+
             if (!param_type)
             {
                 return nullptr;
@@ -2834,7 +2878,7 @@ namespace Cryo
 
         size_t start = 0;
         int bracket_count = 0;
-        
+
         for (size_t i = 0; i < params_str.size(); ++i)
         {
             char c = params_str[i];
@@ -2860,7 +2904,7 @@ namespace Cryo
                 start = i + 1;
             }
         }
-        
+
         // Handle the last parameter
         if (start < params_str.size())
         {
