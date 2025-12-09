@@ -73,14 +73,33 @@ namespace Cryo::CLI
             {
                 std::string flag_name = normalize_flag(arg);
 
-                // Check if it's a flag with value (--flag=value)
-                size_t eq_pos = flag_name.find('=');
-                if (eq_pos != std::string::npos)
+                // Handle -D defines first (highest priority)
+                if (flag_name.length() > 1 && flag_name[0] == 'D')
                 {
-                    std::string key = flag_name.substr(0, eq_pos);
-                    std::string value = flag_name.substr(eq_pos + 1);
-                    args.set_arg(key, value);
+                    std::string define_str = flag_name.substr(1); // Remove 'D' prefix
+                    size_t define_eq_pos = define_str.find('=');
+                    if (define_eq_pos != std::string::npos)
+                    {
+                        std::string key = define_str.substr(0, define_eq_pos);
+                        std::string value = define_str.substr(define_eq_pos + 1);
+                        args.set_define(key, value);
+                    }
+                    else
+                    {
+                        // -DFLAG without value defaults to "true"
+                        args.set_define(define_str, "true");
+                    }
                 }
+                // Check if it's a flag with value (--flag=value)
+                else
+                {
+                    size_t eq_pos = flag_name.find('=');
+                    if (eq_pos != std::string::npos)
+                    {
+                        std::string key = flag_name.substr(0, eq_pos);
+                        std::string value = flag_name.substr(eq_pos + 1);
+                        args.set_arg(key, value);
+                    }
                 // Handle special compilation flags that expect values
                 else if ((flag_name == "o" || flag_name == "output" ||
                           flag_name == "log-file" || flag_name == "log-component") &&
@@ -116,6 +135,7 @@ namespace Cryo::CLI
                         args.set_flag(flag_name, true);
                     }
                 }
+                } // Close the main else block for non-D flags
             }
             else
             {
