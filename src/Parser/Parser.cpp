@@ -12,12 +12,16 @@ namespace Cryo
         : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(nullptr), _diagnostic_builder(nullptr)
     {
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
-        try {
-            if (&context.symbols()) {
+        try
+        {
+            if (&context.symbols())
+            {
                 _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&context.types());
                 _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
             }
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception &e)
+        {
             // SRM initialization failed, continue without it (fallback to manual naming)
             _srm_context.reset();
             _srm_manager.reset();
@@ -32,18 +36,22 @@ namespace Cryo
         : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
-        try {
-            if (&context.symbols()) {
+        try
+        {
+            if (&context.symbols())
+            {
                 _srm_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(&context.types());
                 _srm_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get());
             }
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception &e)
+        {
             // SRM initialization failed, continue without it (fallback to manual naming)
             _srm_context.reset();
             _srm_manager.reset();
             LOG_WARN(LogComponent::PARSER, "Symbol Resolution Manager (SRM) initialization failed: {}", e.what());
         }
-        
+
         // Initialize diagnostic builder if diagnostic manager is available
         if (_diagnostic_manager)
         {
@@ -283,7 +291,7 @@ namespace Cryo
     {
         // Reset parser state for clean parsing session
         reset_parsing_state();
-        
+
         auto program = _builder.create_program_node(SourceLocation{});
 
         // Parse file-level directives before anything else
@@ -301,18 +309,21 @@ namespace Cryo
         {
             std::string namespace_name = parse_namespace();
             _current_namespace = namespace_name; // Store the namespace in parser state
-            
+
             // Update SRM context with the new namespace
-            if (_srm_context) {
+            if (_srm_context)
+            {
                 // Clear and rebuild namespace stack from the full namespace name
                 // First, clear existing stack
-                while (!_srm_context->get_namespace_stack().empty()) {
+                while (!_srm_context->get_namespace_stack().empty())
+                {
                     _srm_context->pop_namespace();
                 }
-                
+
                 // Parse and push each part of the namespace
                 auto parts = get_current_namespace_parts();
-                for (const auto& part : parts) {
+                for (const auto &part : parts)
+                {
                     _srm_context->push_namespace(part);
                 }
             }
@@ -365,7 +376,7 @@ namespace Cryo
         } while (_current_token.is(TokenKind::TK_COMMENT) ||
                  _current_token.is(TokenKind::TK_DOC_COMMENT_BLOCK) ||
                  _current_token.is(TokenKind::TK_DOC_COMMENT_LINE)); // Skip all comment tokens
-        
+
         // Update bracket depth tracking and token count
         update_bracket_depth(_current_token.kind());
         _tokens_consumed++;
@@ -541,27 +552,27 @@ namespace Cryo
     }
     void Parser::synchronize()
     {
-        LOG_DEBUG(LogComponent::PARSER, "Parser synchronization initiated at {}:{} (brace_depth={}, paren_depth={}, bracket_depth={})", 
+        LOG_DEBUG(LogComponent::PARSER, "Parser synchronization initiated at {}:{} (brace_depth={}, paren_depth={}, bracket_depth={})",
                   _current_token.location().line(), _current_token.location().column(),
                   _brace_depth, _paren_depth, _bracket_depth);
-        
+
         // Track starting position for diagnostic purposes
         SourceLocation sync_start = _current_token.location();
         size_t tokens_skipped = 0;
         size_t sync_start_token_count = _tokens_consumed;
-        
+
         // Prevent infinite loops by ensuring we always make progress
         Token previous_token = _current_token;
-        
+
         // Enhanced error recovery with context-aware synchronization
         while (!is_at_end())
         {
             TokenKind current_kind = _current_token.kind();
-            
+
             // ================================================================
             // Primary Recovery Points - Natural Statement Boundaries
             // ================================================================
-            
+
             // Statement terminators
             if (current_kind == TokenKind::TK_SEMICOLON)
             {
@@ -569,7 +580,7 @@ namespace Cryo
                 LOG_DEBUG(LogComponent::PARSER, "Synchronized on semicolon after skipping {} tokens", tokens_skipped);
                 return;
             }
-            
+
             // Block boundaries - handle closing braces carefully to avoid infinite loops
             if (current_kind == TokenKind::TK_R_BRACE)
             {
@@ -590,23 +601,23 @@ namespace Cryo
                     return;
                 }
             }
-            
+
             // ================================================================
-            // Declaration Recovery Points 
+            // Declaration Recovery Points
             // ================================================================
-            
+
             // Top-level declarations (safe recovery points)
             if (is_top_level_declaration_start(current_kind))
             {
-                LOG_DEBUG(LogComponent::PARSER, "Synchronized on top-level declaration '{}' after skipping {} tokens", 
+                LOG_DEBUG(LogComponent::PARSER, "Synchronized on top-level declaration '{}' after skipping {} tokens",
                           std::string(_current_token.text()), tokens_skipped);
                 return;
             }
-            
+
             // ================================================================
             // Statement Recovery Points (Context-Aware)
             // ================================================================
-            
+
             // Control flow statements (safe within blocks)
             if (is_statement_start(current_kind))
             {
@@ -627,59 +638,59 @@ namespace Cryo
                             continue;
                         }
                     }
-                    
-                    LOG_DEBUG(LogComponent::PARSER, "Synchronized on statement start '{}' after skipping {} tokens", 
+
+                    LOG_DEBUG(LogComponent::PARSER, "Synchronized on statement start '{}' after skipping {} tokens",
                               std::string(_current_token.text()), tokens_skipped);
                     return;
                 }
             }
-            
+
             // ================================================================
             // Special Context Recovery
             // ================================================================
-            
+
             // Implementation block boundaries
             if (_in_implementation_block && current_kind == TokenKind::TK_KW_IMPLEMENT)
             {
                 LOG_DEBUG(LogComponent::PARSER, "Synchronized on implement block boundary after skipping {} tokens", tokens_skipped);
                 return;
             }
-            
+
             // Namespace boundaries (global scope recovery)
             if (is_global_scope() && current_kind == TokenKind::TK_KW_NAMESPACE)
             {
                 LOG_DEBUG(LogComponent::PARSER, "Synchronized on namespace declaration after skipping {} tokens", tokens_skipped);
                 return;
             }
-            
+
             // ================================================================
             // Bracket Depth Recovery
             // ================================================================
-            
+
             // This check is now handled in the closing brace section above
-            
+
             // ================================================================
             // Emergency Recovery - Prevent Infinite Loops
             // ================================================================
-            
+
             // Prevent excessive token skipping (likely indicates a deeper issue)
             if (tokens_skipped > 50)
             {
                 LOG_WARN(LogComponent::PARSER, "Emergency synchronization: skipped {} tokens without finding recovery point", tokens_skipped);
-                
+
                 // Report a diagnostic about potential structural issues
                 if (_diagnostic_manager)
                 {
                     SourceRange error_range(sync_start, _current_token.location());
-                    auto& diagnostic = _diagnostic_manager->create_error(ErrorCode::E0115_PARSE_RECOVERY_FAILED, error_range, _source_file);
+                    auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0115_PARSE_RECOVERY_FAILED, error_range, _source_file);
                     diagnostic.add_note("Parser unable to recover from syntax error - possible structural issue in code");
                     diagnostic.add_note("Consider checking for unmatched braces, parentheses, or missing semicolons");
-                    diagnostic.add_note("Current nesting: " + std::to_string(_brace_depth) + " braces, " + 
-                                       std::to_string(_paren_depth) + " parentheses, " + 
-                                       std::to_string(_bracket_depth) + " brackets");
+                    diagnostic.add_note("Current nesting: " + std::to_string(_brace_depth) + " braces, " +
+                                        std::to_string(_paren_depth) + " parentheses, " +
+                                        std::to_string(_bracket_depth) + " brackets");
                     diagnostic.add_note("Large-scale syntax errors may require manual review of the surrounding code");
                 }
-                
+
                 // Force recovery at next reasonable boundary
                 while (!is_at_end() && !is_forced_recovery_point(_current_token.kind()))
                 {
@@ -687,37 +698,37 @@ namespace Cryo
                 }
                 return;
             }
-            
+
             // ================================================================
             // Ensure Progress to Prevent Infinite Loops
             // ================================================================
-            
+
             // Store current position before advancing
             Token current_before_advance = _current_token;
-            
+
             // Continue advancing and tracking
             advance();
             tokens_skipped++;
-            
+
             // Critical check: Ensure we're making progress compared to previous iteration
-            if (_current_token.location().line() == current_before_advance.location().line() && 
+            if (_current_token.location().line() == current_before_advance.location().line() &&
                 _current_token.location().column() == current_before_advance.location().column() &&
                 _current_token.kind() == current_before_advance.kind())
             {
                 LOG_ERROR(LogComponent::PARSER, "CRITICAL: Parser synchronization stuck at same token - forcing emergency exit");
-                LOG_ERROR(LogComponent::PARSER, "Stuck token: '{}' at {}:{}", 
-                         std::string(_current_token.text()),
-                         _current_token.location().line(), 
-                         _current_token.location().column());
+                LOG_ERROR(LogComponent::PARSER, "Stuck token: '{}' at {}:{}",
+                          std::string(_current_token.text()),
+                          _current_token.location().line(),
+                          _current_token.location().column());
                 return; // Emergency exit to prevent infinite loop
             }
-            
+
             // Update previous token for next iteration
             previous_token = current_before_advance;
         }
-        
+
         // EOF reached during synchronization
-        LOG_DEBUG(LogComponent::PARSER, "Synchronization reached EOF after skipping {} tokens (final depths: brace={}, paren={}, bracket={})", 
+        LOG_DEBUG(LogComponent::PARSER, "Synchronization reached EOF after skipping {} tokens (final depths: brace={}, paren={}, bracket={})",
                   tokens_skipped, _brace_depth, _paren_depth, _bracket_depth);
     }
 
@@ -729,33 +740,33 @@ namespace Cryo
     {
         switch (kind)
         {
-            case TokenKind::TK_L_BRACE:
-                _brace_depth++;
-                break;
-            case TokenKind::TK_R_BRACE:
-                _brace_depth--;
-                break;
-            case TokenKind::TK_L_PAREN:
-                _paren_depth++;
-                break;
-            case TokenKind::TK_R_PAREN:
-                _paren_depth--;
-                break;
-            case TokenKind::TK_L_SQUARE:
-                _bracket_depth++;
-                break;
-            case TokenKind::TK_R_SQUARE:
-                _bracket_depth--;
-                break;
-            default:
-                // No bracket depth change for other tokens
-                break;
+        case TokenKind::TK_L_BRACE:
+            _brace_depth++;
+            break;
+        case TokenKind::TK_R_BRACE:
+            _brace_depth--;
+            break;
+        case TokenKind::TK_L_PAREN:
+            _paren_depth++;
+            break;
+        case TokenKind::TK_R_PAREN:
+            _paren_depth--;
+            break;
+        case TokenKind::TK_L_SQUARE:
+            _bracket_depth++;
+            break;
+        case TokenKind::TK_R_SQUARE:
+            _bracket_depth--;
+            break;
+        default:
+            // No bracket depth change for other tokens
+            break;
         }
-        
+
         // Log significant depth changes for debugging
         if (kind == TokenKind::TK_L_BRACE || kind == TokenKind::TK_R_BRACE)
         {
-            LOG_TRACE(LogComponent::PARSER, "Brace depth changed to {} at {}:{}", 
+            LOG_TRACE(LogComponent::PARSER, "Brace depth changed to {} at {}:{}",
                       _brace_depth, _current_token.location().line(), _current_token.location().column());
         }
     }
@@ -768,7 +779,7 @@ namespace Cryo
         _tokens_consumed = 0;
         _scope_depth = 0;
         _in_implementation_block = false;
-        
+
         LOG_DEBUG(LogComponent::PARSER, "Parser state reset - all depths and counters cleared");
     }
 
@@ -795,7 +806,7 @@ namespace Cryo
                kind == TokenKind::TK_KW_PRIVATE ||
                kind == TokenKind::TK_KW_STATIC;
     }
-    
+
     bool Parser::is_statement_start(TokenKind kind) const
     {
         return kind == TokenKind::TK_KW_CONST ||
@@ -818,7 +829,7 @@ namespace Cryo
                kind == TokenKind::TK_KW_WITH ||
                kind == TokenKind::TK_KW_YIELD;
     }
-    
+
     bool Parser::is_forced_recovery_point(TokenKind kind) const
     {
         return kind == TokenKind::TK_KW_FUNCTION ||
@@ -1215,9 +1226,9 @@ namespace Cryo
         // Parse variable name first (correct syntax: const identifier: type)
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected variable name");
         std::string var_name = std::string(name_token.text());
-        
+
         // Debug: Log variable name parsing
-        LOG_DEBUG(Cryo::LogComponent::PARSER, "VARDECL_DEBUG: Parsing variable declaration for name='{}', location={}:{}", 
+        LOG_DEBUG(Cryo::LogComponent::PARSER, "VARDECL_DEBUG: Parsing variable declaration for name='{}', location={}:{}",
                   var_name, name_token.location().line(), name_token.location().column());
 
         // Parse required colon and type annotation
@@ -1240,8 +1251,8 @@ namespace Cryo
         auto var_decl = _builder.create_variable_declaration(start_loc, var_name, var_type, std::move(initializer), is_mutable, is_global);
 
         // Debug: Log created variable declaration
-        LOG_DEBUG(Cryo::LogComponent::PARSER, "VARDECL_DEBUG: Created VariableDeclarationNode for name='{}', node_ptr={}, stored_name='{}'", 
-                  var_name, static_cast<void*>(var_decl.get()), var_decl->name());
+        LOG_DEBUG(Cryo::LogComponent::PARSER, "VARDECL_DEBUG: Created VariableDeclarationNode for name='{}', node_ptr={}, stored_name='{}'",
+                  var_name, static_cast<void *>(var_decl.get()), var_decl->name());
 
         return var_decl;
     }
@@ -1272,15 +1283,18 @@ namespace Cryo
         // Runtime function name transformation: main -> _user_main_
         // Only transform if this is not a stdlib module (not in "std" namespace)
         bool is_in_std_namespace = false;
-        if (_srm_context) {
+        if (_srm_context)
+        {
             // Check if we're in "std" namespace exactly OR any namespace starting with "std::"
-            is_in_std_namespace = _srm_context->is_in_namespace("std") || 
-                                 _current_namespace.starts_with("std::");
-        } else {
+            is_in_std_namespace = _srm_context->is_in_namespace("std") ||
+                                  _current_namespace.starts_with("std::");
+        }
+        else
+        {
             // Fallback to manual check
             is_in_std_namespace = _current_namespace.find("std::") != std::string::npos;
         }
-        
+
         if (func_name == "main")
         {
             if (!is_in_std_namespace)
@@ -2193,15 +2207,18 @@ namespace Cryo
                             // Generic type with scope resolution: Option<T>::None
                             // Create a generic type identifier using SRM utilities for consistency
                             std::string generic_type_name;
-                            if (_srm_manager) {
+                            if (_srm_manager)
+                            {
                                 auto namespace_parts = get_current_namespace_parts();
                                 // Convert string generic args to Type* for TypeIdentifier
                                 // Note: This is a simplification - in practice we'd need proper type resolution
-                                std::vector<Cryo::Type*> template_types; // Empty for now, proper resolution needed
+                                std::vector<Cryo::Type *> template_types; // Empty for now, proper resolution needed
                                 auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
                                     namespace_parts, type_name, Cryo::TypeKind::Struct, template_types);
                                 generic_type_name = type_id->to_template_name();
-                            } else {
+                            }
+                            else
+                            {
                                 // Fallback construction
                                 generic_type_name = type_name + "<";
                                 for (size_t i = 0; i < generic_args.size(); ++i)
@@ -2310,7 +2327,7 @@ namespace Cryo
             advance(); // consume '('
             auto expr = parse_expression();
             consume(TokenKind::TK_R_PAREN, "Expected ')' after expression");
-            
+
             // Handle postfix expressions after parentheses (like (*ptr).method())
             while (true)
             {
@@ -2342,7 +2359,7 @@ namespace Cryo
                     break;
                 }
             }
-            
+
             return expr;
         }
 
@@ -2751,7 +2768,31 @@ namespace Cryo
     {
         SourceLocation start_loc = _current_token.location();
 
-        // For now, only handle enum patterns like Shape::Circle(radius)
+        // Handle literal patterns (character, string, integer literals)
+        if (_current_token.is(TokenKind::TK_CHAR_CONSTANT) ||
+            _current_token.is(TokenKind::TK_STRING_LITERAL) ||
+            _current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+        {
+            // Create a literal pattern - for now we can reuse the literal node structure
+            auto literal = _builder.create_literal_node(_current_token);
+            advance();
+
+            // Create a pattern node that wraps the literal
+            auto pattern = std::make_unique<PatternNode>(start_loc);
+            pattern->set_literal_value(std::move(literal));
+            return std::move(pattern);
+        }
+
+        // Handle wildcard pattern
+        if (_current_token.is(TokenKind::TK_IDENTIFIER) && _current_token.text() == "_")
+        {
+            advance();
+            auto pattern = std::make_unique<PatternNode>(start_loc);
+            pattern->set_wildcard(true);
+            return std::move(pattern);
+        }
+
+        // Handle enum patterns like Shape::Circle(radius)
         if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
             std::string enum_name{_current_token.text()};
@@ -2798,9 +2839,16 @@ namespace Cryo
                     return std::move(pattern);
                 }
             }
+            else
+            {
+                // Simple identifier pattern (variable binding)
+                auto pattern = std::make_unique<PatternNode>(start_loc);
+                pattern->set_identifier(enum_name);
+                return std::move(pattern);
+            }
         }
 
-        error("Expected enum pattern");
+        error("Expected pattern (literal, identifier, enum pattern, or wildcard)");
         return nullptr;
     }
 
@@ -3747,7 +3795,7 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_EQUAL))
         {
             advance(); // consume '='
-            
+
             if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
             {
                 int64_t explicit_value = std::stoll(std::string(_current_token.text()));
@@ -4536,7 +4584,7 @@ namespace Cryo
         std::vector<Token> collected_tokens;
         int angle_bracket_depth = 0;
 
-        LOG_DEBUG(LogComponent::PARSER, "parse_type_annotation_with_tokens() starting, current token: {} ({})", 
+        LOG_DEBUG(LogComponent::PARSER, "parse_type_annotation_with_tokens() starting, current token: {} ({})",
                   static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
 
         // Collect tokens that form the complete type expression
@@ -4564,15 +4612,15 @@ namespace Cryo
                 angle_bracket_depth--;
             }
 
-            LOG_DEBUG(LogComponent::PARSER, "Collecting token: {} ({})", 
+            LOG_DEBUG(LogComponent::PARSER, "Collecting token: {} ({})",
                       static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
-            
+
             collected_tokens.push_back(_current_token);
             type_string += std::string(_current_token.text()) + " ";
             advance();
 
             // Break on certain terminators, but only if we're not inside angle brackets
-            if (angle_bracket_depth == 0 && 
+            if (angle_bracket_depth == 0 &&
                 (_current_token.is(TokenKind::TK_SEMICOLON) ||
                  _current_token.is(TokenKind::TK_COMMA) ||
                  _current_token.is(TokenKind::TK_R_PAREN) ||
@@ -4826,78 +4874,83 @@ namespace Cryo
     // Symbol Resolution Manager (SRM) Helper Methods
     // ========================================
 
-    std::string Parser::generate_qualified_namespace_name(const std::string& namespace_name)
+    std::string Parser::generate_qualified_namespace_name(const std::string &namespace_name)
     {
-        if (!_srm_manager) {
+        if (!_srm_manager)
+        {
             return namespace_name;
         }
 
         // Convert single namespace name to parts and generate qualified name
         auto namespace_parts = get_current_namespace_parts();
-        
+
         auto qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
-            namespace_parts, namespace_name, Cryo::SymbolKind::Type
-        );
-        
+            namespace_parts, namespace_name, Cryo::SymbolKind::Type);
+
         return qualified_id->to_string();
     }
 
-    std::string Parser::generate_qualified_type_name(const std::string& base_name, const std::string& member_name)
+    std::string Parser::generate_qualified_type_name(const std::string &base_name, const std::string &member_name)
     {
-        if (!_srm_manager) {
+        if (!_srm_manager)
+        {
             return base_name + "::" + member_name;
         }
 
         auto namespace_parts = get_current_namespace_parts();
         namespace_parts.push_back(base_name);
-        
+
         auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
-            namespace_parts, member_name, Cryo::TypeKind::Struct
-        );
-        
+            namespace_parts, member_name, Cryo::TypeKind::Struct);
+
         return type_id->to_string();
     }
 
-    std::string Parser::generate_scope_resolution_name(const std::string& scope_name, const std::string& member_name)
+    std::string Parser::generate_scope_resolution_name(const std::string &scope_name, const std::string &member_name)
     {
-        if (!_srm_manager) {
+        if (!_srm_manager)
+        {
             return scope_name + "::" + member_name;
         }
 
         // Create a qualified identifier for scope resolution
         std::vector<std::string> parts = {scope_name};
         auto qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
-            parts, member_name, Cryo::SymbolKind::Variable
-        );
-        
+            parts, member_name, Cryo::SymbolKind::Variable);
+
         return qualified_id->to_string();
     }
 
     std::vector<std::string> Parser::get_current_namespace_parts() const
     {
-        if (!_srm_context) {
+        if (!_srm_context)
+        {
             // Fallback to manual namespace tracking if SRM is not available
             std::vector<std::string> parts;
-            if (!_current_namespace.empty()) {
+            if (!_current_namespace.empty())
+            {
                 // Simple split by "::" - this is a fallback for legacy compatibility
                 std::string delimiter = "::";
                 std::string ns = _current_namespace;
                 size_t pos = 0;
                 std::string token;
-                while ((pos = ns.find(delimiter)) != std::string::npos) {
+                while ((pos = ns.find(delimiter)) != std::string::npos)
+                {
                     token = ns.substr(0, pos);
-                    if (!token.empty()) {
+                    if (!token.empty())
+                    {
                         parts.push_back(token);
                     }
                     ns.erase(0, pos + delimiter.length());
                 }
-                if (!ns.empty()) {
+                if (!ns.empty())
+                {
                     parts.push_back(ns);
                 }
             }
             return parts;
         }
-        
+
         return _srm_context->get_namespace_stack();
     }
 }

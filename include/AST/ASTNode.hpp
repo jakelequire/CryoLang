@@ -2079,7 +2079,75 @@ namespace Cryo
     class PatternNode : public ASTNode
     {
     public:
-        PatternNode(NodeKind kind, SourceLocation loc) : ASTNode(kind, loc) {}
+        enum class PatternType
+        {
+            Literal,
+            Identifier,
+            Wildcard,
+            Enum
+        };
+
+    private:
+        PatternType _pattern_type;
+        std::unique_ptr<LiteralNode> _literal_value;
+        std::string _identifier;
+        bool _is_wildcard = false;
+
+    public:
+        PatternNode(SourceLocation loc) : ASTNode(NodeKind::Pattern, loc), _pattern_type(PatternType::Wildcard) {}
+        PatternNode(NodeKind kind, SourceLocation loc) : ASTNode(kind, loc), _pattern_type(PatternType::Enum) {}
+
+        // Setters for different pattern types
+        void set_literal_value(std::unique_ptr<LiteralNode> literal)
+        {
+            _literal_value = std::move(literal);
+            _pattern_type = PatternType::Literal;
+        }
+
+        void set_identifier(const std::string &identifier)
+        {
+            _identifier = identifier;
+            _pattern_type = PatternType::Identifier;
+        }
+
+        void set_wildcard(bool wildcard)
+        {
+            _is_wildcard = wildcard;
+            _pattern_type = PatternType::Wildcard;
+        }
+
+        // Getters
+        PatternType pattern_type() const { return _pattern_type; }
+        LiteralNode *literal_value() const { return _literal_value.get(); }
+        const std::string &identifier() const { return _identifier; }
+        bool is_wildcard() const { return _is_wildcard; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "Pattern";
+            switch (_pattern_type)
+            {
+            case PatternType::Literal:
+                os << " (Literal)";
+                if (_literal_value)
+                {
+                    os << std::endl;
+                    _literal_value->print(os, indent + 2);
+                }
+                break;
+            case PatternType::Identifier:
+                os << " (Identifier: " << _identifier << ")";
+                break;
+            case PatternType::Wildcard:
+                os << " (Wildcard)";
+                break;
+            case PatternType::Enum:
+                os << " (Enum)";
+                break;
+            }
+            os << std::endl;
+        }
+
         void accept(ASTVisitor &visitor) override;
     };
 
