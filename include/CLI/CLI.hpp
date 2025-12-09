@@ -60,11 +60,13 @@ namespace Cryo::CLI
     private:
         std::map<std::string, std::string> _args;
         std::map<std::string, bool> _flags;
+        std::map<std::string, std::string> _defines;  // For -D flags
         std::vector<std::string> _positional;
 
     public:
         void set_arg(const std::string &key, const std::string &value) { _args[key] = value; }
         void set_flag(const std::string &key, bool value = true) { _flags[key] = value; }
+        void set_define(const std::string &key, const std::string &value) { _defines[key] = value; }
         void add_positional(const std::string &value) { _positional.push_back(value); }
 
         std::string get_arg(const std::string &key, const std::string &default_val = "") const
@@ -82,6 +84,13 @@ namespace Cryo::CLI
         const std::vector<std::string> &positional() const { return _positional; }
         bool has_arg(const std::string &key) const { return _args.find(key) != _args.end(); }
         bool has_flag(const std::string &key) const { return _flags.find(key) != _flags.end(); }
+        bool has_define(const std::string &key) const { return _defines.find(key) != _defines.end(); }
+        std::string get_define(const std::string &key, const std::string &default_val = "") const
+        {
+            auto it = _defines.find(key);
+            return (it != _defines.end()) ? it->second : default_val;
+        }
+        const std::map<std::string, std::string> &defines() const { return _defines; }
         size_t positional_count() const { return _positional.size(); }
 
         // Enhanced accessors for compilation flags

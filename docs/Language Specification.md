@@ -82,7 +82,7 @@ The lexical structure of Cryo is defined through a formal grammar that specifies
 
 **Definition 2.1** (Lexical Categories): The lexical categories of Cryo are defined as follows:
 
-```
+```bnf
 Token ::= Keyword | Identifier | Literal | Operator | Separator | Comment
 
 Keyword ::= 'const' | 'mut' | 'function' | 'type' | 'struct' | 'class' | 'enum' 
@@ -367,7 +367,7 @@ The Cryo type system is formalized as an extension of System F<sub>ω</sub> (Sys
 
 **Definition 4.1** (Kind System): Types are classified by kinds, which describe the arity and structure of type constructors:
 
-```
+```bnf
 κ ::= *                    (kind of types)
     | κ₁ → κ₂              (kind of type constructors)
     | Lin                  (kind of linear types)
@@ -436,7 +436,7 @@ The Cryo type system is formalized as an extension of System F<sub>ω</sub> (Sys
 
 **Definition 4.7** (Struct Types): Struct types are product types that combine multiple values:
 
-```
+```cryo
 struct Point {
     x: f64;
     y: f64;
@@ -447,7 +447,7 @@ The type `Point` is equivalent to the product type `f64 × f64`. Access to field
 
 **Definition 4.8** (Enum Types): Enum types are sum types that represent choices between alternatives:
 
-```
+```cryo
 enum Option<T> {
     Some(T),
     None
@@ -466,7 +466,7 @@ The type `Option<T>` is equivalent to the sum type `T + Unit`. Pattern matching 
 
 **Definition 4.10** (Type Parameters): Generic types are parameterized by type variables with optional bounds:
 
-```
+```cryo
 struct Container<T> where T: Clone {
     value: T;
 }
@@ -522,7 +522,7 @@ Effects compose using a semilattice structure, where the least upper bound repre
 
 **Definition 5.1** (Value Domains): The semantic domains define the mathematical structures that model runtime values:
 
-```
+```bnf
 Values v ∈ V ::= n ∈ ℤ                    (integers)
                 | r ∈ ℚ                    (rationals)  
                 | b ∈ 𝔹                    (booleans)
@@ -540,7 +540,7 @@ Values v ∈ V ::= n ∈ ℤ                    (integers)
 
 **Definition 5.2** (Memory Locations): The location domain L represents memory addresses with associated metadata:
 
-```
+```bnf
 Locations ℓ ∈ L ::= ⟨addr, size, type, ownership⟩
 
 where:
@@ -554,7 +554,7 @@ where:
 
 **Definition 5.3** (Environment Structure): Environments map identifiers to values and types:
 
-```
+```bnf
 Type Environments   Γ : Identifier → Type
 Value Environments  ρ : Identifier → V
 Store              σ : L → V
@@ -572,7 +572,7 @@ Heap               h : L → {allocated, free}
 
 **Definition 5.5** (Continuation Structure): Continuations model the rest of the computation:
 
-```
+```bnf
 Continuations κ ∈ K ::= halt
                       | let x = □ in e; κ
                       | □ op v; κ  
@@ -589,7 +589,7 @@ Continuations κ ∈ K ::= halt
 
 **Definition 5.6** (Effect Structure): Effects model observable computational actions:
 
-```
+```bnf
 Effects ε ∈ E ::= pure                    (no effects)
                 | read(ℓ)                 (memory read)
                 | write(ℓ, v)             (memory write)  
@@ -615,7 +615,7 @@ Effects ε ∈ E ::= pure                    (no effects)
 
 **Definition 6.1** (Configuration Space): A configuration represents the current state of computation:
 
-```
+```bnf
 Configuration ⟨e, ρ, σ, h, κ⟩ where:
   e ∈ Expression    (current expression)
   ρ ∈ Environment   (variable bindings)
@@ -626,7 +626,7 @@ Configuration ⟨e, ρ, σ, h, κ⟩ where:
 
 **Definition 6.2** (Reduction Relations): The small-step operational semantics is defined by reduction relations:
 
-```
+```bnf
 ⟨e, ρ, σ, h, κ⟩ → ⟨e', ρ', σ', h', κ'⟩    (single step)
 ⟨e, ρ, σ, h, κ⟩ →* ⟨e', ρ', σ', h', κ'⟩   (multi-step)
 ⟨e, ρ, σ, h, κ⟩ ↑                          (divergence)
@@ -636,7 +636,7 @@ Configuration ⟨e, ρ, σ, h, κ⟩ where:
 
 **Definition 6.3** (Arithmetic Operations): Arithmetic expressions evaluate according to mathematical semantics with overflow checking:
 
-```
+```bnf
 (E-Add)
 n₁ + n₂ = n₃ ∧ inBounds(n₃, τ)
 ─────────────────────────────────────
@@ -650,7 +650,7 @@ n₁ + n₂ = n₃ ∧ ¬inBounds(n₃, τ)
 
 **Definition 6.4** (Variable Access): Variable lookup follows scoping rules with error handling:
 
-```
+```bnf
 (E-Var)
 ρ(x) = v
 ─────────────────────────
@@ -664,7 +664,7 @@ x ∉ dom(ρ)
 
 **Definition 6.5** (Function Application): Function calls follow call-by-value semantics with stack management:
 
-```
+```bnf
 (E-App)
 ρ(f) = λ(x₁: τ₁, ..., xₙ: τₙ).e
 ρ' = ρ[x₁ ↦ v₁, ..., xₙ ↦ vₙ]
@@ -676,7 +676,7 @@ x ∉ dom(ρ)
 
 **Definition 6.6** (Memory Allocation): Heap allocation creates new memory locations:
 
-```
+```bnf
 (E-Alloc)
 ℓ ∉ dom(σ) ∧ size(τ) = n
 h' = h[ℓ ↦ allocated]
@@ -687,7 +687,7 @@ h' = h[ℓ ↦ allocated]
 
 **Definition 6.7** (Memory Deallocation): Memory deallocation marks locations as free:
 
-```
+```bnf
 (E-Free)  
 σ(ℓ) = v ∧ h(ℓ) = allocated
 h' = h[ℓ ↦ free]
@@ -703,7 +703,7 @@ h(ℓ) = free
 
 **Definition 6.8** (Memory Access): Memory reads and writes check allocation status:
 
-```
+```bnf
 (E-Deref)
 σ(ℓ) = v ∧ h(ℓ) = allocated  
 ─────────────────────────────────────
@@ -719,7 +719,7 @@ h(ℓ) = free
 
 **Definition 6.9** (Conditional Evaluation): Conditionals evaluate based on boolean values:
 
-```
+```bnf
 (E-If-True)
 ─────────────────────────────────────
 ⟨if true then e₁ else e₂, ρ, σ, h, κ⟩ → ⟨e₁, ρ, σ, h, κ⟩
@@ -731,7 +731,7 @@ h(ℓ) = free
 
 **Definition 6.10** (Loop Semantics): While loops are desugared to recursive function calls:
 
-```
+```bnf
 (E-While)
 ─────────────────────────────────────
 ⟨while e₁ do e₂, ρ, σ, h, κ⟩ → ⟨if e₁ then (e₂; while e₁ do e₂) else (), ρ, σ, h, κ⟩
@@ -739,7 +739,7 @@ h(ℓ) = free
 
 **Definition 6.11** (Pattern Matching): Pattern matching follows exhaustiveness and coverage rules:
 
-```
+```bnf
 (E-Match-Success)
 match(v, p) = ρ'
 ─────────────────────────────────────
@@ -755,7 +755,7 @@ match(v, p) = ρ'
 
 **Definition 6.12** (Panic Propagation): Panics propagate through the call stack until handled:
 
-```
+```bnf
 (E-Panic-Prop)
 ─────────────────────────────────────
 ⟨panic(msg), ρ, σ, h, let x = □ in e; κ⟩ → ⟨panic(msg), ρ, σ, h, κ⟩
@@ -773,7 +773,7 @@ match(v, p) = ρ'
 
 **Definition 7.1** (Memory Regions): Memory is partitioned into distinct regions with different allocation and lifetime semantics:
 
-```
+```bnf
 Memory Regions R ::= Stack(thread_id)      (stack memory per thread)
                    | Heap(allocator_id)    (heap memory per allocator)  
                    | Static                 (program static data)
@@ -791,7 +791,7 @@ Memory Layout M : R → P(Address × Size × Type)
 
 **Definition 7.3** (Ownership Model): Memory ownership follows an affine type system:
 
-```
+```bnf
 Ownership ::= Owned(T)          (exclusive ownership)
             | Borrowed(&T, ℓ)   (shared immutable reference)  
             | BorrowedMut(&mut T, ℓ)  (exclusive mutable reference)
@@ -802,7 +802,7 @@ Ownership ::= Owned(T)          (exclusive ownership)
 
 **Definition 7.4** (Lifetime Parameters): Lifetimes represent the scope during which references are valid:
 
-```
+```bnf
 Lifetimes ℓ ::= 'a                      (named lifetime parameter)
               | 'static                 (program lifetime)
               | '_                      (inferred lifetime)
@@ -826,7 +826,7 @@ Lifetimes ℓ ::= 'a                      (named lifetime parameter)
 
 **Definition 7.7** (Stack Frame Structure): Stack frames contain local variables and control information:
 
-```
+```bnf
 StackFrame ::= ⟨locals: Identifier ⇀ Value,
                 return_addr: Address,  
                 saved_regs: Register ⇀ Value,
@@ -851,7 +851,7 @@ StackFrame ::= ⟨locals: Identifier ⇀ Value,
 
 **Definition 7.10** (Allocation Metadata): Each allocation carries metadata for safety checking:
 
-```
+```bnf
 AllocationHeader ::= ⟨size: Size,
                       type: Type,
                       checksum: u32,
@@ -862,7 +862,7 @@ AllocationHeader ::= ⟨size: Size,
 
 **Definition 7.11** (Reference Operations): References support safe aliasing with compile-time checking:
 
-```
+```bnf
 Reference Operations:
 - &x          (create immutable reference)
 - &mut x      (create mutable reference)  
@@ -885,7 +885,7 @@ Reference Operations:
 
 **Definition 8.1** (Module Definition): A module is a collection of items with associated visibility and dependency information:
 
-```
+```bnf
 Module M ::= ⟨name: ModuleName,
              items: Item*,
              imports: ImportDecl*,
@@ -908,7 +908,7 @@ Item ::= TypeDecl | FunctionDecl | ConstDecl | ModuleDecl
 
 **Definition 8.3** (Import Declaration): Imports bring external items into the current module's scope:
 
-```
+```bnf
 ImportDecl ::= import ModulePath                    (import all public items)
              | import ModulePath :: ItemList         (import specific items)
              | import ItemName from ModulePath       (import with renaming)
@@ -920,7 +920,7 @@ ItemList ::= ItemName (, ItemName)*
 
 **Definition 8.4** (Export Declaration): Exports control the visibility of items to external modules:
 
-```
+```bnf
 ExportDecl ::= export Item                          (re-export item)
              | export ModulePath :: ItemList         (re-export from module)
              | export * from ModulePath              (re-export all)
@@ -939,7 +939,7 @@ Visibility ::= public | private | protected
 
 **Definition 8.6** (Dependency Graph): Module dependencies form a directed acyclic graph:
 
-```
+```bnf
 Dependencies D : Module → P(Module)
 Dependency Order: topological sort of D
 ```
@@ -988,7 +988,7 @@ Dependency Order: topological sort of D
 
 **Definition 9.1** (Type Parameters): Generic types and functions are parameterized by type variables:
 
-```
+```bnf
 GenericDecl ::= ⟨name: Identifier,
                  params: TypeParam*,
                  constraints: Constraint*,
@@ -1027,7 +1027,7 @@ Constraint ::= TraitBound | LifetimeBound | TypeEquality
 
 **Definition 9.5** (Generic Type Inference): Type inference for generics follows bidirectional typing:
 
-```
+```bnf
 Inference Rules:
 ⊢ e : ∀α.τ    α ∉ FV(Γ)
 ─────────────────────────    (Instantiation)
@@ -1049,15 +1049,15 @@ Inference Rules:
 
 **Definition 9.7** (Associated Type Definition): Traits can define associated types that are determined by implementations:
 
-```
+```bnf
 trait Iterator {
     type Item;
-    fn next(&mut self) -> Option<Self::Item>;
+    next(&mut self) -> Option<Self::Item>;
 }
 
 impl Iterator for Vec<T> {
     type Item = T;
-    fn next(&mut self) -> Option<T> { ... }
+    next(&mut self) -> Option<T> { ... }
 }
 ```
 
@@ -1089,7 +1089,7 @@ impl Iterator for Vec<T> {
 
 **Definition 10.1** (Trait Declaration): Traits define interfaces that types can implement:
 
-```
+```bnf
 TraitDecl ::= trait TraitName GenericParams? SuperTraits? {
                 TraitItem*
               }
@@ -1104,7 +1104,7 @@ SuperTraits ::= : TraitBound (, TraitBound)*
 
 **Definition 10.2** (Trait Implementation): Types implement traits through implementation blocks:
 
-```
+```bnf
 ImplDecl ::= implement trait TraitName GenericParams? for Type {
                ImplItem*
              }
@@ -1124,7 +1124,7 @@ ImplItem ::= FunctionDef
 
 **Definition 10.4** (Trait Bounds): Generic parameters can be constrained by trait requirements:
 
-```
+```bnf
 TraitBound ::= TypeParam : Trait
              | TypeParam : Trait + Trait  
              | TypeParam : for<'a> Trait<'a>
@@ -1134,7 +1134,7 @@ WhereClause ::= where TraitBound (, TraitBound)*
 
 **Definition 10.5** (Bound Satisfaction): Type parameter bounds are satisfied when implementations exist:
 
-```
+```bnf
 Satisfaction Relation ⊨:
 Γ ⊨ T : Trait  iff  ∃ impl Trait for T ∈ Γ
 
@@ -1146,7 +1146,7 @@ Higher-Ranked Bounds:
 
 **Definition 10.6** (Trait Objects): Traits can be used as types for dynamic dispatch:
 
-```
+```bnf
 TraitObject ::= dyn Trait
               | dyn Trait + Trait
               | dyn Trait + 'lifetime
@@ -1160,19 +1160,19 @@ Object Safety Conditions:
 
 **Definition 10.7** (Virtual Table Layout): Trait objects use virtual tables for method dispatch:
 
-```
+```bnf
 VTable ::= ⟨type_info: TypeInfo,
-           destructor: fn(*mut ()),
+           destructor: (*mut ()),
            size: usize,
            align: usize,
-           methods: [fn(args) -> ret]*⟩
+           methods: [(args) -> ret]*⟩
 ```
 
 ### 10.4 Associated Items
 
 **Definition 10.8** (Associated Types): Traits can declare associated types determined by implementations:
 
-```
+```bnf
 Associated Type Declaration:
 trait Trait {
     type AssocType: Bound;
@@ -1186,7 +1186,7 @@ impl Trait for Type {
 
 **Definition 10.9** (Associated Constants): Traits can declare associated constants:
 
-```
+```bnf
 trait Trait {
     const CONSTANT: Type;
 }
@@ -1219,7 +1219,7 @@ impl Trait for Type {
 
 **Definition 11.1** (Error Classification): Cryo distinguishes between different categories of errors:
 
-```
+```bnf
 Error Categories:
 - RecoverableError: Errors that can be handled by user code
 - UnrecoverableError: Errors that cause program termination  
@@ -1229,13 +1229,13 @@ Error Categories:
 
 **Definition 11.2** (Result Type): The Result type encapsulates operations that may fail:
 
-```
+```cryo
 enum Result<T, E> {
     Ok(T),
     Err(E)
 }
 
-Error Propagation Operator:
+// Error Propagation Operator:
 expression? ≡ match expression {
     Ok(value) => value,
     Err(error) => return Err(error)
@@ -1244,13 +1244,13 @@ expression? ≡ match expression {
 
 **Definition 11.3** (Option Type): The Option type represents optional values:
 
-```
+```cryo
 enum Option<T> {
     Some(T),
     None
 }
 
-Null Pointer Alternative:
+// Null Pointer Alternative:
 Option<T> replaces nullable pointers for safe null handling
 ```
 
@@ -1258,7 +1258,7 @@ Option<T> replaces nullable pointers for safe null handling
 
 **Definition 11.4** (Panic Semantics): Panics represent unrecoverable errors:
 
-```
+```bnf
 Panic Behavior:
 1. Immediate termination of current thread
 2. Stack unwinding with destructor execution
@@ -1283,10 +1283,10 @@ Panic Behavior:
 
 **Definition 11.7** (Error Context): Errors can carry additional context information:
 
-```
+```cryo
 trait Context<T> {
-    fn context(self, msg: &str) -> Result<T, ContextError>;
-    fn with_context<F>(self, f: F) -> Result<T, ContextError>
+    context(self, msg: &str) -> Result<T, ContextError>;
+    with_context<F>(self, f: F) -> Result<T, ContextError>
         where F: FnOnce() -> String;
 }
 ```
@@ -1314,7 +1314,7 @@ trait Context<T> {
 
 **Definition 12.1** (Runtime Components): The Cryo runtime consists of several interconnected subsystems:
 
-```
+```bnf
 Runtime System ::= ⟨memory_manager: MemoryManager,
                     gc_system: GarbageCollector,
                     type_system: TypeSystem,
@@ -1325,7 +1325,7 @@ Runtime System ::= ⟨memory_manager: MemoryManager,
 
 **Definition 12.2** (Runtime State Machine): The runtime follows a state machine model for lifecycle management:
 
-```
+```bnf
 RuntimeState ::= Uninitialized
                | Initializing  
                | Running
@@ -1340,7 +1340,7 @@ Uninitialized → Initializing → Running → ShuttingDown → Terminated
 
 **Definition 12.3** (Heap Manager): The heap manager implements segregated free lists with coalescing:
 
-```
+```bnf
 HeapManager ::= ⟨free_lists: SizeClass → FreeList,
                  large_objects: Set<LargeObject>,
                  allocation_stats: AllocationStats⟩
@@ -1354,7 +1354,7 @@ Block Management:
 
 **Definition 12.4** (Stack Management): Stack frames are managed automatically with overflow detection:
 
-```
+```bnf
 StackFrame ::= ⟨locals: LocalVariables,
                return_address: Address,
                frame_pointer: Address,
@@ -1370,7 +1370,7 @@ Stack Safety:
 
 **Definition 12.5** (Runtime Type Information): Types carry runtime information for safety checking:
 
-```
+```bnf
 TypeInfo ::= ⟨type_id: TypeId,
              size: Size,
              alignment: Alignment,  
@@ -1394,7 +1394,7 @@ Type Checking:
 
 **Definition 12.7** (Thread Model**: Cryo uses a 1:1 threading model with OS threads:
 
-```
+```bnf
 Thread ::= ⟨thread_id: ThreadId,
            stack: Stack,
            local_heap: LocalHeap,
@@ -1414,7 +1414,7 @@ ThreadState ::= Running | Blocked | Terminated
 
 **Definition 12.9** (Panic Propagation): Panics unwind the stack while executing destructors:
 
-```
+```bnf
 Panic Handler:
 1. Capture panic location and message
 2. Begin stack unwinding
@@ -1438,7 +1438,7 @@ Panic Handler:
 
 **Definition 13.1** (Standard Library Structure): The standard library is organized into logical modules:
 
-```
+```bnf
 std Library Structure:
 ├── core/           (Core types and traits)
 │   ├── types       (Fundamental types)  
@@ -1465,46 +1465,46 @@ std Library Structure:
 
 **Definition 13.3** (Fundamental Traits): Core traits provide basic capabilities:
 
-```
+```cryo
 trait Clone {
-    fn clone(&self) -> Self;
+    clone(&self) -> Self;
 }
 
 trait Copy: Clone {}  // Marker trait for trivial copying
 
 trait Drop {
-    fn drop(&mut self);  // Custom cleanup logic
+    drop(&mut self);  // Custom cleanup logic
 }
 
 trait Default {
-    fn default() -> Self;  // Default value construction
+    default() -> Self;  // Default value construction
 }
 
 trait Debug {
-    fn fmt(&self, f: &mut Formatter) -> Result;
+    fmt(&self, f: &mut Formatter) -> Result;
 }
 
 trait Display {
-    fn fmt(&self, f: &mut Formatter) -> Result;  
+    fmt(&self, f: &mut Formatter) -> Result;  
 }
 ```
 
 **Definition 13.4** (Comparison Traits): Traits for ordering and equality:
 
-```
+```cryo
 trait PartialEq<Rhs = Self> {
-    fn eq(&self, other: &Rhs) -> bool;
-    fn ne(&self, other: &Rhs) -> bool { !self.eq(other) }
+    eq(&self, other: &Rhs) -> bool;
+    ne(&self, other: &Rhs) -> bool { !self.eq(other) }
 }
 
 trait Eq: PartialEq<Self> {}
 
 trait PartialOrd<Rhs = Self>: PartialEq<Rhs> {
-    fn partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
+    partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
 }
 
 trait Ord: Eq + PartialOrd<Self> {
-    fn cmp(&self, other: &Self) -> Ordering;
+    cmp(&self, other: &Self) -> Ordering;
 }
 ```
 
@@ -1514,9 +1514,9 @@ trait Ord: Eq + PartialOrd<Self> {
 
 ```
 trait Allocator {
-    fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocError>;
-    fn deallocate(&self, ptr: *mut u8, layout: Layout);
-    fn realloc(&self, ptr: *mut u8, old: Layout, new: Layout) 
+    allocate(&self, layout: Layout) -> Result<*mut u8, AllocError>;
+    deallocate(&self, ptr: *mut u8, layout: Layout);
+    realloc(&self, ptr: *mut u8, old: Layout, new: Layout) 
         -> Result<*mut u8, AllocError>;
 }
 
@@ -1529,7 +1529,7 @@ Global Allocator:
 
 **Definition 13.6** (Smart Pointers): Automatic memory management through smart pointers:
 
-```
+```cryo
 struct Box<T> {          // Owned heap allocation
     ptr: *mut T,
     _marker: PhantomData<T>
@@ -1548,19 +1548,19 @@ struct Arc<T> {          // Atomic reference counted
 
 **Definition 13.7** (Collection Traits): Generic interfaces for data structures:
 
-```
+```cryo
 trait Iterator {
     type Item;
-    fn next(&mut self) -> Option<Self::Item>;
+    next(&mut self) -> Option<Self::Item>;
     
     // Default implementations for common operations
-    fn collect<C>(self) -> C where C: FromIterator<Self::Item>;
-    fn map<B, F>(self, f: F) -> Map<Self, F> where F: FnMut(Self::Item) -> B;
-    fn filter<P>(self, predicate: P) -> Filter<Self, P>;
+    collect<C>(self) -> C where C: FromIterator<Self::Item>;
+    map<B, F>(self, f: F) -> Map<Self, F> where F: FnMut(Self::Item) -> B;
+    filter<P>(self, predicate: P) -> Filter<Self, P>;
 }
 
 trait FromIterator<A> {
-    fn from_iter<T>(iter: T) -> Self where T: IntoIterator<Item = A>;
+    from_iter<T>(iter: T) -> Self where T: IntoIterator<Item = A>;
 }
 ```
 
@@ -1579,19 +1579,19 @@ trait FromIterator<A> {
 
 ```
 trait Read {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize>;
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
+    read(&mut self, buf: &mut [u8]) -> Result<usize>;
+    read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize>;
+    read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
 }
 
 trait Write {  
-    fn write(&mut self, buf: &[u8]) -> Result<usize>;
-    fn flush(&mut self) -> Result<()>;
-    fn write_all(&mut self, buf: &[u8]) -> Result<()>;
+    write(&mut self, buf: &[u8]) -> Result<usize>;
+    flush(&mut self) -> Result<()>;
+    write_all(&mut self, buf: &[u8]) -> Result<()>;
 }
 
 trait Seek {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+    seek(&mut self, pos: SeekFrom) -> Result<u64>;
 }
 ```
 
