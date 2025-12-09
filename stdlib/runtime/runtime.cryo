@@ -112,26 +112,39 @@ public:
     split(requested_size: u64) -> HeapBlock* {
         printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Splitting block: ptr=%p, current_size=%llu bytes, requested_size=%llu bytes\033[0m\n", 
                                    this, this.size, requested_size);
-        if (this.size <= requested_size + sizeof(HeapBlock) + MIN_BLOCK_SIZE) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Cannot split, block too small\033[0m\n");
+        
+        const header_size: u64 = sizeof(HeapBlock);
+        const min_split_size: u64 = requested_size + header_size + MIN_BLOCK_SIZE;
+        
+        if (this.size <= min_split_size) {
+            printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Cannot split, block too small (need %llu, have %llu)\033[0m\n", min_split_size, this.size);
             return null; // Cannot split, block too small
         }
 
+        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Original block size: %llu, will allocate: %llu\033[0m\n", this.size, requested_size);
+        
         // Calculate where the new block should start
-        // New block starts at: current block + header size + requested_size
-        const header_size: u64 = sizeof(HeapBlock);
+        // New block starts at: current block + header size + requested_size  
         const new_block_ptr: void* = Intrinsics::__ptr_add__(this, header_size + requested_size);
         const new_block: HeapBlock* = new_block_ptr;
         
-        const remaining_size: u64 = this.size - header_size - requested_size;
+        // The remaining size is: original_size - requested_size - header_for_new_block
+        const remaining_size: u64 = this.size - requested_size - header_size;
+        
+        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Remaining size calculation: %llu - %llu - %llu = %llu\033[0m\n",
+                                   this.size, requested_size, header_size, remaining_size);
+        
         new_block.size = remaining_size;
         new_block.flags = BLOCK_FREE | BLOCK_MAGIC;
         new_block.next = this.next;
         new_block.prev = this;
 
+        // Update this block to the requested size
         this.size = requested_size;
         this.next = new_block;
 
+        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Split complete - first block: %llu bytes, second block: %llu bytes\033[0m\n", 
+                                   this.size, new_block.size);
         printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Created new block: ptr=%p, size=%llu bytes\033[0m\n", 
                                    new_block, new_block.size);
 
@@ -429,10 +442,14 @@ private:
             return size; // No alignment
         }
         printf("\033[90m[DEBUG::RUNTIME] {HeapManager::align_size} Aligning size: original=%llu bytes, alignment=%llu bytes\033[0m\n", size, alignment);
-        const size_plus_align: u64 = size + alignment;
-        const size_plus_align_minus_1: u64 = size_plus_align - u64(1);
-        const divided: u64 = size_plus_align_minus_1 / alignment;
-        const aligned: u64 = divided * alignment;
+        
+        // Proper alignment using bitwise operations: (size + alignment - 1) & ~(alignment - 1)
+        const size_plus_align_minus_1: u64 = size + alignment - u64(1);
+        const alignment_mask: u64 = alignment - u64(1);
+        const neg_alignment_mask: u64 = u64(0) - alignment_mask - u64(1); // ~(alignment - 1)
+        const aligned: u64 = size_plus_align_minus_1 & neg_alignment_mask;
+        
+        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::align_size} Aligned result: %llu bytes\033[0m\n", aligned);
         return aligned;
     }
 
@@ -445,24 +462,38 @@ private:
 
     // Coalesce block with adjacent free blocks
     coalesce_block(block: HeapBlock*) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing block: ptr=%p\033[0m\n", block.get_user_data_ptr());
+        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing block: ptr=%p, size=%llu\033[0m\n", 
+                                   block.get_user_data_ptr(), block.size);
         printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Block details: next=%p, prev=%p\033[0m\n", block.next, block.prev);
         
-        // Try to merge with next block
+        mut coalesced: boolean = false;
+        
+        // Try to merge with next block first
         if (block.next != null) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Checking next block: ptr=%p\033[0m\n", block.next);
+            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Checking next block: ptr=%p, size=%llu\033[0m\n", 
+                                       block.next.get_user_data_ptr(), block.next.size);
             if (block.next.is_free()) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing with next block: ptr=%p\033[0m\n",
-                                       block.next.get_user_data_ptr());
-            
-            this.free_list.remove_block(block.next);
-            block.size = block.size + sizeof(HeapBlock) + block.next.size;
-            block.next = block.next.next;
-            
-            if (block.next != null) {
-                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Updating next block's previous pointer: ptr=%p\033[0m\n", block.next.get_user_data_ptr());
-                block.next.prev = block;
-            }
+                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing with next block: ptr=%p, size=%llu\033[0m\n",
+                                           block.next.get_user_data_ptr(), block.next.size);
+                
+                const old_size: u64 = block.size;
+                const next_size: u64 = block.next.size;
+                const header_size: u64 = sizeof(HeapBlock);
+                
+                // Remove next block from free list before destroying its linkage
+                this.free_list.remove_block(block.next);
+                
+                // Merge: current_size + header + next_size
+                block.size = old_size + header_size + next_size;
+                block.next = block.next.next;
+                
+                if (block.next != null) {
+                    block.next.prev = block;
+                }
+                
+                coalesced = true;
+                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Merged with next: %llu + %llu + %llu = %llu\033[0m\n",
+                                           old_size, header_size, next_size, block.size);
             } else {
                 printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Next block is not free\033[0m\n");
             }
@@ -472,19 +503,30 @@ private:
         
         // Try to merge with previous block
         if (block.prev != null) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Checking previous block: ptr=%p\033[0m\n", block.prev);
+            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Checking previous block: ptr=%p, size=%llu\033[0m\n", 
+                                       block.prev.get_user_data_ptr(), block.prev.size);
             if (block.prev.is_free()) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing with previous block: ptr=%p\033[0m\n", 
-                                       block.prev.get_user_data_ptr());
-            
-            this.free_list.remove_block(block);
-            block.prev.size = block.prev.size + sizeof(HeapBlock) + block.size;
-            block.prev.next = block.next;
-            
-            if (block.next != null) {
-                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Updating next block's previous pointer: ptr=%p\033[0m\n", block.next.get_user_data_ptr());
-                block.next.prev = block.prev;
-            }
+                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing with previous block: ptr=%p, size=%llu\033[0m\n", 
+                                           block.prev.get_user_data_ptr(), block.prev.size);
+                
+                const prev_size: u64 = block.prev.size;
+                const current_size: u64 = block.size;
+                const header_size: u64 = sizeof(HeapBlock);
+                
+                // Remove current block from free list (prev block is already in list)
+                this.free_list.remove_block(block);
+                
+                // Merge into previous block: prev_size + header + current_size
+                block.prev.size = prev_size + header_size + current_size;
+                block.prev.next = block.next;
+                
+                if (block.next != null) {
+                    block.next.prev = block.prev;
+                }
+                
+                coalesced = true;
+                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Merged with prev: %llu + %llu + %llu = %llu\033[0m\n",
+                                           prev_size, header_size, current_size, block.prev.size);
             } else {
                 printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Previous block is not free\033[0m\n");
             }
@@ -492,8 +534,13 @@ private:
             printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} No previous block to coalesce\033[0m\n");
         }
 
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing complete for block: ptr=%p\033[0m\n", 
-                                   block.get_user_data_ptr());
+        if (coalesced) {
+            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing successful - larger blocks available for reuse\033[0m\n");
+        } else {
+            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} No coalescing performed\033[0m\n");
+        }
+        
+        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing complete\033[0m\n");
         return;
     }
 }
@@ -810,10 +857,11 @@ public:
         if (alignment == 0) {
             return size;
         }
-        const size_plus_align: u64 = size + alignment;
-        const size_plus_align_minus_1: u64 = size_plus_align - u64(1);
-        const neg_alignment: u64 = u64(0) - alignment;
-        return size_plus_align_minus_1 & neg_alignment;
+        // Use same alignment logic as heap manager: (size + alignment - 1) & ~(alignment - 1)
+        const size_plus_align_minus_1: u64 = size + alignment - u64(1);
+        const alignment_mask: u64 = alignment - u64(1);
+        const neg_alignment_mask: u64 = u64(0) - alignment_mask - u64(1); // ~(alignment - 1)
+        return size_plus_align_minus_1 & neg_alignment_mask;
     }
 
     // Free memory

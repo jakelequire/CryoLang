@@ -965,9 +965,19 @@ namespace Cryo::Codegen
                     }
                 }
 
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registering variable {} of type {} for destruction (heap: {}, destructor type: {})",
-                          var_name, cryo_type->to_string(), is_heap_allocated, destruction_type_name);
-                register_variable_for_destruction(var_name, destruction_type_name, alloca, is_heap_allocated);
+                // RAII: Automatically register ALL local variables with destructors for cleanup
+                // First check if this type has a destructor
+                if (has_destructor(destruction_type_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "RAII: Registering variable {} of type {} for automatic destruction (heap: {})",
+                              var_name, destruction_type_name, is_heap_allocated);
+                    register_variable_for_destruction(var_name, destruction_type_name, alloca, is_heap_allocated);
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "RAII: Variable {} of type {} has no destructor, skipping registration",
+                              var_name, destruction_type_name);
+                }
 
                 // Handle initialization if present
                 if (node.has_initializer())
@@ -15305,20 +15315,9 @@ namespace Cryo::Codegen
                 for (auto it = current_scope.destructors.rbegin(); it != current_scope.destructors.rend(); ++it)
                 {
                     const DestructorInfo &destructor_info = *it;
-                    std::string destructor_method_name = "~" + destructor_info.type_name;
-
-                    // Construct the qualified destructor name using SRM utilities
-                    std::string destructor_name;
-                    if (!_namespace_context.empty())
-                    {
-                        std::vector<std::string> namespace_parts = {_namespace_context, destructor_info.type_name};
-                        destructor_name = Cryo::SRM::Utils::build_qualified_name(namespace_parts, destructor_method_name);
-                    }
-                    else
-                    {
-                        std::vector<std::string> type_parts = {destructor_info.type_name};
-                        destructor_name = Cryo::SRM::Utils::build_qualified_name(type_parts, destructor_method_name);
-                    }
+                    
+                    // Use the same naming convention as generated destructors: "TypeName::~TypeName"
+                    std::string destructor_name = destructor_info.type_name + "::~" + destructor_info.type_name;
 
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for destructor function: {}", destructor_name);
 
@@ -16503,18 +16502,19 @@ namespace Cryo::Codegen
             return false;
         }
 
-        // Check if there's a destructor function for this type using qualified name
-        std::string destructor_method_name = "~" + type_name;
-        std::string destructor_name;
+        // Check if there's a destructor function for this type using the same naming convention 
+        // as the generated destructors. Generated destructors use the format: "TypeName::~TypeName"
+        std::string destructor_name = type_name + "::~" + type_name;
+
+        // Also try namespace-qualified version if we're in a namespace
         if (!_namespace_context.empty())
         {
-            std::vector<std::string> namespace_parts = {_namespace_context, type_name};
-            destructor_name = Cryo::SRM::Utils::build_qualified_name(namespace_parts, destructor_method_name);
-        }
-        else
-        {
-            std::vector<std::string> type_parts = {type_name};
-            destructor_name = Cryo::SRM::Utils::build_qualified_name(type_parts, destructor_method_name);
+            std::string namespace_qualified_destructor = _namespace_context + "::" + type_name + "::~" + type_name;
+            llvm::Function *ns_destructor_fn = _context_manager.get_module()->getFunction(namespace_qualified_destructor);
+            if (ns_destructor_fn != nullptr)
+            {
+                return true;
+            }
         }
 
         llvm::Function *destructor_fn = _context_manager.get_module()->getFunction(destructor_name);
