@@ -498,6 +498,9 @@ namespace Cryo::Codegen
         bool is_primitive_constructor(const std::string &function_name) const;
         llvm::Value *generate_primitive_constructor_call(CallExpressionNode *node, const std::string &target_type);
         llvm::Value *generate_stack_constructor_call(CallExpressionNode *node, const std::string &type_name, Type *struct_type);
+        
+        // Array helpers
+        void handle_array_struct_assignment(llvm::Value *array_ptr, llvm::AllocaInst *alloca, size_t array_size);
         llvm::Value *generate_integer_cast(llvm::Value *source_value, llvm::Type *source_type,
                                            llvm::Type *target_type, const std::string &target_type_name);
         llvm::Value *generate_float_cast(llvm::Value *source_value, llvm::Type *source_type,

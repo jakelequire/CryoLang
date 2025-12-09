@@ -191,7 +191,7 @@ Item ::= VariableDeclaration
 
 VariableDeclaration ::= (const | mut) Identifier : Type [= Expression] ;
 
-FunctionDeclaration ::= function Identifier GenericParameters? 
+FunctionDeclaration ::= function Identifier <<GenericParameters?>> 
                        ( ParameterList? ) [-> Type] Block
 
 TypeDeclaration ::= StructDeclaration
@@ -200,19 +200,19 @@ TypeDeclaration ::= StructDeclaration
                   | TraitDeclaration
                   | TypeAliasDeclaration
 
-StructDeclaration ::= [type] struct Identifier GenericParameters? 
+StructDeclaration ::= [type] struct Identifier <GenericParameters?> 
                      { StructMember* }
 
-ClassDeclaration ::= class Identifier GenericParameters? [: Type] 
+ClassDeclaration ::= [type] class Identifier <GenericParameters?> [: Type] 
                     { ClassMember* }
 
-EnumDeclaration ::= [type] enum Identifier GenericParameters? 
+EnumDeclaration ::= [type] enum Identifier <GenericParameters?> 
                    { EnumVariant* }
 
-TraitDeclaration ::= trait Identifier GenericParameters? [: TraitBound] 
+TraitDeclaration ::= trait Identifier <GenericParameters?> [: TraitBound] 
                     { TraitItem* }
 
-TypeAliasDeclaration ::= type Identifier GenericParameters? = Type ;
+TypeAliasDeclaration ::= type Identifier <GenericParameters?> = Type ;
 
 ImplementationBlock ::= implement (struct | class | enum | trait) Type 
                        [for Type] { ImplementationMember* }

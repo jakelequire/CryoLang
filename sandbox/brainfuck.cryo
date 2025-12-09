@@ -1,0 +1,263 @@
+namespace Brainfuck;
+
+import <io/stdio>;
+
+// Brainfuck interpreter implementation
+// Supports all 8 Brainfuck commands: > < + - . , [ ]
+
+type class BrainfuckInterpreter {
+public:
+    memory: u8*;           // Memory tape (30,000 cells)
+    memory_size: u32;      // Size of memory tape
+    data_ptr: u32;         // Current position in memory
+    code: string;          // Brainfuck program code
+    code_ptr: u32;         // Current position in code
+    code_length: u32;      // Length of code
+    input_buffer: string;  // Input for ',' commands
+    input_ptr: u32;        // Current position in input buffer
+    
+    BrainfuckInterpreter(program: string, input: string) {
+        this.memory_size = u32(30000);
+        this.data_ptr = u32(0);
+        this.code = program;
+        this.code_ptr = u32(0);
+        this.code_length = u32(program.length());
+        this.input_buffer = input;
+        this.input_ptr = u32(0);
+        
+        // Allocate memory for the tape
+        const memory_bytes: u64 = u64(this.memory_size);
+        this.memory = cryo_alloc(memory_bytes);
+        
+        // Initialize memory to zero
+        for (mut i: u32 = u32(0); i < this.memory_size; i = i + u32(1)) {
+            this.memory[i] = u8(0);
+        }
+        
+        println("Brainfuck Interpreter initialized");
+        IO::printf("Memory size: %d cells\n", this.memory_size);
+        IO::printf("Program length: %d characters\n", this.code_length);
+    }
+
+    ~BrainfuckInterpreter() {
+        if (this.memory != null) {
+            cryo_free(this.memory);
+        }
+    }
+
+    // Execute the Brainfuck program
+    run() -> void {
+        println("Starting Brainfuck program execution...");
+        println("========================================");
+        
+        while (this.code_ptr < this.code_length) {
+            const current_char: char = this.code[this.code_ptr];
+            
+            match (current_char) {
+                '>' => this.move_right(),
+                '<' => this.move_left(),
+                '+' => this.increment(),
+                '-' => this.decrement(),
+                '.' => this.output(),
+                ',' => this.input(),
+                '[' => this.loop_start(),
+                ']' => this.loop_end(),
+                _ => {} // Ignore non-Brainfuck characters
+            }
+            
+            this.code_ptr = this.code_ptr + u32(1);
+        }
+        
+        println("");
+        println("========================================");
+        println("Program execution completed.");
+    }
+
+    // > - Move data pointer to the right
+    move_right() -> void {
+        if (this.data_ptr < this.memory_size - u32(1)) {
+            this.data_ptr = this.data_ptr + u32(1);
+        } else {
+            println("Warning: Attempted to move beyond right boundary");
+        }
+        return;
+    }
+
+    // < - Move data pointer to the left
+    move_left() -> void {
+        if (this.data_ptr > u32(0)) {
+            this.data_ptr = this.data_ptr - u32(1);
+        } else {
+            println("Warning: Attempted to move beyond left boundary");
+        }
+        return;
+    }
+
+    // + - Increment the memory cell at the data pointer
+    increment() -> void {
+        this.memory[this.data_ptr] = this.memory[this.data_ptr] + u8(1);
+        return;
+    }
+
+    // - - Decrement the memory cell at the data pointer
+    decrement() -> void {
+        this.memory[this.data_ptr] = this.memory[this.data_ptr] - u8(1);
+        return;
+    }
+
+    // . - Output the character signified by the cell at the data pointer
+    output() -> void {
+        const value: u8 = this.memory[this.data_ptr];
+        const ch: char = char(value);
+        print_char(ch);
+        return;
+    }
+
+    // , - Input a character and store it in the cell at the data pointer
+    input() -> void {
+        if (this.input_ptr < u32(this.input_buffer.length())) {
+            const ch: char = this.input_buffer[this.input_ptr];
+            this.memory[this.data_ptr] = u8(ch);
+            this.input_ptr = this.input_ptr + u32(1);
+        } else {
+            // No more input available, store 0
+            this.memory[this.data_ptr] = u8(0);
+        }
+        return;
+    }
+
+    // [ - If the byte at the data pointer is zero, jump forward to the matching ]
+    loop_start() -> void {
+        if (this.memory[this.data_ptr] == u8(0)) {
+            // Find matching ']'
+            mut bracket_count: i32 = i32(1);
+            mut search_ptr: u32 = this.code_ptr + u32(1);
+            
+            while (search_ptr < this.code_length && bracket_count > i32(0)) {
+                const ch: char = this.code[search_ptr];
+                if (ch == '[') {
+                    bracket_count = bracket_count + i32(1);
+                } else if (ch == ']') {
+                    bracket_count = bracket_count - i32(1);
+                }
+                search_ptr = search_ptr + u32(1);
+            }
+            
+            if (bracket_count == i32(0)) {
+                this.code_ptr = search_ptr - u32(1); // Position at the ']'
+            } else {
+                println("Error: Unmatched '[' bracket");
+            }
+        }
+        return;
+    }
+
+    // ] - If the byte at the data pointer is nonzero, jump back to the matching [
+    loop_end() -> void {
+        if (this.memory[this.data_ptr] != u8(0)) {
+            // Find matching '['
+            mut bracket_count: i32 = i32(1);
+            mut search_ptr: i32 = i32(this.code_ptr) - i32(1);
+            
+            while (search_ptr >= i32(0) && bracket_count > i32(0)) {
+                const ch: char = this.code[u32(search_ptr)];
+                if (ch == ']') {
+                    bracket_count = bracket_count + i32(1);
+                } else if (ch == '[') {
+                    bracket_count = bracket_count - i32(1);
+                }
+                search_ptr = search_ptr - i32(1);
+            }
+            
+            if (bracket_count == i32(0)) {
+                this.code_ptr = u32(search_ptr + i32(1)); // Position at the '['
+            } else {
+                println("Error: Unmatched ']' bracket");
+            }
+        }
+        return;
+    }
+
+    // Debug: Print current memory state around the data pointer
+    debug_memory() -> void {
+        println("\n--- Memory Debug ---");
+        printf("Data pointer: %d\n", this.data_ptr);
+        printf("Current cell value: %d\n", this.memory[this.data_ptr]);
+        
+        // Print a window of memory around current position
+        mut start: u32 = u32(0);
+        if (this.data_ptr >= u32(5)) {
+            start = this.data_ptr - u32(5);
+        }
+        
+        mut end: u32 = this.memory_size - u32(1);
+        if (this.data_ptr + u32(5) < this.memory_size) {
+            end = this.data_ptr + u32(5);
+        }
+        
+        printf("Memory [%d-%d]: ", start, end);
+        for (mut i: u32 = start; i <= end; i = i + u32(1)) {
+            if (i == this.data_ptr) {
+                IO::printf(">[%d]< ", this.memory[i]);
+            } else {
+                IO::printf("%d ", this.memory[i]);
+            }
+        }
+        println("");
+        println("-------------------");
+        return;
+    }
+}
+
+// Collection of classic Brainfuck programs
+function get_hello_world_program() -> string {
+    // Classic "Hello World!" program
+    return "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.";
+}
+
+function get_fibonacci_program() -> string {
+    // Fibonacci sequence (first 10 numbers)
+    return ">++++++++++>+>+[[+++++[>++++++++<-]>.<++++++[>--------<-]+<<<]>.>>[[-]<[>+<-]>>[<<+>+>-]<[>+<-[>+<-[>+<-[>+<-[>+<-[>+<-[>+<-[>+<-[>+<-[>[-]>+>+<<<-[>+<-]]]]]]]]]]]+>>>]<<<]";
+}
+
+function get_simple_echo_program() -> string {
+    // Simple echo program (echo input until null)
+    return ",[.,]";
+}
+
+function get_simple_addition() -> string {
+    // Add two single digit numbers
+    return ",>++++++[<-------->-],[<+>-]<.";
+}
+
+function main() -> int {
+    println("CryoLang Brainfuck Interpreter");
+    println("==============================");
+    
+    // Test 1: Hello World
+    println("\n1. Running Hello World program:");
+    const hello_program: string = get_hello_world_program();
+    const hello_interpreter: BrainfuckInterpreter = BrainfuckInterpreter(hello_program, "");
+    hello_interpreter.run();
+    
+    // Test 2: Simple Addition (5 + 3 = 8, where 5 = '5', 3 = '3', result should be '8')
+    println("\n\n2. Running simple addition (5 + 3):");
+    const add_program: string = get_simple_addition();
+    const add_interpreter: BrainfuckInterpreter = BrainfuckInterpreter(add_program, "53");
+    add_interpreter.run();
+    
+    // Test 3: Echo program
+    println("\n\n3. Running echo program with input 'Hi!':");
+    const echo_program: string = get_simple_echo_program();
+    const echo_interpreter: BrainfuckInterpreter = BrainfuckInterpreter(echo_program, "Hi!");
+    echo_interpreter.run();
+    
+    // Test 4: Custom simple program - print 'A' (ASCII 65)
+    println("\n\n4. Running custom program to print 'A':");
+    const custom_program: string = "++++++++++[>+++++++>++++++++++>+++>+<<<<-]>++.>+.>..>-.";
+    const custom_interpreter: BrainfuckInterpreter = BrainfuckInterpreter(custom_program, "");
+    custom_interpreter.run();
+    
+    println("\n\nAll Brainfuck programs completed!");
+    return 0;
+}
