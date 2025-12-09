@@ -204,6 +204,9 @@ namespace Cryo
         // Private method tracking - maps struct name -> private method name -> return type
         std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _private_struct_methods;
 
+        // Template parameter tracking - maps struct/class name -> template parameter names (e.g., "Pair" -> {"K", "V"})
+        std::unordered_map<std::string, std::vector<std::string>> _template_parameters;
+
         // Current function's generic parameters and their trait bounds
         // Maps generic parameter name -> set of trait names (e.g., "T" -> {"Default", "Clone"})
         std::unordered_map<std::string, std::vector<std::string>> _current_generic_trait_bounds;
@@ -467,6 +470,9 @@ namespace Cryo
         bool is_boolean_context_valid(Type *type);
         bool is_primitive_integer_type(const std::string &type_name);
         bool is_method_declared_in_type(const std::string &type_name, const std::string &method_name);
+        
+        // Template parameter management
+        std::vector<std::string> get_template_parameters(const std::string &type_name) const;
 
         // Enum validation helpers
         void validate_enum_variant(EnumVariantNode &node, const std::vector<std::string> &generic_param_names);

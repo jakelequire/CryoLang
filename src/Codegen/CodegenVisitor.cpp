@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <sstream>
 #include <algorithm>
+#include <string>
+#include <cmath>
 
 // Helper function to normalize type names for constructor signature matching
 static std::string normalize_type_for_signature(const std::string& type_name) {
@@ -1096,15 +1098,15 @@ namespace Cryo::Codegen
                                 else
                                 {
                                     LOG_ERROR(Cryo::LogComponent::CODEGEN, "Constructor doesn't have expected parameter count for new signature (expected 3, got {})", constructor_type->getNumParams());
-                                    // Fall back to direct assignment
-                                    create_store(array_ptr, alloca);
+                                    // Fall back to direct assignment but handle Array<T> struct properly
+                                    handle_array_struct_assignment(array_ptr, alloca, array_literal_size);
                                 }
                             }
                             else
                             {
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Warning: Array constructor not found: {}", constructor_name);
-                                // Fall back to direct assignment
-                                create_store(array_ptr, alloca);
+                                // Fall back to direct assignment but handle Array<T> struct properly
+                                handle_array_struct_assignment(array_ptr, alloca, array_literal_size);
                             }
                         }
                     }
@@ -2978,19 +2980,186 @@ namespace Cryo::Codegen
         {
             std::string value_str = node.value();
 
-            // Check if it's a float (contains decimal point)
-            if (value_str.find('.') != std::string::npos)
+            // Determine if this is a floating point number
+            bool is_float = false;
+            bool is_double = false;
+            std::string clean_value = value_str;
+
+            // Check for explicit float type suffixes
+            if (value_str.ends_with("f32"))
             {
-                // Float literal
-                float float_val = std::stof(value_str);
-                literal_value = llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_ctx), float_val);
+                is_float = true;
+                clean_value = value_str.substr(0, value_str.length() - 3);
+            }
+            else if (value_str.ends_with("f64"))
+            {
+                is_double = true;
+                clean_value = value_str.substr(0, value_str.length() - 3);
+            }
+            // Check for generic 'f' suffix (defaults to f32)
+            else if (value_str.ends_with("f") && value_str.length() > 1)
+            {
+                is_float = true;
+                clean_value = value_str.substr(0, value_str.length() - 1);
+            }
+            // Check for decimal point or scientific notation
+            else if (clean_value.find('.') != std::string::npos ||
+                     clean_value.find('e') != std::string::npos ||
+                     clean_value.find('E') != std::string::npos)
+            {
+                // Check if we have type information from context (e.g., variable declaration)
+                if (node.has_resolved_type())
+                {
+                    Type* resolved_type = node.get_resolved_type();
+                    if (resolved_type && resolved_type->name() == "f32")
+                    {
+                        is_float = true;
+                    }
+                    else
+                    {
+                        // Default to double for f64 or unspecified float types
+                        is_double = true;
+                    }
+                }
+                else
+                {
+                    // Default to double for literals without explicit type context
+                    is_double = true;
+                }
+            }
+
+            if (is_float || is_double)
+            {
+                try
+                {
+                    if (is_double)
+                    {
+                        // Use double precision for f64 or unsuffixed floating point literals
+                        double double_val = std::stod(clean_value);
+                        
+                        // Check for infinity or NaN
+                        if (std::isinf(double_val) || std::isnan(double_val))
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Float literal '{}' resulted in inf/nan", value_str);
+                            _diagnostic_builder->report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, &node, 
+                                "Invalid floating point literal: " + value_str + " (overflow)");
+                            return;
+                        }
+                        
+                        literal_value = llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_ctx), double_val);
+                    }
+                    else
+                    {
+                        // Use single precision for f32
+                        float float_val = std::stof(clean_value);
+                        
+                        // Check for infinity or NaN
+                        if (std::isinf(float_val) || std::isnan(float_val))
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Float literal '{}' resulted in inf/nan", value_str);
+                            _diagnostic_builder->report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, &node, 
+                                "Invalid floating point literal: " + value_str + " (overflow)");
+                            return;
+                        }
+                        
+                        literal_value = llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_ctx), float_val);
+                    }
+                }
+                catch (const std::out_of_range& e)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Float literal '{}' out of range: {}", value_str, e.what());
+                    _diagnostic_builder->report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, &node, 
+                        "Invalid floating point literal: " + value_str + " (out of range)");
+                    return;
+                }
+                catch (const std::invalid_argument& e)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Invalid float literal '{}': {}", value_str, e.what());
+                    _diagnostic_builder->report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, &node, 
+                        "Invalid floating point literal: " + value_str + " (invalid format)");
+                    return;
+                }
+                catch (const std::exception& e)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to parse float literal '{}': {}", value_str, e.what());
+                    _diagnostic_builder->report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, &node, 
+                        "Invalid floating point literal: " + value_str);
+                    return;
+                }
             }
             else
             {
-                // Integer literal - check if it has a resolved type from TypeChecker
-                int64_t int_val = std::stoll(value_str);
-
-                if (node.has_resolved_type())
+                // Integer literal - handle type suffixes and parse accordingly
+                std::string clean_int_value = value_str;
+                llvm::Type* target_type = nullptr;
+                bool is_unsigned = false;
+                
+                // Check for integer type suffixes
+                if (value_str.ends_with("u8"))
+                {
+                    target_type = llvm::Type::getInt8Ty(llvm_ctx);
+                    is_unsigned = true;
+                    clean_int_value = value_str.substr(0, value_str.length() - 2);
+                }
+                else if (value_str.ends_with("u16"))
+                {
+                    target_type = llvm::Type::getInt16Ty(llvm_ctx);
+                    is_unsigned = true;
+                    clean_int_value = value_str.substr(0, value_str.length() - 3);
+                }
+                else if (value_str.ends_with("u32"))
+                {
+                    target_type = llvm::Type::getInt32Ty(llvm_ctx);
+                    is_unsigned = true;
+                    clean_int_value = value_str.substr(0, value_str.length() - 3);
+                }
+                else if (value_str.ends_with("u64"))
+                {
+                    target_type = llvm::Type::getInt64Ty(llvm_ctx);
+                    is_unsigned = true;
+                    clean_int_value = value_str.substr(0, value_str.length() - 3);
+                }
+                else if (value_str.ends_with("i8"))
+                {
+                    target_type = llvm::Type::getInt8Ty(llvm_ctx);
+                    clean_int_value = value_str.substr(0, value_str.length() - 2);
+                }
+                else if (value_str.ends_with("i16"))
+                {
+                    target_type = llvm::Type::getInt16Ty(llvm_ctx);
+                    clean_int_value = value_str.substr(0, value_str.length() - 3);
+                }
+                else if (value_str.ends_with("i32"))
+                {
+                    target_type = llvm::Type::getInt32Ty(llvm_ctx);
+                    clean_int_value = value_str.substr(0, value_str.length() - 3);
+                }
+                else if (value_str.ends_with("i64"))
+                {
+                    target_type = llvm::Type::getInt64Ty(llvm_ctx);
+                    clean_int_value = value_str.substr(0, value_str.length() - 3);
+                }
+                
+                try
+                {
+                    // Parse the integer value
+                    uint64_t int_val;
+                    if (is_unsigned)
+                    {
+                        int_val = std::stoull(clean_int_value);
+                    }
+                    else
+                    {
+                        int64_t signed_val = std::stoll(clean_int_value);
+                        int_val = static_cast<uint64_t>(signed_val);
+                    }
+                
+                    // Use explicit suffix type if provided
+                    if (target_type)
+                    {
+                        literal_value = llvm::ConstantInt::get(target_type, int_val);
+                    }
+                    else if (node.has_resolved_type())
                 {
                     // Use the resolved type from TypeChecker (e.g., promoted to u64)
                     Type *resolved_type = node.get_resolved_type();
@@ -3020,6 +3189,14 @@ namespace Cryo::Codegen
                         // Default behavior - generate as i32 for small values
                         literal_value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), int_val);
                     }
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to parse integer literal '{}': {}", value_str, e.what());
+                    _diagnostic_builder->report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, &node, 
+                        "Invalid integer literal: " + value_str);
+                    return;
                 }
             }
             break;
@@ -3399,18 +3576,85 @@ namespace Cryo::Codegen
         else_block = builder.GetInsertBlock(); // Update in case of nested expressions
         builder.CreateBr(merge_block);
 
-        // Create merge block with PHI node
-        builder.SetInsertPoint(merge_block);
-
         // Ensure both values have the same type (add type coercion if needed)
+        // IMPORTANT: Type conversions must happen in predecessor blocks, not in merge block
         llvm::Type *result_type = then_value->getType();
         if (then_value->getType() != else_value->getType())
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Warning: Type mismatch in ternary expression branches");
-            // For now, we'll assume they should be the same type
-            // In a full implementation, we'd need type coercion logic here
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type mismatch in ternary expression branches, performing type coercion");
+            
+            // Perform type coercion to make both values the same type
+            llvm::Type *then_type = then_value->getType();
+            llvm::Type *else_type = else_value->getType();
+            
+            // Handle integer type coercion
+            if (then_type->isIntegerTy() && else_type->isIntegerTy())
+            {
+                unsigned then_bits = then_type->getIntegerBitWidth();
+                unsigned else_bits = else_type->getIntegerBitWidth();
+                
+                if (then_bits < else_bits)
+                {
+                    // Extend then_value in the then_block before branching
+                    builder.SetInsertPoint(then_block->getTerminator());
+                    then_value = builder.CreateZExt(then_value, else_type, "ternary.then.ext");
+                    result_type = else_type;
+                }
+                else if (else_bits < then_bits)
+                {
+                    // Extend else_value in the else_block before branching
+                    builder.SetInsertPoint(else_block->getTerminator());
+                    else_value = builder.CreateZExt(else_value, then_type, "ternary.else.ext");
+                    result_type = then_type;
+                }
+            }
+            // Handle float type coercion
+            else if (then_type->isFloatingPointTy() && else_type->isFloatingPointTy())
+            {
+                unsigned then_bits = then_type->getPrimitiveSizeInBits();
+                unsigned else_bits = else_type->getPrimitiveSizeInBits();
+                
+                if (then_bits < else_bits)
+                {
+                    // Extend then_value in the then_block before branching
+                    builder.SetInsertPoint(then_block->getTerminator());
+                    then_value = builder.CreateFPExt(then_value, else_type, "ternary.then.fpext");
+                    result_type = else_type;
+                }
+                else if (else_bits < then_bits)
+                {
+                    // Extend else_value in the else_block before branching
+                    builder.SetInsertPoint(else_block->getTerminator());
+                    else_value = builder.CreateFPExt(else_value, then_type, "ternary.else.fpext");
+                    result_type = then_type;
+                }
+            }
+            // Handle mixed int/float coercion
+            else if (then_type->isIntegerTy() && else_type->isFloatingPointTy())
+            {
+                // Convert integer to float in the then_block before branching
+                builder.SetInsertPoint(then_block->getTerminator());
+                then_value = builder.CreateSIToFP(then_value, else_type, "ternary.then.sitofp");
+                result_type = else_type;
+            }
+            else if (then_type->isFloatingPointTy() && else_type->isIntegerTy())
+            {
+                // Convert integer to float in the else_block before branching
+                builder.SetInsertPoint(else_block->getTerminator());
+                else_value = builder.CreateSIToFP(else_value, then_type, "ternary.else.sitofp");
+                result_type = then_type;
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unsupported type coercion in ternary expression: {} vs {}", 
+                         then_type->getTypeID(), else_type->getTypeID());
+                register_value(&node, nullptr);
+                return;
+            }
         }
 
+        // Create merge block with PHI node (PHI nodes must be at top of basic block)
+        builder.SetInsertPoint(merge_block);
         llvm::PHINode *phi = builder.CreatePHI(result_type, 2, "ternary.result");
         phi->addIncoming(then_value, then_block);
         phi->addIncoming(else_value, else_block);
@@ -3747,15 +3991,60 @@ namespace Cryo::Codegen
                 std::vector<llvm::Value *> args;
                 args.push_back(struct_ptr); // 'this' pointer (heap allocated)
 
-                // Generate constructor arguments
-                for (const auto &arg : node.arguments())
+                // Generate constructor arguments with type conversion
+                llvm::FunctionType *func_type = constructor_func->getFunctionType();
+                for (size_t i = 0; i < node.arguments().size(); ++i)
                 {
+                    const auto &arg = node.arguments()[i];
                     if (arg)
                     {
                         arg->accept(*this);
                         llvm::Value *arg_value = get_current_value();
                         if (arg_value)
                         {
+                            // Check if we need type conversion for this argument
+                            // Parameter index is i+1 because first parameter is 'this' pointer
+                            if (i + 1 < func_type->getNumParams())
+                            {
+                                llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                llvm::Type *actual_type = arg_value->getType();
+
+                                // Perform implicit type conversion if needed
+                                if (actual_type != expected_type)
+                                {
+                                    // Handle float to double conversion
+                                    if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for heap constructor parameter {}", i);
+                                        arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                    }
+                                    // Handle double to float conversion
+                                    else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for heap constructor parameter {}", i);
+                                        arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                    }
+                                    // Handle integer conversions
+                                    else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                    {
+                                        unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                        unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                        if (actual_bits != expected_bits)
+                                        {
+                                            if (actual_bits < expected_bits)
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for heap constructor parameter {}", actual_bits, expected_bits, i);
+                                                arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                            }
+                                            else
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for heap constructor parameter {}", actual_bits, expected_bits, i);
+                                                arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             args.push_back(arg_value);
                         }
                         else
@@ -3789,19 +4078,64 @@ namespace Cryo::Codegen
                         // Also generate all generic methods for this instantiation
                         generate_generic_methods(full_type_name, base_type_name, node.generic_args(), struct_type);
 
-                        // Now call the generated constructor
+                        // Now call the generated constructor with type conversion
                         std::vector<llvm::Value *> args;
                         args.push_back(struct_ptr); // 'this' pointer (heap allocated)
 
-                        // Generate constructor arguments
-                        for (const auto &arg : node.arguments())
+                        // Generate constructor arguments with type conversion
+                        llvm::FunctionType *func_type = generated_constructor->getFunctionType();
+                        for (size_t i = 0; i < node.arguments().size(); ++i)
                         {
+                            const auto &arg = node.arguments()[i];
                             if (arg)
                             {
                                 arg->accept(*this);
                                 llvm::Value *arg_value = get_current_value();
                                 if (arg_value)
                                 {
+                                    // Check if we need type conversion for this argument
+                                    // Parameter index is i+1 because first parameter is 'this' pointer
+                                    if (i + 1 < func_type->getNumParams())
+                                    {
+                                        llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                        llvm::Type *actual_type = arg_value->getType();
+
+                                        // Perform implicit type conversion if needed
+                                        if (actual_type != expected_type)
+                                        {
+                                            // Handle float to double conversion
+                                            if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for generated constructor parameter {}", i);
+                                                arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                            }
+                                            // Handle double to float conversion
+                                            else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for generated constructor parameter {}", i);
+                                                arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                            }
+                                            // Handle integer conversions
+                                            else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                            {
+                                                unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                                unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                                if (actual_bits != expected_bits)
+                                                {
+                                                    if (actual_bits < expected_bits)
+                                                    {
+                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for generated constructor parameter {}", actual_bits, expected_bits, i);
+                                                        arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                                    }
+                                                    else
+                                                    {
+                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for generated constructor parameter {}", actual_bits, expected_bits, i);
+                                                        arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     args.push_back(arg_value);
                                 }
                                 else
@@ -10648,15 +10982,60 @@ namespace Cryo::Codegen
 
                             args.push_back(this_ptr); // 'this' pointer
 
-                            // Generate method arguments
-                            for (const auto &arg : node->arguments())
+                            // Generate method arguments with type conversion
+                            llvm::FunctionType *func_type = method_func->getFunctionType();
+                            for (size_t i = 0; i < node->arguments().size(); ++i)
                             {
+                                const auto &arg = node->arguments()[i];
                                 if (arg)
                                 {
                                     arg->accept(*this);
                                     llvm::Value *arg_value = get_current_value();
                                     if (arg_value)
                                     {
+                                        // Check if we need type conversion for this argument
+                                        // Parameter index is i+1 because first parameter is 'this' pointer
+                                        if (i + 1 < func_type->getNumParams())
+                                        {
+                                            llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                            llvm::Type *actual_type = arg_value->getType();
+
+                                            // Perform implicit type conversion if needed
+                                            if (actual_type != expected_type)
+                                            {
+                                                // Handle float to double conversion
+                                                if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for method parameter {}", i);
+                                                    arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                                }
+                                                // Handle double to float conversion
+                                                else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for method parameter {}", i);
+                                                    arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                                }
+                                                // Handle integer conversions
+                                                else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                                {
+                                                    unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                                    unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                                    if (actual_bits != expected_bits)
+                                                    {
+                                                        if (actual_bits < expected_bits)
+                                                        {
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for method parameter {}", actual_bits, expected_bits, i);
+                                                            arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                                        }
+                                                        else
+                                                        {
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for method parameter {}", actual_bits, expected_bits, i);
+                                                            arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         args.push_back(arg_value);
                                     }
                                 }
@@ -10791,15 +11170,60 @@ namespace Cryo::Codegen
                                     std::vector<llvm::Value *> args;
                                     args.push_back(global_value); // Pass pointer to global variable as 'this'
 
-                                    // Generate method arguments
-                                    for (const auto &arg : node->arguments())
+                                    // Generate method arguments with type conversion
+                                    llvm::FunctionType *func_type = method_func->getFunctionType();
+                                    for (size_t i = 0; i < node->arguments().size(); ++i)
                                     {
+                                        const auto &arg = node->arguments()[i];
                                         if (arg)
                                         {
                                             arg->accept(*this);
                                             llvm::Value *arg_value = get_current_value();
                                             if (arg_value)
                                             {
+                                                // Check if we need type conversion for this argument
+                                                // Parameter index is i+1 because first parameter is 'this' pointer
+                                                if (i + 1 < func_type->getNumParams())
+                                                {
+                                                    llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                                    llvm::Type *actual_type = arg_value->getType();
+
+                                                    // Perform implicit type conversion if needed
+                                                    if (actual_type != expected_type)
+                                                    {
+                                                        // Handle float to double conversion
+                                                        if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                                        {
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for global method parameter {}", i);
+                                                            arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                                        }
+                                                        // Handle double to float conversion
+                                                        else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                                        {
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for global method parameter {}", i);
+                                                            arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                                        }
+                                                        // Handle integer conversions
+                                                        else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                                        {
+                                                            unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                                            unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                                            if (actual_bits != expected_bits)
+                                                            {
+                                                                if (actual_bits < expected_bits)
+                                                                {
+                                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for global method parameter {}", actual_bits, expected_bits, i);
+                                                                    arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                                                }
+                                                                else
+                                                                {
+                                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for global method parameter {}", actual_bits, expected_bits, i);
+                                                                    arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                                 args.push_back(arg_value);
                                             }
                                         }
@@ -11018,15 +11442,60 @@ namespace Cryo::Codegen
                             std::vector<llvm::Value *> args;
                             args.push_back(nested_object_ptr); // 'this' pointer for the nested object
 
-                            // Generate method arguments
-                            for (const auto &arg : node->arguments())
+                            // Generate method arguments with type conversion
+                            llvm::FunctionType *func_type = method_func->getFunctionType();
+                            for (size_t i = 0; i < node->arguments().size(); ++i)
                             {
+                                const auto &arg = node->arguments()[i];
                                 if (arg)
                                 {
                                     arg->accept(*this);
                                     llvm::Value *arg_value = get_current_value();
                                     if (arg_value)
                                     {
+                                        // Check if we need type conversion for this argument
+                                        // Parameter index is i+1 because first parameter is 'this' pointer
+                                        if (i + 1 < func_type->getNumParams())
+                                        {
+                                            llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                            llvm::Type *actual_type = arg_value->getType();
+
+                                            // Perform implicit type conversion if needed
+                                            if (actual_type != expected_type)
+                                            {
+                                                // Handle float to double conversion
+                                                if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for nested method parameter {}", i);
+                                                    arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                                }
+                                                // Handle double to float conversion
+                                                else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for nested method parameter {}", i);
+                                                    arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                                }
+                                                // Handle integer conversions
+                                                else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                                {
+                                                    unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                                    unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                                    if (actual_bits != expected_bits)
+                                                    {
+                                                        if (actual_bits < expected_bits)
+                                                        {
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for nested method parameter {}", actual_bits, expected_bits, i);
+                                                            arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                                        }
+                                                        else
+                                                        {
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for nested method parameter {}", actual_bits, expected_bits, i);
+                                                            arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         args.push_back(arg_value);
                                     }
                                 }
@@ -11087,14 +11556,60 @@ namespace Cryo::Codegen
                                         std::vector<llvm::Value *> args;
                                         args.push_back(nested_object_ptr);
 
-                                        for (const auto &arg : node->arguments())
+                                        // Generate method arguments with type conversion
+                                        llvm::FunctionType *func_type = generated_method->getFunctionType();
+                                        for (size_t i = 0; i < node->arguments().size(); ++i)
                                         {
+                                            const auto &arg = node->arguments()[i];
                                             if (arg)
                                             {
                                                 arg->accept(*this);
                                                 llvm::Value *arg_value = get_current_value();
                                                 if (arg_value)
                                                 {
+                                                    // Check if we need type conversion for this argument
+                                                    // Parameter index is i+1 because first parameter is 'this' pointer
+                                                    if (i + 1 < func_type->getNumParams())
+                                                    {
+                                                        llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                                        llvm::Type *actual_type = arg_value->getType();
+
+                                                        // Perform implicit type conversion if needed
+                                                        if (actual_type != expected_type)
+                                                        {
+                                                            // Handle float to double conversion
+                                                            if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                                            {
+                                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for specialized method parameter {}", i);
+                                                                arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                                            }
+                                                            // Handle double to float conversion
+                                                            else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                                            {
+                                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for specialized method parameter {}", i);
+                                                                arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                                            }
+                                                            // Handle integer conversions
+                                                            else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                                            {
+                                                                unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                                                unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                                                if (actual_bits != expected_bits)
+                                                                {
+                                                                    if (actual_bits < expected_bits)
+                                                                    {
+                                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for specialized method parameter {}", actual_bits, expected_bits, i);
+                                                                        arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                                                    }
+                                                                    else
+                                                                    {
+                                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for specialized method parameter {}", actual_bits, expected_bits, i);
+                                                                        arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                     args.push_back(arg_value);
                                                 }
                                             }
@@ -11187,15 +11702,60 @@ namespace Cryo::Codegen
                                 std::vector<llvm::Value *> args;
                                 args.push_back(ptr_value); // Use the pointer directly as 'this'
 
-                                // Generate method arguments
-                                for (const auto &arg : node->arguments())
+                                // Generate method arguments with type conversion
+                                llvm::FunctionType *func_type = method_func->getFunctionType();
+                                for (size_t i = 0; i < node->arguments().size(); ++i)
                                 {
+                                    const auto &arg = node->arguments()[i];
                                     if (arg)
                                     {
                                         arg->accept(*this);
                                         llvm::Value *arg_value = get_current_value();
                                         if (arg_value)
                                         {
+                                            // Check if we need type conversion for this argument
+                                            // Parameter index is i+1 because first parameter is 'this' pointer
+                                            if (i + 1 < func_type->getNumParams())
+                                            {
+                                                llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                                llvm::Type *actual_type = arg_value->getType();
+
+                                                // Perform implicit type conversion if needed
+                                                if (actual_type != expected_type)
+                                                {
+                                                    // Handle float to double conversion
+                                                    if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                                    {
+                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for dereferenced method parameter {}", i);
+                                                        arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                                    }
+                                                    // Handle double to float conversion
+                                                    else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                                    {
+                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for dereferenced method parameter {}", i);
+                                                        arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                                    }
+                                                    // Handle integer conversions
+                                                    else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                                    {
+                                                        unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                                        unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                                        if (actual_bits != expected_bits)
+                                                        {
+                                                            if (actual_bits < expected_bits)
+                                                            {
+                                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for dereferenced method parameter {}", actual_bits, expected_bits, i);
+                                                                arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                                            }
+                                                            else
+                                                            {
+                                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for dereferenced method parameter {}", actual_bits, expected_bits, i);
+                                                                arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             args.push_back(arg_value);
                                         }
                                     }
@@ -11264,15 +11824,60 @@ namespace Cryo::Codegen
                             std::vector<llvm::Value *> args;
                             args.push_back(element_ptr); // Use the element pointer as 'this'
 
-                            // Generate method arguments
-                            for (const auto &arg : node->arguments())
+                            // Generate method arguments with type conversion
+                            llvm::FunctionType *func_type = method_func->getFunctionType();
+                            for (size_t i = 0; i < node->arguments().size(); ++i)
                             {
+                                const auto &arg = node->arguments()[i];
                                 if (arg)
                                 {
                                     arg->accept(*this);
                                     llvm::Value *arg_value = get_current_value();
                                     if (arg_value)
                                     {
+                                        // Check if we need type conversion for this argument
+                                        // Parameter index is i+1 because first parameter is 'this' pointer
+                                        if (i + 1 < func_type->getNumParams())
+                                        {
+                                            llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                            llvm::Type *actual_type = arg_value->getType();
+
+                                            // Perform implicit type conversion if needed
+                                            if (actual_type != expected_type)
+                                            {
+                                                // Handle float to double conversion
+                                                if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for array element method parameter {}", i);
+                                                    arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                                }
+                                                // Handle double to float conversion
+                                                else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for array element method parameter {}", i);
+                                                    arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                                }
+                                                // Handle integer conversions
+                                                else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                                {
+                                                    unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                                    unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                                    if (actual_bits != expected_bits)
+                                                    {
+                                                        if (actual_bits < expected_bits)
+                                                        {
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for array element method parameter {}", actual_bits, expected_bits, i);
+                                                            arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                                        }
+                                                        else
+                                                        {
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for array element method parameter {}", actual_bits, expected_bits, i);
+                                                            arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         args.push_back(arg_value);
                                     }
                                 }
@@ -11815,13 +12420,61 @@ namespace Cryo::Codegen
                     }
                 }
                 
-                // Add the regular function arguments
-                for (const auto &arg : node->arguments())
+                // Add the regular function arguments with type conversion
+                llvm::FunctionType *func_type = primitive_function->getFunctionType();
+                for (size_t i = 0; i < node->arguments().size(); ++i)
                 {
+                    const auto &arg = node->arguments()[i];
                     arg->accept(*this);
                     llvm::Value *arg_value = get_current_value();
                     if (arg_value)
                     {
+                        // Check if we need type conversion for this argument
+                        // Parameter index accounts for any 'this' pointers already added
+                        size_t func_param_idx = args.size();
+                        
+                        if (func_param_idx < func_type->getNumParams())
+                        {
+                            llvm::Type *expected_type = func_type->getParamType(func_param_idx);
+                            llvm::Type *actual_type = arg_value->getType();
+
+                            // Perform implicit type conversion if needed
+                            if (actual_type != expected_type)
+                            {
+                                auto &builder = _context_manager.get_builder();
+                                // Handle float to double conversion
+                                if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for primitive method {} parameter {}", stdlib_qualified_name, func_param_idx);
+                                    arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                }
+                                // Handle double to float conversion
+                                else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for primitive method {} parameter {}", stdlib_qualified_name, func_param_idx);
+                                    arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                }
+                                // Handle integer conversions
+                                else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                {
+                                    unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                    unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                    if (actual_bits != expected_bits)
+                                    {
+                                        if (actual_bits < expected_bits)
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for primitive method {} parameter {}", actual_bits, expected_bits, stdlib_qualified_name, func_param_idx);
+                                            arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                        }
+                                        else
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for primitive method {} parameter {}", actual_bits, expected_bits, stdlib_qualified_name, func_param_idx);
+                                            arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         args.push_back(arg_value);
                     }
                 }
@@ -11872,13 +12525,61 @@ namespace Cryo::Codegen
                     }
                 }
                 
-                // Add the regular function arguments
-                for (const auto &arg : node->arguments())
+                // Add the regular function arguments with type conversion
+                llvm::FunctionType *func_type = primitive_function->getFunctionType();
+                for (size_t i = 0; i < node->arguments().size(); ++i)
                 {
+                    const auto &arg = node->arguments()[i];
                     arg->accept(*this);
                     llvm::Value *arg_value = get_current_value();
                     if (arg_value)
                     {
+                        // Check if we need type conversion for this argument
+                        // Parameter index accounts for any 'this' pointers already added
+                        size_t func_param_idx = args.size();
+                        
+                        if (func_param_idx < func_type->getNumParams())
+                        {
+                            llvm::Type *expected_type = func_type->getParamType(func_param_idx);
+                            llvm::Type *actual_type = arg_value->getType();
+
+                            // Perform implicit type conversion if needed
+                            if (actual_type != expected_type)
+                            {
+                                auto &builder = _context_manager.get_builder();
+                                // Handle float to double conversion
+                                if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for primitive method {} parameter {}", full_qualified_name, func_param_idx);
+                                    arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                }
+                                // Handle double to float conversion
+                                else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for primitive method {} parameter {}", full_qualified_name, func_param_idx);
+                                    arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                }
+                                // Handle integer conversions
+                                else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                {
+                                    unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                    unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                    if (actual_bits != expected_bits)
+                                    {
+                                        if (actual_bits < expected_bits)
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for primitive method {} parameter {}", actual_bits, expected_bits, full_qualified_name, func_param_idx);
+                                            arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                        }
+                                        else
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for primitive method {} parameter {}", actual_bits, expected_bits, full_qualified_name, func_param_idx);
+                                            arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         args.push_back(arg_value);
                     }
                 }
@@ -11921,14 +12622,58 @@ namespace Cryo::Codegen
             llvm::Function *known_function = func_it->second;
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found function in symbol table: {} -> {}", resolved_function_name, known_function->getName().str());
 
-            // Generate arguments for the function call
+            // Generate arguments for the function call with type conversion
             std::vector<llvm::Value *> args;
-            for (const auto &arg : node->arguments())
+            llvm::FunctionType *func_type = known_function->getFunctionType();
+            for (size_t i = 0; i < node->arguments().size(); ++i)
             {
+                const auto &arg = node->arguments()[i];
                 arg->accept(*this);
                 llvm::Value *arg_value = get_current_value();
                 if (arg_value)
                 {
+                    // Check if we need type conversion for this argument
+                    if (i < func_type->getNumParams())
+                    {
+                        llvm::Type *expected_type = func_type->getParamType(i);
+                        llvm::Type *actual_type = arg_value->getType();
+
+                        // Perform implicit type conversion if needed
+                        if (actual_type != expected_type)
+                        {
+                            // Handle float to double conversion
+                            if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for function parameter {}", i);
+                                arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                            }
+                            // Handle double to float conversion
+                            else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for function parameter {}", i);
+                                arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                            }
+                            // Handle integer conversions
+                            else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                            {
+                                unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                if (actual_bits != expected_bits)
+                                {
+                                    if (actual_bits < expected_bits)
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for function parameter {}", actual_bits, expected_bits, i);
+                                        arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                    }
+                                    else
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for function parameter {}", actual_bits, expected_bits, i);
+                                        arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                    }
+                                }
+                            }
+                        }
+                    }
                     args.push_back(arg_value);
                 }
             }
@@ -12323,7 +13068,8 @@ namespace Cryo::Codegen
             }
         }
 
-        // Add regular arguments
+        // Add regular arguments with type conversion
+        llvm::FunctionType *func_type = function->getFunctionType();
         for (size_t i = 0; i < node->arguments().size(); ++i)
         {
             const auto &arg = node->arguments()[i];
@@ -12339,6 +13085,53 @@ namespace Cryo::Codegen
                 // Additional safety check - ensure the value has a valid type
                 if (arg_value->getType())
                 {
+                    // Determine argument index for function parameters 
+                    // (accounting for any 'this' pointers already added)
+                    size_t func_param_idx = args.size();
+                    
+                    // Check if we need type conversion for this argument
+                    if (func_param_idx < func_type->getNumParams())
+                    {
+                        llvm::Type *expected_type = func_type->getParamType(func_param_idx);
+                        llvm::Type *actual_type = arg_value->getType();
+
+                        // Perform implicit type conversion if needed
+                        if (actual_type != expected_type)
+                        {
+                            // Handle float to double conversion
+                            if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting float argument to double for function {} parameter {}", function_name, func_param_idx);
+                                arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                            }
+                            // Handle double to float conversion
+                            else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Converting double argument to float for function {} parameter {}", function_name, func_param_idx);
+                                arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                            }
+                            // Handle integer conversions
+                            else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                            {
+                                unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                if (actual_bits != expected_bits)
+                                {
+                                    if (actual_bits < expected_bits)
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Zero-extending integer argument from {} to {} bits for function {} parameter {}", actual_bits, expected_bits, function_name, func_param_idx);
+                                        arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                    }
+                                    else
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Truncating integer argument from {} to {} bits for function {} parameter {}", actual_bits, expected_bits, function_name, func_param_idx);
+                                        arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
                     args.push_back(arg_value);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully added argument {} to call", i);
                 }
@@ -13757,13 +14550,30 @@ namespace Cryo::Codegen
 
                 if (case_value && llvm::isa<llvm::ConstantInt>(case_value))
                 {
-                    switch_inst->addCase(llvm::cast<llvm::ConstantInt>(case_value), case_block);
+                    llvm::ConstantInt *case_const = llvm::cast<llvm::ConstantInt>(case_value);
+                    
+                    // SWITCH TYPE FIX: Ensure case value type matches switch value type
+                    llvm::Type *switch_type = actual_switch_value->getType();
+                    if (case_const->getType() != switch_type)
+                    {
+                        // Cast the case value to match switch type
+                        case_const = llvm::cast<llvm::ConstantInt>(llvm::ConstantInt::get(switch_type, case_const->getZExtValue()));
+                    }
+                    
+                    switch_inst->addCase(case_const, case_block);
                 }
                 else
                 {
                     // Convert the case value to a constant integer if possible
                     if (auto const_int = llvm::dyn_cast<llvm::ConstantInt>(case_value))
                     {
+                        // SWITCH TYPE FIX: Ensure case value type matches switch value type  
+                        llvm::Type *switch_type = actual_switch_value->getType();
+                        if (const_int->getType() != switch_type)
+                        {
+                            const_int = llvm::cast<llvm::ConstantInt>(llvm::ConstantInt::get(switch_type, const_int->getZExtValue()));
+                        }
+                        
                         switch_inst->addCase(const_int, case_block);
                     }
                     else
@@ -16797,6 +17607,70 @@ namespace Cryo::Codegen
         }
         
         return nullptr;
+    }
+
+    void CodegenVisitor::handle_array_struct_assignment(llvm::Value *array_ptr, llvm::AllocaInst *alloca, size_t array_size)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "handle_array_struct_assignment called: array_ptr={}, alloca={}, array_size={}", 
+                 static_cast<void*>(array_ptr), static_cast<void*>(alloca), array_size);
+        
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Check if the alloca is for an Array<T> struct type
+        llvm::Type *alloca_type = alloca->getAllocatedType();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Alloca type: {}", alloca_type->getTypeID());
+        
+        if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(alloca_type))
+        {
+            if (struct_type->hasName()) {
+                std::string type_name = struct_type->getName().str();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking struct type name: '{}'", type_name);
+                if (type_name.find("Array") != std::string::npos)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Creating Array struct assignment for type: {}", type_name);
+                    
+                    // Create Array<T> struct: { ptr, length, capacity }
+                    llvm::Value *array_struct = llvm::UndefValue::get(struct_type);
+                    
+                    // Set the elements field (index 0)
+                    array_struct = builder.CreateInsertValue(
+                        array_struct,
+                        array_ptr,
+                        {0},
+                        "array.struct.elements");
+                    
+                    // Set the length field (index 1)
+                    llvm::Value *length_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), array_size);
+                    array_struct = builder.CreateInsertValue(
+                        array_struct,
+                        length_val,
+                        {1},
+                        "array.struct.length");
+                    
+                    // Set the capacity field (index 2) - same as length for now
+                    array_struct = builder.CreateInsertValue(
+                        array_struct,
+                        length_val,
+                        {2},
+                        "array.struct.capacity");
+                    
+                    // Store the complete struct
+                    builder.CreateStore(array_struct, alloca);
+                    
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully created Array struct assignment");
+                    return;
+                }
+            } else {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Struct type has no name");
+            }
+        } else {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Alloca type is not a struct");
+        }
+
+        // Fallback to regular store if not an Array<T> type
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fallback direct assignment (not an Array type)");
+        create_store(array_ptr, alloca);
     }
 
 } // namespace Cryo::Codegen
