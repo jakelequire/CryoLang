@@ -2247,6 +2247,47 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic function: {} with type: {}", func_name, func_type->to_string());
     }
 
+    void TypeChecker::visit(IntrinsicConstDeclarationNode &node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing intrinsic const declaration: {}", node.name());
+        
+        const std::string const_name = node.name();
+        
+        // Get the resolved type from the intrinsic constant declaration
+        Type *const_type = node.get_resolved_type();
+        
+        if (!const_type)
+        {
+            _diagnostic_builder->create_type_error(ErrorCode::E0301_GENERIC_TYPE_RESOLUTION_FAILED, node.location(), 
+                                                 "Unable to resolve type for intrinsic constant: " + const_name);
+            return;
+        }
+        
+        // Check if intrinsic constant already exists in symbol table
+        TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(const_name);
+        if (existing_symbol)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Intrinsic constant '{}' already exists, verifying type compatibility", const_name);
+            if (existing_symbol->type && const_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Existing type: {}, New type: {}", 
+                         existing_symbol->type->to_string(), const_type->to_string());
+            }
+            LOG_DEBUG(Cryo::LogComponent::AST, "Intrinsic constant '{}' already registered, skipping duplicate declaration", const_name);
+        }
+        else
+        {
+            // Register the intrinsic constant in symbol table
+            if (!_symbol_table->declare_symbol(const_name, const_type, node.location()))
+            {
+                _diagnostic_builder->create_redefined_symbol_error(const_name, NodeKind::IntrinsicConstDeclaration, node.location());
+                return;
+            }
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic constant: {} with type: {}", const_name, const_type->to_string());
+    }
+
     //===----------------------------------------------------------------------===//
     // Statement Visitors
     //===----------------------------------------------------------------------===//

@@ -291,6 +291,9 @@ endif
 
 # stdlib individual module targets for debugging
 
+stdlib-intrinsics:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/core/intrinsics.cryo --debug --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/core/intrinsics.bc
+
 stdlib-types:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/core/types.cryo --debug --emit-llvm -c --stdlib-mode -o $(STDLIB_BUILD_DIR)/core/types.bc
 

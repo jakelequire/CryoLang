@@ -142,7 +142,8 @@ namespace Cryo
         std::unique_ptr<FunctionDeclarationNode> parse_function_declaration();
         std::unique_ptr<FunctionDeclarationNode> parse_extern_function_declaration();
         void parse_where_clause(FunctionDeclarationNode *func_decl);
-        std::unique_ptr<IntrinsicDeclarationNode> parse_intrinsic_declaration();
+        std::unique_ptr<DeclarationNode> parse_intrinsic_declaration();
+        std::unique_ptr<IntrinsicConstDeclarationNode> parse_intrinsic_const_declaration(SourceLocation start_loc);
         std::unique_ptr<ImportDeclarationNode> parse_import_declaration();
         std::unique_ptr<StructDeclarationNode> parse_struct_declaration();
         std::unique_ptr<ClassDeclarationNode> parse_class_declaration();

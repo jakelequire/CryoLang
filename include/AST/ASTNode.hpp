@@ -81,6 +81,7 @@ namespace Cryo
         VariableDeclaration,
         FunctionDeclaration,
         IntrinsicDeclaration,
+        IntrinsicConstDeclaration,
         ImportDeclaration,
         StructDeclaration,
         ClassDeclaration,
@@ -170,6 +171,8 @@ namespace Cryo
             return "FunctionDeclaration";
         case NodeKind::IntrinsicDeclaration:
             return "IntrinsicDeclaration";
+        case NodeKind::IntrinsicConstDeclaration:
+            return "IntrinsicConstDeclaration";
         case NodeKind::ImportDeclaration:
             return "ImportDeclaration";
         case NodeKind::StructDeclaration:
@@ -709,6 +712,34 @@ namespace Cryo
                 os << std::string(indent + 2, ' ') << "Implementation Hint:" << std::endl;
                 _body->print(os, indent + 4);
             }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Intrinsic constant declaration node for compile-time constants
+    class IntrinsicConstDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _name;
+        Cryo::Type *_resolved_type = nullptr;
+
+    public:
+        IntrinsicConstDeclarationNode(SourceLocation loc, std::string name, Cryo::Type *type)
+            : DeclarationNode(NodeKind::IntrinsicConstDeclaration, loc),
+              _name(std::move(name)), _resolved_type(type) {}
+
+        const std::string &name() const { return _name; }
+        
+        // Core type system access
+        Cryo::Type *get_resolved_type() const { return _resolved_type; }
+        void set_resolved_type(Cryo::Type *type) { _resolved_type = type; }
+        bool has_resolved_type() const { return _resolved_type != nullptr; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "IntrinsicConstDecl: " << _name
+               << ": " << (_resolved_type ? _resolved_type->to_string() : "unknown") << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;
