@@ -560,6 +560,42 @@ namespace Cryo::Codegen
         }
     }
 
+    void CodegenVisitor::visit(Cryo::IntrinsicConstDeclarationNode &node)
+    {
+        try
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registering intrinsic constant: {}", node.name());
+
+            // Intrinsic constants are not generated as globals - they are resolved at use time
+            // Just register that this intrinsic constant exists
+            std::string const_name = node.name();
+
+            if (const_name == "__FILE__" || const_name == "__LINE__" || const_name == "__FUNCTION__")
+            {
+                // Just log that we've seen this intrinsic constant declaration
+                // The actual value generation happens in visit(IdentifierNode &node) when referenced
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Intrinsic constant '{}' registered for on-demand generation", const_name);
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown intrinsic constant: {}", const_name);
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0608_INTRINSIC_GENERATION_ERROR, &node,
+                                                      "Unknown intrinsic constant: " + const_name);
+                }
+            }
+        }
+        catch (const std::exception &e)
+        {
+            if (_diagnostic_builder)
+            {
+                _diagnostic_builder->report_error(ErrorCode::E0608_INTRINSIC_GENERATION_ERROR, &node,
+                                                  "Exception in intrinsic constant declaration: " + std::string(e.what()));
+            }
+        }
+    }
+
     void CodegenVisitor::visit(Cryo::ImportDeclarationNode &node)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing import declaration: {} (alias: {})",
@@ -3342,6 +3378,18 @@ namespace Cryo::Codegen
                     llvm::Value *this_param = &(*args);
                     set_current_value(this_param);
                     register_value(&node, this_param);
+                    return;
+                }
+            }
+
+            // Handle intrinsic constants
+            if (identifier == "__FILE__" || identifier == "__LINE__" || identifier == "__FUNCTION__")
+            {
+                llvm::Value *intrinsic_value = generate_intrinsic_constant(identifier);
+                if (intrinsic_value)
+                {
+                    set_current_value(intrinsic_value);
+                    register_value(&node, intrinsic_value);
                     return;
                 }
             }
@@ -15417,6 +15465,59 @@ namespace Cryo::Codegen
         // Use the new Type-based interface directly
         return _type_mapper->map_type(cryo_type);
     }
+
+    std::string CodegenVisitor::get_current_filename()
+    {
+        // Return the current source file being compiled
+        return _source_file.empty() ? "unknown" : _source_file;
+    }
+
+    uint32_t CodegenVisitor::get_current_line_number()
+    {
+        // Get line number from current AST node if available
+        if (_current_node && _current_node->location().line() > 0)
+        {
+            return static_cast<uint32_t>(_current_node->location().line());
+        }
+        return 1; // Default to line 1 if no current node
+    }
+
+    std::string CodegenVisitor::get_current_function_name()
+    {
+        // Get current function name from function context
+        if (_current_function && _current_function->ast_node)
+        {
+            return _current_function->ast_node->name();
+        }
+        return "global"; // Default to "global" if not in a function
+    }
+
+    llvm::Value *CodegenVisitor::generate_intrinsic_constant(const std::string &const_name)
+    {
+        auto &llvm_ctx = _context_manager.get_context();
+        
+        if (const_name == "__FILE__")
+        {
+            std::string filename = get_current_filename();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating __FILE__ constant: {}", filename);
+            return _context_manager.get_builder().CreateGlobalStringPtr(filename, "__FILE__");
+        }
+        else if (const_name == "__LINE__")
+        {
+            uint32_t line_number = get_current_line_number();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating __LINE__ constant: {}", line_number);
+            return llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx), line_number);
+        }
+        else if (const_name == "__FUNCTION__")
+        {
+            std::string function_name = get_current_function_name();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating __FUNCTION__ constant: {}", function_name);
+            return _context_manager.get_builder().CreateGlobalStringPtr(function_name, "__FUNCTION__");
+        }
+        
+        return nullptr;
+    }
+
     llvm::Value *CodegenVisitor::cast_value(llvm::Value *value, llvm::Type *target_type) { return nullptr; }
     bool CodegenVisitor::is_lvalue(Cryo::ExpressionNode *expr) { return false; }
 

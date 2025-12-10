@@ -1455,15 +1455,27 @@ namespace Cryo
         } while (true);
     }
 
-    std::unique_ptr<IntrinsicDeclarationNode> Parser::parse_intrinsic_declaration()
+    std::unique_ptr<DeclarationNode> Parser::parse_intrinsic_declaration()
     {
         SourceLocation start_loc = _current_token.location();
 
         // Parse 'intrinsic' keyword
         consume(TokenKind::TK_KW_INTRINSIC, "Expected 'intrinsic'");
 
-        // Parse 'function' keyword
-        consume(TokenKind::TK_KW_FUNCTION, "Expected 'function' after 'intrinsic'");
+        // Check if this is 'intrinsic const' or 'intrinsic function'
+        if (_current_token.is(TokenKind::TK_KW_CONST))
+        {
+            return parse_intrinsic_const_declaration(start_loc);
+        }
+        else if (_current_token.is(TokenKind::TK_KW_FUNCTION))
+        {
+            // Parse 'function' keyword
+            consume(TokenKind::TK_KW_FUNCTION, "Expected 'function' after 'intrinsic'");
+        }
+        else
+        {
+            throw ParseError("Expected 'function' or 'const' after 'intrinsic'", _current_token.location());
+        }
 
         // Parse function name
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
@@ -1516,7 +1528,29 @@ namespace Cryo
             consume(TokenKind::TK_SEMICOLON, "Expected ';' after intrinsic function declaration");
         }
 
-        return intrinsic_decl;
+        return std::move(intrinsic_decl);
+    }
+
+    std::unique_ptr<IntrinsicConstDeclarationNode> Parser::parse_intrinsic_const_declaration(SourceLocation start_loc)
+    {
+        // Parse 'const' keyword
+        consume(TokenKind::TK_KW_CONST, "Expected 'const' after 'intrinsic'");
+
+        // Parse constant name
+        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected constant name");
+        std::string const_name = std::string(name_token.text());
+
+        // Parse type annotation
+        consume(TokenKind::TK_COLON, "Expected ':' after intrinsic constant name");
+        Type *const_type = parse_type_annotation();
+
+        // Create intrinsic const declaration
+        auto intrinsic_const = std::make_unique<IntrinsicConstDeclarationNode>(start_loc, const_name, const_type);
+
+        // End with semicolon
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after intrinsic constant declaration");
+
+        return intrinsic_const;
     }
 
     std::unique_ptr<ImportDeclarationNode> Parser::parse_import_declaration()

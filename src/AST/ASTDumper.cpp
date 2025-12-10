@@ -509,6 +509,31 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(IntrinsicConstDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "IntrinsicConstDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+        _output << "'" << node.name() << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << " ";
+        if (_use_colors)
+            _output << Colors::TYPE;
+        _output << "'" << (node.get_resolved_type() ? node.get_resolved_type()->to_string() : "unknown") << "'";
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+    }
+
     void ASTDumper::visit(ImportDeclarationNode &node)
     {
         print_prefix();

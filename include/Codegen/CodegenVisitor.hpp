@@ -114,6 +114,7 @@ namespace Cryo::Codegen
         void visit(Cryo::DeclarationNode &node) override;
         void visit(Cryo::FunctionDeclarationNode &node) override;
         void visit(Cryo::IntrinsicDeclarationNode &node) override;
+        void visit(Cryo::IntrinsicConstDeclarationNode &node) override;
         void visit(Cryo::ImportDeclarationNode &node) override;
         void visit(Cryo::VariableDeclarationNode &node) override;
         void visit(Cryo::StructDeclarationNode &node) override;
@@ -595,6 +596,12 @@ namespace Cryo::Codegen
         // Destructor management
         bool has_destructor(const std::string &type_name);
         void register_variable_for_destruction(const std::string &variable_name, const std::string &type_name, llvm::Value *value, bool is_heap_allocated = false);
+
+        // Intrinsic constant context tracking
+        std::string get_current_filename();
+        uint32_t get_current_line_number();
+        std::string get_current_function_name();
+        llvm::Value *generate_intrinsic_constant(const std::string &const_name);
 
         // Error reporting
         void report_error(const std::string &message);

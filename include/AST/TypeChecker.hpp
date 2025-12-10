@@ -371,6 +371,7 @@ namespace Cryo
         void visit(VariableDeclarationNode &node) override;
         void visit(FunctionDeclarationNode &node) override;
         void visit(IntrinsicDeclarationNode &node) override;
+        void visit(IntrinsicConstDeclarationNode &node) override;
         void visit(ImportDeclarationNode &node) override;
         void visit(StructDeclarationNode &node) override;
         void visit(ClassDeclarationNode &node) override;
