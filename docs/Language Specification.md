@@ -2,8 +2,6 @@
 
 **Author:** Jacob C. LeQuire
 
-*A Comprehensive Academic Specification for a Modern Systems Programming Language*
-
 ```bf
                     #            
                   = #^.          
@@ -24,14 +22,11 @@
                   =.#<-          
                     #                      
 ```
-
 ---
 
 ## Abstract
 
 This document presents a formal specification for Cryo, a statically-typed, compiled systems programming language designed for performance, safety, and developer productivity. Cryo combines the expressiveness of modern high-level languages with the control and efficiency required for systems programming. The language features a comprehensive type system with generic programming support, memory safety guarantees through references and explicit pointer management, trait-based polymorphism, pattern matching with algebraic data types, and an LLVM-based compilation backend. This specification provides a rigorous mathematical foundation for the language's syntax, semantics, type system, and operational behavior, establishing Cryo as a principled approach to systems programming that bridges the gap between safety and performance.
-
-**Keywords:** Programming Languages, Type Systems, Systems Programming, Formal Semantics, Memory Safety, Generic Programming, LLVM
 
 ---
 
@@ -497,10 +492,12 @@ public:
 
 type class Dog : Animal {
 public:
-    Dog() : super("Woof!") {}
+    Dog() : super("Woof!") {
+        this.breed = "golden reteriver";
+    }
 
     override make_sound() -> string {
-        return this.sound + " (barks)";
+        return this.breed + ":" + this.sound;
     }
 private:
     breed: string;
@@ -1145,7 +1142,7 @@ TraitItem ::= FunctionSignature
             | AssociatedConst
             | DefaultImpl
 
-SuperTraits ::= : TraitBound (, TraitBound)*
+SuperTraits ::= : TraitBound (& TraitBound)*
 ```
 
 **Definition 10.2** (Trait Implementation): Types implement traits through implementation blocks:
@@ -1175,7 +1172,7 @@ TraitBound ::= TypeParam : Trait
              | TypeParam : Trait & Trait  
              | TypeParam : for<'a> Trait<'a>
 
-WhereClause ::= where TraitBound (, TraitBound)*
+WhereClause ::= where TraitBound (& TraitBound)*
 ```
 
 **Definition 10.5** (Bound Satisfaction): Type parameter bounds are satisfied when implementations exist:
@@ -1347,7 +1344,7 @@ trait Context<T> {
 - **Exhaustiveness Checking**: Ensures pattern matches are complete
 - **Reachability Analysis**: Detects unreachable code paths
 
-**Definition 11.9** (Error Recovery**: The compiler attempts error recovery for better diagnostics:
+**Definition 11.9** (Error Recovery**): The compiler attempts error recovery for better diagnostics:
 
 - **Syntax Error Recovery**: Continue parsing after syntax errors
 - **Type Error Recovery**: Infer reasonable types after type errors
@@ -1439,7 +1436,7 @@ Type Checking:
 
 ### 12.4 Concurrency Runtime
 
-**Definition 12.7** (Thread Model**: Cryo uses a 1:1 threading model with OS threads:
+**Definition 12.7** (Thread Model**): Cryo uses a 1:1 threading model with OS threads:
 
 ```bnf
 Thread ::= ⟨thread_id: ThreadId,
@@ -1470,7 +1467,7 @@ Panic Handler:
 5. Terminate thread or process
 ```
 
-**Definition 12.10** (Panic Safety Guarantees**: The runtime maintains safety during panics:
+**Definition 12.10** (Panic Safety Guarantees**): The runtime maintains safety during panics:
 
 - Memory safety is preserved during unwinding
 - Resources are properly released
@@ -1526,11 +1523,11 @@ trait Clone {
 trait Copy: Clone {}  // Marker trait for trivial copying
 
 trait Drop {
-    drop(&mut self);  // Custom cleanup logic
+    drop(&mut this);  // Custom cleanup logic
 }
 
 trait Default {
-    default() -> Self;  // Default value construction
+    default() -> This;  // Default value construction
 }
 
 trait Debug {
@@ -1545,18 +1542,18 @@ trait Display {
 **Definition 13.4** (Comparison Traits): Traits for ordering and equality:
 
 ```cryo
-trait PartialEq<Rhs = Self> {
-    eq(&this, other: &Rhs) -> bool;
-    ne(&this, other: &Rhs) -> bool { !self.eq(other) }
+trait PartialEq<Rhs = This> {
+    eq(&this, other: &Rhs) -> boolean;
+    ne(&this, other: &Rhs) -> boolean { !this.eq(other) }
 }
 
-trait Eq: PartialEq<Self> {}
+trait Eq: PartialEq<This> {}
 
-trait PartialOrd<Rhs = Self>: PartialEq<Rhs> {
+trait PartialOrd<Rhs = This>: PartialEq<Rhs> {
     partial_cmp(&this, other: &Rhs) -> Option<Ordering>;
 }
 
-trait Ord: Eq , PartialOrd<Self> {
+trait Ord: Eq , PartialOrd<This> {
     cmp(&this, other: &this) -> Ordering;
 }
 ```
@@ -1684,7 +1681,7 @@ Source Code → Lexical Analysis → Syntax Analysis → Semantic Analysis
 3. **Trait Resolution**: Resolve trait bounds and associated types
 4. **Coherence Checking**: Ensure trait implementations are coherent
 
-**Definition 14.4** (Borrow Checking**: Memory safety is ensured through static analysis:
+**Definition 14.4** (Borrow Checking**): Memory safety is ensured through static analysis:
 
 - **Lifetime Inference**: Infer lifetime parameters for references
 - **Ownership Analysis**: Track ownership transfer and borrowing
@@ -1693,7 +1690,7 @@ Source Code → Lexical Analysis → Syntax Analysis → Semantic Analysis
 
 ### 14.3 Optimization Framework
 
-**Definition 14.5** (Optimization Passes**: The compiler applies various optimization transformations:
+**Definition 14.5** (Optimization Passes**): The compiler applies various optimization transformations:
 
 **High-Level Optimizations**:
 - Constant folding and propagation
@@ -1713,7 +1710,7 @@ Source Code → Lexical Analysis → Syntax Analysis → Semantic Analysis
 - Peephole optimizations
 - Link-time optimization
 
-**Definition 14.6** (Optimization Safety**: All optimizations preserve program semantics:
+**Definition 14.6** (Optimization Safety**): All optimizations preserve program semantics:
 
 - **Correctness Preservation**: Optimizations maintain program meaning
 - **Safety Preservation**: Memory and type safety are maintained
@@ -1722,14 +1719,14 @@ Source Code → Lexical Analysis → Syntax Analysis → Semantic Analysis
 
 ### 14.4 Code Generation
 
-**Definition 14.7** (LLVM Backend**: Code generation targets LLVM IR for portability:
+**Definition 14.7** (LLVM Backend**): Code generation targets LLVM IR for portability:
 
 - **Platform Independence**: LLVM handles target-specific details
 - **Optimization Pipeline**: Leverage LLVM's optimization passes
 - **Debug Support**: Generate DWARF debug information
 - **Link-Time Optimization**: Cross-module optimization
 
-**Definition 14.8** (ABI Compliance**: Generated code follows platform ABIs:
+**Definition 14.8** (ABI Compliance**): Generated code follows platform ABIs:
 
 - **Calling Conventions**: Proper function call protocols
 - **Data Layout**: Compatible struct and union layouts
@@ -1738,14 +1735,14 @@ Source Code → Lexical Analysis → Syntax Analysis → Semantic Analysis
 
 ### 14.5 Incremental Compilation
 
-**Definition 14.9** (Dependency Tracking**: The compiler tracks fine-grained dependencies:
+**Definition 14.9** (Dependency Tracking**): The compiler tracks fine-grained dependencies:
 
 - **Query-Based Architecture**: Compilation as cached queries
 - **Incremental Analysis**: Only reprocess changed components
 - **Parallel Compilation**: Independent modules compile concurrently
 - **Cache Management**: Intelligent cache invalidation
 
-**Definition 14.10** (Separate Compilation**: Modules compile independently when possible:
+**Definition 14.10** (Separate Compilation**): Modules compile independently when possible:
 
 - **Interface Stability**: Public interfaces determine recompilation needs
 - **Link-Time Checks**: Verify compatibility at link time
@@ -1905,55 +1902,3 @@ Cryo represents a significant step forward in systems programming language desig
 The formal specification presented here establishes Cryo as a well-founded programming language with clear semantics and strong safety properties. It provides both the theoretical foundation necessary for reasoning about program correctness and the practical guidance needed for implementing robust, efficient compilers.
 
 As systems programming continues to evolve, languages like Cryo point the way toward a future where safety and performance are complementary rather than competing concerns. This specification represents not just the definition of a particular language, but a demonstration of the principles and techniques necessary for achieving this synthesis.
-
----
-
-## References
-
-[1] Wright, A. K., & Felleisen, M. (1994). A syntactic approach to type soundness. *Information and Computation*, 115(1), 38-94.
-
-[2] Pierce, B. C. (2002). *Types and programming languages*. MIT press.
-
-[3] Harper, R. (2016). *Practical foundations for programming languages*. Cambridge University Press.
-
-[4] Girard, J. Y. (1972). Interprétation fonctionelle et élimination des coupures de l'arithmétique d'ordre supérieur. *Thèse de doctorat d'État*, Université Paris VII.
-
-[5] Reynolds, J. C. (1974). Towards a theory of type structure. In *Programming Symposium* (pp. 408-425). Springer.
-
-[6] Wadler, P. (1990). Linear types can change the world. In *Programming concepts and methods* (Vol. 2, No. 3, pp. 347-359).
-
-[7] Ahmed, A., Fluet, M., & Morrisett, G. (2007). L3: A linear language with locations. *Fundamenta Informaticae*, 77(4), 397-449.
-
-[8] Klabnik, S., & Nichols, C. (2019). *The Rust Programming Language*. No Starch Press.
-
-[9] Stroustrup, B. (2013). *The C++ programming language*. Pearson Education.
-
-[10] Milner, R., Tofte, M., Harper, R., & MacQueen, D. (1997). *The definition of Standard ML: revised*. MIT press.
-
----
-
-## Appendices
-
-### Appendix A: Complete Grammar
-
-[The complete BNF grammar would be included here, building on the fragments presented throughout the specification]
-
-### Appendix B: Type System Rules
-
-[Complete typing rules for all language constructs would be presented here in formal notation]
-
-### Appendix C: Operational Semantics Rules
-
-[Complete operational semantics rules would be provided here]
-
-### Appendix D: Standard Library Interface
-
-[Complete interface specifications for the standard library would be documented here]
-
-### Appendix E: LLVM IR Generation
-
-[Detailed mapping from Cryo constructs to LLVM IR would be specified here]
-
----
-
-*This specification represents Version 1.0 of the Cryo language definition. Future versions will extend and refine these definitions based on implementation experience and formal verification efforts.*
