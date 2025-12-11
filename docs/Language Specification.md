@@ -1,8 +1,29 @@
 # The Cryo Programming Language: A Formal Specification
 
-**Version 1.0**
+**Author:** Jacob C. LeQuire
 
 *A Comprehensive Academic Specification for a Modern Systems Programming Language*
+
+```bf
+                    #            
+                  = #^.          
+        =        ^# # #.         
+         ## ^##^# ##### #        
+         # ## # ## ### ## #      
+          ###^^# #(###=# #(=#     :::::::::  :::   :::  ::::::::  
+          ## # ## #   # ## #.#<   :+:    :+: :+:   :+: :+:    :+: 
+        ## # ## #       # ## # #. +:+    +:+  +:+ +:+  +:+    +:+ 
+     # # #-## #^                  +#++:++#:    +#++:   +#+    +:+ 
+     # # #=}# #<                  +#+    +#+    +#+    +#+    +#+ 
+        ## # ## #       # ## # #. #+#    #+#    #+#    #+#    #+# 
+          ## # ## #   # ## #-#<   ###    ###    ###     ########  
+          ###<=# #(###=# #<^#    
+         # ## # ## ### ## #      
+         ## =##(# ##@## #        
+        =        ^# # #.         
+                  =.#<-          
+                    #                      
+```
 
 ---
 
@@ -86,11 +107,10 @@ The lexical structure of Cryo is defined through a formal grammar that specifies
 Token ::= Keyword | Identifier | Literal | Operator | Separator | Comment
 
 Keyword ::= 'const' | 'mut' | 'function' | 'type' | 'struct' | 'class' | 'enum' 
-          | 'trait' | 'implement' | 'namespace' | 'import' | 'export'
+          | 'trait' | 'implement' | 'namespace' | 'import' | 'do'
           | 'if' | 'else' | 'while' | 'for' | 'do' | 'break' | 'continue' 
           | 'return' | 'match' | 'switch' | 'case' | 'default'
-          | 'public' | 'private' | 'protected' | 'static' | 'extern' 
-          | 'inline' | 'virtual' | 'override' | 'abstract' | 'final'
+          | 'public' | 'private' | 'protected' | 'static' | 'extern' | 'override'
           | 'this' | 'true' | 'false' | 'null' | 'sizeof' | 'new' | 'intrinsic'
 
 Identifier ::= IdentifierStart IdentifierContinue*
@@ -141,7 +161,7 @@ DocComment ::= '/**' (!'**/' Character)* '**/' | '///' (!'\n' Character)* '\n'?
 **Definition 2.5** (Integer Literal Typing): Integer literals are typed according to the following rules:
 
 1. Decimal literals without suffix are typed as the smallest type in {i32, i64} that can represent the value
-2. Literals with explicit type suffixes (e.g., 42u64, 100i16) have the specified type
+2. Literals with explicit type conversion calls (e.g., `u8(42)`) are typed according to the specified type
 3. Literals that exceed the range of i64 cause a compile-time error unless explicitly typed
 
 **Definition 2.6** (Floating-Point Literal Typing): Floating-point literals are typed as f64 by default, or according to their explicit suffix (f32, f64).
@@ -191,7 +211,7 @@ Item ::= VariableDeclaration
 
 VariableDeclaration ::= (const | mut) Identifier : Type [= Expression] ;
 
-FunctionDeclaration ::= function Identifier <<GenericParameters?>> 
+FunctionDeclaration ::= function Identifier <GenericParameters?> 
                        ( ParameterList? ) [-> Type] Block
 
 TypeDeclaration ::= StructDeclaration
@@ -253,6 +273,7 @@ MultiplicativeExpression ::= UnaryExpression
 UnaryExpression ::= PostfixExpression
                   | UnaryOperator UnaryExpression
                   | sizeof ( Type )
+                  | aignof { Type }
 
 PostfixExpression ::= PrimaryExpression
                     | PostfixExpression [ Expression ]
@@ -264,7 +285,8 @@ PostfixExpression ::= PrimaryExpression
 PrimaryExpression ::= Identifier
                     | Literal
                     | ( Expression )
-                    | new Type ( ArgumentList? )
+                    | new Type ( ArgumentList? ) // Heap allocation
+                    | Type ( ArgumentList? )     // Stack allocation
                     | StructLiteral
                     | ArrayLiteral
 ```
@@ -272,22 +294,23 @@ PrimaryExpression ::= Identifier
 ### 3.3 Type Grammar
 
 **Definition 3.3** (Type Grammar): The type system supports primitive types, user-defined types, generic types, and type constructors:
+*note: 'a' indicates that it is a type alias*
 
 ```bnf
 Type ::= PrimitiveType
        | TypeIdentifier
        | Type [ ]
        | Type *
-       | & Type
-       | & mut Type
+       | & const? Type  // immutable reference, `const` is optional
+       | & mut Type     // mutable reference
        | ( Type )
        | TypeIdentifier < TypeArgumentList >
 
 PrimitiveType ::= i8 | i16 | i32 | i64 | i128
                 | u8 | u16 | u32 | u64 | u128
-                | int | uint
-                | f32 | f64 | float | double
-                | boolean | char | string | void
+                | int (a) | uint (a)
+                | f32 | f64 | float (a) | double (a)
+                | boolean | char (a) | string | void
 
 TypeArgumentList ::= Type (, Type)*
 
@@ -311,7 +334,7 @@ Pattern ::= IdentifierPattern
           | WildcardPattern
           | ( Pattern )
 
-IdentifierPattern ::= [mut] Identifier
+IdentifierPattern ::= [mut | const] Identifier
 
 LiteralPattern ::= Literal
 
@@ -353,7 +376,7 @@ FieldPattern ::= Identifier [: Pattern]
 
 1. **Generic vs. Comparison**: `Type<T>` is parsed as a generic type instantiation rather than less-than comparison when `Type` is in scope as a type constructor.
 
-2. **Struct vs. Block**: `Type { ... }` is parsed as struct literal when `Type` is a struct type and the contents match field initialization syntax.
+2. **Struct vs. Block**: The `type` keyword disambiguates struct declarations from block expressions. A `{}` following `type struct Identifier` is always a struct declaration.
 
 3. **Expression vs. Type**: In generic parameter positions, identifiers are interpreted as types when possible, falling back to constant expressions for non-type template parameters.
 
@@ -412,12 +435,12 @@ The Cryo type system is formalized as an extension of System F<sub>ω</sub> (Sys
 
 ### 4.3 Composite Types
 
-**Definition 4.4** (Array Types): Array types `T[]` represent homogeneous sequences with the following properties:
+**Definition 4.4** (Array Types): Array types `T[]` represent the `Array<T>` core type. The `[]` syntax is syntactic sugar for array types with the following properties:
 
 - **Element Type**: All elements have type `T`
 - **Bounds Checking**: Array access is bounds-checked at runtime
 - **Memory Layout**: Elements are stored contiguously in memory
-- **Size Information**: Arrays carry their length as runtime information
+- **Size Information**: Arrays carry their length within the object properties.
 
 **Definition 4.5** (Reference Types): Reference types provide safe access to memory locations:
 
@@ -456,11 +479,28 @@ enum Option<T> {
 
 The type `Option<T>` is equivalent to the sum type `T + Unit`. Pattern matching provides the elimination form for sum types.
 
-**Definition 4.9** (Class Types): Class types extend struct types with inheritance and dynamic dispatch:
+**Definition 4.9** (Class Types): Class types extend struct types with inheritance:
+
+```cryo
+type class Animal {
+public:
+    sound: string;
+    make_sound() -> string {
+        return self.sound;
+    }
+}
+
+type class Dog : Animal {
+public:
+    bark() -> string {
+        return "Woof!";
+    }
+}
+```
 
 - **Single Inheritance**: Classes may inherit from at most one base class
-- **Virtual Methods**: Methods may be virtual, enabling dynamic dispatch
 - **Access Control**: Members have visibility modifiers (`public`, `private`, `protected`)
+- **Method Overriding**: Subclasses may override methods of the base class with `override` keyword
 
 ### 4.5 Generic Types
 
@@ -477,7 +517,7 @@ The type parameter `T` is universally quantified with the constraint that `T` im
 **Definition 4.11** (Type Parameter Constraints): Type parameters may be constrained by trait bounds:
 
 - **Single Bounds**: `T: Trait` requires `T` to implement `Trait`
-- **Multiple Bounds**: `T: Trait₁ + Trait₂` requires `T` to implement both traits
+- **Multiple Bounds**: `T: Trait₁ , Trait₂` requires `T` to implement both traits
 - **Lifetime Bounds**: `T: 'a` requires all references in `T` to outlive lifetime `'a`
 
 **Definition 4.12** (Monomorphization): Generic types are instantiated through monomorphization, where each concrete instantiation generates specialized code. This ensures zero runtime overhead for generic abstractions.
@@ -574,7 +614,7 @@ Heap               h : L → {allocated, free}
 
 ```bnf
 Continuations κ ∈ K ::= halt
-                      | let x = □ in e; κ
+                      | const | mut x = □ in e; κ
                       | □ op v; κ  
                       | v op □; κ
                       | if □ then e₁ else e₂; κ
@@ -735,6 +775,9 @@ h(ℓ) = free
 (E-While)
 ─────────────────────────────────────
 ⟨while e₁ do e₂, ρ, σ, h, κ⟩ → ⟨if e₁ then (e₂; while e₁ do e₂) else (), ρ, σ, h, κ⟩
+─────────────────────────────────────
+(E-Do-While)
+⟨do e₁ while e₂, ρ, σ, h, κ⟩ → ⟨e₁; while e₂ do e₁, ρ, σ, h, κ⟩
 ```
 
 **Definition 6.11** (Pattern Matching): Pattern matching follows exhaustiveness and coverage rules:
@@ -758,7 +801,7 @@ match(v, p) = ρ'
 ```bnf
 (E-Panic-Prop)
 ─────────────────────────────────────
-⟨panic(msg), ρ, σ, h, let x = □ in e; κ⟩ → ⟨panic(msg), ρ, σ, h, κ⟩
+⟨panic(msg), ρ, σ, h, const | mut x = □ in e; κ⟩ → ⟨panic(msg), ρ, σ, h, κ⟩
 
 (E-Panic-Halt)
 ─────────────────────────────────────
@@ -830,7 +873,8 @@ Lifetimes ℓ ::= 'a                      (named lifetime parameter)
 StackFrame ::= ⟨locals: Identifier ⇀ Value,
                 return_addr: Address,  
                 saved_regs: Register ⇀ Value,
-                frame_ptr: Address⟩
+                frame_ptr: Address,
+                attributes: FrameAttributes⟩
 ```
 
 **Definition 7.8** (Stack Allocation Rules): Stack allocation follows LIFO semantics with automatic cleanup:
@@ -855,7 +899,7 @@ StackFrame ::= ⟨locals: Identifier ⇀ Value,
 AllocationHeader ::= ⟨size: Size,
                       type: Type,
                       checksum: u32,
-                      gc_mark: boolean⟩
+                      alignment: Alignment⟩
 ```
 
 ### 7.5 Reference Semantics
@@ -864,7 +908,7 @@ AllocationHeader ::= ⟨size: Size,
 
 ```bnf
 Reference Operations:
-- &x          (create immutable reference)
+- &const? x   (create immutable reference - `const` is optional)
 - &mut x      (create mutable reference)  
 - *r          (dereference reference)
 - r.f         (field access through reference)
@@ -883,13 +927,12 @@ Reference Operations:
 
 ### 8.1 Module Structure
 
-**Definition 8.1** (Module Definition): A module is a collection of items with associated visibility and dependency information:
+**Definition 8.1** (Module Definition): A module is a collection of items with associated visibility and dependency information. There is no `export` keyword; all items are public by default unless qualified as private.
 
 ```bnf
 Module M ::= ⟨name: ModuleName,
              items: Item*,
              imports: ImportDecl*,
-             exports: ExportDecl*,
              visibility: Visibility⟩
 
 ModuleName ::= Identifier (:: Identifier)*
@@ -906,45 +949,39 @@ Item ::= TypeDecl | FunctionDecl | ConstDecl | ModuleDecl
 
 ### 8.2 Import and Export Semantics
 
-**Definition 8.3** (Import Declaration): Imports bring external items into the current module's scope:
+**Definition 8.3** (Import Declaration): Imports bring external items into the current module's scope. Cryo differientiates between standard library imports and user-defined module imports:
 
 ```bnf
-ImportDecl ::= import ModulePath                    (import all public items)
+ImportDecl ::= import ModulePath                     (import all public items)
              | import ModulePath :: ItemList         (import specific items)
              | import ItemName from ModulePath       (import with renaming)
              | import ModulePath as Alias            (import with alias)
 
+StdImportDecl ::= import <module/ModuleName> 
+```
+
+```bnf
 ModulePath ::= Identifier (:: Identifier)*
 ItemList ::= ItemName (, ItemName)*
 ```
 
-**Definition 8.4** (Export Declaration): Exports control the visibility of items to external modules:
-
-```bnf
-ExportDecl ::= export Item                          (re-export item)
-             | export ModulePath :: ItemList         (re-export from module)
-             | export * from ModulePath              (re-export all)
-
-Visibility ::= public | private | protected
-```
-
-**Definition 8.5** (Visibility Rules): Item visibility determines accessibility across module boundaries:
+**Definition 8.4** (Visibility Rules): Item visibility determines accessibility across module boundaries:
 
 - **Public**: Accessible from any module
 - **Private**: Accessible only within the declaring module
 - **Protected**: Accessible within the module hierarchy
-- **Module-Private**: Default visibility for unexported items
+- **Module-Public**: Accessible to sibling modules
 
 ### 8.3 Dependency Resolution
 
-**Definition 8.6** (Dependency Graph): Module dependencies form a directed acyclic graph:
+**Definition 8.5** (Dependency Graph): Module dependencies form a directed acyclic graph:
 
 ```bnf
 Dependencies D : Module → P(Module)
 Dependency Order: topological sort of D
 ```
 
-**Definition 8.7** (Circular Dependency Detection): The module system rejects circular dependencies:
+**Definition 8.6** (Circular Dependency Detection): The module system rejects circular dependencies:
 
 - **Static Analysis**: Dependency cycles are detected at compile time
 - **Forward Declarations**: Allowed for mutually recursive types
@@ -952,7 +989,7 @@ Dependency Order: topological sort of D
 
 ### 8.4 Namespace Resolution
 
-**Definition 8.8** (Name Resolution Algorithm): Names are resolved according to a priority hierarchy:
+**Definition 8.7** (Name Resolution Algorithm): Names are resolved according to a priority hierarchy:
 
 1. **Local Scope**: Variables and parameters in current function
 2. **Module Scope**: Items declared in current module  
@@ -960,7 +997,7 @@ Dependency Order: topological sort of D
 4. **Standard Library**: Items from the standard library
 5. **Qualified Lookup**: Explicit qualified names
 
-**Definition 8.9** (Ambiguity Resolution): Naming conflicts are resolved through disambiguation rules:
+**Definition 8.8** (Ambiguity Resolution): Naming conflicts are resolved through disambiguation rules:
 
 - **Explicit Qualification**: Use fully qualified names to resolve ambiguity
 - **Import Precedence**: More specific imports take precedence
@@ -968,13 +1005,13 @@ Dependency Order: topological sort of D
 
 ### 8.5 Module Compilation
 
-**Definition 8.10** (Compilation Units): Each module compiles to an independent compilation unit:
+**Definition 8.9** (Compilation Units): Each module compiles to an independent compilation unit:
 
 - **Interface Files**: Contain public type and signature information
 - **Implementation Files**: Contain compiled code and private details
 - **Dependency Information**: Metadata about required modules
 
-**Definition 8.11** (Separate Compilation): Modules can be compiled independently when interfaces are stable:
+**Definition 8.10** (Separate Compilation): Modules can be compiled independently when interfaces are stable:
 
 - **Interface Stability**: Changes to public interfaces require recompilation of dependents
 - **Implementation Changes**: Private implementation changes do not affect dependents
@@ -1052,12 +1089,12 @@ Inference Rules:
 ```bnf
 trait Iterator {
     type Item;
-    next(&mut self) -> Option<Self::Item>;
+    next(&mut this) -> Option<This::Item>;
 }
 
-impl Iterator for Vec<T> {
+implement Iterator for Vec<T> {
     type Item = T;
-    next(&mut self) -> Option<T> { ... }
+    next(&mut this) -> Option<T> { ... }
 }
 ```
 
@@ -1090,7 +1127,7 @@ impl Iterator for Vec<T> {
 **Definition 10.1** (Trait Declaration): Traits define interfaces that types can implement:
 
 ```bnf
-TraitDecl ::= trait TraitName GenericParams? SuperTraits? {
+TraitDecl ::= trait TraitName <GenericParams?> SuperTraits? {
                 TraitItem*
               }
 
@@ -1105,7 +1142,7 @@ SuperTraits ::= : TraitBound (, TraitBound)*
 **Definition 10.2** (Trait Implementation): Types implement traits through implementation blocks:
 
 ```bnf
-ImplDecl ::= implement trait TraitName GenericParams? for Type {
+ImplDecl ::= implement trait TraitName <GenericParams?> for Type {
                ImplItem*
              }
 
@@ -1126,7 +1163,7 @@ ImplItem ::= FunctionDef
 
 ```bnf
 TraitBound ::= TypeParam : Trait
-             | TypeParam : Trait + Trait  
+             | TypeParam : Trait , Trait  
              | TypeParam : for<'a> Trait<'a>
 
 WhereClause ::= where TraitBound (, TraitBound)*
@@ -1136,10 +1173,10 @@ WhereClause ::= where TraitBound (, TraitBound)*
 
 ```bnf
 Satisfaction Relation ⊨:
-Γ ⊨ T : Trait  iff  ∃ impl Trait for T ∈ Γ
+Γ ⊨ T : Trait  if  ∃ implement Trait for T ∈ Γ
 
 Higher-Ranked Bounds:
-Γ ⊨ T : for<'a> Trait<'a>  iff  ∀'a. Γ ⊨ T : Trait<'a>
+Γ ⊨ T : for<'a> Trait<'a>  if  ∀'a. Γ ⊨ T : Trait<'a>
 ```
 
 ### 10.3 Dynamic Dispatch
@@ -1179,7 +1216,7 @@ trait Trait {
 }
 
 Associated Type Implementation:  
-impl Trait for Type {
+implement Trait for Type {
     type AssocType = ConcreteType;
 }
 ```
@@ -1191,7 +1228,7 @@ trait Trait {
     const CONSTANT: Type;
 }
 
-impl Trait for Type {
+implement Trait for Type {
     const CONSTANT: Type = value;
 }
 ```
@@ -1207,8 +1244,8 @@ impl Trait for Type {
 
 **Definition 10.11** (Coherence Rules): Trait implementations must be coherent and non-overlapping:
 
-- **Local Coherence**: Within a crate, implementations cannot overlap
-- **Global Coherence**: Across crates, orphan rules prevent conflicts  
+- **Local Coherence**: Within a namespace, implementations cannot overlap
+- **Global Coherence**: Across namespaces, orphan rules prevent conflicts  
 - **Negative Reasoning**: Absence of implementations can be reasoned about
 
 ---
@@ -1225,6 +1262,7 @@ Error Categories:
 - UnrecoverableError: Errors that cause program termination  
 - CompileTimeError: Errors detected during compilation
 - RuntimeError: Errors detected during execution
+- Panic: Unrecoverable errors that trigger stack unwinding
 ```
 
 **Definition 11.2** (Result Type): The Result type encapsulates operations that may fail:
@@ -1285,7 +1323,7 @@ Panic Behavior:
 
 ```cryo
 trait Context<T> {
-    context(self, msg: &str) -> Result<T, ContextError>;
+    context(this, msg: &str) -> Result<T, ContextError>;
     with_context<F>(self, f: F) -> Result<T, ContextError>
         where F: FnOnce() -> String;
 }
@@ -1316,8 +1354,7 @@ trait Context<T> {
 
 ```bnf
 Runtime System ::= ⟨memory_manager: MemoryManager,
-                    gc_system: GarbageCollector,
-                    type_system: TypeSystem,
+                    type_system: TypeSystem,        // Unimplemented until self-hosting is complete
                     thread_scheduler: ThreadScheduler,
                     panic_handler: PanicHandler,
                     ffi_bridge: FFIBridge⟩
@@ -1374,8 +1411,9 @@ Stack Safety:
 TypeInfo ::= ⟨type_id: TypeId,
              size: Size,
              alignment: Alignment,  
-             drop_fn: Option<DropFn>,
-             vtable: Option<VTable>⟩
+             destructor: Option<DestructorFn>,
+             vtable: Option<VTable>,
+             allocator: AllocatorInfo⟩
 
 Type Checking:
 - Dynamic type checks for trait objects
@@ -1451,7 +1489,13 @@ std Library Structure:
 ├── thread/        (Concurrency)  
 ├── fs/            (File system)
 ├── net/           (Networking)
+├── json/          (JSON handling)
+├── time/          (Time and date)
+├── fmt/           (Formatting)
+├── env/           (Environment variables)
+├── process/       (Process management)
 └── sys/           (System interfaces)
+
 ```
 
 **Definition 13.2** (Module Dependencies): Standard library modules form a dependency hierarchy:
@@ -1467,7 +1511,7 @@ std Library Structure:
 
 ```cryo
 trait Clone {
-    clone(&self) -> Self;
+    clone(&this) -> Self;
 }
 
 trait Copy: Clone {}  // Marker trait for trivial copying
@@ -1481,11 +1525,11 @@ trait Default {
 }
 
 trait Debug {
-    fmt(&self, f: &mut Formatter) -> Result;
+    fmt(&this, f: &mut Formatter) -> Result;
 }
 
 trait Display {
-    fmt(&self, f: &mut Formatter) -> Result;  
+    fmt(&this, f: &mut Formatter) -> Result;  
 }
 ```
 
@@ -1493,18 +1537,18 @@ trait Display {
 
 ```cryo
 trait PartialEq<Rhs = Self> {
-    eq(&self, other: &Rhs) -> bool;
-    ne(&self, other: &Rhs) -> bool { !self.eq(other) }
+    eq(&this, other: &Rhs) -> bool;
+    ne(&this, other: &Rhs) -> bool { !self.eq(other) }
 }
 
 trait Eq: PartialEq<Self> {}
 
 trait PartialOrd<Rhs = Self>: PartialEq<Rhs> {
-    partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
+    partial_cmp(&this, other: &Rhs) -> Option<Ordering>;
 }
 
-trait Ord: Eq + PartialOrd<Self> {
-    cmp(&self, other: &Self) -> Ordering;
+trait Ord: Eq , PartialOrd<Self> {
+    cmp(&this, other: &this) -> Ordering;
 }
 ```
 
@@ -1514,9 +1558,9 @@ trait Ord: Eq + PartialOrd<Self> {
 
 ```
 trait Allocator {
-    allocate(&self, layout: Layout) -> Result<*mut u8, AllocError>;
-    deallocate(&self, ptr: *mut u8, layout: Layout);
-    realloc(&self, ptr: *mut u8, old: Layout, new: Layout) 
+    allocate(&this, layout: Layout) -> Result<*mut u8, AllocError>;
+    deallocate(&this, ptr: *mut u8, layout: Layout);
+    realloc(&this, ptr: *mut u8, old: Layout, new: Layout) 
         -> Result<*mut u8, AllocError>;
 }
 
@@ -1551,11 +1595,11 @@ struct Arc<T> {          // Atomic reference counted
 ```cryo
 trait Iterator {
     type Item;
-    next(&mut self) -> Option<Self::Item>;
+    next(&mut self) -> Option<This::Item>;
     
     // Default implementations for common operations
-    collect<C>(self) -> C where C: FromIterator<Self::Item>;
-    map<B, F>(self, f: F) -> Map<Self, F> where F: FnMut(Self::Item) -> B;
+    collect<C>(self) -> C where C: FromIterator<This::Item>;
+    map<B, F>(self, f: F) -> Map<Self, F> where F: FnMut(This::Item) -> B;
     filter<P>(self, predicate: P) -> Filter<Self, P>;
 }
 
@@ -1617,11 +1661,9 @@ Source Code → Lexical Analysis → Syntax Analysis → Semantic Analysis
 → Monomorphization → LLVM IR Generation → Code Generation → Linking
 ```
 
-**Definition 14.2** (Intermediate Representations): The compiler uses multiple IRs for optimization:
+**Definition 14.2** (Intermediate Representations): The compiler only true intermediate representation is LLVM IR:
 
 - **AST**: Abstract syntax tree preserving source structure
-- **HIR**: High-level IR after desugaring and name resolution  
-- **MIR**: Mid-level IR suitable for analysis and optimization
 - **LLVM IR**: Low-level IR for code generation
 
 ### 14.2 Type Checking and Inference
@@ -1785,7 +1827,7 @@ The development of Cryo demonstrates several important principles for systems la
 
 **Gradual Complexity**: Supporting both simple patterns for common cases and sophisticated patterns for complex requirements.
 
-**Tool-Friendly Design**: Designing language semantics to support sophisticated development tools and IDE integration.
+**Tool-Friendly Design**: Built-in toolchain support for project-based development, package management, CLI tools, and IDE integration. This principle avoids ad-hoc solutions and promotes a consistent developer experience within the language ecosystem.
 
 ### 16.3 Performance Characteristics
 
