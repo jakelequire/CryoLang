@@ -315,6 +315,9 @@ stdlib-signal:
 stdlib-hashmap:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/collections/hashmap.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/collections/hashmap.bc
 
+stdlib-pair:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/collections/pair.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/collections/pair.bc
+
 stdlib-tcp-gdb:
 	@echo "Building stdlib TCP module through gdb for debugging..."
 	@gdb -batch \
