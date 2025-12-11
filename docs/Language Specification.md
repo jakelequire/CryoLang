@@ -485,16 +485,25 @@ The type `Option<T>` is equivalent to the sum type `T + Unit`. Pattern matching 
 type class Animal {
 public:
     sound: string;
+
+    Animal(sound) {
+        this.sound = sound;
+    }
+    
     make_sound() -> string {
-        return self.sound;
+        return this.sound;
     }
 }
 
 type class Dog : Animal {
 public:
-    bark() -> string {
-        return "Woof!";
+    Dog() : super("Woof!") {}
+
+    override make_sound() -> string {
+        return this.sound + " (barks)";
     }
+private:
+    breed: string;
 }
 ```
 
@@ -1163,7 +1172,7 @@ ImplItem ::= FunctionDef
 
 ```bnf
 TraitBound ::= TypeParam : Trait
-             | TypeParam : Trait , Trait  
+             | TypeParam : Trait & Trait  
              | TypeParam : for<'a> Trait<'a>
 
 WhereClause ::= where TraitBound (, TraitBound)*
@@ -1185,8 +1194,8 @@ Higher-Ranked Bounds:
 
 ```bnf
 TraitObject ::= dyn Trait
-              | dyn Trait + Trait
-              | dyn Trait + 'lifetime
+              | dyn Trait & Trait
+              | dyn Trait & 'lifetime
 
 Object Safety Conditions:
 - No static methods
@@ -1595,16 +1604,16 @@ struct Arc<T> {          // Atomic reference counted
 ```cryo
 trait Iterator {
     type Item;
-    next(&mut self) -> Option<This::Item>;
+    next(&mut this) -> Option<This::Item>;
     
     // Default implementations for common operations
-    collect<C>(self) -> C where C: FromIterator<This::Item>;
-    map<B, F>(self, f: F) -> Map<Self, F> where F: FnMut(This::Item) -> B;
-    filter<P>(self, predicate: P) -> Filter<Self, P>;
+    collect<C>(this) -> C where C: FromIterator<This::Item>;
+    map<B, F>(this, f: F) -> Map<This, F> where F: FnMut(This::Item) -> B;
+    filter<P>(this, predicate: P) -> Filter<This, P>;
 }
 
 trait FromIterator<A> {
-    from_iter<T>(iter: T) -> Self where T: IntoIterator<Item = A>;
+    from_iter<T>(iter: T) -> This where T: IntoIterator<Item = A>;
 }
 ```
 
@@ -1623,19 +1632,19 @@ trait FromIterator<A> {
 
 ```
 trait Read {
-    read(&mut self, buf: &mut [u8]) -> Result<usize>;
-    read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize>;
-    read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
+    read(&mut this, buf: &mut [u8]) -> Result<usize>;
+    read_to_end(&mut this, buf: &mut Vec<u8>) -> Result<usize>;
+    read_exact(&mut this, buf: &mut [u8]) -> Result<()>;
 }
 
 trait Write {  
-    write(&mut self, buf: &[u8]) -> Result<usize>;
-    flush(&mut self) -> Result<()>;
-    write_all(&mut self, buf: &[u8]) -> Result<()>;
+    write(&mut this, buf: &[u8]) -> Result<usize>;
+    flush(&mut this) -> Result<()>;
+    write_all(&mut this, buf: &[u8]) -> Result<()>;
 }
 
 trait Seek {
-    seek(&mut self, pos: SeekFrom) -> Result<u64>;
+    seek(&mut this, pos: SeekFrom) -> Result<u64>;
 }
 ```
 
