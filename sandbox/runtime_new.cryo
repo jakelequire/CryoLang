@@ -1,0 +1,193 @@
+namespace std::Runtime;
+
+import <collections/pair>;
+import <collections/hashmap>;
+import <collections/vector>;
+import <io/stdio>;
+import <fs/file>;
+import <fs/path>;
+import <time/time>;
+import <atomic/types>;
+import <fmt/types>;
+
+const RUNTIME_VERSION_MAJOR: i32 = 0;
+const RUNTIME_VERSION_MINOR: i32 = 1;
+const RUNTIME_VERSION_PATCH: i32 = 0;
+const RUNTIME_BUILD_ID: string = "alpha";
+
+const DEFAULT_ALIGNMENT: u64 = 16;
+const PAGE_SIZE: u64 = 4096;
+const LARGE_OBJECT_THRESHOLD: u64 = 32,768; // 32 KB
+
+type enum RuntimeError {
+    OutOfMemory,
+    NullPointerDereference,
+    StackOverflow,
+    InvalidOperation,
+    ThreadPanic(string),
+    TypeMismatch,
+    IndexOutOfBounds,
+    DivisionByZero,
+    IntegerOverflow,
+    DeadlockDetected,
+    ResourceExhausted,
+    InvalidArgument,
+    SystemCallFailure(int),
+    FFIError(string),
+}
+
+
+implement fmt::Display for RuntimeError {
+    to_string(&this) -> string {
+        match this {
+            RuntimeError::OutOfMemory => "Out of memory".to_string(),
+            RuntimeError::NullPointerDereference => "Null pointer dereference".to_string(),
+            RuntimeError::StackOverflow => "Stack overflow".to_string(),
+            RuntimeError::InvalidOperation => "Invalid operation".to_string(),
+            RuntimeError::ThreadPanic(msg) => "Thread panic: ".to_string() + msg,
+            RuntimeError::TypeMismatch => "Type mismatch".to_string(),
+            RuntimeError::IndexOutOfBounds => "Index out of bounds".to_string(),
+            RuntimeError::DivisionByZero => "Division by zero".to_string(),
+            RuntimeError::IntegerOverflow => "Integer overflow".to_string(),
+            RuntimeError::DeadlockDetected => "Deadlock detected".to_string(),
+            RuntimeError::ResourceExhausted => "Resource exhausted".to_string(),
+            RuntimeError::InvalidArgument => "Invalid argument".to_string(),
+            RuntimeError::SystemCallFailure(code) => "System call failure with code: ".to_string() + fmt::int_to_string(code),
+            RuntimeError::FFIError(msg) => "FFI error: ".to_string() + msg,
+        }
+    }
+}
+
+implement error::Error for RuntimeError {}
+
+type RuntimeResult<T> = Result<T, RuntimeError>;
+
+type struct ObjectHeader {
+    size: u64;
+    type_id: u64;
+    mark_bits: AtomicU8;
+    forwarding_ptr: AtomicPtr<ObjectHeader>;
+    ref_count: AtomicU64;
+    generation: u32;
+    flags: u32;
+
+    ObjectHeader(s: u64, t_id: u64) {
+        this.size = s;
+        this.type_id = t_id;
+        this.mark_bits = AtomicU8(0);
+        this.forwarding_ptr = AtomicPtr<ObjectHeader>(null);
+        this.ref_count = AtomicU64(1);
+        this.generation = 0;
+        this.flags = 0;
+    }
+
+    ~ObjectHeader() default;
+
+    is_marked() -> boolean {
+        return this.mark_bits.load(Ordering::Acquire) != 0;
+    }
+
+    mark() -> void {
+        this.mark_bits.store(1, Ordering::Release);
+    }
+
+    unmark() -> void {
+        this.mark_bits.store(0, Ordering::Release);
+    }
+}
+
+type struct TypeId {
+    id: u64;
+
+    TypeId(identifier: u64) {
+        this.id = identifier;
+    }
+
+    ~TypeId() default;
+}
+
+
+type struct TypeInfo {
+    id: TypeId;
+    name: string;
+    size: u64;
+    alignment: u64;
+    is_primitive: boolean;
+    is_reference: boolean;
+    destructor: Option<(ptr: void*) -> void>;
+
+    TypeInfo(
+        type_id: TypeId, 
+        type_name: string, 
+        type_size: u64, 
+        type_alignment: u64, 
+        primitive: boolean, 
+        reference: boolean, 
+        destr: Option<(ptr: void*) -> void>)
+    {
+        this.id = type_id;
+        this.name = type_name;
+        this.size = type_size;
+        this.alignment = type_alignment;
+        this.is_primitive = primitive;
+        this.is_reference = reference;
+        this.destructor = destr;
+    }
+}
+
+
+type struct HeapRegion {
+    memory: void*;
+    size: u64;
+    allocated: u64;
+    free_blocks: Vector<Pair<u64, u64>>;
+}
+
+type struct LargeObject {
+    ptr: NonNull<void>;
+    size: u64;
+}
+
+type struct FreeList {
+    blocks: Vector<Pair<u64, u64>>; // start address, size
+    block_size: u64;
+}
+
+
+type struct MemoryAllocator {
+    nursery: HeapRegion;
+    old_generation: HeapRegion;
+    large_objects: Vector<HeapRegion>;
+    free_list: HashMap<u64, Vector<u64>>; // size -> list of free blocks
+    allocated_bytes: AtomicU64;
+    allocation_count: AtomicU64;
+    type_registry: HashMap<TypeId, TypeInfo>;
+
+    MemoryAllocator() -> RuntimeResult<This> {
+        this.nursery = HeapRegion(null, 0, 0, Vector<Pair<u64, u64>>());
+        this.old_generation = HeapRegion(null, 0, 0, Vector<Pair<u64, u64>>());
+        this.large_objects = Vector<HeapRegion>();
+        this.free_list = HashMap<u64, Vector<u64>>();
+        this.allocated_bytes = AtomicU64(0);
+        this.allocation_count = AtomicU64(0);
+        this.type_registry = HashMap<TypeId, TypeInfo>();
+
+        return RuntimeResult::Ok(this);
+    }
+
+    ~MemoryAllocator() default;
+
+    allocate(&this, size: u64, type_id: TypeId) -> RuntimeResult<ObjectHeader> {
+        const aligned_size = (size + DEFAULT_ALIGNMENT - 1) & ~(DEFAULT_ALIGNMENT - 1);
+        const total_size = aligned_size + sizeof(ObjectHeader);
+
+        const _ptr:  = if (total_size >= LARGE_OBJECT_THRESHOLD) {
+            // Allocate as large object
+            this.allocate_large_object(total_size)?
+        } else {
+            // Allocate from nursery or old generation
+            this.allocate_small_object(total_size)?
+        };
+    }
+}
+
