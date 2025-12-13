@@ -1,114 +1,51 @@
-#*******************************************************************************
-#  Copyright 2025 Jacob LeQuire                                                *
-#  SPDX-License-Identifier: Apache-2.0                                         *
-#*******************************************************************************
+# CryoLSP Server Makefile
+# Language Server Protocol implementation for CryoLang
 
-#*******************************************************************************
-# CryoLSP (Language Server Protocol) Makefile                                  *
-#*******************************************************************************
+# Compiler settings
+CXX = C:/msys64/mingw64/bin/clang++
+CXXFLAGS = -std=c++23 -D_CRT_SECURE_NO_WARNINGS -DNOMINMAX -DWIN32_LEAN_AND_MEAN -w -g -Og -I"C:/msys64/mingw64/include" -fexceptions
+INCLUDES = -I../../include -I./include
+LIBS = -L../../bin -lcryo-compiler -LC:/msys64/mingw64/lib "C:/msys64/mingw64/lib/libLLVM-20.dll.a" -lws2_32
 
-# Get settings from parent makefile
-include ../../makefile.config
+# Directories
+SRC_DIR = src
+INCLUDE_DIR = include
+BUILD_DIR = ../../bin/.o/lsp
+TARGET_DIR = ../../bin
+TARGET = $(TARGET_DIR)/cryolsp.exe
 
-# LSP-specific settings
-LSP_TARGET = cryo-lsp$(BIN_SUFFIX)
-LSP_BIN_DIR = ../../bin
-LSP_OBJ_DIR = ../../bin/.o/LSP
+# Source files
+SOURCES = $(wildcard $(SRC_DIR)/*.cpp)
+OBJECTS = $(SOURCES:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o)
 
-# Source directories
-LSP_SRC_DIR = src
-LSP_INCLUDE_DIR = include
-
-# Find all source files recursively
-LSP_SOURCES = $(shell find $(LSP_SRC_DIR) -name "*.cpp" 2>/dev/null || powershell -Command "Get-ChildItem -Path $(LSP_SRC_DIR) -Recurse -Filter '*.cpp' | ForEach-Object { $$_.FullName -replace '.*\\$(LSP_SRC_DIR)\\', '$(LSP_SRC_DIR)/' -replace '\\', '/' }")
-LSP_OBJECTS = $(patsubst $(LSP_SRC_DIR)/%.cpp,$(LSP_OBJ_DIR)/%.o,$(LSP_SOURCES))
-
-# Include paths - reuse from main project plus LSP includes
-LSP_INCLUDES = -I$(LSP_INCLUDE_DIR) -I../../include
-
-# Compiler settings - inherit from main project
-LSP_CXXFLAGS = $(CXXFLAGS) $(LSP_INCLUDES)
-
-# Link against minimal dependencies (standalone LSP server)
-LSP_LIBS = 
-
-# Cryo compiler library
-COMPILER_LIB = ../../bin/libcryo-compiler.a
-
-# OS-specific socket libraries
-ifeq ($(OS), Windows_NT)
-    SOCKET_LIBS = -lws2_32 -lwsock32
-else
-    SOCKET_LIBS = 
-endif
-
-.PHONY: all clean help
+.PHONY: all clean
 
 # Default target
-all: $(LSP_BIN_DIR)/$(LSP_TARGET)
+all: $(TARGET)
 
-# Create output directories
-$(LSP_OBJ_DIR):
-	@echo "Creating LSP object directory..."
-ifeq ($(OS), Windows_NT)
-	@if not exist "$(LSP_OBJ_DIR)" mkdir "$(subst /,\,$(LSP_OBJ_DIR))"
-else
-	@mkdir -p $(LSP_OBJ_DIR)
-endif
+# Create build directory
+$(BUILD_DIR):
+	@if not exist "$(BUILD_DIR)" mkdir "$(BUILD_DIR)"
 
-# Compile LSP source files
-$(LSP_OBJ_DIR)/%.o: $(LSP_SRC_DIR)/%.cpp | $(LSP_OBJ_DIR)
-	@echo "Compiling LSP: $<"
-ifeq ($(OS), Windows_NT)
-	@if not exist "$(dir $@)" mkdir "$(subst /,\,$(dir $@))"
-else
-	@mkdir -p $(dir $@)
-endif
-	$(CXX) $(LSP_CXXFLAGS) -c $< -o $@
+# Compile source files
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-# Link the LSP executable
-$(LSP_BIN_DIR)/$(LSP_TARGET): $(LSP_OBJECTS) $(COMPILER_LIB)
-	@echo "Linking CryoLSP..."
-	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJECTS) $(COMPILER_LIB) $(LSP_LIBS) -o $@ $(LDFLAGS) $(SOCKET_LIBS)
-	@echo "✓ CryoLSP built successfully: $(LSP_BIN_DIR)/$(LSP_TARGET)"
+# Link executable
+$(TARGET): $(OBJECTS)
+	$(CXX) $(OBJECTS) $(LIBS) -o $@
+	@echo "✓ CryoLSP server built successfully: $(TARGET)"
 
-# TCP version target
-tcp: $(LSP_BIN_DIR)/cryo-lsp-tcp$(BIN_SUFFIX)
-
-# TCP version objects (exclude main.o, include main_tcp.o and TcpTransport.o)
-LSP_TCP_OBJECTS = $(filter-out $(LSP_OBJ_DIR)/main.o,$(LSP_OBJECTS)) $(LSP_OBJ_DIR)/main_tcp.o $(LSP_OBJ_DIR)/transport/TcpTransport.o
-
-# Build TCP version
-$(LSP_BIN_DIR)/cryo-lsp-tcp$(BIN_SUFFIX): $(LSP_OBJ_DIR)/main_tcp.o $(LSP_OBJ_DIR)/transport/TcpTransport.o $(filter-out $(LSP_OBJ_DIR)/main.o,$(LSP_OBJECTS)) $(COMPILER_LIB)
-	@echo "Linking CryoLSP TCP..."
-	$(CXX) $(LSP_CXXFLAGS) $(LSP_OBJ_DIR)/main_tcp.o $(LSP_OBJ_DIR)/transport/TcpTransport.o $(filter-out $(LSP_OBJ_DIR)/main.o,$(LSP_OBJECTS)) $(COMPILER_LIB) $(LSP_LIBS) -o $@ $(LDFLAGS) $(SOCKET_LIBS)
-	@echo "✓ CryoLSP TCP built successfully: $(LSP_BIN_DIR)/cryo-lsp-tcp$(BIN_SUFFIX)"
-
-
-
-# Clean LSP build artifacts
+# Clean build artifacts
 clean:
-	@echo "Cleaning LSP build artifacts..."
-ifeq ($(OS), Windows_NT)
-	@if exist "$(LSP_OBJ_DIR)" rmdir /S /Q "$(subst /,\,$(LSP_OBJ_DIR))"
-	@if exist "$(LSP_BIN_DIR)\$(LSP_TARGET)" del /Q "$(subst /,\,$(LSP_BIN_DIR)\$(LSP_TARGET))"
-else
-	@rm -rf $(LSP_OBJ_DIR)
-	@rm -f $(LSP_BIN_DIR)/$(LSP_TARGET)
-endif
-	@echo "✓ LSP clean completed"
+	@if exist "$(BUILD_DIR)" rmdir /s /q "$(BUILD_DIR)"
+	@if exist "$(TARGET)" del /f "$(TARGET)"
+	@echo "✓ Cleaned CryoLSP build artifacts"
 
-# Help target
-help:
-	@echo "CryoLSP Build System"
-	@echo "===================="
-	@echo "Targets:"
-	@echo "  all     - Build the CryoLSP server (default, stdio transport)"
-	@echo "  tcp     - Build the CryoLSP TCP server (TCP socket transport)"
-	@echo "  clean   - Clean LSP build artifacts"
-	@echo "  help    - Show this help message"
-	@echo ""
-	@echo "Output:"
-	@echo "  Stdio Binary: $(LSP_BIN_DIR)/$(LSP_TARGET)"
-	@echo "  TCP Binary: $(LSP_BIN_DIR)/cryo-lsp-tcp$(BIN_SUFFIX)"
-	@echo "  Objects: $(LSP_OBJ_DIR)/"
+# Debug target with verbose output
+debug: CXXFLAGS += -DDEBUG -v
+debug: $(TARGET)
+
+# Install target (copy to system path if needed)
+install: $(TARGET)
+	@echo "CryoLSP server is ready at: $(TARGET)"

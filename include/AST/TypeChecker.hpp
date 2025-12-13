@@ -151,7 +151,7 @@ namespace Cryo
 
         // Access symbols for detailed inspection
         const std::unordered_map<std::string, TypedSymbol> &get_symbols() const { return _symbols; }
-        
+
         // Clear all symbols (useful for testing)
         void clear() { _symbols.clear(); }
 
@@ -239,8 +239,6 @@ namespace Cryo
         // Helper method to parse comma-separated template arguments
         std::vector<std::string> parse_template_arguments(const std::string &args_str);
 
-
-
         // NEW: Token-based type resolution (preferred)
         Type *resolve_type_from_tokens(Lexer &lexer);
         Type *resolve_type_from_token_stream(const std::vector<Token> &tokens, size_t &index);
@@ -266,6 +264,7 @@ namespace Cryo
         // Diagnostic manager for error reporting (optional)
         DiagnosticManager *_diagnostic_manager = nullptr;
         std::string _source_file; // Current source file being checked
+        bool _lsp_mode = false;   // LSP compilation mode
 
         // Diagnostic builder for enhanced error reporting
         std::unique_ptr<TypeCheckerDiagnosticBuilder> _diagnostic_builder;
@@ -320,7 +319,7 @@ namespace Cryo
 
         // Access to TypeContext for monomorphization
         TypeContext &get_type_context() { return _type_context; }
-        
+
         // Access to SRM context for import resolution
         Cryo::SRM::SymbolResolutionContext *get_srm_context() { return _srm_context.get(); }
         const Cryo::SRM::SymbolResolutionContext *get_srm_context() const { return _srm_context.get(); }
@@ -339,10 +338,11 @@ namespace Cryo
 
         // Type table access
         void print_type_table(std::ostream &os = std::cout) const { _symbol_table->print_type_table(os); }
-        
+
         // Clear symbol table (useful for testing)
-        void clear_symbols() { 
-            _symbol_table->clear(); 
+        void clear_symbols()
+        {
+            _symbol_table->clear();
             // Reset symbol loading flags to allow fresh loading
             _builtin_symbols_loaded = false;
             _intrinsic_symbols_loaded = false;
@@ -358,11 +358,11 @@ namespace Cryo
         TypedSymbol *lookup_symbol(const std::string &name) const { return _symbol_table->lookup_symbol(name); }
 
         // SRM Helper Methods for standardized naming
-        std::string generate_function_name(const std::string& function_name, const std::vector<Cryo::Type*>& parameter_types);
-        std::string generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types);
-        std::string generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind);
+        std::string generate_function_name(const std::string &function_name, const std::vector<Cryo::Type *> &parameter_types);
+        std::string generate_method_name(const std::string &type_name, const std::string &method_name, const std::vector<Cryo::Type *> &parameter_types);
+        std::string generate_qualified_name(const std::string &base_name, Cryo::SymbolKind symbol_kind);
         std::vector<std::string> get_current_namespace_parts() const;
-        std::string resolve_module_path_to_namespace(const std::string& module_path) const;
+        std::string resolve_module_path_to_namespace(const std::string &module_path) const;
 
         // Visitor methods - Program
         void visit(ProgramNode &node) override;
@@ -471,12 +471,32 @@ namespace Cryo
         bool is_boolean_context_valid(Type *type);
         bool is_primitive_integer_type(const std::string &type_name);
         bool is_method_declared_in_type(const std::string &type_name, const std::string &method_name);
-        
+
         // Template parameter management
         std::vector<std::string> get_template_parameters(const std::string &type_name) const;
 
         // Enum validation helpers
         void validate_enum_variant(EnumVariantNode &node, const std::vector<std::string> &generic_param_names);
+
+        // LSP-specific API
+        struct LSPTypeInfo
+        {
+            std::string type_name;
+            std::string kind; // "primitive", "struct", "class", "enum", "function", etc.
+            std::string documentation;
+            std::vector<std::string> members;         // For structs/classes
+            std::vector<std::string> methods;         // For classes
+            std::string return_type;                  // For functions
+            std::vector<std::string> parameter_types; // For functions
+            bool is_generic;
+            std::vector<std::string> generic_parameters;
+        };
+
+        std::optional<LSPTypeInfo> get_type_info_at_position(const std::string &filename,
+                                                             size_t line, size_t column) const;
+        std::optional<LSPTypeInfo> get_type_info_by_name(const std::string &type_name) const;
+        std::vector<std::string> get_available_completions(const std::string &context) const;
+        std::string get_hover_info(const std::string &symbol_name) const;
 
         // Generic type substitution helpers
         std::vector<std::string> extract_template_parameter_names(const std::string &template_type_string);

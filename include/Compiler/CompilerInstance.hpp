@@ -72,6 +72,8 @@ namespace Cryo
         bool _stdlib_linking_enabled;                  // Control whether to link libcryo.a by default
         bool _stdlib_compilation_mode;                 // Control whether to generate full implementations for stdlib compilation
         bool _auto_imports_enabled;                    // Control whether to automatically import core types
+        bool _lsp_mode;                                // LSP compilation mode
+        bool _frontend_only;                           // Frontend-only compilation mode
         std::string _current_namespace;                // Current namespace context
         std::vector<std::string> _imported_namespaces; // Track imported namespaces for enhanced resolution
 
@@ -128,7 +130,7 @@ namespace Cryo
         // Standard library compilation mode (generates full implementations)
         void set_stdlib_compilation_mode(bool enable) { _stdlib_compilation_mode = enable; }
         bool stdlib_compilation_mode() const { return _stdlib_compilation_mode; }
-        
+
         void set_auto_imports_enabled(bool enable) { _auto_imports_enabled = enable; }
         bool auto_imports_enabled() const { return _auto_imports_enabled; }
 
@@ -148,6 +150,11 @@ namespace Cryo
         void dump_type_errors(std::ostream &os = std::cout) const;
         void dump_ir(std::ostream &os = std::cout) const;
         void print_diagnostics(std::ostream &os = std::cerr) const;
+
+        // LSP-specific compilation mode
+        bool compile_for_lsp(const std::string &source_file);
+        void set_lsp_mode(bool enabled) { _lsp_mode = enabled; }
+        bool is_lsp_mode() const { return _lsp_mode; }
         void clear();
 
     private:
@@ -164,7 +171,7 @@ namespace Cryo
         void process_struct_declarations_recursive(ASTNode *node);
         std::string build_function_signature(FunctionDeclarationNode *func_decl);
         void inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name); // Auto-import core types
-        
+
         // SRM helper methods
         std::string generate_method_name(const std::string &scope_name, const std::string &class_name, const std::string &method_name);
 
