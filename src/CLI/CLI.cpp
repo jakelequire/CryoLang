@@ -100,41 +100,42 @@ namespace Cryo::CLI
                         std::string value = flag_name.substr(eq_pos + 1);
                         args.set_arg(key, value);
                     }
-                // Handle special compilation flags that expect values
-                else if ((flag_name == "o" || flag_name == "output" ||
-                          flag_name == "log-file" || flag_name == "log-component") &&
-                         i + 1 < argc && !is_flag(argv[i + 1]))
-                {
-                    args.set_arg(flag_name, argv[++i]);
-                }
-                // Handle boolean flags
-                else if (flag_name == "c" || flag_name == "compile-only" ||
-                         flag_name == "ast" || flag_name == "show-ast" ||
-                         flag_name == "symbols" || flag_name == "show-symbols" ||
-                         flag_name == "ir" || flag_name == "show-ir" ||
-                         flag_name == "emit-llvm" ||
-                         flag_name == "analyze" ||
-                         flag_name == "help" || flag_name == "h" ||
-                         flag_name == "version" || flag_name == "v" ||
-                         flag_name == "no-std" || flag_name == "stdlib-mode" ||
-                         flag_name == "debug" || flag_name == "d" ||
-                         flag_name == "verbose" ||
-                         flag_name == "trace")
-                {
-                    args.set_flag(flag_name, true);
-                }
-                else
-                {
-                    // Check if next argument is not a flag (value for this flag)
-                    if (i + 1 < argc && !is_flag(argv[i + 1]))
+                    // Handle special compilation flags that expect values
+                    else if ((flag_name == "o" || flag_name == "output" ||
+                              flag_name == "log-file" || flag_name == "log-component") &&
+                             i + 1 < argc && !is_flag(argv[i + 1]))
                     {
                         args.set_arg(flag_name, argv[++i]);
                     }
-                    else
+                    // Handle boolean flags
+                    else if (flag_name == "c" || flag_name == "compile-only" ||
+                             flag_name == "ast" || flag_name == "show-ast" ||
+                             flag_name == "symbols" || flag_name == "show-symbols" ||
+                             flag_name == "ir" || flag_name == "show-ir" ||
+                             flag_name == "emit-llvm" ||
+                             flag_name == "analyze" ||
+                             flag_name == "help" || flag_name == "h" ||
+                             flag_name == "version" || flag_name == "v" ||
+                             flag_name == "no-std" || flag_name == "stdlib-mode" ||
+                             flag_name == "debug" || flag_name == "d" ||
+                             flag_name == "verbose" ||
+                             flag_name == "trace" ||
+                             flag_name == "lsp")
                     {
                         args.set_flag(flag_name, true);
                     }
-                }
+                    else
+                    {
+                        // Check if next argument is not a flag (value for this flag)
+                        if (i + 1 < argc && !is_flag(argv[i + 1]))
+                        {
+                            args.set_arg(flag_name, argv[++i]);
+                        }
+                        else
+                        {
+                            args.set_flag(flag_name, true);
+                        }
+                    }
                 } // Close the main else block for non-D flags
             }
             else

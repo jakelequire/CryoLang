@@ -13,7 +13,7 @@
 namespace Cryo
 {
     CompilerInstance::CompilerInstance()
-        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _auto_imports_enabled(true), _current_namespace("")
+        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _auto_imports_enabled(true), _current_namespace(""), _lsp_mode(false), _frontend_only(false)
     {
         initialize_components();
     }
@@ -358,9 +358,10 @@ namespace Cryo
         {
             _ast_root = _parser->parse_program();
 
-            // Immediately discover and register generic types from the AST 
+            // Immediately discover and register generic types from the AST
             // This must happen before any type resolution attempts
-            if (_ast_root) {
+            if (_ast_root)
+            {
                 _type_checker->discover_generic_types_from_ast(*_ast_root);
             }
 
@@ -628,7 +629,7 @@ namespace Cryo
             {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Importing specialized methods from TypeChecker to CodeGen...");
                 _codegen->get_visitor()->import_specialized_methods(*_type_checker);
-                
+
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Importing namespace aliases from TypeChecker to CodeGen...");
                 _codegen->get_visitor()->import_namespace_aliases(*_type_checker);
             }
@@ -778,6 +779,70 @@ namespace Cryo
         return _diagnostic_manager && _diagnostic_manager->has_errors();
     }
 
+    bool CompilerInstance::compile_for_lsp(const std::string &source_file)
+    {
+        try
+        {
+            // Set LSP mode
+            _lsp_mode = true;
+            _frontend_only = true; // LSP doesn't need codegen
+
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Starting LSP compilation for: {}", source_file);
+            }
+
+            // Set source file
+            set_source_file(source_file);
+
+            // Parse and analyze (no codegen needed for LSP)
+            auto file = make_file_from_path(source_file);
+            if (!file || !file->is_loaded())
+            {
+                if (_debug_mode)
+                {
+                    LOG_ERROR(Cryo::LogComponent::GENERAL, "LSP: Could not load file {}", source_file);
+                }
+                return false;
+            }
+
+            if (!parse_source_from_file(std::move(file)))
+            {
+                if (_debug_mode)
+                {
+                    LOG_ERROR(Cryo::LogComponent::GENERAL, "LSP: Parse failed for {}", source_file);
+                }
+                return false;
+            }
+
+            // Run analysis phase (type checking, symbol resolution)
+            if (!analyze())
+            {
+                if (_debug_mode)
+                {
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "LSP: Analysis failed for {} - providing partial information", source_file);
+                }
+                // Don't return false - LSP should provide partial information even with errors
+            }
+
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "LSP compilation completed for: {}", source_file);
+            }
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            if (_debug_mode)
+            {
+                LOG_ERROR(Cryo::LogComponent::GENERAL, "LSP compilation exception: {}", e.what());
+            }
+            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
+                                              SourceRange{}, source_file);
+            return false;
+        }
+    }
+
     void CompilerInstance::print_ast(std::ostream &os, bool use_colors) const
     {
         if (_ast_root)
@@ -877,11 +942,11 @@ namespace Cryo
                 {
                     const auto &diag = diagnostics[i];
                     bool is_stdlib = _diagnostic_manager->is_stdlib_diagnostic(diag);
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Diagnostic {}: severity={}, filename='{}', is_stdlib={}, message='{}'", 
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Diagnostic {}: severity={}, filename='{}', is_stdlib={}, message='{}'",
                               i, static_cast<int>(diag.severity()), diag.filename(), is_stdlib, diag.message());
                 }
             }
-            
+
             if (_diagnostic_manager->total_count() > 0)
             {
                 _diagnostic_manager->print_all(os);
@@ -1037,8 +1102,8 @@ namespace Cryo
             current_scope->declare_symbol(intrinsic_decl->name(), SymbolKind::Intrinsic,
                                           intrinsic_decl->location(), function_type, "std::Intrinsics");
 
-            LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered intrinsic function '{}' in namespace 'std::Intrinsics'", 
-                     intrinsic_decl->name());
+            LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered intrinsic function '{}' in namespace 'std::Intrinsics'",
+                      intrinsic_decl->name());
         }
         // Handle struct declarations
         else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
@@ -1281,13 +1346,14 @@ namespace Cryo
                         // Register namespace for qualified access (e.g., IO::println)
                         current_scope->register_namespace(namespace_name, result.symbol_map);
                         _imported_namespaces.push_back(namespace_name); // Track for enhanced resolution
-                        
+
                         // Also register in SRM context for proper wildcard import resolution
-                        if (_symbol_resolution_manager && _symbol_resolution_manager->get_context()) {
+                        if (_symbol_resolution_manager && _symbol_resolution_manager->get_context())
+                        {
                             _symbol_resolution_manager->get_context()->add_imported_namespace(namespace_name);
                             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added '{}' to SRM imported namespaces", namespace_name);
                         }
-                        
+
                         // TODO: Re-enable TypeChecker SRM synchronization after fixing crashes
                         // Temporarily disabled due to compilation issues
                         /*
@@ -1301,7 +1367,7 @@ namespace Cryo
                             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added '{}' to TypeChecker SRM imported namespaces", namespace_name);
                         }
                         */
-                        
+
                         // Also register symbols directly in current scope for unqualified access (e.g., println)
                         // This enables wildcard imports to work with direct function calls
                         for (const auto &[symbol_name, symbol] : result.symbol_map)
@@ -1310,7 +1376,7 @@ namespace Cryo
                             current_scope->declare_symbol(symbol_name, symbol.kind, symbol.declaration_location, symbol.data_type, scope_name);
                             LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered wildcard symbol for unqualified access: {}", symbol_name);
                         }
-                        
+
                         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered namespace '{}' with {} symbols (qualified and unqualified access)",
                                   namespace_name, result.symbol_map.size());
                     }
@@ -1554,7 +1620,7 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports in stdlib compilation mode");
             return;
         }
-        
+
         if (!_auto_imports_enabled)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imports disabled");
@@ -1828,7 +1894,7 @@ namespace Cryo
                 process_struct_declarations_recursive(statement.get());
             }
         }
-        
+
         // If this is a block statement, process its statements
         else if (auto block = dynamic_cast<BlockStatementNode *>(node))
         {

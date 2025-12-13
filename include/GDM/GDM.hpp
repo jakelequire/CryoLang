@@ -590,12 +590,12 @@ namespace Cryo
         size_t warning_count() const { return _warning_count; }
         size_t note_count() const { return _note_count; }
         size_t total_count() const { return _diagnostics.size(); }
-        
+
         // User code only statistics (excluding stdlib)
         size_t user_error_count() const;
         size_t user_warning_count() const;
         size_t user_total_count() const;
-        
+
         // Utility method to detect if a diagnostic is from stdlib code
         bool is_stdlib_diagnostic(const Diagnostic &diagnostic) const;
 
@@ -612,6 +612,24 @@ namespace Cryo
         // State management
         void clear();
         bool should_continue_compilation() const;
+
+        // LSP-specific API
+        struct LSPDiagnostic
+        {
+            std::string message;
+            std::string severity; // "error", "warning", "info", "hint"
+            size_t line;
+            size_t column;
+            size_t end_line;
+            size_t end_column;
+            std::string filename;
+            std::vector<std::string> suggestions;
+            std::string code; // Error code like "E0001"
+        };
+
+        std::vector<LSPDiagnostic> get_lsp_diagnostics() const;
+        void clear_lsp_diagnostics();
+        bool has_lsp_diagnostics() const;
 
     private:
         void update_statistics(DiagnosticSeverity severity);

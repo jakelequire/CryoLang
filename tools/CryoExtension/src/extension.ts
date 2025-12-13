@@ -1,599 +1,395 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import * as net from 'net';
-import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind, ErrorAction, CloseAction, Trace } from 'vscode-languageclient/node';
+import {
+    LanguageClient,
+    LanguageClientOptions,
+    ServerOptions,
+    TransportKind,
+    ErrorAction,
+    CloseAction,
+    StreamInfo
+} from 'vscode-languageclient/node';
+import { Socket } from 'net';
 
-let client: LanguageClient | undefined;
-let clientStopped = false; // Flag to prevent auto-restart
-let isRestarting = false; // Flag to prevent multiple simultaneous restarts
-let consecutiveRestarts = 0; // Track restart attempts
-let lastRestartTime = 0; // Track time of last restart
-let consecutiveHoverFailures = 0; // Track hover failures for auto-restart
-let lastHoverSuccess = Date.now(); // Track last successful hover
-
-// File logging utility
-function logToFile(level: string, component: string, message: string) {
-    // File logging disabled to prevent log spam
-    return;
-}
-
-// Convenience logging functions - reduced logging to prevent log spam
-const LOG = {
-    debug: (component: string, message: string) => {
-        // Debug logging disabled to reduce log file size
-    },
-    info: (component: string, message: string) => {
-        // Info logging disabled to reduce log file size  
-    },
-    error: (component: string, message: string) => {
-        console.error(`[ERROR] [${component}] ${message}`);
-        logToFile('ERROR', component, message);
-    }
-};
-
-// Helper function to check if LSP server is already running on a port
-async function checkServerRunning(port: number): Promise<boolean> {
-    return new Promise((resolve) => {
-        const socket = new net.Socket();
-
-        const timeout = setTimeout(() => {
-            socket.destroy();
-            resolve(false);
-        }, 1000);
-
-        socket.on('connect', () => {
-            clearTimeout(timeout);
-            socket.destroy();
-            resolve(true);
-        });
-
-        socket.on('error', () => {
-            clearTimeout(timeout);
-            resolve(false);
-        });
-
-        socket.connect(port, 'localhost');
-    });
-}
+let client: LanguageClient;
+let manualShutdown = false; // Track if shutdown was intentional
+let serverDisabled = false; // Track if server is completely disabled
 
 export function activate(context: vscode.ExtensionContext) {
-    LOG.info('Extension', '=== Cryo Language Support Extension Activated ===');
-    LOG.info('Extension', 'Extension path: ' + context.extensionPath);
-    LOG.info('Extension', 'Workspace folders: ' + JSON.stringify(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath)));
+    console.log('CryoLang extension is now active!');
+    vscode.window.showInformationMessage('CryoLang extension activated!');
 
-    // Debug: Check if VS Code recognizes .cryo files
-    const activeEditor = vscode.window.activeTextEditor;
-    if (activeEditor) {
-        LOG.debug('Extension', 'Active editor document: ' + JSON.stringify({
-            fileName: activeEditor.document.fileName,
-            languageId: activeEditor.document.languageId,
-            uri: activeEditor.document.uri.toString()
-        }));
-    }
+    // Store context globally for restart functionality
+    (global as any).cryoExtensionContext = context;
 
-    // Listen for active editor changes to see language ID
-    const editorChangeDisposable = vscode.window.onDidChangeActiveTextEditor((editor) => {
-        // Logging disabled - hover functionality is working
+    // Start the language server
+    startLanguageServer(context);
+
+    // Register commands
+    const restartCommand = vscode.commands.registerCommand('cryo.restartLanguageServer', () => {
+        restartLanguageServer(context);
     });
 
-    // Determine the correct executable name based on platform
-    const isWindows = process.platform === 'win32';
-    const lspExecutableName = isWindows ? 'cryo-lsp.exe' : 'cryo-lsp';
+    const shutdownCommand = vscode.commands.registerCommand('cryo.shutdownLanguageServer', () => {
+        shutdownLanguageServer();
+    });
 
-    // Try multiple possible paths for the LSP server executable
-    const possiblePaths = [
-        // Development path (from extension directory up to project root, then to bin)
-        path.join(context.extensionPath, '..', '..', '..', 'bin', lspExecutableName),
-        // Bundled path (if LSP is bundled with extension)
-        path.join(context.extensionPath, 'bin', lspExecutableName),
-        // Look in workspace root/bin if we're in a CryoLang workspace
-        ...(vscode.workspace.workspaceFolders || []).map(folder =>
-            path.join(folder.uri.fsPath, 'bin', lspExecutableName)
-        ),
-        // Legacy Windows absolute path (keeping for backward compatibility)
-        ...(isWindows ? ['C:\\Programming\\apps\\CryoLang\\bin\\cryo-lsp.exe'] : [])
-    ];
+    const disableCommand = vscode.commands.registerCommand('cryo.disableLanguageServer', () => {
+        disableLanguageServer();
+    });
 
-    let serverCommand = '';
+    const enableCommand = vscode.commands.registerCommand('cryo.enableLanguageServer', () => {
+        enableLanguageServer(context);
+    });
 
-    LOG.info('Extension', `Platform detected: ${process.platform}, looking for executable: ${lspExecutableName}`);
-    LOG.info('Extension', `Possible paths to check: ${possiblePaths.length}`);
+    const openLogCommand = vscode.commands.registerCommand('cryo.openLogFile', () => {
+        openLogFile();
+    });
 
-    for (const possiblePath of possiblePaths) {
-        LOG.debug('Extension', 'Checking for LSP server at: ' + possiblePath);
-        if (fs.existsSync(possiblePath)) {
-            serverCommand = possiblePath;
-            LOG.info('Extension', 'Found LSP server at: ' + serverCommand);
-            break;
-        }
+    context.subscriptions.push(restartCommand, shutdownCommand, disableCommand, enableCommand, openLogCommand);
+}
+
+export function deactivate(): Thenable<void> | undefined {
+    if (!client) {
+        return undefined;
     }
+    return client.stop();
+}
 
-    if (!serverCommand) {
-        const errorMsg = 'Cryo LSP Server not found. Please ensure cryo-lsp.exe is built.';
-        LOG.error('Extension', errorMsg);
-        vscode.window.showErrorMessage(errorMsg);
+function startLanguageServer(context: vscode.ExtensionContext) {
+    console.log('Starting CryoLang Language Server...');
+    vscode.window.showInformationMessage('Starting CryoLang Language Server...');
+
+    // Don't start if server is disabled
+    if (serverDisabled) {
+        console.log('Language server is disabled, not starting');
         return;
     }
 
-    // Automatic restart function for when LSP crashes
-    async function attemptAutoRestart() {
-        if (isRestarting || clientStopped) {
-            LOG.info('LanguageServer', 'Auto-restart skipped - already restarting or stopped');
-            return;
-        }
+    const serverPath = findLanguageServer();
+    console.log('Server path found:', serverPath);
+    vscode.window.showInformationMessage('Server path: ' + (serverPath || 'NOT FOUND'));
 
-        try {
-            isRestarting = true;
-            lastRestartTime = Date.now();
-            
-            LOG.info('LanguageServer', 'Attempting automatic restart of language server...');
-            
-            // Stop existing client
-            if (client) {
-                try {
-                    await client.stop(3000); // Shorter timeout for auto-restart
-                    client.dispose();
-                    client = undefined;
-                } catch (error) {
-                    LOG.error('LanguageServer', 'Error stopping client during auto-restart: ' + String(error));
-                }
+    if (!serverPath) {
+        console.error('CryoLSP server not found');
+        vscode.window.showErrorMessage(
+            'CryoLSP language server not found. Please check your configuration or ensure the server is built.',
+            'Open Settings'
+        ).then((selection: string | undefined) => {
+            if (selection === 'Open Settings') {
+                vscode.commands.executeCommand('workbench.action.openSettings', 'cryo.languageServer');
             }
+        });
+        return;
+    }
 
-            // Small delay to ensure cleanup
-            await new Promise(resolve => setTimeout(resolve, 1000));
+    const config = vscode.workspace.getConfiguration('cryo.languageServer');
+    const debugMode = config.get<boolean>('debug', true); // Default to true for now
 
-            // Start fresh
-            await startLanguageServer();
-            
-            LOG.info('LanguageServer', 'Automatic restart completed successfully');
-            vscode.window.showInformationMessage('Cryo Language Server automatically restarted');
-            
-        } catch (error) {
-            LOG.error('LanguageServer', 'Automatic restart failed: ' + String(error));
-            vscode.window.showErrorMessage(`Failed to restart language server: ${error}`);
-        } finally {
-            isRestarting = false;
+    // Create log file in workspace root if possible, otherwise next to server
+    let logFile = config.get<string>('logFile', '');
+    if (!logFile) {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (workspaceRoot) {
+            logFile = path.join(workspaceRoot, 'cryo-lsp.log');
+        } else {
+            logFile = path.join(path.dirname(serverPath), '..', 'cryo-lsp.log');
         }
     }
 
-    async function startLanguageServer() {
-        // Check if client was intentionally stopped
-        if (clientStopped) {
-            LOG.info('LanguageServer', 'Language client was intentionally stopped, not restarting.');
-            return;
-        }
+    // Ensure log file directory exists
+    const logDir = path.dirname(logFile);
+    if (!fs.existsSync(logDir)) {
+        fs.mkdirSync(logDir, { recursive: true });
+    }
 
-        // Get workspace root for server configuration
-        const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    // Use TCP mode for reliable communication
+    const port = 8080;
+    const serverArgs: string[] = ['--tcp', port.toString()];
+    if (debugMode) {
+        serverArgs.push('--debug');
+    }
+    if (logFile) {
+        serverArgs.push('--log-file', logFile);
+    }
 
-        // If client already exists, stop it first
-        if (client) {
-            try {
-                LOG.info('LanguageServer', 'Stopping existing client...');
-                await client.stop(5000); // 5 second timeout
-                client.dispose();
-                // Add a delay to ensure proper cleanup
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            } catch (error) {
-                LOG.error('LanguageServer', 'Error stopping previous client: ' + String(error));
-            }
-        }
+    console.log('Server path:', serverPath);
+    console.log('Server args:', serverArgs);
+    console.log('Log file path:', logFile);
 
-        LOG.info('LanguageServer', 'Configuring server options for LSP communication');
+    // Configure server options with TCP transport
+    const serverOptions: ServerOptions = () => {
+        return new Promise<StreamInfo>((resolve, reject) => {
+            console.log('Starting LSP server with TCP transport...');
 
-        // Test server executable first
-        LOG.debug('LanguageServer', 'Testing server executable...');
-        try {
-            const testResult = await new Promise<string>((resolve, reject) => {
-                const testProcess = require('child_process').spawn(serverCommand, ['--version'], {
-                    stdio: ['pipe', 'pipe', 'pipe']
-                });
-                
-                let output = '';
-                testProcess.stdout.on('data', (data: Buffer) => {
-                    output += data.toString();
-                });
-                
-                testProcess.stderr.on('data', (data: Buffer) => {
-                    output += data.toString();
-                });
-                
-                testProcess.on('close', (code: number) => {
-                    LOG.debug('LanguageServer', `Test process exited with code: ${code}`);
-                    if (code === 0 || output.length > 0) {
-                        resolve(output);
-                    } else {
-                        reject(new Error(`Process exited with code ${code}`));
-                    }
-                });
-                
-                testProcess.on('error', (error: Error) => {
-                    reject(error);
-                });
-                
-                // Timeout after 5 seconds
-                setTimeout(() => {
-                    testProcess.kill();
-                    reject(new Error('Test timeout'));
-                }, 5000);
+            // Start the server process
+            const { spawn } = require('child_process');
+            const serverProcess = spawn(serverPath, serverArgs, {
+                stdio: ['pipe', 'pipe', 'pipe'],
+                cwd: path.dirname(path.dirname(serverPath)) // Set working directory to CryoLang root
             });
-            
-            LOG.debug('LanguageServer', 'Server executable test result: ' + testResult);
-        } catch (error) {
-            LOG.error('LanguageServer', 'Server executable test failed: ' + String(error));
-            // Continue anyway - server might not support --version
-        }
 
-        // Use TCP socket communication (as requested - stdio was problematic)
-        const LSP_PORT = 7777;
-        LOG.info('LanguageServer', `Configuring LSP with TCP socket on port ${LSP_PORT}`);
-        
-        // Determine the CryoLang project root directory from the server command path
-        const projectRoot = path.dirname(path.dirname(serverCommand));
-        LOG.info('LanguageServer', `Setting LSP working directory to: ${projectRoot}`);
-        
-        // First, manually start the LSP server in socket mode
-        LOG.info('LanguageServer', `Starting LSP server in socket mode on port ${LSP_PORT}`);
-        const { spawn } = require('child_process');
-        const serverProcess = spawn(serverCommand, ['--socket', '--port', LSP_PORT.toString()], {
-            cwd: projectRoot,
-            stdio: ['pipe', 'pipe', 'pipe'],
-            detached: false
-        });
-        
-        serverProcess.on('error', (error: Error) => {
-            LOG.error('LanguageServer', `Failed to start LSP server: ${error.message}`);
-        });
-        
-        serverProcess.stdout.on('data', (data: Buffer) => {
-            // All LSP server stdout logging disabled to prevent log spam from compiler debug output
-        });
-        
-        serverProcess.stderr.on('data', (data: Buffer) => {
-            // All LSP server stderr logging disabled to prevent log spam from compiler debug output  
-        });
-        
-        // Wait for server to start
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        // Configure the client to connect to the existing TCP server using socket connection
-        const serverOptions: ServerOptions = () => {
-            return new Promise((resolve, reject) => {
-                const socket = net.createConnection({ port: LSP_PORT, host: 'localhost' });
-                
-                socket.on('connect', () => {
-                    LOG.info('LanguageServer', `Connected to LSP server on port ${LSP_PORT}`);
+            serverProcess.stdout.on('data', (data: Buffer) => {
+                const output = data.toString();
+                console.log('Server stdout:', output);
+                // Look for the "listening on port" message
+                if (output.includes('LSP server listening on port')) {
+                    console.log('Server is ready, attempting TCP connection...');
+                    attemptConnection();
+                }
+            });
+
+            serverProcess.stderr.on('data', (data: Buffer) => {
+                const stderr = data.toString();
+                console.log('Server stderr:', stderr);
+                // Also show critical errors to user
+                if (stderr.includes('Error') || stderr.includes('Failed')) {
+                    vscode.window.showErrorMessage(`CryoLSP Error: ${stderr.trim()}`);
+                }
+            });
+
+            serverProcess.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+                console.log(`Server process exited with code ${code}, signal ${signal}`);
+                if (code !== 0 && !manualShutdown) {
+                    vscode.window.showErrorMessage(`CryoLSP server crashed with exit code ${code}`);
+                }
+            });
+
+            serverProcess.on('error', (error: Error) => {
+                console.error('Failed to start server process:', error);
+                reject(new Error(`Failed to start server: ${error.message}`));
+            });
+
+            let connectionAttempted = false;
+
+            function attemptConnection() {
+                if (connectionAttempted) return;
+                connectionAttempted = true;
+
+                const socket = new Socket();
+                socket.connect(port, 'localhost', () => {
+                    console.log('Successfully connected to LSP server via TCP on port', port);
                     resolve({
                         reader: socket,
                         writer: socket
                     });
                 });
-                
-                socket.on('error', (error) => {
-                    LOG.error('LanguageServer', `Socket connection error: ${error.message}`);
-                    reject(error);
+
+                socket.on('error', (err) => {
+                    console.error('TCP connection error:', err);
+                    reject(err);
                 });
-            });
-        };
+            }
 
-        LOG.debug('LanguageServer', 'Server options configured for TCP socket connection on port ' + LSP_PORT);
-
-        // Client options - simplified configuration for better compatibility
-        const clientOptions: LanguageClientOptions = {
-            documentSelector: [
-                { scheme: 'file', language: 'cryo' }
-            ],
-            // Ensure only LSP provides hover, not built-in VS Code hover
-            // Simplified connection options
-            connectionOptions: {
-                maxRestartCount: 0 // Disable auto-restart to prevent conflicts
-            },
-            // Standard error handler
-            errorHandler: {
-                error: (error, message, count) => {
-                    LOG.error('LanguageServer', `LSP Error (count: ${count}): ${error}, message: ${message}`);
-                    LOG.error('LanguageServer', `Error details: ${JSON.stringify(error)}`);
-                    
-                    // Log raw error information for debugging
-                    if (error && typeof error === 'object') {
-                        LOG.error('LanguageServer', `Error name: ${(error as any).name}`);
-                        LOG.error('LanguageServer', `Error message: ${(error as any).message}`);
-                        LOG.error('LanguageServer', `Error stack: ${(error as any).stack}`);
-                    }
-                    
-                    // Only shutdown on repeated errors (more than 3)
-                    if (count && count > 3) {
-                        return { action: ErrorAction.Shutdown };
-                    }
-                    return { action: ErrorAction.Continue };
-                },
-                closed: () => {
-                    LOG.info('LanguageServer', 'LSP connection closed');
-                    return { action: CloseAction.DoNotRestart };
+            // Fallback: try to connect after a delay if we don't see the ready message
+            setTimeout(() => {
+                if (!connectionAttempted) {
+                    console.log('Timeout waiting for server ready message, attempting connection anyway...');
+                    vscode.window.showWarningMessage('CryoLSP server may be slow to start, attempting connection...');
+                    attemptConnection();
                 }
-            }
-        };
-
-        LOG.info('LanguageServer', 'Creating LanguageClient with options: ' + JSON.stringify({ documentSelector: clientOptions.documentSelector }));
-
-        // Create the language client with minimal tracing
-        client = new LanguageClient(
-            'cryoLanguageServer',
-            'Cryo Language Server',
-            serverOptions,
-            clientOptions
-        );
-
-        // Disable all client tracing to reduce log output
-        client.setTrace(Trace.Off);
-
-        // Add event listeners for debugging and shutdown handling
-        client.onDidChangeState((event) => {
-            LOG.debug('LanguageServer', `Client state changed from ${event.oldState} to ${event.newState}`);
-            LOG.debug('LanguageServer', `State meanings: 1=Stopped, 2=Starting, 3=Running`);
-            LOG.debug('LanguageServer', `Current time: ${new Date().toISOString()}`);
-
-            // If the client stops unexpectedly and we didn't initiate it, DON'T restart automatically
-            // This allows manual intervention for development/debugging
-            if (event.newState === 1 && !clientStopped && !isRestarting) { // State 1 = Stopped
-                LOG.info('LanguageServer', 'Language server stopped unexpectedly, marking as stopped to prevent auto-restart');
-                clientStopped = true;
-                vscode.window.showWarningMessage('Cryo Language Server stopped unexpectedly. Use "Cryo: Restart Language Server" to restart.');
-            }
-            
-            // Reset consecutive restart counter on successful start
-            if (event.newState === 3) { // State 3 = Running
-                consecutiveRestarts = 0;
-            }
+            }, 5000); // Increased timeout to 5 seconds
         });
+    };
 
-        // Add debugging for LSP lifecycle events
-        LOG.debug('LanguageServer', 'Setting up LSP lifecycle monitoring...');
+    // Configure client options
+    const clientOptions: LanguageClientOptions = {
+        documentSelector: [{ scheme: 'file', language: 'cryo' }],
+        synchronize: {
+            configurationSection: 'cryo',
+            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.cryo')
+        },
+        outputChannelName: 'CryoLang Language Server',
+        traceOutputChannel: vscode.window.createOutputChannel('CryoLang Language Server Trace'),
+        // Add initialization options
+        initializationOptions: {
+            debug: debugMode
+        },
 
-        // DO NOT show output channel - this can interfere with stdio transport
-        // client.outputChannel.show(); // REMOVED - potential stdio interference
-        // client.outputChannel.appendLine('=== Cryo Language Server Starting ==='); // DISABLED - reduces log spam
-
-        try {
-            // Start the client - use a simpler approach
-            LOG.info('LanguageServer', 'Starting Cryo Language Client...');
-            LOG.debug('LanguageServer', `Client instance created: ${!!client}`);
-            LOG.debug('LanguageServer', `Server command: ${serverCommand}`);
-            LOG.debug('LanguageServer', `Client initial state: ${client.state}`);
-
-            // Simply start the client and let VS Code handle the state management
-            LOG.info('LanguageServer', 'Starting client...');
-            await client.start();
-            
-            LOG.info('LanguageServer', 'Client start() completed');
-            LOG.debug('LanguageServer', `Final client state: ${client?.state || 'undefined'}`);
-
-            // Let the Language Client handle hover requests automatically - no custom provider needed
-            LOG.info('Extension', 'Letting Language Client handle hover requests automatically...');
-
-            LOG.info('LanguageServer', 'Cryo Language Server connection established');
-
-            // Add debugging for client state
-            if (client.state) {
-                LOG.debug('LanguageServer', 'Client state after start: ' + client.state);
+        // Add error handler
+        errorHandler: {
+            error: (error, message, count) => {
+                console.error('LSP Client Error:', error, message, count);
+                if (count !== undefined && count >= 5) {
+                    vscode.window.showErrorMessage('CryoLang Language Server has crashed multiple times. Auto-restart disabled.');
+                    return { action: ErrorAction.Shutdown };
+                }
+                return { action: ErrorAction.Continue };
+            },
+            closed: () => {
+                console.log('LSP Connection closed');
+                return { action: CloseAction.DoNotRestart };
             }
+        }
+    };
 
-            // Client started successfully
-            LOG.info('LanguageServer', 'Setting global client reference for hover provider...');
-            
-            // Ensure the global client reference is set for hover provider
-            if (client) {
-                LOG.debug('LanguageServer', 'Global client reference successfully set');
-                LOG.debug('LanguageServer', `Global client state: ${client.state}`);
+    // Create the language client
+    client = new LanguageClient(
+        'cryoLanguageServer',
+        'CryoLang Language Server',
+        serverOptions,
+        clientOptions
+    );
+
+    console.log('Starting LSP client with server path:', serverPath);
+    console.log('Server args:', serverArgs);
+
+    // Set up event handlers before starting
+    client.onDidChangeState((event) => {
+        console.log('LSP Client state changed:', event.oldState, '->', event.newState);
+        vscode.window.showInformationMessage(`LSP Client state: ${event.oldState} -> ${event.newState}`);
+    });
+
+    // Start the client (and server)
+    client.start().then(() => {
+        console.log('CryoLSP language server started successfully');
+        vscode.window.showInformationMessage('CryoLang language server is running');
+
+        // Verify the server is actually responding
+        setTimeout(() => {
+            if (client.isRunning()) {
+                console.log('LSP client is running and ready');
             } else {
-                LOG.error('LanguageServer', 'CRITICAL: Global client reference is null after successful start!');
+                console.warn('LSP client started but may not be responding');
             }
-            LOG.info('LanguageServer', 'Language client connected to LSP server');
-
-            vscode.window.showInformationMessage('Cryo Language Server started');
-
-            LOG.info('LanguageServer', 'Language client initialization complete');
-
-            // Debug: Check if any .cryo files are currently open  
-            const openDocuments = vscode.workspace.textDocuments.filter(doc => doc.languageId === 'cryo');
-            LOG.info('LanguageServer', `Found ${openDocuments.length} open .cryo documents`);
-            for (const doc of openDocuments) {
-                LOG.info('LanguageServer', `Open document: ${doc.fileName} (languageId: ${doc.languageId})`);
-                LOG.debug('LanguageServer', `Letting Language Client handle document sync automatically for: ${doc.fileName}`);
-            }
-
-        } catch (error) {
-            const errorMsg = 'Failed to start Cryo Language Server: ' + String(error);
-            LOG.error('LanguageServer', errorMsg);
-            vscode.window.showErrorMessage(errorMsg);
-        }
-    }
-
-    // Start the language server initially
-    startLanguageServer();
-
-    // Add document event listeners for debugging
-    const onDidOpenTextDocument = vscode.workspace.onDidOpenTextDocument((document) => {
-        if (document.languageId === 'cryo') {
-            LOG.info('Extension', `Document opened: ${document.fileName} (languageId: ${document.languageId})`);
-            LOG.info('Extension', `Document URI: ${document.uri.toString()}`);
-            LOG.info('Extension', `Client state: ${client?.state || 'no client'}`);
-
-            // The Language Client will automatically handle didOpen - don't send duplicates
-            LOG.debug('Extension', `Letting Language Client handle didOpen automatically for: ${document.fileName}`);
-        }
-    });
-
-    const onDidChangeActiveTextEditor = vscode.window.onDidChangeActiveTextEditor((editor) => {
-        if (editor && editor.document.languageId === 'cryo') {
-            LOG.info('Extension', `Active editor changed to .cryo file: ${editor.document.fileName}`);
-            LOG.info('Extension', `Client state: ${client?.state || 'no client'}`);
-
-            // Don't send redundant didOpen notifications - the Language Client handles document lifecycle
-            LOG.debug('Extension', `Active editor changed, Language Client will handle document sync for: ${editor.document.fileName}`);
-        }
-    });
-
-    context.subscriptions.push(onDidOpenTextDocument, onDidChangeActiveTextEditor);
-
-    // Use the built-in LanguageClient hover support - let the server handle comment detection
-    LOG.info('Extension', 'Using built-in LanguageClient hover support (server handles comment detection)');    // Command to restart the language server (for development)
-    const restartCommand = vscode.commands.registerCommand('cryo.restartLanguageServer', async () => {
-        vscode.window.showInformationMessage('Restarting Cryo Language Server...');
-        LOG.info('Commands', 'Manual restart command initiated');
-
-        try {
-            // Reset the stopped flag to allow restart
-            clientStopped = false;
-
-            // Stop existing client if running
-            if (client) {
-                LOG.info('Commands', 'Stopping existing client for restart...');
-                try {
-                    await client.stop(5000);
-                    client.dispose();
-                    client = undefined;
-                } catch (stopError) {
-                    LOG.error('Commands', 'Error stopping client during restart: ' + String(stopError));
-                }
-            }
-
-            // Small delay to ensure cleanup
-            await new Promise(resolve => setTimeout(resolve, 1000));
-
-            // Start fresh
-            await startLanguageServer();
-            vscode.window.showInformationMessage('Cryo Language Server restarted successfully!');
-            LOG.info('Commands', 'Manual restart completed successfully');
-        } catch (error) {
-            LOG.error('Commands', 'Error restarting language server: ' + String(error));
-            vscode.window.showErrorMessage(`Failed to restart language server: ${error}`);
-        }
-    });
-
-    // Command to shutdown the language server (for development)
-    const shutdownCommand = vscode.commands.registerCommand('cryo.shutdownLanguageServer', async () => {
-        if (!client) {
-            vscode.window.showWarningMessage('Cryo Language Server is not running.');
-            LOG.info('Commands', 'Shutdown command called but no client is running');
-            return;
-        }
-
-        try {
-            vscode.window.showInformationMessage('Shutting down Cryo Language Server...');
-            LOG.info('Commands', 'Manual shutdown command initiated');
-
-            // Set flag to prevent auto-restart BEFORE stopping the client
-            clientStopped = true;
-
-            LOG.info('Commands', 'Sending shutdown request to LSP server...');
-
-            // Stop the client with a longer timeout to ensure proper shutdown
-            await client.stop(5000); // 5 second timeout
-            client.dispose();
-            client = undefined;
-
-            // Add a small delay to ensure the process has fully terminated
-            await new Promise(resolve => setTimeout(resolve, 2000));
-
-            vscode.window.showInformationMessage('Cryo Language Server shut down successfully!');
-            LOG.info('Commands', 'LSP server shutdown complete - process should be released');
-        } catch (error) {
-            LOG.error('Commands', 'Error shutting down language server: ' + String(error));
-            vscode.window.showErrorMessage(`Failed to shutdown language server: ${error}`);
-        }
-    });
-
-    // Command to completely stop the language client (for development builds)
-    const stopCommand = vscode.commands.registerCommand('cryo.stopLanguageClient', async () => {
-        try {
-            vscode.window.showInformationMessage('Stopping Cryo Language Client for development...');
-            console.log('Stopping language client for development build...');
-
-            clientStopped = true; // Prevent any restart
-
-            if (client) {
-                console.log('Forcibly stopping language client...');
-
-                // Try to stop gracefully first
-                try {
-                    await client.stop(2000); // Shorter timeout
-                } catch (stopError) {
-                    console.log('Graceful stop failed, disposing directly:', stopError);
-                }
-
-                // Always dispose
-                client.dispose();
-                client = undefined;
-                console.log('Client disposed');
-            } else {
-                console.log('No active client to stop');
-            }
-
-            // Longer delay to ensure process cleanup
-            await new Promise(resolve => setTimeout(resolve, 5000));
-
-            vscode.window.showInformationMessage('Cryo Language Client stopped - binary is now free for rebuild!');
-            console.log('Language client stopped - binary file should be unlocked.');
-        } catch (error) {
-            console.error('Error stopping language client:', error);
-            vscode.window.showErrorMessage(`Failed to stop language client: ${error}`);
-        }
-    });
-
-    // Command to completely disable the extension (nuclear option for development)
-    const disableCommand = vscode.commands.registerCommand('cryo.disableExtension', async () => {
-        try {
-            vscode.window.showWarningMessage('Disabling Cryo Language Extension completely for development...');
-            console.log('Disabling extension completely...');
-
-            clientStopped = true; // Prevent any restart
-
-            if (client) {
-                try {
-                    await client.stop(1000);
-                } catch (error) {
-                    console.log('Stop failed, continuing with dispose:', error);
-                }
-                client.dispose();
-                client = undefined;
-            }
-
-            // Clear all subscriptions to fully disable
-            context.subscriptions.forEach(subscription => {
-                try {
-                    subscription.dispose();
-                } catch (error) {
-                    console.log('Error disposing subscription:', error);
+        }, 1000);
+    }).catch((error: any) => {
+        console.error('Failed to start CryoLSP language server:', error);
+        const errorMsg = error.message || error.toString();
+        vscode.window.showErrorMessage(`Failed to start CryoLang language server: ${errorMsg}`, 'Retry', 'Open Settings')
+            .then((selection: string | undefined) => {
+                if (selection === 'Retry') {
+                    setTimeout(() => startLanguageServer(context), 2000);
+                } else if (selection === 'Open Settings') {
+                    vscode.commands.executeCommand('workbench.action.openSettings', 'cryo.languageServer');
                 }
             });
-
-            await new Promise(resolve => setTimeout(resolve, 2000));
-
-            vscode.window.showInformationMessage('Cryo Extension disabled - LSP binary is completely free!');
-            console.log('Extension disabled - no more LSP processes should start.');
-        } catch (error) {
-            console.error('Error disabling extension:', error);
-            vscode.window.showErrorMessage(`Failed to disable extension: ${error}`);
-        }
     });
-
-    context.subscriptions.push(restartCommand);
-    context.subscriptions.push(shutdownCommand);
-    context.subscriptions.push(stopCommand);
-    context.subscriptions.push(disableCommand);
-    context.subscriptions.push(editorChangeDisposable);
 }
 
-export async function deactivate(): Promise<void> {
+function restartLanguageServer(context: vscode.ExtensionContext) {
     if (client) {
-        try {
-            console.log('Deactivating extension, stopping client...');
-            await client.stop(5000); // 5 second timeout
-            client.dispose();
-        } catch (error) {
-            console.log('Error during deactivation:', error);
+        manualShutdown = true; // Mark as intentional shutdown to prevent auto-restart during restart
+        client.stop().then(() => {
+            setTimeout(() => {
+                manualShutdown = false; // Reset flag before starting
+                startLanguageServer(context);
+            }, 1000);
+        });
+    } else {
+        manualShutdown = false; // Ensure flag is reset
+        startLanguageServer(context);
+    }
+    vscode.window.showInformationMessage('Restarting CryoLang language server...');
+}
+
+function shutdownLanguageServer() {
+    if (client) {
+        manualShutdown = true; // Mark as intentional shutdown
+        client.stop().then(() => {
+            vscode.window.showInformationMessage('CryoLang language server stopped');
+        });
+    } else {
+        vscode.window.showWarningMessage('CryoLang language server is not running');
+    }
+}
+
+function disableLanguageServer() {
+    serverDisabled = true;
+    if (client) {
+        manualShutdown = true; // Prevent restart
+        client.stop().then(() => {
+            vscode.window.showInformationMessage('CryoLang language server disabled. It will not restart automatically.');
+        });
+    } else {
+        vscode.window.showInformationMessage('CryoLang language server disabled.');
+    }
+}
+
+function enableLanguageServer(context: vscode.ExtensionContext) {
+    serverDisabled = false;
+    if (!client || !client.isRunning()) {
+        vscode.window.showInformationMessage('Enabling and starting CryoLang language server...');
+        startLanguageServer(context);
+    } else {
+        vscode.window.showInformationMessage('CryoLang language server enabled and already running.');
+    }
+}
+
+function openLogFile() {
+    const config = vscode.workspace.getConfiguration('cryo.languageServer');
+    let logFile = config.get<string>('logFile', '');
+
+    if (!logFile) {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (workspaceRoot) {
+            logFile = path.join(workspaceRoot, 'cryo-lsp.log');
         }
     }
+
+    if (!logFile) {
+        vscode.window.showErrorMessage('Cannot determine log file path. Please configure cryo.languageServer.logFile in settings.');
+        return;
+    }
+
+    if (!fs.existsSync(logFile)) {
+        vscode.window.showWarningMessage(`Log file does not exist: ${logFile}. The language server may not have started yet.`);
+        return;
+    }
+
+    // Open the log file in VS Code
+    const uri = vscode.Uri.file(logFile);
+    vscode.workspace.openTextDocument(uri).then(doc => {
+        vscode.window.showTextDocument(doc);
+    });
+}
+
+function findLanguageServer(): string | null {
+    console.log('Looking for CryoLSP server...');
+    const config = vscode.workspace.getConfiguration('cryo.languageServer');
+    const configuredPath = config.get<string>('path', '');
+    console.log('Configured server path:', configuredPath);
+
+    // Check configured path first
+    if (configuredPath && fs.existsSync(configuredPath)) {
+        console.log('Using configured server path:', configuredPath);
+        return configuredPath;
+    }
+
+    // Search in workspace
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders) {
+        for (const folder of workspaceFolders) {
+            // Check common locations within workspace
+            const candidates = [
+                path.join(folder.uri.fsPath, 'bin', 'cryolsp.exe'),
+                path.join(folder.uri.fsPath, 'bin', 'cryolsp'),
+                path.join(folder.uri.fsPath, 'tools', 'CryoLSP', 'bin', 'cryolsp.exe'),
+                path.join(folder.uri.fsPath, 'tools', 'CryoLSP', 'bin', 'cryolsp'),
+                path.join(folder.uri.fsPath, 'cryolsp.exe'),
+                path.join(folder.uri.fsPath, 'cryolsp')
+            ];
+
+            for (const candidate of candidates) {
+                if (fs.existsSync(candidate)) {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    // Try to find in PATH
+    const pathEnv = process.env.PATH || '';
+    const pathSeparator = process.platform === 'win32' ? ';' : ':';
+    const executableName = process.platform === 'win32' ? 'cryolsp.exe' : 'cryolsp';
+
+    for (const dir of pathEnv.split(pathSeparator)) {
+        const fullPath = path.join(dir, executableName);
+        if (fs.existsSync(fullPath)) {
+            return fullPath;
+        }
+    }
+
+    return null;
 }

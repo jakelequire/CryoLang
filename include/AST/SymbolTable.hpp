@@ -35,7 +35,8 @@ namespace Cryo
     };
 
     // Forward declarations for SRM integration
-    namespace SRM {
+    namespace SRM
+    {
         class SymbolResolutionContext;
         class SymbolResolutionManager;
         class SymbolIdentifier;
@@ -48,7 +49,7 @@ namespace Cryo
         std::unordered_map<std::string, std::unordered_map<std::string, Symbol>> namespaces_; // namespace_name -> symbols
         std::unique_ptr<SymbolTable> parent_scope_;
         TypeContext *type_context_; // Add TypeContext for creating function types
-        
+
         // SRM integration - lazy initialization to maintain compatibility
         mutable std::unique_ptr<SRM::SymbolResolutionContext> srm_context_;
         mutable std::unique_ptr<SRM::SymbolResolutionManager> srm_manager_;
@@ -91,31 +92,53 @@ namespace Cryo
         std::unique_ptr<SymbolTable> exit_scope();
 
         // SRM integration methods
-        SRM::SymbolResolutionContext* get_srm_context() const;
-        SRM::SymbolResolutionManager* get_srm_manager() const;
+        SRM::SymbolResolutionContext *get_srm_context() const;
+        SRM::SymbolResolutionManager *get_srm_manager() const;
         void initialize_srm() const;
-        
+
         // Enhanced symbol lookup using SRM
-        Symbol* lookup_symbol_srm(const SRM::SymbolIdentifier& identifier) const;
-        std::vector<Symbol*> find_symbol_overloads(const std::string& base_name, const std::vector<Type*>& arg_types) const;
-        Symbol* find_best_function_overload(const std::string& base_name, const std::vector<Type*>& arg_types) const;
-        
+        Symbol *lookup_symbol_srm(const SRM::SymbolIdentifier &identifier) const;
+        std::vector<Symbol *> find_symbol_overloads(const std::string &base_name, const std::vector<Type *> &arg_types) const;
+        Symbol *find_best_function_overload(const std::string &base_name, const std::vector<Type *> &arg_types) const;
+
         // SRM-based symbol registration
-        bool declare_symbol_srm(std::unique_ptr<SRM::SymbolIdentifier> identifier, 
-                               SymbolKind kind, 
-                               SourceLocation loc, 
-                               Type* data_type = nullptr, 
-                               const std::string& scope = "Global");
-        
+        bool declare_symbol_srm(std::unique_ptr<SRM::SymbolIdentifier> identifier,
+                                SymbolKind kind,
+                                SourceLocation loc,
+                                Type *data_type = nullptr,
+                                const std::string &scope = "Global");
+
         // SRM configuration
         void configure_srm(bool enable_implicit_std = true, bool enable_namespace_fallback = true) const;
-        void add_srm_namespace_alias(const std::string& alias, const std::string& full_namespace) const;
-        void add_srm_imported_namespace(const std::string& namespace_name) const;
-        
+        void add_srm_namespace_alias(const std::string &alias, const std::string &full_namespace) const;
+        void add_srm_imported_namespace(const std::string &namespace_name) const;
+
         // Debug/Pretty printing
         void dump(std::ostream &os = std::cout, int indent_level = 0) const;
         void print_pretty(std::ostream &os = std::cout) const;
         void dump_srm_state(std::ostream &os = std::cout) const;
+
+        // LSP-specific API
+        struct LSPSymbolInfo
+        {
+            std::string name;
+            std::string type_name;
+            std::string kind; // "function", "variable", "class", "struct", "enum", etc.
+            std::string scope;
+            std::string namespace_name;
+            size_t definition_line;
+            size_t definition_column;
+            std::string definition_file;
+            std::string documentation;
+            bool is_generic;
+            std::vector<std::string> generic_parameters;
+        };
+
+        std::vector<LSPSymbolInfo> get_all_symbols_for_lsp() const;
+        std::optional<LSPSymbolInfo> find_symbol_at_position(const std::string &filename,
+                                                             size_t line, size_t column) const;
+        std::vector<LSPSymbolInfo> find_symbols_by_name(const std::string &name) const;
+        std::vector<LSPSymbolInfo> get_completions_for_scope(const std::string &scope_name) const;
 
     private:
         std::string get_symbol_kind_string(SymbolKind kind) const;

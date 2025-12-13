@@ -10,21 +10,23 @@ namespace Cryo
     // ============================================================================
     // Constructor/Destructor
     // ============================================================================
-    
+
     SymbolTable::SymbolTable(std::unique_ptr<SymbolTable> parent, TypeContext *type_context)
-        : parent_scope_(std::move(parent)), type_context_(type_context) {
+        : parent_scope_(std::move(parent)), type_context_(type_context)
+    {
         // Implementation in .cpp file to ensure SRM types are complete when unique_ptr destructors are instantiated
     }
-    
-    SymbolTable::~SymbolTable() {
+
+    SymbolTable::~SymbolTable()
+    {
         // Default destructor - unique_ptr will handle cleanup automatically
         // The SRM headers are included in this .cpp file so destructor can access complete types
     }
-    
+
     // ============================================================================
     // Symbol Management
     // ============================================================================
-    
+
     bool SymbolTable::declare_symbol(const std::string &name, SymbolKind kind, SourceLocation loc, Type *data_type, const std::string &scope, const std::string &enhanced_display)
     {
         // Check if symbol already exists in current scope
@@ -85,9 +87,11 @@ namespace Cryo
         // First check if namespace_name is an alias in SRM
         std::string resolved_namespace = namespace_name;
         auto srm_manager = get_srm_manager();
-        if (srm_manager) {
+        if (srm_manager)
+        {
             auto context = srm_manager->get_context();
-            if (context && context->has_namespace_alias(namespace_name)) {
+            if (context && context->has_namespace_alias(namespace_name))
+            {
                 resolved_namespace = context->resolve_namespace_alias(namespace_name);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Resolved namespace alias '{}' -> '{}'", namespace_name, resolved_namespace);
             }
@@ -99,7 +103,8 @@ namespace Cryo
             return result;
 
         // If that failed and we didn't resolve an alias, try the original namespace
-        if (resolved_namespace != namespace_name) {
+        if (resolved_namespace != namespace_name)
+        {
             result = lookup_namespaced_symbol(namespace_name, symbol_name);
             if (result)
                 return result;
@@ -551,128 +556,347 @@ namespace Cryo
     }
 
     // SRM integration methods implementation
-    
-    SRM::SymbolResolutionContext* SymbolTable::get_srm_context() const {
+
+    SRM::SymbolResolutionContext *SymbolTable::get_srm_context() const
+    {
         initialize_srm();
         return srm_context_.get();
     }
-    
-    SRM::SymbolResolutionManager* SymbolTable::get_srm_manager() const {
+
+    SRM::SymbolResolutionManager *SymbolTable::get_srm_manager() const
+    {
         initialize_srm();
         return srm_manager_.get();
     }
-    
-    void SymbolTable::initialize_srm() const {
-        if (!srm_context_) {
+
+    void SymbolTable::initialize_srm() const
+    {
+        if (!srm_context_)
+        {
             // Initialize SRM context for naming purposes only
             srm_context_ = std::make_unique<SRM::SymbolResolutionContext>(type_context_);
-            
+
             // Configure default settings
             srm_context_->set_enable_implicit_std_import(true);
             srm_context_->set_enable_namespace_fallback(true);
         }
-        
-        if (!srm_manager_) {
+
+        if (!srm_manager_)
+        {
             // Initialize SRM manager for naming purposes
             srm_manager_ = std::make_unique<SRM::SymbolResolutionManager>(srm_context_.get());
         }
     }
-    
-    Symbol* SymbolTable::lookup_symbol_srm(const SRM::SymbolIdentifier& identifier) const {
+
+    Symbol *SymbolTable::lookup_symbol_srm(const SRM::SymbolIdentifier &identifier) const
+    {
         // Use SRM to generate lookup candidates, then search using traditional lookup
         auto candidates = get_srm_manager()->generate_lookup_candidates(
             identifier.get_simple_name(), identifier.get_symbol_kind());
-            
+
         // Try each candidate until we find a match
-        for (const auto& candidate_name : candidates) {
+        for (const auto &candidate_name : candidates)
+        {
             auto symbol = lookup_symbol(candidate_name);
-            if (symbol) {
+            if (symbol)
+            {
                 return symbol;
             }
         }
-        
+
         return nullptr;
     }
-    
-    std::vector<Symbol*> SymbolTable::find_symbol_overloads(
-        const std::string& base_name, const std::vector<Type*>& arg_types) const {
-        
+
+    std::vector<Symbol *> SymbolTable::find_symbol_overloads(
+        const std::string &base_name, const std::vector<Type *> &arg_types) const
+    {
+
         // Generate function lookup candidates based on the base name and parameter types
         auto candidates = get_srm_manager()->generate_function_lookup_candidates(base_name, arg_types);
-        
-        std::vector<Symbol*> symbols;
-        for (const auto& candidate_name : candidates) {
+
+        std::vector<Symbol *> symbols;
+        for (const auto &candidate_name : candidates)
+        {
             auto symbol = lookup_symbol(candidate_name);
-            if (symbol) {
+            if (symbol)
+            {
                 symbols.push_back(symbol);
             }
         }
-        
+
         return symbols;
     }
-    
-    Symbol* SymbolTable::find_best_function_overload(
-        const std::string& base_name, const std::vector<Type*>& arg_types) const {
-        
+
+    Symbol *SymbolTable::find_best_function_overload(
+        const std::string &base_name, const std::vector<Type *> &arg_types) const
+    {
+
         // Get all function overloads with the given name
         auto overloads = find_symbol_overloads(base_name, arg_types);
-        
-        // Simple selection: return the first match (in a real implementation, 
+
+        // Simple selection: return the first match (in a real implementation,
         // this would use type compatibility scoring)
         return overloads.empty() ? nullptr : overloads[0];
     }
-    
+
     bool SymbolTable::declare_symbol_srm(
-        std::unique_ptr<SRM::SymbolIdentifier> identifier, 
-        SymbolKind kind, 
-        SourceLocation loc, 
-        Type* data_type, 
-        const std::string& scope) {
-        
-        if (!identifier) return false;
-        
+        std::unique_ptr<SRM::SymbolIdentifier> identifier,
+        SymbolKind kind,
+        SourceLocation loc,
+        Type *data_type,
+        const std::string &scope)
+    {
+
+        if (!identifier)
+            return false;
+
         // Use the SRM identifier's canonical name for registration
         std::string canonical_name = identifier->to_string();
-        
+
         // Register with traditional symbol table
         bool success = declare_symbol(canonical_name, kind, loc, data_type, scope);
-        
-        if (success) {
+
+        if (success)
+        {
             // SRM is now purely for naming, no symbol registration needed
             // The canonical name generation is sufficient
         }
-        
+
         return success;
     }
-    
-    void SymbolTable::configure_srm(bool enable_implicit_std, bool enable_namespace_fallback) const {
+
+    void SymbolTable::configure_srm(bool enable_implicit_std, bool enable_namespace_fallback) const
+    {
         initialize_srm();
         srm_context_->set_enable_implicit_std_import(enable_implicit_std);
         srm_context_->set_enable_namespace_fallback(enable_namespace_fallback);
     }
-    
-    void SymbolTable::add_srm_namespace_alias(const std::string& alias, const std::string& full_namespace) const {
+
+    void SymbolTable::add_srm_namespace_alias(const std::string &alias, const std::string &full_namespace) const
+    {
         initialize_srm();
         srm_context_->register_namespace_alias(alias, full_namespace);
     }
-    
-    void SymbolTable::add_srm_imported_namespace(const std::string& namespace_name) const {
+
+    void SymbolTable::add_srm_imported_namespace(const std::string &namespace_name) const
+    {
         initialize_srm();
         srm_context_->add_imported_namespace(namespace_name);
     }
-    
-    void SymbolTable::dump_srm_state(std::ostream& os) const {
-        if (srm_context_) {
+
+    void SymbolTable::dump_srm_state(std::ostream &os) const
+    {
+        if (srm_context_)
+        {
             os << "=== SRM Context State ===" << std::endl;
             srm_context_->dump_context(os);
             os << std::endl;
         }
-        
-        if (srm_manager_) {
+
+        if (srm_manager_)
+        {
             os << "=== SRM Manager State ===" << std::endl;
             os << srm_manager_->to_debug_string() << std::endl;
             os << srm_manager_->get_performance_report() << std::endl;
         }
+    }
+
+    // LSP-specific API implementation
+    std::vector<SymbolTable::LSPSymbolInfo> SymbolTable::get_all_symbols_for_lsp() const
+    {
+        std::vector<LSPSymbolInfo> lsp_symbols;
+
+        // Collect symbols from current scope
+        for (const auto &[name, symbol] : symbols_)
+        {
+            LSPSymbolInfo info;
+            info.name = symbol.name;
+            info.type_name = symbol.data_type ? symbol.data_type->to_string() : "unknown";
+            info.kind = get_symbol_kind_string(symbol.kind);
+            info.scope = symbol.scope;
+            info.namespace_name = ""; // Extract from scope if needed
+            info.definition_line = symbol.declaration_location.line();
+            info.definition_column = symbol.declaration_location.column();
+            info.definition_file = "";                    // Would need to be set by caller with file info
+            info.documentation = symbol.enhanced_display; // Use enhanced display as documentation
+            info.is_generic = false;                      // TODO: detect generic symbols
+
+            lsp_symbols.push_back(std::move(info));
+        }
+
+        // Collect from parent scopes recursively
+        if (parent_scope_)
+        {
+            auto parent_symbols = parent_scope_->get_all_symbols_for_lsp();
+            lsp_symbols.insert(lsp_symbols.end(),
+                               std::make_move_iterator(parent_symbols.begin()),
+                               std::make_move_iterator(parent_symbols.end()));
+        }
+
+        // Collect from namespaces
+        for (const auto &[ns_name, ns_symbols] : namespaces_)
+        {
+            for (const auto &[name, symbol] : ns_symbols)
+            {
+                LSPSymbolInfo info;
+                info.name = symbol.name;
+                info.type_name = symbol.data_type ? symbol.data_type->to_string() : "unknown";
+                info.kind = get_symbol_kind_string(symbol.kind);
+                info.scope = symbol.scope;
+                info.namespace_name = ns_name;
+                info.definition_line = symbol.declaration_location.line();
+                info.definition_column = symbol.declaration_location.column();
+                info.definition_file = "";
+                info.documentation = symbol.enhanced_display;
+                info.is_generic = false;
+
+                lsp_symbols.push_back(std::move(info));
+            }
+        }
+
+        return lsp_symbols;
+    }
+
+    std::optional<SymbolTable::LSPSymbolInfo> SymbolTable::find_symbol_at_position(
+        const std::string &filename, size_t line, size_t column) const
+    {
+        // Search through all symbols to find one at the given position
+        for (const auto &[name, symbol] : symbols_)
+        {
+            if (symbol.declaration_location.line() == line)
+            {
+                // Check if column is within reasonable range
+                // TODO: Could be more precise with actual token ranges
+                size_t symbol_col = symbol.declaration_location.column();
+                if (column >= symbol_col && column <= symbol_col + name.length())
+                {
+                    LSPSymbolInfo info;
+                    info.name = symbol.name;
+                    info.type_name = symbol.data_type ? symbol.data_type->to_string() : "unknown";
+                    info.kind = get_symbol_kind_string(symbol.kind);
+                    info.scope = symbol.scope;
+                    info.namespace_name = "";
+                    info.definition_line = symbol.declaration_location.line();
+                    info.definition_column = symbol.declaration_location.column();
+                    info.definition_file = filename;
+                    info.documentation = symbol.enhanced_display;
+                    info.is_generic = false;
+
+                    return info;
+                }
+            }
+        }
+
+        // Search in parent scopes
+        if (parent_scope_)
+        {
+            return parent_scope_->find_symbol_at_position(filename, line, column);
+        }
+
+        return std::nullopt;
+    }
+
+    std::vector<SymbolTable::LSPSymbolInfo> SymbolTable::find_symbols_by_name(const std::string &name) const
+    {
+        std::vector<LSPSymbolInfo> matching_symbols;
+
+        // Search in current scope
+        auto it = symbols_.find(name);
+        if (it != symbols_.end())
+        {
+            const Symbol &symbol = it->second;
+            LSPSymbolInfo info;
+            info.name = symbol.name;
+            info.type_name = symbol.data_type ? symbol.data_type->to_string() : "unknown";
+            info.kind = get_symbol_kind_string(symbol.kind);
+            info.scope = symbol.scope;
+            info.namespace_name = "";
+            info.definition_line = symbol.declaration_location.line();
+            info.definition_column = symbol.declaration_location.column();
+            info.definition_file = "";
+            info.documentation = symbol.enhanced_display;
+            info.is_generic = false;
+
+            matching_symbols.push_back(std::move(info));
+        }
+
+        // Search in namespaces
+        for (const auto &[ns_name, ns_symbols] : namespaces_)
+        {
+            auto ns_it = ns_symbols.find(name);
+            if (ns_it != ns_symbols.end())
+            {
+                const Symbol &symbol = ns_it->second;
+                LSPSymbolInfo info;
+                info.name = symbol.name;
+                info.type_name = symbol.data_type ? symbol.data_type->to_string() : "unknown";
+                info.kind = get_symbol_kind_string(symbol.kind);
+                info.scope = symbol.scope;
+                info.namespace_name = ns_name;
+                info.definition_line = symbol.declaration_location.line();
+                info.definition_column = symbol.declaration_location.column();
+                info.definition_file = "";
+                info.documentation = symbol.enhanced_display;
+                info.is_generic = false;
+
+                matching_symbols.push_back(std::move(info));
+            }
+        }
+
+        // Search in parent scopes
+        if (parent_scope_)
+        {
+            auto parent_matches = parent_scope_->find_symbols_by_name(name);
+            matching_symbols.insert(matching_symbols.end(),
+                                    std::make_move_iterator(parent_matches.begin()),
+                                    std::make_move_iterator(parent_matches.end()));
+        }
+
+        return matching_symbols;
+    }
+
+    std::vector<SymbolTable::LSPSymbolInfo> SymbolTable::get_completions_for_scope(const std::string &scope_name) const
+    {
+        std::vector<LSPSymbolInfo> completions;
+
+        // If scope matches current scope, return all symbols
+        if (scope_name.empty() || scope_name == "Global")
+        {
+            return get_all_symbols_for_lsp();
+        }
+
+        // Look for symbols in the specified scope/namespace
+        auto ns_it = namespaces_.find(scope_name);
+        if (ns_it != namespaces_.end())
+        {
+            for (const auto &[name, symbol] : ns_it->second)
+            {
+                LSPSymbolInfo info;
+                info.name = symbol.name;
+                info.type_name = symbol.data_type ? symbol.data_type->to_string() : "unknown";
+                info.kind = get_symbol_kind_string(symbol.kind);
+                info.scope = symbol.scope;
+                info.namespace_name = scope_name;
+                info.definition_line = symbol.declaration_location.line();
+                info.definition_column = symbol.declaration_location.column();
+                info.definition_file = "";
+                info.documentation = symbol.enhanced_display;
+                info.is_generic = false;
+
+                completions.push_back(std::move(info));
+            }
+        }
+
+        // Also check parent scopes for completions
+        if (parent_scope_)
+        {
+            auto parent_completions = parent_scope_->get_completions_for_scope(scope_name);
+            completions.insert(completions.end(),
+                               std::make_move_iterator(parent_completions.begin()),
+                               std::make_move_iterator(parent_completions.end()));
+        }
+
+        return completions;
     }
 
 }

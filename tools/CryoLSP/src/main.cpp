@@ -1,78 +1,176 @@
-#include "LanguageServer.hpp"
-#include "Transport.hpp"
-#include "TcpTransport.hpp"
-#include "Logger.hpp"
-#include "Utils/OS.hpp"
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <filesystem>
-#include <cstdlib>
 
-using namespace Cryo::LSP;
+#include "Server.hpp"
+#include "Compiler/CompilerInstance.hpp"
+#include "Utils/Logger.hpp"
+
+using namespace CryoLSP;
+
+void print_usage()
+{
+    std::cout << "CryoLSP - Language Server Protocol implementation for CryoLang\n";
+    std::cout << "Usage: cryolsp [options]\n\n";
+    std::cout << "Options:\n";
+    std::cout << "  --help, -h          Show this help message\n";
+    std::cout << "  --version, -v       Show version information\n";
+    std::cout << "  --stdio             Use stdin/stdout for communication (default)\n";
+    std::cout << "  --debug             Enable debug logging\n";
+    std::cout << "  --log-file <file>   Write logs to specified file\n";
+    std::cout << "\nThe server communicates via JSON-RPC over stdin/stdout.\n";
+    std::cout << "This is typically used by editors and IDEs, not run directly.\n";
+}
+
+void print_version()
+{
+    std::cout << "CryoLSP v0.1.0\n";
+    std::cout << "Language Server Protocol implementation for CryoLang\n";
+    std::cout << "Built with CryoLang Compiler v0.1.0\n";
+}
 
 int main(int argc, char *argv[])
 {
     try
     {
-        // Initialize OS utility first
-        if (!Cryo::Utils::OS::initialize(argc > 0 ? argv[0] : ""))
+        // Always output to stderr first
+        std::cerr << "[MAIN] CryoLSP starting with " << argc << " arguments:" << std::endl;
+        for (int i = 0; i < argc; ++i)
         {
-            std::cerr << "Fatal error: Failed to initialize OS utility for LSP" << std::endl;
-            return 1;
+            std::cerr << "[MAIN] argv[" << i << "]: " << argv[i] << std::endl;
         }
 
-        // Initialize logger with cross-platform log file path
-        Logger &logger = Logger::instance();
-        // Debug logging disabled to reduce log spam
+        bool debug_mode = false;
+        bool stdio_mode = false; // Default to TCP mode now
+        bool tcp_mode = false;
+        int tcp_port = 8080;
+        std::string log_file;
 
-        // Get logs directory from OS utility
-        auto& os = Cryo::Utils::OS::instance();
-        std::string log_file = os.join_path(os.get_logs_directory(), "cryo-lsp.log");
-
-        logger.set_file_output(log_file); // Write to log file
-        logger.set_console_output(false); // Disable console output (interferes with LSP stdio)
-        logger.info("LSP", "==== CryoLSP Language Server Starting ====");
-        logger.info("LSP", "Version: Debug Build");
-        logger.info("LSP", "Log file: " + log_file);
-        logger.info("LSP", "Command line args: " + std::to_string(argc));
-        for (int i = 0; i < argc; i++) {
-            logger.info("LSP", "  arg[" + std::to_string(i) + "]: " + std::string(argv[i]));
-        }
-        logger.info("LSP", "Working directory: " + os.get_working_directory());
-        logger.info("LSP", "Waiting for VS Code initialize request...");
-
-        // Debug: Create a file to prove the server process actually started
-        try {
-            // Debug file creation disabled to reduce log spam
-        } catch (...) {
-            logger.error("LSP", "Failed to create debug file");
-        }
-
-        // Create transport based on command line arguments
-        auto config = TransportFactory::parse_config(argc, argv);
-        auto transport = TransportFactory::create_from_config(config);
-
-        if (config.type == TransportFactory::TransportConfig::Socket)
+        // Parse command line arguments
+        for (int i = 1; i < argc; ++i)
         {
-            logger.info("LSP", "Using TCP socket transport on port " + std::to_string(config.socket_port));
+            std::string arg = argv[i];
+
+            if (arg == "--help" || arg == "-h")
+            {
+                print_usage();
+                return 0;
+            }
+            else if (arg == "--version" || arg == "-v")
+            {
+                print_version();
+                return 0;
+            }
+            else if (arg == "--stdio")
+            {
+                stdio_mode = true; // Explicitly enable stdio mode
+            }
+            else if (arg == "--tcp")
+            {
+                tcp_mode = true;
+                // Check if port is specified as next argument
+                if (i + 1 < argc && argv[i + 1][0] != '-')
+                {
+                    tcp_port = std::stoi(argv[++i]);
+                }
+            }
+            else if (arg == "--debug")
+            {
+                debug_mode = true;
+            }
+            else if (arg == "--log-file" && i + 1 < argc)
+            {
+                log_file = argv[++i];
+            }
+            else
+            {
+                std::cerr << "Unknown argument: " << arg << "\n";
+                print_usage();
+                return 1;
+            }
+        }
+
+        // Default to TCP mode if no mode specified
+        if (!stdio_mode && !tcp_mode)
+        {
+            tcp_mode = true;
+        }
+
+        // Initialize logging FIRST - before any other operations
+        auto &logger = Cryo::Logger::instance();
+        std::string logPath = "cryolsp.log";
+
+        if (debug_mode || !log_file.empty())
+        {
+            if (!log_file.empty())
+            {
+                logPath = log_file;
+            }
+
+            // Always enable file logging for LSP to help with debugging
+            logger.set_console_level(debug_mode ? Cryo::LogLevel::DEBUG : Cryo::LogLevel::INFO);
+            logger.set_file_level(Cryo::LogLevel::DEBUG);
+            logger.set_log_file(logPath);
+
+            // Force immediate log initialization
+            logger.info(Cryo::LogComponent::LSP, "=== CryoLSP Starting ====");
+            logger.info(Cryo::LogComponent::LSP, "Debug logging enabled, log file: " + logPath);
+
+            if (tcp_mode)
+            {
+                logger.info(Cryo::LogComponent::LSP, "Starting in TCP mode on port " + std::to_string(tcp_port));
+            }
+            else
+            {
+                logger.info(Cryo::LogComponent::LSP, "Starting in stdio mode");
+            }
         }
         else
         {
-            logger.info("LSP", "Using stdio transport");
+            // Even without debug mode, enable basic file logging
+            logger.set_file_level(Cryo::LogLevel::INFO);
+            logger.set_log_file(logPath);
+            logger.info(Cryo::LogComponent::LSP, "CryoLSP starting (basic logging enabled)");
         }
 
-        // Create and run the language server
-        LanguageServer server(std::move(transport));
+        // Create and configure the compiler instance
+        auto compiler = new Cryo::CompilerInstance();
+        compiler->set_lsp_mode(true);
 
-        logger.info("LSP", "Language server created, entering main loop");
-        bool success = server.run();
+        // Create and configure the LSP server
+        Server lsp_server;
+        lsp_server.set_compiler_instance(compiler);
+        lsp_server.set_tcp_mode(tcp_mode, tcp_port);
+        lsp_server.set_debug_mode(debug_mode);
 
-        logger.info("LSP", "Language server exited " + std::string(success ? "successfully" : "with errors"));
-        return success ? 0 : 1;
+        // Log server startup
+        if (debug_mode)
+        {
+            Cryo::Logger::instance().info(Cryo::LogComponent::LSP, "Starting LSP server...");
+        }
+
+        // Run the server (this blocks until shutdown)
+        lsp_server.run();
+
+        if (debug_mode)
+        {
+            Cryo::Logger::instance().info(Cryo::LogComponent::LSP, "LSP server shutdown complete");
+        }
+
+        // Clean up compiler instance
+        delete compiler;
+
+        return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Fatal error: " << e.what() << std::endl;
+        return 1;
+    }
+    catch (...)
+    {
+        std::cerr << "Unknown fatal error occurred" << std::endl;
         return 1;
     }
 }

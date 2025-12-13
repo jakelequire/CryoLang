@@ -99,6 +99,7 @@ namespace Cryo::CLI::Commands
         argument(CLIArgument("emit-wasm", "Compile to WebAssembly (.wasm)", false).flag());
         argument(CLIArgument("wasm-exports", "Comma-separated list of functions to export to JavaScript", false));
         argument(CLIArgument("enable-js-interop", "Enable JavaScript interoperability", false).flag());
+        argument(CLIArgument("lsp", "LSP compilation mode (frontend only, no executable generation)", false).flag());
     }
 
     int CompileCommand::execute(const ParsedArgs &args)
@@ -219,8 +220,24 @@ namespace Cryo::CLI::Commands
             compiler->set_show_ast_before_ir(true);
         }
 
+        // Check for LSP mode
+        bool lsp_mode = args.get_flag("lsp");
+
         // Compile
-        bool success = compiler->compile_file(input_file);
+        bool success;
+        if (lsp_mode)
+        {
+            if (verbose || debug)
+            {
+                std::cout << "[LSP] Compiling in LSP mode (frontend only)..." << std::endl;
+            }
+            compiler->set_lsp_mode(true);
+            success = compiler->compile_for_lsp(input_file);
+        }
+        else
+        {
+            success = compiler->compile_file(input_file);
+        }
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -235,6 +252,34 @@ namespace Cryo::CLI::Commands
 
         if (success)
         {
+            // LSP mode: show LSP-specific information
+            if (lsp_mode)
+            {
+                if (verbose || debug)
+                {
+                    std::cout << "\n[LSP] Compilation completed successfully" << std::endl;
+
+                    // Show LSP diagnostics
+                    if (compiler->diagnostic_manager())
+                    {
+                        auto lsp_diagnostics = compiler->diagnostic_manager()->get_lsp_diagnostics();
+                        std::cout << "[LSP] Found " << lsp_diagnostics.size() << " diagnostics" << std::endl;
+                        for (const auto &diag : lsp_diagnostics)
+                        {
+                            std::cout << "  " << diag.severity << " at " << diag.line << ":" << diag.column << ": " << diag.message << std::endl;
+                        }
+                    }
+
+                    // Show symbol count
+                    if (compiler->symbol_table())
+                    {
+                        auto symbols = compiler->symbol_table()->get_all_symbols_for_lsp();
+                        std::cout << "[LSP] Found " << symbols.size() << " symbols" << std::endl;
+                    }
+                }
+                return 0; // LSP mode doesn't need executable generation
+            }
+
             // Show requested outputs
             // Note: AST is already shown before IR generation if --ast flag was used
 
@@ -782,7 +827,7 @@ namespace Cryo::CLI::Commands
 
         // Determine final debug/verbose state (CLI flags override config)
         bool use_debug = debug || config_has_debug;
-        bool use_verbose = verbose || use_debug;  // Debug implies verbose
+        bool use_verbose = verbose || use_debug; // Debug implies verbose
 
         // Configure logger based on debug/verbose flags
         if (use_debug || use_verbose)

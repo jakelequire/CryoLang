@@ -979,17 +979,17 @@ namespace Cryo
             {
                 continue; // Skip stdlib diagnostics - users don't need to see these
             }
-            
+
             // Always use the sophisticated Rust-style formatter
             if (_formatter)
             {
                 // Only count actual errors (not warnings or notes) for numbering
-                if (diagnostic.severity() == DiagnosticSeverity::Error || 
+                if (diagnostic.severity() == DiagnosticSeverity::Error ||
                     diagnostic.severity() == DiagnosticSeverity::Fatal)
                 {
                     error_number++;
                 }
-                
+
                 std::string formatted = _formatter->format_diagnostic(diagnostic, error_number);
                 os << formatted;
             }
@@ -1002,7 +1002,7 @@ namespace Cryo
         size_t user_errors = user_error_count();
         size_t user_warnings = user_warning_count();
         size_t user_total = user_total_count();
-        
+
         if (user_total == 0)
         {
             os << "No diagnostics.\n";
@@ -1020,7 +1020,7 @@ namespace Cryo
                 os << ", ";
             os << user_warnings << " warning" << (user_warnings == 1 ? "" : "s");
         }
-        if (_note_count > 0)  // Notes are generally less critical, keep original count
+        if (_note_count > 0) // Notes are generally less critical, keep original count
         {
             if (user_errors > 0 || user_warnings > 0)
                 os << ", ";
@@ -1041,7 +1041,7 @@ namespace Cryo
         _error_count = 0;
         _warning_count = 0;
         _note_count = 0;
-        
+
         // Clear source manager to prevent stale file references
         _source_manager.clear();
     }
@@ -1068,6 +1068,78 @@ namespace Cryo
         }
     }
 
+    std::vector<DiagnosticManager::LSPDiagnostic> DiagnosticManager::get_lsp_diagnostics() const
+    {
+        std::vector<LSPDiagnostic> lsp_diagnostics;
+
+        for (const auto &diagnostic : _diagnostics)
+        {
+            LSPDiagnostic lsp_diag;
+            lsp_diag.message = diagnostic.message();
+
+            // Convert severity to LSP format
+            switch (diagnostic.severity())
+            {
+            case DiagnosticSeverity::Error:
+            case DiagnosticSeverity::Fatal:
+                lsp_diag.severity = "error";
+                break;
+            case DiagnosticSeverity::Warning:
+                lsp_diag.severity = "warning";
+                break;
+            case DiagnosticSeverity::Note:
+                lsp_diag.severity = "info";
+                break;
+            }
+
+            // Extract position information
+            if (diagnostic.range().is_valid())
+            {
+                lsp_diag.line = diagnostic.range().start.line();
+                lsp_diag.column = diagnostic.range().start.column();
+                lsp_diag.end_line = diagnostic.range().end.line();
+                lsp_diag.end_column = diagnostic.range().end.column();
+            }
+            else
+            {
+                lsp_diag.line = 1;
+                lsp_diag.column = 1;
+                lsp_diag.end_line = 1;
+                lsp_diag.end_column = 1;
+            }
+
+            lsp_diag.filename = diagnostic.filename();
+
+            // Extract suggestions from primary spans
+            const auto &primary_spans = diagnostic.multi_span().primary_spans();
+            for (const auto &span : primary_spans)
+            {
+                const auto &label = span.label();
+                if (label.has_value() && !label.value().empty() && label.value() != diagnostic.message())
+                {
+                    lsp_diag.suggestions.push_back(label.value());
+                }
+            }
+
+            // Add error code if available
+            lsp_diag.code = "E" + std::to_string(static_cast<uint32_t>(diagnostic.error_code()));
+
+            lsp_diagnostics.push_back(std::move(lsp_diag));
+        }
+
+        return lsp_diagnostics;
+    }
+
+    void DiagnosticManager::clear_lsp_diagnostics()
+    {
+        clear();
+    }
+
+    bool DiagnosticManager::has_lsp_diagnostics() const
+    {
+        return !_diagnostics.empty();
+    }
+
     DiagnosticSeverity DiagnosticManager::adjust_severity(DiagnosticSeverity original_severity) const
     {
         if (_errors_as_warnings && (original_severity == DiagnosticSeverity::Error))
@@ -1088,8 +1160,8 @@ namespace Cryo
         size_t count = 0;
         for (const auto &diagnostic : _diagnostics)
         {
-            if (!is_stdlib_diagnostic(diagnostic) && 
-                (diagnostic.severity() == DiagnosticSeverity::Error || 
+            if (!is_stdlib_diagnostic(diagnostic) &&
+                (diagnostic.severity() == DiagnosticSeverity::Error ||
                  diagnostic.severity() == DiagnosticSeverity::Fatal))
             {
                 count++;
@@ -1127,28 +1199,29 @@ namespace Cryo
     bool DiagnosticManager::is_stdlib_diagnostic(const Diagnostic &diagnostic) const
     {
         const std::string &filename = diagnostic.filename();
-        
+
         // Check for stdlib file paths
         bool is_stdlib_file = (filename.find("stdlib") != std::string::npos ||
-                             filename.find("core/") != std::string::npos ||
-                             filename.find("/core/") != std::string::npos ||
-                             filename.find("\\core\\") != std::string::npos ||
-                             filename.find("/stdlib/") != std::string::npos ||
-                             filename.find("\\stdlib\\") != std::string::npos);
-        
-        if (is_stdlib_file) {
+                               filename.find("core/") != std::string::npos ||
+                               filename.find("/core/") != std::string::npos ||
+                               filename.find("\\core\\") != std::string::npos ||
+                               filename.find("/stdlib/") != std::string::npos ||
+                               filename.find("\\stdlib\\") != std::string::npos);
+
+        if (is_stdlib_file)
+        {
             return true;
         }
-        
+
         // Additional heuristic: check error message for stdlib-related content
         // This helps catch auto-imported stdlib errors that get misattributed to user files
         const std::string &message = diagnostic.message();
         bool is_stdlib_error = (message.find("Option<T>") != std::string::npos ||
-                               message.find("Result<T,E>") != std::string::npos ||
-                               message.find("is not declared in string") != std::string::npos ||
-                               message.find("is not declared in Array") != std::string::npos ||
-                               message.find("is not declared in Vec") != std::string::npos);
-        
+                                message.find("Result<T,E>") != std::string::npos ||
+                                message.find("is not declared in string") != std::string::npos ||
+                                message.find("is not declared in Array") != std::string::npos ||
+                                message.find("is not declared in Vec") != std::string::npos);
+
         return is_stdlib_error;
     }
 
