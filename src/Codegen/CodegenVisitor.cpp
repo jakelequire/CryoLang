@@ -5571,6 +5571,13 @@ namespace Cryo::Codegen
                     effective_type = ptr_type->pointee_type().get();
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Dereferencing pointer type to: {}", effective_type->name());
                 }
+                // For reference types, get the referent type
+                else if (resolved_type->kind() == Cryo::TypeKind::Reference)
+                {
+                    Cryo::ReferenceType *ref_type = static_cast<Cryo::ReferenceType *>(resolved_type);
+                    effective_type = ref_type->referent_type().get();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Accessing through reference type to: {}", effective_type->name());
+                }
 
                 if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class || effective_type->kind() == Cryo::TypeKind::Parameterized)
                 {
@@ -5598,6 +5605,12 @@ namespace Cryo::Codegen
                     {
                         Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(cryo_type);
                         cryo_type = ptr_type->pointee_type().get();
+                    }
+                    // For reference types, get the referent type
+                    else if (cryo_type->kind() == Cryo::TypeKind::Reference)
+                    {
+                        Cryo::ReferenceType *ref_type = static_cast<Cryo::ReferenceType *>(cryo_type);
+                        cryo_type = ref_type->referent_type().get();
                     }
 
                     if (cryo_type->kind() == Cryo::TypeKind::Struct)
