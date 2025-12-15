@@ -3814,6 +3814,37 @@ namespace Cryo
             node.set_resolved_type(pointee_type);
             LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Pointer element type is '{}'", pointee_type->name());
         }
+        else if (array_type->kind() == TypeKind::Reference)
+        {
+            // Reference type - can be indexed like an array if the referent supports it
+            ReferenceType *ref_type = static_cast<ReferenceType *>(array_type);
+            Type *referent_type = ref_type->referent_type().get();
+            
+            // Check if the referent type supports array access
+            if (referent_type->kind() == TypeKind::Array)
+            {
+                ArrayType *array_ref = static_cast<ArrayType *>(referent_type);
+                node.set_resolved_type(array_ref->element_type().get());
+                LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Reference to array element type is '{}'", array_ref->element_type()->name());
+            }
+            else if (referent_type->kind() == TypeKind::String)
+            {
+                node.set_resolved_type(_type_context.get_char_type());
+                LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Reference to string element type is 'char'");
+            }
+            else if (referent_type->kind() == TypeKind::Pointer)
+            {
+                PointerType *ptr_type = static_cast<PointerType *>(referent_type);
+                node.set_resolved_type(ptr_type->pointee_type().get());
+                LOG_DEBUG(Cryo::LogComponent::AST, "ArrayAccess: Reference to pointer element type is '{}'", ptr_type->pointee_type()->name());
+            }
+            else
+            {
+                std::string error_msg = "Cannot index into reference to type '" + referent_type->name() + "'";
+                report_error(TypeError::ErrorKind::TypeMismatch, node.location(), error_msg, &node);
+                node.set_resolved_type(_type_context.get_unknown_type());
+            }
+        }
         else if (array_type->kind() == TypeKind::String)
         {
             // String type - can be indexed to get individual characters
@@ -3950,9 +3981,18 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Dereferencing pointer type to access member '{}' on type '{}'",
                       member_name, effective_type->name());
         }
+        else if (object_type->kind() == TypeKind::Reference)
+        {
+            // This is a reference type, get the referent type
+            const ReferenceType *ref_type = static_cast<const ReferenceType *>(object_type);
+            effective_type = ref_type->referent_type().get();
+            is_pointer_access = false; // References don't need special dereferencing syntax
+            LOG_DEBUG(Cryo::LogComponent::AST, "Accessing member '{}' through reference type, referent type: '{}'",
+                      member_name, effective_type->name());
+        }
         else
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Object type '{}' is not a pointer, kind: {}",
+            LOG_DEBUG(Cryo::LogComponent::AST, "Object type '{}' is not a pointer or reference, kind: {}",
                       object_type->name(), static_cast<int>(object_type->kind()));
         }
 
