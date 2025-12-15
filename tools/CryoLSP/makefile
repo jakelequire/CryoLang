@@ -1,51 +1,82 @@
-# CryoLSP Server Makefile
-# Language Server Protocol implementation for CryoLang
+# CryoLSP Makefile
+# Simple Language Server Protocol implementation for CryoLang
 
-# Compiler settings
-CXX = C:/msys64/mingw64/bin/clang++
-CXXFLAGS = -std=c++23 -D_CRT_SECURE_NO_WARNINGS -DNOMINMAX -DWIN32_LEAN_AND_MEAN -w -g -Og -I"C:/msys64/mingw64/include" -fexceptions
-INCLUDES = -I../../include -I./include
-LIBS = -L../../bin -lcryo-compiler -LC:/msys64/mingw64/lib "C:/msys64/mingw64/lib/libLLVM-20.dll.a" -lws2_32
+# Include shared configuration from parent
+include ../../makefile.config
 
 # Directories
-SRC_DIR = src
-INCLUDE_DIR = include
-BUILD_DIR = ../../bin/.o/lsp
-TARGET_DIR = ../../bin
-TARGET = $(TARGET_DIR)/cryolsp.exe
+SRCDIR = src
+BUILDDIR = build
+BINDIR = bin
+TARGET = $(BINDIR)/cryolsp
 
 # Source files
-SOURCES = $(wildcard $(SRC_DIR)/*.cpp)
-OBJECTS = $(SOURCES:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o)
+SOURCES = $(wildcard $(SRCDIR)/*.cpp)
+OBJECTS = $(SOURCES:$(SRCDIR)/%.cpp=$(BUILDDIR)/%.o)
 
-.PHONY: all clean
+# Get LLVM configuration
+LLVM_CONFIG = llvm-config
+
+# Platform-specific LLVM flags
+ifeq ($(OS), Windows_NT)
+    LLVM_LDFLAGS = $(shell $(LLVM_CONFIG) --ldflags) C:/msys64/mingw64/lib/libLLVM-20.dll.a
+else
+    LLVM_LDFLAGS = $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs) $(shell $(LLVM_CONFIG) --system-libs)
+endif
+
+# Includes and libs
+INCLUDES += -Iinclude -I../../include -I../../libs/cjson/include
+LIBS = -pthread ../../bin/libcryo-compiler.a ../../libs/cjson/build/libcjson.a $(LLVM_LDFLAGS)
+ifeq ($(OS), Windows_NT)
+    LIBS += -lws2_32 -lwsock32
+endif
 
 # Default target
 all: $(TARGET)
 
-# Create build directory
-$(BUILD_DIR):
-	@if not exist "$(BUILD_DIR)" mkdir "$(BUILD_DIR)"
+# Create directories
+$(BUILDDIR) $(BINDIR):
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$@)" mkdir "$(subst /,\,$@)"
+else
+	@$(MKDIR) $@
+endif
+
+# Build target
+$(TARGET): $(OBJECTS) | $(BINDIR)
+	$(CXX) $(CXXFLAGS) $(OBJECTS) -o $@ $(LIBS)
+	@echo "✓ CryoLSP built: $@"
 
 # Compile source files
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
+$(BUILDDIR)/%.o: $(SRCDIR)/%.cpp | $(BUILDDIR)
+ifeq ($(OS), Windows_NT)
+	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
+else
+	@$(MKDIR) $(dir $@)
+endif
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-# Link executable
-$(TARGET): $(OBJECTS)
-	$(CXX) $(OBJECTS) $(LIBS) -o $@
-	@echo "✓ CryoLSP server built successfully: $(TARGET)"
-
-# Clean build artifacts
-clean:
-	@if exist "$(BUILD_DIR)" rmdir /s /q "$(BUILD_DIR)"
-	@if exist "$(TARGET)" del /f "$(TARGET)"
-	@echo "✓ Cleaned CryoLSP build artifacts"
-
-# Debug target with verbose output
-debug: CXXFLAGS += -DDEBUG -v
+# Debug build
+debug: CXXFLAGS += -g -O0 -DDEBUG
 debug: $(TARGET)
 
-# Install target (copy to system path if needed)
-install: $(TARGET)
-	@echo "CryoLSP server is ready at: $(TARGET)"
+# Clean
+clean:
+ifeq ($(OS), Windows_NT)
+	@if exist "$(BUILDDIR)" rmdir /s /q "$(BUILDDIR)"
+	@if exist "$(BINDIR)" rmdir /s /q "$(BINDIR)"
+else
+	@rm -rf $(BUILDDIR) $(BINDIR)
+endif
+	@echo "✓ CryoLSP cleaned"
+
+# Run LSP server
+run: $(TARGET)
+	./$(TARGET) --port 7777 --log-level debug
+
+# Test basic functionality
+test: $(TARGET)
+	./$(TARGET) --version
+	./$(TARGET) --help
+
+.PHONY: all debug clean run test

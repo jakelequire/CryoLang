@@ -176,6 +176,8 @@ tools: lsp
 compiler-lib: $(COMPILER_LIB)
 
 lsp: $(COMPILER_LIB)
+	@echo "Building cjson library..."
+	@$(MAKE) -C libs/cjson static
 	@echo "Building CryoLSP..."
 	@$(MAKE) -C tools/CryoLSP
 

@@ -105,10 +105,10 @@ function startLanguageServer(context: vscode.ExtensionContext) {
     }
 
     // Use TCP mode for reliable communication
-    const port = 8080;
-    const serverArgs: string[] = ['--tcp', port.toString()];
+    const port = 7777;
+    const serverArgs: string[] = ['--port', port.toString()];
     if (debugMode) {
-        serverArgs.push('--debug');
+        serverArgs.push('--log-level', 'debug');
     }
     if (logFile) {
         serverArgs.push('--log-file', logFile);
@@ -127,14 +127,16 @@ function startLanguageServer(context: vscode.ExtensionContext) {
             const { spawn } = require('child_process');
             const serverProcess = spawn(serverPath, serverArgs, {
                 stdio: ['pipe', 'pipe', 'pipe'],
-                cwd: path.dirname(path.dirname(serverPath)) // Set working directory to CryoLang root
+                cwd: path.dirname(path.dirname(serverPath)), // Set working directory to CryoLang root
+                shell: true, // Use shell on Windows for better compatibility
+                windowsHide: true // Hide window on Windows
             });
 
             serverProcess.stdout.on('data', (data: Buffer) => {
                 const output = data.toString();
                 console.log('Server stdout:', output);
-                // Look for the "listening on port" message
-                if (output.includes('LSP server listening on port')) {
+                // Look for the server startup message
+                if (output.includes('Starting CryoLSP server on') || output.includes('Ready to accept client connections')) {
                     console.log('Server is ready, attempting TCP connection...');
                     attemptConnection();
                 }
@@ -162,14 +164,22 @@ function startLanguageServer(context: vscode.ExtensionContext) {
             });
 
             let connectionAttempted = false;
+            let connectionRetries = 0;
+            const maxRetries = 10;
 
             function attemptConnection() {
-                if (connectionAttempted) return;
+                if (connectionAttempted && connectionRetries >= maxRetries) {
+                    reject(new Error('Failed to connect to LSP server after multiple attempts'));
+                    return;
+                }
+
                 connectionAttempted = true;
+                connectionRetries++;
 
                 const socket = new Socket();
+                
                 socket.connect(port, 'localhost', () => {
-                    console.log('Successfully connected to LSP server via TCP on port', port);
+                    console.log(`Successfully connected to LSP server via TCP on port ${port} (attempt ${connectionRetries})`);
                     resolve({
                         reader: socket,
                         writer: socket
@@ -177,19 +187,26 @@ function startLanguageServer(context: vscode.ExtensionContext) {
                 });
 
                 socket.on('error', (err) => {
-                    console.error('TCP connection error:', err);
-                    reject(err);
+                    console.error(`TCP connection error (attempt ${connectionRetries}):`, err);
+                    
+                    if (connectionRetries < maxRetries) {
+                        // Reset for retry
+                        connectionAttempted = false;
+                        // Exponential backoff: 500ms, 1s, 2s, 4s, etc.
+                        const delay = Math.min(500 * Math.pow(2, connectionRetries - 1), 4000);
+                        console.log(`Retrying connection in ${delay}ms...`);
+                        setTimeout(attemptConnection, delay);
+                    } else {
+                        reject(err);
+                    }
                 });
             }
 
-            // Fallback: try to connect after a delay if we don't see the ready message
+            // Start trying to connect immediately, then retry with backoff
             setTimeout(() => {
-                if (!connectionAttempted) {
-                    console.log('Timeout waiting for server ready message, attempting connection anyway...');
-                    vscode.window.showWarningMessage('CryoLSP server may be slow to start, attempting connection...');
-                    attemptConnection();
-                }
-            }, 5000); // Increased timeout to 5 seconds
+                console.log('Starting LSP server connection attempts...');
+                attemptConnection();
+            }, 1000); // Start after 1 second to let server initialize
         });
     };
 
