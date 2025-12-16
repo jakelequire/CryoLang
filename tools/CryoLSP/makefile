@@ -4,28 +4,31 @@
 # Include shared configuration from parent
 include ../../makefile.config
 
+# Use the same compiler and flags as parent makefile
+CXX = $(CXX_COMPILER)
+# CXXFLAGS is inherited from makefile.config and includes LLVM flags
+
 # Directories
 SRCDIR = src
 BUILDDIR = build
-BINDIR = bin
+# Use root bin directory - CRYO_SRC env var or relative path to root
+ifdef CRYO_SRC
+    BINDIR = $(CRYO_SRC)/bin
+else
+    BINDIR = ../../bin
+endif
 TARGET = $(BINDIR)/cryolsp
 
 # Source files
 SOURCES = $(wildcard $(SRCDIR)/*.cpp)
 OBJECTS = $(SOURCES:$(SRCDIR)/%.cpp=$(BUILDDIR)/%.o)
 
-# Get LLVM configuration
-LLVM_CONFIG = llvm-config
+# Use the exact same LLVM configuration as the main compiler
+# These are already defined in makefile.config and imported above
+# LLVM_CONFIG, LLVM_CXXFLAGS, and LLVM_LDFLAGS are inherited from parent
 
-# Platform-specific LLVM flags
-ifeq ($(OS), Windows_NT)
-    LLVM_LDFLAGS = $(shell $(LLVM_CONFIG) --ldflags) C:/msys64/mingw64/lib/libLLVM-20.dll.a
-else
-    LLVM_LDFLAGS = $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --libs) $(shell $(LLVM_CONFIG) --system-libs)
-endif
-
-# Includes and libs
-INCLUDES += -Iinclude -I../../include -I../../libs/cjson/include
+# Additional includes specific to LSP (CXXFLAGS already includes LLVM includes)
+INCLUDES = -Iinclude -I../../include -I../../libs/cjson/include
 LIBS = -pthread ../../bin/libcryo-compiler.a ../../libs/cjson/build/libcjson.a $(LLVM_LDFLAGS)
 ifeq ($(OS), Windows_NT)
     LIBS += -lws2_32 -lwsock32
@@ -64,9 +67,10 @@ debug: $(TARGET)
 clean:
 ifeq ($(OS), Windows_NT)
 	@if exist "$(BUILDDIR)" rmdir /s /q "$(BUILDDIR)"
-	@if exist "$(BINDIR)" rmdir /s /q "$(BINDIR)"
+	@if exist "$(TARGET)" del /q "$(TARGET)"
 else
-	@rm -rf $(BUILDDIR) $(BINDIR)
+	@rm -rf $(BUILDDIR)
+	@rm -f $(TARGET)
 endif
 	@echo "✓ CryoLSP cleaned"
 
