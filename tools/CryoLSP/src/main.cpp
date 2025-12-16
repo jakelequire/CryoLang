@@ -104,7 +104,7 @@ CommandLineArgs parse_command_line(int argc, char *argv[])
 void setup_logging(const CommandLineArgs &args)
 {
     std::cout << "Configuring log level: " << args.log_level << std::endl;
-    
+
     // Configure logging based on command line arguments
     Cryo::LogLevel level = Cryo::LogLevel::INFO;
 
@@ -130,8 +130,8 @@ void setup_logging(const CommandLineArgs &args)
     }
 
     std::cout << "Getting logger instance..." << std::endl;
-    
-    try 
+
+    try
     {
         // Get logger instance and configure it
         auto &logger = Cryo::Logger::instance();
@@ -143,12 +143,12 @@ void setup_logging(const CommandLineArgs &args)
         config.file_level = Cryo::LogLevel::DEBUG; // Always log debug level to file
         config.enable_colors = true;
         config.enable_timestamps = true;
-        
+
         // Always ensure we have a log file for debugging
         if (args.log_file.empty())
         {
             // Use the logs folder if CRYO_SRC environment variable is available
-            const char* cryo_src = std::getenv("CRYO_SRC");
+            const char *cryo_src = std::getenv("CRYO_SRC");
             if (cryo_src != nullptr)
             {
                 config.log_file_path = std::string(cryo_src) + "/logs/cryo-lsp-debug.log";
@@ -163,20 +163,20 @@ void setup_logging(const CommandLineArgs &args)
         {
             config.log_file_path = args.log_file;
         }
-        
+
         std::cout << "Log file path: " << config.log_file_path << std::endl;
         std::cout << "Initializing logger with config..." << std::endl;
-        
+
         // Try to initialize logger
         logger.initialize(config);
-        
+
         std::cout << "Logger initialized successfully!" << std::endl;
         logger.info(Cryo::LogComponent::LSP, "CryoLSP starting up...");
         logger.info(Cryo::LogComponent::LSP, "Log level: " + args.log_level);
         logger.info(Cryo::LogComponent::LSP, "Logging to file: " + config.log_file_path);
         logger.debug(Cryo::LogComponent::LSP, "Debug logging enabled");
     }
-    catch (const std::exception& e)
+    catch (const std::exception &e)
     {
         std::cerr << "Failed to initialize logging: " << e.what() << std::endl;
         std::cout << "Continuing without advanced logging..." << std::endl;
@@ -220,7 +220,7 @@ int main(int argc, char *argv[])
     try
     {
         std::cout << "CryoLSP starting..." << std::endl;
-        
+
         // Parse command line arguments
         CommandLineArgs args = parse_command_line(argc, argv);
 
@@ -263,14 +263,15 @@ int main(int argc, char *argv[])
         // Create and start the LSP server
         logger.debug(Cryo::LogComponent::LSP, "Creating LSP server instance...");
         LSPServer server(config);
-        
+
         std::cout << "Initializing LSP server..." << std::endl;
-        if (!server.initialize()) {
+        if (!server.initialize())
+        {
             std::cerr << "Failed to initialize LSP server" << std::endl;
             logger.error(Cryo::LogComponent::LSP, "Failed to initialize LSP server");
             return 1;
         }
-        
+
         std::cout << "Starting LSP server..." << std::endl;
         logger.debug(Cryo::LogComponent::LSP, "Starting LSP server...");
         if (!server.start())

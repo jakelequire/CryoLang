@@ -177,7 +177,7 @@ function startLanguageServer(context: vscode.ExtensionContext) {
                 connectionRetries++;
 
                 const socket = new Socket();
-                
+
                 socket.connect(port, 'localhost', () => {
                     console.log(`Successfully connected to LSP server via TCP on port ${port} (attempt ${connectionRetries})`);
                     resolve({
@@ -188,7 +188,7 @@ function startLanguageServer(context: vscode.ExtensionContext) {
 
                 socket.on('error', (err) => {
                     console.error(`TCP connection error (attempt ${connectionRetries}):`, err);
-                    
+
                     if (connectionRetries < maxRetries) {
                         // Reset for retry
                         connectionAttempted = false;
