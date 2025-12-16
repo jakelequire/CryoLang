@@ -20,9 +20,12 @@ namespace CryoLSP
 #ifdef _WIN32
         WSADATA wsaData;
         int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-        if (result != 0) {
+        if (result != 0)
+        {
             log_error("WSAStartup failed with error: " + std::to_string(result));
-        } else {
+        }
+        else
+        {
             log_debug("WSAStartup successful");
         }
 #endif
@@ -45,13 +48,16 @@ namespace CryoLSP
 
         // Initialize compiler
         log_debug("Creating compiler instance...");
-        try {
+        try
+        {
             _compiler = Cryo::create_compiler_instance();
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception &e)
+        {
             log_error("Exception creating compiler instance: " + std::string(e.what()));
             return false;
         }
-        
+
         if (!_compiler)
         {
             log_error("Failed to create compiler instance - returned null");
