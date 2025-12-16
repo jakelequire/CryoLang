@@ -105,6 +105,8 @@ namespace Cryo::Codegen
         llvm::Value *generate_mfree(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_msize(const std::vector<llvm::Value *> &args);
 
+        llvm::Value *generate_exit(const std::vector<llvm::Value *> &args);
+
         // Error handling
         bool has_errors() const { return _has_errors; }
         const std::string& get_last_error() const { return _last_error; }

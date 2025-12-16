@@ -188,6 +188,9 @@ namespace Cryo::Codegen
             return generate_mfree(args);
         else if (intrinsic_name == "__msize__")
             return generate_msize(args);
+        
+        else if (intrinsic_name == "__exit__")
+            return generate_exit(args);
 
         else
         {
@@ -1864,6 +1867,33 @@ namespace Cryo::Codegen
 
         // Call malloc_usable_size
         return builder.CreateCall(msize_func, {ptr_arg}, "msize.result");
+    }
+
+
+    llvm::Value *Intrinsics::generate_exit(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("__exit__ requires exactly 1 argument (exit_code)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create exit function type: void exit(int status)
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *exit_type = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(context), {int_type}, false);
+
+        // Get or create exit function
+        llvm::Function *exit_func = get_or_create_libc_function("exit", exit_type);
+
+        llvm::Value *code_arg = args[0];
+        llvm::Value *code_arg_32 = ensure_type(code_arg, int_type, "exit.code");
+
+        // Call exit
+        return builder.CreateCall(exit_func, {code_arg_32}, "exit.result");
     }
 
 } // namespace Cryo::Codegen

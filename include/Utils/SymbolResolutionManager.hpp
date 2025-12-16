@@ -100,7 +100,7 @@ namespace Cryo::SRM {
         bool is_namespaced() const { return !namespace_parts_.empty(); }
         
         // Utility methods
-        std::string get_simple_name() const { return symbol_name_; }
+        std::string get_simple_name() const override { return symbol_name_; }
         std::string get_qualified_name() const { return to_string(); }
         
         // Creation helpers

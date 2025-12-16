@@ -106,12 +106,16 @@ namespace Cryo
         _config.log_file_path = path;
         _current_file_size = 0;
 
-        // Create directory if it doesn't exist using OS utility
-        auto& os = Cryo::Utils::OS::instance();
+        // Create directory if it doesn't exist using standard filesystem
         std::filesystem::path file_path(path);
         if (file_path.has_parent_path())
         {
-            os.create_directories(file_path.parent_path().string());
+            try {
+                std::filesystem::create_directories(file_path.parent_path());
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: Could not create log directory: " << e.what() << std::endl;
+                // Continue anyway - let file opening fail if needed
+            }
         }
 
         // Open log file

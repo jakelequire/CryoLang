@@ -17,19 +17,48 @@ namespace CryoLSP
 
     LSPServer::LSPServer(const Config &config) : _config(config), _server_socket(0)
     {
+        std::cerr << "[LSPServer] Constructor starting..." << std::endl;
+        std::cout << "[LSPServer] Constructor starting..." << std::endl;
+        std::cerr.flush();
+        std::cout.flush();
+        
+        try {
 #ifdef _WIN32
-        WSADATA wsaData;
-        int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-        if (result != 0)
-        {
-            log_error("WSAStartup failed with error: " + std::to_string(result));
-        }
-        else
-        {
-            log_debug("WSAStartup successful");
-        }
+            std::cerr << "[LSPServer] Setting up WSA..." << std::endl;
+            std::cout << "[LSPServer] Setting up WSA..." << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
+            
+            WSADATA wsaData;
+            int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+            if (result != 0)
+            {
+                log_error("WSAStartup failed with error: " + std::to_string(result));
+            }
+            else
+            {
+                log_debug("WSAStartup successful");
+            }
 #endif
-        log_debug("LSPServer constructor completed");
+            std::cerr << "[LSPServer] Constructor completed successfully" << std::endl;
+            std::cout << "[LSPServer] Constructor completed successfully" << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
+            
+            log_debug("LSPServer constructor completed");
+        } catch (const std::exception& e) {
+            std::cerr << "[LSPServer] Exception in constructor: " << e.what() << std::endl;
+            std::cout << "[LSPServer] Exception in constructor: " << e.what() << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
+            throw;
+        } catch (...) {
+            std::cerr << "[LSPServer] Unknown exception in constructor" << std::endl;
+            std::cout << "[LSPServer] Unknown exception in constructor" << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
+            throw;
+        }
     }
 
     LSPServer::~LSPServer()
@@ -47,22 +76,59 @@ namespace CryoLSP
         log_debug("Max connections: " + std::to_string(_config.max_connections));
 
         // Initialize compiler
+        std::cerr << "[LSPServer] About to create compiler instance..." << std::endl;
+        std::cout << "[LSPServer] About to create compiler instance..." << std::endl;
+        std::cerr.flush();
+        std::cout.flush();
+        
         log_debug("Creating compiler instance...");
         try
         {
+            std::cerr << "[LSPServer] Calling Cryo::create_compiler_instance()..." << std::endl;
+            std::cout << "[LSPServer] Calling Cryo::create_compiler_instance()..." << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
+            
             _compiler = Cryo::create_compiler_instance();
+            
+            std::cerr << "[LSPServer] create_compiler_instance() returned: " << (_compiler ? "valid pointer" : "NULL") << std::endl;
+            std::cout << "[LSPServer] create_compiler_instance() returned: " << (_compiler ? "valid pointer" : "NULL") << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
         }
         catch (const std::exception &e)
         {
+            std::cerr << "[LSPServer] Exception creating compiler instance: " << e.what() << std::endl;
+            std::cout << "[LSPServer] Exception creating compiler instance: " << e.what() << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
             log_error("Exception creating compiler instance: " + std::string(e.what()));
+            return false;
+        }
+        catch (...)
+        {
+            std::cerr << "[LSPServer] Unknown exception creating compiler instance" << std::endl;
+            std::cout << "[LSPServer] Unknown exception creating compiler instance" << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
+            log_error("Unknown exception creating compiler instance");
             return false;
         }
 
         if (!_compiler)
         {
+            std::cerr << "[LSPServer] Compiler instance is NULL!" << std::endl;
+            std::cout << "[LSPServer] Compiler instance is NULL!" << std::endl;
+            std::cerr.flush();
+            std::cout.flush();
             log_error("Failed to create compiler instance - returned null");
             return false;
         }
+        
+        std::cerr << "[LSPServer] Compiler instance created successfully" << std::endl;
+        std::cout << "[LSPServer] Compiler instance created successfully" << std::endl;
+        std::cerr.flush();
+        std::cout.flush();
         log_debug("Compiler instance created successfully");
 
         _compiler->set_debug_mode(_config.enable_debug_logging);
@@ -101,6 +167,11 @@ namespace CryoLSP
 
         // Start server thread
         _server_thread = std::thread(&LSPServer::server_loop, this);
+
+        // Output the exact message the VS Code extension is looking for
+        std::cout << "Ready to accept client connections" << std::endl;
+        std::cout.flush(); // Ensure immediate output
+        log_info("Ready to accept client connections");
 
         return true;
     }
@@ -165,16 +236,20 @@ namespace CryoLSP
     {
         log_debug("Creating socket...");
         _server_socket = socket(AF_INET, SOCK_STREAM, 0);
-        if (_server_socket < 0)
-        {
 #ifdef _WIN32
+        if (_server_socket == INVALID_SOCKET)
+        {
             int error = WSAGetLastError();
             log_error("Failed to create socket, WSA Error: " + std::to_string(error));
-#else
-            log_error("Failed to create socket, errno: " + std::to_string(errno));
-#endif
             return false;
         }
+#else
+        if (_server_socket < 0)
+        {
+            log_error("Failed to create socket, errno: " + std::to_string(errno));
+            return false;
+        }
+#endif
         log_debug("Socket created successfully");
 
         // Set socket options
@@ -188,36 +263,71 @@ namespace CryoLSP
         // Bind socket
         struct sockaddr_in address;
         address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
+        
+        // Use configured host address instead of INADDR_ANY
+        if (_config.host == "localhost" || _config.host == "127.0.0.1") {
+            address.sin_addr.s_addr = inet_addr("127.0.0.1");
+        } else if (_config.host == "0.0.0.0") {
+            address.sin_addr.s_addr = INADDR_ANY;
+        } else {
+            address.sin_addr.s_addr = inet_addr(_config.host.c_str());
+        }
+        
         address.sin_port = htons(_config.port);
 
-        log_debug("Binding socket to port " + std::to_string(_config.port) + "...");
+        log_debug("Binding socket to " + _config.host + ":" + std::to_string(_config.port) + "...");
+        std::cout << "Attempting to bind to " << _config.host << ":" << _config.port << std::endl;
+        std::cout.flush();
+        
         if (bind(_server_socket, (struct sockaddr *)&address, sizeof(address)) < 0)
         {
 #ifdef _WIN32
             int error = WSAGetLastError();
+            std::cout << "BIND FAILED: WSA Error " << error << std::endl;
+            if (error == WSAEADDRINUSE) {
+                std::cout << "ERROR: Port " << _config.port << " is already in use!" << std::endl;
+            } else if (error == WSAEACCES) {
+                std::cout << "ERROR: Permission denied to bind to port " << _config.port << std::endl;
+            }
             log_error("Failed to bind socket to port " + std::to_string(_config.port) + ", WSA Error: " + std::to_string(error));
 #else
+            std::cout << "BIND FAILED: errno " << errno << std::endl;
+            if (errno == EADDRINUSE) {
+                std::cout << "ERROR: Port " << _config.port << " is already in use!" << std::endl;
+            } else if (errno == EACCES) {
+                std::cout << "ERROR: Permission denied to bind to port " << _config.port << std::endl;
+            }
             log_error("Failed to bind socket to port " + std::to_string(_config.port) + ", errno: " + std::to_string(errno));
 #endif
+            std::cout.flush();
             cleanup_socket();
             return false;
         }
+        std::cout << "Socket bound successfully to " << _config.host << ":" << _config.port << std::endl;
+        std::cout.flush();
         log_debug("Socket bound successfully");
 
         // Listen for connections
         log_debug("Setting up socket to listen...");
+        std::cout << "Setting up socket to listen (max connections: " << _config.max_connections << ")..." << std::endl;
+        std::cout.flush();
+        
         if (listen(_server_socket, _config.max_connections) < 0)
         {
 #ifdef _WIN32
             int error = WSAGetLastError();
+            std::cout << "LISTEN FAILED: WSA Error " << error << std::endl;
             log_error("Failed to listen on socket, WSA Error: " + std::to_string(error));
 #else
+            std::cout << "LISTEN FAILED: errno " << errno << std::endl;
             log_error("Failed to listen on socket, errno: " + std::to_string(errno));
 #endif
+            std::cout.flush();
             cleanup_socket();
             return false;
         }
+        std::cout << "Socket is now listening for connections" << std::endl;
+        std::cout.flush();
         log_debug("Socket listening successfully");
 
         return true;
@@ -247,14 +357,26 @@ namespace CryoLSP
 
             socket_t client_socket = accept(_server_socket, (struct sockaddr *)&client_addr, &client_len);
 
+#ifdef _WIN32
+            if (client_socket == INVALID_SOCKET)
+            {
+                if (_running.load())
+                {
+                    int error = WSAGetLastError();
+                    log_error("Failed to accept client connection, WSA Error: " + std::to_string(error));
+                }
+                continue;
+            }
+#else
             if (client_socket < 0)
             {
                 if (_running.load())
                 {
-                    log_error("Failed to accept client connection");
+                    log_error("Failed to accept client connection, errno: " + std::to_string(errno));
                 }
                 continue;
             }
+#endif
 
             log_info("New client connected");
 

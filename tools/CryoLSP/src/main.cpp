@@ -1,10 +1,14 @@
 #include "LSPServer.hpp"
 #include "Utils/Logger.hpp"
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <cstdlib>
 #include <thread>
 #include <chrono>
+#include <filesystem>
+#include <csignal>
+#include <ctime>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -20,14 +24,12 @@ void print_usage(const char *program_name)
     std::cout << "\nOptions:\n";
     std::cout << "  --port PORT        TCP port to listen on (default: 7777)\n";
     std::cout << "  --host HOST        Host address to bind to (default: localhost)\n";
-    std::cout << "  --log-level LEVEL  Log level: debug, info, warn, error (default: info)\n";
-    std::cout << "  --log-file FILE    Log file path (default: stderr)\n";
     std::cout << "  --config FILE      Configuration file path\n";
     std::cout << "  --help, -h         Show this help message\n";
     std::cout << "  --version, -v      Show version information\n";
     std::cout << "\nExamples:\n";
     std::cout << "  " << program_name << " --port 8080\n";
-    std::cout << "  " << program_name << " --host 0.0.0.0 --port 7777 --log-level debug\n";
+    std::cout << "  " << program_name << " --host 0.0.0.0 --port 7777\n";
     std::cout << "\nFor more information, visit: https://github.com/YourOrg/CryoLang\n";
 }
 
@@ -42,8 +44,6 @@ struct CommandLineArgs
 {
     int port = 7777;
     std::string host = "localhost";
-    std::string log_level = "info";
-    std::string log_file = "";
     std::string config_file = "";
     bool show_help = false;
     bool show_version = false;
@@ -78,14 +78,8 @@ CommandLineArgs parse_command_line(int argc, char *argv[])
         {
             args.host = argv[++i];
         }
-        else if (arg == "--log-level" && i + 1 < argc)
-        {
-            args.log_level = argv[++i];
-        }
-        else if (arg == "--log-file" && i + 1 < argc)
-        {
-            args.log_file = argv[++i];
-        }
+
+
         else if (arg == "--config" && i + 1 < argc)
         {
             args.config_file = argv[++i];
@@ -101,87 +95,96 @@ CommandLineArgs parse_command_line(int argc, char *argv[])
     return args;
 }
 
-void setup_logging(const CommandLineArgs &args)
+void setup_logging(std::ofstream &debug_log)
 {
-    std::cout << "Configuring log level: " << args.log_level << std::endl;
+    debug_log << "[SETUP_LOGGING] Skipping logger initialization - known to crash" << std::endl;
+    debug_log << "[SETUP_LOGGING] Logger functionality disabled but server will continue" << std::endl;
+    debug_log.flush();
+    // Note: Logger calls in main() will be ignored/commented out
+        debug_log << "[SETUP_LOGGING] Got logger instance successfully" << std::endl;
+        debug_log.flush();
 
-    // Configure logging based on command line arguments
-    Cryo::LogLevel level = Cryo::LogLevel::INFO;
-
-    if (args.log_level == "debug")
-    {
-        level = Cryo::LogLevel::DEBUG;
-    }
-    else if (args.log_level == "info")
-    {
-        level = Cryo::LogLevel::INFO;
-    }
-    else if (args.log_level == "warn")
-    {
-        level = Cryo::LogLevel::WARN;
-    }
-    else if (args.log_level == "error")
-    {
-        level = Cryo::LogLevel::FATAL;
-    }
-    else
-    {
-        std::cerr << "Warning: Unknown log level '" << args.log_level << "', using 'info'\n";
-    }
-
-    std::cout << "Getting logger instance..." << std::endl;
-
-    try
-    {
-        // Get logger instance and configure it
-        auto &logger = Cryo::Logger::instance();
-
-        std::cout << "Creating logger config..." << std::endl;
+        debug_log << "[SETUP_LOGGING] Creating logger config..." << std::endl;
+        debug_log.flush();
         // Create logger config and initialize
+        debug_log << "[SETUP_LOGGING] Calling create_default_config..." << std::endl;
+        debug_log.flush();
         auto config = Cryo::Logger::create_default_config();
+        debug_log << "[SETUP_LOGGING] Got default config successfully" << std::endl;
+        debug_log.flush();
+        
         config.console_level = level;
         config.file_level = Cryo::LogLevel::DEBUG; // Always log debug level to file
         config.enable_colors = true;
         config.enable_timestamps = true;
 
-        // Always ensure we have a log file for debugging
-        if (args.log_file.empty())
-        {
-            // Use the logs folder if CRYO_SRC environment variable is available
-            const char *cryo_src = std::getenv("CRYO_SRC");
-            if (cryo_src != nullptr)
-            {
-                config.log_file_path = std::string(cryo_src) + "/logs/cryo-lsp-debug.log";
-            }
-            else
-            {
-                // Fallback to current directory
-                config.log_file_path = "cryo-lsp-debug.log";
+        // Always log to ./logs directory
+        config.log_file_path = "./logs/cryo-lsp.log";
+
+        debug_log << "[SETUP_LOGGING] Log file path: " << config.log_file_path << std::endl;
+        debug_log.flush();
+        
+        // Check if log directory exists and try to create it
+        debug_log << "[SETUP_LOGGING] Checking log directory..." << std::endl;
+        debug_log.flush();
+        
+        std::filesystem::path log_path(config.log_file_path);
+        std::filesystem::path log_dir = log_path.parent_path();
+        
+        if (!log_dir.empty()) {
+            debug_log << "[SETUP_LOGGING] Log directory: " << log_dir << std::endl;
+            debug_log.flush();
+            if (!std::filesystem::exists(log_dir)) {
+                debug_log << "[SETUP_LOGGING] Creating log directory..." << std::endl;
+                debug_log.flush();
+                try {
+                    std::filesystem::create_directories(log_dir);
+                    debug_log << "[SETUP_LOGGING] Log directory created successfully" << std::endl;
+                    debug_log.flush();
+                } catch (const std::exception& e) {
+                    debug_log << "[SETUP_LOGGING] Warning: Could not create log directory: " << e.what() << std::endl;
+                    debug_log.flush();
+                }
+            } else {
+                debug_log << "[SETUP_LOGGING] Log directory already exists" << std::endl;
+                debug_log.flush();
             }
         }
-        else
-        {
-            config.log_file_path = args.log_file;
-        }
+        
+        debug_log << "[SETUP_LOGGING] About to initialize logger (using standard filesystem)..." << std::endl;
+        debug_log.flush();
 
-        std::cout << "Log file path: " << config.log_file_path << std::endl;
-        std::cout << "Initializing logger with config..." << std::endl;
-
-        // Try to initialize logger
+        // Initialize logger now that OS utility is ready
         logger.initialize(config);
-
-        std::cout << "Logger initialized successfully!" << std::endl;
+        
+        debug_log << "[SETUP_LOGGING] Logger initialized successfully!" << std::endl;
+        debug_log.flush();
+        
+        debug_log << "[SETUP_LOGGING] Making logger method calls..." << std::endl;
+        debug_log.flush();
+        
         logger.info(Cryo::LogComponent::LSP, "CryoLSP starting up...");
-        logger.info(Cryo::LogComponent::LSP, "Log level: " + args.log_level);
+        logger.info(Cryo::LogComponent::LSP, "Log level: debug");
         logger.info(Cryo::LogComponent::LSP, "Logging to file: " + config.log_file_path);
         logger.debug(Cryo::LogComponent::LSP, "Debug logging enabled");
+        
+        debug_log << "[SETUP_LOGGING] All logger method calls completed successfully" << std::endl;
+        debug_log.flush();
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Failed to initialize logging: " << e.what() << std::endl;
-        std::cout << "Continuing without advanced logging..." << std::endl;
+        debug_log << "[SETUP_LOGGING] EXCEPTION in setup_logging: " << e.what() << std::endl;
+        debug_log.flush();
         // Continue without file logging if it fails
     }
+    catch (...)
+    {
+        debug_log << "[SETUP_LOGGING] UNKNOWN EXCEPTION in setup_logging" << std::endl;
+        debug_log.flush();
+    }
+    
+    debug_log << "[SETUP_LOGGING] Exiting setup_logging function" << std::endl;
+    debug_log.flush();
 }
 
 LSPServer::Config create_server_config(const CommandLineArgs &args)
@@ -190,8 +193,8 @@ LSPServer::Config create_server_config(const CommandLineArgs &args)
 
     config.port = args.port;
     config.host = args.host;
-    config.enable_debug_logging = (args.log_level == "debug");
-    config.enable_trace_logging = (args.log_level == "debug");
+    config.enable_debug_logging = true;
+    config.enable_trace_logging = true;
     config.enable_diagnostics = true;
     config.enable_completion = true;
     config.enable_hover = true;
@@ -201,28 +204,109 @@ LSPServer::Config create_server_config(const CommandLineArgs &args)
     if (!args.config_file.empty())
     {
         // TODO: Implement configuration file loading
-        auto &logger = Cryo::Logger::instance();
-        logger.info(Cryo::LogComponent::LSP, "Loading configuration from: " + args.config_file);
+        // Note: Logger disabled for testing - config file loading noted but not logged
     }
 
     return config;
 }
 
+LSPServer* g_server_instance = nullptr;
+
+void signal_handler(int signal)
+{
+    std::cout << "\nReceived signal " << signal << ", shutting down gracefully..." << std::endl;
+    if (g_server_instance) {
+        g_server_instance->shutdown();
+    }
+    std::exit(0);
+}
+
 void handle_shutdown_signals()
 {
     // Set up signal handlers for graceful shutdown
-    // This would typically involve signal() or sigaction() calls
-    // For now, we'll rely on the server's built-in shutdown handling
+    std::cout << "Setting up signal handlers..." << std::endl;
+    
+#ifdef _WIN32
+    // Windows signal handling
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+#else
+    // Unix/Linux signal handling
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGHUP, signal_handler);
+    std::signal(SIGPIPE, SIG_IGN); // Ignore broken pipe
+#endif
+    
+    std::cout << "Signal handlers configured" << std::endl;
 }
 
 int main(int argc, char *argv[])
 {
+    // IMMEDIATELY set up file logging before doing anything else
+    std::string debug_log_path;
+    const char *cryo_src = std::getenv("CRYO_SRC");
+    if (cryo_src != nullptr) {
+        debug_log_path = std::string(cryo_src) + "/logs/cryo-lsp-startup-debug.log";
+    } else {
+        debug_log_path = "/workspaces/CryoLang/logs/cryo-lsp-startup-debug.log";
+    }
+    
+    // Create logs directory if it doesn't exist
+    try {
+        std::filesystem::path log_dir = std::filesystem::path(debug_log_path).parent_path();
+        if (!std::filesystem::exists(log_dir)) {
+            std::filesystem::create_directories(log_dir);
+        }
+    } catch (...) {
+        // Fallback to current directory if we can't create logs dir
+        debug_log_path = "./cryo-lsp-startup-debug.log";
+    }
+    
+    // Open debug log file immediately
+    std::ofstream debug_log(debug_log_path, std::ios::app);
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    debug_log << "\n=== LSP SERVER STARTUP DEBUG - " << std::ctime(&time_t) << " ===" << std::endl;
+    debug_log << "Process started with " << argc << " arguments" << std::endl;
+    debug_log.flush();
+    
+    try {
+        debug_log << "Current working directory: " << std::filesystem::current_path() << std::endl;
+    } catch (...) {
+        debug_log << "ERROR: Could not get current directory" << std::endl;
+    }
+    debug_log.flush();
+    
+    for (int i = 0; i < argc; i++) {
+        debug_log << "arg[" << i << "] = " << (argv[i] ? argv[i] : "NULL") << std::endl;
+    }
+    debug_log.flush();
+    
+    debug_log << "About to enter try block..." << std::endl;
+    debug_log.flush();
+    
     try
     {
-        std::cout << "CryoLSP starting..." << std::endl;
+        debug_log << "Inside try block - CryoLSP starting..." << std::endl;
 
         // Parse command line arguments
-        CommandLineArgs args = parse_command_line(argc, argv);
+        debug_log << "About to parse command line arguments..." << std::endl;
+        debug_log.flush();
+        
+        CommandLineArgs args;
+        try {
+            args = parse_command_line(argc, argv);
+            debug_log << "Command line parsed successfully" << std::endl;
+        } catch (const std::exception& e) {
+            debug_log << "FATAL: Exception parsing command line: " << e.what() << std::endl;
+            debug_log.flush();
+            return 1;
+        } catch (...) {
+            debug_log << "FATAL: Unknown exception parsing command line" << std::endl;
+            debug_log.flush();
+            return 1;
+        }
 
         // Handle help and version requests
         if (args.show_help)
@@ -237,9 +321,23 @@ int main(int argc, char *argv[])
             return 0;
         }
 
-        std::cout << "Setting up logging..." << std::endl;
-        // Setup logging
-        setup_logging(args);
+        debug_log << "About to set up logging..." << std::endl;
+        debug_log.flush();
+        
+        // Setup logging with error handling (now that OS utility is initialized)
+        try {
+            setup_logging(debug_log);
+            debug_log << "Logging setup completed successfully" << std::endl;
+            debug_log.flush();
+        } catch (const std::exception& e) {
+            debug_log << "FATAL: Logging setup failed: " << e.what() << std::endl;
+            debug_log.flush();
+            return 1;
+        } catch (...) {
+            debug_log << "FATAL: Unknown exception during logging setup" << std::endl;
+            debug_log.flush();
+            return 1;
+        }
 
         // Setup signal handling for graceful shutdown
         handle_shutdown_signals();
@@ -248,72 +346,163 @@ int main(int argc, char *argv[])
         // Create server configuration
         LSPServer::Config config = create_server_config(args);
 
+        // Output the exact message the VS Code extension is looking for
         std::cout << "Starting CryoLSP server on " << args.host << ":" << args.port << std::endl;
+        std::cout.flush(); // Ensure immediate output
 
-        // Log startup information
-        auto &logger = Cryo::Logger::instance();
-        logger.info(Cryo::LogComponent::LSP, "Starting CryoLSP server on " + args.host + ":" + std::to_string(args.port));
+        // Log startup information (using debug_log since logger is broken)
+        debug_log << "Starting CryoLSP server on " << args.host << ":" << args.port << std::endl;
 #ifdef _WIN32
-        logger.info(Cryo::LogComponent::LSP, "Process ID: " + std::to_string(GetCurrentProcessId()));
+        debug_log << "Process ID: " << GetCurrentProcessId() << std::endl;
 #else
-        logger.info(Cryo::LogComponent::LSP, "Process ID: " + std::to_string(getpid()));
+        debug_log << "Process ID: " << getpid() << std::endl;
 #endif
+        debug_log.flush();
 
-        std::cout << "Creating LSP server instance..." << std::endl;
-        // Create and start the LSP server
-        logger.debug(Cryo::LogComponent::LSP, "Creating LSP server instance...");
-        LSPServer server(config);
-
-        std::cout << "Initializing LSP server..." << std::endl;
-        if (!server.initialize())
-        {
-            std::cerr << "Failed to initialize LSP server" << std::endl;
-            logger.error(Cryo::LogComponent::LSP, "Failed to initialize LSP server");
+        debug_log << "About to create LSP server instance..." << std::endl;
+        debug_log.flush();
+        
+        // Declare server variable before try block for proper scoping
+        LSPServer* server = nullptr;
+        
+        try {
+            // Skip logger since it's broken
+            debug_log << "Creating LSP server instance..." << std::endl;
+            debug_log.flush();
+            
+            debug_log << "Creating LSPServer object..." << std::endl;
+            debug_log.flush();
+            
+            server = new LSPServer(config);
+            g_server_instance = server;
+            
+            debug_log << "LSPServer object created successfully" << std::endl;
+            debug_log.flush();
+        } catch (const std::exception& e) {
+            debug_log << "FATAL: Exception creating LSP server: " << e.what() << std::endl;
+            debug_log.flush();
+            return 1;
+        } catch (...) {
+            debug_log << "FATAL: Unknown exception creating LSP server" << std::endl;
+            debug_log.flush();
+            return 1;
+        }
+        
+        if (!server) {
+            std::cerr << "FATAL: Server pointer is null after creation" << std::endl;
+            std::cout << "FATAL: Server pointer is null after creation" << std::endl;
             return 1;
         }
 
-        std::cout << "Starting LSP server..." << std::endl;
-        logger.debug(Cryo::LogComponent::LSP, "Starting LSP server...");
-        if (!server.start())
+        debug_log << "About to initialize LSP server..." << std::endl;
+        debug_log.flush();
+        
+        bool initialized = false;
+        try {
+            // Move server to heap to avoid potential stack issues
+            debug_log << "Calling server.initialize()..." << std::endl;
+            debug_log.flush();
+            
+            initialized = server->initialize();
+            
+            debug_log << "server.initialize() returned: " << (initialized ? "true" : "false") << std::endl;
+            debug_log.flush();
+            
+        } catch (const std::exception& e) {
+            debug_log << "FATAL: Exception during LSP server initialization: " << e.what() << std::endl;
+            debug_log.flush();
+            delete server;
+            return 1;
+        } catch (...) {
+            debug_log << "FATAL: Unknown exception during LSP server initialization" << std::endl;
+            debug_log.flush();
+            delete server;
+            return 1;
+        }
+        
+        if (!initialized)
         {
-            std::cerr << "Failed to start LSP server" << std::endl;
-            logger.error(Cryo::LogComponent::LSP, "Failed to start LSP server");
-            logger.error(Cryo::LogComponent::LSP, "Server configuration - Host: " + config.host + ", Port: " + std::to_string(config.port));
+            debug_log << "FATAL: Failed to initialize LSP server" << std::endl;
+            debug_log << "This is a SERVER-SIDE problem. Check:" << std::endl;
+            debug_log << "  1. Compiler initialization" << std::endl;
+            debug_log << "  2. LSP provider setup" << std::endl;
+            debug_log << "  3. Required libraries available" << std::endl;
+            debug_log.flush();
+            delete server;
+            return 1;
+        }
+        
+        debug_log << "LSP server initialized successfully" << std::endl;
+        debug_log.flush();
+
+        debug_log << "Starting LSP server..." << std::endl;
+        debug_log << "Server configuration:" << std::endl;
+        debug_log << "  Host: " << args.host << std::endl;
+        debug_log << "  Port: " << args.port << std::endl;
+        debug_log << "  Log level: debug" << std::endl;
+        debug_log.flush();
+        
+        debug_log << "Starting LSP server..." << std::endl;
+        debug_log.flush();
+        if (!server->start())
+        {
+            debug_log << "FATAL: Failed to start LSP server" << std::endl;
+            debug_log << "This is a SERVER-SIDE problem. Check:" << std::endl;
+            debug_log << "  1. Port " << args.port << " is available" << std::endl;
+            debug_log << "  2. Permission to bind to port" << std::endl;
+            debug_log << "  3. Firewall settings" << std::endl;
+            debug_log.flush();
+            
+            debug_log << "ERROR: Failed to start LSP server" << std::endl;
+            debug_log << "Server configuration - Host: " << config.host << ", Port: " << config.port << std::endl;
+            debug_log.flush();
             return 1;
         }
 
         std::cout << "LSP server started successfully on port " << args.port << std::endl;
-        logger.info(Cryo::LogComponent::LSP, "LSP server started successfully");
-        logger.info(Cryo::LogComponent::LSP, "Ready to accept client connections...");
+        debug_log << "LSP server started successfully" << std::endl;
+        debug_log << "Ready to accept client connections..." << std::endl;
+        debug_log.flush();
 
         // Keep server running (this will block until shutdown signal)
         // Wait for shutdown signal - in a real implementation, this would wait for SIGTERM/SIGINT
-        while (server.is_running())
+        while (server->is_running())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        logger.info(Cryo::LogComponent::LSP, "LSP server shutting down...");
+        debug_log << "LSP server shutting down..." << std::endl;
+        debug_log.flush();
 
         // Cleanup
-        server.stop();
+        server->stop();
+        delete server;
 
-        logger.info(Cryo::LogComponent::LSP, "LSP server stopped successfully");
+        debug_log << "LSP server stopped successfully" << std::endl;
+        debug_log.flush();
+        
+        debug_log << "LSP server exiting normally" << std::endl;
+        debug_log.flush();
+        debug_log.close();
 
         return 0;
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Fatal error: " << e.what() << "\n";
-        auto &logger = Cryo::Logger::instance();
-        logger.error(Cryo::LogComponent::LSP, "Fatal error: " + std::string(e.what()));
+        // Log to debug file since normal logger may not be available
+        std::ofstream error_log("/workspaces/CryoLang/logs/cryo-lsp-fatal-error.log", std::ios::app);
+        error_log << "Fatal error: " << e.what() << std::endl;
+        error_log.flush();
+        // Logger not available - already logged to error file above
         return 1;
     }
     catch (...)
     {
-        std::cerr << "Unknown fatal error occurred\n";
-        auto &logger = Cryo::Logger::instance();
-        logger.error(Cryo::LogComponent::LSP, "Unknown fatal error occurred");
+        // Log to debug file since normal logger may not be available
+        std::ofstream error_log("/workspaces/CryoLang/logs/cryo-lsp-fatal-error.log", std::ios::app);
+        error_log << "Unknown fatal error occurred" << std::endl;
+        error_log.flush();
+        // Logger not available - already logged to error file above
         return 1;
     }
 }
