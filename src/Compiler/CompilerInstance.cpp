@@ -1467,11 +1467,31 @@ namespace Cryo
         {
             // Already processed in first pass, nothing to do
         }
-        // Skip variable declarations - they will be handled by TypeChecker
+        // Handle constant variable declarations only (const variables need global visibility)
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Variables don't need to be processed in populate_symbol_table_with_scope
-            // They will be properly handled by TypeChecker which manages its own TypedSymbolTable
+            // Only process const variables (not mutable ones) - they need to be available for lookup
+            if (!var_decl->is_mutable())
+            {
+                // Use resolved type from AST node
+                Type *var_type = var_decl->get_resolved_type();
+
+                // Add constant to current scope for global visibility
+                bool success = current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
+                                                             var_decl->location(), var_type, scope_name);
+
+                if (!success && _debug_mode)
+                {
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "Constant '{}' already declared in scope '{}'",
+                             var_decl->name(), scope_name);
+                }
+                else if (_debug_mode)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added constant '{}' to scope '{}' with type '{}'",
+                              var_decl->name(), scope_name, var_type ? var_type->to_string() : "null");
+                }
+            }
+            // Skip mutable variables - they will be handled by TypeChecker
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
