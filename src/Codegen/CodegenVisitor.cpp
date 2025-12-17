@@ -53,7 +53,8 @@ namespace Cryo::Codegen
           _current_node(nullptr),
           _has_errors(false),
           _stdlib_compilation_mode(false),
-          _imported_asts(nullptr)
+          _imported_asts(nullptr),
+          _defer_function_bodies(false)
     {
     }
 
@@ -279,7 +280,7 @@ namespace Cryo::Codegen
         }
 
         // Pass 1: Process all global variable declarations (including constants)
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing global variable declarations");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing global variable declarations (_globals has {} entries before pass)", _globals.size());
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
@@ -288,12 +289,13 @@ namespace Cryo::Codegen
                 // Check if this is a global variable declaration
                 if (stmt->kind() == NodeKind::VariableDeclaration)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing global variable declaration {}/{}", i + 1, node.statements().size());
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing global variable declaration {}/{} (_globals has {} entries)", i + 1, node.statements().size(), _globals.size());
                     stmt->accept(*this);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed global variable declaration {}", i + 1);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed global variable declaration {} (_globals has {} entries)", i + 1, _globals.size());
                 }
             }
         }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1 complete: _globals now has {} entries", _globals.size());
 
         // Pass 2: Process all enum declarations (needed for struct/class methods)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Processing enum declarations");
@@ -314,6 +316,8 @@ namespace Cryo::Codegen
 
         // Pass 3: Process all struct and class declarations
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 3: Processing struct and class declarations");
+        _defer_function_bodies = true;  // Defer function body generation until globals are ready
+        _defer_function_bodies = true;  // Defer function body generation until globals are ready
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
@@ -336,8 +340,27 @@ namespace Cryo::Codegen
         _type_mapper->register_parameterized_types_from_context(_srm_context.get());
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished registering parameterized types from TypeContext");
 
+        // Process deferred function bodies now that all globals are available
+        _defer_function_bodies = false;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing {} deferred function bodies", _deferred_function_bodies.size());
+        for (auto& [func_node, func_llvm] : _deferred_function_bodies)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating deferred function body for: {}", func_node->name());
+            bool body_success = generate_function_body(func_node, func_llvm);
+            if (!body_success)
+            {
+                if (_diagnostic_builder)
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED, func_node,
+                                                      "Failed to generate deferred function body: " + func_node->name());
+                }
+            }
+        }
+        _deferred_function_bodies.clear();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished processing deferred function bodies");
+
         // Pass 4: Process all other statements
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4: Processing other statements");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4: Processing other statements (_globals has {} entries before pass)", _globals.size());
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
@@ -350,19 +373,20 @@ namespace Cryo::Codegen
                     stmt->kind() == NodeKind::StructDeclaration ||
                     stmt->kind() == NodeKind::ClassDeclaration)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping already processed declaration {}", i + 1);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping already processed declaration {} (type: {})", i + 1, (int)stmt->kind());
                     continue;
                 }
 
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing statement {}/{}", i + 1, node.statements().size());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing statement {}/{} (type: {}, _globals has {} entries)", i + 1, node.statements().size(), (int)stmt->kind(), _globals.size());
                 stmt->accept(*this);
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed statement {}", i + 1);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed statement {} (_globals has {} entries)", i + 1, _globals.size());
             }
             else
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping null statement {}", i + 1);
             }
         }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4 complete: _globals has {} entries", _globals.size());
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed processing main program");
     }
@@ -510,14 +534,22 @@ namespace Cryo::Codegen
             // Generate function body if present
             if (node.body())
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating function body for: {}", node.name());
-                bool body_success = generate_function_body(&node, function);
-                if (!body_success)
+                if (_defer_function_bodies)
                 {
-                    if (_diagnostic_builder)
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Deferring function body generation for: {}", node.name());
+                    _deferred_function_bodies.emplace_back(&node, function);
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating function body for: {}", node.name());
+                    bool body_success = generate_function_body(&node, function);
+                    if (!body_success)
                     {
-                        _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED, &node,
-                                                          "Failed to generate function body: " + node.name());
+                        if (_diagnostic_builder)
+                        {
+                            _diagnostic_builder->report_error(ErrorCode::E0600_CODEGEN_FAILED, &node,
+                                                              "Failed to generate function body: " + node.name());
+                        }
                     }
                 }
             }
@@ -6430,6 +6462,8 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pre-registration complete. Total functions registered: {}", _functions.size());
     }
+
+
 
     void CodegenVisitor::import_specialized_methods(const Cryo::TypeChecker &type_checker)
     {

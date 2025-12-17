@@ -1362,12 +1362,12 @@ namespace Cryo
 
         LOG_DEBUG(Cryo::LogComponent::AST, "Loading user-defined symbols into TypeChecker... [table={}]", static_cast<void *>(_symbol_table.get()));
 
-        // Copy user-defined symbols from main symbol table (functions only, variables handled directly)
+        // Copy user-defined symbols from main symbol table (functions and constants only)
         int copied_count = 0;
         int skipped_count = 0;
         for (const auto &[name, symbol] : main_symbol_table.get_symbols())
         {
-            if (symbol.kind == SymbolKind::Function && symbol.data_type != nullptr)
+            if ((symbol.kind == SymbolKind::Function || symbol.kind == SymbolKind::Variable) && symbol.data_type != nullptr)
             {
                 // Check if symbol already exists to avoid redefinition errors
                 if (_symbol_table->lookup_symbol(name) != nullptr)

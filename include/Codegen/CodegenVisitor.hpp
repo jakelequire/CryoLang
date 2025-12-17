@@ -201,6 +201,8 @@ namespace Cryo::Codegen
          */
         void pre_register_functions_from_symbol_table();
 
+
+
         /**
          * @brief Import specialized methods from TypeChecker after monomorphization
          * @param type_checker Reference to TypeChecker containing specialized methods
@@ -232,6 +234,9 @@ namespace Cryo::Codegen
          * @brief Get Symbol Resolution Context for namespace management
          */
         Cryo::SRM::SymbolResolutionContext *get_srm_context() const { return _srm_context.get(); }
+
+    private:
+
 
     private:
         //===================================================================
@@ -381,6 +386,12 @@ namespace Cryo::Codegen
 
         std::string _source_file;
         std::string _namespace_context;
+        
+        // Flag to defer function body generation until all globals are processed
+        bool _defer_function_bodies;
+        
+        // Vector to store function nodes for deferred body generation
+        std::vector<std::pair<Cryo::FunctionDeclarationNode*, llvm::Function*>> _deferred_function_bodies;
 
         //===================================================================
         // Private Generation Methods
