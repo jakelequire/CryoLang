@@ -10798,6 +10798,14 @@ namespace Cryo::Codegen
             function_name = identifier->name();
             resolved_function_name = function_name;
 
+            // Check if this is a primitive type constructor (e.g., i64, i32, f64, etc.) FIRST
+            // This must happen before any function lookup to prevent primitive types from being
+            // treated as undefined functions
+            if (is_primitive_constructor(function_name))
+            {
+                return generate_primitive_constructor_call(node, function_name);
+            }
+
             // Check for built-in conversion functions first
             if (function_name == "string")
             {
@@ -10952,12 +10960,6 @@ namespace Cryo::Codegen
             else
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No imported namespaces available for wildcard resolution");
-            }
-
-            // Check if this is a primitive type constructor (e.g., i64, i32, f64, etc.)
-            if (is_primitive_constructor(function_name))
-            {
-                return generate_primitive_constructor_call(node, function_name);
             }
 
             // Check if this is a struct/class constructor call without 'new' keyword
@@ -15376,7 +15378,7 @@ namespace Cryo::Codegen
                 for (auto it = current_scope.destructors.rbegin(); it != current_scope.destructors.rend(); ++it)
                 {
                     const DestructorInfo &destructor_info = *it;
-                    
+
                     // Use the same naming convention as generated destructors: "TypeName::~TypeName"
                     std::string destructor_name = destructor_info.type_name + "::~" + destructor_info.type_name;
 
@@ -15508,7 +15510,7 @@ namespace Cryo::Codegen
     llvm::Value *CodegenVisitor::generate_intrinsic_constant(const std::string &const_name)
     {
         auto &llvm_ctx = _context_manager.get_context();
-        
+
         if (const_name == "__FILE__")
         {
             std::string filename = get_current_filename();
@@ -15527,7 +15529,7 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating __FUNCTION__ constant: {}", function_name);
             return _context_manager.get_builder().CreateGlobalStringPtr(function_name, "__FUNCTION__");
         }
-        
+
         return nullptr;
     }
 
@@ -16616,7 +16618,7 @@ namespace Cryo::Codegen
             return false;
         }
 
-        // Check if there's a destructor function for this type using the same naming convention 
+        // Check if there's a destructor function for this type using the same naming convention
         // as the generated destructors. Generated destructors use the format: "TypeName::~TypeName"
         std::string destructor_name = type_name + "::~" + type_name;
 
@@ -16841,19 +16843,25 @@ namespace Cryo::Codegen
             return source_value;
         }
 
+        // Helper lambda to check if a type is any floating point type (float, double, etc.)
+        auto isAnyFloatType = [](llvm::Type *type)
+        {
+            return type->isFloatTy() || type->isDoubleTy() || type->isFP128Ty() || type->isHalfTy();
+        };
+
         // Handle conversions between different types
-        if (source_type->isIntegerTy() && target_type->isFloatTy())
+        if (source_type->isIntegerTy() && isAnyFloatType(target_type))
         {
             // Integer to float conversion
             // Assume signed integer for now (could be enhanced to check signedness)
             return builder.CreateSIToFP(source_value, target_type, "int2float");
         }
-        else if (source_type->isFloatTy() && target_type->isIntegerTy())
+        else if (isAnyFloatType(source_type) && target_type->isIntegerTy())
         {
             // Float to integer conversion
             return builder.CreateFPToSI(source_value, target_type, "float2int");
         }
-        else if (source_type->isFloatTy() && target_type->isFloatTy())
+        else if (isAnyFloatType(source_type) && isAnyFloatType(target_type))
         {
             // Float to float conversion
             unsigned source_bits = source_type->getPrimitiveSizeInBits();
@@ -16877,7 +16885,12 @@ namespace Cryo::Codegen
         }
         else
         {
+            // Debug: Print what the types actually are
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unsupported type conversion in float cast");
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Source type isFloatTy(): {}, isDoubleTy(): {}, isIntegerTy(): {}",
+                      source_type->isFloatTy(), source_type->isDoubleTy(), source_type->isIntegerTy());
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Target type isFloatTy(): {}, isDoubleTy(): {}, isIntegerTy(): {}",
+                      target_type->isFloatTy(), target_type->isDoubleTy(), target_type->isIntegerTy());
             return nullptr;
         }
     }
