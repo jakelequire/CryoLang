@@ -216,6 +216,18 @@ namespace Cryo::Codegen
         void import_namespace_aliases(const Cryo::TypeChecker &type_checker);
 
         /**
+         * @brief Recursively process all global variable declarations throughout the AST
+         * @param node Root node to scan for global variables
+         */
+        void process_global_variables_recursively(ASTNode *node);
+
+        /**
+         * @brief Set pre-registration mode to only register types without generating method bodies
+         * @param enabled True to enable pre-registration mode, false to disable
+         */
+        void set_pre_registration_mode(bool enabled) { _pre_registration_mode = enabled; }
+
+        /**
          * @brief Get TypeMapper for manual AST node registration
          */
         TypeMapper *get_type_mapper() const { return _type_mapper.get(); }
@@ -389,6 +401,9 @@ namespace Cryo::Codegen
         
         // Flag to defer function body generation until all globals are processed
         bool _defer_function_bodies;
+        
+        // Flag to indicate we're in pre-registration mode (only register types, don't generate bodies)
+        bool _pre_registration_mode;
         
         // Vector to store function nodes for deferred body generation
         std::vector<std::pair<Cryo::FunctionDeclarationNode*, llvm::Function*>> _deferred_function_bodies;

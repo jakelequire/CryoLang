@@ -1892,11 +1892,13 @@ namespace Cryo::Codegen
         llvm::Value *code_arg_32 = ensure_type(code_arg, int_type, "exit.code");
 
         // Call exit - exit() is a void function so no result name
-        builder.CreateCall(exit_func, {code_arg_32});
+        llvm::Value *call_result = builder.CreateCall(exit_func, {code_arg_32});
 
         // Since exit() never returns, we should add an unreachable instruction
         builder.CreateUnreachable();
-        return nullptr;
+        
+        // Return the call instruction as the result (even though exit is void)
+        return call_result;
     }
 
 } // namespace Cryo::Codegen

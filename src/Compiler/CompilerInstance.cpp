@@ -994,8 +994,14 @@ namespace Cryo
             if (_codegen->ensure_visitor_initialized())
             {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing struct declarations before function pre-registration...");
+                // Enable pre-registration mode to skip method body generation
+                _codegen->get_visitor()->set_pre_registration_mode(true);
+                
                 // First, process struct declarations to ensure TypeMapper has correct type information
                 process_struct_declarations_for_preregistration(node);
+                
+                // Disable pre-registration mode
+                _codegen->get_visitor()->set_pre_registration_mode(false);
 
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registering functions in LLVM module...");
                 _codegen->get_visitor()->pre_register_functions_from_symbol_table();
