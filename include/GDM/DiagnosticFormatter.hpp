@@ -97,6 +97,9 @@ namespace Cryo
         // Suggestion formatting
         std::string format_suggestions(const std::vector<CodeSuggestion>& suggestions) const;
         std::string format_single_suggestion(const CodeSuggestion& suggestion) const;
+        
+        // Phase information formatting
+        std::string format_error_code_with_phase(ErrorCode error_code, DiagnosticCategory category) const;
 
         // Utility methods
         std::string colorize(const std::string& text, const std::string& color) const;

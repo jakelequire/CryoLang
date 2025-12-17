@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <optional>
 #include <vector>
+#include <cstdint>
+
 #include "Utils/File.hpp"
 
 namespace Cryo
@@ -138,7 +140,7 @@ namespace Cryo
         std::optional<Token> _peeked_token;
 
         // Diagnostic reporting
-        DiagnosticManager* _diagnostic_manager;
+        DiagnosticManager *_diagnostic_manager;
         std::string _source_file;
 
         // String pool for processed string literals
@@ -150,11 +152,11 @@ namespace Cryo
     public:
         // Constructors
         explicit Lexer(std::unique_ptr<File> file);
-        Lexer(std::unique_ptr<File> file, DiagnosticManager* diagnostic_manager, const std::string& source_file);
+        Lexer(std::unique_ptr<File> file, DiagnosticManager *diagnostic_manager, const std::string &source_file);
 
         // Constructor for spot lexing from string content
         explicit Lexer(const std::string &content);
-        Lexer(const std::string &content, DiagnosticManager* diagnostic_manager, const std::string& source_file);
+        Lexer(const std::string &content, DiagnosticManager *diagnostic_manager, const std::string &source_file);
 
         // Destructor
         ~Lexer() = default;
@@ -200,12 +202,12 @@ namespace Cryo
         bool at_end() const;
         Token make_token(TokenKind kind, const char *start) const;
         Token make_error_token(const std::string &message) const;
-        
+
         // Enhanced error reporting
-        void report_lexer_error(const std::string& message, const SourceLocation& location);
+        void report_lexer_error(const std::string &message, const SourceLocation &location);
 
         // String processing helpers
-        std::string process_escape_sequences(const std::string& raw_string);
+        std::string process_escape_sequences(const std::string &raw_string);
         std::string_view store_processed_string(std::string processed_string);
 
         // Character classification
