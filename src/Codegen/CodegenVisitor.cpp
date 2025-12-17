@@ -895,6 +895,7 @@ namespace Cryo::Codegen
                 _globals[var_name] = global_var;
                 _global_types[var_name] = llvm_type;   // Store the type for later access
                 _variable_types[var_name] = cryo_type; // Store Cryo type for method lookup
+
                 register_value(&node, global_var);
             }
             else
@@ -3227,8 +3228,25 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        int64_t signed_val = std::stoll(clean_int_value);
-                        int_val = static_cast<uint64_t>(signed_val);
+                        // Special case: Handle UINT64_MAX which is too large for signed parsing
+                        if (clean_int_value == "18446744073709551615")
+                        {
+                            int_val = UINT64_MAX;
+                        }
+                        else
+                        {
+                            // Try signed parsing first, fall back to unsigned if out of range
+                            try
+                            {
+                                int64_t signed_val = std::stoll(clean_int_value);
+                                int_val = static_cast<uint64_t>(signed_val);
+                            }
+                            catch (const std::out_of_range &)
+                            {
+                                // Value too large for signed, try unsigned parsing
+                                int_val = std::stoull(clean_int_value);
+                            }
+                        }
                     }
 
                     // Use explicit suffix type if provided
@@ -3457,6 +3475,45 @@ namespace Cryo::Codegen
                 set_current_value(enum_variant_it->second);
                 register_value(&node, enum_variant_it->second);
                 return;
+            }
+
+            // Try to find unprocessed global constant in symbol table
+            if (!_globals.count(identifier) && !_value_context->has_value(identifier))
+            {
+                // Check if this identifier exists as a global constant in the symbol table
+                std::string qualified_name = generate_qualified_name(identifier, Cryo::SymbolKind::Variable);
+                auto symbol_info = _symbol_table.lookup_symbol(qualified_name);
+
+                if (symbol_info && symbol_info->name == identifier)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found identifier '{}' in symbol table but not yet processed, creating placeholder global", identifier);
+
+                    // Get the type from the symbol table
+                    Cryo::Type *cryo_type = symbol_info->data_type;
+                    llvm::Type *llvm_type = _type_mapper->map_type(cryo_type);
+
+                    if (llvm_type)
+                    {
+                        // Create a global variable as placeholder
+                        auto *module = _context_manager.get_module();
+                        llvm::Constant *initializer = llvm::Constant::getNullValue(llvm_type);
+
+                        auto global_var = new llvm::GlobalVariable(
+                            *module, llvm_type, false,
+                            llvm::GlobalValue::ExternalLinkage,
+                            initializer, identifier);
+
+                        _globals[identifier] = global_var;
+                        _global_types[identifier] = llvm_type;
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Created placeholder global variable for identifier '{}' with type '{}'", identifier, cryo_type ? cryo_type->to_string() : "unknown");
+
+                        llvm::Value *loaded_value = create_load(global_var, llvm_type, identifier + ".global.load");
+                        set_current_value(loaded_value);
+                        register_value(&node, loaded_value);
+                        return;
+                    }
+                }
             }
 
             // If not found, report error
@@ -6027,6 +6084,21 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Found enum variant '{}' in _enum_variants (unqualified lookup)", member_name);
             llvm::Value *enum_value = unqualified_it->second;
+            set_current_value(enum_value);
+            register_value(&node, enum_value);
+            return;
+        }
+
+        // If enum variant not found, try to ensure the enum variants are registered
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Enum variant '{}' NOT FOUND in _enum_variants, attempting to ensure availability", qualified_name);
+        ensure_enum_variants_available(scope_name);
+
+        // Try again after ensuring variants are available
+        enum_variant_it = _enum_variants.find(qualified_name);
+        if (enum_variant_it != _enum_variants.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  Found enum variant '{}' in _enum_variants after ensuring availability", qualified_name);
+            llvm::Value *enum_value = enum_variant_it->second;
             set_current_value(enum_value);
             register_value(&node, enum_value);
             return;
@@ -15543,6 +15615,143 @@ namespace Cryo::Codegen
 
         // Also register with just the variant name for unqualified access
         _enum_variants[variant_name] = value;
+    }
+
+    void CodegenVisitor::ensure_enum_variants_available(const std::string &enum_name)
+    {
+        // Check if variants are already registered
+        std::string test_qualified_name = generate_qualified_name(enum_name + "::*", Cryo::SymbolKind::Type);
+        bool variants_exist = false;
+
+        // Quick check - see if any variants for this enum exist
+        for (const auto &[key, value] : _enum_variants)
+        {
+            if (key.find(enum_name + "::") == 0)
+            {
+                variants_exist = true;
+                break;
+            }
+        }
+
+        if (variants_exist)
+        {
+            return; // Variants already registered
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_enum_variants_available: Enum '{}' variants not found, attempting to register", enum_name);
+
+        // Look up the enum type and generate variants immediately
+        Cryo::Type *enum_type_cryo = _symbol_table.get_type_context()->lookup_enum_type(enum_name);
+        if (!enum_type_cryo)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_enum_variants_available: Enum type '{}' not found in type context", enum_name);
+            return;
+        }
+
+        auto *cryo_enum_type = dynamic_cast<Cryo::EnumType *>(enum_type_cryo);
+        if (!cryo_enum_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_enum_variants_available: '{}' is not an enum type", enum_name);
+            return;
+        }
+
+        // Check if it's a simple enum
+        if (!cryo_enum_type->is_simple_enum())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_enum_variants_available: '{}' is a complex enum, skipping variant generation", enum_name);
+            return;
+        }
+
+        // Generate LLVM type and register simple enum variants
+        llvm::Type *enum_llvm_type = _type_mapper->map_enum_type(cryo_enum_type);
+        if (!enum_llvm_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_enum_variants_available: Failed to map LLVM type for enum '{}'", enum_name);
+            return;
+        }
+
+        // Register variants immediately
+        const auto &variant_names = cryo_enum_type->variants();
+        int variant_value = 0;
+
+        for (const auto &variant_name : variant_names)
+        {
+            llvm::Constant *variant_const = llvm::ConstantInt::get(
+                llvm::cast<llvm::IntegerType>(enum_llvm_type), variant_value);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_enum_variants_available: Registering enum variant: {}::{} = {}",
+                      enum_name, variant_name, variant_value);
+
+            register_enum_variant(enum_name, variant_name, variant_const);
+            variant_value++;
+        }
+    }
+
+    void CodegenVisitor::ensure_global_constant_available(const std::string &constant_name)
+    {
+        // Check if the global constant is already processed
+        if (_globals.count(constant_name))
+        {
+            return; // Already available
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_global_constant_available: Constant '{}' not found, attempting to process", constant_name);
+
+        // Search for the constant declaration in the imported ASTs
+        if (!_imported_asts)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_global_constant_available: No imported ASTs available");
+            return;
+        }
+
+        // Find the variable declaration for this constant
+        for (const auto &[module_path, program_ast] : *_imported_asts)
+        {
+            if (!program_ast)
+                continue;
+
+            std::function<void(Cryo::ASTNode *)> search_for_constant = [&](Cryo::ASTNode *node)
+            {
+                if (!node)
+                    return;
+
+                if (auto var_decl = dynamic_cast<Cryo::VariableDeclarationNode *>(node))
+                {
+                    if (var_decl->name() == constant_name)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ensure_global_constant_available: Found constant declaration '{}', processing now", constant_name);
+                        // Process this variable declaration immediately
+                        visit(*var_decl);
+                        return;
+                    }
+                }
+
+                // Recursively search child nodes based on node type
+                if (auto program_node = dynamic_cast<Cryo::ProgramNode *>(node))
+                {
+                    for (const auto &stmt : program_node->statements())
+                    {
+                        search_for_constant(stmt.get());
+                    }
+                }
+                else if (auto block_node = dynamic_cast<Cryo::BlockStatementNode *>(node))
+                {
+                    for (const auto &stmt : block_node->statements())
+                    {
+                        search_for_constant(stmt.get());
+                    }
+                }
+                else if (auto decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(node))
+                {
+                    if (decl_stmt->declaration())
+                    {
+                        search_for_constant(decl_stmt->declaration());
+                    }
+                }
+            };
+
+            search_for_constant(program_ast.get());
+        }
     }
 
     void CodegenVisitor::ensure_parameterized_enum_constructors(const std::string &instantiated_name,

@@ -267,8 +267,6 @@ namespace Cryo::Codegen
                 : entry_block(entry), exit_block(exit) {}
         };
 
-
-
         /**
          * @brief Function generation context
          */
@@ -408,7 +406,7 @@ namespace Cryo::Codegen
                                              const std::vector<std::string> &type_args,
                                              llvm::Type *struct_type,
                                              const std::unordered_map<std::string, std::string> &type_substitutions);
-                                             
+
         /**
          * @brief Generate specialized method on-demand for core library types
          * @param method_name Fully qualified method name (e.g., "std::net::HTTP::Array<Header>::push")
@@ -416,10 +414,10 @@ namespace Cryo::Codegen
          * @param method_base_name The method name without type (e.g., "push")
          * @return true if method was successfully generated, false otherwise
          */
-        bool generate_specialized_method_on_demand(const std::string &method_name, 
-                                                   const std::string &type_name, 
+        bool generate_specialized_method_on_demand(const std::string &method_name,
+                                                   const std::string &type_name,
                                                    const std::string &method_base_name);
-                                                   
+
         void generate_get_value_method(const std::string &instantiated_type,
                                        const std::vector<std::string> &type_args,
                                        llvm::Type *struct_type,
@@ -429,8 +427,8 @@ namespace Cryo::Codegen
                                             const std::unordered_map<std::string, std::string> &type_substitutions);
 
         // Function interception for runtime function qualification
-        llvm::Function* get_qualified_function(const std::string& function_name);
-        bool is_runtime_function(const std::string& function_name) const;
+        llvm::Function *get_qualified_function(const std::string &function_name);
+        bool is_runtime_function(const std::string &function_name) const;
 
         // Type generation
         llvm::Type *generate_struct_type(Cryo::StructDeclarationNode *node);
@@ -453,13 +451,17 @@ namespace Cryo::Codegen
                                                   Cryo::EnumVariantNode *variant,
                                                   int discriminant);
         void register_enum_variant(const std::string &enum_name, const std::string &variant_name, llvm::Value *value);
-        
+        void ensure_enum_variants_available(const std::string &enum_name);
+
+        // Global constant on-demand processing
+        void ensure_global_constant_available(const std::string &constant_name);
+
         // Cross-module enum loading
         void load_enum_variants_from_namespace(const std::string &namespace_name);
-        
+
         // Cross-module global constant loading
         void load_global_constants_from_namespace(const std::string &namespace_name);
-        
+
         // Cross-module constructor declaration
         void declare_imported_constructors(const Cryo::ImportDeclarationNode &import_node);
 
@@ -499,7 +501,7 @@ namespace Cryo::Codegen
         bool is_primitive_constructor(const std::string &function_name) const;
         llvm::Value *generate_primitive_constructor_call(CallExpressionNode *node, const std::string &target_type);
         llvm::Value *generate_stack_constructor_call(CallExpressionNode *node, const std::string &type_name, Type *struct_type);
-        
+
         // Array helpers
         void handle_array_struct_assignment(llvm::Value *array_ptr, llvm::AllocaInst *alloca, size_t array_size);
         llvm::Value *generate_integer_cast(llvm::Value *source_value, llvm::Type *source_type,
@@ -585,12 +587,12 @@ namespace Cryo::Codegen
         bool is_primitive_type(const std::string &type_name);
         bool is_runtime_internal_function(const std::string &function_name);
         void ensure_valid_insertion_point();
-        
+
         // SRM Helper methods for standardized naming
-        std::string generate_function_name(const std::string& function_name, const std::vector<Cryo::Type*>& parameter_types = {});
-        std::string generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types = {});
-        std::string generate_constructor_name(const std::string& type_name, const std::vector<Cryo::Type*>& parameter_types);
-        std::string generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind = Cryo::SymbolKind::Function);
+        std::string generate_function_name(const std::string &function_name, const std::vector<Cryo::Type *> &parameter_types = {});
+        std::string generate_method_name(const std::string &type_name, const std::string &method_name, const std::vector<Cryo::Type *> &parameter_types = {});
+        std::string generate_constructor_name(const std::string &type_name, const std::vector<Cryo::Type *> &parameter_types);
+        std::string generate_qualified_name(const std::string &base_name, Cryo::SymbolKind symbol_kind = Cryo::SymbolKind::Function);
         std::vector<std::string> get_current_namespace_parts() const;
 
         // Destructor management
@@ -607,5 +609,5 @@ namespace Cryo::Codegen
         void report_error(const std::string &message);
         void report_error(const std::string &message, Cryo::ASTNode *node);
     };
-    
+
 } // namespace Cryo::Codegen
