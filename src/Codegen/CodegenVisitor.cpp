@@ -54,7 +54,8 @@ namespace Cryo::Codegen
           _has_errors(false),
           _stdlib_compilation_mode(false),
           _imported_asts(nullptr),
-          _defer_function_bodies(false)
+          _defer_function_bodies(false),
+          _pre_registration_mode(false)
     {
     }
 
@@ -262,8 +263,13 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing main program with {} statements", node.statements().size());
 
         // Five-pass processing to ensure proper dependency order
-        // Pass 0: Process all imports first (needed for cross-module type resolution)
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processing import declarations");
+        // Pass 0: Process all global variable declarations FIRST (including constants)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processing global variable declarations (_globals has {} entries before pass)", _globals.size());
+        process_global_variables_recursively(&node);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0 complete: _globals now has {} entries", _globals.size());
+        
+        // Pass 1: Process all imports (needed for cross-module type resolution)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing import declarations");
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
@@ -278,24 +284,6 @@ namespace Cryo::Codegen
                 }
             }
         }
-
-        // Pass 1: Process all global variable declarations (including constants)
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing global variable declarations (_globals has {} entries before pass)", _globals.size());
-        for (size_t i = 0; i < node.statements().size(); ++i)
-        {
-            auto &stmt = node.statements()[i];
-            if (stmt)
-            {
-                // Check if this is a global variable declaration
-                if (stmt->kind() == NodeKind::VariableDeclaration)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing global variable declaration {}/{} (_globals has {} entries)", i + 1, node.statements().size(), _globals.size());
-                    stmt->accept(*this);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed global variable declaration {} (_globals has {} entries)", i + 1, _globals.size());
-                }
-            }
-        }
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1 complete: _globals now has {} entries", _globals.size());
 
         // Pass 2: Process all enum declarations (needed for struct/class methods)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Processing enum declarations");
@@ -359,6 +347,8 @@ namespace Cryo::Codegen
         _deferred_function_bodies.clear();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished processing deferred function bodies");
 
+
+
         // Pass 4: Process all other statements
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4: Processing other statements (_globals has {} entries before pass)", _globals.size());
         for (size_t i = 0; i < node.statements().size(); ++i)
@@ -389,6 +379,50 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4 complete: _globals has {} entries", _globals.size());
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed processing main program");
+    }
+
+    void CodegenVisitor::process_global_variables_recursively(ASTNode *node)
+    {
+        if (!node)
+            return;
+
+        // Check if this is a global variable declaration
+        if (node->kind() == NodeKind::VariableDeclaration)
+        {
+            auto var_decl = static_cast<VariableDeclarationNode*>(node);
+            // Only process global variables (not local ones inside functions)
+            if (var_decl->is_global() || !_current_function)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing global variable recursively: {}", var_decl->name());
+                var_decl->accept(*this);
+                return; // Don't recurse into variable declarations
+            }
+        }
+
+        // Recursively process child nodes based on node type
+        if (auto program = dynamic_cast<ProgramNode*>(node))
+        {
+            for (const auto& stmt : program->statements())
+            {
+                process_global_variables_recursively(stmt.get());
+            }
+        }
+        else if (auto block = dynamic_cast<BlockStatementNode*>(node))
+        {
+            for (const auto& stmt : block->statements())
+            {
+                process_global_variables_recursively(stmt.get());
+            }
+        }
+        else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode*>(node))
+        {
+            if (decl_stmt->declaration())
+            {
+                process_global_variables_recursively(decl_stmt->declaration());
+            }
+        }
+        // Don't recurse into function bodies during global variable processing
+        // to avoid processing local variables as globals
     }
 
     void CodegenVisitor::visit(Cryo::FunctionDeclarationNode &node)
@@ -1580,8 +1614,8 @@ namespace Cryo::Codegen
                     }
                 }
 
-                // Generate method body if it exists
-                if (method->body())
+                // Generate method body if it exists (skip during pre-registration)
+                if (!_pre_registration_mode)
                 {
                     // Create basic block for method entry
                     llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(context, "entry", func);
@@ -1636,43 +1670,52 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    // Generate method body
-                    try
+                    // Generate method body if it exists
+                    if (method->body())
                     {
-                        // Set current struct context for member access resolution
-                        current_struct_type = node.name();
-
-                        method->body()->accept(*this);
-
-                        // Clear struct context
-                        current_struct_type.clear();
-
-                        // Add return if the method doesn't already have one
-                        llvm::BasicBlock *current_block = _context_manager.get_builder().GetInsertBlock();
-                        if (current_block && !current_block->getTerminator())
+                        try
                         {
-                            if (return_type->isVoidTy())
-                            {
-                                _context_manager.get_builder().CreateRetVoid();
-                            }
-                            else
-                            {
-                                // Create a default return value (this shouldn't happen in well-formed code)
-                                llvm::Value *default_val = llvm::UndefValue::get(return_type);
-                                _context_manager.get_builder().CreateRet(default_val);
-                            }
+                            // Set current struct context for member access resolution
+                            current_struct_type = node.name();
+
+                            method->body()->accept(*this);
+
+                            // Clear struct context
+                            current_struct_type.clear();
+                        }
+                        catch (const std::exception &e)
+                        {
+                            // report_error("Exception in struct method body generation: " + std::string(e.what()), method.get());
                         }
                     }
-                    catch (const std::exception &e)
+
+                    // Add return if the method doesn't already have one
+                    llvm::BasicBlock *current_block = _context_manager.get_builder().GetInsertBlock();
+                    if (current_block && !current_block->getTerminator())
                     {
-                        // report_error("Exception in struct method body generation: " + std::string(e.what()), method.get());
+                        if (return_type->isVoidTy())
+                        {
+                            _context_manager.get_builder().CreateRetVoid();
+                        }
+                        else
+                        {
+                            // Create a default return value (this shouldn't happen in well-formed code)
+                            llvm::Value *default_val = llvm::UndefValue::get(return_type);
+                            _context_manager.get_builder().CreateRet(default_val);
+                        }
                     }
 
                     // Exit function scope
                     exit_scope();
                     _current_function.reset();
                 }
-                else if (method->is_destructor() && method->is_default_destructor())
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Skipping method body generation for {}.{} (pre-registration mode)", node.name(), method->name());
+                }
+
+                // Handle default destructor generation in both modes
+                if (method->is_destructor() && method->is_default_destructor() && !_pre_registration_mode)
                 {
                     // Generate default destructor body: empty destructor for proper RAII
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating default destructor body for {}::{}", node.name(), method->name());
@@ -2090,7 +2133,9 @@ namespace Cryo::Codegen
                     exit_scope();
                     _current_function.reset();
                 }
-                else if (method->is_destructor() && method->is_default_destructor())
+                
+                // Handle default destructor generation for classes
+                if (method->is_destructor() && method->is_default_destructor())
                 {
                     // Generate default destructor body: empty destructor for proper RAII
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating default destructor body for class {}::{}", class_name, method->name());
