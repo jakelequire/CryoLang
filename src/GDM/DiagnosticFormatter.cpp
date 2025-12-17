@@ -24,7 +24,6 @@ namespace Cryo
         _syntax_highlighter.set_color_output(use_colors);
         _syntax_highlighter.set_default_language("cryo");
 
-
         _style.arrow = "-->";
         _style.vertical_bar = "|";
         _style.horizontal_line = "-";
@@ -185,7 +184,8 @@ namespace Cryo
             output << format_severity(diagnostic.severity());
         }
         output << "[" << colorize(format_error_code_with_phase(diagnostic.error_code(), diagnostic.category()), _style.error_code_color) << "]: "
-               << "\n" << diagnostic.message() << "\n\n";
+               << "\n"
+               << diagnostic.message() << "\n\n";
 
         // Location line
         if (!spans.is_empty())
@@ -700,26 +700,26 @@ namespace Cryo
         std::string phase_name;
         switch (category)
         {
-            case DiagnosticCategory::Lexer:
-                phase_name = "Lexer";
-                break;
-            case DiagnosticCategory::Parser:
-                phase_name = "Parser";
-                break;
-            case DiagnosticCategory::Semantic:
-                phase_name = "TypeChecker";
-                break;
-            case DiagnosticCategory::CodeGen:
-                phase_name = "Codegen";
-                break;
-            case DiagnosticCategory::System:
-                phase_name = "System";
-                break;
-            default:
-                phase_name = "Unknown";
-                break;
+        case DiagnosticCategory::Lexer:
+            phase_name = "Lexer";
+            break;
+        case DiagnosticCategory::Parser:
+            phase_name = "Parser";
+            break;
+        case DiagnosticCategory::Semantic:
+            phase_name = "TypeChecker";
+            break;
+        case DiagnosticCategory::CodeGen:
+            phase_name = "Codegen";
+            break;
+        case DiagnosticCategory::System:
+            phase_name = "System";
+            break;
+        default:
+            phase_name = "Unknown";
+            break;
         }
-        
+
         return ErrorRegistry::error_code_to_string(error_code) + "::" + phase_name;
     }
 
