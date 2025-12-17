@@ -188,7 +188,7 @@ namespace Cryo::Codegen
             return generate_mfree(args);
         else if (intrinsic_name == "__msize__")
             return generate_msize(args);
-        
+
         else if (intrinsic_name == "__exit__")
             return generate_exit(args);
 
@@ -865,9 +865,9 @@ namespace Cryo::Codegen
         }
 
         // Call strlen
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "__strlen__ about to call strlen with argument: {}", static_cast<void*>(str_arg));
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "__strlen__ about to call strlen with argument: {}", static_cast<void *>(str_arg));
         llvm::Value *result = builder.CreateCall(strlen_func, {str_arg}, "strlen.result");
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "__strlen__ call completed, result: {}", static_cast<void*>(result));
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "__strlen__ call completed, result: {}", static_cast<void *>(result));
         return result;
     }
 
@@ -1009,12 +1009,12 @@ namespace Cryo::Codegen
         // WINDOWS x64 ABI FIX: Convert arguments to ensure proper ABI compliance
         std::vector<llvm::Value *> converted_args;
         converted_args.reserve(args.size());
-        
+
         for (size_t i = 0; i < args.size(); ++i)
         {
             llvm::Value *arg = args[i];
             llvm::Type *arg_type = arg->getType();
-            
+
             // For Windows x64 ABI: convert small integers to i32, keep i64 as i64
             if (arg_type->isIntegerTy())
             {
@@ -1030,19 +1030,19 @@ namespace Cryo::Codegen
             {
                 arg = builder.CreateFPExt(arg, llvm::Type::getDoubleTy(context), "printf.arg.fpext");
             }
-            
+
             converted_args.push_back(arg);
         }
 
         // Call printf with properly converted arguments for Windows ABI
         llvm::CallInst *call = builder.CreateCall(real_printf_func, converted_args, "printf.result");
-        
+
         // WINDOWS x64 ABI FIX: Ensure the call uses the correct calling convention
         if (module->getTargetTriple().find("windows") != std::string::npos)
         {
             call->setCallingConv(llvm::CallingConv::Win64);
         }
-        
+
         return call;
     }
 
@@ -1083,12 +1083,12 @@ namespace Cryo::Codegen
         // WINDOWS x64 ABI FIX: Convert arguments to ensure proper ABI compliance
         std::vector<llvm::Value *> converted_args;
         converted_args.reserve(args.size());
-        
+
         for (size_t i = 0; i < args.size(); ++i)
         {
             llvm::Value *arg = args[i];
             llvm::Type *arg_type = arg->getType();
-            
+
             // For Windows x64 ABI: convert small integers to i32, keep i64 as i64
             if (arg_type->isIntegerTy())
             {
@@ -1104,19 +1104,19 @@ namespace Cryo::Codegen
             {
                 arg = builder.CreateFPExt(arg, llvm::Type::getDoubleTy(context), "sprintf.arg.fpext");
             }
-            
+
             converted_args.push_back(arg);
         }
 
         // Call sprintf with properly converted arguments for Windows ABI
         llvm::CallInst *call = builder.CreateCall(sprintf_func, converted_args, "sprintf.result");
-        
+
         // WINDOWS x64 ABI FIX: Ensure the call uses the correct calling convention
         if (module->getTargetTriple().find("windows") != std::string::npos)
         {
             call->setCallingConv(llvm::CallingConv::Win64);
         }
-        
+
         return call;
     }
 
@@ -1620,18 +1620,18 @@ namespace Cryo::Codegen
     llvm::Function *Intrinsics::get_or_create_libc_function(const std::string &name, llvm::FunctionType *type)
     {
         auto *module = _context_manager.get_module();
-        
+
         // Check if this is a runtime function that needs qualification
         static const std::set<std::string> runtime_functions = {
-            "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc", 
-            "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
-        };
-        
+            "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc",
+            "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"};
+
         std::string function_name = name;
-        if (runtime_functions.find(name) != runtime_functions.end()) {
+        if (runtime_functions.find(name) != runtime_functions.end())
+        {
             function_name = "std::Runtime::" + name;
         }
-        
+
         llvm::Function *func = module->getFunction(function_name);
 
         if (!func)
@@ -1869,7 +1869,6 @@ namespace Cryo::Codegen
         return builder.CreateCall(msize_func, {ptr_arg}, "msize.result");
     }
 
-
     llvm::Value *Intrinsics::generate_exit(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 1)
@@ -1892,8 +1891,12 @@ namespace Cryo::Codegen
         llvm::Value *code_arg = args[0];
         llvm::Value *code_arg_32 = ensure_type(code_arg, int_type, "exit.code");
 
-        // Call exit
-        return builder.CreateCall(exit_func, {code_arg_32}, "exit.result");
+        // Call exit - exit() is a void function so no result name
+        builder.CreateCall(exit_func, {code_arg_32});
+
+        // Since exit() never returns, we should add an unreachable instruction
+        builder.CreateUnreachable();
+        return nullptr;
     }
 
 } // namespace Cryo::Codegen
