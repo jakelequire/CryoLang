@@ -1391,14 +1391,12 @@ namespace Cryo
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to load import '{}': {}", import_decl->path(), result.error_message);
             }
         }
-        // Handle variable declarations (collect them in first pass too)
+        // Skip variable declarations in first pass - they don't need forward declaration
+        // and will be processed by TypeChecker in second pass
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Use resolved variable type directly
-            Type *var_type = var_decl->get_resolved_type();
-
-            current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
-                                          var_decl->location(), var_type, scope_name);
+            // Skip variable declarations in collect_declarations_pass
+            // They will be properly handled by TypeChecker
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
@@ -1469,26 +1467,11 @@ namespace Cryo
         {
             // Already processed in first pass, nothing to do
         }
-        // Handle variable declarations - add to current scope
+        // Skip variable declarations - they will be handled by TypeChecker
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Use resolved type from AST node
-            Type *var_type = var_decl->get_resolved_type();
-
-            // Add variable to current scope
-            bool success = current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
-                                                         var_decl->location(), var_type, scope_name);
-
-            if (!success && _debug_mode)
-            {
-                LOG_WARN(Cryo::LogComponent::GENERAL, "Variable '{}' already declared in scope '{}'",
-                         var_decl->name(), scope_name);
-            }
-            else if (_debug_mode)
-            {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added variable '{}' to scope '{}' with type '{}'",
-                          var_decl->name(), scope_name, var_type->to_string());
-            }
+            // Variables don't need to be processed in populate_symbol_table_with_scope
+            // They will be properly handled by TypeChecker which manages its own TypedSymbolTable
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
