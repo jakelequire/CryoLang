@@ -755,7 +755,7 @@ namespace Cryo
               _name(std::move(name)), _resolved_type(type) {}
 
         const std::string &name() const { return _name; }
-        
+
         // Core type system access
         Cryo::Type *get_resolved_type() const { return _resolved_type; }
         void set_resolved_type(Cryo::Type *type) { _resolved_type = type; }
