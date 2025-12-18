@@ -18154,9 +18154,9 @@ namespace Cryo::Codegen
         if (symbol_kind == Cryo::SymbolKind::Function)
         {
             static const std::set<std::string> runtime_functions = {
-                "cryo_alloc", "cryo_memcpy", "cryo_free", "cryo_realloc", "cryo_malloc", 
+                "cryo_alloc", "cryo_memcpy", "cryo_free", "cryo_realloc", "cryo_malloc",
                 "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat", "cryo_runtime_allocate",
-                "cryo_runtime_deallocate", "cryo_profile_start", "cryo_profile_end", 
+                "cryo_runtime_deallocate", "cryo_profile_start", "cryo_profile_end",
                 "cryo_throw_exception", "cryo_runtime_initialize"};
 
             if (runtime_functions.find(base_name) != runtime_functions.end())
