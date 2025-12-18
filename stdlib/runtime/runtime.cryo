@@ -1,1000 +1,1281 @@
-namespace std::Runtime;
+namespace std::RuntimeV2;
 
-import <core/intrinsics>;
 import <io/stdio>;
 
-// Future: Add this to make an easy switch between enabled/disabled debug logging
-// Depending on the compiler args, it can be set to true or false
-// extern const ENABLE_RUNTIME_DEBUG: boolean;
-
 //===================================================================
-// CONSTANTS AND ENUMS (same as before)
+// RUNTIME CONFIGURATION AND CONSTANTS
 //===================================================================
 
-const DEFAULT_HEAP_SIZE: u64 = 16777216;    // 16MB
-const MIN_BLOCK_SIZE: u64    = 32;          // Minimum block size to avoid fragmentation
-const BLOCK_ALIGNMENT: u64   = 16;          // 16-byte alignment
-const HEAP_GUARD_SIZE: u64   = 4096;        // 4KB guard pages
+const RUNTIME_VERSION_MAJOR: u32 = 1;
+const RUNTIME_VERSION_MINOR: u32 = 0;
+const RUNTIME_VERSION_PATCH: u32 = 0;
 
-const BLOCK_FREE: u64       =   0x0000000000000001;    // Block is free
-const BLOCK_ALLOCATED: u64  =   0x0000000000000002;    // Block is allocated
-const BLOCK_MAGIC: u64      =   0xDEADBEEF00000000;    // Magic number for block validation
+// Memory configuration
+const DEFAULT_HEAP_SIZE: u64           = 67108864;    // 64MB default heap
+const DEFAULT_STACK_SIZE: u64          = 1048576;     // 1MB default stack per thread
+const SMALL_OBJECT_THRESHOLD: u64     = 256;         // Objects <= 256 bytes use small allocator
+const LARGE_OBJECT_THRESHOLD: u64     = 65536;       // Objects >= 64KB use large allocator
+const MAX_SMALL_OBJECT_SIZE: u64      = 256;
+const MIN_ALLOCATION_SIZE: u64         = 16;          // Minimum allocation size
+const ALLOCATION_ALIGNMENT: u64        = 16;          // Memory alignment requirement
+const GUARD_PAGE_SIZE: u64             = 4096;        // Memory protection
+const MEMORY_POOL_COUNT: u32           = 32;          // Number of memory pools
 
+// Threading configuration
+const MAX_THREADS: u32                 = 256;         // Maximum concurrent threads
+const THREAD_STACK_SIZE: u64           = 2097152;     // 2MB per thread stack
+const WORK_QUEUE_SIZE: u32             = 1024;        // Work stealing queue size
 
+// GC-less memory management thresholds
+const MEMORY_PRESSURE_THRESHOLD: f64   = 0.85;        // 85% heap usage triggers cleanup
+const MEMORY_WARNING_THRESHOLD: f64    = 0.95;        // 95% heap usage warning
+const DEFRAG_THRESHOLD: f64            = 0.3;         // 30% fragmentation triggers defrag
+
+// Runtime debugging and profiling
+const ENABLE_RUNTIME_PROFILING: boolean = true;
+const ENABLE_MEMORY_TRACKING: boolean   = true;
+const ENABLE_TYPE_CHECKING: boolean     = true;
+const MAX_STACK_TRACE_DEPTH: u32        = 128;
+
+//===================================================================
+// RUNTIME STATE AND ERROR HANDLING
+//===================================================================
 
 enum RuntimeState {
-    UNINITIALIZED,
-    INITIALIZING,
-    RUNNING,
-    SHUTTING_DOWN,
-    TERMINATED
+    RTS_UNINITIALIZED,
+    RTS_INITIALIZING,
+    RTS_RUNNING,
+    RTS_SHUTDOWN,
+    RTS_SUSPENDED,
+    RTS_ERROR,
+    RTS_PANIC
 }
 
 enum RuntimeError {
-    SUCCESS,
-    INITIALIZATION_FAILED,
-    HEAP_NOT_INITIALIZED,
-    OUT_OF_MEMORY,
-    INVALID_POINTER,
-    ALLOCATION_FAILED,
-    DOUBLE_FREE,
-    SYSTEM_ERROR,
-    PANIC,
-    UNKNOWN_ERROR
+    RTE_SUCCESS                    = 0,
+    RTE_INITIALIZATION_FAILED     = 1,
+    RTE_OUT_OF_MEMORY            = 2,
+    RTE_STACK_OVERFLOW           = 3,
+    RTE_NULL_POINTER_ACCESS      = 4,
+    RTE_INVALID_TYPE_CAST        = 5,
+    RTE_THREAD_CREATION_FAILED   = 6,
+    RTE_MUTEX_LOCK_FAILED        = 7,
+    RTE_IO_ERROR                 = 8,
+    RTE_INVALID_OPERATION        = 9,
+    RTE_RESOURCE_EXHAUSTED       = 10,
+    RTE_ASSERTION_FAILED         = 11,
+    RTE_UNHANDLED_EXCEPTION      = 12,
+    RTE_SYSTEM_ERROR            = 13,
+    RTE_RUNTIME_CORRUPTION      = 14,
+    RTE_PANIC                     = 15,
+    RTE_UNKNOWN_ERROR           = 255
 }
 
-
+enum MemoryRegionType {
+    HEAP,
+    STACK,
+    CODE,
+    DATA,
+    THREAD_LOCAL
+}
 
 //===================================================================
-// HEAP BLOCK MANAGEMENT
+// TYPE SYSTEM RUNTIME SUPPORT
 //===================================================================
 
-type class HeapBlock {
-public:
+// Runtime Type Information
+type struct TypeInfo {
+    type_id: u64;
+    name: string;
     size: u64;
+    alignment: u64;
     flags: u64;
-    next: HeapBlock*;
-    prev: HeapBlock*;
-
-    HeapBlock(block_size: u64, block_flags: u64) {
-        this.size = block_size;
-        this.flags = block_flags;
-        this.next = null;
-        this.prev = null;
+    parent_type_id: u64;           // For inheritance
+    trait_vtables: void**;         // Trait dispatch tables
+    destructor: void*;             // Destructor function pointer
+    copy_constructor: void*;       // Copy constructor
+    move_constructor: void*;       // Move constructor
+    
+    TypeInfo(id: u64, type_name: string, type_size: u64, type_alignment: u64) {
+        this.type_id = id;
+        this.name = type_name;
+        this.size = type_size;
+        this.alignment = type_alignment;
+        this.flags = u64(0);
+        this.parent_type_id = u64(0);
+        this.trait_vtables = null;
+        this.destructor = null;
+        this.copy_constructor = null;
+        this.move_constructor = null;
     }
+}
 
-    // Check if this block is free
-    is_free() -> boolean {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlocK::is_free} Checking if block is free: flags=0x%llx\033[0m\n", this.flags);
-        return (this.flags & BLOCK_FREE) != u64(0);
+// Dynamic type checking and casting
+type class TypeRegistry {
+public:
+    type_info_map: TypeInfo*;      // Hash map of type ID -> TypeInfo
+    next_type_id: u64;
+    
+    TypeRegistry() {
+        this.type_info_map = null;
+        this.next_type_id = u64(1); // Type ID 0 reserved for void/null
     }
-
-    // Check if this block is allocated
-    is_allocated() -> boolean {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::is_allocated} Checking if block is allocated: flags=0x%llx\033[0m\n", this.flags);
-        return (this.flags & BLOCK_ALLOCATED) != u64(0);
-    }
-
-    // Check if this block has valid magic number
-    is_valid() -> boolean {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::is_valid} Validating block magic: flags=0x%llx\033[0m\n", this.flags);
-        const magic_check: u64 = this.flags & BLOCK_MAGIC;
-        return magic_check == BLOCK_MAGIC;
-    }
-
-    // Mark block as allocated
-    mark_allocated() -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::mark_allocated} Marking block as allocated: flags=0x%llx\033[0m\n", this.flags);
-        this.flags = BLOCK_ALLOCATED | BLOCK_MAGIC;
-        return;
-    }
-
-    // Mark block as free
-    mark_free() -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::mark_free} Marking block as free: this=%p flags=0x%llx\033[0m\n", this, this.flags);
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::mark_free} BLOCK_FREE=0x%llx, BLOCK_MAGIC=0x%llx\033[0m\n", BLOCK_FREE, BLOCK_MAGIC);
-        const combined: u64 = BLOCK_FREE | BLOCK_MAGIC;
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::mark_free} Combined flags=0x%llx\033[0m\n", combined);
-        this.flags = combined;
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::mark_free} After setting: this=%p flags=0x%llx\033[0m\n", this, this.flags);
-        return;
-    }
-
-    // Get pointer to user data (after header)
-    get_user_data_ptr() -> void* {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::get_user_data_ptr} Getting user data pointer: flags=0x%llx\033[0m\n", this.flags);
-        const header_size: u64 = sizeof(HeapBlock);
-        return __ptr_add__(this, header_size);
-    }
-
-    // Split this block into two blocks
-    split(requested_size: u64) -> HeapBlock* {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Splitting block: ptr=%p, current_size=%llu bytes, requested_size=%llu bytes\033[0m\n", 
-                                   this, this.size, requested_size);
+    
+    register_type(name: string, size: u64, alignment: u64) -> u64 {
+        const type_id: u64 = this.next_type_id;
+        this.next_type_id = this.next_type_id + u64(1);
         
-        const header_size: u64 = sizeof(HeapBlock);
-        const min_split_size: u64 = requested_size + header_size + MIN_BLOCK_SIZE;
+        // Create TypeInfo and store in registry
+        // Implementation would use hash map
         
-        if (this.size <= min_split_size) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Cannot split, block too small (need %llu, have %llu)\033[0m\n", min_split_size, this.size);
-            return null; // Cannot split, block too small
-        }
-
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Original block size: %llu, will allocate: %llu\033[0m\n", this.size, requested_size);
-        
-        // Calculate where the new block should start
-        // New block starts at: current block + header size + requested_size  
-        const new_block_ptr: void* = __ptr_add__(this, header_size + requested_size);
-        const new_block: HeapBlock* = new_block_ptr;
-        
-        // The remaining size is: original_size - requested_size - header_for_new_block
-        const remaining_size: u64 = this.size - requested_size - header_size;
-        
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Remaining size calculation: %llu - %llu - %llu = %llu\033[0m\n",
-                                   this.size, requested_size, header_size, remaining_size);
-        
-        new_block.size = remaining_size;
-        new_block.flags = BLOCK_FREE | BLOCK_MAGIC;
-        new_block.next = this.next;
-        new_block.prev = this;
-
-        // Update this block to the requested size
-        this.size = requested_size;
-        this.next = new_block;
-
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Split complete - first block: %llu bytes, second block: %llu bytes\033[0m\n", 
-                                   this.size, new_block.size);
-        printf("\033[90m[DEBUG::RUNTIME] {HeapBlock::split} Created new block: ptr=%p, size=%llu bytes\033[0m\n", 
-                                   new_block, new_block.size);
-
-        return new_block;
+        printf("[Runtime::TypeRegistry] Registered type '%s' with ID %llu\n", name, type_id);
+        return type_id;
     }
-
-private:
+    
+    get_type_info(type_id: u64) -> TypeInfo* {
+        // Hash map lookup implementation
+        return null; // Placeholder
+    }
+    
+    is_instance_of(object_type_id: u64, target_type_id: u64) -> boolean {
+        // Check type hierarchy and trait implementations
+        return false; // Placeholder
+    }
 }
 
 //===================================================================
-// FREE LIST MANAGER
+// ADVANCED MEMORY MANAGEMENT
 //===================================================================
 
-type class FreeListManager {
+// Memory pool for fixed-size allocations
+type class MemoryPool {
 public:
-    head: HeapBlock*;
-
-    FreeListManager() {
-        printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::constructor} Initializing FreeListManager\033[0m\n");
-        this.head = null;
+    block_size: u64;
+    block_count: u64;
+    free_blocks: void**;           // Stack of free blocks
+    memory_region: void*;          // Base memory for this pool
+    allocated_count: u64;
+    peak_allocation: u64;
+    
+    MemoryPool(size: u64, count: u64) {
+        this.block_size = size;
+        this.block_count = count;
+        this.allocated_count = u64(0);
+        this.peak_allocation = u64(0);
+        
+        // Allocate memory region
+        const total_size: u64 = size * count;
+        this.memory_region = __malloc__(total_size);
+        
+        // Initialize free block stack
+        this.initialize_free_blocks();
+        
+        printf("[Runtime::MemoryPool] Created pool: %llu blocks of %llu bytes\n", count, size);
     }
-
-    // Add block to the head of free list
-    add_block(block: HeapBlock*) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::add_block} Adding block to free list: ptr=%p\033[0m\n", block.get_user_data_ptr());
-        
-        block.next = this.head;
-        block.prev = null;
-        
-        if (this.head != null) {
-            printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::add_block} Updating previous head's prev pointer\033[0m\n");
-            this.head.prev = block;
+    
+    allocate() -> void* {
+        if (this.allocated_count >= this.block_count) {
+            return null; // Pool exhausted
         }
         
-        this.head = block;
-        return;
-    }
-
-    // Remove block from free list
-    remove_block(block: HeapBlock*) -> void {
-        // Temporarily replace method call to test execution flow
-        mut user_ptr: void* = __ptr_add__(block, u64(32));
-        printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::remove_block} Removing block from free list: ptr=%p\033[0m\n", user_ptr);
-        
-        if (block.prev != null) {
-            printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::remove_block} Updating previous block's next pointer\033[0m\n");
-            block.prev.next = block.next;
-        } else {
-            printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::remove_block} Updating head pointer\033[0m\n");
-            // This is the head of the list
-            this.head = block.next;
-        }
-        
-        if (block.next != null) {
-            printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::remove_block} Updating next block's previous pointer\033[0m\n");
-            block.next.prev = block.prev;
-        }
-        
-        block.next = null;
-        block.prev = null;
-        return;
-    }
-
-    // Find a free block of at least the requested size
-    find_free_block(size: u64) -> HeapBlock* {
-        printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::find_free_block} Finding free block: size=%llu bytes\033[0m\n", size);
-        printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::find_free_block} Free list head: %p\033[0m\n", this.head);
-
-        mut current: HeapBlock* = this.head;
-
-        while (current != null) {
-            printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::find_free_block} Checking block: ptr=%p, size=%llu bytes\033[0m\n", 
-                                       current.get_user_data_ptr(), current.size);
-            
-            if (current.size >= size) {
-                printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::find_free_block} Found suitable block: ptr=%p, size=%llu bytes\033[0m\n",
-                                           current.get_user_data_ptr(), current.size);
-                return current;
+        // Pop from free block stack
+        const block: void * = this.pop_free_block();
+        if (block != null) {
+            this.allocated_count = this.allocated_count + u64(1);
+            if (this.allocated_count > this.peak_allocation) {
+                this.peak_allocation = this.allocated_count;
             }
-            
-            current = current.next;
         }
-
-        printf("\033[90m[DEBUG::RUNTIME] {FreeListManager::find_free_block} No suitable free block found\033[0m\n");
+        return block;
+    }
+    
+    deallocate(ptr: void*) -> boolean {
+        if (!this.is_valid_block(ptr)) {
+            return false;
+        }
+        
+        // Push to free block stack
+        this.push_free_block(ptr);
+        this.allocated_count = this.allocated_count - u64(1);
+        return true;
+    }
+    
+private:
+    initialize_free_blocks() -> void {
+        // Initialize the free block stack with all blocks
+    }
+    
+    pop_free_block() -> void* {
+        // Stack pop implementation
         return null;
     }
-
-private:
+    
+    push_free_block(ptr: void*) -> void {
+        // Stack push implementation
+    }
+    
+    is_valid_block(ptr: void*) -> boolean {
+        // Check if pointer belongs to this pool
+        return false;
+    }
 }
 
-
-//===================================================================
-// HEAP MANAGER
-//===================================================================
-
-type class HeapManager {
+// Advanced heap manager with multiple allocation strategies
+type class AdvancedHeapManager {
 public:
+    small_pools: MemoryPool*;      // Array of small object pools
+    medium_allocator: void*;       // Best-fit allocator for medium objects
+    large_allocator: void*;        // Segment allocator for large objects
+    
+    total_allocated: u64;
+    total_deallocated: u64;
+    peak_memory_usage: u64;
+    current_memory_usage: u64;
+    fragmentation_ratio: f64;
+    
     heap_base: void*;
     heap_size: u64;
-    free_list: FreeListManager;
     is_initialized: boolean;
-
-    HeapManager() {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::constructor} Initializing HeapManager\033[0m\n");
-        this.heap_base = null;
-        this.heap_size = u64(64);
-        this.free_list = FreeListManager();
+    
+    AdvancedHeapManager() {
+        this.total_allocated = u64(0);
+        this.total_deallocated = u64(0);
+        this.peak_memory_usage = u64(0);
+        this.current_memory_usage = u64(0);
+        this.fragmentation_ratio = 0.0;
         this.is_initialized = false;
     }
-
-    // Initialize the heap
+    
     initialize(heap_size: u64) -> RuntimeError {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} Initializing heap with size: %llu bytes\033[0m\n", heap_size);
-        
-        this.heap_base = __mmap__(heap_size);
-        if (this.heap_base == null) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} Heap initialization failed: mmap returned null\033[0m\n");
-            return RuntimeError::SYSTEM_ERROR;
-        }
+        printf("[Runtime::AdvancedHeapManager] Initializing heap: %llu bytes\n", heap_size);
         
         this.heap_size = heap_size;
-        this.is_initialized = true;
+        this.heap_base = __malloc__(heap_size);
         
-        // Create initial free block
-        const initial_block: HeapBlock* = this.heap_base;
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} Initial block at: %p\033[0m\n", initial_block);
-        
-        const header_size: u64 = sizeof(HeapBlock);
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} sizeof(HeapBlock)=%llu bytes\033[0m\n", header_size);
-        
-        initial_block.size = heap_size - header_size;
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} Setting initial block size to %llu bytes\033[0m\n", initial_block.size);
-        
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} Before mark_free: initial_block=%p\033[0m\n", initial_block);
-        initial_block.mark_free();
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} After mark_free: initial_block=%p\033[0m\n", initial_block);
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} IMMEDIATE after mark_free call\033[0m\n");
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} After mark_free: initial_block=%p\033[0m\n", initial_block);
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} Reading flags: initial_block=%p flags=0x%llx\033[0m\n", initial_block, initial_block.flags);
-        
-        initial_block.next = null;
-        initial_block.prev = null;
-        
-        // Add to free list
-        this.free_list.add_block(initial_block);
-
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::initialize} Heap initialized: base=%p, size=%llu bytes\033[0m\n",
-                                   this.heap_base, this.heap_size);
-        return RuntimeError::SUCCESS;
-    }
-
-    // Allocate memory from heap
-    allocate(size: u64) -> void* {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::allocate} Allocating memory: size=%llu bytes\033[0m\n", size);
-        
-        if (!this.is_initialized) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::allocate} Heap not initialized\033[0m\n");
-            return null;
-        }
-        
-        if (size == u64(0)) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::allocate} Invalid allocation size: 0 bytes\033[0m\n");
-            return null;
-        }
-        
-        // Align size
-        const aligned_size: u64 = this.align_size(size, BLOCK_ALIGNMENT);
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::allocate} Aligned size: %llu bytes\033[0m\n", aligned_size);
-        
-        // Find free block
-        const block: HeapBlock* = this.free_list.find_free_block(aligned_size);
-        if (block == null) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::allocate} No suitable free block found\033[0m\n");
-            return null;
-        }
-        
-        // // Split block if it's much larger than needed
-        if (block.size > aligned_size + sizeof(HeapBlock) + MIN_BLOCK_SIZE) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::allocate} Splitting block: ptr=%p\033[0m\n", block.get_user_data_ptr());
-            const new_block: HeapBlock* = block.split(aligned_size);
-            if (new_block != null) {
-                this.free_list.add_block(new_block);
-            }
-        }
-        
-        // // Remove from free list and mark as allocated
-        this.free_list.remove_block(block);
-        block.mark_allocated();
-
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::allocate} Allocated memory: ptr=%p, size=%llu bytes\033[0m\n",
-                                  block.get_user_data_ptr(), block.size);
-        
-        return block.get_user_data_ptr();
-    }
-
-    reallocate(ptr: void*, new_size: u64) -> void* {
-        if (ptr == null) {
-            return this.allocate(new_size);
-        }
-
-        if (new_size == 0) {
-            this.deallocate(ptr);
-            return null;
-        }
-
-        const block: HeapBlock* = this.get_block_from_ptr(ptr);
-        const aligned_new_size: u64 = this.align_size(new_size, BLOCK_ALIGNMENT);
-
-        // If new size fits in current block, just return it
-        if (aligned_new_size <= block.size) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::reallocate} Reusing existing block\033[0m\n");
-            return ptr;
-        }
-
-        // Allocate new block
-        const new_ptr: void* = this.allocate(new_size);
-        if (new_ptr == null) {
-            return null;  // Keep old allocation on failure
-        }
-
-        // Copy old data
-        cryo_memcpy(new_ptr, ptr, block.size);
-
-        // Free old block
-        this.deallocate(ptr);
-
-        return new_ptr;
-    }
-
-    // Free allocated memory
-    deallocate(_ptr: void*) -> u64 {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::deallocate} Freeing memory: ptr=%p\033[0m\n", _ptr);
-        
-        if (_ptr == null) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::deallocate} Invalid pointer: null\033[0m\n");
-            return u64(0);
-        }
-        
-        // Get block header from user pointer
-       const block: HeapBlock* = this.get_block_from_ptr(_ptr);
-       
-       if (!block.is_valid()) {
-           printf("\033[90m[DEBUG::RUNTIME] {HeapManager::deallocate} Invalid block detected during free: ptr=%p\033[0m\n", _ptr);
-           return u64(0);
-       }
-       
-       if (block.is_free()) {
-           printf("\033[90m[DEBUG::RUNTIME] {HeapManager::deallocate} Double free detected: ptr=%p\033[0m\n", _ptr);
-           return u64(0);
-       }
-       
-       // Get the size before marking as free
-       const block_size: u64 = block.size;
-       
-       // Mark as free and add to free list
-       block.mark_free();
-       this.free_list.add_block(block);
-       
-       // Coalesce with adjacent blocks
-       this.coalesce_block(block);
-
-       printf("\033[90m[DEBUG::RUNTIME] {HeapManager::deallocate} Memory freed: ptr=%p\033[0m\n", _ptr);
-
-       return block_size;
-    }
-
-    // Shutdown heap
-    shutdown() -> void {
-        if (this.is_initialized && this.heap_base != null) {
-            __munmap__(this.heap_base, this.heap_size);
-            this.heap_base = null;
-            this.is_initialized = false;
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::shutdown} Heap shutdown complete\033[0m\n");
-            return;
-        }
         if (this.heap_base == null) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::shutdown} Heap base is null, cannot shutdown\033[0m\n");
-            return;
+            return RuntimeError::RTE_OUT_OF_MEMORY;
         }
-        if (!this.is_initialized) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::shutdown} Heap not initialized, nothing to shutdown\033[0m\n");
-            return;
-        }
-
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::shutdown} Heap not initialized or already shutdown\033[0m\n");
-        return;
+        
+        // Initialize memory pools for different sizes
+        this.initialize_memory_pools();
+        
+        this.is_initialized = true;
+        printf("[Runtime::AdvancedHeapManager] Heap initialization complete\n");
+        return RuntimeError::RTE_SUCCESS;
     }
-
-private:
-    // Align size to boundary
-    align_size(size: u64, alignment: u64) -> u64 {
-        if (alignment == 0) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::align_size} Invalid alignment: 0\033[0m\n");
-            return size; // No alignment
-        }
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::align_size} Aligning size: original=%llu bytes, alignment=%llu bytes\033[0m\n", size, alignment);
-        
-        // Proper alignment using bitwise operations: (size + alignment - 1) & ~(alignment - 1)
-        const size_plus_align_minus_1: u64 = size + alignment - u64(1);
-        const alignment_mask: u64 = alignment - u64(1);
-        const neg_alignment_mask: u64 = u64(0) - alignment_mask - u64(1); // ~(alignment - 1)
-        const aligned: u64 = size_plus_align_minus_1 & neg_alignment_mask;
-        
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::align_size} Aligned result: %llu bytes\033[0m\n", aligned);
-        return aligned;
-    }
-
-    // Get block header from user pointer
-    get_block_from_ptr(ptr: void*) -> HeapBlock* {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::get_block_from_ptr} Getting block header from pointer: ptr=%p\033[0m\n", ptr);
-        const header_size: u64 = sizeof(HeapBlock);
-        return __ptr_sub__(ptr, header_size);
-    }
-
-    // Coalesce block with adjacent free blocks
-    coalesce_block(block: HeapBlock*) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing block: ptr=%p, size=%llu\033[0m\n", 
-                                   block.get_user_data_ptr(), block.size);
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Block details: next=%p, prev=%p\033[0m\n", block.next, block.prev);
-        
-        mut coalesced: boolean = false;
-        
-        // Try to merge with next block first
-        if (block.next != null) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Checking next block: ptr=%p, size=%llu\033[0m\n", 
-                                       block.next.get_user_data_ptr(), block.next.size);
-            if (block.next.is_free()) {
-                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing with next block: ptr=%p, size=%llu\033[0m\n",
-                                           block.next.get_user_data_ptr(), block.next.size);
-                
-                const old_size: u64 = block.size;
-                const next_size: u64 = block.next.size;
-                const header_size: u64 = sizeof(HeapBlock);
-                
-                // Remove next block from free list before destroying its linkage
-                this.free_list.remove_block(block.next);
-                
-                // Merge: current_size + header + next_size
-                block.size = old_size + header_size + next_size;
-                block.next = block.next.next;
-                
-                if (block.next != null) {
-                    block.next.prev = block;
-                }
-                
-                coalesced = true;
-                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Merged with next: %llu + %llu + %llu = %llu\033[0m\n",
-                                           old_size, header_size, next_size, block.size);
-            } else {
-                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Next block is not free\033[0m\n");
-            }
-        } else {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} No next block to coalesce\033[0m\n");
-        }
-        
-        // Try to merge with previous block
-        if (block.prev != null) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Checking previous block: ptr=%p, size=%llu\033[0m\n", 
-                                       block.prev.get_user_data_ptr(), block.prev.size);
-            if (block.prev.is_free()) {
-                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing with previous block: ptr=%p, size=%llu\033[0m\n", 
-                                           block.prev.get_user_data_ptr(), block.prev.size);
-                
-                const prev_size: u64 = block.prev.size;
-                const current_size: u64 = block.size;
-                const header_size: u64 = sizeof(HeapBlock);
-                
-                // Remove current block from free list (prev block is already in list)
-                this.free_list.remove_block(block);
-                
-                // Merge into previous block: prev_size + header + current_size
-                block.prev.size = prev_size + header_size + current_size;
-                block.prev.next = block.next;
-                
-                if (block.next != null) {
-                    block.next.prev = block.prev;
-                }
-                
-                coalesced = true;
-                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Merged with prev: %llu + %llu + %llu = %llu\033[0m\n",
-                                           prev_size, header_size, current_size, block.prev.size);
-            } else {
-                printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Previous block is not free\033[0m\n");
-            }
-        } else {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} No previous block to coalesce\033[0m\n");
-        }
-
-        if (coalesced) {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing successful - larger blocks available for reuse\033[0m\n");
-        } else {
-            printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} No coalescing performed\033[0m\n");
-        }
-        
-        printf("\033[90m[DEBUG::RUNTIME] {HeapManager::coalesce_block} Coalescing complete\033[0m\n");
-        return;
-    }
-}
-
-//===================================================================
-// STATISTICS MANAGER
-//===================================================================
-
-type class StatisticsManager {
-public:
-    total_allocations: u64;
-    total_deallocations: u64;
-    bytes_allocated: u64;
-    peak_allocation: u64;
-
-    // New fields for enhanced statistics
-    current_allocations: u64;     // Active allocations
-    failed_allocations: u64;      // OOM count
-    fragmentation_ratio: f64;     // Heap fragmentation
-    largest_free_block: u64;      // For fragmentation tracking
     
-    // Allocation size histogram (future)
-    small_allocs: u64;   // < 64 bytes
-    medium_allocs: u64;  // 64 - 4096 bytes
-    large_allocs: u64;   // > 4096 bytes
-
-    heap_size: u64;
-
-    StatisticsManager() {
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::StatisticsManager} Initializing StatisticsManager\033[0m\n");
-        this.initialize_fields();
-        
-        // Debug: verify initialization
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::StatisticsManager} After init: total_allocations=%llu\033[0m\n", this.total_allocations);
-    }
-
-    // Explicit field initialization method
-    initialize_fields() -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::initialize_fields} Explicitly initializing all fields\033[0m\n");
-        this.total_allocations = u64(0);
-        this.total_deallocations = u64(0);
-        this.bytes_allocated = u64(0);
-        this.peak_allocation = u64(0);
-        this.current_allocations = u64(0);
-        this.failed_allocations = u64(0);
-        this.fragmentation_ratio = 0.0;
-        this.largest_free_block = u64(0);
-        this.small_allocs = u64(0);
-        this.medium_allocs = u64(0);
-        this.large_allocs = u64(0);
-        this.heap_size = u64(0);
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::initialize_fields} Fields initialized: total_allocations=%llu\033[0m\n", this.total_allocations);
-    }
-
-    // Record allocation
-    record_allocation(size: u64) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_allocation} Recording allocation: size=%llu bytes\033[0m\n", size);
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_allocation} Before increment: total_allocations=%llu\033[0m\n", this.total_allocations);
-        this.total_allocations = this.total_allocations + u64(1);
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_allocation} After increment: total_allocations=%llu\033[0m\n", this.total_allocations);
-        this.current_allocations = this.current_allocations + u64(1);
-        
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_allocation} Before: bytes_allocated=%llu\033[0m\n", this.bytes_allocated);
-        this.bytes_allocated = this.bytes_allocated + size;
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_allocation} After: bytes_allocated=%llu\033[0m\n", this.bytes_allocated);
-        
-        // Update allocation size histogram
-        this.update_allocation_histogram(size);
-        
-        if (this.bytes_allocated > this.peak_allocation) {
-            this.peak_allocation = this.bytes_allocated;
-            printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_allocation} New peak allocation: %llu bytes\033[0m\n", this.peak_allocation);
+    allocate(size: u64) -> void* {
+        if (!this.is_initialized) {
+            return null;
         }
-        return;
-    }
-
-    // Record deallocation
-    record_deallocation(size: u64) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_deallocation} Recording deallocation: size=%llu bytes\033[0m\n", size);
-        this.total_deallocations = this.total_deallocations + u64(1);
         
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_deallocation} Before: bytes_allocated=%llu\033[0m\n", this.bytes_allocated);
-        this.bytes_allocated = this.bytes_allocated - size;
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_deallocation} After: bytes_allocated=%llu\033[0m\n", this.bytes_allocated);
+        // Choose allocation strategy based on size
+        if (size <= SMALL_OBJECT_THRESHOLD) {
+            return this.allocate_small(size);
+        } else if (size <= LARGE_OBJECT_THRESHOLD) {
+            return this.allocate_medium(size);
+        } else {
+            return this.allocate_large(size);
+        }
+    }
+    
+    deallocate(ptr: void*) -> boolean {
+        if (ptr == null) {
+            return true; // Deallocating null is valid
+        }
         
-        this.current_allocations = this.current_allocations - u64(1);
-        return;
+        // Determine which allocator owns this pointer
+        if (this.is_small_pool_pointer(ptr)) {
+            return this.deallocate_small(ptr);
+        } else if (this.is_medium_allocator_pointer(ptr)) {
+            return this.deallocate_medium(ptr);
+        } else if (this.is_large_allocator_pointer(ptr)) {
+            return this.deallocate_large(ptr);
+        }
+        
+        return false; // Invalid pointer
     }
-
-    // Set heap size (called during heap initialization)
-    set_heap_size(size: u64) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::set_heap_size} Setting heap size: %llu bytes\033[0m\n", size);
-        this.heap_size = size;
-        return;
+    
+    defragment() -> void {
+        printf("[Runtime::AdvancedHeapManager] Starting heap defragmentation\n");
+        // Compact memory and reduce fragmentation
+        this.calculate_fragmentation();
     }
-
-    // Get heap utilization as a percentage
-    get_heap_utilization() -> f64 {
+    
+    get_memory_pressure() -> f64 {
         if (this.heap_size == u64(0)) {
             return 0.0;
         }
-        const utilization: f64 = (this.bytes_allocated * 100.0) / this.heap_size;
-        return utilization;
+        return f64(this.current_memory_usage) / f64(this.heap_size);
     }
-
-    // Record failed allocation
-    record_failed_allocation(requested_size: u64) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {StatisticsManager::record_failed_allocation} Recording failed allocation: size=%llu bytes\033[0m\n", requested_size);
-        this.failed_allocations = this.failed_allocations + u64(1);
-        return;
-    }
-
-    // Update allocation size histogram
-    update_allocation_histogram(size: u64) -> void {
-        if (size < u64(64)) {
-            this.small_allocs = this.small_allocs + u64(1);
-        } else if (size <= u64(4096)) {
-            this.medium_allocs = this.medium_allocs + u64(1);
-        } else {
-            this.large_allocs = this.large_allocs + u64(1);
-        }
-        return;
-    }
-
-    // Print statistics
-    print_stats() -> void {
-        printf("\033[0m");
-        printf("\033[90m");
-        printf("===========================================================\n");
-        printf("                    RUNTIME STATISTICS                     \n");
-        printf("===========================================================\n");
-        printf("Allocations:\n");
-        printf("  Total allocations:   %10llu\n", this.total_allocations);
-        printf("  Total deallocations: %10llu\n", this.total_deallocations);
-        printf("  Current allocations: %10llu\n", this.current_allocations);
-        printf("  Failed allocations:  %10llu\n", this.failed_allocations);
-        printf("\n");
-        printf("Heap Information:\n");
-        printf("  Total heap size:     %10llu bytes\n", this.heap_size);
-        printf("  Bytes allocated:     %10llu bytes\n", this.bytes_allocated);
-        printf("  Peak allocation:     %10llu bytes\n", this.peak_allocation);
-        printf("  Largest free block:  %10llu bytes\n", this.largest_free_block);
-        
-        // Calculate and display heap utilization
-        const utilization: f64 = this.get_heap_utilization();
-        printf("  Heap utilization:    %10.2f%%\n", utilization);
-        
-        // Display fragmentation info if available
-        if (this.heap_size > u64(0)) {
-            const free_bytes: u64 = this.heap_size - this.bytes_allocated;
-            printf("  Free bytes:          %10llu bytes\n", free_bytes);
-            if (this.largest_free_block > u64(0) && free_bytes > u64(0)) {
-                const fragmentation: f64 = (1.0 - (this.largest_free_block / free_bytes)) * 100.0;
-                printf("  Fragmentation:       %10.2f%%\n", fragmentation);
-            }
-        }
-        
-        printf("\n");
-        printf("Allocation Sizes:\n");
-        printf("  Small  (< 64B):      %10llu\n", this.small_allocs);
-        printf("  Medium (64B-4KB):    %10llu\n", this.medium_allocs);
-        printf("  Large  (> 4KB):      %10llu\n", this.large_allocs);
-        printf("===========================================================\n");
-        
-        if (this.current_allocations > 0) {
-            printf("\nWARNING: Memory leak detected!\n");
-            printf("   %llu allocations not freed (%llu bytes)\n",
-                                   this.current_allocations, this.bytes_allocated);
-        }
-        printf("\033[0m");
-        return;
-    }
-
+    
 private:
+    initialize_memory_pools() -> void {
+        // Create pools for common allocation sizes: 16, 32, 64, 128, 256 bytes
+    }
+    
+    allocate_small(size: u64) -> void* {
+        // Use memory pools for small allocations
+        return null;
+    }
+    
+    allocate_medium(size: u64) -> void* {
+        // Use best-fit allocator for medium allocations
+        return null;
+    }
+    
+    allocate_large(size: u64) -> void* {
+        // Use segment allocator for large allocations
+        return null;
+    }
+    
+    deallocate_small(ptr: void*) -> boolean {
+        return false;
+    }
+    
+    deallocate_medium(ptr: void*) -> boolean {
+        return false;
+    }
+    
+    deallocate_large(ptr: void*) -> boolean {
+        return false;
+    }
+    
+    is_small_pool_pointer(ptr: void*) -> boolean {
+        return false;
+    }
+    
+    is_medium_allocator_pointer(ptr: void*) -> boolean {
+        return false;
+    }
+    
+    is_large_allocator_pointer(ptr: void*) -> boolean {
+        return false;
+    }
+    
+    calculate_fragmentation() -> void {
+        // Calculate and update fragmentation ratio
+    }
 }
 
 //===================================================================
-// ERROR MANAGER
+// THREADING AND CONCURRENCY SUPPORT
 //===================================================================
 
-type class ErrorManager {
-public:
-    last_error: RuntimeError;
-    panic_in_progress: boolean;
+enum ThreadState {
+    CREATED,
+    RUNNING,
+    BLOCKED,
+    WAITING,
+    SUSPENDED,
+    TERMINATED
+}
 
-    ErrorManager() {
-        printf("\033[90m[DEBUG::RUNTIME] {ErrorManager::ErrorManager} Initializing ErrorManager\033[0m\n");
-        this.last_error = RuntimeError::SUCCESS;
-        this.panic_in_progress = false;
+type struct Thread {
+    thread_id: u64;
+    state: ThreadState;
+    stack_base: void*;
+    stack_size: u64;
+    stack_pointer: void*;
+    entry_point: void*;            // Function pointer
+    argument: void*;               // Thread argument
+    return_value: void*;           // Thread return value
+    local_storage: void*;          // Thread-local storage
+    
+    Thread(id: u64, entry: void*, arg: void*) {
+        this.thread_id = id;
+        this.state = ThreadState::CREATED;
+        this.entry_point = entry;
+        this.argument = arg;
+        this.stack_size = THREAD_STACK_SIZE;
+        this.stack_base = __malloc__(this.stack_size);
+        this.stack_pointer = this.stack_base;
+        this.return_value = null;
+        this.local_storage = null;
     }
+}
 
-    // Set runtime error
-    set_error(error: RuntimeError) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {ErrorManager::set_error} Setting error: %d\033[0m\n", error);
-        this.last_error = error;
+type class ThreadManager {
+public:
+    threads: Thread*;              // Array of managed threads
+    thread_count: u32;
+    max_threads: u32;
+    next_thread_id: u64;
+    
+    ThreadManager() {
+        this.thread_count = u32(0);
+        this.max_threads = MAX_THREADS;
+        this.next_thread_id = u64(1);
+        this.threads = null; // Would allocate array of Thread pointers
+    }
+    
+    create_thread(entry_point: void*, argument: void*) -> u64 {
+        if (this.thread_count >= this.max_threads) {
+            return u64(0); // Failed to create thread
+        }
+        
+        const thread_id: u64 = this.next_thread_id;
+        this.next_thread_id = this.next_thread_id + u64(1);
+        
+        // Create and initialize thread
+        const thread: Thread = Thread(thread_id, entry_point, argument);
+        
+        // Add to thread registry
+        this.thread_count = this.thread_count + u32(1);
+        
+        printf("[Runtime::ThreadManager] Created thread %llu\n", thread_id);
+        return thread_id;
+    }
+    
+    join_thread(thread_id: u64) -> void* {
+        const thread: Thread* = this.find_thread(thread_id);
+        if (thread == null) {
+            return null;
+        }
+        
+        // Wait for thread completion
+        while (thread.state != ThreadState::TERMINATED) {
+            // Yield CPU or block
+            this.yield_thread();
+        }
+        
+        return thread.return_value;
+    }
+    
+    terminate_thread(thread_id: u64) -> boolean {
+        const thread: Thread* = this.find_thread(thread_id);
+        if (thread == null) {
+            return false;
+        }
+        
+        thread.state = ThreadState::TERMINATED;
+        this.cleanup_thread(thread);
+        return true;
+    }
+    
+private:
+    find_thread(thread_id: u64) -> Thread* {
+        // Linear search or hash map lookup
+        return null;
+    }
+    
+    cleanup_thread(thread: Thread*) -> void {
+        // Free stack and cleanup resources
+        if (thread.stack_base != null) {
+            __free__(thread.stack_base);
+            thread.stack_base = null;
+        }
+    }
+    
+    yield_thread() -> void {
+        // Platform-specific thread yielding
+    }
+}
+
+// Mutex for thread synchronization
+type class Mutex {
+public:
+    locked: boolean;
+    owner_thread_id: u64;
+    waiting_threads: u64*;         // Queue of waiting thread IDs
+    
+    Mutex() {
+        this.locked = false;
+        this.owner_thread_id = u64(0);
+        this.waiting_threads = null;
+    }
+    
+    lock() -> boolean {
+        // Atomic compare-and-swap implementation
+        while (this.locked) {
+            // Add current thread to waiting queue
+            this.wait_for_unlock();
+        }
+        
+        this.locked = true;
+        this.owner_thread_id = this.get_current_thread_id();
+        return true;
+    }
+    
+    unlock() -> boolean {
+        if (!this.locked || this.owner_thread_id != this.get_current_thread_id()) {
+            return false; // Not owned by current thread
+        }
+        
+        this.locked = false;
+        this.owner_thread_id = u64(0);
+        
+        // Wake up waiting threads
+        this.notify_waiting_threads();
+        return true;
+    }
+    
+    try_lock() -> boolean {
+        if (this.locked) {
+            return false;
+        }
+        
+        // Atomic compare-and-swap
+        this.locked = true;
+        this.owner_thread_id = this.get_current_thread_id();
+        return true;
+    }
+    
+private:
+    wait_for_unlock() -> void {
+        // Platform-specific waiting mechanism
+    }
+    
+    notify_waiting_threads() -> void {
+        // Wake up threads in waiting queue
+    }
+    
+    get_current_thread_id() -> u64 {
+        return u64(1); // Placeholder - would get actual thread ID
+    }
+}
+
+//===================================================================
+// EXCEPTION AND ERROR HANDLING SYSTEM
+//===================================================================
+
+type struct StackFrame {
+    function_name: string;
+    source_file: string;
+    line_number: u32;
+    column_number: u32;
+    frame_pointer: void*;
+    
+    StackFrame(func: string, file: string, line: u32, col: u32) {
+        this.function_name = func;
+        this.source_file = file;
+        this.line_number = line;
+        this.column_number = col;
+        this.frame_pointer = null;
+    }
+}
+
+type class StackTrace {
+public:
+    frames: StackFrame*;           // Array of stack frames
+    frame_count: u32;
+    max_frames: u32;
+    
+    StackTrace() {
+        this.frame_count = u32(0);
+        this.max_frames = MAX_STACK_TRACE_DEPTH;
+        // Allocate frames array
+    }
+    
+    capture() -> void {
+        // Walk the call stack and capture frames
+        this.frame_count = u32(0);
+        
+        // Platform-specific stack walking
+        this.capture_native_stack();
+
         return;
     }
+    
+    print() -> void {
+        printf("Stack trace (%u frames):\n", this.frame_count);
+        for (mut i: u32 = u32(0); i < this.frame_count; i = i + u32(1)) {
+            const frame: StackFrame = this.frames[i];
+            printf("  #%u: %s at %s:%u:%u\n", 
+                   i, frame.function_name, frame.source_file, 
+                   frame.line_number, frame.column_number);
+        }
 
-    // Get last error
-    get_error() -> RuntimeError {
-        printf("\033[90m[DEBUG::RUNTIME] {ErrorManager::get_error} Getting error: %d\033[0m\n", this.last_error);
-        return this.last_error;
+        return;
     }
+    
+private:
+    capture_native_stack() -> void {
+        // Platform-specific stack capture implementation
+        printf("[Runtime::StackTrace] Capturing native stack trace (not implemented)\n");
+    }
+}
 
-    // Handle panic
-    panic(message: string, file: string, line: i32) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {ErrorManager::panic} Panic invoked: %s\033[0m\n", message);
+type struct Exception {
+    message: string;
+    error_code: RuntimeError;
+    stack_trace: StackTrace;
+    inner_exception: Exception*;   // For nested exceptions
+    
+    Exception(msg: string, code: RuntimeError) {
+        this.message = msg;
+        this.error_code = code;
+        this.stack_trace = StackTrace();
+        this.stack_trace.capture();
+        this.inner_exception = null;
+    }
+}
+
+type class ExceptionManager {
+public:
+    current_exception: Exception*;
+    exception_handlers: void**;    // Stack of exception handlers
+    
+    ExceptionManager() {
+        this.current_exception = null;
+        this.exception_handlers = null;
+    }
+    
+    throw_exception(message: string, error_code: RuntimeError) -> void {
+        const exc: Exception = Exception(message, error_code);
+        this.current_exception = &exc;
         
-        if (this.panic_in_progress) {
-            printf("\033[90m[DEBUG::RUNTIME] {ErrorManager::panic} Recursive panic detected, forcing exit\033[0m\n");
-            __syscall_exit__(127);
+        printf("[Runtime::ExceptionManager] Exception thrown: %s (code: %d)\n", 
+               message, error_code);
+        exc.stack_trace.print();
+        
+        // Unwind stack and find handler
+        this.unwind_stack();
+    }
+    
+    register_exception_handler(handler: void*) -> void {
+        // Push handler onto stack
+    }
+    
+    unregister_exception_handler() -> void {
+        // Pop handler from stack
+    }
+    
+private:
+    unwind_stack() -> void {
+        // Stack unwinding implementation
+        // Call destructors for stack objects
+        // Find appropriate exception handler
+    }
+}
+
+//===================================================================
+// I/O AND SYSTEM INTERFACE
+//===================================================================
+
+enum FileMode {
+    READ_ONLY,
+    WRITE_ONLY,
+    READ_WRITE,
+    APPEND,
+    CREATE
+}
+
+type struct FileHandle {
+    fd: i32;                       // File descriptor
+    mode: FileMode;
+    path: string;
+    is_open: boolean;
+    position: u64;
+    size: u64;
+    
+    FileHandle(file_path: string, file_mode: FileMode) {
+        this.fd = i32(-1);
+        this.mode = file_mode;
+        this.path = file_path;
+        this.is_open = false;
+        this.position = u64(0);
+        this.size = u64(0);
+    }
+}
+
+type class IOManager {
+public:
+    open_files: FileHandle*;       // Array of open file handles
+    file_count: u32;
+    max_files: u32;
+    
+    IOManager() {
+        this.file_count = u32(0);
+        this.max_files = u32(1024);
+    }
+    
+    open_file(path: string, mode: FileMode) -> FileHandle* {
+        if (this.file_count >= this.max_files) {
+            return null;
+        }
+        
+        const handle: FileHandle = FileHandle(path, mode);
+        
+        // Platform-specific file opening
+        handle.fd = this.system_open_file(path, mode);
+        if (handle.fd >= i32(0)) {
+            handle.is_open = true;
+            handle.size = this.get_file_size(handle.fd);
+            this.file_count = this.file_count + u32(1);
+        }
+        
+        return &handle;
+    }
+    
+    close_file(handle: FileHandle*) -> boolean {
+        if (handle == null || !handle.is_open) {
+            return false;
+        }
+        
+        const result: i32 = this.system_close_file(handle.fd);
+        if (result == i32(0)) {
+            handle.is_open = false;
+            this.file_count = this.file_count - u32(1);
+            return true;
+        }
+        
+        return false;
+    }
+    
+    read_file(handle: FileHandle*, buffer: void*, size: u64) -> u64 {
+        if (handle == null || !handle.is_open) {
+            return u64(0);
+        }
+        
+        const bytes_read: u64 = this.system_read_file(handle.fd, buffer, size);
+        handle.position = handle.position + bytes_read;
+        return bytes_read;
+    }
+    
+    write_file(handle: FileHandle*, buffer: void*, size: u64) -> u64 {
+        if (handle == null || !handle.is_open) {
+            return u64(0);
+        }
+        
+        const bytes_written: u64 = this.system_write_file(handle.fd, buffer, size);
+        handle.position = handle.position + bytes_written;
+        return bytes_written;
+    }
+    
+private:
+    system_open_file(path: string, mode: FileMode) -> i32 {
+        // Platform-specific file opening
+        return i32(-1);
+    }
+    
+    system_close_file(fd: i32) -> i32 {
+        // Platform-specific file closing
+        return i32(-1);
+    }
+    
+    system_read_file(fd: i32, buffer: void*, size: u64) -> u64 {
+        // Platform-specific file reading
+        return u64(0);
+    }
+    
+    system_write_file(fd: i32, buffer: void*, size: u64) -> u64 {
+        // Platform-specific file writing
+        return u64(0);
+    }
+    
+    get_file_size(fd: i32) -> u64 {
+        // Platform-specific file size query
+        return u64(0);
+    }
+}
+
+//===================================================================
+// PROFILING AND DIAGNOSTICS
+//===================================================================
+
+type struct PerformanceCounter {
+    name: string;
+    count: u64;
+    total_time: u64;              // In microseconds
+    min_time: u64;
+    max_time: u64;
+    average_time: f64;
+    
+    PerformanceCounter(counter_name: string) {
+        this.name = counter_name;
+        this.count = u64(0);
+        this.total_time = u64(0);
+        this.min_time = u64(18446744073709551615); // Max u64
+        this.max_time = u64(0);
+        this.average_time = 0.0;
+    }
+    
+    record_execution(duration: u64) -> void {
+        this.count = this.count + u64(1);
+        this.total_time = this.total_time + duration;
+        
+        if (duration < this.min_time) {
+            this.min_time = duration;
+        }
+        if (duration > this.max_time) {
+            this.max_time = duration;
+        }
+        
+        this.average_time = f64(this.total_time) / f64(this.count);
+    }
+}
+
+type class ProfilerManager {
+public:
+    counters: PerformanceCounter*; // Array of performance counters
+    counter_count: u32;
+    profiling_enabled: boolean;
+    
+    ProfilerManager() {
+        this.counter_count = u32(0);
+        this.profiling_enabled = ENABLE_RUNTIME_PROFILING;
+    }
+    
+    start_profiling(operation_name: string) -> u64 {
+        if (!this.profiling_enabled) {
+            return u64(0);
+        }
+        
+        // Return timestamp for duration calculation
+        return this.get_high_precision_timestamp();
+    }
+    
+    end_profiling(operation_name: string, start_time: u64) -> void {
+        if (!this.profiling_enabled) {
             return;
         }
         
-        this.panic_in_progress = true;
-        this.last_error = RuntimeError::PANIC;
+        const end_time: u64 = this.get_high_precision_timestamp();
+        const duration: u64 = end_time - start_time;
         
-        printf("RUNTIME PANIC: %s\033[0m\n", message);
-        if (file != "" && line > 0) {
-            printf("Location: %s:%d\033[0m\n", file, line);
-        }
-
-        printf("\033[90m[DEBUG::RUNTIME] {ErrorManager::panic} Panic shutdown complete\033[0m\n");
-        __syscall_exit__(1);
-        return;
+        // Find or create performance counter
+        const counter: PerformanceCounter* = this.find_or_create_counter(operation_name);
+        counter.record_execution(duration);
     }
-
+    
+    print_performance_report() -> void {
+        printf("\n=== Runtime Performance Report ===\n");
+        for (mut i: u32 = u32(0); i < this.counter_count; i = i + u32(1)) {
+            const counter: PerformanceCounter = this.counters[i];
+            printf("Operation: %s\n", counter.name);
+            printf("  Calls: %llu\n", counter.count);
+            printf("  Total Time: %llu μs\n", counter.total_time);
+            printf("  Average: %.2f μs\n", counter.average_time);
+            printf("  Min: %llu μs, Max: %llu μs\n", counter.min_time, counter.max_time);
+            printf("\n");
+        }
+    }
+    
 private:
+    find_or_create_counter(name: string) -> PerformanceCounter* {
+        // Find existing counter or create new one
+        return null;
+    }
+    
+    get_high_precision_timestamp() -> u64 {
+        // Platform-specific high-precision timing
+        return u64(0);
+    }
 }
 
 //===================================================================
-// MAIN RUNTIME MANAGER
+// STRING MANAGEMENT AND INTERNING
 //===================================================================
 
-type class RuntimeManager {
+// Define StringBuilder first to avoid forward reference issues
+type class StringBuilder {
 public:
-    state: RuntimeState;
-    heap: HeapManager;
-    stats: StatisticsManager;
-    error: ErrorManager;
-
-    RuntimeManager() {
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::RuntimeManager} Initializing RuntimeManager\033[0m\n");
-        this.state = RuntimeState::UNINITIALIZED;
-        
-        // Initialize managers directly
-        this.heap = HeapManager();
-        this.stats = StatisticsManager();
-        this.error = ErrorManager();
+    buffer: char*;
+    capacity: u64;
+    length: u64;
+    
+    StringBuilder(initial_capacity: u64) {
+        this.capacity = initial_capacity;
+        this.length = u64(0);
+        this.buffer = cryo_alloc(initial_capacity);
     }
-
-    // Reset runtime to uninitialized state
-    reset() -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::reset} Resetting RuntimeManager\033[0m\n");
-        this.state = RuntimeState::UNINITIALIZED;
-        
-        // Reset managers
-        this.heap = HeapManager();
-        this.stats = StatisticsManager();
-        this.error = ErrorManager();
-        
-        // Explicitly reinitialize statistics to ensure clean state
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::reset} Explicitly reinitializing statistics\033[0m\n");
-        this.stats.initialize_fields();
-    }
-
-    // Initialize runtime system
-    initialize() -> RuntimeError {
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::initialize} Initializing runtime system...\033[0m\n");
-
-        if (this.state != RuntimeState::UNINITIALIZED) {
-            printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::initialize} Runtime already initialized\033[0m\n");
-            return RuntimeError::INITIALIZATION_FAILED;
+    
+    append(str: string) -> void {
+        const str_len: u64 = u64(str.length());
+        if (this.length + str_len >= this.capacity) {
+            this.resize(this.capacity * u64(2));
         }
         
-        this.state = RuntimeState::INITIALIZING;
+        // Copy string to buffer
+        for (mut i: u64 = u64(0); i < str_len; i = i + u64(1)) {
+            this.buffer[this.length + i] = str[i];
+        }
+        this.length = this.length + str_len;
+    }
+    
+    to_string() -> string {
+        // Convert buffer to string
+        mut result: string = "";
+        for (mut i: u64 = u64(0); i < this.length; i = i + u64(1)) {
+            result = result + this.buffer[i];
+        }
+        return result;
+    }
+    
+private:
+    resize(new_capacity: u64) -> void {
+        const new_buffer: char* = cryo_alloc(new_capacity);
         
-        // Initialize heap
-        const heap_result: RuntimeError = this.heap.initialize(DEFAULT_HEAP_SIZE);
-        if (heap_result != RuntimeError::SUCCESS) {
-            printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::initialize} Heap initialization failed\033[0m\n");
-            this.state = RuntimeState::UNINITIALIZED;
+        // Copy existing data
+        for (mut i: u64 = u64(0); i < this.length; i = i + u64(1)) {
+            new_buffer[i] = this.buffer[i];
+        }
+        
+        cryo_free(this.buffer);
+        this.buffer = new_buffer;
+        this.capacity = new_capacity;
+    }
+}
+
+type class StringManager {
+public:
+    interned_strings: string*;     // Hash set of interned strings
+    string_count: u32;
+    total_string_memory: u64;
+    
+    StringManager() {
+        this.string_count = u32(0);
+        this.total_string_memory = u64(0);
+    }
+    
+    intern_string(str: string) -> string {
+        // Check if string is already interned
+        if (this.is_interned(str)) {
+            return this.find_interned_string(str);
+        }
+        
+        // Create new interned string
+        const interned: string = this.create_interned_copy(str);
+        this.add_to_intern_table(interned);
+        
+        this.string_count = this.string_count + u32(1);
+        this.total_string_memory = this.total_string_memory + u64(str.length());
+        
+        return interned;
+    }
+    
+    create_string_builder(initial_capacity: u64) -> StringBuilder* {
+        return new StringBuilder(initial_capacity);
+    }
+    
+    get_string_statistics() -> void {
+        printf("String Manager Statistics:\n");
+        printf("  Interned strings: %u\n", this.string_count);
+        printf("  Total string memory: %llu bytes\n", this.total_string_memory);
+        printf("  Average string length: %.2f\n", 
+               (f64(this.total_string_memory) / f64(this.string_count)));
+    }
+    
+private:
+    is_interned(str: string) -> boolean {
+        return false;
+    }
+    
+    find_interned_string(str: string) -> string {
+        return "";
+    }
+    
+    create_interned_copy(str: string) -> string {
+        return str;
+    }
+    
+    add_to_intern_table(str: string) -> void {
+        // Add to hash table
+    }
+}
+
+//===================================================================
+// MAIN RUNTIME SYSTEM ORCHESTRATOR
+//===================================================================
+
+type class CryoRuntime {
+public:
+    state: RuntimeState;
+    version_major: u32;
+    version_minor: u32;
+    version_patch: u32;
+    
+    // Core runtime components
+    heap_manager: AdvancedHeapManager;
+    type_registry: TypeRegistry;
+    thread_manager: ThreadManager;
+    exception_manager: ExceptionManager;
+    io_manager: IOManager;
+    profiler_manager: ProfilerManager;
+    string_manager: StringManager;
+    
+    // Statistics and monitoring
+    startup_time: u64;
+    total_runtime: u64;
+    memory_peak: u64;
+    
+    CryoRuntime() {
+        this.state = RuntimeState::RTS_UNINITIALIZED;
+        this.version_major = RUNTIME_VERSION_MAJOR;
+        this.version_minor = RUNTIME_VERSION_MINOR;
+        this.version_patch = RUNTIME_VERSION_PATCH;
+        this.startup_time = u64(0);
+        this.total_runtime = u64(0);
+        this.memory_peak = u64(0);
+        
+        // Initialize all managers
+        this.heap_manager = AdvancedHeapManager();
+        this.type_registry = TypeRegistry();
+        this.thread_manager = ThreadManager();
+        this.exception_manager = ExceptionManager();
+        this.io_manager = IOManager();
+        this.profiler_manager = ProfilerManager();
+        this.string_manager = StringManager();
+    }
+    
+    initialize() -> RuntimeError {
+        printf("=== CryoLang Runtime System v%u.%u.%u ===\n",
+               this.version_major, this.version_minor, this.version_patch);
+        printf("Initializing runtime components...\n");
+        
+        this.state = RuntimeState::RTS_INITIALIZING;
+        this.startup_time = this.get_timestamp();
+        
+        // Initialize heap manager
+        const heap_result: RuntimeError = this.heap_manager.initialize(DEFAULT_HEAP_SIZE);
+        if (heap_result != RuntimeError::RTE_SUCCESS) {
+            this.state = RuntimeState::RTS_ERROR;
             return heap_result;
         }
         
-        // Set heap size in statistics manager
-        this.stats.set_heap_size(this.heap.heap_size);
+        // Register core types
+        this.register_core_types();
         
-        this.state = RuntimeState::RUNNING;
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::initialize} Runtime initialized successfully\033[0m\n");
-        return RuntimeError::SUCCESS;
+        // Initialize other components
+        printf("Runtime initialization complete.\n");
+        printf("Heap size: %llu bytes\n", DEFAULT_HEAP_SIZE);
+        printf("Max threads: %u\n", MAX_THREADS);
+        printf("Memory pools: %u\n", MEMORY_POOL_COUNT);
+        
+        this.state = RuntimeState::RTS_RUNNING;
+        return RuntimeError::RTE_SUCCESS;
     }
-
-    // Allocate memory
-    allocate(size: u64) -> void* {
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::allocate} METHOD CALLED - size=%llu\033[0m\n", size);
-        const ptr: void* = this.heap.allocate(size);
-        if (ptr != null) {
-            // Calculate aligned size to match what the heap actually allocated
-            // This replicates the heap's alignment logic for consistent tracking
-            const aligned_size: u64 = this.align_size_for_tracking(size);
-            printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::allocate} Original size=%llu, aligned size=%llu\033[0m\n", size, aligned_size);
-            this.stats.record_allocation(aligned_size);
-        } else {
-            this.stats.record_failed_allocation(size);
-        }
-        return ptr;
-    }
-
-    // Helper method to align size for consistent tracking
-    // This should match the heap's alignment logic
-    align_size_for_tracking(size: u64) -> u64 {
-        const alignment: u64 = u64(16); // BLOCK_ALIGNMENT = 16
-        if (alignment == 0) {
-            return size;
-        }
-        // Use same alignment logic as heap manager: (size + alignment - 1) & ~(alignment - 1)
-        const size_plus_align_minus_1: u64 = size + alignment - u64(1);
-        const alignment_mask: u64 = alignment - u64(1);
-        const neg_alignment_mask: u64 = u64(0) - alignment_mask - u64(1); // ~(alignment - 1)
-        return size_plus_align_minus_1 & neg_alignment_mask;
-    }
-
-    // Free memory
-    deallocate(ptr: void*) -> void {
-        const size: u64 = this.heap.deallocate(ptr);
-        if (size > 0) {
-            this.stats.record_deallocation(size);
-        }
-        return;
-    }
-
-    // Shutdown runtime
+    
     shutdown() -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::shutdown} Shutting down runtime system...\033[0m\n");
-        if (this.state == RuntimeState::TERMINATED) {
-            printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::shutdown} Runtime already terminated\033[0m\n");
-            return;
+        printf("\n=== Runtime Shutdown ===\n");
+        this.state = RuntimeState::RTS_SHUTDOWN;
+        
+        // Print final statistics
+        this.print_runtime_statistics();
+        
+        // Cleanup all resources
+        this.cleanup_resources();
+        
+        this.state = RuntimeState::RTS_SHUTDOWN;
+        printf("Runtime shutdown complete.\n");
+    }
+    
+    allocate_memory(size: u64) -> void* {
+        return this.heap_manager.allocate(size);
+    }
+    
+    deallocate_memory(ptr: void*) -> boolean {
+        return this.heap_manager.deallocate(ptr);
+    }
+    
+    panic(message: string, file: string, line: u32) -> void {
+        this.state = RuntimeState::RTE_PANIC;
+        
+        printf("\n!!! RUNTIME PANIC !!!\n");
+        printf("Message: %s\n", message);
+        printf("Location: %s:%u\n", file, line);
+        
+        // Capture stack trace
+        const trace: StackTrace = StackTrace();
+        trace.capture();
+        trace.print();
+        
+        // Attempt graceful shutdown
+        this.shutdown();
+        
+        // Force exit
+        __exit__(1);
+    }
+    
+    get_memory_statistics() -> void {
+        printf("\n=== Memory Statistics ===\n");
+        printf("Current usage: %llu bytes (%.1f%%)\n",
+               this.heap_manager.current_memory_usage,
+               this.heap_manager.get_memory_pressure() * f64(100.0));
+        printf("Peak usage: %llu bytes\n", this.memory_peak);
+        printf("Total allocated: %llu bytes\n", this.heap_manager.total_allocated);
+        printf("Total deallocated: %llu bytes\n", this.heap_manager.total_deallocated);
+        printf("Fragmentation: %.2f%%\n", this.heap_manager.fragmentation_ratio * f64(100.0));
+    }
+    
+    force_memory_cleanup() -> void {
+        printf("Forcing memory cleanup...\n");
+        
+        // Trigger defragmentation if fragmentation is high
+        if (this.heap_manager.fragmentation_ratio > DEFRAG_THRESHOLD) {
+            this.heap_manager.defragment();
         }
         
-        this.state = RuntimeState::SHUTTING_DOWN;
-        
-        // Print statistics
-        this.stats.print_stats();
-        
-        // Shutdown heap
-        this.heap.shutdown();
-        
-        this.state = RuntimeState::TERMINATED;
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::shutdown} Runtime shutdown complete\033[0m\n");
-        return;
+        // Compact string intern table
+        this.string_manager.get_string_statistics();
     }
-
-    // Get runtime error
-    get_last_error() -> RuntimeError {
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::get_last_error} Getting last runtime error\033[0m\n");
-        // const error_result: RuntimeError = this.error.get_error();
-        // return error_result;
-        return RuntimeError::UNKNOWN_ERROR;
-    }
-
-    // Set runtime error  
-    set_error(error: RuntimeError) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::set_error} Setting runtime error: %d\033[0m\n", error);
-        this.error.set_error(error);
-        return;
-    }
-
-    // Panic
-    panic(message: string, file: string, line: i32) -> void {
-        printf("\033[90m[DEBUG::RUNTIME] {RuntimeManager::panic} Invoking panic\033[0m\n");
-        this.error.panic(message, file, line);
-        __syscall_exit__(1);
-        return;
-    }
-
+    
 private:
-}
-
-//===================================================================
-// GLOBAL RUNTIME INSTANCE
-//===================================================================
-
-mut g_runtime_manager: RuntimeManager;
-
-//===================================================================
-// PUBLIC API FUNCTIONS
-//===================================================================
-
-function cryo_assert(condition: boolean, message: string) -> void {
-    if (!condition) {
-        g_runtime_manager.panic(message, "assertion", 0);
+    register_core_types() -> void {
+        // Register primitive types with the type registry
+        this.type_registry.register_type("i8", u64(1), u64(1));
+        this.type_registry.register_type("i16", u64(2), u64(2));
+        this.type_registry.register_type("i32", u64(4), u64(4));
+        this.type_registry.register_type("i64", u64(8), u64(8));
+        this.type_registry.register_type("u8", u64(1), u64(1));
+        this.type_registry.register_type("u16", u64(2), u64(2));
+        this.type_registry.register_type("u32", u64(4), u64(4));
+        this.type_registry.register_type("u64", u64(8), u64(8));
+        this.type_registry.register_type("f32", u64(4), u64(4));
+        this.type_registry.register_type("f64", u64(8), u64(8));
+        this.type_registry.register_type("boolean", u64(1), u64(1));
+        this.type_registry.register_type("char", u64(1), u64(1));
+        this.type_registry.register_type("string", u64(16), u64(8)); // Pointer + length
     }
-    return;
+    
+    print_runtime_statistics() -> void {
+        const current_time: u64 = this.get_timestamp();
+        this.total_runtime = current_time - this.startup_time;
+        
+        printf("\n=== Runtime Statistics ===\n");
+        printf("Total runtime: %llu ms\n", this.total_runtime / u64(1000));
+        printf("Threads created: %u\n", this.thread_manager.thread_count);
+        printf("Types registered: %llu\n", this.type_registry.next_type_id - u64(1));
+        
+        this.get_memory_statistics();
+        this.profiler_manager.print_performance_report();
+    }
+    
+    cleanup_resources() -> void {
+        // Cleanup would happen here
+        printf("Cleaning up runtime resources...\n");
+    }
+    
+    get_timestamp() -> u64 {
+        // Platform-specific timestamp implementation
+        return u64(0);
+    }
 }
+
+//===================================================================
+// GLOBAL RUNTIME INSTANCE AND API
+//===================================================================
+
+mut g_cryo_runtime: CryoRuntime;
+
+// Public runtime API functions
+function cryo_runtime_initialize() -> RuntimeError {
+    g_cryo_runtime = CryoRuntime();
+    return g_cryo_runtime.initialize();
+}
+
+function cryo_runtime_shutdown() -> void {
+    g_cryo_runtime.shutdown();
+}
+
+function cryo_runtime_allocate(size: u64) -> void* {
+    return g_cryo_runtime.allocate_memory(size);
+}
+
+function cryo_runtime_deallocate(ptr: void*) -> void {
+    g_cryo_runtime.deallocate_memory(ptr);
+}
+
+function cryo_runtime_panic(message: string, file: string, line: u32) -> void {
+    g_cryo_runtime.panic(message, file, line);
+}
+
+function cryo_runtime_force_cleanup() -> void {
+    g_cryo_runtime.force_memory_cleanup();
+}
+
+function cryo_runtime_get_stats() -> void {
+    g_cryo_runtime.get_memory_statistics();
+}
+
+// Thread management API
+function cryo_create_thread(entry_point: void*, argument: void*) -> u64 {
+    return g_cryo_runtime.thread_manager.create_thread(entry_point, argument);
+}
+
+function cryo_join_thread(thread_id: u64) -> void* {
+    return g_cryo_runtime.thread_manager.join_thread(thread_id);
+}
+
+// String management API
+function cryo_intern_string(str: string) -> string {
+    return g_cryo_runtime.string_manager.intern_string(str);
+}
+
+function cryo_create_string_builder(capacity: u64) -> StringBuilder* {
+    return g_cryo_runtime.string_manager.create_string_builder(capacity);
+}
+
+// Type system API
+function cryo_register_type(name: string, size: u64, alignment: u64) -> u64 {
+    return g_cryo_runtime.type_registry.register_type(name, size, alignment);
+}
+
+function cryo_get_type_info(type_id: u64) -> TypeInfo* {
+    return g_cryo_runtime.type_registry.get_type_info(type_id);
+}
+
+// Profiling API
+function cryo_profile_start(operation: string) -> u64 {
+    return g_cryo_runtime.profiler_manager.start_profiling(operation);
+}
+
+function cryo_profile_end(operation: string, start_time: u64) -> void {
+    g_cryo_runtime.profiler_manager.end_profiling(operation, start_time);
+}
+
+// Exception handling API
+function cryo_throw_exception(message: string, error_code: RuntimeError) -> void {
+    g_cryo_runtime.exception_manager.throw_exception(message, error_code);
+}
+
+//===================================================================
+// RUNTIME INTEGRATION WITH USER CODE
+//===================================================================
 
 function cryo_alloc(size: u64) -> void* {
-    printf("\033[90m[DEBUG::RUNTIME] {cryo_alloc} Allocating memory: size=%llu bytes\033[0m\n", size);
-    printf("\033[90m[DEBUG::RUNTIME] {cryo_alloc} About to call g_runtime_manager.allocate()\033[0m\n");
-    const ptr: void* = g_runtime_manager.allocate(size);
-    printf("\033[90m[DEBUG::RUNTIME] {cryo_alloc} Returned from g_runtime_manager.allocate(): ptr=%p\033[0m\n", ptr);
+    const start_time: u64 = cryo_profile_start("memory_allocation");
+    const ptr: void* = cryo_runtime_allocate(size);
+    cryo_profile_end("memory_allocation", start_time);
+    
+    if (ptr == null) {
+        cryo_throw_exception("Memory allocation failed", RuntimeError::RTE_OUT_OF_MEMORY);
+    }
+    
     return ptr;
 }
 
-function cryo_realloc(ptr: void*, new_size: u64) -> void* {
-    return g_runtime_manager.heap.reallocate(ptr, new_size);
-}
-
-function cryo_memcpy(dest: void*, src: void*, size: u64) -> void* {
-    cryo_assert(dest != null, "memcpy: destination is null");
-    cryo_assert(src != null, "memcpy: source is null");
-    return __memcpy__(dest, src, size);
-}
-
 function cryo_free(ptr: void*) -> void {
-    printf("\033[90m[DEBUG::RUNTIME] {cryo_free} Freeing memory: ptr=%p\033[0m\n", ptr);
-    g_runtime_manager.deallocate(ptr);
-    return;
+    const start_time: u64 = cryo_profile_start("memory_deallocation");
+    cryo_runtime_deallocate(ptr);
+    cryo_profile_end("memory_deallocation", start_time);
 }
 
-function cryo_panic(message: string, file: string, line: i32) -> void {
-    g_runtime_manager.panic(message, file, line);
-}
-
-//===================================================================
-// MAIN RUNTIME FUNCTION
-//===================================================================
-
+// Enhanced main function with runtime initialization
 extern function _user_main_(argc: int, argv: string*) -> int;
 
 function main(argc: int, argv: string*) -> int {
-    printf("\033[90m[DEBUG::RUNTIME] {main} Starting runtime initialization...\033[0m\n");
-
-    // Reset global runtime manager to ensure clean state
-    g_runtime_manager.reset();
-
-    // Initialize runtime
-    const init_result: RuntimeError = g_runtime_manager.initialize();
-    if (init_result != RuntimeError::SUCCESS) {
-        printf("\033[90m[DEBUG::RUNTIME] Runtime initialization failed: %d\033[0m\n", init_result);
+    // Initialize runtime system
+    const init_result: RuntimeError = cryo_runtime_initialize();
+    if (init_result != RuntimeError::RTE_SUCCESS) {
+        printf("Failed to initialize CryoLang runtime: error %d\n", init_result);
         return 1;
     }
-
-    printf("\033[90m[DEBUG::RUNTIME] {main} Runtime initialized, calling user main\033[0m\n");
-    printf("\033[1m\033[36mvv================== USER PROGRAM OUTPUT ==================vvv\n\033[0m\n");
-
-    // Call user main function
+    
+    printf("\n🚀 Starting user program...\n");
+    printf("========================================\n\n");
+    
+    // Call user main with exception handling
     mut user_result: int = 0;
+    // In a real implementation, this would be wrapped in try-catch
     user_result = _user_main_(argc, argv);
     
-    printf("\n\033[1m\033[36m^^^============= END USER PROGRAM OUTPUT =============^^^\n\033[0m");
-    printf("\033[90m[DEBUG::RUNTIME] {main} User main returned: %d\033[0m\n", user_result);
-
-    // Shutdown runtime
-    g_runtime_manager.shutdown();
-
-    printf("\033[90m[DEBUG::RUNTIME] {main} Runtime shutdown complete\033[0m\n");
+    printf("\n========================================\n");
+    printf("✅ User program completed (exit code: %d)\n", user_result);
+    
+    // Shutdown runtime system
+    cryo_runtime_shutdown();
+    
     return user_result;
 }

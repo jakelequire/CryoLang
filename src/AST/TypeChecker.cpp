@@ -4107,6 +4107,10 @@ namespace Cryo
             else
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "No methods registered for primitive type '{}'", primitive_type_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Currently registered struct types: {}", _struct_methods.size());
+                for (const auto& [type, methods] : _struct_methods) {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "  - {} has {} methods", type, methods.size());
+                }
             }
             
             // Fall through to error if method not found
@@ -5962,8 +5966,8 @@ namespace Cryo
         Type *target_type = nullptr;
         bool is_primitive_type = false;
 
-        // std::cout << "[DEBUG] ImplementationBlockNode::visit() - Processing implementation for type: " << target_type_name << std::endl;
-        // std::cout << "[DEBUG] Number of methods in this implementation: " << node.method_implementations().size() << std::endl;
+        LOG_DEBUG(Cryo::LogComponent::AST, "ImplementationBlockNode::visit() - Processing implementation for type: {} (source: {})", target_type_name, _source_file);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Number of methods in this implementation: {}", node.method_implementations().size());
 
         if (!target_type_name.empty())
         {
@@ -6024,7 +6028,7 @@ namespace Cryo
         {
             if (method)
             {
-                // std::cout << "[DEBUG] Checking method: " << method->name() << " for type " << target_type_name << std::endl;
+// std::cout << "[DEBUG] Checking method: " << method->name() << " for type " << target_type_name << std::endl;
                 
                 // Skip method validation for stdlib files - stdlib implementations
                 // are allowed to extend functionality without requiring explicit declarations
@@ -6063,10 +6067,9 @@ namespace Cryo
                     }
                 }
 
-                // std::cout << "[DEBUG] Processing method: " << method->name() << " for type " << target_type_name << std::endl;
-                // std::cout << "[DEBUG] About to call accept() on method: " << method->name() << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Processing method: {} for type {} (source: {})", method->name(), target_type_name, _source_file);
                 method->accept(*this);
-                // std::cout << "[DEBUG] Finished processing method: " << method->name() << " for type " << target_type_name << std::endl;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Finished processing method: {} for type {} - should be registered in _struct_methods", method->name(), target_type_name);
             }
         }
 
