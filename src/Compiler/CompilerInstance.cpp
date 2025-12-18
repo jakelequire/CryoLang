@@ -1624,7 +1624,11 @@ namespace Cryo
         }
 
         // Skip auto-import if we're in stdlib compilation mode to avoid circular dependencies
-        if (_stdlib_compilation_mode)
+        // Exception: runtime files need access to core/types for string methods
+        bool is_runtime_file = (_source_file.find("runtime/runtime.cryo") != std::string::npos ||
+                               _source_file.find("stdlib/runtime/runtime.cryo") != std::string::npos);
+        
+        if (_stdlib_compilation_mode && !is_runtime_file)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports in stdlib compilation mode");
             return;
@@ -1636,15 +1640,22 @@ namespace Cryo
             return;
         }
 
-        // Skip auto-import if we're compiling the core/types module itself
+        // Skip auto-import if we're compiling the core/types module itself to avoid circular dependencies
         if (_source_file.find("core/types.cryo") != std::string::npos ||
-            _source_file.find("stdlib/core/types.cryo") != std::string::npos ||
-            _source_file.find("runtime/runtime.cryo") != std::string::npos)
+            _source_file.find("stdlib/core/types.cryo") != std::string::npos)
         {
-            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports when compiling core/types module");
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports when compiling core/types module itself");
             return;
         }
 
+        // Check if we're in stdlib mode and only allow core/types for runtime files
+        bool stdlib_mode_runtime_exception = _stdlib_compilation_mode && is_runtime_file;
+        
+        if (is_runtime_file) {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file detected: {}, stdlib_mode: {}, exception_active: {}", 
+                      _source_file, _stdlib_compilation_mode, stdlib_mode_runtime_exception);
+        }
+        
         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: core/types");
 
         // Use the member ModuleLoader instance
@@ -1675,6 +1686,9 @@ namespace Cryo
                 current_scope->register_namespace(result.module_name, result.symbol_map);
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported core/types: registered namespace '{}' with {} symbols",
                           result.module_name, result.symbol_map.size());
+                if (is_runtime_file) {
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file successfully auto-imported core/types - implementation blocks should be processed later");
+                }
             }
             else
             {
@@ -1684,6 +1698,16 @@ namespace Cryo
         else
         {
             LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import core/types: {}", result.error_message);
+            if (is_runtime_file) {
+                LOG_ERROR(Cryo::LogComponent::GENERAL, "CRITICAL: Runtime file failed to auto-import core/types - string methods will be unavailable!");
+            }
+        }
+
+        // Skip remaining auto-imports if we're in stdlib mode (except for runtime files which only get core/types)
+        if (stdlib_mode_runtime_exception)
+        {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file in stdlib mode: only auto-imported core/types, skipping other imports");
+            return;
         }
 
         // Auto-import intrinsic functions for user projects
@@ -1744,9 +1768,11 @@ namespace Cryo
             // Register the namespace and symbols (wildcard import behavior)
             if (!runtime_result.symbol_map.empty())
             {
-                current_scope->register_namespace(runtime_result.module_name, runtime_result.symbol_map);
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: registered namespace '{}' with {} symbols",
-                          runtime_result.module_name, runtime_result.symbol_map.size());
+                // Force runtime symbols to be registered under std::Runtime for TypeChecker fallback compatibility
+                std::string runtime_namespace = "std::Runtime";
+                current_scope->register_namespace(runtime_namespace, runtime_result.symbol_map);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: registered namespace '{}' with {} symbols (original module: '{}')",
+                          runtime_namespace, runtime_result.symbol_map.size(), runtime_result.module_name);
 
                 // Only use fully qualified std::Runtime namespace - no short names for consistency
             }
