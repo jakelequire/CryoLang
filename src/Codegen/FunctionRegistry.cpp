@@ -46,8 +46,10 @@ namespace Cryo::Codegen
         {
             // List of runtime functions that should be auto-qualified when called from within runtime namespace
             static const std::set<std::string> runtime_functions = {
-                "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc", 
-                "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"
+                "cryo_alloc", "cryo_memcpy", "cryo_free", "cryo_realloc", "cryo_malloc", 
+                "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat", "cryo_runtime_allocate",
+                "cryo_runtime_deallocate", "cryo_profile_start", "cryo_profile_end", 
+                "cryo_throw_exception", "cryo_runtime_initialize"
             };
             
             if (runtime_functions.find(function_name) != runtime_functions.end())
