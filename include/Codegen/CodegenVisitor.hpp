@@ -167,6 +167,7 @@ namespace Cryo::Codegen
         void visit(Cryo::CallExpressionNode &node) override;
         void visit(Cryo::NewExpressionNode &node) override;
         void visit(Cryo::SizeofExpressionNode &node) override;
+        void visit(Cryo::CastExpressionNode &node) override;
         void visit(Cryo::StructLiteralNode &node) override;
         void visit(Cryo::ArrayLiteralNode &node) override;
         void visit(Cryo::ArrayAccessNode &node) override;
@@ -627,6 +628,15 @@ namespace Cryo::Codegen
         uint32_t get_current_line_number();
         std::string get_current_function_name();
         llvm::Value *generate_intrinsic_constant(const std::string &const_name);
+
+        // Cast expression helper methods
+        llvm::Type *get_primitive_type(const std::string &type_name);
+        llvm::Value *generate_cast_instruction(llvm::Value *source_value, 
+                                              llvm::Type *source_type, 
+                                              llvm::Type *target_type, 
+                                              const std::string &source_type_name, 
+                                              const std::string &target_type_name,
+                                              llvm::IRBuilder<> &builder);
 
         // Error reporting
         void report_error(const std::string &message);

@@ -405,6 +405,7 @@ namespace Cryo
         void visit(NewExpressionNode &node) override;
         void visit(StructLiteralNode &node) override;
         void visit(SizeofExpressionNode &node) override;
+        void visit(CastExpressionNode &node) override;
         void visit(ArrayLiteralNode &node) override;
         void visit(ArrayAccessNode &node) override;
         void visit(MemberAccessNode &node) override;
@@ -474,6 +475,11 @@ namespace Cryo
         bool is_in_unsafe_context() const { return _in_unsafe_context; }
         bool is_primitive_integer_type(const std::string &type_name);
         bool is_method_declared_in_type(const std::string &type_name, const std::string &method_name);
+        
+        // Type casting helpers
+        bool is_valid_type(const std::string &type_name);
+        bool is_cast_valid(const std::string &from_type, const std::string &to_type);
+        bool requires_explicit_cast(const std::string &from_type, const std::string &to_type);
 
         // Template parameter management
         std::vector<std::string> get_template_parameters(const std::string &type_name) const;

@@ -97,6 +97,11 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void CastExpressionNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     void StructLiteralNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);

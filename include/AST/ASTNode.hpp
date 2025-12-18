@@ -57,6 +57,7 @@ namespace Cryo
         CallExpression,
         NewExpression,
         SizeofExpression,
+        CastExpression,
         StructLiteral,
         ArrayLiteral,
         ArrayAccess,
@@ -132,6 +133,8 @@ namespace Cryo
             return "NewExpression";
         case NodeKind::SizeofExpression:
             return "SizeofExpression";
+        case NodeKind::CastExpression:
+            return "CastExpression";
         case NodeKind::StructLiteral:
             return "StructLiteral";
         case NodeKind::ArrayLiteral:
@@ -1796,6 +1799,34 @@ namespace Cryo
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "SizeofExpression: " << _type_name << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    //===----------------------------------------------------------------------===//
+    // CastExpressionNode
+    //===----------------------------------------------------------------------===//
+    class CastExpressionNode : public ExpressionNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _expression;
+        std::string _target_type_name;
+
+    public:
+        CastExpressionNode(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::string target_type)
+            : ExpressionNode(NodeKind::CastExpression, loc), 
+              _expression(std::move(expression)), 
+              _target_type_name(std::move(target_type)) {}
+
+        ExpressionNode *expression() const { return _expression.get(); }
+        const std::string &target_type_name() const { return _target_type_name; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "CastExpression: " << _target_type_name << std::endl;
+            if (_expression)
+                _expression->print(os, indent + 2);
         }
 
         void accept(ASTVisitor &visitor) override;

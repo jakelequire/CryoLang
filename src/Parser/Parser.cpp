@@ -1895,14 +1895,53 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_bitwise_and()
     {
-        auto expr = parse_relational();
+        auto expr = parse_cast();
 
         while (_current_token.is(TokenKind::TK_AMP))
         {
             Token op = _current_token;
             advance();
-            auto right = parse_relational();
+            auto right = parse_cast();
             expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_cast()
+    {
+        auto expr = parse_relational();
+
+        // Handle type casts: expression as TargetType
+        while (_current_token.is(TokenKind::TK_KW_AS))
+        {
+            SourceLocation cast_loc = _current_token.location();
+            advance(); // consume 'as'
+
+            // Parse the target type
+            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
+            {
+                error("Expected type name after 'as' in cast expression");
+                return nullptr;
+            }
+
+            std::string target_type = std::string(_current_token.text());
+            advance(); // consume type name
+
+            // Handle generic types like Array<T> or Map<K, V>
+            if (_current_token.is(TokenKind::TK_L_ANGLE))
+            {
+                target_type += parse_generic_type_suffix();
+            }
+
+            // Handle pointer types like int* or char**
+            while (_current_token.is(TokenKind::TK_STAR))
+            {
+                target_type += "*";
+                advance();
+            }
+
+            expr = _builder.create_cast_expression(cast_loc, std::move(expr), target_type);
         }
 
         return expr;
@@ -3232,6 +3271,71 @@ namespace Cryo
         return _builder.create_sizeof_expression(sizeof_location, type_name);
     }
 
+    std::string Parser::parse_generic_type_suffix()
+    {
+        std::string result;
+        
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            result += "<";
+            advance(); // consume '<'
+
+            // Parse generic type arguments
+            if (!_current_token.is(TokenKind::TK_R_ANGLE))
+            {
+                do
+                {
+                    // Parse type argument
+                    if (_current_token.is(TokenKind::TK_IDENTIFIER) || is_type_token())
+                    {
+                        result += std::string(_current_token.text());
+                        advance();
+
+                        // Handle nested generics like Array<Map<K, V>>
+                        if (_current_token.is(TokenKind::TK_L_ANGLE))
+                        {
+                            result += parse_generic_type_suffix();
+                        }
+
+                        // Handle pointers in generic arguments like Array<int*>
+                        while (_current_token.is(TokenKind::TK_STAR))
+                        {
+                            result += "*";
+                            advance();
+                        }
+                    }
+                    else
+                    {
+                        error("Expected type name in generic type arguments");
+                        break;
+                    }
+
+                    if (_current_token.is(TokenKind::TK_COMMA))
+                    {
+                        result += ", ";
+                        advance(); // consume comma
+                    }
+                    else
+                    {
+                        break;
+                    }
+                } while (true);
+            }
+
+            if (_current_token.is(TokenKind::TK_R_ANGLE))
+            {
+                result += ">";
+                advance(); // consume '>'
+            }
+            else
+            {
+                error("Expected '>' to close generic type arguments");
+            }
+        }
+
+        return result;
+    }
+
     std::unique_ptr<ExpressionNode> Parser::parse_member_access(std::unique_ptr<ExpressionNode> expr)
     {
         SourceLocation access_location = _current_token.location();
@@ -3327,6 +3431,11 @@ namespace Cryo
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after struct name");
 
+        // DEBUG: Log struct parsing
+        if (struct_name == "MemoryPool") {
+            std::cout << "\n🔥🔥🔥 PARSING MEMORYPOOL STRUCT 🔥🔥🔥\n" << std::endl;
+        }
+
         // Parse struct members (fields and methods)
         Visibility current_visibility = Visibility::Public; // Default for structs
 
@@ -3337,7 +3446,9 @@ namespace Cryo
                 // Check for visibility modifiers
                 if (is_visibility_modifier())
                 {
+                    std::cout << "🔍 PARSER DEBUG: Found visibility modifier: " << _current_token.text() << std::endl;
                     current_visibility = parse_visibility_modifier(); // Store the parsed visibility
+                    std::cout << "🔍 PARSER DEBUG: Set current_visibility to " << static_cast<int>(current_visibility) << std::endl;
                     consume(TokenKind::TK_COLON, "Expected ':' after visibility modifier");
                     continue;
                 }
@@ -3373,6 +3484,7 @@ namespace Cryo
                 if (is_method)
                 {
                     // It's a method
+                    std::cout << "🔍 PARSER DEBUG: Parsing method '" << _current_token.text() << "' with visibility " << static_cast<int>(current_visibility) << std::endl;
                     auto method = parse_struct_method(struct_name, current_visibility);
                     struct_decl->add_method(std::move(method));
                 }
@@ -3434,6 +3546,11 @@ namespace Cryo
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after class declaration");
 
+        // DEBUG: Log class parsing
+        if (class_name == "MemoryPool") {
+            std::cout << "\n🔥🔥🔥 PARSING MEMORYPOOL CLASS 🔥🔥🔥\n" << std::endl;
+        }
+
         // Parse class members
         Visibility current_visibility = Visibility::Private; // Default for classes
 
@@ -3444,7 +3561,13 @@ namespace Cryo
                 // Check for visibility modifiers
                 if (is_visibility_modifier())
                 {
+                    if (class_name == "MemoryPool") {
+                        std::cout << "🔍 CLASS PARSER: Found visibility modifier: " << _current_token.text() << std::endl;
+                    }
                     current_visibility = parse_visibility_modifier();
+                    if (class_name == "MemoryPool") {
+                        std::cout << "🔍 CLASS PARSER: Set current_visibility to " << static_cast<int>(current_visibility) << std::endl;
+                    }
                     consume(TokenKind::TK_COLON, "Expected ':' after visibility modifier");
                     continue;
                 }
@@ -3480,6 +3603,9 @@ namespace Cryo
                 if (is_method)
                 {
                     // It's a method
+                    if (class_name == "MemoryPool") {
+                        std::cout << "🔍 CLASS PARSER: Parsing method '" << _current_token.text() << "' with visibility " << static_cast<int>(current_visibility) << std::endl;
+                    }
                     auto method = parse_struct_method(class_name, current_visibility);
                     // Note: We reuse StructMethodNode for class methods
                     class_decl->add_method(std::move(method));
@@ -4692,7 +4818,37 @@ namespace Cryo
 
         if (collected_tokens.empty())
         {
-            error("Expected type annotation");
+            // Instead of throwing an error, handle the case gracefully
+            LOG_DEBUG(LogComponent::PARSER, "No type tokens collected, current token is: {} ({})", 
+                      static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
+            
+            // We must advance at least one token to prevent infinite loops
+            SourceLocation error_location = _current_token.location();
+            TokenKind error_token = _current_token.kind();
+            advance(); // Always advance to prevent infinite loops
+            
+            // Report appropriate error based on what we encountered
+            if (is_statement_start(error_token) || error_token == TokenKind::TK_EOF)
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Advanced past statement start or EOF that appeared in type context");
+                if (_diagnostic_manager)
+                {
+                    SourceRange range(error_location, error_location);
+                    auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0111_INVALID_SYNTAX, range, _source_file);
+                    diagnostic.add_note("Expected type annotation but found statement keyword - possible missing type or misplaced statement");
+                }
+            }
+            else
+            {
+                // For other unexpected tokens, report generic error
+                if (_diagnostic_manager)
+                {
+                    SourceRange range(error_location, error_location);
+                    auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0111_INVALID_SYNTAX, range, _source_file);
+                    diagnostic.add_note("Expected valid type annotation");
+                }
+            }
+            
             return _context.types().get_unknown_type();
         }
 

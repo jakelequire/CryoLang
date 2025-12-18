@@ -174,17 +174,20 @@ public:
     }
     
     allocate() -> void* {
-        if (this.allocated_count >= this.block_count) {
-            return null; // Pool exhausted
+        if (this.free_blocks == null || this.memory_region == null) {
+            return null; // Pool exhausted or not initialized
         }
         
         // Pop from free block stack
-        const block: void * = this.pop_free_block();
+        const block: void* = this.pop_free_block();
         if (block != null) {
             this.allocated_count = this.allocated_count + u64(1);
             if (this.allocated_count > this.peak_allocation) {
                 this.peak_allocation = this.allocated_count;
             }
+            
+            // Clear the allocated block for security and consistency
+            __memset__(block, 0, this.block_size);
         }
         return block;
     }
@@ -200,23 +203,79 @@ public:
         return true;
     }
     
-private:
+public:
     initialize_free_blocks() -> void {
         // Initialize the free block stack with all blocks
+        if (this.memory_region == null) {
+            this.free_blocks = null;
+            return;
+        }
+        
+        // Ensure minimum block size for pointer storage
+        if (this.block_size < sizeof(void*)) {
+            this.block_size = sizeof(void*);
+        }
+        
+        // Link all blocks together in a free list
+        mut current_block: void* = this.memory_region;
+        this.free_blocks = current_block;
+        
+        // Create linked list by storing next pointer in each block
+        mut i: u64 = u64(0);
+        while (i < (this.block_count - u64(1))) {
+            const next_block: void* = (current_block as u8*) + this.block_size;
+            *(current_block as void**) = next_block;
+            current_block = next_block;
+            i += u64(1);
+        }
+        
+        // Last block points to null
+        *(current_block as void**) = null;
     }
-    
+
+private:
     pop_free_block() -> void* {
-        // Stack pop implementation
-        return null;
+        if (this.free_blocks == null) {
+            return null;
+        }
+        
+        const block: void* = this.free_blocks;
+        // Update free_blocks to point to next free block
+        this.free_blocks = *(this.free_blocks as void**);
+        
+        return block;
     }
     
     push_free_block(ptr: void*) -> void {
-        // Stack push implementation
+        if (ptr == null) {
+            return;
+        }
+        
+        // Clear the block for security before returning to free list
+        __memset__(ptr, 0xDD, this.block_size); // Fill with debug pattern
+        
+        // Add block to front of free list
+        *(ptr as void**) = this.free_blocks;
+        this.free_blocks = ptr;
     }
     
     is_valid_block(ptr: void*) -> boolean {
-        // Check if pointer belongs to this pool
-        return false;
+        if (ptr == null || this.memory_region == null) {
+            return false;
+        }
+        
+        // Check if pointer is within our memory region
+        const start_addr: u8* = this.memory_region as u8*;
+        const end_addr: u8* = start_addr + (this.block_size * this.block_count);
+        const check_addr: u8* = ptr as u8*;
+        
+        if (check_addr < start_addr || check_addr >= end_addr) {
+            return false;
+        }
+        
+        // Check if pointer is properly aligned to block boundary
+        const offset: u64 = u64(check_addr - start_addr);
+        return (offset % this.block_size) == u64(0);
     }
 }
 
@@ -309,147 +368,36 @@ public:
         }
         return f64(this.current_memory_usage) / f64(this.heap_size);
     }
-    
+
 private:
     initialize_memory_pools() -> void {
-        // Initialize small pools array (we'll use malloc fallback for now)
-        // Future: Create pools for common allocation sizes: 16, 32, 64, 128, 256 bytes
-        this.small_pools = null; // Will use malloc fallback
-        printf("[Runtime::AdvancedHeapManager] Memory pools initialized (using malloc fallback)\n");
-    }
-    
-    allocate_small(size: u64) -> void* {
-        // Use malloc as fallback for small allocations
-        const aligned_size: u64 = (size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
-        const ptr: void* = __malloc__(aligned_size);
+        // Create memory pools for common allocation sizes
+        const pool_sizes: u64[5] = [u64(16), u64(32), u64(64), u64(128), u64(256)];
+        const blocks_per_pool: u64 = u64(1024); // 1024 blocks per pool
         
-        if (ptr != null) {
-            this.total_allocated += aligned_size;
-            this.current_memory_usage += aligned_size;
-            
-            // Update peak memory usage
-            if (this.current_memory_usage > this.peak_memory_usage) {
-                this.peak_memory_usage = this.current_memory_usage;
-            }
-            
-            // Update fragmentation calculation
-            this.calculate_fragmentation();
+        printf("[Runtime::AdvancedHeapManager] Initializing %d memory pools...\n", 5);
+        
+        // Allocate array of memory pools
+        this.small_pools = __malloc__(u64(5) * sizeof(MemoryPool)) as MemoryPool*;
+        
+        if (this.small_pools == null) {
+            printf("[Runtime::AdvancedHeapManager] ERROR: Failed to allocate memory pools array\n");
+            return;
         }
         
-        return ptr;
-    }
-    
-    allocate_medium(size: u64) -> void* {
-        // Use malloc as fallback for medium allocations
-        const aligned_size: u64 = (size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
-        const ptr: void* = __malloc__(aligned_size);
-        
-        if (ptr != null) {
-            this.total_allocated += aligned_size;
-            this.current_memory_usage += aligned_size;
-            
-            // Update peak memory usage
-            if (this.current_memory_usage > this.peak_memory_usage) {
-                this.peak_memory_usage = this.current_memory_usage;
-            }
-            
-            // Update fragmentation calculation
-            this.calculate_fragmentation();
+        // Initialize each memory pool
+        mut i: u64 = u64(0);
+        while (i < u64(5)) {
+            const pool_ptr: MemoryPool* = this.small_pools + i;
+            *pool_ptr = MemoryPool(pool_sizes[i], blocks_per_pool);
+            printf("[Runtime::AdvancedHeapManager] Initialized pool %llu: %llu bytes, %llu blocks\n", 
+                   i, pool_sizes[i], blocks_per_pool);
+            i += u64(1);
         }
         
-        return ptr;
+        printf("[Runtime::AdvancedHeapManager] Memory pools initialized successfully\n");
     }
-    
-    allocate_large(size: u64) -> void* {
-        // Use malloc as fallback for large allocations
-        const aligned_size: u64 = (size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
-        const ptr: void* = __malloc__(aligned_size);
-        
-        if (ptr != null) {
-            this.total_allocated += aligned_size;
-            this.current_memory_usage += aligned_size;
-            
-            // Update peak memory usage
-            if (this.current_memory_usage > this.peak_memory_usage) {
-                this.peak_memory_usage = this.current_memory_usage;
-            }
-            
-            // Update fragmentation calculation
-            this.calculate_fragmentation();
-        }
-        
-        return ptr;
-    }
-    
-    deallocate_small(ptr: void*) -> boolean {
-        if (ptr == null) {
-            return true;
-        }
-        
-        // Since we're using malloc, we can't easily determine the original size
-        // For now, we'll use a conservative approach and not track deallocation size precisely
-        __free__(ptr);
-        
-        // We can't accurately track deallocated size without additional metadata,
-        // but we should at least increment the deallocation counter
-        this.total_deallocated += u64(1); // Count of deallocations, not bytes
-        
-        return true;
-    }
-    
-    deallocate_medium(ptr: void*) -> boolean {
-        if (ptr == null) {
-            return true;
-        }
-        
-        // Since we're using malloc, we can't easily determine the original size
-        // For now, we'll use a conservative approach and not track deallocation size precisely
-        __free__(ptr);
-        
-        // We can't accurately track deallocated size without additional metadata,
-        // but we should at least increment the deallocation counter
-        this.total_deallocated += u64(1); // Count of deallocations, not bytes
-        
-        return true;
-    }
-    
-    deallocate_large(ptr: void*) -> boolean {
-        if (ptr == null) {
-            return true;
-        }
-        
-        // Since we're using malloc, we can't easily determine the original size
-        // For now, we'll use a conservative approach and not track deallocation size precisely
-        __free__(ptr);
-        
-        // We can't accurately track deallocated size without additional metadata,
-        // but we should at least increment the deallocation counter
-        this.total_deallocated += u64(1); // Count of deallocations, not bytes
-        
-        return true;
-    }
-    
-    is_small_pool_pointer(ptr: void*) -> boolean {
-        // With malloc fallback, we classify based on heuristics
-        // This is a limitation of the hybrid approach - we can't definitively classify pointers
-        // For now, assume all pointers could be from any allocator
-        return ptr != null;
-    }
-    
-    is_medium_allocator_pointer(ptr: void*) -> boolean {
-        // With malloc fallback, we classify based on heuristics
-        // This is a limitation of the hybrid approach - we can't definitively classify pointers
-        // For now, assume all pointers could be from any allocator
-        return ptr != null;
-    }
-    
-    is_large_allocator_pointer(ptr: void*) -> boolean {
-        // With malloc fallback, we classify based on heuristics
-        // This is a limitation of the hybrid approach - we can't definitively classify pointers
-        // For now, assume all pointers could be from any allocator
-        return ptr != null;
-    }
-    
+
     calculate_fragmentation() -> void {
         // Calculate memory fragmentation ratio
         // With malloc fallback, fragmentation is handled by the system allocator
@@ -464,6 +412,255 @@ private:
         } else {
             this.fragmentation_ratio = f64(0.0);
         }
+    }
+
+    malloc_fallback(size: u64) -> void* {
+        const aligned_size: u64 = (size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
+        const ptr: void* = __malloc__(aligned_size);
+        
+        if (ptr != null) {
+            this.total_allocated += aligned_size;
+            this.current_memory_usage += aligned_size;
+            
+            if (this.current_memory_usage > this.peak_memory_usage) {
+                this.peak_memory_usage = this.current_memory_usage;
+            }
+            
+            __memset__(ptr, 0, aligned_size);
+            this.calculate_fragmentation();
+        }
+        
+        return ptr;
+    }
+
+    find_pool_for_size(size: u64) -> u64 {
+        // Pool sizes: 16, 32, 64, 128, 256
+        if (size <= u64(16)) {
+            return u64(0);
+        } else if (size <= u64(32)) {
+            return u64(1);
+        } else if (size <= u64(64)) {
+            return u64(2);
+        } else if (size <= u64(128)) {
+            return u64(3);
+        } else if (size <= u64(256)) {
+            return u64(4);
+        } else {
+            return u64(5); // Too large for small pools
+        }
+    }
+
+    allocate_small(size: u64) -> void* {
+        if (this.small_pools == null) {
+            // Fallback to malloc if pools not initialized
+            return this.malloc_fallback(size);
+        }
+        
+        // Find the appropriate pool for this size
+        const pool_index: u64 = this.find_pool_for_size(size);
+        if (pool_index >= u64(5)) {
+            // Size too large for small pools, use medium allocator
+            return this.allocate_medium(size);
+        }
+        
+        const pool_ptr: MemoryPool* = this.small_pools + pool_index;
+        const ptr: void* = pool_ptr->allocate();
+        
+        if (ptr != null) {
+            // Get actual pool block size for accurate tracking
+            const pool_sizes: u64[5] = [u64(16), u64(32), u64(64), u64(128), u64(256)];
+            const actual_size: u64 = pool_sizes[pool_index];
+            
+            this.total_allocated += actual_size;
+            this.current_memory_usage += actual_size;
+            
+            // Update peak memory usage
+            if (this.current_memory_usage > this.peak_memory_usage) {
+                this.peak_memory_usage = this.current_memory_usage;
+            }
+            
+            // Update fragmentation calculation
+            this.calculate_fragmentation();
+        } else {
+            // Pool exhausted, fallback to malloc
+            printf("[Runtime::AdvancedHeapManager] Pool %llu exhausted, using malloc fallback\n", pool_index);
+            return this.malloc_fallback(size);
+        }
+        
+        return ptr;
+    }
+    
+    allocate_medium(size: u64) -> void* {
+        // For medium allocations (256 bytes to 64KB), use best-fit strategy
+        // TODO: Implement proper best-fit allocator with free list coalescing
+        // For now, use aligned malloc with proper tracking
+        
+        const aligned_size: u64 = (size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
+        const ptr: void* = __malloc__(aligned_size);
+        
+        if (ptr != null) {
+            this.total_allocated += aligned_size;
+            this.current_memory_usage += aligned_size;
+            
+            // Update peak memory usage
+            if (this.current_memory_usage > this.peak_memory_usage) {
+                this.peak_memory_usage = this.current_memory_usage;
+            }
+            
+            // Clear allocated memory for security
+            __memset__(ptr, 0, aligned_size);
+            
+            // Update fragmentation calculation
+            this.calculate_fragmentation();
+        }
+        
+        return ptr;
+    }
+    
+    allocate_large(size: u64) -> void* {
+        // For large allocations (>64KB), use direct system allocation
+        // Large objects are allocated directly from the OS for efficiency
+        
+        const aligned_size: u64 = (size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
+        
+        printf("[Runtime::AdvancedHeapManager] Large allocation: %llu bytes\n", aligned_size);
+        
+        const ptr: void* = __malloc__(aligned_size);
+        
+        if (ptr != null) {
+            this.total_allocated += aligned_size;
+            this.current_memory_usage += aligned_size;
+            
+            // Update peak memory usage
+            if (this.current_memory_usage > this.peak_memory_usage) {
+                this.peak_memory_usage = this.current_memory_usage;
+            }
+            
+            // Clear allocated memory for security
+            __memset__(ptr, 0, aligned_size);
+            
+            // Update fragmentation calculation
+            this.calculate_fragmentation();
+        }
+        
+        return ptr;
+    }
+    
+    deallocate_small(ptr: void*) -> boolean {
+        if (ptr == null) {
+            return true;
+        }
+        
+        if (this.small_pools == null) {
+            // Fallback to free if pools not initialized
+            __free__(ptr);
+            this.total_deallocated += u64(1);
+            return true;
+        }
+        
+        // Try to find which pool owns this pointer
+        mut i: u64 = u64(0);
+        while (i < u64(5)) {
+            const pool_ptr: MemoryPool* = this.small_pools + i;
+            if (pool_ptr->is_valid_block(ptr)) {
+                const success: boolean = pool_ptr->deallocate(ptr);
+                if (success) {
+                    // Update tracking with actual pool block size
+                    const pool_sizes: u64[5] = [u64(16), u64(32), u64(64), u64(128), u64(256)];
+                    const actual_size: u64 = pool_sizes[i];
+                    
+                    this.total_deallocated += actual_size;
+                    if (this.current_memory_usage >= actual_size) {
+                        this.current_memory_usage -= actual_size;
+                    }
+                    
+                    this.calculate_fragmentation();
+                }
+                return success;
+            }
+            i += u64(1);
+        }
+        
+        // Not found in any pool, might be from malloc fallback
+        __free__(ptr);
+        this.total_deallocated += u64(1);
+        return true;
+    }
+    
+    deallocate_medium(ptr: void*) -> boolean {
+        if (ptr == null) {
+            return true;
+        }
+        
+        // For medium allocations, we use malloc fallback currently
+        // TODO: Implement proper best-fit allocator with size tracking
+        __free__(ptr);
+        
+        // We can't track exact size without metadata, but update counters
+        this.total_deallocated += u64(1); // Count, not bytes
+        
+        this.calculate_fragmentation();
+        return true;
+    }
+    
+    deallocate_large(ptr: void*) -> boolean {
+        if (ptr == null) {
+            return true;
+        }
+        
+        printf("[Runtime::AdvancedHeapManager] Large deallocation\n");
+        
+        // For large allocations, free directly
+        __free__(ptr);
+        
+        // Update counters (size tracking would require metadata)
+        this.total_deallocated += u64(1); // Count, not bytes
+        
+        this.calculate_fragmentation();
+        return true;
+    }
+    
+    is_small_pool_pointer(ptr: void*) -> boolean {
+        if (ptr == null || this.small_pools == null) {
+            return false;
+        }
+        
+        // Check if pointer belongs to any of our small pools
+        mut i: u64 = u64(0);
+        while (i < u64(5)) {
+            const pool_ptr: MemoryPool* = this.small_pools + i;
+            if (pool_ptr->is_valid_block(ptr)) {
+                return true;
+            }
+            i += u64(1);
+        }
+        
+        return false;
+    }
+    
+    is_medium_allocator_pointer(ptr: void*) -> boolean {
+        if (ptr == null) {
+            return false;
+        }
+        
+        // If not in small pools and not large, assume medium
+        // This is a heuristic since we don't have perfect tracking yet
+        return !this.is_small_pool_pointer(ptr) && !this.is_large_allocator_pointer(ptr);
+    }
+    
+    is_large_allocator_pointer(ptr: void*) -> boolean {
+        if (ptr == null) {
+            return false;
+        }
+        
+        // TODO: Implement proper large allocation tracking
+        // For now, use heuristic based on alignment and address ranges
+        // Large allocations are typically at specific alignment boundaries
+        const addr: u64 = ptr as u64;
+        const page_size: u64 = u64(4096);
+        
+        // Large allocations are often page-aligned
+        return (addr % page_size) == u64(0);
     }
 }
 

@@ -125,6 +125,11 @@ namespace Cryo
         return std::make_unique<SizeofExpressionNode>(loc, std::move(type_name));
     }
 
+    std::unique_ptr<CastExpressionNode> ASTBuilder::create_cast_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::string target_type)
+    {
+        return std::make_unique<CastExpressionNode>(loc, std::move(expression), std::move(target_type));
+    }
+
     std::unique_ptr<StructLiteralNode> ASTBuilder::create_struct_literal(SourceLocation loc, std::string struct_type)
     {
         return std::make_unique<StructLiteralNode>(loc, std::move(struct_type));
