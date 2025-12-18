@@ -267,7 +267,7 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processing global variable declarations (_globals has {} entries before pass)", _globals.size());
         process_global_variables_recursively(&node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0 complete: _globals now has {} entries", _globals.size());
-        
+
         // Pass 1: Process all imports (needed for cross-module type resolution)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing import declarations");
         for (size_t i = 0; i < node.statements().size(); ++i)
@@ -304,8 +304,8 @@ namespace Cryo::Codegen
 
         // Pass 3: Process all struct and class declarations
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 3: Processing struct and class declarations");
-        _defer_function_bodies = true;  // Defer function body generation until globals are ready
-        _defer_function_bodies = true;  // Defer function body generation until globals are ready
+        _defer_function_bodies = true; // Defer function body generation until globals are ready
+        _defer_function_bodies = true; // Defer function body generation until globals are ready
         for (size_t i = 0; i < node.statements().size(); ++i)
         {
             auto &stmt = node.statements()[i];
@@ -331,7 +331,7 @@ namespace Cryo::Codegen
         // Process deferred function bodies now that all globals are available
         _defer_function_bodies = false;
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing {} deferred function bodies", _deferred_function_bodies.size());
-        for (auto& [func_node, func_llvm] : _deferred_function_bodies)
+        for (auto &[func_node, func_llvm] : _deferred_function_bodies)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating deferred function body for: {}", func_node->name());
             bool body_success = generate_function_body(func_node, func_llvm);
@@ -346,8 +346,6 @@ namespace Cryo::Codegen
         }
         _deferred_function_bodies.clear();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Finished processing deferred function bodies");
-
-
 
         // Pass 4: Process all other statements
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4: Processing other statements (_globals has {} entries before pass)", _globals.size());
@@ -389,7 +387,7 @@ namespace Cryo::Codegen
         // Check if this is a global variable declaration
         if (node->kind() == NodeKind::VariableDeclaration)
         {
-            auto var_decl = static_cast<VariableDeclarationNode*>(node);
+            auto var_decl = static_cast<VariableDeclarationNode *>(node);
             // Only process global variables (not local ones inside functions)
             if (var_decl->is_global() || !_current_function)
             {
@@ -400,21 +398,21 @@ namespace Cryo::Codegen
         }
 
         // Recursively process child nodes based on node type
-        if (auto program = dynamic_cast<ProgramNode*>(node))
+        if (auto program = dynamic_cast<ProgramNode *>(node))
         {
-            for (const auto& stmt : program->statements())
+            for (const auto &stmt : program->statements())
             {
                 process_global_variables_recursively(stmt.get());
             }
         }
-        else if (auto block = dynamic_cast<BlockStatementNode*>(node))
+        else if (auto block = dynamic_cast<BlockStatementNode *>(node))
         {
-            for (const auto& stmt : block->statements())
+            for (const auto &stmt : block->statements())
             {
                 process_global_variables_recursively(stmt.get());
             }
         }
-        else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode*>(node))
+        else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
         {
             if (decl_stmt->declaration())
             {
@@ -2133,7 +2131,7 @@ namespace Cryo::Codegen
                     exit_scope();
                     _current_function.reset();
                 }
-                
+
                 // Handle default destructor generation for classes
                 if (method->is_destructor() && method->is_default_destructor())
                 {
@@ -6507,8 +6505,6 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pre-registration complete. Total functions registered: {}", _functions.size());
     }
-
-
 
     void CodegenVisitor::import_specialized_methods(const Cryo::TypeChecker &type_checker)
     {
@@ -12987,6 +12983,9 @@ namespace Cryo::Codegen
                 }
             }
         }
+
+        // Debug: Print function lookup details
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking up function: '{}' (resolved from: '{}')", resolved_function_name, function_name);
 
         // First, check if this is a function we know about in our symbol table
         auto func_it = _functions.find(resolved_function_name);

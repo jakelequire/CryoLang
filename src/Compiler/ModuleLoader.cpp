@@ -28,6 +28,11 @@ namespace Cryo
         _global_executable_path = executable_path;
     }
 
+    void ModuleLoader::set_auto_import_callback(std::function<void(SymbolTable *, const std::string &, const std::string &)> callback)
+    {
+        _auto_import_callback = callback;
+    }
+
     void ModuleLoader::set_stdlib_root(const std::string &stdlib_root)
     {
         _stdlib_root = stdlib_root;
@@ -56,7 +61,7 @@ namespace Cryo
             try
             {
                 // Get the directory containing the executable using OS utility
-                auto& os = Cryo::Utils::OS::instance();
+                auto &os = Cryo::Utils::OS::instance();
                 std::string exe_dir = std::filesystem::path(os.absolute_path(executable_path)).parent_path().string();
 
                 // Common relative locations from binary directory:
@@ -78,7 +83,7 @@ namespace Cryo
         // Get current working directory for relative fallbacks
         try
         {
-            auto& os = Cryo::Utils::OS::instance();
+            auto &os = Cryo::Utils::OS::instance();
             std::string cwd = os.get_working_directory();
 
             // Common development and project patterns:
@@ -100,8 +105,8 @@ namespace Cryo
 
         // Windows system paths (if we're on Windows)
         // Platform-specific search paths
-        auto& os = Cryo::Utils::OS::instance();
-        if (os.is_windows()) 
+        auto &os = Cryo::Utils::OS::instance();
+        if (os.is_windows())
         {
             search_paths.push_back("C:/Program Files/Cryo/stdlib");
             search_paths.push_back("C:/Program Files (x86)/Cryo/stdlib");
@@ -256,8 +261,8 @@ namespace Cryo
 
     std::string ModuleLoader::resolve_import_path(const std::string &import_path, ImportDeclarationNode::ImportType import_type)
     {
-        auto& os = Cryo::Utils::OS::instance();
-        
+        auto &os = Cryo::Utils::OS::instance();
+
         if (import_type == ImportDeclarationNode::ImportType::Relative)
         {
             // Relative import: resolve relative to current file's directory
@@ -329,6 +334,15 @@ namespace Cryo
             }
 
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Successfully parsed {}", import_path);
+
+            // Check if this is a runtime module that needs auto-imports
+            if (_auto_import_callback &&
+                (import_path.find("runtime/runtime") != std::string::npos ||
+                 import_path.find("runtime\\runtime") != std::string::npos))
+            {
+                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Triggering auto-imports for runtime dependency: {}", import_path);
+                _auto_import_callback(&_symbol_table, "Global", import_path);
+            }
 
             // Extract module name from parser's namespace information
             result.module_name = parser.current_namespace();
@@ -745,30 +759,30 @@ namespace Cryo
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
                 {
                     LOG_TRACE(LogComponent::GENERAL, "  Marked struct '{}' as from module '{}'", struct_decl->name(), module_name);
-                    
+
                     // Also mark all methods (including constructors) within the struct
                     for (const auto &method : struct_decl->methods())
                     {
                         if (method)
                         {
                             method->set_source_module(module_name);
-                            LOG_TRACE(LogComponent::GENERAL, "    Marked struct method '{}::{}' as from module '{}'", 
-                                     struct_decl->name(), method->name(), module_name);
+                            LOG_TRACE(LogComponent::GENERAL, "    Marked struct method '{}::{}' as from module '{}'",
+                                      struct_decl->name(), method->name(), module_name);
                         }
                     }
                 }
                 else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
                 {
                     LOG_TRACE(LogComponent::GENERAL, "  Marked class '{}' as from module '{}'", class_decl->name(), module_name);
-                    
+
                     // Also mark all methods (including constructors) within the class
                     for (const auto &method : class_decl->methods())
                     {
                         if (method)
                         {
                             method->set_source_module(module_name);
-                            LOG_TRACE(LogComponent::GENERAL, "    Marked class method '{}::{}' as from module '{}'", 
-                                     class_decl->name(), method->name(), module_name);
+                            LOG_TRACE(LogComponent::GENERAL, "    Marked class method '{}::{}' as from module '{}'",
+                                      class_decl->name(), method->name(), module_name);
                         }
                     }
                 }
