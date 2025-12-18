@@ -141,9 +141,10 @@ namespace Cryo::Codegen
     bool CodegenVisitor::is_runtime_function(const std::string &function_name) const
     {
         static const std::unordered_set<std::string> runtime_functions = {
-            "cryo_malloc", "cryo_free", "cryo_realloc", "cryo_memcpy", "cryo_memset",
+            "cryo_alloc", "cryo_malloc", "cryo_free", "cryo_realloc", "cryo_memcpy", "cryo_memset",
             "cryo_calloc", "cryo_strdup", "cryo_strlen", "cryo_strcmp", "cryo_strcpy",
-            "cryo_strcat", "cryo_memcmp", "cryo_memmove"};
+            "cryo_strcat", "cryo_memcmp", "cryo_memmove", "cryo_runtime_allocate", "cryo_runtime_deallocate",
+            "cryo_profile_start", "cryo_profile_end", "cryo_throw_exception", "cryo_runtime_initialize"};
         return runtime_functions.count(function_name) > 0;
     }
 
@@ -18038,10 +18039,21 @@ namespace Cryo::Codegen
             // Use SRM to properly parse the qualified type name
             auto [type_namespaces, base_type_name] = Cryo::SRM::Utils::parse_qualified_name(type_name);
 
-            // For instance methods, always use consistent simple naming format: ClassName::methodName
-            // This avoids LLVM name disambiguation suffixes (.1, .2, etc.) by ensuring consistent naming
-            std::vector<std::string> class_parts = {base_type_name};
-            return Cryo::SRM::Utils::build_qualified_name(class_parts, method_name);
+            // Check if the type is qualified (has namespace parts)
+            if (!type_namespaces.empty())
+            {
+                // Preserve full namespace qualification for proper method resolution
+                std::vector<std::string> full_method_parts = type_namespaces;
+                full_method_parts.push_back(base_type_name);
+                return Cryo::SRM::Utils::build_qualified_name(full_method_parts, method_name);
+            }
+            else
+            {
+                // For instance methods in current namespace, always include current namespace
+                auto namespace_parts = get_current_namespace_parts();
+                namespace_parts.push_back(base_type_name);
+                return Cryo::SRM::Utils::build_qualified_name(namespace_parts, method_name);
+            }
         }
         catch (const std::exception &e)
         {
@@ -18142,8 +18154,10 @@ namespace Cryo::Codegen
         if (symbol_kind == Cryo::SymbolKind::Function)
         {
             static const std::set<std::string> runtime_functions = {
-                "cryo_memcpy", "cryo_alloc", "cryo_free", "cryo_realloc",
-                "cryo_malloc", "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat"};
+                "cryo_alloc", "cryo_memcpy", "cryo_free", "cryo_realloc", "cryo_malloc", 
+                "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat", "cryo_runtime_allocate",
+                "cryo_runtime_deallocate", "cryo_profile_start", "cryo_profile_end", 
+                "cryo_throw_exception", "cryo_runtime_initialize"};
 
             if (runtime_functions.find(base_name) != runtime_functions.end())
             {
