@@ -233,7 +233,7 @@ RUNTIME_BC_FILES := $(patsubst %.cryo,$(RUNTIME_BUILD_DIR)/%.bc,$(RUNTIME_SRCS))
 all: 
 	@$(MAKE) timed-build
 	@$(MAKE) stdlib
-	@$(MAKE) tools
+#	@$(MAKE) tools
 
 run: $(MAIN_BIN)
 	@$(MAIN_BIN)

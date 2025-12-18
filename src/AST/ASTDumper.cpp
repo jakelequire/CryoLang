@@ -366,6 +366,21 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(UnsafeBlockStatementNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "UnsafeBlockStmt";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << std::endl;
+
+        if (node.block())
+        {
+            dump_child(node.block(), true);
+        }
+    }
+
     void ASTDumper::visit(ReturnStatementNode &node)
     {
         print_prefix();

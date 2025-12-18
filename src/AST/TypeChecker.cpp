@@ -2308,6 +2308,22 @@ namespace Cryo
         exit_scope();
     }
 
+    void TypeChecker::visit(UnsafeBlockStatementNode &node)
+    {
+        // Enter unsafe context
+        bool previous_unsafe_context = _in_unsafe_context;
+        _in_unsafe_context = true;
+
+        // Type-check the inner block
+        if (node.block())
+        {
+            node.block()->accept(*this);
+        }
+
+        // Restore previous unsafe context
+        _in_unsafe_context = previous_unsafe_context;
+    }
+
     void TypeChecker::visit(ReturnStatementNode &node)
     {
         if (!_in_function)
