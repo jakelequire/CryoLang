@@ -4531,6 +4531,83 @@ namespace Cryo::Codegen
         set_current_value(size_value);
     }
 
+    void CodegenVisitor::visit(Cryo::CastExpressionNode &node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating cast expression");
+
+        auto &context = _context_manager.get_context();
+        auto module = _context_manager.get_module();
+        auto &builder = _context_manager.get_builder();
+
+        if (!module)
+        {
+            _diagnostic_builder->report_error(ErrorCode::E0620_MODULE_CONTEXT_ERROR, &node, 
+                                              "No module available for cast expression");
+            return;
+        }
+
+        // Generate code for the source expression
+        if (!node.expression())
+        {
+            _diagnostic_builder->report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, &node,
+                                              "Cast expression has no source expression");
+            return;
+        }
+
+        node.expression()->accept(*this);
+        llvm::Value *source_value = get_current_value();
+        
+        if (!source_value)
+        {
+            _diagnostic_builder->report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, &node,
+                                              "Failed to generate source value for cast");
+            return;
+        }
+
+        // Get source and target types
+        std::string source_type = "unknown";
+        if (node.expression() && node.expression()->has_resolved_type())
+        {
+            Cryo::Type *resolved_type = node.expression()->get_resolved_type();
+            if (resolved_type)
+            {
+                source_type = resolved_type->to_string();
+            }
+        }
+        std::string target_type = node.target_type_name();
+
+        llvm::Type *source_llvm_type = source_value->getType();
+        llvm::Type *target_llvm_type = _type_mapper->lookup_type(target_type);
+
+        if (!target_llvm_type)
+        {
+            // Fallback to primitive type mapping
+            target_llvm_type = get_primitive_type(target_type);
+        }
+
+        if (!target_llvm_type)
+        {
+            _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                              "Unknown target type in cast: " + target_type);
+            return;
+        }
+
+        llvm::Value *cast_value = generate_cast_instruction(source_value, source_llvm_type, 
+                                                           target_llvm_type, source_type, 
+                                                           target_type, builder);
+
+        if (!cast_value)
+        {
+            _diagnostic_builder->report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, &node,
+                                              "Failed to generate cast from '" + source_type + 
+                                              "' to '" + target_type + "'");
+            return;
+        }
+
+        register_value(&node, cast_value);
+        set_current_value(cast_value);
+    }
+
     void CodegenVisitor::visit(Cryo::StructLiteralNode &node)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating struct literal");
@@ -18356,6 +18433,159 @@ namespace Cryo::Codegen
         // Fallback to regular store if not an Array<T> type
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using fallback direct assignment (not an Array type)");
         create_store(array_ptr, alloca);
+    }
+
+    llvm::Type *CodegenVisitor::get_primitive_type(const std::string &type_name)
+    {
+        auto &context = _context_manager.get_context();
+
+        if (type_name == "u8" || type_name == "i8" || type_name == "char")
+        {
+            return llvm::Type::getInt8Ty(context);
+        }
+        else if (type_name == "u16" || type_name == "i16")
+        {
+            return llvm::Type::getInt16Ty(context);
+        }
+        else if (type_name == "u32" || type_name == "i32" || type_name == "int")
+        {
+            return llvm::Type::getInt32Ty(context);
+        }
+        else if (type_name == "u64" || type_name == "i64")
+        {
+            return llvm::Type::getInt64Ty(context);
+        }
+        else if (type_name == "f32")
+        {
+            return llvm::Type::getFloatTy(context);
+        }
+        else if (type_name == "f64" || type_name == "float")
+        {
+            return llvm::Type::getDoubleTy(context);
+        }
+        else if (type_name == "boolean")
+        {
+            return llvm::Type::getInt1Ty(context);
+        }
+        else if (type_name == "string")
+        {
+            return llvm::PointerType::get(context, 0);
+        }
+
+        return nullptr;
+    }
+
+    llvm::Value *CodegenVisitor::generate_cast_instruction(
+        llvm::Value *source_value, 
+        llvm::Type *source_type, 
+        llvm::Type *target_type, 
+        const std::string &source_type_name, 
+        const std::string &target_type_name,
+        llvm::IRBuilder<> &builder)
+    {
+        if (!source_value || !source_type || !target_type)
+        {
+            return nullptr;
+        }
+
+        // If types are already the same, no cast needed
+        if (source_type == target_type)
+        {
+            return source_value;
+        }
+
+        auto &context = _context_manager.get_context();
+
+        // Integer to integer casts
+        if (source_type->isIntegerTy() && target_type->isIntegerTy())
+        {
+            unsigned source_width = source_type->getIntegerBitWidth();
+            unsigned target_width = target_type->getIntegerBitWidth();
+
+            if (source_width < target_width)
+            {
+                // Sign extension for signed types, zero extension for unsigned
+                bool is_signed = (source_type_name[0] == 'i'); // i8, i16, i32, i64
+                if (is_signed)
+                {
+                    return builder.CreateSExt(source_value, target_type, "sext");
+                }
+                else
+                {
+                    return builder.CreateZExt(source_value, target_type, "zext");
+                }
+            }
+            else if (source_width > target_width)
+            {
+                return builder.CreateTrunc(source_value, target_type, "trunc");
+            }
+            else
+            {
+                // Same width, just bitcast
+                return builder.CreateBitCast(source_value, target_type, "bitcast");
+            }
+        }
+
+        // Float to float casts
+        if (source_type->isFloatingPointTy() && target_type->isFloatingPointTy())
+        {
+            if (source_type->isFloatTy() && target_type->isDoubleTy())
+            {
+                return builder.CreateFPExt(source_value, target_type, "fpext");
+            }
+            else if (source_type->isDoubleTy() && target_type->isFloatTy())
+            {
+                return builder.CreateFPTrunc(source_value, target_type, "fptrunc");
+            }
+        }
+
+        // Integer to float casts
+        if (source_type->isIntegerTy() && target_type->isFloatingPointTy())
+        {
+            bool is_signed = (source_type_name[0] == 'i');
+            if (is_signed)
+            {
+                return builder.CreateSIToFP(source_value, target_type, "sitofp");
+            }
+            else
+            {
+                return builder.CreateUIToFP(source_value, target_type, "uitofp");
+            }
+        }
+
+        // Float to integer casts
+        if (source_type->isFloatingPointTy() && target_type->isIntegerTy())
+        {
+            bool is_signed = (target_type_name[0] == 'i');
+            if (is_signed)
+            {
+                return builder.CreateFPToSI(source_value, target_type, "fptosi");
+            }
+            else
+            {
+                return builder.CreateFPToUI(source_value, target_type, "fptoui");
+            }
+        }
+
+        // Boolean conversions
+        if (source_type->isIntegerTy(1) && target_type->isIntegerTy()) // bool to int
+        {
+            return builder.CreateZExt(source_value, target_type, "bool_to_int");
+        }
+        if (source_type->isIntegerTy() && target_type->isIntegerTy(1)) // int to bool
+        {
+            llvm::Value *zero = llvm::ConstantInt::get(source_type, 0);
+            return builder.CreateICmpNE(source_value, zero, "int_to_bool");
+        }
+
+        // Pointer casts
+        if (source_type->isPointerTy() && target_type->isPointerTy())
+        {
+            return builder.CreateBitCast(source_value, target_type, "ptr_cast");
+        }
+
+        // Default: try bitcast
+        return builder.CreateBitCast(source_value, target_type, "cast");
     }
 
 } // namespace Cryo::Codegen

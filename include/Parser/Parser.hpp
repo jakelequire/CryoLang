@@ -183,6 +183,7 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> parse_bitwise_or();
         std::unique_ptr<ExpressionNode> parse_bitwise_xor();
         std::unique_ptr<ExpressionNode> parse_bitwise_and();
+        std::unique_ptr<ExpressionNode> parse_cast();
         std::unique_ptr<ExpressionNode> parse_relational();
         std::unique_ptr<ExpressionNode> parse_shift();
         std::unique_ptr<ExpressionNode> parse_additive();
@@ -256,6 +257,9 @@ namespace Cryo
 
         // Enhanced type parsing using tokens
         Type *parse_type_annotation_with_tokens();
+
+        // Type parsing helpers for cast expressions
+        std::string parse_generic_type_suffix();
 
         // Enhanced diagnostic helper methods
         bool is_delimiter_token(TokenKind kind) const;

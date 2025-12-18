@@ -123,6 +123,12 @@ namespace Cryo
             BaseASTVisitor::visit(node);
         }
 
+        void visit(CastExpressionNode &node) override
+        {
+            process_node_directives(&node);
+            BaseASTVisitor::visit(node);
+        }
+
         void visit(BinaryExpressionNode &node) override
         {
             process_node_directives(&node);

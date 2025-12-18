@@ -650,6 +650,21 @@ namespace Cryo
         _output << " '" << node.type_name() << "'" << std::endl;
     }
 
+    void ASTDumper::visit(CastExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "CastExpr";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " target='" << node.target_type_name() << "'" << std::endl;
+        
+        // Dump the expression being cast
+        if (node.expression()) {
+            dump_child(node.expression(), true);
+        }
+    }
+
     void ASTDumper::visit(StructLiteralNode &node)
     {
         print_prefix();

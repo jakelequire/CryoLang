@@ -2141,6 +2141,9 @@ namespace Cryo
         _in_function = true;
         _current_function_return_type = return_type;
 
+        // PRESERVE _current_struct_type during method body processing
+        Type *preserved_struct_type = _current_struct_type;
+
         // Process trait bounds for generic parameters
         _current_generic_trait_bounds.clear();
         for (const auto &trait_bound : node.trait_bounds())
@@ -2163,10 +2166,11 @@ namespace Cryo
             node.body()->accept(*this);
         }
 
-        // Exit function scope
+        // Exit function scope and RESTORE _current_struct_type
         _current_function_return_type = nullptr;
         _in_function = false;
         _current_generic_trait_bounds.clear();
+        _current_struct_type = preserved_struct_type;  // RESTORE the struct context
         exit_scope();
 
         // Exit generic context if it was a generic function
@@ -2592,6 +2596,7 @@ namespace Cryo
             }
             else
             {
+                LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: 'this' resolved but _current_struct_type is NULL - this should not happen in method context");
                 _diagnostic_builder->create_undefined_symbol_error(name, NodeKind::VariableDeclaration, node.location());
                 node.set_resolved_type(_type_context.get_unknown_type());
             }
@@ -3071,20 +3076,31 @@ namespace Cryo
                 else if (op == TokenKind::TK_STAR) // Dereference operator (*)
                 {
                     // Operand should be a pointer or reference type
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Dereference operator: operand type='{}', kind={}", 
+                              operand_type->to_string(), TypeKindToString(operand_type->kind()));
+                    
                     if (operand_type->kind() == TypeKind::Pointer)
                     {
                         // Get the pointee type
                         auto *ptr_type = static_cast<PointerType *>(operand_type);
-                        node.set_resolved_type(ptr_type->pointee_type().get());
+                        Type *pointee = ptr_type->pointee_type().get();
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Dereferencing pointer '{}' -> pointee '{}'", 
+                                  operand_type->to_string(), pointee ? pointee->to_string() : "null");
+                        node.set_resolved_type(pointee);
                     }
                     else if (operand_type->kind() == TypeKind::Reference)
                     {
                         // Get the referent type
                         auto *ref_type = static_cast<ReferenceType *>(operand_type);
-                        node.set_resolved_type(ref_type->referent_type().get());
+                        Type *referent = ref_type->referent_type().get();
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Dereferencing reference '{}' -> referent '{}'", 
+                                  operand_type->to_string(), referent ? referent->to_string() : "null");
+                        node.set_resolved_type(referent);
                     }
                     else
                     {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: Cannot dereference non-pointer type '{}' (kind={})", 
+                                  operand_type->to_string(), TypeKindToString(operand_type->kind()));
                         _diagnostic_builder->create_invalid_operation_error("dereference", operand_type, nullptr, node.location());
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
@@ -3690,6 +3706,67 @@ namespace Cryo
         }
     }
 
+    void TypeChecker::visit(CastExpressionNode &node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Visiting CastExpressionNode");
+
+        // Visit the expression being cast first
+        if (node.expression())
+        {
+            node.expression()->accept(*this);
+        }
+
+        std::string target_type_name = node.target_type_name();
+        
+        // Validate the target type exists
+        if (!is_valid_type(target_type_name))
+        {
+            _diagnostic_builder->create_type_error(ErrorCode::E0208_INVALID_CAST, 
+                                                  node.location(),
+                                                  "Unknown target type '" + target_type_name + "' in cast expression");
+            node.set_resolved_type(_type_context.get_unknown_type());
+            return;
+        }
+
+        // Get the source type from the expression
+        std::string source_type = "unknown";
+        if (node.expression() && node.expression()->has_resolved_type())
+        {
+            Cryo::Type *resolved_type = node.expression()->get_resolved_type();
+            if (resolved_type)
+            {
+                source_type = resolved_type->to_string();
+            }
+        }
+
+        // Check if the cast is valid
+        if (!is_cast_valid(source_type, target_type_name))
+        {
+            std::string error_msg = "Invalid cast from '" + source_type + "' to '" + target_type_name + "'";
+            _diagnostic_builder->create_type_error(ErrorCode::E0208_INVALID_CAST, 
+                                                  node.location(), 
+                                                  error_msg);
+        }
+        else if (!requires_explicit_cast(source_type, target_type_name))
+        {
+            // Warn about unnecessary explicit casts - for now just continue, warnings can be added later
+        }
+
+        // Set the result type to the target type
+        Type *resolved_target_type = resolve_type_with_generic_context(target_type_name);
+        if (resolved_target_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Cast expression: '{}' as '{}' -> resolved to '{}'",
+                      source_type, target_type_name, resolved_target_type->to_string());
+            node.set_resolved_type(resolved_target_type);
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: Cast expression failed - could not resolve target type '{}'", target_type_name);
+            node.set_resolved_type(_type_context.get_unknown_type());
+        }
+    }
+
     void TypeChecker::visit(ArrayLiteralNode &node)
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "Visiting ArrayLiteralNode with {} elements", node.size());
@@ -3941,12 +4018,15 @@ namespace Cryo
 
     void TypeChecker::visit(MemberAccessNode &node)
     {
-        LOG_DEBUG(Cryo::LogComponent::AST, "Visiting MemberAccessNode: member='{}'", node.member());
+        LOG_DEBUG(Cryo::LogComponent::AST, "Visiting MemberAccessNode: member='{}', _current_struct_type='{}'", 
+                  node.member(), _current_struct_type ? _current_struct_type->to_string() : "NULL");
 
         // Visit the object expression first
         if (node.object())
         {
             node.object()->accept(*this);
+            LOG_DEBUG(Cryo::LogComponent::AST, "After visiting object, _current_struct_type='{}'", 
+                      _current_struct_type ? _current_struct_type->to_string() : "NULL");
         }
 
         // Get the Type* of the object being accessed
@@ -4751,11 +4831,25 @@ namespace Cryo
         }
 
         // Check for private methods - allow access from within the same class
-        LOG_DEBUG(Cryo::LogComponent::AST, "Checking for private methods: lookup_type_name='{}', member_name='{}', current_struct='{}'", lookup_type_name, member_name, _current_struct_name);
+        LOG_DEBUG(Cryo::LogComponent::AST, "PRIVATE METHOD LOOKUP: lookup_type_name='{}', member_name='{}', _current_struct_name='{}', _current_struct_type='{}'", 
+                  lookup_type_name, member_name, _current_struct_name, _current_struct_type ? _current_struct_type->to_string() : "NULL");
         auto private_method_struct_it = _private_struct_methods.find(lookup_type_name);
         if (private_method_struct_it != _private_struct_methods.end())
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found private methods for type '{}'", lookup_type_name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found private methods for type '{}', has {} private methods", lookup_type_name, private_method_struct_it->second.size());
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "NO private methods registered for type '{}'", lookup_type_name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Available private method types: {}", _private_struct_methods.size());
+            for (const auto &[type, methods] : _private_struct_methods) 
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "  - '{}' has {} private methods", type, methods.size());
+            }
+        }
+        
+        if (private_method_struct_it != _private_struct_methods.end())
+        {
             auto private_method_it = private_method_struct_it->second.find(member_name);
             if (private_method_it != private_method_struct_it->second.end())
             {
@@ -5380,6 +5474,8 @@ namespace Cryo
         // Save previous struct type and set current for 'this' keyword in methods
         Type *previous_struct_type = _current_struct_type;
         _current_struct_type = struct_type;
+        LOG_DEBUG(Cryo::LogComponent::AST, "StructDeclarationNode: Set _current_struct_type to '{}' (kind: {})", 
+                  struct_type ? struct_type->name() : "null", struct_type ? TypeKindToString(struct_type->kind()) : "null");
 
         // Save previous struct name and set current for field tracking
         std::string previous_struct_name = _current_struct_name;
@@ -5507,6 +5603,8 @@ namespace Cryo
         // Save previous class type and set current for 'this' keyword in methods
         Type *previous_struct_type = _current_struct_type;
         _current_struct_type = class_type;
+        LOG_DEBUG(Cryo::LogComponent::AST, "ClassDeclarationNode: Set _current_struct_type to '{}' (kind: {})", 
+                  class_type ? class_type->name() : "null", class_type ? TypeKindToString(class_type->kind()) : "null");
 
         // Save previous class name and set current for field/method tracking
         std::string previous_struct_name = _current_struct_name;
@@ -7542,8 +7640,28 @@ namespace Cryo
         std::string method_name = node.name();
         bool is_constructor = node.is_constructor();
 
-        LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: method_name='{}', struct='{}', is_constructor={}",
-                  method_name, _current_struct_name, is_constructor);
+        LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: method_name='{}', struct='{}', is_constructor={}, visibility={}({})",
+                  method_name, _current_struct_name, is_constructor,
+                  (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public" : "Unknown"),
+                  static_cast<int>(node.visibility()));
+
+        // Special logging for MemoryPool methods to debug visibility issue
+        if (_current_struct_name == "MemoryPool") {
+            LOG_DEBUG(Cryo::LogComponent::AST, "🔍 MEMORYPOOL METHOD: '{}' has visibility {}({})", 
+                      method_name, 
+                      (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public" : "Unknown"),
+                      static_cast<int>(node.visibility()));
+            
+            // Write to debug file for verification
+            static bool first_write = true;
+            std::ofstream debug_file("/tmp/memorypool_methods.txt", first_write ? std::ios::trunc : std::ios::app);
+            if (debug_file.is_open()) {
+                debug_file << "Method: " << method_name << " | Visibility: " << static_cast<int>(node.visibility()) 
+                          << " (" << (node.visibility() == Visibility::Private ? "Private" : "Public") << ")" << std::endl;
+                debug_file.close();
+            }
+            first_write = false;
+        }
 
         // Get return type or use struct name for constructors
         Type *return_type = node.get_resolved_return_type();
@@ -7607,10 +7725,11 @@ namespace Cryo
             _type_context.create_function_type(return_type, param_types));
 
         // Register in appropriate registry based on visibility
-        LOG_DEBUG(Cryo::LogComponent::AST, "Registering signature for method '{}' in struct '{}' with visibility: {}",
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registering signature for method '{}' in struct '{}' with visibility: {} (enum value: {})",
                   method_name, _current_struct_name,
                   (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
-                                                                                                                  : "Unknown"));
+                                                                                                                  : "Unknown"),
+                  static_cast<int>(node.visibility()));
 
         if (node.visibility() == Visibility::Private)
         {
@@ -7714,6 +7833,129 @@ namespace Cryo
             << (expected ? expected->to_string() : "unknown") << "', got '"
             << (actual ? actual->to_string() : "unknown") << "'";
         return oss.str();
+    }
+
+    bool TypeChecker::is_valid_type(const std::string &type_name)
+    {
+        // Handle pointer types (e.g., void*, void**, u32*, etc.)
+        if (type_name.back() == '*')
+        {
+            // Extract base type by removing all trailing asterisks
+            std::string base_type = type_name;
+            while (!base_type.empty() && base_type.back() == '*')
+            {
+                base_type.pop_back();
+            }
+            
+            // Check if base type is valid (including void)
+            if (base_type == "void")
+            {
+                return true;
+            }
+            return is_valid_type(base_type); // Recursively check base type
+        }
+
+        // Check primitive types (including void)
+        if (type_name == "void" ||
+            type_name == "u8" || type_name == "i8" || type_name == "char" ||
+            type_name == "u16" || type_name == "i16" ||
+            type_name == "u32" || type_name == "i32" || type_name == "int" ||
+            type_name == "u64" || type_name == "i64" ||
+            type_name == "f32" || type_name == "f64" || type_name == "float" ||
+            type_name == "boolean" || type_name == "string")
+        {
+            return true;
+        }
+
+        // Check if it's a generic parameter in current context
+        if (is_in_generic_context() && is_generic_parameter(type_name))
+        {
+            return true;
+        }
+
+        // Check user-defined types in symbol table
+        TypedSymbol *type_symbol = _symbol_table->lookup_symbol(type_name);
+        return type_symbol != nullptr;
+    }
+
+    bool TypeChecker::is_cast_valid(const std::string &from_type, const std::string &to_type)
+    {
+        // Same type - always valid but unnecessary
+        if (from_type == to_type)
+        {
+            return true;
+        }
+
+        // Casting from/to unknown is always invalid
+        if (from_type == "unknown" || to_type == "unknown")
+        {
+            return false;
+        }
+
+        // Numeric conversions
+        std::vector<std::string> numeric_types = {
+            "u8", "i8", "u16", "i16", "u32", "i32", "int", "u64", "i64", 
+            "f32", "f64", "float"
+        };
+
+        bool from_numeric = std::find(numeric_types.begin(), numeric_types.end(), from_type) != numeric_types.end();
+        bool to_numeric = std::find(numeric_types.begin(), numeric_types.end(), to_type) != numeric_types.end();
+
+        // Numeric to numeric conversions are generally valid
+        if (from_numeric && to_numeric)
+        {
+            return true;
+        }
+
+        // Char to numeric and vice versa
+        if ((from_type == "char" && to_numeric) || (from_numeric && to_type == "char"))
+        {
+            return true;
+        }
+
+        // Boolean to numeric (0/1) and vice versa
+        if ((from_type == "boolean" && to_numeric) || (from_numeric && to_type == "boolean"))
+        {
+            return true;
+        }
+
+        // String conversions are typically not allowed via cast (use conversion functions instead)
+        if (from_type == "string" || to_type == "string")
+        {
+            return false;
+        }
+
+        // For now, disallow other casts (could be extended for user-defined types)
+        return false;
+    }
+
+    bool TypeChecker::requires_explicit_cast(const std::string &from_type, const std::string &to_type)
+    {
+        // Same type requires no cast
+        if (from_type == to_type)
+        {
+            return false;
+        }
+
+        // Implicit widening conversions for integers
+        if ((from_type == "u8" && (to_type == "u16" || to_type == "u32" || to_type == "u64")) ||
+            (from_type == "u16" && (to_type == "u32" || to_type == "u64")) ||
+            (from_type == "u32" && to_type == "u64") ||
+            (from_type == "i8" && (to_type == "i16" || to_type == "i32" || to_type == "i64")) ||
+            (from_type == "i16" && (to_type == "i32" || to_type == "i64")) ||
+            (from_type == "i32" && to_type == "i64"))
+        {
+            return false; // Implicit conversion allowed
+        }
+
+        // Implicit widening for floats
+        if (from_type == "f32" && to_type == "f64")
+        {
+            return false;
+        }
+
+        // All other conversions require explicit cast
+        return true;
     }
 
     //===----------------------------------------------------------------------===//
