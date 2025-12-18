@@ -194,6 +194,7 @@ namespace Cryo
         bool _in_function = false;
         bool _in_loop = false;
         bool _in_call_expression = false;
+        bool _in_unsafe_context = false;
 
         // Struct field tracking - maps struct name -> field name -> field type
         std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _struct_fields;
@@ -387,6 +388,7 @@ namespace Cryo
 
         // Visitor methods - Statements
         void visit(BlockStatementNode &node) override;
+        void visit(UnsafeBlockStatementNode &node) override;
         void visit(ReturnStatementNode &node) override;
         void visit(IfStatementNode &node) override;
         void visit(WhileStatementNode &node) override;
@@ -469,6 +471,7 @@ namespace Cryo
         bool is_comparable_type(Type *type);
         bool is_integral_type(Type *type);
         bool is_boolean_context_valid(Type *type);
+        bool is_in_unsafe_context() const { return _in_unsafe_context; }
         bool is_primitive_integer_type(const std::string &type_name);
         bool is_method_declared_in_type(const std::string &type_name, const std::string &method_name);
 

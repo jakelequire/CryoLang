@@ -2846,6 +2846,19 @@ namespace Cryo::Codegen
         }
     }
 
+    void CodegenVisitor::visit(Cryo::UnsafeBlockStatementNode &node)
+    {
+        // For code generation, unsafe blocks are handled the same as regular blocks
+        // The safety is enforced at the type-checker level, not at code generation
+        // Simply delegate to the inner block
+        if (node.block())
+        {
+            node.block()->accept(*this);
+        }
+
+        register_value(&node, nullptr);
+    }
+
     void CodegenVisitor::visit(Cryo::ReturnStatementNode &node)
     {
         try

@@ -231,6 +231,12 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    // UnsafeBlockStatementNode visitor implementation
+    void UnsafeBlockStatementNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     // ReturnStatementNode visitor implementation
     void ReturnStatementNode::accept(ASTVisitor &visitor)
     {

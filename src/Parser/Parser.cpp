@@ -823,6 +823,7 @@ namespace Cryo
                kind == TokenKind::TK_KW_RETURN ||
                kind == TokenKind::TK_KW_BREAK ||
                kind == TokenKind::TK_KW_CONTINUE ||
+               kind == TokenKind::TK_KW_UNSAFE ||
                kind == TokenKind::TK_KW_TRY ||
                kind == TokenKind::TK_KW_CATCH ||
                kind == TokenKind::TK_KW_THROW ||
@@ -1178,6 +1179,10 @@ namespace Cryo
         else if (_current_token.is(TokenKind::TK_KW_CONTINUE))
         {
             statement = parse_continue_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_UNSAFE))
+        {
+            statement = parse_unsafe_block_statement();
         }
         else if (_current_token.is(TokenKind::TK_L_BRACE))
         {
@@ -2902,6 +2907,23 @@ namespace Cryo
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after 'continue'");
 
         return _builder.create_continue_statement(start_loc);
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_unsafe_block_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_UNSAFE, "Expected 'unsafe'");
+        
+        auto block = parse_block_statement();
+        if (auto block_stmt = dynamic_cast<BlockStatementNode*>(block.get()))
+        {
+            block.release(); // Release ownership
+            auto unsafe_block = std::unique_ptr<BlockStatementNode>(block_stmt);
+            return _builder.create_unsafe_block_statement(start_loc, std::move(unsafe_block));
+        }
+        
+        error("Expected block statement after 'unsafe'");
+        return nullptr;
     }
 
     std::unique_ptr<ASTNode> Parser::parse_expression_statement()

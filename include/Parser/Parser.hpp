@@ -164,6 +164,7 @@ namespace Cryo
         std::unique_ptr<PatternNode> parse_pattern();
         std::unique_ptr<ASTNode> parse_break_statement();
         std::unique_ptr<ASTNode> parse_continue_statement();
+        std::unique_ptr<ASTNode> parse_unsafe_block_statement();
         std::unique_ptr<ASTNode> parse_expression_statement();
 
         // Parameter parsing for functions

@@ -50,6 +50,7 @@ namespace Cryo
         std::unique_ptr<ForStatementNode> create_for_statement(SourceLocation loc, std::unique_ptr<VariableDeclarationNode> init, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> update, std::unique_ptr<StatementNode> body);
         std::unique_ptr<BreakStatementNode> create_break_statement(SourceLocation loc);
         std::unique_ptr<ContinueStatementNode> create_continue_statement(SourceLocation loc);
+        std::unique_ptr<UnsafeBlockStatementNode> create_unsafe_block_statement(SourceLocation loc, std::unique_ptr<BlockStatementNode> block);
         std::unique_ptr<ExpressionStatementNode> create_expression_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> expr);
         std::unique_ptr<DeclarationStatementNode> create_declaration_statement(SourceLocation loc, std::unique_ptr<DeclarationNode> decl);
 

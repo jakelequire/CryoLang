@@ -138,6 +138,7 @@ namespace Cryo::Codegen
 
         void visit(Cryo::StatementNode &node) override;
         void visit(Cryo::BlockStatementNode &node) override;
+        void visit(Cryo::UnsafeBlockStatementNode &node) override;
         void visit(Cryo::ReturnStatementNode &node) override;
         void visit(Cryo::IfStatementNode &node) override;
         void visit(Cryo::WhileStatementNode &node) override;

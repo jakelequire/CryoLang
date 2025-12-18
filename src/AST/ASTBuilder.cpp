@@ -175,6 +175,11 @@ namespace Cryo
         return std::make_unique<ContinueStatementNode>(loc);
     }
 
+    std::unique_ptr<UnsafeBlockStatementNode> ASTBuilder::create_unsafe_block_statement(SourceLocation loc, std::unique_ptr<BlockStatementNode> block)
+    {
+        return std::make_unique<UnsafeBlockStatementNode>(loc, std::move(block));
+    }
+
     std::unique_ptr<ExpressionStatementNode> ASTBuilder::create_expression_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> expr)
     {
         return std::make_unique<ExpressionStatementNode>(loc, std::move(expr));

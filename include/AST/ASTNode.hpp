@@ -65,6 +65,7 @@ namespace Cryo
 
         // Concrete statement types
         BlockStatement,
+        UnsafeBlockStatement,
         ReturnStatement,
         IfStatement,
         WhileStatement,
@@ -143,6 +144,8 @@ namespace Cryo
             return "ScopeResolution";
         case NodeKind::BlockStatement:
             return "BlockStatement";
+        case NodeKind::UnsafeBlockStatement:
+            return "UnsafeBlockStatement";
         case NodeKind::ReturnStatement:
             return "ReturnStatement";
         case NodeKind::IfStatement:
@@ -534,6 +537,28 @@ namespace Cryo
                 if (stmt)
                     stmt->print(os, indent + 2);
             }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Unsafe block statement
+    class UnsafeBlockStatementNode : public StatementNode
+    {
+    private:
+        std::unique_ptr<BlockStatementNode> _block;
+
+    public:
+        UnsafeBlockStatementNode(SourceLocation loc, std::unique_ptr<BlockStatementNode> block)
+            : StatementNode(NodeKind::UnsafeBlockStatement, loc), _block(std::move(block)) {}
+
+        BlockStatementNode *block() const { return _block.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "UnsafeBlock:" << std::endl;
+            if (_block)
+                _block->print(os, indent + 2);
         }
 
         void accept(ASTVisitor &visitor) override;
