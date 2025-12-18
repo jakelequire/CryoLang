@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <memory>
 #include <vector>
+#include <functional>
 
 #include "AST/ASTNode.hpp"
 #include "AST/SymbolTable.hpp"
@@ -45,6 +46,9 @@ namespace Cryo
         // Storage for imported ASTs to keep them alive for template registration
         std::unordered_map<std::string, std::unique_ptr<ProgramNode>> _imported_asts;
 
+        // Callback for triggering auto-imports on dependencies
+        std::function<void(SymbolTable *, const std::string &, const std::string &)> _auto_import_callback;
+
         // Static storage for global executable path
         static std::string _global_executable_path;
 
@@ -83,6 +87,12 @@ namespace Cryo
          * @param current_file_path Path to the currently compiling file
          */
         void set_current_file(const std::string &current_file_path);
+
+        /**
+         * @brief Set callback for auto-imports on runtime dependencies
+         * @param callback Function to call for auto-imports (symbol_table, scope_name, source_file)
+         */
+        void set_auto_import_callback(std::function<void(SymbolTable *, const std::string &, const std::string &)> callback);
 
         /**
          * @brief Load and process an import declaration

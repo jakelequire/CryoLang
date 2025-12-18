@@ -842,7 +842,6 @@ namespace Cryo
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "resolve_type_with_generic_context: '{}'", type_string);
 
-
         // First check if this is a generic parameter
 
         if (is_generic_parameter(type_string))
@@ -851,7 +850,6 @@ namespace Cryo
 
             return _type_context.get_generic_type(type_string);
         }
-
 
         // Check for tuple types first (before checking for generic syntax)
         if (type_string.front() == '(' && type_string.back() == ')')
@@ -1064,7 +1062,6 @@ namespace Cryo
         size_t open_bracket_pos = type_string.find('<');
         size_t close_bracket_pos = type_string.find('>');
 
-        
         // First check if this is a generic type (e.g., "Array<int>")
         // This must happen before other type lookups to ensure proper parameterized type creation
         if (open_bracket_pos != std::string::npos && close_bracket_pos != std::string::npos)
@@ -1493,10 +1490,11 @@ namespace Cryo
     {
 
         auto result = _type_registry->parse_and_instantiate(type_string);
-        if (result) {
-
-        } else {
-
+        if (result)
+        {
+        }
+        else
+        {
         }
         return result;
     }
@@ -1650,7 +1648,7 @@ namespace Cryo
                 // For stdlib paths like "core/types", construct the stdlib path
                 module_file = "stdlib/" + module_name + ".cryo";
             }
-            
+
             // Use set_source_file to properly update both _source_file and _diagnostic_builder
             set_source_file(module_file);
             LOG_DEBUG(Cryo::LogComponent::AST, "Set source context to: {}", _source_file);
@@ -1696,7 +1694,7 @@ namespace Cryo
                         node_type = "other";
                         break;
                     }
-                    
+
                     // std::cout << "[DEBUG] Found " << node_type << " in imported module " << module_name << std::endl;
 
                     // For function declarations, we need to check with qualified names
@@ -1705,9 +1703,9 @@ namespace Cryo
                         if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(stmt.get()))
                         {
                             std::string func_name = func_decl->name();
-                            
+
                             // Extract parameter types for SRM naming
-                            std::vector<Cryo::Type*> parameter_types;
+                            std::vector<Cryo::Type *> parameter_types;
                             for (const auto &param : func_decl->parameters())
                             {
                                 if (param && param->get_resolved_type())
@@ -1715,7 +1713,7 @@ namespace Cryo
                                     parameter_types.push_back(param->get_resolved_type());
                                 }
                             }
-                            
+
                             // Use SRM helper to generate standardized qualified function name
                             // Build proper module context for function resolution
                             std::vector<std::string> module_parts = {module_name};
@@ -1787,8 +1785,8 @@ namespace Cryo
         Type *inferred_type = nullptr;
 
         // Enhanced debugging for variable name corruption issue
-        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Processing variable '{}' is_mutable={}, stdlib_compilation_mode={}, node_ptr={}, location={}:{}", 
-                  var_name, node.is_mutable(), _stdlib_compilation_mode, static_cast<const void*>(&node), node.location().line(), node.location().column());
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Processing variable '{}' is_mutable={}, stdlib_compilation_mode={}, node_ptr={}, location={}:{}",
+                  var_name, node.is_mutable(), _stdlib_compilation_mode, static_cast<const void *>(&node), node.location().line(), node.location().column());
 
         // Parse type annotation from node
         if (!node.type_annotation().empty() && node.type_annotation() != "auto")
@@ -1871,12 +1869,13 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Attempting to declare variable '{}' with type '{}' (kind={})", var_name, final_type ? final_type->name() : "null", final_type ? TypeKindToString(final_type->kind()) : "null");
 
         // Enhanced debugging for type resolution failures
-        if (!final_type || final_type->kind() == TypeKind::Unknown) {
+        if (!final_type || final_type->kind() == TypeKind::Unknown)
+        {
             LOG_ERROR(Cryo::LogComponent::AST, "TYPE RESOLUTION FAILURE: Variable '{}' has null/unknown type! declared_type={}, inferred_type={}, node_ptr={}, location={}:{}",
-                      var_name, 
+                      var_name,
                       declared_type ? declared_type->name() : "null",
                       inferred_type ? inferred_type->name() : "null",
-                      static_cast<const void*>(&node),
+                      static_cast<const void *>(&node),
                       node.location().line(), node.location().column());
         }
 
@@ -1892,7 +1891,7 @@ namespace Cryo
         {
             // Check if this is a compatible redefinition (handles double processing from symbol population)
             bool should_report_error = true;
-            
+
             // Check for compatible redefinition (applies to all compilation modes)
             TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(var_name);
             if (existing_symbol && existing_symbol->type && final_type)
@@ -2250,19 +2249,19 @@ namespace Cryo
     void TypeChecker::visit(IntrinsicConstDeclarationNode &node)
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "Processing intrinsic const declaration: {}", node.name());
-        
+
         const std::string const_name = node.name();
-        
+
         // Get the resolved type from the intrinsic constant declaration
         Type *const_type = node.get_resolved_type();
-        
+
         if (!const_type)
         {
-            _diagnostic_builder->create_type_error(ErrorCode::E0301_GENERIC_TYPE_RESOLUTION_FAILED, node.location(), 
-                                                 "Unable to resolve type for intrinsic constant: " + const_name);
+            _diagnostic_builder->create_type_error(ErrorCode::E0301_GENERIC_TYPE_RESOLUTION_FAILED, node.location(),
+                                                   "Unable to resolve type for intrinsic constant: " + const_name);
             return;
         }
-        
+
         // Check if intrinsic constant already exists in symbol table
         TypedSymbol *existing_symbol = _symbol_table->lookup_symbol(const_name);
         if (existing_symbol)
@@ -2270,8 +2269,8 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Intrinsic constant '{}' already exists, verifying type compatibility", const_name);
             if (existing_symbol->type && const_type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Existing type: {}, New type: {}", 
-                         existing_symbol->type->to_string(), const_type->to_string());
+                LOG_DEBUG(Cryo::LogComponent::AST, "Existing type: {}, New type: {}",
+                          existing_symbol->type->to_string(), const_type->to_string());
             }
             LOG_DEBUG(Cryo::LogComponent::AST, "Intrinsic constant '{}' already registered, skipping duplicate declaration", const_name);
         }
@@ -2284,7 +2283,7 @@ namespace Cryo
                 return;
             }
         }
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic constant: {} with type: {}", const_name, const_type->to_string());
     }
 
@@ -2470,22 +2469,23 @@ namespace Cryo
             node.declaration()->accept(*this);
         }
     }
-    
+
     void TypeChecker::visit(ImportDeclarationNode &node)
     {
-        LOG_DEBUG(Cryo::LogComponent::AST, "Processing import: {} (type: {})", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing import: {} (type: {})",
                   node.path(), node.has_alias() ? "with alias" : "standard");
-        
+
         if (node.has_alias())
         {
             // Traditional import with alias: import <path> as alias;
             std::string alias_name = node.alias();
             std::string full_path = node.path();
-            
+
             LOG_DEBUG(Cryo::LogComponent::AST, "Import with alias: {} as {}", full_path, alias_name);
-            
+
             // Register the alias in symbol table and SRM
-            if (_srm_context) {
+            if (_srm_context)
+            {
                 std::string namespace_path = resolve_module_path_to_namespace(full_path);
                 _srm_context->register_namespace_alias(alias_name, namespace_path);
             }
@@ -2495,19 +2495,20 @@ namespace Cryo
             // Specific import: import IO from <path>; or import IO, Function from <path>;
             auto specific_imports = node.specific_imports();
             std::string module_path = node.path();
-            
+
             LOG_DEBUG(Cryo::LogComponent::AST, "Specific imports from {}", module_path);
-            
+
             // Convert module path to namespace (e.g., "net/types" -> "std::net::Types")
             std::string namespace_path = resolve_module_path_to_namespace(module_path);
-            
-            for (const auto& import_name : specific_imports)
+
+            for (const auto &import_name : specific_imports)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "  - {}", import_name);
-                
+
                 // Register each specific import as an alias to the target namespace
                 // For "import Types from <net/types>", register "Types" -> "std::net::Types"
-                if (_srm_context) {
+                if (_srm_context)
+                {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Registering namespace alias: '{}' -> '{}'", import_name, namespace_path);
                     _srm_context->register_namespace_alias(import_name, namespace_path);
                 }
@@ -2518,9 +2519,10 @@ namespace Cryo
             // Wildcard import: import <path>;
             std::string module_path = node.path();
             LOG_DEBUG(Cryo::LogComponent::AST, "Wildcard import from {}", module_path);
-            
+
             // Add the namespace to imported namespaces for wildcard resolution
-            if (_srm_context) {
+            if (_srm_context)
+            {
                 std::string namespace_path = resolve_module_path_to_namespace(module_path);
                 _srm_context->add_imported_namespace(namespace_path);
             }
@@ -2596,7 +2598,7 @@ namespace Cryo
             auto parsed = Cryo::SRM::Utils::parse_qualified_name(name);
             std::vector<std::string> ns_parts = parsed.first;
             std::string simple_name = parsed.second;
-            
+
             // Resolve the first namespace part if it's an alias
             if (!ns_parts.empty())
             {
@@ -2606,13 +2608,13 @@ namespace Cryo
                     // Replace the first part with the resolved namespace
                     auto resolved_parts = Cryo::SRM::Utils::parse_qualified_name(resolved_first).first;
                     resolved_parts.insert(resolved_parts.end(), ns_parts.begin() + 1, ns_parts.end());
-                    
+
                     // Build the new qualified name
                     std::string resolved_name = Cryo::SRM::Utils::build_qualified_name(resolved_parts, simple_name);
-                    
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Resolved alias '{}' -> '{}' for identifier '{}'", 
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Resolved alias '{}' -> '{}' for identifier '{}'",
                               ns_parts[0], resolved_first, resolved_name);
-                    
+
                     // Try to look up the resolved qualified name
                     TypedSymbol *symbol = _symbol_table->lookup_symbol(resolved_name);
                     if (symbol && symbol->type)
@@ -2633,17 +2635,18 @@ namespace Cryo
             if (_srm_context && _main_symbol_table)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Checking wildcard imports for identifier: {}", name);
-                
+
                 // Generate lookup candidates using SRM
                 auto candidates = _srm_context->generate_lookup_candidates(name, Cryo::SymbolKind::Variable);
-                
-                for (const auto& candidate : candidates)
+
+                for (const auto &candidate : candidates)
                 {
-                    if (!candidate) continue;
-                    
+                    if (!candidate)
+                        continue;
+
                     std::string qualified_name = candidate->to_string();
                     LOG_DEBUG(Cryo::LogComponent::AST, "Trying candidate: {}", qualified_name);
-                    
+
                     // Try TypedSymbol lookup first
                     TypedSymbol *typed_symbol = _symbol_table->lookup_symbol(qualified_name);
                     if (typed_symbol && typed_symbol->type)
@@ -2652,7 +2655,7 @@ namespace Cryo
                         node.set_resolved_type(typed_symbol->type);
                         return;
                     }
-                    
+
                     // Try main symbol table lookup
                     Symbol *main_symbol = _main_symbol_table->lookup_symbol(qualified_name);
                     if (main_symbol && main_symbol->data_type)
@@ -2661,17 +2664,19 @@ namespace Cryo
                         node.set_resolved_type(main_symbol->data_type);
                         return;
                     }
-                    
+
                     // Try namespace resolution with context
                     auto ns_parts = candidate->get_namespace_parts();
                     if (!ns_parts.empty())
                     {
                         std::string namespace_path = "";
-                        for (size_t i = 0; i < ns_parts.size(); ++i) {
-                            if (i > 0) namespace_path += "::";
+                        for (size_t i = 0; i < ns_parts.size(); ++i)
+                        {
+                            if (i > 0)
+                                namespace_path += "::";
                             namespace_path += ns_parts[i];
                         }
-                        
+
                         Symbol *ns_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(namespace_path, candidate->get_simple_name(), _current_namespace);
                         if (ns_symbol && ns_symbol->data_type)
                         {
@@ -2682,7 +2687,7 @@ namespace Cryo
                     }
                 }
             }
-            
+
             // Try to find the symbol in the std::Runtime namespace as a fallback
             // This allows runtime functions like cryo_alloc to be used without qualification
             if (_main_symbol_table)
@@ -2691,9 +2696,12 @@ namespace Cryo
                 if (runtime_symbol)
                 {
                     // Found runtime function - use the actual function type if available
-                    if (runtime_symbol->data_type) {
+                    if (runtime_symbol->data_type)
+                    {
                         node.set_resolved_type(runtime_symbol->data_type);
-                    } else {
+                    }
+                    else
+                    {
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                     return;
@@ -2871,7 +2879,7 @@ namespace Cryo
                             }
                             // Same type numeric operations
                             else if (left_type == right_type &&
-                                     (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float" || 
+                                     (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float" ||
                                       left_type->name() == "f32" || left_type->name() == "f64" ||
                                       left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" ||
                                       left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64" ||
@@ -2894,7 +2902,7 @@ namespace Cryo
                                       left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64" ||
                                       left_type->name() == "char"))
                             {
-                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", 
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}",
                                           right_type->to_string(), left_type->to_string());
                                 result_type = left_type; // int literal promotes to specific integer type
                             }
@@ -2904,7 +2912,7 @@ namespace Cryo
                                       right_type->name() == "u8" || right_type->name() == "u16" || right_type->name() == "u32" || right_type->name() == "u64" ||
                                       right_type->name() == "char"))
                             {
-                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}", 
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}",
                                           left_type->to_string(), right_type->to_string());
                                 result_type = right_type; // int literal promotes to specific integer type
                             }
@@ -3330,7 +3338,7 @@ namespace Cryo
                 IdentifierNode *identifier = static_cast<IdentifierNode *>(member_access->object());
                 std::string base_name = identifier->name();
                 std::string variant_name = member_access->member();
-                
+
                 // Use SRM helper to generate standardized enum variant name
                 auto namespace_parts = get_current_namespace_parts();
                 auto variant_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
@@ -3819,7 +3827,7 @@ namespace Cryo
             // Reference type - can be indexed like an array if the referent supports it
             ReferenceType *ref_type = static_cast<ReferenceType *>(array_type);
             Type *referent_type = ref_type->referent_type().get();
-            
+
             // Check if the referent type supports array access
             if (referent_type->kind() == TypeKind::Array)
             {
@@ -3855,7 +3863,7 @@ namespace Cryo
         else
         {
             // Invalid type for array access
-            
+
             std::string error_msg = "Cannot index into type '" + array_type->name() + "' Kind: " + TypeKindToString(array_type->kind());
             report_error(TypeError::ErrorKind::TypeMismatch, node.location(), error_msg, &node);
             node.set_resolved_type(_type_context.get_unknown_type());
@@ -4086,7 +4094,7 @@ namespace Cryo
             std::string primitive_type_name = effective_type->name();
             LOG_DEBUG(Cryo::LogComponent::AST, "=== PRIMITIVE TYPE DEBUG ===");
             LOG_DEBUG(Cryo::LogComponent::AST, "Looking for method '{}' on primitive type '{}'", member_name, primitive_type_name);
-            
+
             auto it = _struct_methods.find(primitive_type_name);
             if (it != _struct_methods.end())
             {
@@ -4108,11 +4116,12 @@ namespace Cryo
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "No methods registered for primitive type '{}'", primitive_type_name);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Currently registered struct types: {}", _struct_methods.size());
-                for (const auto& [type, methods] : _struct_methods) {
+                for (const auto &[type, methods] : _struct_methods)
+                {
                     LOG_DEBUG(Cryo::LogComponent::AST, "  - {} has {} methods", type, methods.size());
                 }
             }
-            
+
             // Fall through to error if method not found
             std::string type_name = effective_type ? effective_type->to_string() : "unknown";
             report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
@@ -4252,9 +4261,9 @@ namespace Cryo
             if (method_it != method_struct_it->second.end())
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Found public method '{}' in struct '{}'", member_name, lookup_type_name);
-                
+
                 // Check if this is a parameterized type that needs type substitution
-                LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Found method '{}', checking if parameterized type. effective_type kind: {}, TypeKind::Parameterized: {}", 
+                LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Found method '{}', checking if parameterized type. effective_type kind: {}, TypeKind::Parameterized: {}",
                           member_name, (int)effective_type->kind(), (int)TypeKind::Parameterized);
                 if (effective_type && effective_type->kind() == TypeKind::Parameterized)
                 {
@@ -4269,19 +4278,19 @@ namespace Cryo
 
                         // Create a type substitution map for generic parameters
                         std::unordered_map<std::string, std::shared_ptr<Type>> substitution_map;
-                        
+
                         // Get the template parameter names from the original struct definition
                         auto template_params = get_template_parameters(lookup_type_name);
-                        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Looking up template params for '{}', found {} params", 
+                        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Looking up template params for '{}', found {} params",
                                   lookup_type_name, template_params.size());
-                        
+
                         // Create generic mapping between template parameter names and concrete types
                         if (template_params.size() == concrete_types.size() && !template_params.empty())
                         {
                             for (size_t i = 0; i < template_params.size(); ++i)
                             {
                                 substitution_map[template_params[i]] = concrete_types[i];
-                                LOG_DEBUG(Cryo::LogComponent::AST, "Type substitution mapping: {} -> {}", 
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Type substitution mapping: {} -> {}",
                                           template_params[i], concrete_types[i]->name());
                             }
                         }
@@ -4293,19 +4302,19 @@ namespace Cryo
                             {
                                 substitution_map["K"] = concrete_types[0];
                                 substitution_map["V"] = concrete_types[1];
-                                LOG_DEBUG(Cryo::LogComponent::AST, "Fallback Pair mapping: K -> {}, V -> {}", 
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Fallback Pair mapping: K -> {}, V -> {}",
                                           concrete_types[0]->name(), concrete_types[1]->name());
                             }
                             else if (lookup_type_name == "Array" && concrete_types.size() == 1)
                             {
                                 substitution_map["T"] = concrete_types[0];
-                                LOG_DEBUG(Cryo::LogComponent::AST, "Fallback Array mapping: T -> {}", 
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Fallback Array mapping: T -> {}",
                                           concrete_types[0]->name());
                             }
                         }
                         else
                         {
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Template parameter count mismatch: expected {}, got {}", 
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Template parameter count mismatch: expected {}, got {}",
                                       template_params.size(), concrete_types.size());
                         }
 
@@ -4313,14 +4322,14 @@ namespace Cryo
                         FunctionType *func_type = dynamic_cast<FunctionType *>(generic_method_type);
                         if (func_type)
                         {
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Original function type: {} -> {}", 
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Original function type: {} -> {}",
                                       func_type->to_string(), func_type->return_type()->to_string());
-                            
+
                             // Substitute return type manually
                             std::shared_ptr<Type> substituted_return_type = func_type->return_type();
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Return type before substitution: {}, kind: {}", 
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Return type before substitution: {}, kind: {}",
                                       substituted_return_type->to_string(), (int)substituted_return_type->kind());
-                            
+
                             if (substituted_return_type->kind() == TypeKind::Generic)
                             {
                                 GenericType *generic_ret = dynamic_cast<GenericType *>(substituted_return_type.get());
@@ -4331,7 +4340,7 @@ namespace Cryo
                                     if (subst_it != substitution_map.end())
                                     {
                                         substituted_return_type = subst_it->second;
-                                        LOG_DEBUG(Cryo::LogComponent::AST, "Substituted generic return type {} -> {}", 
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Substituted generic return type {} -> {}",
                                                   generic_name, substituted_return_type->to_string());
                                     }
                                     else
@@ -4352,7 +4361,7 @@ namespace Cryo
                                     if (subst_it != substitution_map.end())
                                     {
                                         substituted_return_type = subst_it->second;
-                                        LOG_DEBUG(Cryo::LogComponent::AST, "Substituted struct-typed generic parameter {} -> {}", 
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Substituted struct-typed generic parameter {} -> {}",
                                                   type_name, substituted_return_type->to_string());
                                     }
                                     else
@@ -4367,25 +4376,25 @@ namespace Cryo
                                 PointerType *ptr_type = dynamic_cast<PointerType *>(substituted_return_type.get());
                                 if (ptr_type)
                                 {
-                                    LOG_DEBUG(Cryo::LogComponent::AST, "Pointee type: {}, kind: {}", 
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "Pointee type: {}, kind: {}",
                                               ptr_type->pointee_type()->to_string(), (int)ptr_type->pointee_type()->kind());
-                                    
+
                                     bool should_substitute = false;
                                     if (ptr_type->pointee_type()->kind() == TypeKind::Generic ||
-                                        ptr_type->pointee_type()->kind() == TypeKind::Struct  ||
-                                        ptr_type->pointee_type()->kind() == TypeKind::Class   ||
-                                        ptr_type->pointee_type()->kind() == TypeKind::Enum    ||
+                                        ptr_type->pointee_type()->kind() == TypeKind::Struct ||
+                                        ptr_type->pointee_type()->kind() == TypeKind::Class ||
+                                        ptr_type->pointee_type()->kind() == TypeKind::Enum ||
                                         ptr_type->pointee_type()->kind() == TypeKind::Parameterized)
                                     {
                                         should_substitute = true;
                                     }
-                                    
+
                                     if (should_substitute && !concrete_types.empty())
                                     {
-                                        LOG_DEBUG(Cryo::LogComponent::AST, "Substituting pointer type T* -> {}*", 
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Substituting pointer type T* -> {}*",
                                                   concrete_types[0]->to_string());
-                                        substituted_return_type = std::shared_ptr<Type>(_type_context.create_pointer_type(concrete_types[0].get()), [](Type*) {});
-                                        LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted pointer type: {}", 
+                                        substituted_return_type = std::shared_ptr<Type>(_type_context.create_pointer_type(concrete_types[0].get()), [](Type *) {});
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted pointer type: {}",
                                                   substituted_return_type->to_string());
                                     }
                                 }
@@ -4394,8 +4403,8 @@ namespace Cryo
                                     LOG_DEBUG(Cryo::LogComponent::AST, "Failed to cast to PointerType");
                                 }
                             }
-                            
-                            // Substitute parameter types manually  
+
+                            // Substitute parameter types manually
                             std::vector<Type *> param_types;
                             for (const auto &param : func_type->parameter_types())
                             {
@@ -4410,7 +4419,7 @@ namespace Cryo
                                         if (subst_it != substitution_map.end())
                                         {
                                             substituted_param = subst_it->second;
-                                            LOG_DEBUG(Cryo::LogComponent::AST, "Substituted generic parameter {} -> {}", 
+                                            LOG_DEBUG(Cryo::LogComponent::AST, "Substituted generic parameter {} -> {}",
                                                       generic_name, substituted_param->to_string());
                                         }
                                     }
@@ -4421,7 +4430,7 @@ namespace Cryo
                             // Create a new function type with substituted types using TypeContext
                             Type *substituted_func_type = _type_context.create_function_type(substituted_return_type.get(), param_types, func_type->is_variadic());
                             node.set_resolved_type(substituted_func_type);
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted function type: {} -> {}", 
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Created substituted function type: {} -> {}",
                                       generic_method_type->to_string(), substituted_func_type->to_string());
                         }
                         else
@@ -4432,7 +4441,7 @@ namespace Cryo
                         return;
                     }
                 }
-                
+
                 // Check if this looks like a generic method call that needs substitution
                 Type *generic_method_type = method_it->second;
                 if (generic_method_type && generic_method_type->kind() == TypeKind::Function)
@@ -4441,144 +4450,144 @@ namespace Cryo
                     if (func_type && func_type->return_type())
                     {
                         Type *return_type = func_type->return_type().get();
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' return type: {} (kind: {})", 
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' return type: {} (kind: {})",
                                   member_name, return_type->name(), (int)return_type->kind());
-                        
+
                         // If the return type is a generic type (K, V, T, etc.) and we have a parameterized effective type,
                         // OR if this looks like a known generic pattern, attempt substitution
-                        if (return_type->kind() == TypeKind::Generic || 
+                        if (return_type->kind() == TypeKind::Generic ||
                             (return_type->name() == "K" || return_type->name() == "V" || return_type->name() == "T"))
                         {
                             LOG_DEBUG(Cryo::LogComponent::AST, "Detected generic return type '{}', attempting substitution", return_type->name());
-                            
-                // Try to get concrete types for substitution
-                std::unordered_map<std::string, std::shared_ptr<Type>> substitution_map;
-                
-                // If we have a parameterized type, use its concrete types
-                if (effective_type && effective_type->kind() == TypeKind::Parameterized)
-                {
-                    ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
-                    auto &concrete_types = param_type->type_parameters();
-                    auto template_params = get_template_parameters(lookup_type_name);
-                    
-                    if (template_params.size() == concrete_types.size())
-                    {
-                        for (size_t i = 0; i < template_params.size(); ++i)
-                        {
-                            substitution_map[template_params[i]] = concrete_types[i];
-                        }
-                    }
-                    else if (lookup_type_name == "Pair" && concrete_types.size() == 2)
-                    {
-                        substitution_map["K"] = concrete_types[0];
-                        substitution_map["V"] = concrete_types[1];
-                    }
-                }
-                else
-                {
-                    // Fallback: try to infer from object type name patterns or variable name patterns
-                    std::string object_type_name = effective_type ? effective_type->name() : "";
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Fallback substitution for object type: '{}'", object_type_name);
-                    
-                    // Check if the effective type is unknown but we might be dealing with a generic type
-                    if (object_type_name == "unknown" || object_type_name.empty())
-                    {
-                        // Try to infer generic type from variable name patterns
-                        // Look for variable names that suggest generic instantiation
-                        if (auto identifier = dynamic_cast<IdentifierNode*>(node.object()))
-                        {
-                            std::string var_name = identifier->name();
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Checking variable '{}' for generic type hints", var_name);
-                            
-                            // Look for known patterns like int_string_pair, float_bool_pair, etc.
-                            if (var_name.find("int_string_pair") != std::string::npos ||
-                                var_name.find("i32_string") != std::string::npos)
+
+                            // Try to get concrete types for substitution
+                            std::unordered_map<std::string, std::shared_ptr<Type>> substitution_map;
+
+                            // If we have a parameterized type, use its concrete types
+                            if (effective_type && effective_type->kind() == TypeKind::Parameterized)
                             {
-                                Type *int_type = lookup_type_by_name("i32");
-                                Type *string_type = lookup_type_by_name("string");
-                                if (int_type && string_type)
+                                ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
+                                auto &concrete_types = param_type->type_parameters();
+                                auto template_params = get_template_parameters(lookup_type_name);
+
+                                if (template_params.size() == concrete_types.size())
                                 {
-                                    substitution_map["K"] = std::shared_ptr<Type>(int_type, [](Type*){});
-                                    substitution_map["V"] = std::shared_ptr<Type>(string_type, [](Type*){});
-                                    LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<i32, string> from variable name");
+                                    for (size_t i = 0; i < template_params.size(); ++i)
+                                    {
+                                        substitution_map[template_params[i]] = concrete_types[i];
+                                    }
+                                }
+                                else if (lookup_type_name == "Pair" && concrete_types.size() == 2)
+                                {
+                                    substitution_map["K"] = concrete_types[0];
+                                    substitution_map["V"] = concrete_types[1];
                                 }
                             }
-                            else if (var_name.find("float_bool_pair") != std::string::npos ||
-                                     var_name.find("f32_boolean") != std::string::npos)
+                            else
                             {
-                                Type *float_type = lookup_type_by_name("f32");
-                                Type *bool_type = lookup_type_by_name("boolean");
-                                if (float_type && bool_type)
+                                // Fallback: try to infer from object type name patterns or variable name patterns
+                                std::string object_type_name = effective_type ? effective_type->name() : "";
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Fallback substitution for object type: '{}'", object_type_name);
+
+                                // Check if the effective type is unknown but we might be dealing with a generic type
+                                if (object_type_name == "unknown" || object_type_name.empty())
                                 {
-                                    substitution_map["K"] = std::shared_ptr<Type>(float_type, [](Type*){});
-                                    substitution_map["V"] = std::shared_ptr<Type>(bool_type, [](Type*){});
-                                    LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<f32, boolean> from variable name");
+                                    // Try to infer generic type from variable name patterns
+                                    // Look for variable names that suggest generic instantiation
+                                    if (auto identifier = dynamic_cast<IdentifierNode *>(node.object()))
+                                    {
+                                        std::string var_name = identifier->name();
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Checking variable '{}' for generic type hints", var_name);
+
+                                        // Look for known patterns like int_string_pair, float_bool_pair, etc.
+                                        if (var_name.find("int_string_pair") != std::string::npos ||
+                                            var_name.find("i32_string") != std::string::npos)
+                                        {
+                                            Type *int_type = lookup_type_by_name("i32");
+                                            Type *string_type = lookup_type_by_name("string");
+                                            if (int_type && string_type)
+                                            {
+                                                substitution_map["K"] = std::shared_ptr<Type>(int_type, [](Type *) {});
+                                                substitution_map["V"] = std::shared_ptr<Type>(string_type, [](Type *) {});
+                                                LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<i32, string> from variable name");
+                                            }
+                                        }
+                                        else if (var_name.find("float_bool_pair") != std::string::npos ||
+                                                 var_name.find("f32_boolean") != std::string::npos)
+                                        {
+                                            Type *float_type = lookup_type_by_name("f32");
+                                            Type *bool_type = lookup_type_by_name("boolean");
+                                            if (float_type && bool_type)
+                                            {
+                                                substitution_map["K"] = std::shared_ptr<Type>(float_type, [](Type *) {});
+                                                substitution_map["V"] = std::shared_ptr<Type>(bool_type, [](Type *) {});
+                                                LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<f32, boolean> from variable name");
+                                            }
+                                        }
+                                        else if (var_name.find("string_int_pair") != std::string::npos ||
+                                                 var_name.find("string_i32") != std::string::npos)
+                                        {
+                                            Type *string_type = lookup_type_by_name("string");
+                                            Type *int_type = lookup_type_by_name("i32");
+                                            if (string_type && int_type)
+                                            {
+                                                substitution_map["K"] = std::shared_ptr<Type>(string_type, [](Type *) {});
+                                                substitution_map["V"] = std::shared_ptr<Type>(int_type, [](Type *) {});
+                                                LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<string, i32> from variable name");
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                            else if (var_name.find("string_int_pair") != std::string::npos ||
-                                     var_name.find("string_i32") != std::string::npos)
-                            {
-                                Type *string_type = lookup_type_by_name("string");
-                                Type *int_type = lookup_type_by_name("i32");
-                                if (string_type && int_type)
+
+                                // Also try to extract from type name patterns like "Pair<i32, string>"
+                                if (object_type_name.find("Pair<") != std::string::npos)
                                 {
-                                    substitution_map["K"] = std::shared_ptr<Type>(string_type, [](Type*){});
-                                    substitution_map["V"] = std::shared_ptr<Type>(int_type, [](Type*){});
-                                    LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<string, i32> from variable name");
+                                    // Try to extract the concrete types from the type name
+                                    size_t start = object_type_name.find('<');
+                                    size_t end = object_type_name.find('>');
+                                    if (start != std::string::npos && end != std::string::npos)
+                                    {
+                                        std::string args = object_type_name.substr(start + 1, end - start - 1);
+                                        size_t comma = args.find(',');
+                                        if (comma != std::string::npos)
+                                        {
+                                            std::string first_type = args.substr(0, comma);
+                                            std::string second_type = args.substr(comma + 1);
+
+                                            // Trim whitespace
+                                            first_type.erase(0, first_type.find_first_not_of(" \t"));
+                                            first_type.erase(first_type.find_last_not_of(" \t") + 1);
+                                            second_type.erase(0, second_type.find_first_not_of(" \t"));
+                                            second_type.erase(second_type.find_last_not_of(" \t") + 1);
+
+                                            // Look up the types
+                                            Type *first_concrete = lookup_type_by_name(first_type);
+                                            Type *second_concrete = lookup_type_by_name(second_type);
+
+                                            if (first_concrete && second_concrete)
+                                            {
+                                                substitution_map["K"] = std::shared_ptr<Type>(first_concrete, [](Type *) {});
+                                                substitution_map["V"] = std::shared_ptr<Type>(second_concrete, [](Type *) {});
+                                                LOG_DEBUG(Cryo::LogComponent::AST, "Extracted types from name: K={}, V={}",
+                                                          first_type, second_type);
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                    }
-                    
-                    // Also try to extract from type name patterns like "Pair<i32, string>"
-                    if (object_type_name.find("Pair<") != std::string::npos)
-                    {
-                        // Try to extract the concrete types from the type name
-                        size_t start = object_type_name.find('<');
-                        size_t end = object_type_name.find('>');
-                        if (start != std::string::npos && end != std::string::npos)
-                        {
-                            std::string args = object_type_name.substr(start + 1, end - start - 1);
-                            size_t comma = args.find(',');
-                            if (comma != std::string::npos)
-                            {
-                                std::string first_type = args.substr(0, comma);
-                                std::string second_type = args.substr(comma + 1);
-                                
-                                // Trim whitespace
-                                first_type.erase(0, first_type.find_first_not_of(" \t"));
-                                first_type.erase(first_type.find_last_not_of(" \t") + 1);
-                                second_type.erase(0, second_type.find_first_not_of(" \t"));
-                                second_type.erase(second_type.find_last_not_of(" \t") + 1);
-                                
-                                // Look up the types
-                                Type *first_concrete = lookup_type_by_name(first_type);
-                                Type *second_concrete = lookup_type_by_name(second_type);
-                                
-                                if (first_concrete && second_concrete)
-                                {
-                                    substitution_map["K"] = std::shared_ptr<Type>(first_concrete, [](Type*){});
-                                    substitution_map["V"] = std::shared_ptr<Type>(second_concrete, [](Type*){});
-                                    LOG_DEBUG(Cryo::LogComponent::AST, "Extracted types from name: K={}, V={}", 
-                                              first_type, second_type);
-                                }
-                            }
-                        }
-                    }
-                }                            // Perform substitution if we have mappings
+                            } // Perform substitution if we have mappings
                             auto subst_it = substitution_map.find(return_type->name());
                             if (subst_it != substitution_map.end())
                             {
-                                LOG_DEBUG(Cryo::LogComponent::AST, "Substituting {} -> {}", 
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Substituting {} -> {}",
                                           return_type->name(), subst_it->second->name());
-                                
+
                                 // Create substituted function type
                                 std::vector<Type *> param_types;
                                 for (const auto &param : func_type->parameter_types())
                                 {
                                     param_types.push_back(param.get());
                                 }
-                                
+
                                 Type *substituted_func_type = _type_context.create_function_type(
                                     subst_it->second.get(), param_types, func_type->is_variadic());
                                 node.set_resolved_type(substituted_func_type);
@@ -4587,7 +4596,7 @@ namespace Cryo
                         }
                     }
                 }
-                
+
                 // Found the method - store the resolved Type*
                 node.set_resolved_type(method_it->second);
                 return;
@@ -4600,6 +4609,15 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_methods map", lookup_type_name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_methods:");
+            for (const auto &[type_name, methods] : _struct_methods)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "  - Type '{}' has {} methods", type_name, methods.size());
+                for (const auto &[method_name, method_type] : methods)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "    - Method '{}' -> {}", method_name, method_type->to_string());
+                }
+            }
 
             // For generic types like "Array<int>", try looking up the base type "Array"
             size_t bracket_pos = lookup_type_name.find('<');
@@ -4854,15 +4872,16 @@ namespace Cryo
                 // Check for primitive type methods in the struct methods registry
                 // This allows stdlib-defined primitive methods to be properly resolved
                 std::string primitive_type_name = effective_type->name();
-                
+
                 LOG_DEBUG(Cryo::LogComponent::AST, "Looking for primitive method '{}' on type '{}'", member_name, primitive_type_name);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Available struct types in _struct_methods: {}", _struct_methods.size());
-                for (const auto& entry : _struct_methods) {
+                for (const auto &entry : _struct_methods)
+                {
                     LOG_DEBUG(Cryo::LogComponent::AST, "  - Type '{}' has {} methods", entry.first, entry.second.size());
                 }
-                
+
                 auto primitive_methods_it = _struct_methods.find(primitive_type_name);
-                
+
                 if (primitive_methods_it != _struct_methods.end())
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Found type '{}' in _struct_methods with {} methods", primitive_type_name, primitive_methods_it->second.size());
@@ -4878,7 +4897,7 @@ namespace Cryo
                             {
                                 node.set_resolved_type(func_type->return_type().get());
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Resolved primitive method '{}' on type '{}' to return type '{}'",
-                                         member_name, primitive_type_name, func_type->return_type()->to_string());
+                                          member_name, primitive_type_name, func_type->return_type()->to_string());
                                 return;
                             }
                         }
@@ -4886,7 +4905,8 @@ namespace Cryo
                     else
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' not found in type '{}', available methods:", member_name, primitive_type_name);
-                        for (const auto& method_entry : primitive_methods_it->second) {
+                        for (const auto &method_entry : primitive_methods_it->second)
+                        {
                             LOG_DEBUG(Cryo::LogComponent::AST, "  - {}", method_entry.first);
                         }
                     }
@@ -4895,7 +4915,7 @@ namespace Cryo
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Type '{}' not found in _struct_methods", primitive_type_name);
                 }
-                
+
                 // No method found in registry - reject member access on primitive types
                 std::string type_name = effective_type ? effective_type->to_string() : "unknown";
                 report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
@@ -4929,7 +4949,7 @@ namespace Cryo
         if (effective_type && effective_type->kind() == TypeKind::Class)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Checking base class methods for class '{}'", lookup_type_name);
-            
+
             // Look up the class definition to get its base class
             TypedSymbol *class_symbol = _symbol_table->lookup_symbol(lookup_type_name);
             if (class_symbol && class_symbol->class_node)
@@ -4939,7 +4959,7 @@ namespace Cryo
                 {
                     std::string base_class_name = class_decl->base_class();
                     LOG_DEBUG(Cryo::LogComponent::AST, "Class '{}' inherits from base class '{}'", lookup_type_name, base_class_name);
-                    
+
                     // Look up method in base class
                     auto base_method_it = _struct_methods.find(base_class_name);
                     if (base_method_it != _struct_methods.end())
@@ -4952,7 +4972,7 @@ namespace Cryo
                             return;
                         }
                     }
-                    
+
                     // Recursively check base classes (for multi-level inheritance)
                     TypedSymbol *base_symbol = _symbol_table->lookup_symbol(base_class_name);
                     if (base_symbol && base_symbol->class_node)
@@ -4962,7 +4982,7 @@ namespace Cryo
                         {
                             std::string grandparent_class_name = base_decl->base_class();
                             LOG_DEBUG(Cryo::LogComponent::AST, "Checking grandparent class '{}' for method '{}'", grandparent_class_name, member_name);
-                            
+
                             auto grandparent_method_it = _struct_methods.find(grandparent_class_name);
                             if (grandparent_method_it != _struct_methods.end())
                             {
@@ -4983,17 +5003,17 @@ namespace Cryo
         // Final error logging before giving up
         LOG_DEBUG(Cryo::LogComponent::AST, "MEMBER ACCESS RESOLUTION FAILED");
         LOG_DEBUG(Cryo::LogComponent::AST, "  member_name: '{}'", member_name);
-        LOG_DEBUG(Cryo::LogComponent::AST, "  effective_type: '{}' (kind: {})", 
-                  effective_type ? effective_type->name() : "null", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "  effective_type: '{}' (kind: {})",
+                  effective_type ? effective_type->name() : "null",
                   effective_type ? (int)effective_type->kind() : -1);
         LOG_DEBUG(Cryo::LogComponent::AST, "  lookup_type_name: '{}'", lookup_type_name);
-        
+
         // If this is an unknown type, it likely means the type instantiation failed earlier
         if (effective_type && effective_type->name() == "unknown")
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Unknown type detected - this suggests the base type wasn't properly registered or instantiated");
         }
-        
+
         // Use enhanced diagnostic builder for field access errors
         std::string type_name = effective_type ? effective_type->to_string() : "unknown";
         report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
@@ -5013,23 +5033,26 @@ namespace Cryo
             resolved_scope = _srm_context->resolve_namespace_alias(scope_name);
             if (resolved_scope != scope_name)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved scope alias '{}' -> '{}' for member '{}'", 
+                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved scope alias '{}' -> '{}' for member '{}'",
                           scope_name, resolved_scope, member_name);
             }
-            
+
             // Also try generating lookup candidates if direct alias resolution fails
             if (resolved_scope == scope_name)
             {
                 auto candidates = _srm_context->generate_lookup_candidates(scope_name, Cryo::SymbolKind::Type);
-                for (const auto& candidate : candidates)
+                for (const auto &candidate : candidates)
                 {
-                    if (!candidate) continue;
+                    if (!candidate)
+                        continue;
                     auto ns_parts = candidate->get_namespace_parts();
                     if (!ns_parts.empty())
                     {
                         std::string candidate_namespace = "";
-                        for (size_t i = 0; i < ns_parts.size(); ++i) {
-                            if (i > 0) candidate_namespace += "::";
+                        for (size_t i = 0; i < ns_parts.size(); ++i)
+                        {
+                            if (i > 0)
+                                candidate_namespace += "::";
                             candidate_namespace += ns_parts[i];
                         }
                         if (candidate->get_simple_name() == scope_name)
@@ -5264,7 +5287,7 @@ namespace Cryo
         if (!scope_symbol)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Scope symbol '{}' not found", base_scope_name);
-            
+
             // Use SRM helper to generate standardized qualified name
             std::vector<std::string> scope_parts = {scope_name};
             auto member_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
@@ -5363,11 +5386,11 @@ namespace Cryo
             }
             _template_parameters[struct_name] = param_names;
             LOG_DEBUG(Cryo::LogComponent::AST, "Stored template parameters for struct '{}': {} params", struct_name, param_names.size());
-            
+
             // CRITICAL FIX: Register struct template with TypeRegistry immediately
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering generic struct template: '{}' with {} parameters", struct_name, param_names.size());
             _type_registry->register_template(struct_name, param_names);
-            
+
             // SECOND CRITICAL FIX: Enter generic context BEFORE method signature processing
             LOG_DEBUG(Cryo::LogComponent::AST, "Entering generic context for struct '{}' with {} parameters", struct_name, param_names.size());
             enter_generic_context(struct_name, param_names, node.location());
@@ -5787,7 +5810,7 @@ namespace Cryo
                             }
                             // In stdlib mode, silently skip all redefinition errors for enum variants
                         }
-                        
+
                         // Only auto-increment if no explicit value was provided
                         if (!variant->has_explicit_value())
                         {
@@ -5875,7 +5898,7 @@ namespace Cryo
                     // Simple variants are essentially integer constants
                     Type *int_type = _type_context.get_int_type();
                     _symbol_table->declare_symbol(variant->name(), int_type, variant->location(), false);
-                    
+
                     // Only auto-increment if no explicit value was provided
                     if (!variant->has_explicit_value())
                     {
@@ -5969,6 +5992,20 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "ImplementationBlockNode::visit() - Processing implementation for type: {} (source: {})", target_type_name, _source_file);
         LOG_DEBUG(Cryo::LogComponent::AST, "Number of methods in this implementation: {}", node.method_implementations().size());
 
+        // Special debug logging for string implementation
+        if (target_type_name == "string")
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "=== PROCESSING STRING IMPLEMENTATION BLOCK ===");
+            LOG_DEBUG(Cryo::LogComponent::AST, "String implementation has {} methods", node.method_implementations().size());
+            for (const auto &method : node.method_implementations())
+            {
+                if (method)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "String method found: {}", method->name());
+                }
+            }
+        }
+
         if (!target_type_name.empty())
         {
             // Handle generic types like "Option<T>" by extracting the base type name
@@ -6028,8 +6065,8 @@ namespace Cryo
         {
             if (method)
             {
-// std::cout << "[DEBUG] Checking method: " << method->name() << " for type " << target_type_name << std::endl;
-                
+                // std::cout << "[DEBUG] Checking method: " << method->name() << " for type " << target_type_name << std::endl;
+
                 // Skip method validation for stdlib files - stdlib implementations
                 // are allowed to extend functionality without requiring explicit declarations
                 bool is_stdlib_file = (_stdlib_compilation_mode ||
@@ -6043,15 +6080,15 @@ namespace Cryo
                                        _source_file.find("std::Intrinsics") != std::string::npos);
 
                 // Also treat primitive types as stdlib types for validation purposes
-                bool is_primitive_target = (target_type_name == "string" || 
-                                          target_type_name == "i32" || 
-                                          target_type_name == "u32" || 
-                                          target_type_name == "i64" || 
-                                          target_type_name == "u64" || 
-                                          target_type_name == "f32" || 
-                                          target_type_name == "f64" || 
-                                          target_type_name == "bool" || 
-                                          target_type_name == "char");
+                bool is_primitive_target = (target_type_name == "string" ||
+                                            target_type_name == "i32" ||
+                                            target_type_name == "u32" ||
+                                            target_type_name == "i64" ||
+                                            target_type_name == "u64" ||
+                                            target_type_name == "f32" ||
+                                            target_type_name == "f64" ||
+                                            target_type_name == "bool" ||
+                                            target_type_name == "char");
 
                 if (!is_stdlib_file && !is_primitive_target)
                 {
@@ -6068,8 +6105,37 @@ namespace Cryo
                 }
 
                 LOG_DEBUG(Cryo::LogComponent::AST, "Processing method: {} for type {} (source: {})", method->name(), target_type_name, _source_file);
+
+                // Special debug for string methods
+                if (target_type_name == "string")
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "=== PROCESSING STRING METHOD: {} ===", method->name());
+                }
+
                 method->accept(*this);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Finished processing method: {} for type {} - should be registered in _struct_methods", method->name(), target_type_name);
+
+                // Verify registration for string methods
+                if (target_type_name == "string")
+                {
+                    auto it = _struct_methods.find("string");
+                    if (it != _struct_methods.end())
+                    {
+                        auto method_it = it->second.find(method->name());
+                        if (method_it != it->second.end())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "=== CONFIRMED: String method '{}' is registered in _struct_methods ===", method->name());
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "=== ERROR: String method '{}' NOT found in _struct_methods ===", method->name());
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "=== ERROR: No 'string' key found in _struct_methods ===");
+                    }
+                }
             }
         }
 
@@ -6208,65 +6274,65 @@ namespace Cryo
         if (!is_constructor && _symbol_table->lookup_symbol(method_name))
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Found existing symbol for method: '{}', checking if it's already registered...", method_name);
-            
+
             // Allow method registration for primitive types from stdlib without redefinition errors
-            bool is_primitive_method = (_current_struct_name == "string" || 
-                                      _current_struct_name == "i32" || 
-                                      _current_struct_name == "u32" || 
-                                      _current_struct_name == "i64" || 
-                                      _current_struct_name == "u64" || 
-                                      _current_struct_name == "f32" || 
-                                      _current_struct_name == "f64" || 
-                                      _current_struct_name == "bool" || 
-                                      _current_struct_name == "char");
-            
+            bool is_primitive_method = (_current_struct_name == "string" ||
+                                        _current_struct_name == "i32" ||
+                                        _current_struct_name == "u32" ||
+                                        _current_struct_name == "i64" ||
+                                        _current_struct_name == "u64" ||
+                                        _current_struct_name == "f32" ||
+                                        _current_struct_name == "f64" ||
+                                        _current_struct_name == "bool" ||
+                                        _current_struct_name == "char");
+
             bool is_stdlib_context = (_stdlib_compilation_mode ||
-                                    _source_file.find("stdlib") != std::string::npos ||
-                                    _source_file.find("/stdlib/") != std::string::npos ||
-                                    _source_file.find("\\stdlib\\") != std::string::npos ||
-                                    _source_file.find("core/") != std::string::npos ||
-                                    _source_file.find("/core/") != std::string::npos ||
-                                    _source_file.find("\\core\\") != std::string::npos ||
-                                    _source_file.find("std::core::Types") != std::string::npos ||
-                                    _source_file.find("std::Intrinsics") != std::string::npos);
-            
+                                      _source_file.find("stdlib") != std::string::npos ||
+                                      _source_file.find("/stdlib/") != std::string::npos ||
+                                      _source_file.find("\\stdlib\\") != std::string::npos ||
+                                      _source_file.find("core/") != std::string::npos ||
+                                      _source_file.find("/core/") != std::string::npos ||
+                                      _source_file.find("\\core\\") != std::string::npos ||
+                                      _source_file.find("std::core::Types") != std::string::npos ||
+                                      _source_file.find("std::Intrinsics") != std::string::npos);
+
             if (is_primitive_method && is_stdlib_context)
             {
                 // Skip redefinition check for primitive methods from stdlib
             }
             else
             {
-            // Check if this method was already registered during signature registration
-            bool is_method_already_registered = false;
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found existing symbol '{}', current_struct_name='{}', checking method registries...",
-                      method_name, _current_struct_name);
-            if (!_current_struct_name.empty())
-            {
-                // Check if this method was already registered in the method registries
-                auto public_methods_it = _struct_methods.find(_current_struct_name);
-                auto private_methods_it = _private_struct_methods.find(_current_struct_name);
-
-                bool found_in_public = (public_methods_it != _struct_methods.end() &&
-                                        public_methods_it->second.find(method_name) != public_methods_it->second.end());
-                bool found_in_private = (private_methods_it != _private_struct_methods.end() &&
-                                         private_methods_it->second.find(method_name) != private_methods_it->second.end());
-
-                LOG_DEBUG(Cryo::LogComponent::AST, "StructMethod lookup for '{}': found_in_public={}, found_in_private={}",
-                          method_name, found_in_public, found_in_private);
-
-                if (found_in_public || found_in_private)
+                // Check if this method was already registered during signature registration
+                bool is_method_already_registered = false;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found existing symbol '{}', current_struct_name='{}', checking method registries...",
+                          method_name, _current_struct_name);
+                if (!_current_struct_name.empty())
                 {
-                    is_method_already_registered = true;
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing redefinition error for struct method '{}' in '{}' - already registered during signature phase",
-                              method_name, _current_struct_name);
-                }
-            }
+                    // Check if this method was already registered in the method registries
+                    auto public_methods_it = _struct_methods.find(_current_struct_name);
+                    auto private_methods_it = _private_struct_methods.find(_current_struct_name);
 
-            if (!is_method_already_registered)
-            {
-                _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, node.location());
-                return;
-            }
+                    bool found_in_public = (public_methods_it != _struct_methods.end() &&
+                                            public_methods_it->second.find(method_name) != public_methods_it->second.end());
+                    bool found_in_private = (private_methods_it != _private_struct_methods.end() &&
+                                             private_methods_it->second.find(method_name) != private_methods_it->second.end());
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "StructMethod lookup for '{}': found_in_public={}, found_in_private={}",
+                              method_name, found_in_public, found_in_private);
+
+                    if (found_in_public || found_in_private)
+                    {
+                        is_method_already_registered = true;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Suppressing redefinition error for struct method '{}' in '{}' - already registered during signature phase",
+                                  method_name, _current_struct_name);
+                    }
+                }
+
+                if (!is_method_already_registered)
+                {
+                    _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, node.location());
+                    return;
+                }
             }
         }
 
@@ -6406,9 +6472,9 @@ namespace Cryo
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
                         _private_struct_methods[_current_struct_name][method_name] = func_type;
-                        
+
                         // Extract parameter types for SRM naming
-                        std::vector<Cryo::Type*> parameter_types;
+                        std::vector<Cryo::Type *> parameter_types;
                         for (const auto &param : node.parameters())
                         {
                             if (param && param->get_resolved_type())
@@ -6426,9 +6492,9 @@ namespace Cryo
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method '{}' for struct '{}'", method_name, _current_struct_name);
                         _struct_methods[_current_struct_name][method_name] = func_type;
-                        
+
                         // Extract parameter types for SRM naming (reuse from above if this is duplicate code)
-                        std::vector<Cryo::Type*> parameter_types;
+                        std::vector<Cryo::Type *> parameter_types;
                         for (const auto &param : node.parameters())
                         {
                             if (param && param->get_resolved_type())
@@ -6618,7 +6684,7 @@ namespace Cryo
                 return true;
             }
         }
-        
+
         // SPECIAL CASE: Allow assignment between generic parameters and their concrete instantiations
         // This handles cases where T (generic) should be compatible with int (concrete) in Array<int>
         // Also handle Unknown types that might be unresolved generic parameters
@@ -6632,7 +6698,7 @@ namespace Cryo
 
         // SPECIAL CASE: Empty array literal compatibility
         // Allow assignment of "unknown" type to array types (this happens with empty array literals [])
-        if (rhs_type->kind() == TypeKind::Unknown && 
+        if (rhs_type->kind() == TypeKind::Unknown &&
             (lhs_type->kind() == TypeKind::Parameterized || lhs_type->kind() == TypeKind::Array) &&
             lhs_str.find("Array") != std::string::npos)
         {
@@ -6682,7 +6748,7 @@ namespace Cryo
         {
             Type *array_type = nullptr;
             Type *param_type = nullptr;
-            
+
             if (lhs_type->kind() == TypeKind::Array)
             {
                 array_type = lhs_type;
@@ -6693,17 +6759,17 @@ namespace Cryo
                 array_type = rhs_type;
                 param_type = lhs_type;
             }
-            
+
             auto array_t = static_cast<ArrayType *>(array_type);
             auto param_t = static_cast<ParameterizedType *>(param_type);
-            
+
             // Check if the parameterized type is Array<T>
             if (param_t->base_name() == "Array" && param_t->type_parameters().size() == 1)
             {
                 // Compare element types
                 auto array_element = array_t->element_type();
                 auto param_element = param_t->type_parameters()[0];
-                
+
                 if (array_element && param_element)
                 {
                     // Recursively check if element types are compatible
@@ -6723,20 +6789,20 @@ namespace Cryo
         {
             auto lhs_param = static_cast<ParameterizedType *>(lhs_type);
             auto rhs_param = static_cast<ParameterizedType *>(rhs_type);
-            
+
             // Both must be Array types with same number of parameters
             if (lhs_param->base_name() == "Array" && rhs_param->base_name() == "Array" &&
                 lhs_param->type_parameters().size() == 1 && rhs_param->type_parameters().size() == 1)
             {
                 auto lhs_element = lhs_param->type_parameters()[0];
                 auto rhs_element = rhs_param->type_parameters()[0];
-                
+
                 if (lhs_element && rhs_element)
                 {
                     // Handle the case where one side has unspecified inner Array type (Array<Array> vs Array<Array<int>>)
                     std::string lhs_elem_str = lhs_element->to_string();
                     std::string rhs_elem_str = rhs_element->to_string();
-                    
+
                     // If one element is just "Array" and the other is "Array<T>", allow compatibility
                     if ((lhs_elem_str == "Array" && rhs_elem_str.find("Array<") == 0) ||
                         (rhs_elem_str == "Array" && lhs_elem_str.find("Array<") == 0))
@@ -6744,7 +6810,7 @@ namespace Cryo
                         LOG_DEBUG(Cryo::LogComponent::AST, "Allowing Array<Array> vs Array<Array<T>> compatibility: {} = {}", lhs_str, rhs_str);
                         return true;
                     }
-                    
+
                     // Otherwise recursively check element compatibility
                     if (check_assignment_compatibility(lhs_element.get(), rhs_element.get(), loc))
                     {
@@ -6768,7 +6834,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing nested array compatibility via string match: {} = {}", lhs_str, rhs_str);
                 return true;
             }
-            
+
             // Also handle more specific patterns like int[][] vs Array<Array<int>>
             if (lhs_str.find("[][]") != std::string::npos && rhs_str.find("Array<Array<") == 0)
             {
@@ -7081,30 +7147,35 @@ namespace Cryo
             return false;
 
         const auto &param_types = func_type->parameter_types();
-        LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: param_types.size()={}", param_types.size()); 
-        
+        LOG_DEBUG(Cryo::LogComponent::AST, "check_function_call_compatibility: param_types.size()={}", param_types.size());
+
         // For variadic functions, param_types only contains the fixed parameters
         // The variadic parameters are handled separately via the is_variadic flag
         // However, there's a bug where some variadic functions (like printf) have is_variadic()=false
         // but still have variadic type parameters. Check for this case as backup.
         bool is_actually_variadic = func_type->is_variadic();
-        
+
         // Backup check: if param_types contains a variadic type, treat as variadic
-        if (!is_actually_variadic) {
-            for (const auto& param_type : param_types) {
-                if (param_type && param_type->kind() == TypeKind::Variadic) {
+        if (!is_actually_variadic)
+        {
+            for (const auto &param_type : param_types)
+            {
+                if (param_type && param_type->kind() == TypeKind::Variadic)
+                {
                     is_actually_variadic = true;
                     LOG_DEBUG(Cryo::LogComponent::AST, "Detected variadic function via parameter type analysis");
                     break;
                 }
             }
         }
-        
+
         // For variadic functions, exclude the variadic parameter from required count
         size_t required_params = param_types.size();
-        if (is_actually_variadic && required_params > 0) {
+        if (is_actually_variadic && required_params > 0)
+        {
             // Check if the last parameter is variadic
-            if (!param_types.empty() && param_types.back()->kind() == TypeKind::Variadic) {
+            if (!param_types.empty() && param_types.back()->kind() == TypeKind::Variadic)
+            {
                 required_params = param_types.size() - 1;
             }
         }
@@ -7261,7 +7332,7 @@ namespace Cryo
         if (_diagnostic_builder)
         {
             LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Using diagnostic builder for type mismatch in {}", context);
-            
+
             // Use appropriate diagnostic builder method based on context
             if (context == "arithmetic operation")
             {
@@ -7542,9 +7613,9 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
             _private_struct_methods[_current_struct_name][method_name] = func_type;
-            
+
             // Extract parameter types for SRM naming
-            std::vector<Cryo::Type*> parameter_types;
+            std::vector<Cryo::Type *> parameter_types;
             for (const auto &param : node.parameters())
             {
                 if (param && param->get_resolved_type())
@@ -7575,9 +7646,9 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
             _struct_methods[_current_struct_name][method_name] = func_type;
-            
+
             // Extract parameter types for SRM naming
-            std::vector<Cryo::Type*> parameter_types;
+            std::vector<Cryo::Type *> parameter_types;
             for (const auto &param : node.parameters())
             {
                 if (param && param->get_resolved_type())
@@ -7865,12 +7936,12 @@ namespace Cryo
             auto pointer_type = static_cast<PointerType *>(type.get());
             auto pointed_to_type = pointer_type->pointee_type();
             auto substituted_pointed_to = substitute_type_with_map(pointed_to_type, substitution_map);
-            
+
             // If the pointed-to type was substituted, create a new pointer type
             if (substituted_pointed_to != pointed_to_type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted pointer type: {}* -> {}*", 
-                         pointed_to_type->name(), substituted_pointed_to->name());
+                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted pointer type: {}* -> {}*",
+                          pointed_to_type->name(), substituted_pointed_to->name());
                 return std::make_shared<PointerType>(substituted_pointed_to);
             }
             break;
@@ -7880,12 +7951,12 @@ namespace Cryo
             auto ref_type = static_cast<ReferenceType *>(type.get());
             auto referenced_type = ref_type->referent_type();
             auto substituted_referenced = substitute_type_with_map(referenced_type, substitution_map);
-            
+
             // If the referenced type was substituted, create a new reference type
             if (substituted_referenced != referenced_type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted reference type: {}& -> {}&", 
-                         referenced_type->name(), substituted_referenced->name());
+                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted reference type: {}& -> {}&",
+                          referenced_type->name(), substituted_referenced->name());
                 return std::make_shared<ReferenceType>(substituted_referenced);
             }
             break;
@@ -7895,12 +7966,12 @@ namespace Cryo
             auto array_type = static_cast<ArrayType *>(type.get());
             auto element_type = array_type->element_type();
             auto substituted_element = substitute_type_with_map(element_type, substitution_map);
-            
+
             // If the element type was substituted, create a new array type
             if (substituted_element != element_type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted array type: {}[] -> {}[]", 
-                         element_type->name(), substituted_element->name());
+                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted array type: {}[] -> {}[]",
+                          element_type->name(), substituted_element->name());
                 return std::make_shared<ArrayType>(substituted_element, array_type->array_size());
             }
             break;
@@ -7910,11 +7981,11 @@ namespace Cryo
             auto func_type = static_cast<FunctionType *>(type.get());
             auto return_type = func_type->return_type();
             auto substituted_return_type = substitute_type_with_map(return_type, substitution_map);
-            
+
             // Substitute parameter types
             std::vector<Type *> substituted_param_types;
             bool params_changed = false;
-            
+
             for (const auto &param_type : func_type->parameter_types())
             {
                 auto substituted_param = substitute_type_with_map(param_type, substitution_map);
@@ -7924,13 +7995,13 @@ namespace Cryo
                     params_changed = true;
                 }
             }
-            
+
             // If return type or parameters were substituted, create a new function type
             if (substituted_return_type != return_type || params_changed)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted function type: return {} -> {}", 
-                         return_type->name(), substituted_return_type->name());
-                return std::shared_ptr<Type>(_type_context.create_function_type(substituted_return_type.get(), substituted_param_types, func_type->is_variadic()), [](Type*) {});
+                LOG_DEBUG(Cryo::LogComponent::AST, "Creating substituted function type: return {} -> {}",
+                          return_type->name(), substituted_return_type->name());
+                return std::shared_ptr<Type>(_type_context.create_function_type(substituted_return_type.get(), substituted_param_types, func_type->is_variadic()), [](Type *) {});
             }
             break;
         }
@@ -7947,9 +8018,9 @@ namespace Cryo
     // SRM Helper Methods
     //===================================================================
 
-    std::string TypeChecker::generate_function_name(const std::string& function_name, const std::vector<Cryo::Type*>& parameter_types)
+    std::string TypeChecker::generate_function_name(const std::string &function_name, const std::vector<Cryo::Type *> &parameter_types)
     {
-        if (!_srm_manager) 
+        if (!_srm_manager)
         {
             // Fallback to simple name if SRM is not available
             return function_name;
@@ -7958,7 +8029,7 @@ namespace Cryo
         try
         {
             auto namespace_parts = get_current_namespace_parts();
-            
+
             if (parameter_types.empty())
             {
                 // Simple function without parameters
@@ -7974,25 +8045,26 @@ namespace Cryo
                 return identifier->to_overload_key();
             }
         }
-        catch (const std::exception& e)
+        catch (const std::exception &e)
         {
             // Fallback to simple name if SRM fails
             return function_name;
         }
     }
 
-    std::string TypeChecker::generate_method_name(const std::string& type_name, const std::string& method_name, const std::vector<Cryo::Type*>& parameter_types)
+    std::string TypeChecker::generate_method_name(const std::string &type_name, const std::string &method_name, const std::vector<Cryo::Type *> &parameter_types)
     {
-        if (!_srm_manager) 
+        if (!_srm_manager)
         {
             // Enhanced fallback using SRM utilities for consistency
             auto namespace_parts = get_current_namespace_parts();
             namespace_parts.push_back(type_name);
-            
-            if (_diagnostic_builder) {
+
+            if (_diagnostic_builder)
+            {
                 LOG_WARN(LogComponent::AST, "SRM manager not available for method name generation: {}::{}", type_name, method_name);
             }
-            
+
             return Cryo::SRM::Utils::build_qualified_name(namespace_parts, method_name);
         }
 
@@ -8001,7 +8073,7 @@ namespace Cryo
             auto namespace_parts = get_current_namespace_parts();
             // Add the type name to the namespace parts for method scoping
             namespace_parts.push_back(type_name);
-            
+
             if (parameter_types.empty())
             {
                 // Simple method without parameters
@@ -8011,13 +8083,13 @@ namespace Cryo
             }
             else
             {
-                // Method with parameters - create method identifier  
+                // Method with parameters - create method identifier
                 auto identifier = std::make_unique<Cryo::SRM::FunctionIdentifier>(
                     namespace_parts, method_name, parameter_types);
                 return identifier->to_overload_key();
             }
         }
-        catch (const std::exception& e)
+        catch (const std::exception &e)
         {
             // Fallback to manual concatenation
             auto namespace_parts = get_current_namespace_parts();
@@ -8026,9 +8098,9 @@ namespace Cryo
         }
     }
 
-    std::string TypeChecker::generate_qualified_name(const std::string& base_name, Cryo::SymbolKind symbol_kind)
+    std::string TypeChecker::generate_qualified_name(const std::string &base_name, Cryo::SymbolKind symbol_kind)
     {
-        if (!_srm_manager) 
+        if (!_srm_manager)
         {
             auto namespace_parts = get_current_namespace_parts();
             if (namespace_parts.empty())
@@ -8044,7 +8116,7 @@ namespace Cryo
                 namespace_parts, base_name, symbol_kind);
             return identifier->to_string();
         }
-        catch (const std::exception& e)
+        catch (const std::exception &e)
         {
             // Fallback to manual concatenation
             auto namespace_parts = get_current_namespace_parts();
@@ -8058,13 +8130,13 @@ namespace Cryo
     std::vector<std::string> TypeChecker::get_current_namespace_parts() const
     {
         std::vector<std::string> namespace_parts;
-        if (!_current_namespace.empty()) 
+        if (!_current_namespace.empty())
         {
             std::istringstream iss(_current_namespace);
             std::string part;
-            while (std::getline(iss, part, ':')) 
+            while (std::getline(iss, part, ':'))
             {
-                if (!part.empty() && part != ":") 
+                if (!part.empty() && part != ":")
                 {
                     namespace_parts.push_back(part);
                 }
@@ -8072,68 +8144,82 @@ namespace Cryo
         }
         return namespace_parts;
     }
-    
-    std::string TypeChecker::resolve_module_path_to_namespace(const std::string& module_path) const
+
+    std::string TypeChecker::resolve_module_path_to_namespace(const std::string &module_path) const
     {
         // Handle special core module mappings first
-        if (module_path == "core/types") {
-            return "std";  // Core types are in std namespace
+        if (module_path == "core/types")
+        {
+            return "std"; // Core types are in std namespace
         }
-        if (module_path == "core/syscall") {
+        if (module_path == "core/syscall")
+        {
             return "std::Syscall";
         }
-        if (module_path == "core/intrinsics") {
+        if (module_path == "core/intrinsics")
+        {
             return "std::Intrinsics";
         }
-        
+
         // Dynamic resolution: Convert module path like "io/stdio" to "std::IO"
         // This creates a more predictable mapping pattern
         std::string namespace_path = "std";
-        
+
         std::string path = module_path;
         size_t start = 0;
         size_t end = path.find('/');
-        
+
         // Special handling for certain patterns
-        if (module_path == "io/stdio") {
-            return "std::IO";  // Map io/stdio to std::IO
+        if (module_path == "io/stdio")
+        {
+            return "std::IO"; // Map io/stdio to std::IO
         }
-        
+
         // Process path segments
         std::vector<std::string> segments;
-        while (end != std::string::npos) {
+        while (end != std::string::npos)
+        {
             std::string segment = path.substr(start, end - start);
             segments.push_back(segment);
             start = end + 1;
             end = path.find('/', start);
         }
-        
+
         // Add the final segment
         std::string final_segment = path.substr(start);
-        if (!final_segment.empty()) {
+        if (!final_segment.empty())
+        {
             segments.push_back(final_segment);
         }
-        
+
         // Build namespace path
-        for (size_t i = 0; i < segments.size(); ++i) {
-            if (i == segments.size() - 1) {
+        for (size_t i = 0; i < segments.size(); ++i)
+        {
+            if (i == segments.size() - 1)
+            {
                 // Last segment gets capitalized (e.g., "stdio" -> "IO" for special cases)
-                if (segments[i] == "stdio" && segments.size() >= 2 && segments[segments.size()-2] == "io") {
+                if (segments[i] == "stdio" && segments.size() >= 2 && segments[segments.size() - 2] == "io")
+                {
                     namespace_path += "::IO";
-                } else {
+                }
+                else
+                {
                     // Capitalize first letter of final segment
                     std::string capitalized = segments[i];
-                    if (!capitalized.empty()) {
+                    if (!capitalized.empty())
+                    {
                         capitalized[0] = std::toupper(capitalized[0]);
                     }
                     namespace_path += "::" + capitalized;
                 }
-            } else {
+            }
+            else
+            {
                 // Intermediate segments remain lowercase
                 namespace_path += "::" + segments[i];
             }
         }
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Resolved module path '{}' to namespace '{}'", module_path, namespace_path);
         return namespace_path;
     }
@@ -8146,7 +8232,7 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Found template parameters for '{}': {} params", type_name, it->second.size());
             return it->second;
         }
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "No template parameters found for '{}'", type_name);
         return {};
     }

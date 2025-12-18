@@ -53,6 +53,29 @@ namespace Cryo
         // Pass the main ASTContext to ensure all modules use the same TypeContext
         _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry, *_ast_context);
 
+        // Set auto-import callback for runtime dependencies
+        _module_loader->set_auto_import_callback([this](SymbolTable *symbol_table, const std::string &scope_name, const std::string &source_file)
+                                                 {
+            // For runtime dependencies, only import what runtime needs: core/types and intrinsics
+            // Don't do full auto-imports to avoid circular dependencies
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-importing dependencies for runtime module");
+            
+            // Import core/types for string methods
+            auto core_types_import = std::make_unique<ImportDeclarationNode>(
+                SourceLocation(0, 0), "core/types", ImportDeclarationNode::ImportType::Absolute);
+            auto core_types_result = _module_loader->load_import(*core_types_import);
+            if (core_types_result.success && !core_types_result.symbol_map.empty()) {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime auto-import: loaded core/types with {} symbols", core_types_result.symbol_map.size());
+            }
+            
+            // Import intrinsics for __malloc__, __free__, etc.
+            auto intrinsics_import = std::make_unique<ImportDeclarationNode>(
+                SourceLocation(0, 0), "core/intrinsics", ImportDeclarationNode::ImportType::Absolute);
+            auto intrinsics_result = _module_loader->load_import(*intrinsics_import);
+            if (intrinsics_result.success && !intrinsics_result.symbol_map.empty()) {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime auto-import: loaded intrinsics with {} symbols", intrinsics_result.symbol_map.size());
+            } });
+
         // Initialize directive system
         initialize_directive_system();
 
@@ -996,10 +1019,10 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing struct declarations before function pre-registration...");
                 // Enable pre-registration mode to skip method body generation
                 _codegen->get_visitor()->set_pre_registration_mode(true);
-                
+
                 // First, process struct declarations to ensure TypeMapper has correct type information
                 process_struct_declarations_for_preregistration(node);
-                
+
                 // Disable pre-registration mode
                 _codegen->get_visitor()->set_pre_registration_mode(false);
 
@@ -1577,12 +1600,17 @@ namespace Cryo
 
     void CompilerInstance::inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name)
     {
-        // Special handling for runtime files in stdlib mode - they need access to intrinsics
+        // Special handling for runtime files in stdlib mode - they need access to intrinsics AND core/types
         if (_stdlib_compilation_mode &&
             (_source_file.find("runtime/runtime.cryo") != std::string::npos ||
-             _source_file.find("stdlib/runtime/runtime.cryo") != std::string::npos))
+             _source_file.find("stdlib/runtime/runtime.cryo") != std::string::npos ||
+             _source_file.find("runtime\\runtime.cryo") != std::string::npos ||
+             _source_file.find("stdlib\\runtime\\runtime.cryo") != std::string::npos ||
+             _source_file.find("std::Runtime") != std::string::npos ||
+             _source_file == "runtime/runtime" ||
+             _source_file == "std::Runtime.cryo"))
         {
-            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading intrinsics for runtime compilation");
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading intrinsics and core/types for runtime compilation");
 
             // Load intrinsics for runtime compilation by importing the compiled stdlib
             try
@@ -1601,9 +1629,6 @@ namespace Cryo
                 // Load the intrinsics import
                 auto intrinsics_result = _module_loader->load_import(*intrinsics_import);
 
-                // Restore stdlib mode
-                _stdlib_compilation_mode = original_stdlib_mode;
-
                 if (intrinsics_result.success && !intrinsics_result.symbol_map.empty())
                 {
                     current_scope->register_namespace(intrinsics_result.module_name, intrinsics_result.symbol_map);
@@ -1614,10 +1639,34 @@ namespace Cryo
                 {
                     LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to load intrinsics for runtime: {}", intrinsics_result.error_message);
                 }
+
+                // Also load core/types for runtime files to access string.length() and other primitive methods
+                auto core_types_import = std::make_unique<ImportDeclarationNode>(
+                    SourceLocation(0, 0),                       // synthetic location
+                    "core/types",                               // path
+                    ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
+                );
+
+                // Load the core/types import
+                auto core_types_result = _module_loader->load_import(*core_types_import);
+
+                // Restore stdlib mode
+                _stdlib_compilation_mode = original_stdlib_mode;
+
+                if (core_types_result.success && !core_types_result.symbol_map.empty())
+                {
+                    current_scope->register_namespace(core_types_result.module_name, core_types_result.symbol_map);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loaded {} core/types symbols for runtime compilation - string methods should now be available",
+                              core_types_result.symbol_map.size());
+                }
+                else
+                {
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to load core/types for runtime: {}", core_types_result.error_message);
+                }
             }
             catch (const std::exception &e)
             {
-                LOG_ERROR(Cryo::LogComponent::GENERAL, "Exception loading intrinsics for runtime: {}", e.what());
+                LOG_ERROR(Cryo::LogComponent::GENERAL, "Exception loading auto-imports for runtime: {}", e.what());
             }
 
             return; // Don't do other auto-imports in stdlib mode
@@ -1626,8 +1675,13 @@ namespace Cryo
         // Skip auto-import if we're in stdlib compilation mode to avoid circular dependencies
         // Exception: runtime files need access to core/types for string methods
         bool is_runtime_file = (_source_file.find("runtime/runtime.cryo") != std::string::npos ||
-                               _source_file.find("stdlib/runtime/runtime.cryo") != std::string::npos);
-        
+                                _source_file.find("stdlib/runtime/runtime.cryo") != std::string::npos ||
+                                _source_file.find("runtime\\runtime.cryo") != std::string::npos ||
+                                _source_file.find("stdlib\\runtime\\runtime.cryo") != std::string::npos ||
+                                _source_file.find("std::Runtime") != std::string::npos ||
+                                _source_file == "runtime/runtime" ||
+                                _source_file == "std::Runtime.cryo");
+
         if (_stdlib_compilation_mode && !is_runtime_file)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports in stdlib compilation mode");
@@ -1642,7 +1696,10 @@ namespace Cryo
 
         // Skip auto-import if we're compiling the core/types module itself to avoid circular dependencies
         if (_source_file.find("core/types.cryo") != std::string::npos ||
-            _source_file.find("stdlib/core/types.cryo") != std::string::npos)
+            _source_file.find("stdlib/core/types.cryo") != std::string::npos ||
+            _source_file.find("core\\types.cryo") != std::string::npos ||
+            _source_file.find("stdlib\\core\\types.cryo") != std::string::npos ||
+            _source_file.find("std::Core") != std::string::npos)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports when compiling core/types module itself");
             return;
@@ -1650,12 +1707,13 @@ namespace Cryo
 
         // Check if we're in stdlib mode and only allow core/types for runtime files
         bool stdlib_mode_runtime_exception = _stdlib_compilation_mode && is_runtime_file;
-        
-        if (is_runtime_file) {
-            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file detected: {}, stdlib_mode: {}, exception_active: {}", 
+
+        if (is_runtime_file)
+        {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file detected: {}, stdlib_mode: {}, exception_active: {}",
                       _source_file, _stdlib_compilation_mode, stdlib_mode_runtime_exception);
         }
-        
+
         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: core/types");
 
         // Use the member ModuleLoader instance
@@ -1686,7 +1744,8 @@ namespace Cryo
                 current_scope->register_namespace(result.module_name, result.symbol_map);
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported core/types: registered namespace '{}' with {} symbols",
                           result.module_name, result.symbol_map.size());
-                if (is_runtime_file) {
+                if (is_runtime_file)
+                {
                     LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file successfully auto-imported core/types - implementation blocks should be processed later");
                 }
             }
@@ -1698,7 +1757,8 @@ namespace Cryo
         else
         {
             LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import core/types: {}", result.error_message);
-            if (is_runtime_file) {
+            if (is_runtime_file)
+            {
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "CRITICAL: Runtime file failed to auto-import core/types - string methods will be unavailable!");
             }
         }

@@ -96,9 +96,12 @@ def compile_module(cryo_exe, source_file, output_file, extra_flags=None, stdlib_
         else:
             log(f"✗ {Colors.FAIL}Compilation failed{Colors.ENDC} for {rel_path}", "ERROR")
             # Show the error details from the compiler even if not in debug mode
-            log(f"Error details: {result.stderr}", "ERROR")
+            if result.stderr:
+                log(f"Error details (stderr): {result.stderr}", "ERROR")
+            if result.stdout:
+                log(f"Error details (stdout): {result.stdout}", "ERROR")
             if extra_flags and '--debug' in extra_flags:
-                log(f"Error details: {result.stderr}", "ERROR")
+                log(f"Full command: {' '.join(cmd)}", "ERROR")
             # Create stub file
             with open(output_file, 'w') as f:
                 f.write(f'"; Compilation failed for {os.path.relpath(source_file)}\n')
@@ -252,7 +255,9 @@ def build_runtime(cryo_exe, stdlib_dir, build_dir, extra_flags=None):
         bc_filename = filename.replace('.cryo', '.bc')
         output_file = os.path.join(runtime_build_dir, bc_filename)
         
-        if compile_module(cryo_exe, cryo_file, output_file, extra_flags, stdlib_mode=True):
+        # Temporarily add --debug flag for runtime compilation debugging
+        debug_flags = (extra_flags or []) + ['--debug']
+        if compile_module(cryo_exe, cryo_file, output_file, debug_flags, stdlib_mode=True):
             if not is_stub_file(output_file):
                 runtime_bc_files.append(output_file)
                 success_count += 1
