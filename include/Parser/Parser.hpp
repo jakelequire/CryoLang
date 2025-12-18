@@ -43,12 +43,12 @@ namespace Cryo
         bool _in_implementation_block = false;
         std::string _current_namespace = "Global"; // Current namespace context
         int _scope_depth = 0;                      // Track nesting depth (0 = global scope)
-        
+
         // Bracket depth tracking for improved error recovery
-        int _brace_depth = 0;                      // Track { } nesting
-        int _paren_depth = 0;                      // Track ( ) nesting
-        int _bracket_depth = 0;                    // Track [ ] nesting
-        size_t _tokens_consumed = 0;               // Track total tokens processed for diagnostics
+        int _brace_depth = 0;        // Track { } nesting
+        int _paren_depth = 0;        // Track ( ) nesting
+        int _bracket_depth = 0;      // Track [ ] nesting
+        size_t _tokens_consumed = 0; // Track total tokens processed for diagnostics
 
         // Documentation comment collection
         std::vector<std::string> _pending_doc_comments; // Collected doc comments waiting to be attached
@@ -82,7 +82,7 @@ namespace Cryo
             if (_scope_depth > 0)
                 _scope_depth--;
         }
-        
+
         // Bracket depth tracking (for error recovery)
         int brace_depth() const { return _brace_depth; }
         int paren_depth() const { return _paren_depth; }
@@ -93,9 +93,9 @@ namespace Cryo
         void set_directive_registry(DirectiveRegistry *registry) { _directive_registry = registry; }
 
         // SRM Helper Methods for standardized naming during parsing
-        std::string generate_qualified_namespace_name(const std::string& namespace_name);
-        std::string generate_qualified_type_name(const std::string& base_name, const std::string& member_name);
-        std::string generate_scope_resolution_name(const std::string& scope_name, const std::string& member_name);
+        std::string generate_qualified_namespace_name(const std::string &namespace_name);
+        std::string generate_qualified_type_name(const std::string &base_name, const std::string &member_name);
+        std::string generate_scope_resolution_name(const std::string &scope_name, const std::string &member_name);
         std::vector<std::string> get_current_namespace_parts() const;
 
     private:
@@ -260,12 +260,12 @@ namespace Cryo
         // Enhanced diagnostic helper methods
         bool is_delimiter_token(TokenKind kind) const;
         char get_delimiter_char(TokenKind kind) const;
-        
+
         // Error recovery helper methods
         bool is_top_level_declaration_start(TokenKind kind) const;
         bool is_statement_start(TokenKind kind) const;
         bool is_forced_recovery_point(TokenKind kind) const;
-        
+
         // Bracket depth management
         void update_bracket_depth(TokenKind kind);
         void reset_parsing_state();

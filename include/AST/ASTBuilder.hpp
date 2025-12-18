@@ -74,7 +74,7 @@ namespace Cryo
         bool is_literal_token(TokenKind kind) const;
         void validate_identifier_token(const Token &token) const;
         void validate_literal_token(const Token &token) const;
-        
+
         // Type lookup helper (replacement for parse_type_from_string)
         Cryo::Type *lookup_type_by_name(const std::string &type_name);
     };

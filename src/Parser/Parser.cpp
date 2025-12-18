@@ -2913,15 +2913,15 @@ namespace Cryo
     {
         SourceLocation start_loc = _current_token.location();
         consume(TokenKind::TK_KW_UNSAFE, "Expected 'unsafe'");
-        
+
         auto block = parse_block_statement();
-        if (auto block_stmt = dynamic_cast<BlockStatementNode*>(block.get()))
+        if (auto block_stmt = dynamic_cast<BlockStatementNode *>(block.get()))
         {
             block.release(); // Release ownership
             auto unsafe_block = std::unique_ptr<BlockStatementNode>(block_stmt);
             return _builder.create_unsafe_block_statement(start_loc, std::move(unsafe_block));
         }
-        
+
         error("Expected block statement after 'unsafe'");
         return nullptr;
     }
