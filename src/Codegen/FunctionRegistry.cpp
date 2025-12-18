@@ -32,7 +32,7 @@ namespace Cryo::Codegen
             LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to initialize Symbol Resolution Manager in FunctionRegistry: {}", e.what());
             _symbol_resolution_manager = nullptr;
         }
-        
+
         initialize_pattern_matchers();
     }
 
@@ -46,16 +46,15 @@ namespace Cryo::Codegen
         {
             // List of runtime functions that should be auto-qualified when called from within runtime namespace
             static const std::set<std::string> runtime_functions = {
-                "cryo_alloc", "cryo_memcpy", "cryo_free", "cryo_realloc", "cryo_malloc", 
+                "cryo_alloc", "cryo_memcpy", "cryo_free", "cryo_realloc", "cryo_malloc",
                 "cryo_strlen", "cryo_strcmp", "cryo_strcpy", "cryo_strcat", "cryo_runtime_allocate",
-                "cryo_runtime_deallocate", "cryo_profile_start", "cryo_profile_end", 
-                "cryo_throw_exception", "cryo_runtime_initialize"
-            };
-            
+                "cryo_runtime_deallocate", "cryo_profile_start", "cryo_profile_end",
+                "cryo_throw_exception", "cryo_runtime_initialize"};
+
             if (runtime_functions.find(function_name) != runtime_functions.end())
             {
                 qualified_function_name = "std::Runtime::" + function_name;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Auto-qualifying runtime function '{}' to '{}'", 
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Auto-qualifying runtime function '{}' to '{}'",
                           function_name, qualified_function_name);
             }
         }
@@ -137,12 +136,12 @@ namespace Cryo::Codegen
         {
             symbol = _symbol_table.lookup_symbol(function_name);
         }
-        
+
         if (symbol && symbol->data_type)
         {
             std::string type_name = symbol->data_type->name();
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry: Direct type mapping for '{}' with type '{}'", function_name, type_name);
-            
+
             // Direct type mapping for primitive return types
             if (type_name == "u64")
             {
@@ -279,7 +278,7 @@ namespace Cryo::Codegen
     {
         FunctionMetadata metadata;
 
-        // Extract runtime name - for stdlib functions, use the full qualified name 
+        // Extract runtime name - for stdlib functions, use the full qualified name
         std::string runtime_name = function_name;
 
         // For all namespaced functions, use the full qualified name as runtime name
@@ -493,7 +492,8 @@ namespace Cryo::Codegen
     std::string FunctionRegistry::generate_qualified_function_name(const std::string &resolved_namespace, const std::string &function_name) const
     {
         // If function_name is already fully qualified (contains ::), return it as-is
-        if (function_name.find("::") != std::string::npos) {
+        if (function_name.find("::") != std::string::npos)
+        {
             return function_name;
         }
 
@@ -501,7 +501,8 @@ namespace Cryo::Codegen
         {
             // Use SRM to generate qualified function name with the provided namespace
             std::vector<std::string> namespace_parts = Cryo::SRM::Utils::parse_qualified_name(resolved_namespace).first;
-            if (namespace_parts.empty()) {
+            if (namespace_parts.empty())
+            {
                 namespace_parts.push_back(resolved_namespace);
             }
             Cryo::SRM::QualifiedIdentifier qualified_id(namespace_parts, function_name, Cryo::SymbolKind::Function);
@@ -510,9 +511,12 @@ namespace Cryo::Codegen
         else
         {
             // Fallback to manual concatenation
-            if (resolved_namespace.empty()) {
+            if (resolved_namespace.empty())
+            {
                 return function_name;
-            } else {
+            }
+            else
+            {
                 std::vector<std::string> namespace_parts = {resolved_namespace};
                 return Cryo::SRM::Utils::build_qualified_name(namespace_parts, function_name);
             }
