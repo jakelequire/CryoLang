@@ -47,6 +47,36 @@ namespace Cryo
         NUM_TOKENS // Count of total tokens
     };
 
+    static std::string TokenKindToString(TokenKind kind)
+    {
+        switch (kind)
+        {
+#define TOK(X) \
+    case TokenKind::TK_##X: \
+        return #X;
+#define KEYWORD(X) \
+    case TokenKind::TK_KW_##X: \
+        return "KW_" #X;
+#define PUNCTUATOR(X, Y) \ 
+    case TokenKind::TK_##X: \
+        return #X;
+#define DIRECTIVE(X) \
+    case TokenKind::TK_PP_##X: \
+        return "PP_" #X;
+#define ATTRIBUTE(X) \
+    case TokenKind::TK_ATTR_##X: \
+        return "ATTR_" #X;
+#include "tokens.def"
+#undef TOK
+#undef KEYWORD
+#undef PUNCTUATOR
+#undef DIRECTIVE
+#undef ATTRIBUTE
+        default:
+            return "UNKNOWN_TOKEN";
+        }
+    }
+
     // ================================================================
     // Source Location Class
     // ================================================================

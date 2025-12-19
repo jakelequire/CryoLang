@@ -256,7 +256,7 @@ def build_runtime(cryo_exe, stdlib_dir, build_dir, extra_flags=None):
         output_file = os.path.join(runtime_build_dir, bc_filename)
         
         # Temporarily add --debug flag for runtime compilation debugging
-        debug_flags = (extra_flags or []) + ['--debug']
+        debug_flags = (extra_flags or [])
         if compile_module(cryo_exe, cryo_file, output_file, debug_flags, stdlib_mode=True):
             if not is_stub_file(output_file):
                 runtime_bc_files.append(output_file)
