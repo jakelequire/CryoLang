@@ -1033,23 +1033,31 @@ namespace Cryo
             }
         }
 
-        // Check for array types (type[]) - handle this before falling back to TypeContext
-        if (type_string.length() > 2 && type_string.substr(type_string.length() - 2) == "[]")
+        // Check for array types (type[] or type[size]) - handle this before falling back to TypeContext
+        if (type_string.length() > 2 && type_string.back() == ']')
         {
-            std::string element_type_str = type_string.substr(0, type_string.length() - 2);
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found array type '{}', resolving element type '{}'", type_string, element_type_str);
+            size_t bracket_pos = type_string.find('[');
+            if (bracket_pos != std::string::npos)
+            {
+                std::string element_type_str = type_string.substr(0, bracket_pos);
+                std::string size_part = type_string.substr(bracket_pos + 1, type_string.length() - bracket_pos - 2);
+                
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found array type '{}', resolving element type '{}' with size '{}'", 
+                         type_string, element_type_str, size_part);
 
-            // Recursively resolve the element type with generic context
-            Type *element_type = resolve_type_with_generic_context(element_type_str);
-            if (element_type)
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved element type '{}' as {}", element_type_str, TypeKindToString(element_type->kind()));
-                return _type_context.create_array_type(element_type);
-            }
-            else
-            {
-                LOG_ERROR(Cryo::LogComponent::AST, "Failed to resolve array element type '{}'", element_type_str);
-                return nullptr;
+                // Recursively resolve the element type with generic context
+                Type *element_type = resolve_type_with_generic_context(element_type_str);
+                if (element_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved element type '{}' as {}", element_type_str, TypeKindToString(element_type->kind()));
+                    // For both type[] and type[size], we transform to Array<T>
+                    return _type_context.create_array_type(element_type);
+                }
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::AST, "Failed to resolve array element type '{}'", element_type_str);
+                    return nullptr;
+                }
             }
         }
 
@@ -1788,32 +1796,40 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Processing variable '{}' is_mutable={}, stdlib_compilation_mode={}, node_ptr={}, location={}:{}",
                   var_name, node.is_mutable(), _stdlib_compilation_mode, static_cast<const void *>(&node), node.location().line(), node.location().column());
 
-        // Parse type annotation from node
-        if (!node.type_annotation().empty() && node.type_annotation() != "auto")
+        // Parse type annotation from node - use resolved Type* directly instead of deprecated string method
+        if (node.get_resolved_type())
+        {
+            declared_type = node.get_resolved_type();
+            LOG_DEBUG(Cryo::LogComponent::AST, "Using directly resolved type '{}' (kind={}) for variable '{}'", 
+                     declared_type->to_string(), TypeKindToString(declared_type->kind()), var_name);
+        }
+        else if (!node.type_annotation().empty() && node.type_annotation() != "auto")
         {
             declared_type = resolve_type_with_generic_context(node.type_annotation());
+            LOG_DEBUG(Cryo::LogComponent::AST, "Fallback: resolved type '{}' from annotation '{}' for variable '{}'",
+                     declared_type ? declared_type->to_string() : "unknown", node.type_annotation(), var_name);
+        }
 
-            // Debug: Check declared type for Array
-            if (declared_type && declared_type->name().find("Array") != std::string::npos)
+        // Debug: Check declared type for Array
+        if (declared_type && declared_type->name().find("Array") != std::string::npos)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Variable declaration '{}': declared_type - to_string: '{}', is_parameterized: {}",
+                      var_name, declared_type->to_string(),
+                      declared_type->kind() == TypeKind::Parameterized ? "true" : "false");
+        }
+
+        // Debug: Track malformed pointer types at declaration time  
+        if (declared_type && (!node.type_annotation().empty() && node.type_annotation().find("*") != std::string::npos))
+        {
+            if (declared_type->kind() == TypeKind::Struct)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Variable declaration '{}': declared_type - to_string: '{}', is_parameterized: {}",
-                          var_name, declared_type->to_string(),
-                          declared_type->kind() == TypeKind::Parameterized ? "true" : "false");
+                LOG_DEBUG(Cryo::LogComponent::AST, "MALFORMED TYPE DETECTED: Variable '{}' with annotation '{}' resolved to struct type '{}' (kind={}) instead of pointer type",
+                          var_name, node.type_annotation(), declared_type->name(), TypeKindToString(declared_type->kind()));
             }
-
-            // Debug: Track malformed pointer types at declaration time
-            if (declared_type && node.type_annotation().find("*") != std::string::npos)
+            else
             {
-                if (declared_type->kind() == TypeKind::Struct)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "MALFORMED TYPE DETECTED: Variable '{}' with annotation '{}' resolved to struct type '{}' (kind={}) instead of pointer type",
-                              var_name, node.type_annotation(), declared_type->name(), TypeKindToString(declared_type->kind()));
-                }
-                else
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "CORRECT TYPE: Variable '{}' with annotation '{}' resolved to type '{}' (kind={})",
-                              var_name, node.type_annotation(), declared_type->name(), TypeKindToString(declared_type->kind()));
-                }
+                LOG_DEBUG(Cryo::LogComponent::AST, "CORRECT TYPE: Variable '{}' with annotation '{}' resolved to type '{}' (kind={})",
+                          var_name, node.type_annotation(), declared_type->name(), TypeKindToString(declared_type->kind()));
             }
         }
 

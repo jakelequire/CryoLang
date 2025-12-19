@@ -4924,12 +4924,13 @@ namespace Cryo
                   static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
 
         // Collect tokens that form the complete type expression
-        // This handles complex types like: const int**, Option<Result<T, E>>, etc.
+        // This handles complex types like: const int**, Option<Result<T, E>>, u64[5], etc.
         while (is_type_token() ||
                _current_token.is(TokenKind::TK_L_ANGLE) ||
                _current_token.is(TokenKind::TK_R_ANGLE) ||
                _current_token.is(TokenKind::TK_L_SQUARE) ||
                _current_token.is(TokenKind::TK_R_SQUARE) ||
+               _current_token.is(TokenKind::TK_NUMERIC_CONSTANT) ||
                _current_token.is(TokenKind::TK_STAR) ||
                _current_token.is(TokenKind::TK_AMP) ||
                _current_token.is(TokenKind::TK_COMMA) ||
