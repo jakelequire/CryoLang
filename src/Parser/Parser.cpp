@@ -3332,15 +3332,13 @@ namespace Cryo
 
         consume(TokenKind::TK_L_PAREN, "Expected '(' after 'sizeof'");
 
-        // Parse type name
-        if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
+        // Parse type annotation (handles pointer types, arrays, etc.)
+        std::string type_name = parse_type_annotation()->to_string();
+        if (type_name.empty())
         {
             error("Expected type name in sizeof expression");
             return nullptr;
         }
-
-        std::string type_name = std::string(_current_token.text());
-        advance(); // consume type name
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after type name");
 
@@ -4489,53 +4487,58 @@ namespace Cryo
         // Parse optional body (for method implementations)
         if (_current_token.is(TokenKind::TK_L_BRACE))
         {
-            // Robust method body parsing with proper error recovery
-            SourceLocation body_start = _current_token.location();
-            int initial_brace_depth = _brace_depth;
-
-            // CRITICAL: Use completely self-contained method body parsing
-            // Don't let ParseErrors escape to the class level where they cause chaos
-
-            // Manual method body parsing with brace counting
-            if (!_current_token.is(TokenKind::TK_L_BRACE))
+            // Parse method body properly
+            try
             {
-                error("Expected '{' to start method body");
-                return method;
+                auto body = parse_block_statement();
+                method->set_body(std::unique_ptr<BlockStatementNode>(
+                    dynamic_cast<BlockStatementNode *>(body.release())));
+                LOG_DEBUG(LogComponent::PARSER, "Method '{}' body parsed successfully with {} statements",
+                          method_name, body ? body->statements().size() : 0);
             }
-
-            // Consume opening brace and track depth
-            advance(); // consume '{'
-            int method_brace_count = 1;
-            size_t tokens_consumed = 0;
-
-            // Consume ALL tokens until we find the matching closing brace
-            // This prevents any escaping to class-level parsing
-            while (!is_at_end() && method_brace_count > 0 && tokens_consumed < 2000)
+            catch (const ParseError &e)
             {
+                _errors.push_back(e);
+
+                // Method-body-specific error recovery
+                int method_brace_count = 0;
+                SourceLocation recovery_start = _current_token.location();
+
+                // Count opening brace
                 if (_current_token.is(TokenKind::TK_L_BRACE))
                 {
-                    method_brace_count++;
+                    method_brace_count = 1;
+                    advance();
                 }
-                else if (_current_token.is(TokenKind::TK_R_BRACE))
+
+                // Skip tokens until we find the matching closing brace for this method
+                size_t tokens_consumed = 0;
+                while (!is_at_end() && method_brace_count > 0 && tokens_consumed < 2000)
                 {
-                    method_brace_count--;
+                    if (_current_token.is(TokenKind::TK_L_BRACE))
+                    {
+                        method_brace_count++;
+                    }
+                    else if (_current_token.is(TokenKind::TK_R_BRACE))
+                    {
+                        method_brace_count--;
+                        if (method_brace_count == 0)
+                        {
+                            advance(); // Consume the final closing brace
+                            break;
+                        }
+                    }
+                    advance();
+                    tokens_consumed++;
                 }
-                advance();
-                tokens_consumed++;
-            }
 
-            if (method_brace_count > 0)
-            {
-                LOG_ERROR(LogComponent::PARSER, "Method '{}' body parsing failed - unclosed braces", method_name);
-            }
-            else
-            {
-                LOG_DEBUG(LogComponent::PARSER, "Method '{}' body consumed {} tokens successfully", method_name, tokens_consumed);
-            }
+                LOG_DEBUG(LogComponent::PARSER, "Method body error recovery: consumed {} tokens, final brace_count={}",
+                          tokens_consumed, method_brace_count);
 
-            // Create empty method body (we've consumed the tokens but not parsed the AST)
-            auto empty_body = _builder.create_block_statement(body_start);
-            method->set_body(std::move(empty_body));
+                // Create an empty block as fallback
+                auto empty_body = _builder.create_block_statement(recovery_start);
+                method->set_body(std::move(empty_body));
+            }
 
             // OLD COMPLEX PARSING - Replaced with simple token consumption above
             /*

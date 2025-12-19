@@ -3595,7 +3595,21 @@ namespace Cryo
         if (type_symbol)
         {
             // The type exists, so the new expression is valid
-            node.set_type(type_name);
+            // Create a pointer type to the allocated type since 'new' returns a pointer
+            Type *base_type = resolve_type_with_generic_context(type_name);
+            if (base_type)
+            {
+                Type *pointer_type = _type_context.create_pointer_type(base_type);
+                node.set_resolved_type(pointer_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "NewExpression: Created pointer type '{}' for base type '{}'",
+                          pointer_type->to_string(), base_type->to_string());
+            }
+            else
+            {
+                // Fallback to string-based type for compatibility
+                node.set_type(type_name + "*");
+                LOG_DEBUG(Cryo::LogComponent::AST, "NewExpression: Set type to '{}' (string fallback)", type_name + "*");
+            }
         }
         else
         {
