@@ -1352,6 +1352,15 @@ namespace Cryo::Codegen
                                     create_store(init_value, alloca);
                                 }
                             }
+                            // Handle pointer type variables (e.g., Point* p = new Point(10, 20))
+                            else if (cryo_type->kind() == TypeKind::Pointer)
+                            {
+                                // For pointer variables, store the pointer value directly
+                                // No need to load from the pointer - we want to store the address itself
+                                create_store(init_value, alloca);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Stored pointer value for variable '{}' of type '{}'",
+                                          var_name, cryo_type->to_string());
+                            }
                             else
                             {
                                 create_store(init_value, alloca);
@@ -3074,9 +3083,15 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::visit(Cryo::ExpressionStatementNode &node)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Visiting ExpressionStatementNode");
         if (node.expression())
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Expression type: {}", typeid(*node.expression()).name());
             node.expression()->accept(*this);
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionStatementNode has no expression");
         }
     }
 
@@ -3973,13 +3988,23 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using resolved type from AST node: {}", resolved_type->to_string());
 
+            // Handle pointer types - extract the pointee type for constructor lookup
+            Cryo::Type *actual_type = resolved_type;
+            if (resolved_type->kind() == Cryo::TypeKind::Pointer)
+            {
+                auto pointer_type = static_cast<Cryo::PointerType *>(resolved_type);
+                actual_type = pointer_type->pointee_type().get();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "NewExpression: Extracted pointee type '{}' from pointer type '{}'",
+                          actual_type->to_string(), resolved_type->to_string());
+            }
+
             // Create TypeIdentifier using SRM for consistent naming
             std::unique_ptr<Cryo::SRM::TypeIdentifier> type_identifier;
 
-            if (resolved_type->kind() == Cryo::TypeKind::Parameterized)
+            if (actual_type->kind() == Cryo::TypeKind::Parameterized)
             {
                 // For parameterized types like GenericStruct<int>, extract template parameters
-                auto parameterized_type = static_cast<Cryo::ParameterizedType *>(resolved_type);
+                auto parameterized_type = static_cast<Cryo::ParameterizedType *>(actual_type);
 
                 // Convert shared_ptr<Type> to Type* for SRM compatibility
                 std::vector<Cryo::Type *> template_params;
@@ -3996,8 +4021,8 @@ namespace Cryo::Codegen
             else
             {
                 type_identifier = _srm_context->create_type_identifier(
-                    resolved_type->to_string(),
-                    resolved_type->kind());
+                    actual_type->to_string(),
+                    actual_type->kind());
             }
 
             // Use SRM-generated names for consistency
@@ -4009,9 +4034,9 @@ namespace Cryo::Codegen
 
             // For parameterized types, we need to use the specialized name for constructor lookup
             // The monomorphization pass creates constructors like "GenericStruct_int(int)"
-            if (resolved_type->kind() == Cryo::TypeKind::Parameterized)
+            if (actual_type->kind() == Cryo::TypeKind::Parameterized)
             {
-                auto parameterized_type = static_cast<Cryo::ParameterizedType *>(resolved_type);
+                auto parameterized_type = static_cast<Cryo::ParameterizedType *>(actual_type);
 
                 // Extract type parameter names and create specialized name
                 std::string specialized_name = parameterized_type->base_name();
@@ -4541,7 +4566,7 @@ namespace Cryo::Codegen
 
         if (!module)
         {
-            _diagnostic_builder->report_error(ErrorCode::E0620_MODULE_CONTEXT_ERROR, &node, 
+            _diagnostic_builder->report_error(ErrorCode::E0620_MODULE_CONTEXT_ERROR, &node,
                                               "No module available for cast expression");
             return;
         }
@@ -4556,7 +4581,7 @@ namespace Cryo::Codegen
 
         node.expression()->accept(*this);
         llvm::Value *source_value = get_current_value();
-        
+
         if (!source_value)
         {
             _diagnostic_builder->report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, &node,
@@ -4592,15 +4617,15 @@ namespace Cryo::Codegen
             return;
         }
 
-        llvm::Value *cast_value = generate_cast_instruction(source_value, source_llvm_type, 
-                                                           target_llvm_type, source_type, 
-                                                           target_type, builder);
+        llvm::Value *cast_value = generate_cast_instruction(source_value, source_llvm_type,
+                                                            target_llvm_type, source_type,
+                                                            target_type, builder);
 
         if (!cast_value)
         {
             _diagnostic_builder->report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, &node,
-                                              "Failed to generate cast from '" + source_type + 
-                                              "' to '" + target_type + "'");
+                                              "Failed to generate cast from '" + source_type +
+                                                  "' to '" + target_type + "'");
             return;
         }
 
@@ -7253,7 +7278,22 @@ namespace Cryo::Codegen
             }
 
             // Generate function body
-            node->body()->accept(*this);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function body generation: function='{}' body_ptr={} has_body={}",
+                      node->name(), static_cast<void *>(node->body()), (node->body() != nullptr));
+
+            if (node->body() != nullptr)
+            {
+                // Special handling for struct methods - ensure they're processed correctly
+                if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(node))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing struct method body for: {}", node->name());
+                }
+                node->body()->accept(*this);
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function '{}' has null body!", node->name());
+            }
 
             // Check if the current basic block already has a terminator
             auto &builder = _context_manager.get_builder();
@@ -8096,6 +8136,9 @@ namespace Cryo::Codegen
             // Handle assignment operations specially - don't evaluate left side as regular expression
             if (op_kind == TokenKind::TK_EQUAL)
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing assignment - left side type: {}",
+                          typeid(*node->left()).name());
+
                 // For assignment, get the variable address directly without loading its value
                 if (auto *left_identifier = dynamic_cast<IdentifierNode *>(node->left()))
                 {
@@ -8359,6 +8402,9 @@ namespace Cryo::Codegen
                 // Handle assignment to member access: obj.field = value
                 else if (auto *left_member_access = dynamic_cast<Cryo::MemberAccessNode *>(node->left()))
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing member access assignment: {}:{}",
+                              left_member_access->object() ? "has_object" : "no_object",
+                              left_member_access->member());
                     // First check if this is a nested member access (e.g., this.position.x)
                     if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(left_member_access->object()))
                     {
@@ -8468,23 +8514,32 @@ namespace Cryo::Codegen
                         {
                             Cryo::Type *cryo_type = cryo_type_it->second;
 
-                            // Special handling for 'this' parameter which is registered as the base type
+                            // Special handling for 'this' parameter
                             if (var_name == "this")
                             {
-                                // 'this' is registered as the base struct type, not a pointer
-                                if (cryo_type->kind() == Cryo::TypeKind::Struct)
+                                Cryo::Type *actual_type = cryo_type;
+
+                                // 'this' can be either a pointer to struct or the struct itself
+                                if (cryo_type->kind() == Cryo::TypeKind::Pointer)
                                 {
-                                    Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(cryo_type);
-                                    type_name = struct_cryo_type->name();
-                                    struct_type = _type_mapper->map_type(cryo_type);
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking for 'this': var='{}' type='{}'", var_name, type_name);
+                                    // If it's a pointer, get the pointed-to type
+                                    Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(cryo_type);
+                                    actual_type = ptr_type->pointee_type().get();
                                 }
-                                else if (cryo_type->kind() == Cryo::TypeKind::Class)
+
+                                if (actual_type->kind() == Cryo::TypeKind::Struct)
                                 {
-                                    Cryo::ClassType *class_cryo_type = static_cast<Cryo::ClassType *>(cryo_type);
+                                    Cryo::StructType *struct_cryo_type = static_cast<Cryo::StructType *>(actual_type);
+                                    type_name = struct_cryo_type->name();
+                                    struct_type = _type_mapper->map_type(actual_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking for 'this': var='{}' type='{}' (was pointer: {})", var_name, type_name, (cryo_type->kind() == Cryo::TypeKind::Pointer));
+                                }
+                                else if (actual_type->kind() == Cryo::TypeKind::Class)
+                                {
+                                    Cryo::ClassType *class_cryo_type = static_cast<Cryo::ClassType *>(actual_type);
                                     type_name = class_cryo_type->name();
-                                    struct_type = _type_mapper->map_type(cryo_type);
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking for 'this': var='{}' type='{}'", var_name, type_name);
+                                    struct_type = _type_mapper->map_type(actual_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment using Cryo type tracking for 'this': var='{}' type='{}' (was pointer: {})", var_name, type_name, (cryo_type->kind() == Cryo::TypeKind::Pointer));
                                 }
                             }
                             else
@@ -8758,22 +8813,35 @@ namespace Cryo::Codegen
                         return nullptr;
                     }
 
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment: object_ptr type: {}, is_argument: {}, is_alloca: {}",
+                              object_ptr->getType()->getTypeID(),
+                              llvm::isa<llvm::Argument>(object_ptr),
+                              llvm::isa<llvm::AllocaInst>(object_ptr));
+
                     // Handle the case where object_ptr might be a pointer to the struct
                     // (like 'this' parameters which are Function Arguments)
                     llvm::Value *struct_ptr = object_ptr;
-                    if (auto *argument = llvm::dyn_cast<llvm::Argument>(object_ptr))
-                    {
-                        // For function arguments (like 'this'), object_ptr is already the struct pointer
-                        struct_ptr = object_ptr;
-                    }
-                    else if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
+
+                    // For 'this' parameter: check if object_ptr is an alloca containing a pointer
+                    // The 'this' parameter gets stored into an alloca during function setup
+                    if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(object_ptr))
                     {
                         llvm::Type *allocated_type = alloca_inst->getAllocatedType();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment: alloca allocated type is pointer: {}", allocated_type->isPointerTy());
+
                         if (allocated_type->isPointerTy())
                         {
-                            // For pointer-to-struct, load the pointer first
+                            // For 'this' parameter alloca, load the pointer value
                             struct_ptr = create_load(object_ptr, allocated_type, "struct_ptr");
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment: loaded struct pointer from 'this' alloca");
                         }
+                        // If allocated_type is not a pointer, then object_ptr is already the struct pointer
+                    }
+                    else if (auto *argument = llvm::dyn_cast<llvm::Argument>(object_ptr))
+                    {
+                        // Direct function argument (shouldn't happen for 'this' in method calls)
+                        struct_ptr = object_ptr;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Member assignment: using direct function argument as struct pointer");
                     }
 
                     // Create GEP instruction to access the field
@@ -14486,8 +14554,21 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully created forward declaration for: {}", c_name);
         return forward_decl;
     }
-    llvm::Value *Cryo::Codegen::CodegenVisitor::generate_array_access(Cryo::ArrayAccessNode *node) { return nullptr; }
-    llvm::Value *Cryo::Codegen::CodegenVisitor::generate_member_access(Cryo::MemberAccessNode *node) { return nullptr; }
+    llvm::Value *Cryo::Codegen::CodegenVisitor::generate_array_access(Cryo::ArrayAccessNode *node)
+    {
+        if (!node)
+            return nullptr;
+        node->accept(*this);
+        return get_current_value();
+    }
+
+    llvm::Value *Cryo::Codegen::CodegenVisitor::generate_member_access(Cryo::MemberAccessNode *node)
+    {
+        if (!node)
+            return nullptr;
+        node->accept(*this);
+        return get_current_value();
+    }
     void Cryo::Codegen::CodegenVisitor::generate_if_statement(Cryo::IfStatementNode *node)
     {
         if (!node)
@@ -18476,10 +18557,10 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CodegenVisitor::generate_cast_instruction(
-        llvm::Value *source_value, 
-        llvm::Type *source_type, 
-        llvm::Type *target_type, 
-        const std::string &source_type_name, 
+        llvm::Value *source_value,
+        llvm::Type *source_type,
+        llvm::Type *target_type,
+        const std::string &source_type_name,
         const std::string &target_type_name,
         llvm::IRBuilder<> &builder)
     {
