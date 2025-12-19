@@ -876,6 +876,8 @@ namespace Cryo
         auto array_type = std::make_unique<ArrayType>(element_shared, size);
 
         Type *result = array_type.get();
+        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Created ArrayType with name='{}', kind={}, size={}", 
+                  result->name(), static_cast<int>(result->kind()), size.has_value() ? std::to_string(*size) : "none");
         _complex_types.push_back(std::move(array_type));
 
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeContext::create_array_type() - created new array type: {}", array_key);
@@ -1272,6 +1274,7 @@ namespace Cryo
                 // Handle array modifiers
                 while (index < tokens.size() && tokens[index].kind() == TokenKind::TK_L_SQUARE)
                 {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Processing array bracket for primitive type: {}", result_type->to_string());
                     ++index; // consume '['
 
                     std::optional<size_t> array_size;
@@ -1279,6 +1282,7 @@ namespace Cryo
                     {
                         std::string size_str = std::string(tokens[index].text());
                         array_size = std::stoull(size_str);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Array size parsed as: {}", *array_size);
                         ++index; // consume size
                     }
 
@@ -1286,7 +1290,12 @@ namespace Cryo
                     if (index < tokens.size() && tokens[index].kind() == TokenKind::TK_R_SQUARE)
                     {
                         ++index; // consume ']'
+                        Type *old_type = result_type;
                         result_type = create_array_type(result_type, array_size);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Array type created for primitive: {} -> {}, kind: {}", 
+                                  old_type->to_string(), 
+                                  result_type ? result_type->to_string() : "null",
+                                  result_type ? static_cast<int>(result_type->kind()) : -1);
                     }
                     else
                     {

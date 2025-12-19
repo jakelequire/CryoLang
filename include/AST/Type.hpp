@@ -423,7 +423,11 @@ namespace Cryo
         ArrayType(std::shared_ptr<Type> element_type, std::optional<size_t> size = std::nullopt)
             : Type(TypeKind::Array), _element_type(element_type), _size(size)
         {
-            _name = element_type->name() + "[]";
+            if (size.has_value()) {
+                _name = element_type->name() + "[" + std::to_string(*size) + "]";
+            } else {
+                _name = element_type->name() + "[]";
+            }
         }
 
         std::shared_ptr<Type> element_type() const { return _element_type; }
