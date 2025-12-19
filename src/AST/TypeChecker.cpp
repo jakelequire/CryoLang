@@ -2143,7 +2143,7 @@ namespace Cryo
 
         // PRESERVE _current_struct_type during method body processing
         Type *preserved_struct_type = _current_struct_type;
-        LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Preserving _current_struct_type='{}' for function '{}'", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Preserving _current_struct_type='{}' for function '{}'",
                   preserved_struct_type ? preserved_struct_type->name() : "NULL", func_name);
 
         // Process trait bounds for generic parameters
@@ -2172,7 +2172,7 @@ namespace Cryo
         _current_function_return_type = nullptr;
         _in_function = false;
         _current_generic_trait_bounds.clear();
-        _current_struct_type = preserved_struct_type;  // RESTORE the struct context
+        _current_struct_type = preserved_struct_type; // RESTORE the struct context
         exit_scope();
 
         // Exit generic context if it was a generic function
@@ -3078,15 +3078,15 @@ namespace Cryo
                 else if (op == TokenKind::TK_STAR) // Dereference operator (*)
                 {
                     // Operand should be a pointer or reference type
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Dereference operator: operand type='{}', kind={}", 
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Dereference operator: operand type='{}', kind={}",
                               operand_type->to_string(), TypeKindToString(operand_type->kind()));
-                    
+
                     if (operand_type->kind() == TypeKind::Pointer)
                     {
                         // Get the pointee type
                         auto *ptr_type = static_cast<PointerType *>(operand_type);
                         Type *pointee = ptr_type->pointee_type().get();
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Dereferencing pointer '{}' -> pointee '{}'", 
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Dereferencing pointer '{}' -> pointee '{}'",
                                   operand_type->to_string(), pointee ? pointee->to_string() : "null");
                         node.set_resolved_type(pointee);
                     }
@@ -3095,13 +3095,13 @@ namespace Cryo
                         // Get the referent type
                         auto *ref_type = static_cast<ReferenceType *>(operand_type);
                         Type *referent = ref_type->referent_type().get();
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Dereferencing reference '{}' -> referent '{}'", 
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Dereferencing reference '{}' -> referent '{}'",
                                   operand_type->to_string(), referent ? referent->to_string() : "null");
                         node.set_resolved_type(referent);
                     }
                     else
                     {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: Cannot dereference non-pointer type '{}' (kind={})", 
+                        LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: Cannot dereference non-pointer type '{}' (kind={})",
                                   operand_type->to_string(), TypeKindToString(operand_type->kind()));
                         _diagnostic_builder->create_invalid_operation_error("dereference", operand_type, nullptr, node.location());
                         node.set_resolved_type(_type_context.get_unknown_type());
@@ -3719,13 +3719,13 @@ namespace Cryo
         }
 
         std::string target_type_name = node.target_type_name();
-        
+
         // Validate the target type exists
         if (!is_valid_type(target_type_name))
         {
-            _diagnostic_builder->create_type_error(ErrorCode::E0208_INVALID_CAST, 
-                                                  node.location(),
-                                                  "Unknown target type '" + target_type_name + "' in cast expression");
+            _diagnostic_builder->create_type_error(ErrorCode::E0208_INVALID_CAST,
+                                                   node.location(),
+                                                   "Unknown target type '" + target_type_name + "' in cast expression");
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
@@ -3745,9 +3745,9 @@ namespace Cryo
         if (!is_cast_valid(source_type, target_type_name))
         {
             std::string error_msg = "Invalid cast from '" + source_type + "' to '" + target_type_name + "'";
-            _diagnostic_builder->create_type_error(ErrorCode::E0208_INVALID_CAST, 
-                                                  node.location(), 
-                                                  error_msg);
+            _diagnostic_builder->create_type_error(ErrorCode::E0208_INVALID_CAST,
+                                                   node.location(),
+                                                   error_msg);
         }
         else if (!requires_explicit_cast(source_type, target_type_name))
         {
@@ -4020,14 +4020,14 @@ namespace Cryo
 
     void TypeChecker::visit(MemberAccessNode &node)
     {
-        LOG_DEBUG(Cryo::LogComponent::AST, "Visiting MemberAccessNode: member='{}', _current_struct_type='{}'", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "Visiting MemberAccessNode: member='{}', _current_struct_type='{}'",
                   node.member(), _current_struct_type ? _current_struct_type->to_string() : "NULL");
 
         // Visit the object expression first
         if (node.object())
         {
             node.object()->accept(*this);
-            LOG_DEBUG(Cryo::LogComponent::AST, "After visiting object, _current_struct_type='{}'", 
+            LOG_DEBUG(Cryo::LogComponent::AST, "After visiting object, _current_struct_type='{}'",
                       _current_struct_type ? _current_struct_type->to_string() : "NULL");
         }
 
@@ -4833,18 +4833,20 @@ namespace Cryo
         }
 
         // Check for private methods - allow access from within the same class
-        LOG_DEBUG(Cryo::LogComponent::AST, "🔍 PRIVATE METHOD LOOKUP: lookup_type_name='{}', member_name='{}', _current_struct_name='{}', _current_struct_type='{}'", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "🔍 PRIVATE METHOD LOOKUP: lookup_type_name='{}', member_name='{}', _current_struct_name='{}', _current_struct_type='{}'",
                   lookup_type_name, member_name, _current_struct_name, _current_struct_type ? _current_struct_type->to_string() : "NULL");
-        
+
         // DEBUG: List all registered private method types
         LOG_DEBUG(Cryo::LogComponent::AST, "🔍 All registered private method types: {}", _private_struct_methods.size());
-        for (const auto& [type_name, methods] : _private_struct_methods) {
+        for (const auto &[type_name, methods] : _private_struct_methods)
+        {
             LOG_DEBUG(Cryo::LogComponent::AST, "🔍   - '{}' has {} private methods", type_name, methods.size());
-            for (const auto& [method_name_debug, method_type] : methods) {
+            for (const auto &[method_name_debug, method_type] : methods)
+            {
                 LOG_DEBUG(Cryo::LogComponent::AST, "🔍     * '{}'", method_name_debug);
             }
         }
-        
+
         auto private_method_struct_it = _private_struct_methods.find(lookup_type_name);
         if (private_method_struct_it != _private_struct_methods.end())
         {
@@ -4854,21 +4856,21 @@ namespace Cryo
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "NO private methods registered for type '{}'", lookup_type_name);
             LOG_DEBUG(Cryo::LogComponent::AST, "Available private method types: {}", _private_struct_methods.size());
-            for (const auto &[type, methods] : _private_struct_methods) 
+            for (const auto &[type, methods] : _private_struct_methods)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "  - '{}' has {} private methods", type, methods.size());
             }
         }
-        
+
         if (private_method_struct_it != _private_struct_methods.end())
         {
             auto private_method_it = private_method_struct_it->second.find(member_name);
             if (private_method_it != private_method_struct_it->second.end())
             {
                 // Check if we're accessing the private method from within the same class
-                LOG_DEBUG(Cryo::LogComponent::AST, "🔍 FOUND private method '{}' - checking access: _current_struct_name='{}' vs lookup_type_name='{}'", 
+                LOG_DEBUG(Cryo::LogComponent::AST, "🔍 FOUND private method '{}' - checking access: _current_struct_name='{}' vs lookup_type_name='{}'",
                           member_name, _current_struct_name, lookup_type_name);
-                
+
                 if (_current_struct_name == lookup_type_name)
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "✅ Found private method '{}' and allowing access from within same class '{}'", member_name, lookup_type_name);
@@ -4891,7 +4893,8 @@ namespace Cryo
             else
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "❌ Method '{}' NOT FOUND in private methods for type '{}' - available methods:", member_name, lookup_type_name);
-                for (const auto& [method_name_debug, method_type] : private_method_struct_it->second) {
+                for (const auto &[method_name_debug, method_type] : private_method_struct_it->second)
+                {
                     LOG_DEBUG(Cryo::LogComponent::AST, "    Available: '{}'", method_name_debug);
                 }
             }
@@ -5492,13 +5495,13 @@ namespace Cryo
         // Save previous struct type and set current for 'this' keyword in methods
         Type *previous_struct_type = _current_struct_type;
         _current_struct_type = struct_type;
-        LOG_DEBUG(Cryo::LogComponent::AST, "StructDeclarationNode: Set _current_struct_type to '{}' (kind: {})", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "StructDeclarationNode: Set _current_struct_type to '{}' (kind: {})",
                   struct_type ? struct_type->name() : "null", struct_type ? TypeKindToString(struct_type->kind()) : "null");
 
         // Save previous struct name and set current for field tracking
         std::string previous_struct_name = _current_struct_name;
         _current_struct_name = struct_name;
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "🏗️ Processing struct/class: '{}' - setting _current_struct_name", struct_name);
 
         // Enter struct scope
@@ -5623,13 +5626,13 @@ namespace Cryo
         // Save previous class type and set current for 'this' keyword in methods
         Type *previous_struct_type = _current_struct_type;
         _current_struct_type = class_type;
-        LOG_DEBUG(Cryo::LogComponent::AST, "ClassDeclarationNode: Set _current_struct_type to '{}' (kind: {})", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "ClassDeclarationNode: Set _current_struct_type to '{}' (kind: {})",
                   class_type ? class_type->name() : "null", class_type ? TypeKindToString(class_type->kind()) : "null");
 
         // Save previous class name and set current for field/method tracking
         std::string previous_struct_name = _current_struct_name;
         _current_struct_name = class_name;
-        
+
         LOG_DEBUG(Cryo::LogComponent::AST, "🏗️ Processing class: '{}' - setting _current_struct_name", class_name);
 
         // Enter class scope
@@ -5690,17 +5693,7 @@ namespace Cryo
         // Process methods in two passes to handle forward references
         // Pass 1: Register all method signatures without type-checking bodies
         LOG_DEBUG(Cryo::LogComponent::AST, "🔧 CLASS PASS 1: Registering {} method signatures for class '{}'", node.methods().size(), class_name);
-        
-        // CRITICAL DEBUG: Check if private methods are now found
-        if (class_name == "MemoryPool") {
-            std::cerr << "=== MEMORYPOOL AFTER PARSER FIX: Found " << node.methods().size() << " methods\n";
-            for (const auto &method : node.methods()) {
-                if (method) {
-                    std::cerr << "=== METHOD: '" << method->name() << "' visibility=" << static_cast<int>(method->visibility()) << "\n";
-                }
-            }
-        }
-        
+
         for (const auto &method : node.methods())
         {
             if (method)
@@ -6556,9 +6549,9 @@ namespace Cryo
         {
             // Process regular methods inline to preserve struct context
             // Don't delegate to FunctionDeclarationNode to avoid context loss
-            
+
             const std::string &func_name = node.name();
-            
+
             // Get return type from the node
             Type *return_type = node.get_resolved_return_type();
             const std::string &return_type_str = return_type ? return_type->to_string() : "void";
@@ -6574,7 +6567,7 @@ namespace Cryo
                         node.set_resolved_return_type(return_type);
                     }
                 }
-                
+
                 if (!return_type)
                 {
                     _diagnostic_builder->create_undefined_symbol_error(return_type_str, NodeKind::Declaration, node.location());
@@ -6586,21 +6579,24 @@ namespace Cryo
             enter_scope();
             _in_function = true;
             _current_function_return_type = return_type;
-            
+
             // Critical: Verify and restore struct context if needed
-            if (!_current_struct_type || _current_struct_name.empty()) {
+            if (!_current_struct_type || _current_struct_name.empty())
+            {
                 LOG_ERROR(Cryo::LogComponent::AST, "CRITICAL ERROR: Struct context lost during method processing for '{}' - this should never happen!", func_name);
                 // Try to recover the struct type from symbol table
-                if (!_current_struct_name.empty()) {
+                if (!_current_struct_name.empty())
+                {
                     TypedSymbol *struct_symbol = _symbol_table->lookup_symbol(_current_struct_name);
-                    if (struct_symbol && struct_symbol->type) {
+                    if (struct_symbol && struct_symbol->type)
+                    {
                         _current_struct_type = struct_symbol->type;
                         LOG_DEBUG(Cryo::LogComponent::AST, "Recovered struct type '{}' from symbol table", _current_struct_type->name());
                     }
                 }
             }
-            
-            LOG_DEBUG(Cryo::LogComponent::AST, "StructMethodNode: Processing '{}' with _current_struct_type='{}', _current_struct_name='{}'", 
+
+            LOG_DEBUG(Cryo::LogComponent::AST, "StructMethodNode: Processing '{}' with _current_struct_type='{}', _current_struct_name='{}'",
                       func_name, _current_struct_type ? _current_struct_type->name() : "NULL", _current_struct_name);
 
             // Declare parameters in function scope
@@ -7743,10 +7739,9 @@ namespace Cryo
 
         LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: method_name='{}', struct='{}', is_constructor={}, visibility={}({})",
                   method_name, _current_struct_name, is_constructor,
-                  (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public" : "Unknown"),
+                  (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
+                                                                                                                  : "Unknown"),
                   static_cast<int>(node.visibility()));
-        
-
 
         // Get return type or use struct name for constructors
         Type *return_type = node.get_resolved_return_type();
@@ -7831,34 +7826,39 @@ namespace Cryo
             }
 
             // Critical: Ensure we have a valid struct context for private method registration
-            if (_current_struct_name.empty()) {
+            if (_current_struct_name.empty())
+            {
                 LOG_ERROR(Cryo::LogComponent::AST, "FATAL: Attempting to register private method '{}' but _current_struct_name is empty!", method_name);
                 return; // Don't register method without proper context
             }
 
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method signature '{}' for struct '{}'",
                       method_name, _current_struct_name);
-            
 
-            
             _private_struct_methods[_current_struct_name][method_name] = func_type;
-            
+
             // Immediate verification that the method was actually registered
             auto verify_it = _private_struct_methods.find(_current_struct_name);
-            if (verify_it != _private_struct_methods.end()) {
+            if (verify_it != _private_struct_methods.end())
+            {
                 auto method_verify_it = verify_it->second.find(method_name);
-                if (method_verify_it != verify_it->second.end()) {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "✅ VERIFIED: Private method '{}' successfully registered for '{}'", 
-                              method_name, _current_struct_name);
-                } else {
-                    LOG_ERROR(Cryo::LogComponent::AST, "❌ REGISTRATION FAILED: Private method '{}' NOT found after registration for '{}'", 
+                if (method_verify_it != verify_it->second.end())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "✅ VERIFIED: Private method '{}' successfully registered for '{}'",
                               method_name, _current_struct_name);
                 }
-            } else {
-                LOG_ERROR(Cryo::LogComponent::AST, "❌ REGISTRATION FAILED: Struct '{}' NOT found in _private_struct_methods after registration", 
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::AST, "❌ REGISTRATION FAILED: Private method '{}' NOT found after registration for '{}'",
+                              method_name, _current_struct_name);
+                }
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::AST, "❌ REGISTRATION FAILED: Struct '{}' NOT found in _private_struct_methods after registration",
                           _current_struct_name);
             }
-            
+
             // DEBUG: Verify the private method was registered
             LOG_DEBUG(Cryo::LogComponent::AST, "✅ PRIVATE METHOD REGISTERED: '{}::{}'", _current_struct_name, method_name);
             LOG_DEBUG(Cryo::LogComponent::AST, "Total private methods for '{}': {}", _current_struct_name, _private_struct_methods[_current_struct_name].size());
@@ -7960,7 +7960,7 @@ namespace Cryo
             {
                 base_type.pop_back();
             }
-            
+
             // Check if base type is valid (including void)
             if (base_type == "void")
             {
@@ -8008,9 +8008,8 @@ namespace Cryo
 
         // Numeric conversions
         std::vector<std::string> numeric_types = {
-            "u8", "i8", "u16", "i16", "u32", "i32", "int", "u64", "i64", 
-            "f32", "f64", "float"
-        };
+            "u8", "i8", "u16", "i16", "u32", "i32", "int", "u64", "i64",
+            "f32", "f64", "float"};
 
         bool from_numeric = std::find(numeric_types.begin(), numeric_types.end(), from_type) != numeric_types.end();
         bool to_numeric = std::find(numeric_types.begin(), numeric_types.end(), to_type) != numeric_types.end();

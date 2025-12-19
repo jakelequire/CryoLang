@@ -555,9 +555,9 @@ namespace Cryo
         LOG_DEBUG(LogComponent::PARSER, "Parser synchronization initiated at {}:{} (brace_depth={}, paren_depth={}, bracket_depth={})",
                   _current_token.location().line(), _current_token.location().column(),
                   _brace_depth, _paren_depth, _bracket_depth);
-        
+
         // CRITICAL DEBUG: Check if synchronize is consuming private: keyword
-        std::cerr << "*** SYNCHRONIZE called at line " << _current_token.location().line() 
+        std::cerr << "*** SYNCHRONIZE called at line " << _current_token.location().line()
                   << " column " << _current_token.location().column() << "\n";
 
         // Track starting position for diagnostic purposes
@@ -576,12 +576,12 @@ namespace Cryo
             // ================================================================
             // METHOD BODY CONTEXT - Prevent escaping method boundaries
             // ================================================================
-            
+
             if (_parsing_method_body)
             {
                 // When inside method body, only synchronize on method-safe recovery points
                 // Never escape to class/struct level declarations
-                
+
                 if (current_kind == TokenKind::TK_SEMICOLON)
                 {
                     advance();
@@ -589,7 +589,7 @@ namespace Cryo
                     std::cerr << "*** SYNCHRONIZE ended on semicolon at line " << _current_token.location().line() << "\n";
                     return;
                 }
-                
+
                 // Only allow closing brace if it closes the method body
                 if (current_kind == TokenKind::TK_R_BRACE && _brace_depth > 0)
                 {
@@ -608,7 +608,7 @@ namespace Cryo
                         continue;
                     }
                 }
-                
+
                 // Statement starts are safe recovery points within method bodies
                 if (is_statement_start(current_kind) && _paren_depth == 0 && _bracket_depth == 0)
                 {
@@ -616,7 +616,7 @@ namespace Cryo
                               std::string(_current_token.text()), tokens_skipped);
                     return;
                 }
-                
+
                 // Continue consuming tokens within the method body
                 advance();
                 tokens_skipped++;
@@ -1986,7 +1986,7 @@ namespace Cryo
                 // Instead of returning nullptr, create an error recovery cast node
                 // This prevents cascading parser failures in method bodies
                 error("Expected type name after 'as' in cast expression");
-                
+
                 // Error recovery: create a cast to 'unknown' type to allow parsing to continue
                 expr = _builder.create_cast_expression(cast_loc, std::move(expr), "unknown");
                 break; // Exit the while loop to prevent further parsing issues
@@ -1998,9 +1998,12 @@ namespace Cryo
             // Handle generic types like Array<T> or Map<K, V> with error recovery
             if (_current_token.is(TokenKind::TK_L_ANGLE))
             {
-                try {
+                try
+                {
                     target_type += parse_generic_type_suffix();
-                } catch (const ParseError &e) {
+                }
+                catch (const ParseError &e)
+                {
                     // If generic type parsing fails, continue with just the base type
                     // This prevents method body parsing from completely failing
                     error("Failed to parse generic type suffix in cast expression");
@@ -3347,7 +3350,7 @@ namespace Cryo
     std::string Parser::parse_generic_type_suffix()
     {
         std::string result;
-        
+
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
             result += "<";
@@ -3504,29 +3507,16 @@ namespace Cryo
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after struct name");
 
-
-
         // Parse struct members (fields and methods)
         Visibility current_visibility = Visibility::Public; // Default for structs
 
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
-            // CRITICAL DEBUG: Track exactly what happens in MemoryPool parsing
-            if (struct_name == "MemoryPool") {
-                std::cerr << "*** MEMORYPOOL DEBUG: Processing token '" << std::string(_current_token.text()) 
-                         << "' (kind=" << static_cast<int>(_current_token.kind()) 
-                         << ") at line " << _current_token.location().line() 
-                         << " column " << _current_token.location().column() << "\n";
-            }
-            
             try
             {
                 // Check for visibility modifiers
                 if (is_visibility_modifier())
                 {
-                    if (struct_name == "MemoryPool") {
-                        std::cerr << "*** MEMORYPOOL DEBUG: Found visibility modifier '" << std::string(_current_token.text()) << "'\n";
-                    }
                     current_visibility = parse_visibility_modifier(); // Store the parsed visibility
                     consume(TokenKind::TK_COLON, "Expected ':' after visibility modifier");
                     continue;
@@ -3562,19 +3552,11 @@ namespace Cryo
 
                 if (is_method)
                 {
-                    // It's a method
-                    if (struct_name == "MemoryPool") {
-                        std::cerr << "*** MEMORYPOOL DEBUG: Parsing METHOD '" << std::string(_current_token.text()) << "' with visibility=" << static_cast<int>(current_visibility) << "\n";
-                    }
                     auto method = parse_struct_method(struct_name, current_visibility);
                     struct_decl->add_method(std::move(method));
                 }
                 else
                 {
-                    // It's a field
-                    if (struct_name == "MemoryPool") {
-                        std::cerr << "*** MEMORYPOOL DEBUG: Parsing FIELD '" << std::string(_current_token.text()) << "' with visibility=" << static_cast<int>(current_visibility) << "\n";
-                    }
                     auto field = parse_struct_field(current_visibility);
                     struct_decl->add_field(std::move(field));
                 }
@@ -3630,29 +3612,16 @@ namespace Cryo
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after class declaration");
 
-
-
         // Parse class members
         Visibility current_visibility = Visibility::Private; // Default for classes
 
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
-            // CRITICAL DEBUG: Track exactly what happens in MemoryPool parsing (CLASS version)
-            if (class_name == "MemoryPool") {
-                std::cerr << "*** MEMORYPOOL DEBUG: Processing token '" << std::string(_current_token.text()) 
-                         << "' (kind=" << static_cast<int>(_current_token.kind()) 
-                         << ") at line " << _current_token.location().line() 
-                         << " column " << _current_token.location().column() << "\n";
-            }
-            
             try
             {
                 // Check for visibility modifiers
                 if (is_visibility_modifier())
                 {
-                    if (class_name == "MemoryPool") {
-                        std::cerr << "*** MEMORYPOOL DEBUG: Found visibility modifier '" << std::string(_current_token.text()) << "'\n";
-                    }
                     current_visibility = parse_visibility_modifier();
                     consume(TokenKind::TK_COLON, "Expected ':' after visibility modifier");
                     continue;
@@ -3688,20 +3657,12 @@ namespace Cryo
 
                 if (is_method)
                 {
-                    // It's a method
-                    if (class_name == "MemoryPool") {
-                        std::cerr << "*** MEMORYPOOL DEBUG: Parsing METHOD '" << std::string(_current_token.text()) << "' with visibility=" << static_cast<int>(current_visibility) << "\n";
-                    }
                     auto method = parse_struct_method(class_name, current_visibility);
                     // Note: We reuse StructMethodNode for class methods
                     class_decl->add_method(std::move(method));
                 }
                 else
                 {
-                    // It's a field
-                    if (class_name == "MemoryPool") {
-                        std::cerr << "*** MEMORYPOOL DEBUG: Parsing FIELD '" << std::string(_current_token.text()) << "' with visibility=" << static_cast<int>(current_visibility) << "\n";
-                    }
                     auto field = parse_struct_field(current_visibility);
                     class_decl->add_field(std::move(field));
                 }
@@ -4531,43 +4492,51 @@ namespace Cryo
             // Robust method body parsing with proper error recovery
             SourceLocation body_start = _current_token.location();
             int initial_brace_depth = _brace_depth;
-            
+
             // CRITICAL: Use completely self-contained method body parsing
             // Don't let ParseErrors escape to the class level where they cause chaos
-            
+
             // Manual method body parsing with brace counting
-            if (!_current_token.is(TokenKind::TK_L_BRACE)) {
+            if (!_current_token.is(TokenKind::TK_L_BRACE))
+            {
                 error("Expected '{' to start method body");
                 return method;
             }
-            
+
             // Consume opening brace and track depth
             advance(); // consume '{'
             int method_brace_count = 1;
             size_t tokens_consumed = 0;
-            
+
             // Consume ALL tokens until we find the matching closing brace
             // This prevents any escaping to class-level parsing
-            while (!is_at_end() && method_brace_count > 0 && tokens_consumed < 2000) {
-                if (_current_token.is(TokenKind::TK_L_BRACE)) {
+            while (!is_at_end() && method_brace_count > 0 && tokens_consumed < 2000)
+            {
+                if (_current_token.is(TokenKind::TK_L_BRACE))
+                {
                     method_brace_count++;
-                } else if (_current_token.is(TokenKind::TK_R_BRACE)) {
+                }
+                else if (_current_token.is(TokenKind::TK_R_BRACE))
+                {
                     method_brace_count--;
                 }
                 advance();
                 tokens_consumed++;
             }
-            
-            if (method_brace_count > 0) {
+
+            if (method_brace_count > 0)
+            {
                 LOG_ERROR(LogComponent::PARSER, "Method '{}' body parsing failed - unclosed braces", method_name);
-            } else {
+            }
+            else
+            {
                 LOG_DEBUG(LogComponent::PARSER, "Method '{}' body consumed {} tokens successfully", method_name, tokens_consumed);
             }
-            
+
             // Create empty method body (we've consumed the tokens but not parsed the AST)
             auto empty_body = _builder.create_block_statement(body_start);
             method->set_body(std::move(empty_body));
-            
+
             // OLD COMPLEX PARSING - Replaced with simple token consumption above
             /*
             try {
@@ -4576,12 +4545,12 @@ namespace Cryo
                     dynamic_cast<BlockStatementNode *>(body.release())));
             } catch (const ParseError &e) {
                 _errors.push_back(e);
-                
+
                 // IMPROVED: Method-body-specific error recovery
                 // Don't use synchronize() here as it's too aggressive for method bodies
                 int brace_count = 0;
                 SourceLocation recovery_start = _current_token.location();
-                
+
                 // Count opening brace
                 if (_current_token.is(TokenKind::TK_L_BRACE)) {
                     brace_count = 1;
@@ -4596,7 +4565,7 @@ namespace Cryo
                         advance();
                     }
                 }
-                
+
                 // Skip tokens until we find ONLY the matching closing brace for this method
                 // Use brace depth tracking to avoid consuming private: sections
                 size_t tokens_consumed = 0;
@@ -4615,10 +4584,10 @@ namespace Cryo
                     advance();
                     tokens_consumed++;
                 }
-                
-                LOG_DEBUG(LogComponent::PARSER, "Method body error recovery: consumed {} tokens, final brace_count={}", 
+
+                LOG_DEBUG(LogComponent::PARSER, "Method body error recovery: consumed {} tokens, final brace_count={}",
                          tokens_consumed, brace_count);
-                
+
                 // Create an empty block as fallback
                 auto empty_block = _builder.create_block_statement(body_start);
                 method->set_body(std::move(empty_block));
@@ -5001,14 +4970,14 @@ namespace Cryo
         if (collected_tokens.empty())
         {
             // Instead of throwing an error, handle the case gracefully
-            LOG_DEBUG(LogComponent::PARSER, "No type tokens collected, current token is: {} ({})", 
+            LOG_DEBUG(LogComponent::PARSER, "No type tokens collected, current token is: {} ({})",
                       static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
-            
+
             // We must advance at least one token to prevent infinite loops
             SourceLocation error_location = _current_token.location();
             TokenKind error_token = _current_token.kind();
             advance(); // Always advance to prevent infinite loops
-            
+
             // Report appropriate error based on what we encountered
             if (is_statement_start(error_token) || error_token == TokenKind::TK_EOF)
             {
@@ -5030,7 +4999,7 @@ namespace Cryo
                     diagnostic.add_note("Expected valid type annotation");
                 }
             }
-            
+
             return _context.types().get_unknown_type();
         }
 
