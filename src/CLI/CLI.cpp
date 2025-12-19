@@ -553,11 +553,11 @@ namespace Cryo::CLI
 
                 if (compiler->generate_output(args.output_file(), target))
                 {
-                    std::cout << "✓ Executable generated successfully: " << args.output_file() << std::endl;
+                    std::cout << "Executable generated successfully: " << args.output_file() << std::endl;
                 }
                 else
                 {
-                    std::cerr << "\n❌ Executable generation failed!" << std::endl;
+                    std::cerr << "\n<!> Executable generation failed!" << std::endl;
                     compiler->print_diagnostics();
                     return 1;
                 }
