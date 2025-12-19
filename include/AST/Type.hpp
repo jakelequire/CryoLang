@@ -423,9 +423,12 @@ namespace Cryo
         ArrayType(std::shared_ptr<Type> element_type, std::optional<size_t> size = std::nullopt)
             : Type(TypeKind::Array), _element_type(element_type), _size(size)
         {
-            if (size.has_value()) {
+            if (size.has_value())
+            {
                 _name = element_type->name() + "[" + std::to_string(*size) + "]";
-            } else {
+            }
+            else
+            {
                 _name = element_type->name() + "[]";
             }
         }
@@ -724,11 +727,12 @@ namespace Cryo
                 return nullptr;
 
             // For user-defined generic types (like GenericStruct), preserve the original base name
-            if (_param_type_kind == TypeKind::Parameterized) {
+            if (_param_type_kind == TypeKind::Parameterized)
+            {
                 // Use the constructor that takes base_name directly to preserve "GenericStruct" instead of "Unknown"
                 return std::make_shared<ParameterizedType>(name(), concrete_types);
             }
-            
+
             return std::make_shared<ParameterizedType>(_param_type_kind, concrete_types);
         }
 
@@ -1373,12 +1377,13 @@ namespace Cryo
 
         // Utility to parse generic type syntax: "Array<int, string>" -> ("Array", ["int", "string"])
         std::pair<std::string, std::vector<std::string>> parse_generic_syntax(const std::string &type_string);
-        
+
         // Helper to parse template parameters respecting nested angle brackets
         std::vector<std::string> parse_template_parameters(const std::string &params_str);
 
         // Access all instantiations for TypeMapper registration
-        const std::unordered_map<std::string, std::shared_ptr<ParameterizedType>>& get_all_instantiations() const {
+        const std::unordered_map<std::string, std::shared_ptr<ParameterizedType>> &get_all_instantiations() const
+        {
             return _instantiations;
         }
     };

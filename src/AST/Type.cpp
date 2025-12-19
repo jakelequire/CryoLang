@@ -876,7 +876,7 @@ namespace Cryo
         auto array_type = std::make_unique<ArrayType>(element_shared, size);
 
         Type *result = array_type.get();
-        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Created ArrayType with name='{}', kind={}, size={}", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Created ArrayType with name='{}', kind={}, size={}",
                   result->name(), static_cast<int>(result->kind()), size.has_value() ? std::to_string(*size) : "none");
         _complex_types.push_back(std::move(array_type));
 
@@ -1292,8 +1292,8 @@ namespace Cryo
                         ++index; // consume ']'
                         Type *old_type = result_type;
                         result_type = create_array_type(result_type, array_size);
-                        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Array type created for primitive: {} -> {}, kind: {}", 
-                                  old_type->to_string(), 
+                        LOG_DEBUG(Cryo::LogComponent::AST, "DEBUG: Array type created for primitive: {} -> {}, kind: {}",
+                                  old_type->to_string(),
                                   result_type ? result_type->to_string() : "null",
                                   result_type ? static_cast<int>(result_type->kind()) : -1);
                     }

@@ -1041,9 +1041,9 @@ namespace Cryo
             {
                 std::string element_type_str = type_string.substr(0, bracket_pos);
                 std::string size_part = type_string.substr(bracket_pos + 1, type_string.length() - bracket_pos - 2);
-                
-                LOG_DEBUG(Cryo::LogComponent::AST, "Found array type '{}', resolving element type '{}' with size '{}'", 
-                         type_string, element_type_str, size_part);
+
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found array type '{}', resolving element type '{}' with size '{}'",
+                          type_string, element_type_str, size_part);
 
                 // Recursively resolve the element type with generic context
                 Type *element_type = resolve_type_with_generic_context(element_type_str);
@@ -1800,14 +1800,14 @@ namespace Cryo
         if (node.get_resolved_type())
         {
             declared_type = node.get_resolved_type();
-            LOG_DEBUG(Cryo::LogComponent::AST, "Using directly resolved type '{}' (kind={}) for variable '{}'", 
-                     declared_type->to_string(), TypeKindToString(declared_type->kind()), var_name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Using directly resolved type '{}' (kind={}) for variable '{}'",
+                      declared_type->to_string(), TypeKindToString(declared_type->kind()), var_name);
         }
         else if (!node.type_annotation().empty() && node.type_annotation() != "auto")
         {
             declared_type = resolve_type_with_generic_context(node.type_annotation());
             LOG_DEBUG(Cryo::LogComponent::AST, "Fallback: resolved type '{}' from annotation '{}' for variable '{}'",
-                     declared_type ? declared_type->to_string() : "unknown", node.type_annotation(), var_name);
+                      declared_type ? declared_type->to_string() : "unknown", node.type_annotation(), var_name);
         }
 
         // Debug: Check declared type for Array
@@ -1818,7 +1818,7 @@ namespace Cryo
                       declared_type->kind() == TypeKind::Parameterized ? "true" : "false");
         }
 
-        // Debug: Track malformed pointer types at declaration time  
+        // Debug: Track malformed pointer types at declaration time
         if (declared_type && (!node.type_annotation().empty() && node.type_annotation().find("*") != std::string::npos))
         {
             if (declared_type->kind() == TypeKind::Struct)
@@ -2589,6 +2589,8 @@ namespace Cryo
         {
             // For now, treat 'this' as having the current struct type
             // TODO: Add proper implementation block context checking
+            LOG_DEBUG(Cryo::LogComponent::AST, "[DEBUG] 'this' keyword accessed: _current_struct_type=0x{:x} (_current_struct_name='{}'), _in_function={}",
+                      (uintptr_t)_current_struct_type, _current_struct_name, _in_function);
             if (_current_struct_type)
             {
                 // For primitive types, 'this' is the primitive type itself
@@ -2614,7 +2616,7 @@ namespace Cryo
             }
             else
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: 'this' resolved but _current_struct_type is NULL - this should not happen in method context");
+                LOG_ERROR(Cryo::LogComponent::AST, "[CRITICAL] 'this' resolved but _current_struct_type is NULL - this should not happen in method context. _current_struct_name='{}', _in_function={}", _current_struct_name, _in_function);
                 _diagnostic_builder->create_undefined_symbol_error(name, NodeKind::VariableDeclaration, node.location());
                 node.set_resolved_type(_type_context.get_unknown_type());
             }

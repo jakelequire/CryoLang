@@ -42,6 +42,7 @@ namespace Cryo
         // Context tracking
         bool _in_implementation_block = false;
         bool _parsing_method_body = false;         // Track if we're inside a method body (for synchronize context)
+        bool _parsing_class_members = false;       // Track if we're parsing class/struct members (for synchronize context)
         std::string _current_namespace = "Global"; // Current namespace context
         int _scope_depth = 0;                      // Track nesting depth (0 = global scope)
 
