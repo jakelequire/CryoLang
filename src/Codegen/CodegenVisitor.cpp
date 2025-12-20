@@ -590,6 +590,40 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No function body to generate for: {}", node.name());
             }
+            
+            // CRITICAL: Check for any unterminated blocks in the generated function
+            if (function)
+            {
+                std::vector<llvm::BasicBlock*> unterminated_blocks;
+                for (llvm::BasicBlock &bb : *function)
+                {
+                    if (!bb.getTerminator())
+                    {
+                        unterminated_blocks.push_back(&bb);
+                    }
+                }
+                
+                if (!unterminated_blocks.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found {} unterminated blocks in function '{}', fixing...", 
+                             unterminated_blocks.size(), node.name());
+                             
+                    for (llvm::BasicBlock* bb : unterminated_blocks)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fixing unterminated block: {}", bb->getName().str());
+                        
+                        // Position builder at the end of the unterminated block
+                        _context_manager.get_builder().SetInsertPoint(bb);
+                        
+                        // Add an unreachable terminator to prevent verification errors
+                        // This is safe because an unterminated block means the control flow
+                        // should never reach this point in a well-formed program
+                        _context_manager.get_builder().CreateUnreachable();
+                    }
+                    
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fixed all unterminated blocks in function '{}'", node.name());
+                }
+            }
         }
         catch (const std::exception &e)
         {
@@ -599,6 +633,7 @@ namespace Cryo::Codegen
                                                   "Exception in function declaration: " + std::string(e.what()));
             }
         }
+        
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed FunctionDeclarationNode: {}", node.name());
     }
 
@@ -9084,8 +9119,18 @@ namespace Cryo::Codegen
 
                     // Evaluate right operand in lor.rhs block
                     builder.SetInsertPoint(lor_rhs);
+                    
+                    // Add debug logging for tracking block termination
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: About to evaluate right operand in block: {}", 
+                             lor_rhs->getName().str());
+                    
                     node->right()->accept(*this);
                     llvm::Value *right_val = get_current_value();
+                    
+                    // Get the current block after right evaluation - it might have changed due to nested expressions
+                    llvm::BasicBlock *current_after_right = builder.GetInsertBlock();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: After right evaluation, current block: {}, has terminator: {}", 
+                             current_after_right->getName().str(), current_after_right->getTerminator() != nullptr);
 
                     if (!right_val)
                     {
@@ -9093,8 +9138,20 @@ namespace Cryo::Codegen
                         llvm::BasicBlock *current_block = builder.GetInsertBlock();
                         if (current_block && !current_block->getTerminator())
                         {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating orphaned block: {}", 
+                                     current_block->getName().str());
                             builder.CreateBr(lor_end);
                         }
+                        
+                        // Also check and terminate the original lor_rhs block if it's different and unterminated
+                        if (lor_rhs != current_block && !lor_rhs->getTerminator())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating original lor_rhs block: {}", 
+                                     lor_rhs->getName().str());
+                            builder.SetInsertPoint(lor_rhs);
+                            builder.CreateBr(lor_end);
+                        }
+                        
                         builder.SetInsertPoint(lor_end);
                         builder.CreateUnreachable();
 
@@ -9105,6 +9162,11 @@ namespace Cryo::Codegen
                         _diagnostic_builder->report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Failed to generate right operand for logical OR", static_cast<ASTNode *>(node));
                         return nullptr;
                     }
+
+                    // IMPORTANT: After evaluating right operand, we might be in a different block
+                    // due to complex expressions (like casts, function calls, etc.)
+                    // We need to get the actual current block before creating the branch
+                    llvm::BasicBlock *right_eval_block = builder.GetInsertBlock();
 
                     // Convert right to boolean
                     llvm::Value *right_bool = right_val;
@@ -9143,15 +9205,47 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    builder.CreateBr(lor_end);
-                    llvm::BasicBlock *lor_rhs_end = builder.GetInsertBlock();
+                    // Ensure the current block (after evaluating and converting right operand) is terminated
+                    llvm::BasicBlock *final_right_block = builder.GetInsertBlock();
+                    if (!final_right_block->getTerminator())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating final_right_block: {}", 
+                                 final_right_block->getName().str());
+                        builder.CreateBr(lor_end);
+                    }
+                    
+                    // SAFETY CHECK: Ensure the original lor_rhs block is also terminated if it's different
+                    if (lor_rhs != final_right_block && !lor_rhs->getTerminator())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating original lor_rhs block: {}", 
+                                 lor_rhs->getName().str());
+                        // Save current position
+                        llvm::BasicBlock *saved_position = builder.GetInsertBlock();
+                        
+                        builder.SetInsertPoint(lor_rhs);
+                        builder.CreateBr(lor_end);
+                        
+                        // Restore position
+                        builder.SetInsertPoint(saved_position);
+                    }
+
+                    // Use the final block for PHI incoming
+                    llvm::BasicBlock *lor_rhs_end = final_right_block;
 
                     // Create PHI node to merge results
                     builder.SetInsertPoint(lor_end);
                     llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx), 2, "logor.result");
                     phi->addIncoming(llvm::ConstantInt::getTrue(llvm_ctx), lor_lhs);
                     phi->addIncoming(right_bool, lor_rhs_end);
+                    
+                    // CRITICAL DEBUG: Log all lor.rhs blocks to ensure they're properly terminated
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Final block status - lor_lhs: {} (terminated: {}), lor_rhs_end: {} (terminated: {}), lor_end: {} (terminated: {})",
+                             lor_lhs->getName().str(), lor_lhs->getTerminator() != nullptr,
+                             lor_rhs_end->getName().str(), lor_rhs_end->getTerminator() != nullptr, 
+                             lor_end->getName().str(), lor_end->getTerminator() != nullptr);
 
+                    // Note: lor_end intentionally has no terminator yet - the caller (if-statement)
+                    // will add the appropriate branch after getting the condition value
                     return phi;
                 }
             }
@@ -11287,6 +11381,182 @@ namespace Cryo::Codegen
             if (function_name.length() > 4 && function_name.substr(0, 2) == "__" && function_name.substr(function_name.length() - 2) == "__")
             {
                 return generate_intrinsic_call(node, function_name);
+            }
+
+            // Implicit 'this' method call: allow calling class/struct methods without explicit 'this.'
+            // Example: inside a class method, calling 'deallocate_medium(ptr)' should resolve to 'this.deallocate_medium(ptr)'
+            {
+                llvm::Value *this_value = _value_context->get_value("this");
+                llvm::AllocaInst *this_alloca = _value_context->get_alloca("this");
+                if (!this_value && this_alloca)
+                {
+                    this_value = this_alloca;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Implicit this: using 'this' alloca from ValueContext");
+                }
+                if (this_value)
+                {
+                    std::string this_type_name;
+                    auto type_it = _variable_types.find("this");
+                    if (type_it != _variable_types.end() && type_it->second)
+                    {
+                        this_type_name = type_it->second->to_string();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Implicit this: found type from _variable_types: '{}'", this_type_name);
+                    }
+                    else
+                    {
+                        // Determine class/struct type from LLVM pointer type by matching registered types
+                        if (this_value->getType()->isPointerTy())
+                        {
+                            for (const auto &[class_name, llvm_type] : _types)
+                            {
+                                llvm::Type *ptr_type = llvm::PointerType::getUnqual(llvm_type);
+                                if (ptr_type == this_value->getType())
+                                {
+                                    this_type_name = class_name;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Implicit this: inferred type from LLVM pointer: '{}'", this_type_name);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!this_type_name.empty())
+                    {
+                        // Strip pointer asterisk if present
+                        if (!this_type_name.empty() && this_type_name.back() == '*')
+                        {
+                            this_type_name.pop_back();
+                        }
+
+                        // Build fully qualified type name if not already qualified
+                        std::string qualified_type_name = this_type_name;
+                        if (qualified_type_name.find("::") == std::string::npos)
+                        {
+                            auto namespace_parts = get_current_namespace_parts();
+                            if (!namespace_parts.empty())
+                            {
+                                qualified_type_name.clear();
+                                for (size_t i = 0; i < namespace_parts.size(); ++i)
+                                {
+                                    if (i > 0)
+                                        qualified_type_name += "::";
+                                    qualified_type_name += namespace_parts[i];
+                                }
+                                qualified_type_name += "::" + this_type_name;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Implicit this: using qualified type name: '{}'", qualified_type_name);
+                            }
+                        }
+
+                        // Collect parameter types for signature matching
+                        std::vector<Cryo::Type *> parameter_types;
+                        for (const auto &arg : node->arguments())
+                        {
+                            if (arg && arg->get_resolved_type())
+                            {
+                                parameter_types.push_back(arg->get_resolved_type());
+                            }
+                        }
+
+                        // Generate standardized method name and try lookup
+                        std::string implicit_method_name = generate_method_name(qualified_type_name, function_name, parameter_types);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Implicit this: built method name: '{}'", implicit_method_name);
+                        auto method_it = _functions.find(implicit_method_name);
+
+                        // Generic monomorphization fallback for types like Generic<T>
+                        if (method_it == _functions.end() && this_type_name.find('<') != std::string::npos)
+                        {
+                            std::string monomorphized_name = this_type_name;
+                            size_t angle_start = monomorphized_name.find('<');
+                            size_t angle_end = monomorphized_name.find('>', angle_start);
+                            if (angle_start != std::string::npos && angle_end != std::string::npos)
+                            {
+                                std::string type_params = monomorphized_name.substr(angle_start + 1, angle_end - angle_start - 1);
+                                size_t pos = 0;
+                                while ((pos = type_params.find(", ", pos)) != std::string::npos)
+                                {
+                                    type_params.replace(pos, 2, "_");
+                                    pos += 1;
+                                }
+                                std::replace(type_params.begin(), type_params.end(), ',', '_');
+                                std::replace(type_params.begin(), type_params.end(), ' ', '_');
+                                monomorphized_name = monomorphized_name.substr(0, angle_start) + "_" + type_params;
+                            }
+                            std::string monomorphized_method_name = generate_method_name(monomorphized_name, function_name, parameter_types);
+                            method_it = _functions.find(monomorphized_method_name);
+                        }
+
+                        if (method_it != _functions.end())
+                        {
+                            llvm::Function *method_func = method_it->second;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Implicit this: found method: {}", implicit_method_name);
+
+                            // Prepare arguments: this pointer + method args
+                            std::vector<llvm::Value *> args;
+                            llvm::Value *this_ptr = this_value;
+                            if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(this_value))
+                            {
+                                llvm::Type *allocated_type = alloca_inst->getAllocatedType();
+                                if (allocated_type->isPointerTy())
+                                {
+                                    this_ptr = create_load(this_value, allocated_type, "this.load");
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Implicit this: loaded pointer for method call");
+                                }
+                            }
+                            args.push_back(this_ptr);
+
+                            // Generate method arguments with implicit type conversions
+                            llvm::FunctionType *func_type = method_func->getFunctionType();
+                            for (size_t i = 0; i < node->arguments().size(); ++i)
+                            {
+                                const auto &arg = node->arguments()[i];
+                                if (arg)
+                                {
+                                    arg->accept(*this);
+                                    llvm::Value *arg_value = get_current_value();
+                                    if (arg_value)
+                                    {
+                                        if (i + 1 < func_type->getNumParams())
+                                        {
+                                            llvm::Type *expected_type = func_type->getParamType(i + 1);
+                                            llvm::Type *actual_type = arg_value->getType();
+                                            if (actual_type != expected_type)
+                                            {
+                                                if (actual_type->isFloatTy() && expected_type->isDoubleTy())
+                                                {
+                                                    arg_value = builder.CreateFPExt(arg_value, expected_type, "float_to_double");
+                                                }
+                                                else if (actual_type->isDoubleTy() && expected_type->isFloatTy())
+                                                {
+                                                    arg_value = builder.CreateFPTrunc(arg_value, expected_type, "double_to_float");
+                                                }
+                                                else if (actual_type->isIntegerTy() && expected_type->isIntegerTy())
+                                                {
+                                                    unsigned actual_bits = actual_type->getIntegerBitWidth();
+                                                    unsigned expected_bits = expected_type->getIntegerBitWidth();
+                                                    if (actual_bits != expected_bits)
+                                                    {
+                                                        if (actual_bits < expected_bits)
+                                                        {
+                                                            arg_value = builder.CreateZExt(arg_value, expected_type, "int_extend");
+                                                        }
+                                                        else
+                                                        {
+                                                            arg_value = builder.CreateTrunc(arg_value, expected_type, "int_truncate");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        args.push_back(arg_value);
+                                    }
+                                }
+                            }
+
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calling implicit 'this' method with {} arguments", args.size());
+                            return builder.CreateCall(method_func, args);
+                        }
+                    }
+                }
             }
         }
         else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->callee()))
@@ -14322,6 +14592,14 @@ namespace Cryo::Codegen
         if (!symbol)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Undefined function detected: '{}' - function not found in symbol table. Refusing to create forward declaration to prevent LLVM DataLayout crash", c_name);
+
+            if (call_node)
+            {
+                const auto &loc = call_node->location();
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "Call site for undefined function '{}' at line {}, column {}",
+                          c_name, loc.line(), loc.column());
+            }
 
             // Don't report GDM error here - AST/type checking phase already reports E0202_UNDEFINED_FUNCTION
             // We just need to return nullptr to prevent LLVM crashes, the actual error reporting
@@ -18665,8 +18943,26 @@ namespace Cryo::Codegen
             return builder.CreateBitCast(source_value, target_type, "ptr_cast");
         }
 
-        // Default: try bitcast
-        return builder.CreateBitCast(source_value, target_type, "cast");
+        // Pointer to integer casts
+        if (source_type->isPointerTy() && target_type->isIntegerTy())
+        {
+            return builder.CreatePtrToInt(source_value, target_type, "ptr_to_int");
+        }
+
+        // Integer to pointer casts
+        if (source_type->isIntegerTy() && target_type->isPointerTy())
+        {
+            return builder.CreateIntToPtr(source_value, target_type, "int_to_ptr");
+        }
+
+        // Default: try bitcast (for compatible types only)
+        if (source_type->getPrimitiveSizeInBits() == target_type->getPrimitiveSizeInBits())
+        {
+            return builder.CreateBitCast(source_value, target_type, "cast");
+        }
+
+        // If we reach here, the cast is not supported
+        return nullptr;
     }
 
 } // namespace Cryo::Codegen

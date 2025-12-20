@@ -1979,6 +1979,57 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::visit(FunctionDeclarationNode) - Processing function '{}' in struct context '{}'",
                   func_name, _current_struct_name);
 
+        // Fallback: If we're not in a struct/class context, but this function
+        // name matches a registered struct/class method, restore the proper context
+        if (_current_struct_name.empty())
+        {
+            std::string owning_type_name;
+            // Check public struct/class methods
+            for (const auto &entry : _struct_methods)
+            {
+                const std::string &type_name = entry.first;
+                const auto &methods = entry.second;
+                if (methods.find(func_name) != methods.end())
+                {
+                    owning_type_name = type_name;
+                    break;
+                }
+            }
+            // If not found in public, check private methods
+            if (owning_type_name.empty())
+            {
+                for (const auto &entry : _private_struct_methods)
+                {
+                    const std::string &type_name = entry.first;
+                    const auto &methods = entry.second;
+                    if (methods.find(func_name) != methods.end())
+                    {
+                        owning_type_name = type_name;
+                        break;
+                    }
+                }
+            }
+
+            if (!owning_type_name.empty())
+            {
+                // Restore struct/class context from symbol table
+                TypedSymbol *type_symbol = _symbol_table->lookup_symbol(owning_type_name);
+                if (type_symbol && type_symbol->type &&
+                    (type_symbol->type->kind() == TypeKind::Struct || type_symbol->type->kind() == TypeKind::Class))
+                {
+                    _current_struct_name = owning_type_name;
+                    _current_struct_type = type_symbol->type;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Restored struct/class context for misclassified method '{}' as '{}'",
+                              func_name, _current_struct_name);
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Could not restore struct/class context for '{}' (symbol not found or invalid)",
+                              func_name);
+                }
+            }
+        }
+
         // Handle generic functions - enter generic context if needed
         bool is_generic_function = !node.generic_parameters().empty();
         if (is_generic_function)
@@ -2157,10 +2208,11 @@ namespace Cryo
         _in_function = true;
         _current_function_return_type = return_type;
 
-        // PRESERVE _current_struct_type during method body processing
+        // PRESERVE _current_struct_type and _current_struct_name during method body processing
         Type *preserved_struct_type = _current_struct_type;
-        LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Preserving _current_struct_type='{}' for function '{}'",
-                  preserved_struct_type ? preserved_struct_type->name() : "NULL", func_name);
+        std::string preserved_struct_name = _current_struct_name;
+        LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Preserving _current_struct_type='{}' and _current_struct_name='{}' for function '{}' (in_struct_scope={})",
+                  preserved_struct_type ? preserved_struct_type->name() : "NULL", preserved_struct_name, func_name, !preserved_struct_name.empty());
 
         // Process trait bounds for generic parameters
         _current_generic_trait_bounds.clear();
@@ -2184,11 +2236,14 @@ namespace Cryo
             node.body()->accept(*this);
         }
 
-        // Exit function scope and RESTORE _current_struct_type
+        // Exit function scope and RESTORE _current_struct_type and _current_struct_name
         _current_function_return_type = nullptr;
         _in_function = false;
         _current_generic_trait_bounds.clear();
         _current_struct_type = preserved_struct_type; // RESTORE the struct context
+        _current_struct_name = preserved_struct_name; // RESTORE the struct name
+        LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Restored _current_struct_type='{}' and _current_struct_name='{}' for function '{}'",
+                  _current_struct_type ? _current_struct_type->name() : "NULL", _current_struct_name, func_name);
         exit_scope();
 
         // Exit generic context if it was a generic function
@@ -2587,10 +2642,39 @@ namespace Cryo
         // Special handling for 'this' keyword
         if (name == "this")
         {
+            // Skip 'this' processing if we're not in a method/struct context (e.g., during code generation)
+            if (!_current_struct_type && _current_struct_name.empty() && _in_function == 0)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "[SKIP] 'this' keyword skipped - not in method context (likely during code generation phase)");
+                // If 'this' already has a resolved type, keep it; otherwise set to unknown
+                if (!node.has_resolved_type())
+                {
+                    node.set_resolved_type(_type_context.get_unknown_type());
+                }
+                return;
+            }
+
             // For now, treat 'this' as having the current struct type
             // TODO: Add proper implementation block context checking
             LOG_DEBUG(Cryo::LogComponent::AST, "[DEBUG] 'this' keyword accessed: _current_struct_type=0x{:x} (_current_struct_name='{}'), _in_function={}",
                       (uintptr_t)_current_struct_type, _current_struct_name, _in_function);
+
+            // Recovery mechanism: if _current_struct_type is NULL, try to recover it
+            if (!_current_struct_type && !_current_struct_name.empty())
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "[RECOVERY] 'this' keyword recovery: attempting to find struct type for '{}'", _current_struct_name);
+                TypedSymbol *struct_symbol = _symbol_table->lookup_symbol(_current_struct_name);
+                if (struct_symbol && (struct_symbol->type->kind() == TypeKind::Struct || struct_symbol->type->kind() == TypeKind::Class))
+                {
+                    _current_struct_type = struct_symbol->type;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "[RECOVERY] 'this' keyword recovery: successfully recovered struct type '{}'", _current_struct_type->name());
+                }
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::AST, "[RECOVERY] 'this' keyword recovery: failed to find struct type for '{}'", _current_struct_name);
+                }
+            }
+
             if (_current_struct_type)
             {
                 // For primitive types, 'this' is the primitive type itself
@@ -4082,6 +4166,144 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "Member '{}' - looked up type '{}': {}",
                           node.member(), type_name, object_type ? object_type->name() : "null");
             }
+
+            // Additional fallback: if object is 'this' and its type is unknown, recover from current struct/class context
+            if ((!object_type || object_type->kind() == TypeKind::Unknown) && node.object())
+            {
+                if (auto *ident = dynamic_cast<IdentifierNode *>(node.object()))
+                {
+                    if (ident->name() == "this")
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "MemberAccess 'this' fallback: object_type is '{}' - attempting context recovery (_current_struct_name='{}')",
+                                  object_type ? object_type->to_string() : "null",
+                                  _current_struct_name);
+
+                        Type *struct_type = _current_struct_type;
+                        if (!struct_type && !_current_struct_name.empty())
+                        {
+                            // Try to restore struct/class type from symbol table using current struct name
+                            TypedSymbol *sym = _symbol_table->lookup_symbol(_current_struct_name);
+                            if (sym)
+                            {
+                                if (sym->struct_node)
+                                {
+                                    struct_type = _type_context.get_struct_type(_current_struct_name);
+                                }
+                                else if (sym->class_node)
+                                {
+                                    struct_type = _type_context.get_class_type(_current_struct_name);
+                                }
+                            }
+                        }
+
+                        // Heuristic recovery: if struct context is still missing, infer owner type by member name
+                        if (!struct_type)
+                        {
+                            const std::string member_name = node.member();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "MemberAccess 'this' heuristic: inferring owner by member '{}'", member_name);
+
+                            // First, try fields
+                            for (const auto &entry : _struct_fields)
+                            {
+                                const std::string &type_name = entry.first;
+                                const auto &fields = entry.second;
+                                if (fields.find(member_name) != fields.end())
+                                {
+                                    TypedSymbol *sym = _symbol_table->lookup_symbol(type_name);
+                                    if (sym && sym->type)
+                                    {
+                                        if (sym->type->kind() == TypeKind::Struct)
+                                        {
+                                            struct_type = _type_context.get_struct_type(type_name);
+                                        }
+                                        else if (sym->type->kind() == TypeKind::Class)
+                                        {
+                                            struct_type = _type_context.get_class_type(type_name);
+                                        }
+                                    }
+                                    if (struct_type)
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "Heuristic matched field '{}' in type '{}'", member_name, type_name);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Next, try methods (public)
+                            if (!struct_type)
+                            {
+                                for (const auto &entry : _struct_methods)
+                                {
+                                    const std::string &type_name = entry.first;
+                                    const auto &methods = entry.second;
+                                    if (methods.find(member_name) != methods.end())
+                                    {
+                                        TypedSymbol *sym = _symbol_table->lookup_symbol(type_name);
+                                        if (sym && sym->type)
+                                        {
+                                            if (sym->type->kind() == TypeKind::Struct)
+                                            {
+                                                struct_type = _type_context.get_struct_type(type_name);
+                                            }
+                                            else if (sym->type->kind() == TypeKind::Class)
+                                            {
+                                                struct_type = _type_context.get_class_type(type_name);
+                                            }
+                                        }
+                                        if (struct_type)
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::AST, "Heuristic matched method '{}' in type '{}'", member_name, type_name);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Finally, try private methods
+                            if (!struct_type)
+                            {
+                                for (const auto &entry : _private_struct_methods)
+                                {
+                                    const std::string &type_name = entry.first;
+                                    const auto &methods = entry.second;
+                                    if (methods.find(member_name) != methods.end())
+                                    {
+                                        TypedSymbol *sym = _symbol_table->lookup_symbol(type_name);
+                                        if (sym && sym->type)
+                                        {
+                                            if (sym->type->kind() == TypeKind::Struct)
+                                            {
+                                                struct_type = _type_context.get_struct_type(type_name);
+                                            }
+                                            else if (sym->type->kind() == TypeKind::Class)
+                                            {
+                                                struct_type = _type_context.get_class_type(type_name);
+                                            }
+                                        }
+                                        if (struct_type)
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::AST, "Heuristic matched private method '{}' in type '{}'", member_name, type_name);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (struct_type)
+                        {
+                            // 'this' should be a pointer to the current struct/class type
+                            object_type = _type_context.create_pointer_type(struct_type);
+                            LOG_DEBUG(Cryo::LogComponent::AST, "MemberAccess 'this' fallback: recovered object_type='{}'",
+                                      object_type ? object_type->to_string() : "null");
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "MemberAccess 'this' fallback: unable to recover struct context");
+                        }
+                    }
+                }
+            }
         }
 
         if (!object_type)
@@ -4903,10 +5125,19 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "🔍 FOUND private method '{}' - checking access: _current_struct_name='{}' vs lookup_type_name='{}'",
                           member_name, _current_struct_name, lookup_type_name);
 
-                if (_current_struct_name == lookup_type_name)
+                bool is_this_access = false;
+                if (node.object())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "✅ Found private method '{}' and allowing access from within same class '{}'", member_name, lookup_type_name);
-                    // Allow access to private method from within the same class
+                    if (auto *ident = dynamic_cast<IdentifierNode *>(node.object()))
+                    {
+                        is_this_access = (ident->name() == "this");
+                    }
+                }
+
+                if (_current_struct_name == lookup_type_name || is_this_access)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "✅ Found private method '{}' and allowing access (same class or 'this') '{}'", member_name, lookup_type_name);
+                    // Allow access to private method from within the same class or via 'this'
                     node.set_resolved_type(private_method_it->second);
                     return;
                 }
@@ -6552,6 +6783,12 @@ namespace Cryo
             // DO NOT declare constructor function in symbol table to avoid name conflict
             // The struct/class type is already declared with this name
 
+            // PRESERVE struct context for constructor processing
+            Type *preserved_struct_type = _current_struct_type;
+            std::string preserved_struct_name = _current_struct_name;
+            LOG_DEBUG(Cryo::LogComponent::AST, "StructMethodNode: Preserving struct context for constructor '{}': _current_struct_type='{}', _current_struct_name='{}'",
+                      func_name, preserved_struct_type ? preserved_struct_type->name() : "NULL", preserved_struct_name);
+
             // Enter function scope for parameter and body checking
             enter_scope();
             _in_function = true;
@@ -6571,6 +6808,12 @@ namespace Cryo
             {
                 node.body()->accept(*this);
             }
+
+            // RESTORE struct context after constructor body processing
+            _current_struct_type = preserved_struct_type;
+            _current_struct_name = preserved_struct_name;
+            LOG_DEBUG(Cryo::LogComponent::AST, "StructMethodNode: Restored struct context for constructor '{}': _current_struct_type='{}', _current_struct_name='{}'",
+                      func_name, _current_struct_type ? _current_struct_type->name() : "NULL", _current_struct_name);
 
             // Exit function scope
             _current_function_return_type = nullptr;
@@ -6640,11 +6883,23 @@ namespace Cryo
                 }
             }
 
+            // PRESERVE struct context during method body processing
+            Type *preserved_struct_type = _current_struct_type;
+            std::string preserved_struct_name = _current_struct_name;
+            LOG_DEBUG(Cryo::LogComponent::AST, "StructMethodNode: Preserving struct context for method '{}': _current_struct_type='{}', _current_struct_name='{}'",
+                      func_name, preserved_struct_type ? preserved_struct_type->name() : "NULL", preserved_struct_name);
+
             // Check function body while maintaining struct context
             if (node.body())
             {
                 node.body()->accept(*this);
             }
+
+            // RESTORE struct context after method body processing
+            _current_struct_type = preserved_struct_type;
+            _current_struct_name = preserved_struct_name;
+            LOG_DEBUG(Cryo::LogComponent::AST, "StructMethodNode: Restored struct context for method '{}': _current_struct_type='{}', _current_struct_name='{}'",
+                      func_name, _current_struct_type ? _current_struct_type->name() : "NULL", _current_struct_name);
 
             // Exit function scope
             _current_function_return_type = nullptr;

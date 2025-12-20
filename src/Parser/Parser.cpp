@@ -578,7 +578,7 @@ namespace Cryo
                 // When inside method body, only synchronize on method-safe recovery points
                 // Never escape to class/struct level declarations
 
-                LOG_DEBUG(LogComponent::PARSER, "[SYNC METHOD] Entered METHOD BODY CONTEXT at token '{}' (line {})", 
+                LOG_DEBUG(LogComponent::PARSER, "[SYNC METHOD] Entered METHOD BODY CONTEXT at token '{}' (line {})",
                           std::string(_current_token.text()), _current_token.location().line());
 
                 // Semicolon is a reliable statement boundary
@@ -599,26 +599,19 @@ namespace Cryo
                     return;
                 }
 
-                // Closing brace - DON'T return here, let the parse_block_statement() handle it
-                // If we return here, we might interfere with nested block closures
+                // Closing brace - this likely ends our method block, so return immediately
+                // Let the parse_block_statement() that owns this brace consume it properly
                 if (current_kind == TokenKind::TK_R_BRACE)
                 {
-                    // Just continue advancing - don't return
-                    // The parse_block_statement() that owns this brace will consume it
-                    advance();
-                    tokens_skipped++;
-                    continue;
+                    LOG_DEBUG(LogComponent::PARSER, "Method body synchronized on closing brace after skipping {} tokens", tokens_skipped);
+                    return;
                 }
 
-                // Track brace nesting - but don't use it for recovery decisions
-                // Just keep advancing
-                if (current_kind == TokenKind::TK_L_BRACE)
-                {
-                    _brace_depth++;
-                    advance();
-                    tokens_skipped++;
-                    continue;
-                }
+                // CRITICAL: Check if we've accidentally reached the NEXT method definition
+                // Pattern: identifier '(' at method boundary is common, but we should be careful
+                // about distinguishing method definitions from method calls.
+                // For now, we'll be conservative and not try to detect method boundaries here
+                // since we don't have easy access to the previous token context.
 
                 // Continue consuming tokens within the method
                 advance();
@@ -732,7 +725,6 @@ namespace Cryo
                 {
                     // We've consumed some tokens before hitting this brace - safe to return
                     LOG_DEBUG(LogComponent::PARSER, "Synchronized on closing brace after skipping {} tokens", tokens_skipped);
-                    std::cerr << "*** SYNCHRONIZE ended on closing brace at line " << _current_token.location().line() << "\n";
                     return;
                 }
             }
@@ -1868,7 +1860,7 @@ namespace Cryo
     std::unique_ptr<BlockStatementNode> Parser::parse_block_statement()
     {
         SourceLocation start_loc = _current_token.location();
-        LOG_DEBUG(LogComponent::PARSER, "[BLOCK] Starting parse_block_statement at line {}, token '{}'", 
+        LOG_DEBUG(LogComponent::PARSER, "[BLOCK] Starting parse_block_statement at line {}, token '{}'",
                   start_loc.line(), std::string(_current_token.text()));
         consume(TokenKind::TK_L_BRACE, "Expected '{'");
 
@@ -1903,6 +1895,12 @@ namespace Cryo
             catch (const ParseError &e)
             {
                 _errors.push_back(e);
+
+                // Emit recovery details to help debug truncated method bodies
+                LOG_WARN(LogComponent::PARSER,
+                         "[RECOVERY] parse_block_statement caught error: {} at line {} (token='{}', _parsing_method_body={})",
+                         e.what(), _current_token.location().line(), std::string(_current_token.text()),
+                         _parsing_method_body);
                 // Enhanced error recovery: skip to next statement boundary
                 // Try to find the end of the current statement (semicolon) or a statement keyword
                 synchronize();
@@ -1923,13 +1921,41 @@ namespace Cryo
                 {
                     advance();
                 }
+
+                // Method-body specific recovery: if we still haven't reached a closing brace,
+                // aggressively seek to the matching '}' so we don't treat the next method
+                // signature as a statement inside the current method.
+                if (_parsing_method_body && !_current_token.is(TokenKind::TK_R_BRACE))
+                {
+                    int brace_balance = 0;
+                    size_t tokens_scanned = 0;
+
+                    while (!is_at_end() && tokens_scanned < 2048)
+                    {
+                        if (_current_token.is(TokenKind::TK_L_BRACE))
+                        {
+                            brace_balance++;
+                        }
+                        else if (_current_token.is(TokenKind::TK_R_BRACE))
+                        {
+                            if (brace_balance == 0)
+                            {
+                                break; // Found the closing brace for the current method body
+                            }
+                            brace_balance--;
+                        }
+
+                        advance();
+                        tokens_scanned++;
+                    }
+                }
             }
         }
 
-        LOG_DEBUG(LogComponent::PARSER, "[BLOCK] About to consume closing brace, current token: '{}' at line {}", 
+        LOG_DEBUG(LogComponent::PARSER, "[BLOCK] About to consume closing brace, current token: '{}' at line {}",
                   std::string(_current_token.text()), _current_token.location().line());
         consume(TokenKind::TK_R_BRACE, "Expected '}'");
-        LOG_DEBUG(LogComponent::PARSER, "[BLOCK] Successfully consumed closing brace, now at token: '{}' at line {}", 
+        LOG_DEBUG(LogComponent::PARSER, "[BLOCK] Successfully consumed closing brace, now at token: '{}' at line {}",
                   std::string(_current_token.text()), _current_token.location().line());
 
         // Exit scope after parsing the block
@@ -2231,7 +2257,7 @@ namespace Cryo
                     // Array access
                     expr = parse_array_access(std::move(expr));
                 }
-                else if (_current_token.is(TokenKind::TK_PERIOD))
+                else if (_current_token.is(TokenKind::TK_PERIOD) || _current_token.is(TokenKind::TK_ARROW))
                 {
                     // Member access
                     expr = parse_member_access(std::move(expr));
@@ -2297,7 +2323,7 @@ namespace Cryo
                     // Array access
                     expr = parse_array_access(std::move(expr));
                 }
-                else if (_current_token.is(TokenKind::TK_PERIOD))
+                else if (_current_token.is(TokenKind::TK_PERIOD) || _current_token.is(TokenKind::TK_ARROW))
                 {
                     // Member access
                     expr = parse_member_access(std::move(expr));
@@ -2557,7 +2583,7 @@ namespace Cryo
                     // Array access
                     expr = parse_array_access(std::move(expr));
                 }
-                else if (_current_token.is(TokenKind::TK_PERIOD))
+                else if (_current_token.is(TokenKind::TK_PERIOD) || _current_token.is(TokenKind::TK_ARROW))
                 {
                     // Member access
                     expr = parse_member_access(std::move(expr));
@@ -2599,7 +2625,7 @@ namespace Cryo
                     // Array access
                     expr = parse_array_access(std::move(expr));
                 }
-                else if (_current_token.is(TokenKind::TK_PERIOD))
+                else if (_current_token.is(TokenKind::TK_PERIOD) || _current_token.is(TokenKind::TK_ARROW))
                 {
                     // Member access
                     expr = parse_member_access(std::move(expr));
@@ -3517,11 +3543,19 @@ namespace Cryo
     std::unique_ptr<ExpressionNode> Parser::parse_member_access(std::unique_ptr<ExpressionNode> expr)
     {
         SourceLocation access_location = _current_token.location();
-        consume(TokenKind::TK_PERIOD, "Expected '.' for member access");
+
+        // Support both object member access (.) and pointer member access (->)
+        if (!_current_token.is(TokenKind::TK_PERIOD) && !_current_token.is(TokenKind::TK_ARROW))
+        {
+            error("Expected '.' or '->' for member access");
+            return expr;
+        }
+
+        advance(); // consume '.' or '->'
 
         if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
         {
-            error("Expected member name after '.'");
+            error("Expected member name after member access operator");
             return expr;
         }
 
@@ -3746,7 +3780,22 @@ namespace Cryo
                 // Case 1: regular method - identifier followed by (
                 if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
                 {
-                    is_method = true;
+                    // Additional validation: identifiers starting with __ are likely function calls, not methods
+                    // Also exclude primitive type names that are likely type casts
+                    std::string identifier_text = std::string(_current_token.text());
+                    if (identifier_text.substr(0, 2) == "__" ||
+                        identifier_text == "u8" || identifier_text == "u16" || identifier_text == "u32" || identifier_text == "u64" ||
+                        identifier_text == "i8" || identifier_text == "i16" || identifier_text == "i32" || identifier_text == "i64" ||
+                        identifier_text == "f32" || identifier_text == "f64" || identifier_text == "bool" || identifier_text == "char")
+                    {
+                        LOG_DEBUG(LogComponent::PARSER, "[CLASS PARSE] Skipping potential function call/type cast '{}' at line {}",
+                                  identifier_text, _current_token.location().line());
+                        is_method = false;
+                    }
+                    else
+                    {
+                        is_method = true;
+                    }
                 }
                 // Case 2: static method - static followed by identifier
                 else if (_current_token.is(TokenKind::TK_KW_STATIC) && next.is(TokenKind::TK_IDENTIFIER))
@@ -3769,8 +3818,8 @@ namespace Cryo
                 if (is_method)
                 {
                     std::string method_name = std::string(_current_token.text());
-                    LOG_DEBUG(LogComponent::PARSER, "[CLASS PARSE] About to parse method: '{}' at line {}", 
-                              method_name, _current_token.location().line());
+                    LOG_DEBUG(LogComponent::PARSER, "[CLASS PARSE] About to parse method: '{}' at line {} (_parsing_method_body={})",
+                              method_name, _current_token.location().line(), _parsing_method_body);
                     auto method = parse_struct_method(class_name, current_visibility);
                     // Note: We reuse StructMethodNode for class methods
                     class_decl->add_method(std::move(method));
@@ -4530,6 +4579,8 @@ namespace Cryo
         // Check for C++-style constructor (method name matches class/struct name)
         if (!is_constructor && !struct_name.empty() && method_name == struct_name)
         {
+            LOG_DEBUG(LogComponent::PARSER, "[CONSTRUCTOR] Detected constructor: method_name='{}' matches struct_name='{}'",
+                      method_name, struct_name);
             is_constructor = true;
         }
 
@@ -4613,42 +4664,52 @@ namespace Cryo
                 // Set flag to indicate we're parsing a method body
                 // This affects synchronize() behavior to prevent escaping method boundaries
                 _parsing_method_body = true;
-                _brace_depth = 1; // Initialize to 1 since we'll consume the opening brace in parse_block_statement()
+
+                // Reset brace depth and set to 1 since we'll consume the opening brace
+                // This ensures clean brace tracking for this method
+                _brace_depth = 0; // Reset first
+                _brace_depth = 1; // Then set to 1 for the method's opening brace
 
                 auto body = parse_block_statement();
                 method->set_body(std::unique_ptr<BlockStatementNode>(
                     dynamic_cast<BlockStatementNode *>(body.release())));
 
                 // Clear flag after method body is parsed
+                LOG_DEBUG(LogComponent::PARSER, "[METHOD] Clearing _parsing_method_body flag after method '{}' at line {}",
+                          method_name, _current_token.location().line());
                 _parsing_method_body = false;
                 _brace_depth = 0;
             }
             catch (const ParseError &e)
             {
                 _parsing_method_body = false; // Ensure flag is cleared even on error
-                _brace_depth = 0; // Reset brace depth
+                _brace_depth = 0;             // Reset brace depth
                 // Don't re-throw - just log the error and continue
                 // The method was already created with a partial body, which is better than
                 // not adding the method to the class at all
                 _errors.push_back(e);
                 LOG_DEBUG(LogComponent::PARSER, "Error parsing method body for '{}': {}. Attempting recovery...", method_name, e.what());
-                
+
                 // Recovery: try to find the end of this method body by counting braces
-                // We need to skip tokens until we find the matching closing brace
+                // synchronize() has already positioned us at a recovery point (likely a closing brace)
+                // We need to count braces to find the matching closing brace of this method
                 int brace_count = 0;
-                
-                // If we're at an opening brace, start from 1, otherwise assume we're inside the method
-                if (_current_token.is(TokenKind::TK_L_BRACE))
+
+                // CRITICAL FIX: Check if we're ALREADY at the closing brace of the method
+                // This happens when synchronize() returns without consuming the brace
+                if (_current_token.is(TokenKind::TK_R_BRACE))
                 {
-                    brace_count = 1;
+                    // We're already at what should be the closing brace of the method
+                    // Consume it and we're done - this is the normal case
                     advance();
+                    LOG_DEBUG(LogComponent::PARSER, "Recovery: Already positioned at method closing brace, consumed it");
+                    return method;
                 }
-                else
-                {
-                    // We might be in the middle of the method, try to find any braces
-                    brace_count = 1; // Assume we're inside one level of braces (the method body)
-                }
-                
+
+                // If we're NOT at a brace, we need to scan forward
+                // Start with brace_count = 1 assuming we're inside the method body
+                brace_count = 1;
+
                 // Skip tokens until we find the matching closing brace
                 int tokens_consumed = 0;
                 while (!is_at_end() && brace_count > 0 && tokens_consumed < 1000)
@@ -4671,7 +4732,7 @@ namespace Cryo
                     advance();
                     tokens_consumed++;
                 }
-                
+
                 if (brace_count > 0)
                 {
                     LOG_DEBUG(LogComponent::PARSER, "Recovery: Could not find method closing brace after {} tokens", tokens_consumed);
