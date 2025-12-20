@@ -320,6 +320,9 @@ stdlib-hashmap:
 stdlib-pair:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/collections/pair.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/collections/pair.bc
 
+stdlib-env:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/env/env.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/env/env.bc
+
 stdlib-tcp-gdb:
 	@echo "Building stdlib TCP module through gdb for debugging..."
 	@gdb -batch \
