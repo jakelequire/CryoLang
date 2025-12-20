@@ -201,13 +201,13 @@ namespace Cryo::Codegen
 
         // Verify the generated IR with detailed error reporting
         std::string verification_errors;
-        
+
         // CRITICAL: Before verification, fix any unterminated basic blocks that might have been missed
         auto active_module = _context_manager->get_module();
         if (active_module)
         {
-            std::vector<std::pair<llvm::BasicBlock*, llvm::Function*>> unterminated_blocks;
-            
+            std::vector<std::pair<llvm::BasicBlock *, llvm::Function *>> unterminated_blocks;
+
             for (llvm::Function &func : *active_module)
             {
                 for (llvm::BasicBlock &bb : func)
@@ -218,68 +218,68 @@ namespace Cryo::Codegen
                     }
                 }
             }
-            
+
             if (!unterminated_blocks.empty())
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found {} unterminated blocks in module before verification, fixing...", 
-                         unterminated_blocks.size());
-                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found {} unterminated blocks in module before verification, fixing...",
+                          unterminated_blocks.size());
+
                 auto &builder = _context_manager->get_builder();
-                         
+
                 for (auto &[bb, func] : unterminated_blocks)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fixing unterminated block '{}' in function '{}'", 
-                             bb->getName().str(), func->getName().str());
-                    
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fixing unterminated block '{}' in function '{}'",
+                              bb->getName().str(), func->getName().str());
+
                     // Position builder at the end of the unterminated block
                     builder.SetInsertPoint(bb);
-                    
+
                     // Add an unreachable terminator to prevent verification errors
                     // This is safe because an unterminated block means the control flow
                     // should never reach this point in a well-formed program
                     builder.CreateUnreachable();
                 }
-                
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fixed all {} unterminated blocks in module", unterminated_blocks.size());
             }
         }
-        
+
         if (!_context_manager->verify_module_with_details("", verification_errors))
         {
             // Try to get the current AST node from the visitor for better error location
             SourceRange error_range(SourceLocation(1, 1), SourceLocation(1, 1));
             std::string context_info = "";
-            
+
             if (_visitor && _visitor->get_current_node())
             {
                 auto current_node = _visitor->get_current_node();
                 auto location = current_node->location();
                 error_range = SourceRange(location, location);
-                
+
                 // Get additional context about what was being processed
                 switch (current_node->kind())
                 {
-                    case NodeKind::FunctionDeclaration:
-                        context_info = "while generating function";
-                        break;
-                    case NodeKind::StructDeclaration:
-                        context_info = "while generating struct";
-                        break;
-                    case NodeKind::VariableDeclaration:
-                        context_info = "while generating variable declaration";
-                        break;
-                    case NodeKind::CallExpression:
-                        context_info = "while generating function call";
-                        break;
-                    case NodeKind::BinaryExpression:
-                        context_info = "while generating binary expression";
-                        break;
-                    default:
-                        context_info = "while generating AST node";
-                        break;
+                case NodeKind::FunctionDeclaration:
+                    context_info = "while generating function";
+                    break;
+                case NodeKind::StructDeclaration:
+                    context_info = "while generating struct";
+                    break;
+                case NodeKind::VariableDeclaration:
+                    context_info = "while generating variable declaration";
+                    break;
+                case NodeKind::CallExpression:
+                    context_info = "while generating function call";
+                    break;
+                case NodeKind::BinaryExpression:
+                    context_info = "while generating binary expression";
+                    break;
+                default:
+                    context_info = "while generating AST node";
+                    break;
                 }
             }
-            
+
             // Report the detailed LLVM verification error to the GDM
             if (_gdm)
             {
@@ -289,10 +289,10 @@ namespace Cryo::Codegen
                     full_message += " " + context_info;
                 }
                 full_message += ": " + verification_errors;
-                
+
                 _gdm->create_error(ErrorCode::E0601_LLVM_ERROR, error_range, "", full_message);
             }
-            
+
             report_error("Generated IR failed verification");
             return false;
         }
