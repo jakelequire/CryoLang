@@ -1,1 +1,306 @@
 namespace std::collections::HashMap;
+
+import <io/stdio>;
+
+//===================================================================
+// HASH MAP IMPLEMENTATION
+// Production-quality hash table with separate chaining collision resolution
+//===================================================================
+
+// Entry for storing key-value pairs in hash buckets
+type struct HashMapEntry<K, V> {
+    key: K;
+    value: V;
+    next: HashMapEntry<K, V>*;
+    hash: u64;
+    
+    HashMapEntry(entry_key: K, entry_value: V, entry_hash: u64) {
+        this.key = entry_key;
+        this.value = entry_value;
+        this.hash = entry_hash;
+        this.next = null;
+    }
+}
+
+// Hash bucket containing linked list of entries
+type struct HashBucket<K, V> {
+    head: HashMapEntry<K, V>*;
+    count: u32;
+    
+    HashBucket() {
+        this.head = null;
+        this.count = u32(0);
+    }
+}
+
+// Main HashMap class with generic key-value types
+type class HashMap<K, V> {
+private:
+    buckets: HashBucket<K, V>*;
+    bucket_count: u64;
+    size: u64;
+    load_factor_threshold: f64;
+    
+public:
+    HashMap() {
+        this.bucket_count = u64(16);  // Start with 16 buckets
+        this.size = u64(0);
+        this.load_factor_threshold = 0.75;
+        this.initialize_buckets();
+    }
+    
+    HashMap(initial_capacity: u64) {
+        this.bucket_count = initial_capacity;
+        this.size = u64(0);
+        this.load_factor_threshold = 0.75;
+        this.initialize_buckets();
+    }
+    
+    ~HashMap() {
+        this.clear();
+        if (this.buckets != null) {
+            cryo_free(this.buckets);
+        }
+    }
+    
+    // Insert or update key-value pair
+    insert(key: K, value: V) -> boolean {
+        const hash: u64 = this.hash_key(key);
+        const bucket_index: u64 = hash % this.bucket_count;
+        
+        mut bucket: HashBucket<K, V>* = this.buckets + bucket_index;
+        
+        // Check if key already exists
+        mut current: HashMapEntry<K, V>* = bucket.head;
+        while (current != null) {
+            if (current.hash == hash && this.keys_equal(current.key, key)) {
+                // Update existing value
+                current.value = value;
+                return true;
+            }
+            current = current.next;
+        }
+        
+        // Create new entry
+        const new_entry: HashMapEntry<K, V>* = cryo_alloc(sizeof(HashMapEntry<K, V>)) as HashMapEntry<K, V>*;
+        if (new_entry == null) {
+            return false;
+        }
+        
+        *new_entry = HashMapEntry<K, V>(key, value, hash);
+        
+        // Insert at head of bucket chain
+        new_entry.next = bucket.head;
+        bucket.head = new_entry;
+        bucket.count += u32(1);
+        
+        this.size += u64(1);
+        
+        // Check if resize is needed
+        if (this.get_load_factor() > this.load_factor_threshold) {
+            this.resize();
+        }
+        
+        return true;
+    }
+    
+    // Get value by key
+    get(key: K) -> Option<V> {
+        const hash: u64 = this.hash_key(key);
+        const bucket_index: u64 = hash % this.bucket_count;
+        
+        const bucket: HashBucket<K, V>* = this.buckets + bucket_index;
+        mut current: HashMapEntry<K, V>* = bucket.head;
+        
+        while (current != null) {
+            if (current.hash == hash && this.keys_equal(current.key, key)) {
+                return Option::Some(current.value);
+            }
+            current = current.next;
+        }
+        
+        return Option::None;
+    }
+    
+    // Remove entry by key
+    remove(key: K) -> boolean {
+        const hash: u64 = this.hash_key(key);
+        const bucket_index: u64 = hash % this.bucket_count;
+        
+        mut bucket: HashBucket<K, V>* = this.buckets + bucket_index;
+        mut current: HashMapEntry<K, V>* = bucket.head;
+        mut prev: HashMapEntry<K, V>* = null;
+        
+        while (current != null) {
+            if (current.hash == hash && this.keys_equal(current.key, key)) {
+                // Remove from chain
+                if (prev != null) {
+                    prev.next = current.next;
+                } else {
+                    bucket.head = current.next;
+                }
+                
+                bucket.count -= u32(1);
+                this.size -= u64(1);
+                
+                cryo_free(current);
+                return true;
+            }
+            
+            prev = current;
+            current = current.next;
+        }
+        
+        return false;
+    }
+    
+    // Check if key exists
+    contains_key(key: K) -> boolean {
+        const hash: u64 = this.hash_key(key);
+        const bucket_index: u64 = hash % this.bucket_count;
+        
+        const bucket: HashBucket<K, V>* = this.buckets + bucket_index;
+        mut current: HashMapEntry<K, V>* = bucket.head;
+        
+        while (current != null) {
+            if (current.hash == hash && this.keys_equal(current.key, key)) {
+                return true;
+            }
+            current = current.next;
+        }
+        
+        return false;
+    }
+    
+    // Get number of entries
+    len() -> u64 {
+        return this.size;
+    }
+    
+    // Check if map is empty
+    is_empty() -> boolean {
+        return this.size == u64(0);
+    }
+    
+    // Clear all entries
+    clear() -> void {
+        for (mut i: u64 = u64(0); i < this.bucket_count; i += u64(1)) {
+            mut bucket: HashBucket<K, V>* = this.buckets + i;
+            mut current: HashMapEntry<K, V>* = bucket.head;
+            
+            while (current != null) {
+                const next: HashMapEntry<K, V>* = current.next;
+                cryo_free(current);
+                current = next;
+            }
+            
+            bucket.head = null;
+            bucket.count = u32(0);
+        }
+        
+        this.size = u64(0);
+    }
+    
+    // Get current load factor
+    get_load_factor() -> f64 {
+        if (this.bucket_count == u64(0)) {
+            return 0.0;
+        }
+        return f64(this.size) / f64(this.bucket_count);
+    }
+    
+    // Get bucket count for diagnostics
+    get_bucket_count() -> u64 {
+        return this.bucket_count;
+    }
+    
+private:
+    // Initialize bucket array
+    initialize_buckets() -> void {
+        const buckets_size: u64 = this.bucket_count * sizeof(HashBucket<K, V>);
+        this.buckets = cryo_alloc(buckets_size) as HashBucket<K, V>*;
+        
+        if (this.buckets != null) {
+            // Initialize each bucket
+            for (mut i: u64 = u64(0); i < this.bucket_count; i += u64(1)) {
+                *(this.buckets + i) = HashBucket<K, V>();
+            }
+        }
+    }
+    
+    // Hash function for keys
+    hash_key(key: K) -> u64 {
+        // Simple hash function - in production this would be more sophisticated
+        // For now, use a basic polynomial rolling hash
+        
+        mut hash: u64 = u64(5381);  // DJB2 hash initial value
+        const key_ptr: u8* = &key as u8*;
+        const key_size: u64 = sizeof(K);
+        
+        for (mut i: u64 = u64(0); i < key_size; i += u64(1)) {
+            hash = ((hash << u64(5)) + hash) + u64(key_ptr[i]);
+        }
+        
+        return hash;
+    }
+    
+    // Compare keys for equality
+    keys_equal(key1: K, key2: K) -> boolean {
+        // Simple byte comparison - works for primitive types
+        const key1_ptr: u8* = &key1 as u8*;
+        const key2_ptr: u8* = &key2 as u8*;
+        const key_size: u64 = sizeof(K);
+        
+        for (mut i: u64 = u64(0); i < key_size; i += u64(1)) {
+            if (key1_ptr[i] != key2_ptr[i]) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    // Resize hash table when load factor exceeds threshold
+    resize() -> void {
+        const old_bucket_count: u64 = this.bucket_count;
+        const old_buckets: HashBucket<K, V>* = this.buckets;
+        
+        // Double the bucket count
+        this.bucket_count = old_bucket_count * u64(2);
+        this.size = u64(0);  // Will be incremented during reinsertion
+        
+        // Allocate new bucket array
+        this.initialize_buckets();
+        
+        if (this.buckets == null) {
+            // Allocation failed, restore old state
+            this.bucket_count = old_bucket_count;
+            this.buckets = old_buckets;
+            return;
+        }
+        
+        // Rehash all existing entries
+        for (mut i: u64 = u64(0); i < old_bucket_count; i += u64(1)) {
+            const old_bucket: HashBucket<K, V>* = old_buckets + i;
+            mut current: HashMapEntry<K, V>* = old_bucket.head;
+            
+            while (current != null) {
+                const next: HashMapEntry<K, V>* = current.next;
+                
+                // Reinsert into new bucket array
+                const new_bucket_index: u64 = current.hash % this.bucket_count;
+                mut new_bucket: HashBucket<K, V>* = this.buckets + new_bucket_index;
+                
+                current.next = new_bucket.head;
+                new_bucket.head = current;
+                new_bucket.count += u32(1);
+                this.size += u64(1);
+                
+                current = next;
+            }
+        }
+        
+        // Free old bucket array
+        cryo_free(old_buckets);
+    }
+}
