@@ -21,6 +21,7 @@ const ALLOCATION_ALIGNMENT: u64         = 16;          // Memory alignment requi
 const GUARD_PAGE_SIZE: u64              = 4096;        // Memory protection
 const MEMORY_POOL_COUNT: u32            = 32;          // Number of memory pools
 const MEMORY_POISON_PATTERN: u8         = 0xDD;        // Pattern for freed memory
+const BLOCK_MAGIC: u32                  = 0xDEADBEEF;   // Magic number for block headers
 
 // Threading configuration
 const MAX_THREADS: u32                  = 256;         // Maximum concurrent threads
@@ -282,12 +283,39 @@ private:
 
 }
 
+// Medium block header for tracking allocation metadata
+type struct MediumBlockHeader {
+    size: u64;                     // Size of this block (including header)
+    is_free: boolean;              // Whether this block is free
+    prev: MediumBlockHeader*;      // Previous block in memory
+    next: MediumBlockHeader*;      // Next block in memory
+    next_free: MediumBlockHeader*; // Next free block in free list
+    prev_free: MediumBlockHeader*; // Previous free block in free list
+    magic: u32;                    // Magic number for corruption detection
+    
+    MediumBlockHeader() {
+        this.size = u64(0);
+        this.is_free = false;
+        this.prev = null;
+        this.next = null;
+        this.next_free = null;
+        this.prev_free = null;
+        this.magic = u32(BLOCK_MAGIC);
+    }
+}
+
 // Advanced heap manager with multiple allocation strategies
 type class HeapManager {
 public:
     small_pools: MemoryPool*;      // Array of small object pools
-    medium_allocator: void*;       // Best-fit allocator for medium objects
+    medium_allocator: void*;       // Base address for medium allocator region
     large_allocator: void*;        // Segment allocator for large objects
+    
+    // Medium allocator management
+    medium_free_list: MediumBlockHeader*;  // Head of free block list
+    medium_region_base: void*;             // Base of medium allocation region
+    medium_region_size: u64;               // Size of medium allocation region
+    medium_allocated_blocks: u64;          // Number of allocated medium blocks
     
     total_allocated: u64;
     total_deallocated: u64;
@@ -306,6 +334,12 @@ public:
         this.current_memory_usage = u64(0);
         this.fragmentation_ratio = f64(0.0);
         this.is_initialized = false;
+        
+        // Initialize medium allocator fields
+        this.medium_free_list = null;
+        this.medium_region_base = null;
+        this.medium_region_size = u64(16777216); // 16MB for medium objects
+        this.medium_allocated_blocks = u64(0);
     }
     
     initialize(heap_size: u64) -> RuntimeError {
@@ -320,6 +354,9 @@ public:
         
         // Initialize memory pools for different sizes
         this.initialize_memory_pools();
+        
+        // Initialize medium allocator
+        this.initialize_medium_allocator();
         
         this.is_initialized = true;
         printf("[Runtime::HeapManager] Heap initialization complete\n");
@@ -495,29 +532,33 @@ private:
     
     allocate_medium(size: u64) -> void* {
         // For medium allocations (256 bytes to 64KB), use best-fit strategy
-        // TODO: Implement proper best-fit allocator with free list coalescing
-        // For now, use aligned malloc with proper tracking
-        
-        const aligned_size: u64 = (size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
-        const ptr: void* = __malloc__(aligned_size);
-        
-        if (ptr != null) {
-            this.total_allocated += aligned_size;
-            this.current_memory_usage += aligned_size;
-            
-            // Update peak memory usage
-            if (this.current_memory_usage > this.peak_memory_usage) {
-                this.peak_memory_usage = this.current_memory_usage;
-            }
-            
-            // Clear allocated memory for security
-            __memset__(ptr, 0, aligned_size);
-            
-            // Update fragmentation calculation
-            this.calculate_fragmentation();
+        if (this.medium_region_base == null) {
+            printf("[Runtime::HeapManager] Medium allocator not initialized, using malloc fallback\n");
+            return this.malloc_fallback(size);
         }
         
-        return ptr;
+        // Add space for block header and align
+        const header_size: u64 = sizeof(MediumBlockHeader);
+        const total_size: u64 = size + header_size;
+        const aligned_size: u64 = (total_size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
+        
+        printf("[Runtime::HeapManager] Medium allocation request: %llu bytes (aligned: %llu)\n", size, aligned_size);
+        
+        // Find best-fit free block
+        const best_block: MediumBlockHeader* = this.find_best_fit_block(aligned_size);
+        
+        if (best_block != null) {
+            // Use existing free block
+            const allocated_block: MediumBlockHeader* = this.allocate_from_free_block(best_block, aligned_size);
+            if (allocated_block != null) {
+                this.update_allocation_stats(aligned_size);
+                return this.get_user_pointer_from_header(allocated_block);
+            }
+        }
+        
+        // No suitable free block found, try to extend heap or fallback to malloc
+        printf("[Runtime::HeapManager] No suitable medium block found, using malloc fallback\n");
+        return this.malloc_fallback(size);
     }
     
     allocate_large(size: u64) -> void* {
@@ -595,12 +636,42 @@ private:
             return true;
         }
         
-        // For medium allocations, we use malloc fallback currently
-        // TODO: Implement proper best-fit allocator with size tracking
-        __free__(ptr);
+        // Get block header from user pointer
+        const header: MediumBlockHeader* = this.get_header_from_user_pointer(ptr);
+        if (header == null) {
+            printf("[Runtime::HeapManager] Invalid medium pointer, trying malloc fallback\n");
+            __free__(ptr);
+            this.total_deallocated += u64(1);
+            return true;
+        }
         
-        // We can't track exact size without metadata, but update counters
-        this.total_deallocated += u64(1); // Count, not bytes
+        if (header.is_free) {
+            printf("[Runtime::HeapManager] ERROR: Double-free detected!\n");
+            return false;
+        }
+        
+        printf("[Runtime::HeapManager] Deallocating medium block: %llu bytes\n", header.size);
+        
+        // Mark block as free
+        header.is_free = true;
+        this.medium_allocated_blocks -= u64(1);
+        
+        // Update statistics
+        this.total_deallocated += header.size;
+        if (this.current_memory_usage >= header.size) {
+            this.current_memory_usage -= header.size;
+        }
+        
+        // Poison the user data for debugging
+        const user_data_ptr: u8* = ptr as u8*;
+        const user_data_size: u64 = header.size - sizeof(MediumBlockHeader);
+        __memset__(user_data_ptr, MEMORY_POISON_PATTERN, user_data_size);
+        
+        // Add to free list
+        this.add_to_free_list(header);
+        
+        // Coalesce with adjacent free blocks
+        this.coalesce_free_blocks(header);
         
         this.calculate_fragmentation();
         return true;
@@ -641,14 +712,249 @@ private:
         return false;
     }
     
-    is_medium_allocator_pointer(ptr: void*) -> boolean {
+    // Medium allocator implementation
+    initialize_medium_allocator() -> void {
+        printf("[Runtime::HeapManager] Initializing medium allocator: %llu bytes\n", this.medium_region_size);
+        
+        // Allocate region for medium objects
+        this.medium_region_base = __malloc__(this.medium_region_size);
+        if (this.medium_region_base == null) {
+            printf("[Runtime::HeapManager] ERROR: Failed to allocate medium region\n");
+            return;
+        }
+        
+        // Initialize with one large free block
+        const initial_header: MediumBlockHeader* = this.medium_region_base as MediumBlockHeader*;
+        initial_header.size = this.medium_region_size;
+        initial_header.is_free = true;
+        initial_header.prev = null;
+        initial_header.next = null;
+        initial_header.next_free = null;
+        initial_header.prev_free = null;
+        initial_header.magic = u32(BLOCK_MAGIC);
+        
+        this.medium_free_list = initial_header;
+        
+        // Clear the region for security
+        __memset__((initial_header as u8*) + sizeof(MediumBlockHeader), 0, 
+                  this.medium_region_size - sizeof(MediumBlockHeader));
+        
+        printf("[Runtime::HeapManager] Medium allocator initialized successfully\n");
+    }
+    
+    find_best_fit_block(size: u64) -> MediumBlockHeader* {
+        mut best_block: MediumBlockHeader* = null;
+        mut best_size: u64 = u64(18446744073709551615); // Max u64
+        
+        mut current: MediumBlockHeader* = this.medium_free_list;
+        while (current != null) {
+            if (current.is_free && current.size >= size && current.size < best_size) {
+                best_block = current;
+                best_size = current.size;
+                
+                // Perfect fit - no need to continue searching
+                if (current.size == size) {
+                    break;
+                }
+            }
+            current = current.next_free;
+        }
+        
+        return best_block;
+    }
+    
+    allocate_from_free_block(block: MediumBlockHeader*, size: u64) -> MediumBlockHeader* {
+        if (block == null || !block.is_free || block.size < size) {
+            return null;
+        }
+        
+        // Remove from free list
+        this.remove_from_free_list(block);
+        
+        // Check if we should split the block
+        const min_split_size: u64 = sizeof(MediumBlockHeader) + u64(32); // Minimum useful block size
+        if (block.size > size + min_split_size) {
+            // Split the block
+            const new_block_addr: u8* = (block as u8*) + size;
+            const new_block: MediumBlockHeader* = new_block_addr as MediumBlockHeader*;
+            
+            new_block.size = block.size - size;
+            new_block.is_free = true;
+            new_block.prev = block;
+            new_block.next = block.next;
+            new_block.magic = u32(BLOCK_MAGIC);
+            
+            // Update original block
+            block.size = size;
+            block.next = new_block;
+            
+            // Update next block's prev pointer
+            if (new_block.next != null) {
+                new_block.next.prev = new_block;
+            }
+            
+            // Add new block to free list
+            this.add_to_free_list(new_block);
+        }
+        
+        // Mark block as allocated
+        block.is_free = false;
+        block.next_free = null;
+        block.prev_free = null;
+        
+        this.medium_allocated_blocks += u64(1);
+        
+        printf("[Runtime::HeapManager] Allocated medium block: %llu bytes\n", block.size);
+        return block;
+    }
+    
+    remove_from_free_list(block: MediumBlockHeader*) -> void {
+        if (block == null) {
+            return;
+        }
+        
+        // Update previous block's next pointer
+        if (block.prev_free != null) {
+            block.prev_free.next_free = block.next_free;
+        } else {
+            // This was the head of free list
+            this.medium_free_list = block.next_free;
+        }
+        
+        // Update next block's prev pointer  
+        if (block.next_free != null) {
+            block.next_free.prev_free = block.prev_free;
+        }
+        
+        block.next_free = null;
+        block.prev_free = null;
+    }
+    
+    add_to_free_list(block: MediumBlockHeader*) -> void {
+        if (block == null) {
+            return;
+        }
+        
+        // Add to front of free list for simplicity
+        block.next_free = this.medium_free_list;
+        block.prev_free = null;
+        
+        if (this.medium_free_list != null) {
+            this.medium_free_list.prev_free = block;
+        }
+        
+        this.medium_free_list = block;
+    }
+    
+    get_user_pointer_from_header(header: MediumBlockHeader*) -> void* {
+        if (header == null) {
+            return null;
+        }
+        
+        const user_ptr: u8* = (header as u8*) + sizeof(MediumBlockHeader);
+        
+        // Clear user memory for security
+        const user_size: u64 = header.size - sizeof(MediumBlockHeader);
+        __memset__(user_ptr, 0, user_size);
+        
+        return user_ptr as void*;
+    }
+    
+    get_header_from_user_pointer(ptr: void*) -> MediumBlockHeader* {
         if (ptr == null) {
+            return null;
+        }
+        
+        const header_ptr: u8* = (ptr as u8*) - sizeof(MediumBlockHeader);
+        const header: MediumBlockHeader* = header_ptr as MediumBlockHeader*;
+        
+        // Validate magic number
+        if (header.magic != u32(BLOCK_MAGIC)) {
+            printf("[Runtime::HeapManager] ERROR: Corrupted block header detected!\n");
+            return null;
+        }
+        
+        return header;
+    }
+    
+    coalesce_free_blocks(block: MediumBlockHeader*) -> MediumBlockHeader* {
+        if (block == null || !block.is_free) {
+            return block;
+        }
+        
+        mut result_block: MediumBlockHeader* = block;
+        
+        // Coalesce with next block if it's free
+        while (result_block.next != null && result_block.next.is_free) {
+            const next_block: MediumBlockHeader* = result_block.next;
+            
+            printf("[Runtime::HeapManager] Coalescing with next block: %llu + %llu bytes\n", 
+                   result_block.size, next_block.size);
+            
+            // Remove next block from free list
+            this.remove_from_free_list(next_block);
+            
+            // Merge blocks
+            result_block.size += next_block.size;
+            result_block.next = next_block.next;
+            
+            if (next_block.next != null) {
+                next_block.next.prev = result_block;
+            }
+        }
+        
+        // Coalesce with previous block if it's free
+        if (result_block.prev != null && result_block.prev.is_free) {
+            const prev_block: MediumBlockHeader* = result_block.prev;
+            
+            printf("[Runtime::HeapManager] Coalescing with previous block: %llu + %llu bytes\n", 
+                   prev_block.size, result_block.size);
+            
+            // Remove current block from free list (prev is already free)
+            this.remove_from_free_list(result_block);
+            
+            // Merge into previous block
+            prev_block.size += result_block.size;
+            prev_block.next = result_block.next;
+            
+            if (result_block.next != null) {
+                result_block.next.prev = prev_block;
+            }
+            
+            result_block = prev_block;
+        }
+        
+        return result_block;
+    }
+    
+    update_allocation_stats(size: u64) -> void {
+        this.total_allocated += size;
+        this.current_memory_usage += size;
+        
+        if (this.current_memory_usage > this.peak_memory_usage) {
+            this.peak_memory_usage = this.current_memory_usage;
+        }
+        
+        this.calculate_fragmentation();
+    }
+    
+    is_medium_allocator_pointer(ptr: void*) -> boolean {
+        if (ptr == null || this.medium_region_base == null) {
             return false;
         }
         
-        // If not in small pools and not large, assume medium
-        // This is a heuristic since we don't have perfect tracking yet
-        return !this.is_small_pool_pointer(ptr) && !this.is_large_allocator_pointer(ptr);
+        const ptr_addr: u8* = ptr as u8*;
+        const region_start: u8* = this.medium_region_base as u8*;
+        const region_end: u8* = region_start + this.medium_region_size;
+        
+        // Check if pointer is within medium allocation region
+        if (ptr_addr < region_start || ptr_addr >= region_end) {
+            return false;
+        }
+        
+        // Additional validation: try to get header and check magic number
+        const header: MediumBlockHeader* = this.get_header_from_user_pointer(ptr);
+        return (header != null && header.magic == u32(BLOCK_MAGIC));
     }
     
     is_large_allocator_pointer(ptr: void*) -> boolean {
@@ -1638,6 +1944,7 @@ function cryo_free(ptr: void*) -> void {
 extern function _user_main_(argc: int, argv: string*) -> int;
 
 function main(argc: int, argv: string*) -> int {
+    rt_log("=== CryoLang Runtime Starting ===\n%d\n", 32);
     // Initialize runtime system
     const init_result: RuntimeError = cryo_runtime_initialize();
     if (init_result != RuntimeError::RTE_SUCCESS) {
@@ -1645,7 +1952,7 @@ function main(argc: int, argv: string*) -> int {
         return 1;
     }
     
-    printf("\nStarting user program...\n");
+    rt_log("\nStarting user program...\n");
     printf("========================================\n\n");
     
     // Call user main with exception handling
