@@ -1923,9 +1923,17 @@ function cryo_throw_exception(message: string, error_code: RuntimeError) -> void
 //===================================================================
 
 function cryo_alloc(size: u64) -> void* {
-    const start_time: u64 = cryo_profile_start("memory_allocation");
-    const ptr: void* = cryo_runtime_allocate(size);
-    cryo_profile_end("memory_allocation", start_time);
+    mut ptr: void* = null;
+    
+    // Skip profiling during shutdown to avoid use-after-free
+    if (g_cryo_runtime.state == RuntimeState::RTS_RUNNING) {
+        const start_time: u64 = cryo_profile_start("memory_allocation");
+        ptr = cryo_runtime_allocate(size);
+        cryo_profile_end("memory_allocation", start_time);
+    } else {
+        // Direct allocation without profiling during shutdown
+        ptr = cryo_runtime_allocate(size);
+    }
     
     if (ptr == null) {
         cryo_throw_exception("Memory allocation failed", RuntimeError::RTE_OUT_OF_MEMORY);
@@ -1935,9 +1943,17 @@ function cryo_alloc(size: u64) -> void* {
 }
 
 function cryo_free(ptr: void*) -> void {
-    const start_time: u64 = cryo_profile_start("memory_deallocation");
-    cryo_runtime_deallocate(ptr);
-    cryo_profile_end("memory_deallocation", start_time);
+    // Skip all runtime infrastructure during shutdown to avoid use-after-free
+    if (g_cryo_runtime.state == RuntimeState::RTS_RUNNING) {
+        const start_time: u64 = cryo_profile_start("memory_deallocation");
+        cryo_runtime_deallocate(ptr);
+        cryo_profile_end("memory_deallocation", start_time);
+    } else {
+        // Direct system free during shutdown - bypass all runtime tracking
+        if (ptr != null) {
+            __free__(ptr);
+        }
+    }
 }
 
 // Enhanced main function with runtime initialization
