@@ -590,11 +590,11 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No function body to generate for: {}", node.name());
             }
-            
+
             // CRITICAL: Check for any unterminated blocks in the generated function
             if (function)
             {
-                std::vector<llvm::BasicBlock*> unterminated_blocks;
+                std::vector<llvm::BasicBlock *> unterminated_blocks;
                 for (llvm::BasicBlock &bb : *function)
                 {
                     if (!bb.getTerminator())
@@ -602,25 +602,25 @@ namespace Cryo::Codegen
                         unterminated_blocks.push_back(&bb);
                     }
                 }
-                
+
                 if (!unterminated_blocks.empty())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found {} unterminated blocks in function '{}', fixing...", 
-                             unterminated_blocks.size(), node.name());
-                             
-                    for (llvm::BasicBlock* bb : unterminated_blocks)
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found {} unterminated blocks in function '{}', fixing...",
+                              unterminated_blocks.size(), node.name());
+
+                    for (llvm::BasicBlock *bb : unterminated_blocks)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fixing unterminated block: {}", bb->getName().str());
-                        
+
                         // Position builder at the end of the unterminated block
                         _context_manager.get_builder().SetInsertPoint(bb);
-                        
+
                         // Add an unreachable terminator to prevent verification errors
                         // This is safe because an unterminated block means the control flow
                         // should never reach this point in a well-formed program
                         _context_manager.get_builder().CreateUnreachable();
                     }
-                    
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Fixed all unterminated blocks in function '{}'", node.name());
                 }
             }
@@ -633,7 +633,7 @@ namespace Cryo::Codegen
                                                   "Exception in function declaration: " + std::string(e.what()));
             }
         }
-        
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed FunctionDeclarationNode: {}", node.name());
     }
 
@@ -9119,18 +9119,18 @@ namespace Cryo::Codegen
 
                     // Evaluate right operand in lor.rhs block
                     builder.SetInsertPoint(lor_rhs);
-                    
+
                     // Add debug logging for tracking block termination
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: About to evaluate right operand in block: {}", 
-                             lor_rhs->getName().str());
-                    
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: About to evaluate right operand in block: {}",
+                              lor_rhs->getName().str());
+
                     node->right()->accept(*this);
                     llvm::Value *right_val = get_current_value();
-                    
+
                     // Get the current block after right evaluation - it might have changed due to nested expressions
                     llvm::BasicBlock *current_after_right = builder.GetInsertBlock();
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: After right evaluation, current block: {}, has terminator: {}", 
-                             current_after_right->getName().str(), current_after_right->getTerminator() != nullptr);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: After right evaluation, current block: {}, has terminator: {}",
+                              current_after_right->getName().str(), current_after_right->getTerminator() != nullptr);
 
                     if (!right_val)
                     {
@@ -9138,20 +9138,20 @@ namespace Cryo::Codegen
                         llvm::BasicBlock *current_block = builder.GetInsertBlock();
                         if (current_block && !current_block->getTerminator())
                         {
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating orphaned block: {}", 
-                                     current_block->getName().str());
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating orphaned block: {}",
+                                      current_block->getName().str());
                             builder.CreateBr(lor_end);
                         }
-                        
+
                         // Also check and terminate the original lor_rhs block if it's different and unterminated
                         if (lor_rhs != current_block && !lor_rhs->getTerminator())
                         {
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating original lor_rhs block: {}", 
-                                     lor_rhs->getName().str());
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating original lor_rhs block: {}",
+                                      lor_rhs->getName().str());
                             builder.SetInsertPoint(lor_rhs);
                             builder.CreateBr(lor_end);
                         }
-                        
+
                         builder.SetInsertPoint(lor_end);
                         builder.CreateUnreachable();
 
@@ -9209,22 +9209,22 @@ namespace Cryo::Codegen
                     llvm::BasicBlock *final_right_block = builder.GetInsertBlock();
                     if (!final_right_block->getTerminator())
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating final_right_block: {}", 
-                                 final_right_block->getName().str());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating final_right_block: {}",
+                                  final_right_block->getName().str());
                         builder.CreateBr(lor_end);
                     }
-                    
+
                     // SAFETY CHECK: Ensure the original lor_rhs block is also terminated if it's different
                     if (lor_rhs != final_right_block && !lor_rhs->getTerminator())
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating original lor_rhs block: {}", 
-                                 lor_rhs->getName().str());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating original lor_rhs block: {}",
+                                  lor_rhs->getName().str());
                         // Save current position
                         llvm::BasicBlock *saved_position = builder.GetInsertBlock();
-                        
+
                         builder.SetInsertPoint(lor_rhs);
                         builder.CreateBr(lor_end);
-                        
+
                         // Restore position
                         builder.SetInsertPoint(saved_position);
                     }
@@ -9237,12 +9237,12 @@ namespace Cryo::Codegen
                     llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx), 2, "logor.result");
                     phi->addIncoming(llvm::ConstantInt::getTrue(llvm_ctx), lor_lhs);
                     phi->addIncoming(right_bool, lor_rhs_end);
-                    
+
                     // CRITICAL DEBUG: Log all lor.rhs blocks to ensure they're properly terminated
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Final block status - lor_lhs: {} (terminated: {}), lor_rhs_end: {} (terminated: {}), lor_end: {} (terminated: {})",
-                             lor_lhs->getName().str(), lor_lhs->getTerminator() != nullptr,
-                             lor_rhs_end->getName().str(), lor_rhs_end->getTerminator() != nullptr, 
-                             lor_end->getName().str(), lor_end->getTerminator() != nullptr);
+                              lor_lhs->getName().str(), lor_lhs->getTerminator() != nullptr,
+                              lor_rhs_end->getName().str(), lor_rhs_end->getTerminator() != nullptr,
+                              lor_end->getName().str(), lor_end->getTerminator() != nullptr);
 
                     // Note: lor_end intentionally has no terminator yet - the caller (if-statement)
                     // will add the appropriate branch after getting the condition value
