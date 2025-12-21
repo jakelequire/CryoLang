@@ -8250,8 +8250,70 @@ namespace Cryo::Codegen
                             return nullptr;
                         }
 
-                        // Store the right side value to the dereferenced pointer
-                        create_store(right_val, ptr_val);
+                        // Check if the right side is a pointer to an object (e.g., from constructor call)
+                        // If so, we need to copy the object data instead of storing the pointer
+                        if (right_val->getType()->isPointerTy())
+                        {
+                            // This is likely a pointer to a stack-constructed object
+                            // We need to copy the object data to the target location
+
+                            // For LLVM 15+, use opaque pointers - we need to get type info from context
+                            // Since we know this is an assignment to a dereferenced pointer,
+                            // we should check if both sides have compatible struct types
+                            auto &builder = _context_manager.get_builder();
+                            auto &context = _context_manager.get_context();
+
+                            // Try to determine if this is a struct type assignment
+                            // by looking at the call expression that generated the right side
+                            bool is_struct_assignment = false;
+
+                            if (auto *call_expr = dynamic_cast<Cryo::CallExpressionNode *>(node->right()))
+                            {
+                                // This is a constructor call, so it's likely a struct assignment
+                                if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(call_expr->callee()))
+                                {
+                                    std::string type_name = identifier->name();
+                                    // Check if this is a known struct type
+                                    auto type_it = _types.find(type_name);
+                                    if (type_it != _types.end())
+                                    {
+                                        is_struct_assignment = true;
+                                        llvm::Type *struct_type = type_it->second;
+
+                                        // Get the size of the struct to copy
+                                        auto &data_layout = _context_manager.get_module()->getDataLayout();
+                                        uint64_t type_size = data_layout.getTypeStoreSize(struct_type);
+
+                                        // Create a memcpy to copy the object data from source to destination
+                                        llvm::Function *memcpy_func = llvm::Intrinsic::getDeclaration(
+                                            _context_manager.get_module(),
+                                            llvm::Intrinsic::memcpy,
+                                            {llvm::PointerType::get(context, 0), llvm::PointerType::get(context, 0), llvm::Type::getInt64Ty(context)});
+
+                                        // Use the pointers directly (opaque pointer support)
+                                        builder.CreateCall(memcpy_func, {
+                                                                            ptr_val,
+                                                                            right_val,
+                                                                            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), type_size),
+                                                                            llvm::ConstantInt::getFalse(context) // is_volatile = false
+                                                                        });
+
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated memcpy for struct assignment '{}' (size: {} bytes)", type_name, type_size);
+                                    }
+                                }
+                            }
+
+                            if (!is_struct_assignment)
+                            {
+                                // Fallback to regular store for non-struct types
+                                create_store(right_val, ptr_val);
+                            }
+                        }
+                        else
+                        {
+                            // Regular store for non-pointer values
+                            create_store(right_val, ptr_val);
+                        }
 
                         // The result of assignment is the assigned value
                         return right_val;

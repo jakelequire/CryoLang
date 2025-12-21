@@ -729,18 +729,27 @@ private:
         this.medium_region_base = __malloc__(this.medium_region_size);
         if (this.medium_region_base == null) {
             printf("\033[90m[Runtime::HeapManager] ERROR: Failed to allocate medium region\n\033[0m");
+            this.medium_free_list = null;
             return;
         }
         
+        // Clear the entire region first for safety
+        __memset__(this.medium_region_base, 0, this.medium_region_size);
+        
         // Initialize with one large free block
         const initial_header: MediumBlockHeader* = this.medium_region_base as MediumBlockHeader*;
+        
+        // Properly construct the MediumBlockHeader object
+        *initial_header = MediumBlockHeader();
+        
+        // Now safely set the fields
         initial_header.size = this.medium_region_size;
         initial_header.is_free = true;
         initial_header.prev = null;
         initial_header.next = null;
         initial_header.next_free = null;
         initial_header.prev_free = null;
-        initial_header.magic = u32(BLOCK_MAGIC);
+        initial_header.magic = BLOCK_MAGIC;
         
         this.medium_free_list = initial_header;
 
@@ -789,11 +798,14 @@ private:
             const new_block_addr: u8* = (block as u8*) + size;
             const new_block: MediumBlockHeader* = new_block_addr as MediumBlockHeader*;
             
+            // Properly construct the new block
+            *new_block = MediumBlockHeader();
+            
             new_block.size = block.size - size;
             new_block.is_free = true;
             new_block.prev = block;
             new_block.next = block.next;
-            new_block.magic = u32(BLOCK_MAGIC);
+            new_block.magic = BLOCK_MAGIC;
             
             // Update original block
             block.size = size;
@@ -880,7 +892,7 @@ private:
         const header: MediumBlockHeader* = header_ptr as MediumBlockHeader*;
         
         // Validate magic number
-        if (header.magic != u32(BLOCK_MAGIC)) {
+        if (header.magic != BLOCK_MAGIC) {
             printf("\033[90m[Runtime::HeapManager] ERROR: Corrupted block header detected!\n\033[0m");
             return null;
         }
@@ -965,7 +977,7 @@ private:
         
         // Additional validation: try to get header and check magic number
         const header: MediumBlockHeader* = this.get_header_from_user_pointer(ptr);
-        return (header != null && header.magic == u32(BLOCK_MAGIC));
+        return (header != null && header.magic == BLOCK_MAGIC);
     }
     
     is_large_allocator_pointer(ptr: void*) -> boolean {
@@ -1211,7 +1223,7 @@ public:
                    i, frame.function_name, frame.source_file, 
                    frame.line_number, frame.column_number);
         }
-        printf("\033[0m");.
+        printf("\033[0m");
 
         return;
     }
@@ -1725,6 +1737,16 @@ public:
         
         this.state = RuntimeState::RTS_INITIALIZING;
         this.startup_time = this.get_timestamp();
+        
+        // Ensure all managers are properly constructed before initialization
+        // This is needed because global variables may be zero-initialized instead of constructor-initialized
+        this.heap_manager = HeapManager();
+        this.type_registry = TypeRegistry();
+        this.thread_manager = ThreadManager();
+        this.exception_manager = ExceptionManager();
+        this.io_manager = IOManager();
+        this.profiler_manager = ProfilerManager();
+        this.string_manager = StringManager();
         
         // Initialize heap manager
         const heap_result: RuntimeError = this.heap_manager.initialize(DEFAULT_HEAP_SIZE);
