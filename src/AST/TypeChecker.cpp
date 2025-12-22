@@ -1772,12 +1772,52 @@ namespace Cryo
 
     void TypeChecker::visit(ProgramNode &node)
     {
-        // Visit all top-level declarations and statements
+        // CRITICAL FIX: Implement two-pass processing for struct declarations
+        // to handle cross-struct method dependencies like ExceptionManager -> CryoRuntime
+
+        // Pass 1: Register all struct types and method signatures
+        LOG_DEBUG(Cryo::LogComponent::AST, "PROGRAM_PROCESSING: Starting Pass 1 - Struct type and method signature registration");
         for (const auto &stmt : node.statements())
         {
             if (stmt)
             {
-                stmt->accept(*this);
+                // Only process struct/class declarations for type and signature registration
+                if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "PROGRAM_PROCESSING: Pass 1 processing struct '{}'", struct_decl->name());
+                    register_struct_declaration_signatures(*struct_decl);
+                }
+                else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(stmt.get()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "PROGRAM_PROCESSING: Pass 1 processing class '{}'", class_decl->name());
+                    register_class_declaration_signatures(*class_decl);
+                }
+                else
+                {
+                    // Process non-struct declarations normally in pass 1
+                    stmt->accept(*this);
+                }
+            }
+        }
+
+        // Pass 2: Process all struct method bodies and other statements
+        LOG_DEBUG(Cryo::LogComponent::AST, "PROGRAM_PROCESSING: Starting Pass 2 - Method body processing");
+        for (const auto &stmt : node.statements())
+        {
+            if (stmt)
+            {
+                // Only process struct/class method bodies now that all signatures are registered
+                if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "PROGRAM_PROCESSING: Pass 2 processing struct method bodies for '{}'", struct_decl->name());
+                    process_struct_method_bodies(*struct_decl);
+                }
+                else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(stmt.get()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "PROGRAM_PROCESSING: Pass 2 processing class method bodies for '{}'", class_decl->name());
+                    process_class_method_bodies(*class_decl);
+                }
+                // Non-struct statements were already processed in pass 1
             }
         }
     }
@@ -1966,6 +2006,13 @@ namespace Cryo
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Registering variable '{}' as struct field in '{}' (type: {})",
                       var_name, _current_struct_name, final_type->name());
+
+            // CRITICAL DEBUG for runtime_instance field
+            if (var_name == "runtime_instance")
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "RUNTIME_INSTANCE DEBUG: field='{}', final_type='{}', kind={}, type_annotation='{}'",
+                          var_name, final_type->to_string(), TypeKindToString(final_type->kind()), node.type_annotation());
+            }
 
             _struct_fields[_current_struct_name][var_name] = final_type;
             LOG_DEBUG(Cryo::LogComponent::AST, "Registered struct field '{}' of type '{}' in struct/class '{}'",
@@ -4157,6 +4204,21 @@ namespace Cryo
                 object_type = node.object()->get_resolved_type();
                 LOG_DEBUG(Cryo::LogComponent::AST, "Member '{}' - using resolved type: {} (kind: {})", node.member(),
                           object_type ? object_type->name() : "null", object_type ? (int)object_type->kind() : -1);
+
+                // CRITICAL DEBUG for chained access on runtime_instance
+                if (node.member() == "get_memory_statistics")
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "GET_MEMORY_STATISTICS ACCESS: object_type='{}', kind={}",
+                              object_type ? object_type->to_string() : "null", object_type ? TypeKindToString(object_type->kind()) : "null");
+                    if (node.object())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "GET_MEMORY_STATISTICS: Object node type: {}", typeid(*node.object()).name());
+                        if (auto *memberAccess = dynamic_cast<MemberAccessNode *>(node.object()))
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "GET_MEMORY_STATISTICS: Previous member access was for '{}'", memberAccess->member());
+                        }
+                    }
+                }
             }
             else if (node.object()->type().has_value())
             {
@@ -4560,12 +4622,34 @@ namespace Cryo
             auto field_it = struct_it->second.find(member_name);
             if (field_it != struct_it->second.end())
             {
+                // CRITICAL DEBUG for runtime_instance field specifically
+                if (member_name == "runtime_instance")
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "RUNTIME_INSTANCE FIELD FOUND: field='{}' in struct '{}', stored_type='{}', kind={}",
+                              member_name, lookup_type_name, field_it->second->to_string(), TypeKindToString(field_it->second->kind()));
+                    LOG_DEBUG(Cryo::LogComponent::AST, "RUNTIME_INSTANCE: Setting node resolved type to: '{}'", field_it->second->to_string());
+                }
+
                 // Found the field - store the resolved Type*
                 node.set_resolved_type(field_it->second);
+
+                // CRITICAL DEBUG: Log what type was actually set
+                if (member_name == "runtime_instance" && node.has_resolved_type())
+                {
+                    Type *resolved = node.get_resolved_type();
+                    LOG_DEBUG(Cryo::LogComponent::AST, "RUNTIME_INSTANCE: Node resolved type after setting: '{}', kind={}",
+                              resolved ? resolved->to_string() : "null", resolved ? TypeKindToString(resolved->kind()) : "null");
+                }
                 return;
             }
             else
             {
+                // CRITICAL DEBUG for get_memory_statistics method specifically
+                if (member_name == "get_memory_statistics")
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "get_memory_statistics FIELD NOT FOUND: looking for field '{}' in struct '{}', will now check methods",
+                              member_name, lookup_type_name);
+                }
                 LOG_DEBUG(Cryo::LogComponent::AST, "Field '{}' NOT found in struct '{}'", member_name, lookup_type_name);
             }
         }
@@ -5743,6 +5827,12 @@ namespace Cryo
     {
         std::string struct_name = node.name();
 
+        // CRITICAL DEBUG for ExceptionManager struct processing
+        if (struct_name == "ExceptionManager")
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "EXCEPTION_MANAGER: Starting to process ExceptionManager struct");
+        }
+
         // Check for redefinition
         if (_symbol_table->lookup_symbol(struct_name))
         {
@@ -5809,6 +5899,11 @@ namespace Cryo
         {
             if (field)
             {
+                // CRITICAL DEBUG for ExceptionManager field processing
+                if (struct_name == "ExceptionManager")
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "EXCEPTION_MANAGER: Processing field in ExceptionManager");
+                }
                 field->accept(*this);
             }
         }
@@ -5829,6 +5924,11 @@ namespace Cryo
         {
             if (method)
             {
+                // CRITICAL DEBUG for ExceptionManager method body processing
+                if (struct_name == "ExceptionManager")
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "EXCEPTION_MANAGER: Processing method body '{}' in ExceptionManager", method->name());
+                }
                 method->accept(*this);
             }
         }
@@ -5848,6 +5948,176 @@ namespace Cryo
         _current_struct_name = previous_struct_name;
 
         node.set_type(struct_name);
+    }
+
+    // Helper method to register only struct types and method signatures (Pass 1)
+    void TypeChecker::register_struct_declaration_signatures(StructDeclarationNode &node)
+    {
+        std::string struct_name = node.name();
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "STRUCT_SIGNATURES: Registering struct '{}' types and method signatures", struct_name);
+
+        // Check for redefinition
+        if (_symbol_table->lookup_symbol(struct_name))
+        {
+            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, node.location());
+            return;
+        }
+
+        // Register struct type in symbol table FIRST, before processing fields
+        Type *struct_type = _type_context.get_struct_type(struct_name);
+        _symbol_table->declare_symbol(struct_name, struct_type, node.location(), &node);
+
+        // Save previous struct type and set current
+        Type *previous_struct_type = _current_struct_type;
+        _current_struct_type = struct_type;
+
+        // Save previous struct name and set current
+        std::string previous_struct_name = _current_struct_name;
+        _current_struct_name = struct_name;
+
+        // Enter struct scope
+        enter_scope();
+
+        // Handle generic parameters if any
+        bool entered_generic_context = false;
+        if (!node.generic_parameters().empty())
+        {
+            std::vector<std::string> param_names;
+            for (const auto &generic_param : node.generic_parameters())
+            {
+                if (generic_param)
+                {
+                    param_names.push_back(generic_param->name());
+                }
+            }
+            _template_parameters[struct_name] = param_names;
+            _type_registry->register_template(struct_name, param_names);
+            enter_generic_context(struct_name, param_names, node.location());
+            entered_generic_context = true;
+        }
+
+        // Process generic parameters
+        for (const auto &generic_param : node.generic_parameters())
+        {
+            if (generic_param)
+            {
+                generic_param->accept(*this);
+            }
+        }
+
+        // Process fields
+        for (const auto &field : node.fields())
+        {
+            if (field)
+            {
+                field->accept(*this);
+            }
+        }
+
+        // CRITICAL: Register all method signatures without processing bodies
+        for (const auto &method : node.methods())
+        {
+            if (method)
+            {
+                register_method_signature(*method);
+            }
+        }
+
+        // Exit generic context if we entered one
+        if (entered_generic_context)
+        {
+            exit_generic_context();
+        }
+
+        // Exit struct scope
+        exit_scope();
+
+        // Restore previous struct type and struct name
+        _current_struct_type = previous_struct_type;
+        _current_struct_name = previous_struct_name;
+    }
+
+    // Helper method to process only struct method bodies (Pass 2)
+    void TypeChecker::process_struct_method_bodies(StructDeclarationNode &node)
+    {
+        std::string struct_name = node.name();
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "STRUCT_BODIES: Processing method bodies for struct '{}'", struct_name);
+
+        // Retrieve the already-registered struct type
+        Type *struct_type = _symbol_table->lookup_symbol(struct_name)->type;
+
+        // Set current struct context
+        Type *previous_struct_type = _current_struct_type;
+        _current_struct_type = struct_type;
+
+        std::string previous_struct_name = _current_struct_name;
+        _current_struct_name = struct_name;
+
+        // Enter struct scope
+        enter_scope();
+
+        // Re-register fields for this scope
+        for (const auto &field : node.fields())
+        {
+            if (field)
+            {
+                field->accept(*this);
+            }
+        }
+
+        // Handle generic context if needed
+        bool entered_generic_context = false;
+        if (!node.generic_parameters().empty())
+        {
+            std::vector<std::string> param_names;
+            for (const auto &generic_param : node.generic_parameters())
+            {
+                if (generic_param)
+                {
+                    param_names.push_back(generic_param->name());
+                }
+            }
+            enter_generic_context(struct_name, param_names, node.location());
+            entered_generic_context = true;
+        }
+
+        // NOW process method bodies with all signatures available
+        for (const auto &method : node.methods())
+        {
+            if (method)
+            {
+                method->accept(*this);
+            }
+        }
+
+        // Exit generic context if we entered one
+        if (entered_generic_context)
+        {
+            exit_generic_context();
+        }
+
+        // Exit struct scope
+        exit_scope();
+
+        // Restore previous struct type and struct name
+        _current_struct_type = previous_struct_type;
+        _current_struct_name = previous_struct_name;
+    }
+
+    // Helper method to register only class types and method signatures (Pass 1)
+    void TypeChecker::register_class_declaration_signatures(ClassDeclarationNode &node)
+    {
+        // For now, just call the existing class visitor which already handles signatures properly
+        visit(node);
+    }
+
+    // Helper method to process only class method bodies (Pass 2)
+    void TypeChecker::process_class_method_bodies(ClassDeclarationNode &node)
+    {
+        // Classes already process method bodies in a controlled way, so nothing extra needed
+        // The existing ClassDeclarationNode visitor already handles this correctly
     }
 
     void TypeChecker::visit(ClassDeclarationNode &node)
@@ -6931,86 +7201,85 @@ namespace Cryo
                 }
             }
 
-            if (!already_registered)
+            // FORCE RE-REGISTRATION: Always register methods during struct method visit
+            // The signature registration might have happened in a different TypeChecker instance
+            // Get the return type from the node
+            Type *return_type = node.get_resolved_return_type();
+            std::string return_type_str = return_type ? return_type->to_string() : "";
+            if (return_type_str.empty() && is_constructor)
             {
-                // Get the return type from the node
-                Type *return_type = node.get_resolved_return_type();
-                std::string return_type_str = return_type ? return_type->to_string() : "";
-                if (return_type_str.empty() && is_constructor)
+                return_type_str = "void"; // Constructors typically return void
+            }
+
+            if (return_type)
+            {
+                // Build full function signature for method type checking
+                std::vector<Type *> param_types;
+                for (const auto &param : node.parameters())
                 {
-                    return_type_str = "void"; // Constructors typically return void
+                    if (param)
+                    {
+                        Type *param_type = param->get_resolved_type();
+                        const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
+                        if (param_type)
+                        {
+                            param_types.push_back(param_type);
+                        }
+                    }
                 }
 
-                if (return_type)
+                // Create function type with full signature
+                FunctionType *func_type = static_cast<FunctionType *>(
+                    _type_context.create_function_type(return_type, param_types));
+
+                // Register in appropriate registry based on visibility
+                LOG_DEBUG(Cryo::LogComponent::AST, "FORCE REGISTERING Method '{}' in struct '{}' with visibility: {}", method_name, _current_struct_name,
+                          (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
+                                                                                                                          : "Unknown"));
+                if (node.visibility() == Visibility::Private)
                 {
-                    // Build full function signature for method type checking
-                    std::vector<Type *> param_types;
+                    LOG_DEBUG(Cryo::LogComponent::AST, "FORCE Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
+                    _private_struct_methods[_current_struct_name][method_name] = func_type;
+
+                    // Extract parameter types for SRM naming
+                    std::vector<Cryo::Type *> parameter_types;
                     for (const auto &param : node.parameters())
                     {
-                        if (param)
+                        if (param && param->get_resolved_type())
                         {
-                            Type *param_type = param->get_resolved_type();
-                            const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
-                            if (param_type)
-                            {
-                                param_types.push_back(param_type);
-                            }
+                            parameter_types.push_back(param->get_resolved_type());
                         }
                     }
 
-                    // Create function type with full signature
-                    FunctionType *func_type = static_cast<FunctionType *>(
-                        _type_context.create_function_type(return_type, param_types));
+                    // Use SRM helper to generate standardized private method name
+                    std::string full_method_name = generate_method_name(_current_struct_name, method_name, parameter_types);
+                    declare_function(full_method_name, func_type, node.location(), nullptr);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Declared private method '{}' in symbol table as '{}'", method_name, full_method_name);
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "FORCE Registering public method '{}' for struct '{}'", method_name, _current_struct_name);
+                    _struct_methods[_current_struct_name][method_name] = func_type;
 
-                    // Register in appropriate registry based on visibility
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' in struct '{}' has visibility: {}", method_name, _current_struct_name,
-                              (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
-                                                                                                                              : "Unknown"));
-                    if (node.visibility() == Visibility::Private)
+                    // Extract parameter types for SRM naming (reuse from above if this is duplicate code)
+                    std::vector<Cryo::Type *> parameter_types;
+                    for (const auto &param : node.parameters())
                     {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Registering private method '{}' for struct '{}'", method_name, _current_struct_name);
-                        _private_struct_methods[_current_struct_name][method_name] = func_type;
-
-                        // Extract parameter types for SRM naming
-                        std::vector<Cryo::Type *> parameter_types;
-                        for (const auto &param : node.parameters())
+                        if (param && param->get_resolved_type())
                         {
-                            if (param && param->get_resolved_type())
-                            {
-                                parameter_types.push_back(param->get_resolved_type());
-                            }
+                            parameter_types.push_back(param->get_resolved_type());
                         }
-
-                        // Use SRM helper to generate standardized private method name
-                        std::string full_method_name = generate_method_name(_current_struct_name, method_name, parameter_types);
-                        declare_function(full_method_name, func_type, node.location(), nullptr);
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Declared private method '{}' in symbol table as '{}'", method_name, full_method_name);
                     }
-                    else
-                    {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Registering public method '{}' for struct '{}'", method_name, _current_struct_name);
-                        _struct_methods[_current_struct_name][method_name] = func_type;
 
-                        // Extract parameter types for SRM naming (reuse from above if this is duplicate code)
-                        std::vector<Cryo::Type *> parameter_types;
-                        for (const auto &param : node.parameters())
-                        {
-                            if (param && param->get_resolved_type())
-                            {
-                                parameter_types.push_back(param->get_resolved_type());
-                            }
-                        }
-
-                        // Use SRM helper to generate standardized public method name
-                        std::string full_method_name = generate_method_name(_current_struct_name, method_name, parameter_types);
-                        declare_function(full_method_name, func_type, node.location(), nullptr);
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Declared method '{}' in symbol table as '{}'", method_name, full_method_name);
-                    }
+                    // Use SRM helper to generate standardized public method name
+                    std::string full_method_name = generate_method_name(_current_struct_name, method_name, parameter_types);
+                    declare_function(full_method_name, func_type, node.location(), nullptr);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Declared method '{}' in symbol table as '{}'", method_name, full_method_name);
                 }
             }
             else
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Method '{}' in struct '{}' already registered, skipping duplicate registration", method_name, _current_struct_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Method '{}' in struct '{}' has no return type, skipping registration", method_name, _current_struct_name);
             }
         }
     }

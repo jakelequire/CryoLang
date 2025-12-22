@@ -222,6 +222,11 @@ namespace Cryo::Codegen
         void process_global_variables_recursively(ASTNode *node);
 
         /**
+         * @brief Generate global constructor function and register with @llvm.global_ctors
+         */
+        void generate_global_constructors();
+
+        /**
          * @brief Set pre-registration mode to only register types without generating method bodies
          * @param enabled True to enable pre-registration mode, false to disable
          */
@@ -360,6 +365,15 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Type *> _global_types;   // Track global variable element types
         std::unordered_map<std::string, llvm::Value *> _enum_variants; // Track enum variants for scope resolution
         std::unordered_map<std::string, Cryo::Type *> _variable_types; // Track variable name -> resolved type object
+
+        // Global constructor support
+        struct GlobalConstructorInfo
+        {
+            llvm::GlobalVariable *global_var;
+            ASTNode *initializer_node;
+            std::string var_name;
+        };
+        std::vector<GlobalConstructorInfo> _global_constructors;
 
         // Imported ASTs for cross-module enum value extraction
         const std::unordered_map<std::string, std::unique_ptr<Cryo::ProgramNode>> *_imported_asts;
@@ -631,12 +645,12 @@ namespace Cryo::Codegen
 
         // Cast expression helper methods
         llvm::Type *get_primitive_type(const std::string &type_name);
-        llvm::Value *generate_cast_instruction(llvm::Value *source_value, 
-                                              llvm::Type *source_type, 
-                                              llvm::Type *target_type, 
-                                              const std::string &source_type_name, 
-                                              const std::string &target_type_name,
-                                              llvm::IRBuilder<> &builder);
+        llvm::Value *generate_cast_instruction(llvm::Value *source_value,
+                                               llvm::Type *source_type,
+                                               llvm::Type *target_type,
+                                               const std::string &source_type_name,
+                                               const std::string &target_type_name,
+                                               llvm::IRBuilder<> &builder);
 
         // Error reporting
         void report_error(const std::string &message);
