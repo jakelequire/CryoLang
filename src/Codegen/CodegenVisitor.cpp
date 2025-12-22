@@ -4636,7 +4636,7 @@ namespace Cryo::Codegen
                 {
                     // Additional safety checks before calculating size
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found LLVM type for sizeof({}), type_id: {}", type_name, llvm_type->getTypeID());
-                    
+
                     // Validate that the LLVM type is complete and safe for size calculation
                     if (llvm_type->isStructTy())
                     {
@@ -4670,19 +4670,19 @@ namespace Cryo::Codegen
                             {
                                 const llvm::DataLayout &data_layout = module->getDataLayout();
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got data layout successfully, about to call getTypeAllocSize");
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "LLVM type pointer: {}, type is valid: {}", 
-                                         static_cast<void*>(llvm_type), llvm_type != nullptr);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "LLVM type pointer: {}, type is valid: {}",
+                                          static_cast<void *>(llvm_type), llvm_type != nullptr);
                                 uint64_t type_size = data_layout.getTypeAllocSize(llvm_type);
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "getTypeAllocSize returned successfully: {} bytes", type_size);
-                                
+
                                 // Cache the result
                                 _sizeof_cache[type_name] = type_size;
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cached sizeof result for {}: {} bytes", type_name, type_size);
-                                
+
                                 size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), type_size);
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully calculated size for {}: {} bytes", type_name, type_size);
                             }
-                            catch (const std::exception& e)
+                            catch (const std::exception &e)
                             {
                                 LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception while calculating size for {}: {}", type_name, e.what());
                                 if (_diagnostic_builder)
@@ -4722,15 +4722,15 @@ namespace Cryo::Codegen
                         {
                             const llvm::DataLayout &data_layout = module->getDataLayout();
                             uint64_t type_size = data_layout.getTypeAllocSize(llvm_type);
-                            
+
                             // Cache the result
                             _sizeof_cache[type_name] = type_size;
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cached sizeof result for {}: {} bytes", type_name, type_size);
-                            
+
                             size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), type_size);
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully calculated size for {}: {} bytes", type_name, type_size);
                         }
-                        catch (const std::exception& e)
+                        catch (const std::exception &e)
                         {
                             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception while calculating size for {}: {}", type_name, e.what());
                             if (_diagnostic_builder)
@@ -8476,36 +8476,36 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing assignment - left side type: {}",
                           typeid(*node->left()).name());
-                          
+
                 // Early check: Cast expressions cannot be the left-hand side of assignment
                 if (dynamic_cast<Cryo::CastExpressionNode *>(node->left()))
                 {
-                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, 
-                        "Cast expressions cannot be assigned to - invalid left-hand side of assignment");
+                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                                                      "Cast expressions cannot be assigned to - invalid left-hand side of assignment");
                     return nullptr;
                 }
-                
+
                 // Early check: Binary expressions cannot be the left-hand side of assignment
                 if (dynamic_cast<Cryo::BinaryExpressionNode *>(node->left()))
                 {
-                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, 
-                        "Binary expressions cannot be assigned to - invalid left-hand side of assignment");
+                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                                                      "Binary expressions cannot be assigned to - invalid left-hand side of assignment");
                     return nullptr;
                 }
-                
+
                 // Early check: Call expressions cannot be the left-hand side of assignment
                 if (dynamic_cast<Cryo::CallExpressionNode *>(node->left()))
                 {
-                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, 
-                        "Function calls cannot be assigned to - invalid left-hand side of assignment");
+                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                                                      "Function calls cannot be assigned to - invalid left-hand side of assignment");
                     return nullptr;
                 }
-                
+
                 // Early check: Sizeof expressions cannot be the left-hand side of assignment
                 if (dynamic_cast<Cryo::SizeofExpressionNode *>(node->left()))
                 {
-                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, 
-                        "Sizeof expressions cannot be assigned to - invalid left-hand side of assignment");
+                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                                                      "Sizeof expressions cannot be assigned to - invalid left-hand side of assignment");
                     return nullptr;
                 }
 
@@ -8841,17 +8841,22 @@ namespace Cryo::Codegen
                 {
                     // Add safe member name extraction with null checking
                     std::string member_name = "<invalid_member>";
-                    try {
-                        if (left_member_access) {
-                            const std::string& member_ref = left_member_access->member();
-                            if (!member_ref.empty()) {
+                    try
+                    {
+                        if (left_member_access)
+                        {
+                            const std::string &member_ref = left_member_access->member();
+                            if (!member_ref.empty())
+                            {
                                 member_name = member_ref;
                             }
                         }
-                    } catch (...) {
+                    }
+                    catch (...)
+                    {
                         member_name = "<corrupted_member>";
                     }
-                    
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing member access assignment: {}:{}",
                               left_member_access->object() ? "has_object" : "no_object",
                               member_name);
