@@ -41,7 +41,7 @@ impl Profiler {
     }
 
     pub fn start_phase(&mut self, phase: &str) {
-        if let Some(current) = &self.current_phase {
+        if let Some(current) = &self.current_phase.clone() {
             self.end_phase(current);
         }
         

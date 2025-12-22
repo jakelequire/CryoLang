@@ -14,33 +14,33 @@ const RUNTIME_VERSION_MINOR: u32 = 0;
 const RUNTIME_VERSION_PATCH: u32 = 0;
 
 // Memory configuration
-const DEFAULT_HEAP_SIZE: u64            = 67108864;    // 64MB default heap
-const DEFAULT_STACK_SIZE: u64           = 1048576;     // 1MB default stack per thread
-const SMALL_OBJECT_THRESHOLD: u64       = 256;         // Objects <= 256 bytes use small allocator
-const LARGE_OBJECT_THRESHOLD: u64       = 65536;       // Objects >= 64KB use large allocator
-const MAX_SMALL_OBJECT_SIZE: u64        = 256;
-const MIN_ALLOCATION_SIZE: u64          = 16;          // Minimum allocation size
-const ALLOCATION_ALIGNMENT: u64         = 16;          // Memory alignment requirement
-const GUARD_PAGE_SIZE: u64              = 4096;        // Memory protection
-const MEMORY_POOL_COUNT: u32            = 32;          // Number of memory pools
-const MEMORY_POISON_PATTERN: u8         = 0xDD;        // Pattern for freed memory
-const BLOCK_MAGIC: u32                  = 0xDEADBEEF;   // Magic number for block headers
+const DEFAULT_HEAP_SIZE:         u64       = 67108864;    // 64MB default heap
+const DEFAULT_STACK_SIZE:        u64       = 1048576;     // 1MB default stack per thread
+const SMALL_OBJECT_THRESHOLD:    u64       = 256;         // Objects <= 256 bytes use small allocator
+const LARGE_OBJECT_THRESHOLD:    u64       = 65536;       // Objects >= 64KB use large allocator
+const MAX_SMALL_OBJECT_SIZE:     u64       = 256;
+const MIN_ALLOCATION_SIZE:       u64       = 16;          // Minimum allocation size
+const ALLOCATION_ALIGNMENT:      u64       = 16;          // Memory alignment requirement
+const GUARD_PAGE_SIZE:           u64       = 4096;        // Memory protection
+const MEMORY_POOL_COUNT:         u32       = 32;          // Number of memory pools
+const MEMORY_POISON_PATTERN:     u8        = 0xDD;        // Pattern for freed memory
+const BLOCK_MAGIC:               u32       = 0xDEADBEEF;   // Magic number for block headers
 
 // Threading configuration
-const MAX_THREADS: u32                  = 256;         // Maximum concurrent threads
-const THREAD_STACK_SIZE: u64            = 2097152;     // 2MB per thread stack
-const WORK_QUEUE_SIZE: u32              = 1024;        // Work stealing queue size
+const MAX_THREADS:               u32       = 256;         // Maximum concurrent threads
+const THREAD_STACK_SIZE:         u64       = 2097152;     // 2MB per thread stack
+const WORK_QUEUE_SIZE:           u32       = 1024;        // Work stealing queue size
 
 // GC-less memory management thresholds
-const MEMORY_PRESSURE_THRESHOLD: f64    = 0.85;        // 85% heap usage triggers cleanup
-const MEMORY_WARNING_THRESHOLD: f64     = 0.95;        // 95% heap usage warning
-const DEFRAG_THRESHOLD: f64             = 0.3;         // 30% fragmentation triggers defrag
+const MEMORY_PRESSURE_THRESHOLD: f64       = 0.85;        // 85% heap usage triggers cleanup
+const MEMORY_WARNING_THRESHOLD:  f64       = 0.95;        // 95% heap usage warning
+const DEFRAG_THRESHOLD:          f64       = 0.3;         // 30% fragmentation triggers defrag
 
 // Runtime debugging and profiling
-const ENABLE_RUNTIME_PROFILING: boolean = true;
-const ENABLE_MEMORY_TRACKING: boolean   = true;
-const ENABLE_TYPE_CHECKING: boolean     = true;
-const MAX_STACK_TRACE_DEPTH: u32        = 128;
+const ENABLE_RUNTIME_PROFILING:  boolean  = true;
+const ENABLE_MEMORY_TRACKING:    boolean  = true;
+const ENABLE_TYPE_CHECKING:      boolean  = true;
+const MAX_STACK_TRACE_DEPTH:     u32      = 128;
 
 //===================================================================
 // RUNTIME STATE AND ERROR HANDLING
@@ -85,7 +85,7 @@ enum MemoryRegionType {
 }
 
 
-mut g_cryo_runtime: CryoRuntime = CryoRuntime();
+mut g_cryo_runtime: CryoRuntime;
 
 
 //===================================================================
@@ -253,7 +253,6 @@ public:
         // Create linked list by storing next pointer in each block
         mut i: u64 = u64(0);
         while (i < (this.block_count - u64(1))) {
-            printf("\033[90m[Runtime::MemoryPool] Linking block %llu at %p\n\033[0m", i, current_block);
             const next_block: void* = (current_block as u8*) + this.block_size;
             *(current_block as void**) = next_block;
             current_block = next_block;
@@ -473,7 +472,7 @@ private:
     initialize_memory_pools() -> void {
         printf("\033[90m[Runtime::HeapManager] Initializing memory pools for small object allocations\n\033[0m");
         // Create memory pools for common allocation sizes
-        const pool_sizes: u64[5] = [16, 32, 64, 128, 256];
+        const pool_sizes: u64[] = [16, 32, 64, 128, 256];
         const blocks_per_pool: u64 = u64(1024); // 1024 blocks per pool
         
         printf("\033[90m[Runtime::HeapManager] Initializing %d memory pools...\n\033[0m", 5);
@@ -820,12 +819,18 @@ private:
             return;
         }
         
+        printf("\033[90m[Runtime::HeapManager] Medium region allocated at %p\n\033[0m", this.medium_region_base);
+        
         // Clear the entire region first for safety
         __memset__(this.medium_region_base, 0, this.medium_region_size);
+        
+        printf("\033[90m[Runtime::HeapManager] Medium region cleared\n\033[0m");
         
         // Initialize with one large free block
         const initial_header: MediumBlockHeader* = this.medium_region_base as MediumBlockHeader*;
         
+        printf("\033[90m[Runtime::HeapManager] Setting up initial medium block header at %p\n\033[0m", initial_header);
+
         // Properly construct the MediumBlockHeader object
         *initial_header = MediumBlockHeader();
         
@@ -837,11 +842,16 @@ private:
         initial_header.next_free = null;
         initial_header.prev_free = null;
         initial_header.magic = BLOCK_MAGIC;
-        
+        printf("\033[90m[Runtime::HeapManager] Initial medium block header set: size=%llu, is_free=%d\n\033[0m", 
+               initial_header.size, initial_header.is_free ? 1 : 0);
+
         this.medium_free_list = initial_header;
 
         const user_data_ptr: u8* = (initial_header as u8*) + sizeof(MediumBlockHeader);
         const user_data_size: u64 = this.medium_region_size - sizeof(MediumBlockHeader);
+        
+        printf("\033[90m[Runtime::HeapManager] Medium allocator initial free block at %p (%llu bytes user data)\n\033[0m", 
+               user_data_ptr, user_data_size);
         
         // Clear the region for security
         __memset__(user_data_ptr, 0, user_data_size);
@@ -2201,6 +2211,7 @@ function cryo_throw_exception(message: string, error_code: RuntimeError) -> void
 
 function cryo_alloc(size: u64) -> void* {
     printf("\033[90m[Runtime] [global::cryo_alloc] Allocating %llu bytes of memory...\n\033[0m", size);
+    printf("\033[90m[Runtime] Current runtime state: %s\n\033[0m", runtime_state_to_string(g_cryo_runtime.state));
     mut ptr: void* = null;
     
     // Skip profiling during shutdown to avoid use-after-free
@@ -2246,6 +2257,7 @@ function cryo_free(ptr: void*) -> void {
 extern function _user_main_(argc: int, argv: string*) -> int;
 
 function main(argc: int, argv: string*) -> int {
+    g_cryo_runtime = CryoRuntime();
     printf("\033[90m=== CryoLang Runtime Starting ===\033[0m\n");
     // Initialize runtime system
     const init_result: RuntimeError = cryo_runtime_initialize();
