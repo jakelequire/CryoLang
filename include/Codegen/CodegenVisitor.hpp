@@ -365,7 +365,7 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Type *> _global_types;   // Track global variable element types
         std::unordered_map<std::string, llvm::Value *> _enum_variants; // Track enum variants for scope resolution
         std::unordered_map<std::string, Cryo::Type *> _variable_types; // Track variable name -> resolved type object
-        std::unordered_map<std::string, uint64_t> _sizeof_cache;      // Cache sizeof results to avoid multiple LLVM calls
+        std::unordered_map<std::string, uint64_t> _sizeof_cache;       // Cache sizeof results to avoid multiple LLVM calls
 
         // Global constructor support
         struct GlobalConstructorInfo
