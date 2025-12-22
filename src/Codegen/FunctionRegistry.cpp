@@ -125,6 +125,10 @@ namespace Cryo::Codegen
     {
         FunctionMetadata metadata = get_function_metadata(function_name, resolved_namespace);
 
+        // ADD DEBUGGING: Log the metadata category that was determined
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry::get_function_return_type for '{}' in namespace '{}': category={}", 
+                  function_name, resolved_namespace, static_cast<int>(metadata.category));
+
         // SPECIAL HANDLING: Check if we have a symbol with direct type information
         // This handles cases where primitive methods have direct type info but aren't FunctionType
         Cryo::Symbol *symbol = nullptr;
@@ -226,6 +230,8 @@ namespace Cryo::Codegen
                                                                   const std::string &resolved_namespace) const
     {
         FunctionMetadata metadata;
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "classify_from_symbol_table: '{}' in namespace '{}'", function_name, resolved_namespace);
 
         // Try to find the function in the symbol table
         Cryo::Symbol *symbol = nullptr;
@@ -234,12 +240,14 @@ namespace Cryo::Codegen
         {
             // Try namespaced lookup first
             symbol = _symbol_table.lookup_namespaced_symbol(resolved_namespace, function_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Namespaced lookup for '{}' in '{}': {}", function_name, resolved_namespace, symbol ? "FOUND" : "NOT FOUND");
         }
 
         if (!symbol)
         {
             // Try direct lookup
             symbol = _symbol_table.lookup_symbol(function_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Direct lookup for '{}': {}", function_name, symbol ? "FOUND" : "NOT FOUND");
         }
 
         if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->data_type)
@@ -306,36 +314,51 @@ namespace Cryo::Codegen
             if (function_type && function_type->return_type())
             {
                 auto return_type_kind = function_type->return_type()->kind();
+                std::string return_type_name = function_type->return_type()->name();
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "classify_from_namespace: function '{}' has return type '{}' (kind: {})", 
+                          function_name, return_type_name, static_cast<int>(return_type_kind));
+                
                 switch (return_type_kind)
                 {
                 case TypeKind::Integer:
                     metadata.category = FunctionCategory::IntegerFunction;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' as IntegerFunction", function_name);
                     break;
                 case TypeKind::Float:
                     metadata.category = FunctionCategory::FloatFunction;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' as FloatFunction", function_name);
                     break;
                 case TypeKind::String:
                     metadata.category = FunctionCategory::StringFunction;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' as StringFunction", function_name);
                     break;
                 case TypeKind::Boolean:
                     metadata.category = FunctionCategory::BooleanFunction;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Function '{}' classified as BooleanFunction with return type '{}'", function_name, return_type_name);
                     break;
                 case TypeKind::Void:
                     metadata.category = FunctionCategory::VoidFunction;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' as VoidFunction", function_name);
                     break;
                 default:
                     metadata.category = FunctionCategory::VoidFunction;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' as VoidFunction (default case)", function_name);
                     break;
                 }
             }
             else
             {
-                metadata.category = FunctionCategory::VoidFunction; // fallback
+                metadata.category = FunctionCategory::IntegerFunction; // Safe fallback to prevent wrong boolean typing
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No function type found for '{}', using IntegerFunction fallback", function_name);
             }
         }
         else
         {
-            metadata.category = FunctionCategory::VoidFunction; // fallback
+            // Default to IntegerFunction for unknown functions rather than VoidFunction
+            // This prevents functions from being incorrectly typed as BooleanFunction later
+            metadata.category = FunctionCategory::IntegerFunction; // Safe fallback
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No symbol found for '{}', using IntegerFunction fallback", function_name);
         }
 
         metadata.runtime_name = runtime_name;
@@ -430,35 +453,52 @@ namespace Cryo::Codegen
     {
         if (!cryo_type)
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_category_from_cryo_type: NULL type, returning Unknown");
             return FunctionCategory::Unknown;
         }
 
+        // Check for pointer types first, before string name comparison
+        if (dynamic_cast<const PointerType *>(cryo_type) != nullptr)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_category_from_cryo_type: Detected PointerType '{}'", cryo_type->name());
+            return FunctionCategory::PointerFunction;
+        }
+
         std::string type_name = cryo_type->name();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_category_from_cryo_type: Categorizing type '{}'", type_name);
 
         if (type_name == "void")
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type '{}' categorized as VoidFunction", type_name);
             return FunctionCategory::VoidFunction;
         }
         else if (type_name == "i8" || type_name == "i16" || type_name == "i32" || type_name == "i64" ||
                  type_name == "u8" || type_name == "u16" || type_name == "u32" || type_name == "u64" ||
                  type_name == "int")
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type '{}' categorized as IntegerFunction", type_name);
             return FunctionCategory::IntegerFunction;
         }
-        else if (type_name == "string" || type_name == "char*")
+        else if (type_name == "string" || type_name == "char*" || type_name.find("*") != std::string::npos)
         {
-            return FunctionCategory::StringFunction;
-        }
-        else if (type_name == "boolean")
-        {
-            return FunctionCategory::BooleanFunction;
-        }
-        else if (dynamic_cast<const PointerType *>(cryo_type) != nullptr)
-        {
+            // Handle any pointer type as string/pointer function
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type '{}' categorized as PointerFunction", type_name);
             return FunctionCategory::PointerFunction;
         }
+        else if (type_name == "boolean" || type_name == "bool")
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Type '{}' categorized as BooleanFunction - this may cause IR verification issues!", type_name);
+            return FunctionCategory::BooleanFunction;
+        }
+        else if (type_name == "float" || type_name == "double" || type_name == "f32" || type_name == "f64")
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type '{}' categorized as FloatFunction", type_name);
+            return FunctionCategory::FloatFunction;
+        }
 
-        return FunctionCategory::IntegerFunction; // Safe default for unknown types
+        // For unknown types, use IntegerFunction as safe default instead of BooleanFunction
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Unknown type '{}', defaulting to IntegerFunction", type_name);
+        return FunctionCategory::IntegerFunction;
     }
 
     llvm::Type *FunctionRegistry::category_to_llvm_type(FunctionCategory category, llvm::LLVMContext &context) const
