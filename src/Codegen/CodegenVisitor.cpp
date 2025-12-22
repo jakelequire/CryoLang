@@ -377,6 +377,11 @@ namespace Cryo::Codegen
         }
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4 complete: _globals has {} entries", _globals.size());
 
+        // Generate global constructors after all declarations are processed
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating global constructors for {} global variables", _global_constructors.size());
+        generate_global_constructors();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Global constructor generation complete");
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Completed processing main program");
     }
 
@@ -971,13 +976,30 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        // For non-literal initializers (like constructor calls), we can't generate
-                        // them as constant initializers. For now, use zero initialization and
-                        // defer the constructor call to a global constructor function.
-                        // TODO: Implement proper global constructor generation
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Warning: Global variable '{}' has non-constant initializer, using zero initialization", var_name);
-                        // Use zero initializer for now
+                        // For non-literal initializers (like constructor calls), store them for
+                        // global constructor generation instead of using zero initialization
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Storing global variable '{}' for global constructor generation", var_name);
+
+                        // Use zero initializer for now, but store constructor call for later
                         initializer = llvm::Constant::getNullValue(llvm_type);
+
+                        // Store this global for constructor generation
+                        auto global_var = new llvm::GlobalVariable(
+                            *module,
+                            llvm_type,
+                            !node.is_mutable(),
+                            llvm::GlobalValue::ExternalLinkage,
+                            initializer,
+                            var_name);
+
+                        _globals[var_name] = global_var;
+                        register_value(&node, global_var);
+
+                        // Store for global constructor generation
+                        _global_constructors.push_back({global_var, node.initializer(), var_name});
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Global variable '{}' registered for constructor call", var_name);
+                        return;
                     }
                 }
 
@@ -19025,6 +19047,109 @@ namespace Cryo::Codegen
 
         // If we reach here, the cast is not supported
         return nullptr;
+    }
+
+    void CodegenVisitor::generate_global_constructors()
+    {
+        if (_global_constructors.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No global constructors to generate");
+            return;
+        }
+
+        auto module = _context_manager.get_module();
+        if (!module)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "No module available for global constructor generation");
+            return;
+        }
+
+        auto &llvm_context = _context_manager.get_context();
+        llvm::IRBuilder<> builder(llvm_context);
+
+        // Create global constructor function
+        llvm::FunctionType *ctor_type = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_context), false);
+        llvm::Function *global_ctor = llvm::Function::Create(
+            ctor_type,
+            llvm::Function::InternalLinkage,
+            "__cryo_global_constructors",
+            module);
+
+        // Create function body
+        llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(llvm_context, "entry", global_ctor);
+        builder.SetInsertPoint(entry_block);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating constructor calls for {} global variables", _global_constructors.size());
+
+        // Generate constructor calls for each global variable
+        for (const auto &global_ctor_info : _global_constructors)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating constructor for global: {}", global_ctor_info.var_name);
+
+            // Get the constructor function name from the initializer
+            if (auto func_call = dynamic_cast<const Cryo::CallExpressionNode *>(global_ctor_info.initializer_node))
+            {
+                if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(func_call->callee()))
+                {
+                    std::string ctor_name = identifier->name() + "()";
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Looking for constructor function: {}", ctor_name);
+
+                    llvm::Function *ctor_function = module->getFunction(ctor_name);
+                    if (ctor_function)
+                    {
+                        // Call the constructor on the global variable
+                        std::vector<llvm::Value *> ctor_args = {global_ctor_info.global_var};
+                        builder.CreateCall(ctor_function, ctor_args);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated constructor call for global: {}", global_ctor_info.var_name);
+                    }
+                    else
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Constructor function {} not found for global: {}", ctor_name, global_ctor_info.var_name);
+                    }
+                }
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Callee is not an identifier for global: {}", global_ctor_info.var_name);
+                }
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Global initializer is not a function call for global: {}", global_ctor_info.var_name);
+            }
+        }
+
+        // Return from constructor function
+        builder.CreateRetVoid();
+
+        // Register the global constructor with LLVM's global_ctors mechanism
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(llvm_context);
+        llvm::Type *ctor_ptr_type = global_ctor->getType();
+
+        // Create array type for global_ctors entry: { i32, void()*, i8* }
+        std::vector<llvm::Type *> ctor_entry_types = {
+            i32_type,                                                         // priority
+            ctor_ptr_type,                                                    // constructor function pointer
+            llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(llvm_context)) // associated data (null)
+        };
+        llvm::StructType *ctor_entry_type = llvm::StructType::get(llvm_context, ctor_entry_types);
+
+        // Create the global_ctors entry
+        std::vector<llvm::Constant *> ctor_entry_values = {
+            llvm::ConstantInt::get(i32_type, 65535),                                                          // priority (default)
+            global_ctor,                                                                                      // constructor function
+            llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(llvm_context))) // no associated data
+        };
+        llvm::Constant *ctor_entry = llvm::ConstantStruct::get(ctor_entry_type, ctor_entry_values);
+
+        // Create global_ctors array
+        llvm::ArrayType *ctor_array_type = llvm::ArrayType::get(ctor_entry_type, 1);
+        llvm::Constant *ctor_array = llvm::ConstantArray::get(ctor_array_type, {ctor_entry});
+
+        // Create the @llvm.global_ctors global variable
+        new llvm::GlobalVariable(*module, ctor_array_type, false,
+                                 llvm::GlobalValue::AppendingLinkage, ctor_array, "llvm.global_ctors");
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Global constructor function created and registered with @llvm.global_ctors");
     }
 
 } // namespace Cryo::Codegen

@@ -397,7 +397,7 @@ else
 	@llc -filetype=obj -relocation-model=pic $(RUNTIME_BUILD_DIR)/runtime_combined.bc -o $(BIN_DIR)stdlib/runtime.o
 endif
 	@llvm-ar rcs $(RUNTIME_LIB) $(BIN_DIR)stdlib/runtime.o
-	@echo "Runtime library created successfully: $(RUNTIME_LIB)"
+	@echo -e "Runtime library created successfully: $(RUNTIME_LIB)"
 
 # Create runtime object file directly (used for linking main executable)
 $(BIN_DIR)stdlib/runtime.o: $(RUNTIME_BC_FILES)

@@ -84,6 +84,10 @@ enum MemoryRegionType {
     THREAD_LOCAL
 }
 
+
+mut g_cryo_runtime: CryoRuntime = CryoRuntime();
+
+
 //===================================================================
 // TYPE SYSTEM RUNTIME SUPPORT
 //===================================================================
@@ -112,6 +116,8 @@ type struct TypeInfo {
         this.destructor = null;
         this.copy_constructor = null;
         this.move_constructor = null;
+        printf("\033[90m[Runtime::TypeInfo] (constructor) Created TypeInfo: ID=%llu, Name='%s', Size=%llu, Alignment=%llu\n\033[0m", 
+               id, type_name, type_size, type_alignment);
     }
 }
 
@@ -124,6 +130,7 @@ public:
     TypeRegistry() {
         this.type_info_map = null;
         this.next_type_id = u64(1); // Type ID 0 reserved for void/null
+        printf("\033[90m[Runtime::TypeRegistry] (constructor) Initialized TypeRegistry\n\033[0m");
     }
     
     register_type(name: string, size: u64, alignment: u64) -> u64 {
@@ -138,11 +145,13 @@ public:
     }
     
     get_type_info(type_id: u64) -> TypeInfo* {
+        printf("\033[90m[Runtime::TypeRegistry] Retrieving TypeInfo for ID %llu\n\033[0m", type_id);
         // Hash map lookup implementation
         return null; // Placeholder
     }
     
     is_instance_of(object_type_id: u64, target_type_id: u64) -> boolean {
+        printf("\033[90m[Runtime::TypeRegistry] Checking if type ID %llu is instance of %llu\n\033[0m", object_type_id, target_type_id);
         // Check type hierarchy and trait implementations
         return false; // Placeholder
     }
@@ -175,17 +184,24 @@ public:
         // Initialize free block stack
         this.initialize_free_blocks();
         
-        printf("\033[90m[Runtime::MemoryPool] Created pool: %llu blocks of %llu bytes\n\033[0m", count, size);
+        printf("\033[90m[Runtime::MemoryPool] (constructor) Created pool: %llu blocks of %llu bytes\n\033[0m", count, size);
     }
     
     allocate() -> void* {
-        if (this.free_blocks == null || this.memory_region == null) {
+        printf("\033[90m[Runtime::MemoryPool] Allocating block of size %llu\n\033[0m", this.block_size);
+        if (this.free_blocks == null) {
+            printf("\033[90m[Runtime::MemoryPool] Pool exhausted, allocation failed\n\033[0m");
             return null; // Pool exhausted or not initialized
+        }
+        if (this.memory_region == null) {
+            printf("\033[90m[Runtime::MemoryPool] Memory region not initialized\n\033[0m");
+            return null;
         }
         
         // Pop from free block stack
         const block: void* = this.pop_free_block();
         if (block != null) {
+            printf("\033[90m[Runtime::MemoryPool] Allocated block at %p\n\033[0m", block);
             this.allocated_count = this.allocated_count + u64(1);
             if (this.allocated_count > this.peak_allocation) {
                 this.peak_allocation = this.allocated_count;
@@ -194,40 +210,50 @@ public:
             // Clear the allocated block for security and consistency
             __memset__(block, 0, this.block_size);
         }
+        printf("\033[90m[Runtime::MemoryPool] Allocation complete at block %p\n\033[0m", block);
         return block;
     }
     
     deallocate(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::MemoryPool] Deallocating block at %p\n\033[0m", ptr);
         if (!this.is_valid_block(ptr)) {
+            printf("\033[90m[Runtime::MemoryPool] Invalid block pointer: %p\n\033[0m", ptr);
             return false;
         }
         
         // Push to free block stack
         this.push_free_block(ptr);
         this.allocated_count = this.allocated_count - u64(1);
+
+        printf("\033[90m[Runtime::MemoryPool] Deallocation complete for block %p\n\033[0m", ptr);
         return true;
     }
     
 public:
     initialize_free_blocks() -> void {
+        printf("\033[90m[Runtime::MemoryPool] Initializing free blocks\n\033[0m");
         // Initialize the free block stack with all blocks
         if (this.memory_region == null) {
+            printf("\033[90m[Runtime::MemoryPool] Memory region is null, cannot initialize free blocks\n\033[0m");
             this.free_blocks = null;
             return;
         }
         
         // Ensure minimum block size for pointer storage
         if (this.block_size < sizeof(void*)) {
+            printf("\033[90m[Runtime::MemoryPool] Adjusting block size from %llu to %llu for pointer storage\n\033[0m", this.block_size, sizeof(void*));
             this.block_size = sizeof(void*);
         }
         
         // Link all blocks together in a free list
         mut current_block: void* = this.memory_region;
         this.free_blocks = current_block;
+        printf("\033[90m[Runtime::MemoryPool] Free blocks initialized starting at %p\n\033[0m", this.free_blocks);
         
         // Create linked list by storing next pointer in each block
         mut i: u64 = u64(0);
         while (i < (this.block_count - u64(1))) {
+            printf("\033[90m[Runtime::MemoryPool] Linking block %llu at %p\n\033[0m", i, current_block);
             const next_block: void* = (current_block as u8*) + this.block_size;
             *(current_block as void**) = next_block;
             current_block = next_block;
@@ -236,10 +262,13 @@ public:
         
         // Last block points to null
         *(current_block) = null;
+        printf("\033[90m[Runtime::MemoryPool] Last block linked to null at %p\n\033[0m", current_block);
     }
 
     is_valid_block(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::MemoryPool] Validating block pointer %p\n\033[0m", ptr);
         if (ptr == null || this.memory_region == null) {
+            printf("\033[90m[Runtime::MemoryPool] Pointer is null or memory region is uninitialized\n\033[0m");
             return false;
         }
         
@@ -249,6 +278,7 @@ public:
         const check_addr: u8* = ptr as u8*;
         
         if (check_addr < start_addr || check_addr >= end_addr) {
+            printf("\033[90m[Runtime::MemoryPool] Pointer %p is out of bounds (%p - %p)\n\033[0m", ptr, start_addr, end_addr);
             return false;
         }
         
@@ -259,7 +289,9 @@ public:
 
 private:
     pop_free_block() -> void* {
+        printf("\033[90m[Runtime::MemoryPool] Popping block from free list\n\033[0m");
         if (this.free_blocks == null) {
+            printf("\033[90m[Runtime::MemoryPool] No free blocks available\n\033[0m");
             return null;
         }
         
@@ -271,7 +303,9 @@ private:
     }
     
     push_free_block(ptr: void*) -> void {
+        printf("\033[90m[Runtime::MemoryPool] Pushing block %p back to free list\n\033[0m", ptr);
         if (ptr == null) {
+            printf("\033[90m[Runtime::MemoryPool] Attempted to push null pointer to free list\n\033[0m");
             return;
         }
         
@@ -281,6 +315,8 @@ private:
         // Add block to front of free list
         *(ptr as void**) = this.free_blocks;
         this.free_blocks = ptr;
+
+        printf("\033[90m[Runtime::MemoryPool] Block %p pushed to free list successfully\n\033[0m", ptr);
     }
     
 
@@ -304,6 +340,7 @@ type struct MediumBlockHeader {
         this.next_free = null;
         this.prev_free = null;
         this.magic = u32(BLOCK_MAGIC);
+        printf("\033[90m[Runtime::MediumBlockHeader] (constructor) Created MediumBlockHeader at %p\n\033[0m", this);
     }
 }
 
@@ -349,6 +386,7 @@ public:
         this.heap_base = null;
         this.heap_size = u64(0);
         this.is_initialized = false;
+        printf("\033[90m[Runtime::HeapManager] (constructor) Created HeapManager instance\n\033[0m");
     }
     
     initialize(heap_size: u64) -> RuntimeError {
@@ -358,6 +396,7 @@ public:
         this.heap_base = __malloc__(heap_size);
         
         if (this.heap_base == null) {
+            printf("\033[90m[Runtime::HeapManager] ERROR: Failed to allocate heap memory\n\033[0m");
             return RuntimeError::RTE_OUT_OF_MEMORY;
         }
         
@@ -373,22 +412,29 @@ public:
     }
     
     allocate(size: u64) -> void* {
+        printf("\033[90m[Runtime::HeapManager] Allocation request: %llu bytes\n\033[0m", size);
         if (!this.is_initialized) {
+            printf("\033[90m[Runtime::HeapManager] ERROR: HeapManager not initialized\n\033[0m");
             return null;
         }
         
         // Choose allocation strategy based on size
         if (size <= SMALL_OBJECT_THRESHOLD) {
+            printf("\033[90m[Runtime::HeapManager] Using small object allocator for size %llu\n\033[0m", size);
             return this.allocate_small(size);
         } else if (size <= LARGE_OBJECT_THRESHOLD) {
+            printf("\033[90m[Runtime::HeapManager] Using medium object allocator for size %llu\n\033[0m", size);
             return this.allocate_medium(size);
         } else {
+            printf("\033[90m[Runtime::HeapManager] Using large object allocator for size %llu\n\033[0m", size);
             return this.allocate_large(size);
         }
     }
     
     deallocate(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::HeapManager] Deallocation request for pointer %p\n\033[0m", ptr);
         if (ptr == null) {
+            printf("\033[90m[Runtime::HeapManager] Pointer is null, nothing to deallocate\n\033[0m");
             return true; // Deallocating null is valid
         }
         
@@ -401,6 +447,8 @@ public:
         
         // Update fragmentation calculation
         this.calculate_fragmentation();
+
+        printf("\033[90m[Runtime::HeapManager] Deallocation complete for pointer %p\n\033[0m", ptr);
         
         return true;
     }
@@ -412,16 +460,20 @@ public:
     }
     
     get_memory_pressure() -> f64 {
+        printf("\033[90m[Runtime::HeapManager] Calculating memory pressure\n\033[0m");
         if (this.heap_size == u64(0)) {
             return 0.0;
         }
-        return f64(this.current_memory_usage) / f64(this.heap_size);
+        const p: f64 = f64(this.current_memory_usage) / f64(this.heap_size);
+        printf("\033[90m[Runtime::HeapManager] Current memory pressure: %.2f%%\n\033[0m", p * f64(100.0));
+        return p;
     }
 
 private:
     initialize_memory_pools() -> void {
+        printf("\033[90m[Runtime::HeapManager] Initializing memory pools for small object allocations\n\033[0m");
         // Create memory pools for common allocation sizes
-        const pool_sizes: u64[5] = [u64(16), u64(32), u64(64), u64(128), u64(256)];
+        const pool_sizes: u64[5] = [16, 32, 64, 128, 256];
         const blocks_per_pool: u64 = u64(1024); // 1024 blocks per pool
         
         printf("\033[90m[Runtime::HeapManager] Initializing %d memory pools...\n\033[0m", 5);
@@ -448,6 +500,7 @@ private:
     }
 
     calculate_fragmentation() -> void {
+        printf("\033[90m[Runtime::HeapManager] Calculating memory fragmentation ratio\n\033[0m");
         // Calculate memory fragmentation ratio
         // With malloc fallback, fragmentation is handled by the system allocator
         // We'll use a simple heuristic based on allocation patterns
@@ -461,9 +514,13 @@ private:
         } else {
             this.fragmentation_ratio = f64(0.0);
         }
+        const frag_p: f64 = this.fragmentation_ratio * f64(100.0);
+        printf("\033[90m[Runtime::HeapManager] Fragmentation ratio: %.2f%%\n\033[0m", frag_p);
     }
 
     malloc_fallback(size: u64) -> void* {
+        printf("\033[90m[Runtime::HeapManager] Malloc fallback allocation: %llu bytes\n\033[0m", size);
+        // Fallback to standard malloc for all allocations
         const aligned_size: u64 = (size + ALLOCATION_ALIGNMENT - u64(1)) & ~(ALLOCATION_ALIGNMENT - u64(1));
         const ptr: void* = __malloc__(aligned_size);
         
@@ -479,6 +536,7 @@ private:
             this.calculate_fragmentation();
         }
         
+        printf("\033[90m[Runtime::HeapManager] Malloc fallback allocation complete: %p\n\033[0m", ptr);
         return ptr;
     }
 
@@ -501,6 +559,7 @@ private:
 
     allocate_small(size: u64) -> void* {
         if (this.small_pools == null) {
+            printf("\033[90m[Runtime::HeapManager] Small pools not initialized, using malloc fallback for size %llu\n\033[0m", size);
             // Fallback to malloc if pools not initialized
             return this.malloc_fallback(size);
         }
@@ -508,6 +567,7 @@ private:
         // Find the appropriate pool for this size
         const pool_index: u64 = this.find_pool_for_size(size);
         if (pool_index >= u64(5)) {
+            printf("\033[90m[Runtime::HeapManager] Requested size %llu exceeds small pool limits, using medium allocator\n\033[0m", size);
             // Size too large for small pools, use medium allocator
             return this.allocate_medium(size);
         }
@@ -516,6 +576,8 @@ private:
         const ptr: void* = pool_ptr.allocate();
         
         if (ptr != null) {
+            printf("\033[90m[Runtime::HeapManager] Small allocation from pool %llu: %llu bytes at %p\n\033[0m", 
+                   pool_index, pool_ptr.block_size, ptr);
             // Get actual pool block size for accurate tracking
             const pool_sizes: u64[5] = [u64(16), u64(32), u64(64), u64(128), u64(256)];
             const actual_size: u64 = pool_sizes[pool_index];
@@ -536,10 +598,12 @@ private:
             return this.malloc_fallback(size);
         }
         
+        printf("\033[90m[Runtime::HeapManager] Small allocation complete: %p\n\033[0m", ptr);
         return ptr;
     }
     
     allocate_medium(size: u64) -> void* {
+        printf("\033[90m[Runtime::HeapManager] Medium allocation request: %llu bytes\n\033[0m", size);
         // For medium allocations (256 bytes to 64KB), use best-fit strategy
         if (this.medium_region_base == null) {
             printf("\033[90m[Runtime::HeapManager] Medium allocator not initialized, using malloc fallback\n\033[0m");
@@ -557,9 +621,11 @@ private:
         const best_block: MediumBlockHeader* = this.find_best_fit_block(aligned_size);
         
         if (best_block != null) {
+            printf("\033[90m[Runtime::HeapManager] Found suitable medium block: %llu bytes\n\033[0m", best_block.size);
             // Use existing free block
             const allocated_block: MediumBlockHeader* = this.allocate_from_free_block(best_block, aligned_size);
             if (allocated_block != null) {
+                printf("\033[90m[Runtime::HeapManager] Medium allocation successful: %llu bytes at %p\n\033[0m", size, this.get_user_pointer_from_header(allocated_block));
                 this.update_allocation_stats(aligned_size);
                 return this.get_user_pointer_from_header(allocated_block);
             }
@@ -571,6 +637,7 @@ private:
     }
     
     allocate_large(size: u64) -> void* {
+        printf("\033[90m[Runtime::HeapManager] Large allocation request: %llu bytes\n\033[0m", size);
         // For large allocations (>64KB), use direct system allocation
         // Large objects are allocated directly from the OS for efficiency
         
@@ -595,16 +662,20 @@ private:
             // Update fragmentation calculation
             this.calculate_fragmentation();
         }
-        
+
+        printf("\033[90m[Runtime::HeapManager] Large allocation complete: %p\n\033[0m", ptr);
         return ptr;
     }
     
     deallocate_small(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::HeapManager] Small deallocation request for pointer %p\n\033[0m", ptr);
         if (ptr == null) {
+            printf("\033[90m[Runtime::HeapManager] Pointer is null, nothing to deallocate\n\033[0m");
             return true;
         }
         
         if (this.small_pools == null) {
+            printf("\033[90m[Runtime::HeapManager] Small pools not initialized, using malloc fallback for deallocation\n\033[0m");
             // Fallback to free if pools not initialized
             __free__(ptr);
             this.total_deallocated += u64(1);
@@ -618,6 +689,7 @@ private:
             if (pool_ptr.is_valid_block(ptr)) {
                 const success: boolean = pool_ptr.deallocate(ptr);
                 if (success) {
+                    printf("\033[90m[Runtime::HeapManager] Small deallocation from pool %llu successful for pointer %p\n\033[0m", i, ptr);
                     // Update tracking with actual pool block size
                     const pool_sizes: u64[5] = [u64(16), u64(32), u64(64), u64(128), u64(256)];
                     const actual_size: u64 = pool_sizes[i];
@@ -628,6 +700,8 @@ private:
                     }
                     
                     this.calculate_fragmentation();
+                } else {
+                    printf("\033[90m[Runtime::HeapManager] ERROR: Small deallocation from pool %llu failed for pointer %p\n\033[0m", i, ptr);
                 }
                 return success;
             }
@@ -636,12 +710,15 @@ private:
         
         // Not found in any pool, might be from malloc fallback
         __free__(ptr);
+        printf("\033[90m[Runtime::HeapManager] Small deallocation using malloc fallback for pointer %p\n\033[0m", ptr);
         this.total_deallocated += u64(1);
         return true;
     }
     
     deallocate_medium(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::HeapManager] Medium deallocation request for pointer %p\n\033[0m", ptr);
         if (ptr == null) {
+            printf("\033[90m[Runtime::HeapManager] Pointer is null, nothing to deallocate\n\033[0m");
             return true;
         }
         
@@ -676,6 +753,8 @@ private:
         const user_data_size: u64 = header.size - sizeof(MediumBlockHeader);
         __memset__(user_data_ptr, MEMORY_POISON_PATTERN, user_data_size);
         
+        printf("\033[90m[Runtime::HeapManager] Medium block at %p marked as free\n\033[0m", header);
+        
         // Add to free list
         this.add_to_free_list(header);
         
@@ -683,11 +762,15 @@ private:
         this.coalesce_free_blocks(header);
         
         this.calculate_fragmentation();
+
+        printf("\033[90m[Runtime::HeapManager] Medium deallocation complete for pointer %p\n\033[0m", ptr);
         return true;
     }
     
     deallocate_large(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::HeapManager] Large deallocation request for pointer %p\n\033[0m", ptr);
         if (ptr == null) {
+            printf("\033[90m[Runtime::HeapManager] Pointer is null, nothing to deallocate\n\033[0m");
             return true;
         }
         
@@ -704,7 +787,9 @@ private:
     }
     
     is_small_pool_pointer(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::HeapManager] Checking if pointer %p belongs to small pools\n\033[0m", ptr);
         if (ptr == null || this.small_pools == null) {
+            printf("\033[90m[Runtime::HeapManager] Pointer is null or small pools not initialized\n\033[0m");
             return false;
         }
         
@@ -713,11 +798,13 @@ private:
         while (i < u64(5)) {
             const pool_ptr: MemoryPool* = this.small_pools + i;
             if (pool_ptr.is_valid_block(ptr)) {
+                printf("\033[90m[Runtime::HeapManager] Pointer %p belongs to small pool %llu\n\033[0m", ptr, i);
                 return true;
             }
             i += u64(1);
         }
         
+        printf("\033[90m[Runtime::HeapManager] Pointer %p does not belong to any small pool\n\033[0m", ptr);
         return false;
     }
     
@@ -763,6 +850,7 @@ private:
     }
     
     find_best_fit_block(size: u64) -> MediumBlockHeader* {
+        printf("\033[90m[Runtime::HeapManager] Searching for best-fit medium block: %llu bytes\n\033[0m", size);
         mut best_block: MediumBlockHeader* = null;
         mut best_size: u64 = u64(18446744073709551615); // Max u64
         
@@ -774,17 +862,22 @@ private:
                 
                 // Perfect fit - no need to continue searching
                 if (current.size == size) {
+                    printf("\033[90m[Runtime::HeapManager] Perfect fit medium block found: %p (%llu bytes)\n\033[0m", best_block, best_size);
                     break;
                 }
             }
             current = current.next_free;
+            printf("\033[90m[Runtime::HeapManager] Checking next medium free block: %p\n\033[0m", current);
         }
         
+        printf("\033[90m[Runtime::HeapManager] Best-fit medium block found: %p (%llu bytes)\n\033[0m", best_block, best_size);
         return best_block;
     }
     
     allocate_from_free_block(block: MediumBlockHeader*, size: u64) -> MediumBlockHeader* {
+        printf("\033[90m[Runtime::HeapManager] Allocating from medium free block: %p (%llu bytes requested)\n\033[0m", block, size);
         if (block == null || !block.is_free || block.size < size) {
+            printf("\033[90m[Runtime::HeapManager] ERROR: Invalid medium block for allocation\n\033[0m");
             return null;
         }
         
@@ -794,6 +887,8 @@ private:
         // Check if we should split the block
         const min_split_size: u64 = sizeof(MediumBlockHeader) + u64(32); // Minimum useful block size
         if (block.size > size + min_split_size) {
+            printf("\033[90m[Runtime::HeapManager] Splitting medium block: %llu bytes into %llu and %llu bytes\n\033[0m", 
+                   block.size, size, block.size - size);
             // Split the block
             const new_block_addr: u8* = (block as u8*) + size;
             const new_block: MediumBlockHeader* = new_block_addr as MediumBlockHeader*;
@@ -814,10 +909,12 @@ private:
             // Update next block's prev pointer
             if (new_block.next != null) {
                 new_block.next.prev = new_block;
+                printf("\033[90m[Runtime::HeapManager] Updated next block's prev pointer: %p\n\033[0m", new_block.next);
             }
             
             // Add new block to free list
             this.add_to_free_list(new_block);
+            printf("\033[90m[Runtime::HeapManager] Added new split medium block to free list: %p\n\033[0m", new_block);
         }
         
         // Mark block as allocated
@@ -832,29 +929,37 @@ private:
     }
     
     remove_from_free_list(block: MediumBlockHeader*) -> void {
+        printf("\033[90m[Runtime::HeapManager] Removing medium block from free list: %p\n\033[0m", block);
         if (block == null) {
+            printf("\033[90m[Runtime::HeapManager] ERROR: Attempted to remove null block from free list\n\033[0m");
             return;
         }
         
         // Update previous block's next pointer
         if (block.prev_free != null) {
             block.prev_free.next_free = block.next_free;
+            printf("\033[90m[Runtime::HeapManager] Updated previous free block's next pointer: %p\n\033[0m", block.prev_free);
         } else {
             // This was the head of free list
             this.medium_free_list = block.next_free;
+            printf("\033[90m[Runtime::HeapManager] Updated medium free list head to: %p\n\033[0m", this.medium_free_list);
         }
         
         // Update next block's prev pointer  
         if (block.next_free != null) {
             block.next_free.prev_free = block.prev_free;
+            printf("\033[90m[Runtime::HeapManager] Updated next free block's prev pointer: %p\n\033[0m", block.next_free);
         }
         
         block.next_free = null;
         block.prev_free = null;
+        printf("\033[90m[Runtime::HeapManager] Medium block %p removed from free list successfully\n\033[0m", block);
     }
     
     add_to_free_list(block: MediumBlockHeader*) -> void {
+        printf("\033[90m[Runtime::HeapManager] Adding medium block to free list: %p\n\033[0m", block);
         if (block == null) {
+            printf("\033[90m[Runtime::HeapManager] ERROR: Attempted to add null block to free list\n\033[0m");
             return;
         }
         
@@ -864,13 +969,16 @@ private:
         
         if (this.medium_free_list != null) {
             this.medium_free_list.prev_free = block;
+            printf("\033[90m[Runtime::HeapManager] Updated previous free block's prev pointer: %p\n\033[0m", this.medium_free_list);
         }
         
         this.medium_free_list = block;
     }
     
     get_user_pointer_from_header(header: MediumBlockHeader*) -> void* {
+        printf("\033[90m[Runtime::HeapManager] Getting user pointer from medium block header: %p\n\033[0m", header);
         if (header == null) {
+            printf("\033[90m[Runtime::HeapManager] ERROR: Null header provided\n\033[0m");
             return null;
         }
         
@@ -880,11 +988,14 @@ private:
         const user_size: u64 = header.size - sizeof(MediumBlockHeader);
         __memset__(user_ptr, 0, user_size);
         
+        printf("\033[90m[Runtime::HeapManager] User pointer obtained: %p\n\033[0m", user_ptr);
         return user_ptr as void*;
     }
     
     get_header_from_user_pointer(ptr: void*) -> MediumBlockHeader* {
+        printf("\033[90m[Runtime::HeapManager] Getting medium block header from user pointer: %p\n\033[0m", ptr);
         if (ptr == null) {
+            printf("\033[90m[Runtime::HeapManager] ERROR: Null pointer provided\n\033[0m");
             return null;
         }
         
@@ -897,11 +1008,14 @@ private:
             return null;
         }
         
+        printf("\033[90m[Runtime::HeapManager] Medium block header obtained: %p\n\033[0m", header);
         return header;
     }
     
     coalesce_free_blocks(block: MediumBlockHeader*) -> MediumBlockHeader* {
+        printf("\033[90m[Runtime::HeapManager] Coalescing medium free blocks around: %p\n\033[0m", block);
         if (block == null || !block.is_free) {
+            printf("\033[90m[Runtime::HeapManager] ERROR: Invalid block for coalescing\n\033[0m");
             return block;
         }
         
@@ -923,11 +1037,13 @@ private:
             
             if (next_block.next != null) {
                 next_block.next.prev = result_block;
+                printf("\033[90m[Runtime::HeapManager] Updated next block's prev pointer: %p\n\033[0m", next_block.next);
             }
         }
         
         // Coalesce with previous block if it's free
         if (result_block.prev != null && result_block.prev.is_free) {
+            printf("\033[90m[Runtime::HeapManager] Coalescing with previous block: %p\n\033[0m", result_block.prev);
             const prev_block: MediumBlockHeader* = result_block.prev;
             
             printf("\033[90m[Runtime::HeapManager] Coalescing with previous block: %llu + %llu bytes\n\033[0m", 
@@ -942,15 +1058,20 @@ private:
             
             if (result_block.next != null) {
                 result_block.next.prev = prev_block;
+                printf("\033[90m[Runtime::HeapManager] Updated next block's prev pointer: %p\n\033[0m", result_block.next);
             }
             
             result_block = prev_block;
+            printf("\033[90m[Runtime::HeapManager] Coalesced block is now: %p\n\033[0m", result_block);
         }
-        
+
+        printf("\033[90m[Runtime::HeapManager] Coalescing complete, resulting block: %p (%llu bytes)\n\033[0m", 
+               result_block, result_block.size);
         return result_block;
     }
     
     update_allocation_stats(size: u64) -> void {
+        printf("\033[90m[Runtime::HeapManager] Updating allocation stats: %llu bytes\n\033[0m", size);
         this.total_allocated += size;
         this.current_memory_usage += size;
         
@@ -962,7 +1083,9 @@ private:
     }
     
     is_medium_allocator_pointer(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::HeapManager] Checking if pointer %p belongs to medium allocator\n\033[0m", ptr);
         if (ptr == null || this.medium_region_base == null) {
+            printf("\033[90m[Runtime::HeapManager] Pointer is null or medium allocator not initialized\n\033[0m");
             return false;
         }
         
@@ -972,16 +1095,20 @@ private:
         
         // Check if pointer is within medium allocation region
         if (ptr_addr < region_start || ptr_addr >= region_end) {
+            printf("\033[90m[Runtime::HeapManager] Pointer %p is outside medium allocation region\n\033[0m", ptr);
             return false;
         }
         
         // Additional validation: try to get header and check magic number
         const header: MediumBlockHeader* = this.get_header_from_user_pointer(ptr);
+        printf("\033[90m[Runtime::HeapManager] Pointer %p belongs to medium allocator: %s\n\033[0m", 
+               ptr, (header != null && header.magic == BLOCK_MAGIC) ? "true" : "false");
         return (header != null && header.magic == BLOCK_MAGIC);
     }
     
     is_large_allocator_pointer(ptr: void*) -> boolean {
         if (ptr == null) {
+            printf("\033[90m[Runtime::HeapManager] Pointer is null, not a large allocator pointer\n\033[0m");
             return false;
         }
         
@@ -991,6 +1118,7 @@ private:
         const addr: u64 = ptr as u64;
         const page_size: u64 = u64(4096);
         
+        printf("\033[90m[Runtime::HeapManager] Checking if pointer %p is a large allocator pointer based on alignment\n\033[0m", ptr);
         // Large allocations are often page-aligned
         return (addr % page_size) == u64(0);
     }
@@ -1030,6 +1158,7 @@ type struct Thread {
         this.stack_pointer = this.stack_base;
         this.return_value = null;
         this.local_storage = null;
+        printf("\033[90m[Runtime::Thread] (constructor) Created thread %llu with stack base %p and size %llu\n\033[0m", this.thread_id, this.stack_base, this.stack_size);
     }
 }
 
@@ -1045,10 +1174,13 @@ public:
         this.max_threads = MAX_THREADS;
         this.next_thread_id = u64(1);
         this.threads = null; // Would allocate array of Thread pointers
+        printf("\033[90m[Runtime::ThreadManager] (constructor) Initialized ThreadManager\n\033[0m");
     }
     
     create_thread(entry_point: void*, argument: void*) -> u64 {
+        printf("\033[90m[Runtime::ThreadManager] Creating new thread...\n\033[0m");
         if (this.thread_count >= this.max_threads) {
+            printf("\033[90m[Runtime::ThreadManager] ERROR: Maximum thread limit reached (%u threads)\n\033[0m", this.max_threads);
             return u64(0); // Failed to create thread
         }
         
@@ -1066,8 +1198,10 @@ public:
     }
     
     join_thread(thread_id: u64) -> void* {
+        printf("\033[90m[Runtime::ThreadManager] Joining thread %llu...\n\033[0m", thread_id);
         const thread: Thread* = this.find_thread(thread_id);
         if (thread == null) {
+            printf("\033[90m[Runtime::ThreadManager] ERROR: Thread %llu not found\n\033[0m", thread_id);
             return null;
         }
         
@@ -1075,29 +1209,36 @@ public:
         while (thread.state != ThreadState::TERMINATED) {
             // Yield CPU or block
             this.yield_thread();
+            printf("\033[90m[Runtime::ThreadManager] Waiting for thread %llu to terminate...\n\033[0m", thread_id);
         }
         
+        printf("\033[90m[Runtime::ThreadManager] Thread %llu has terminated\n\033[0m", thread_id);
         return thread.return_value;
     }
     
     terminate_thread(thread_id: u64) -> boolean {
+        printf("\033[90m[Runtime::ThreadManager] Terminating thread %llu...\n\033[0m", thread_id);
         const thread: Thread* = this.find_thread(thread_id);
         if (thread == null) {
+            printf("\033[90m[Runtime::ThreadManager] ERROR: Thread %llu not found\n\033[0m", thread_id);
             return false;
         }
         
         thread.state = ThreadState::TERMINATED;
         this.cleanup_thread(thread);
+        printf("\033[90m[Runtime::ThreadManager] Thread %llu terminated successfully\n\033[0m", thread_id);
         return true;
     }
     
 private:
     find_thread(thread_id: u64) -> Thread* {
+        printf("\033[90m[Runtime::ThreadManager] Searching for thread %llu...\n\033[0m", thread_id);
         // Linear search or hash map lookup
         return null;
     }
     
     cleanup_thread(thread: Thread*) -> void {
+        printf("\033[90m[Runtime::ThreadManager] Cleaning up resources for thread %llu...\n\033[0m", thread.thread_id);
         // Free stack and cleanup resources
         if (thread.stack_base != null) {
             __free__(thread.stack_base);
@@ -1106,6 +1247,7 @@ private:
     }
     
     yield_thread() -> void {
+        printf("\033[90m[Runtime::ThreadManager] Yielding current thread...\n\033[0m");
         // Platform-specific thread yielding
     }
 }
@@ -1121,9 +1263,11 @@ public:
         this.locked = false;
         this.owner_thread_id = u64(0);
         this.waiting_threads = null;
+        printf("\033[90m[Runtime::Mutex] (constructor) Initialized mutex\n\033[0m");
     }
     
     lock() -> boolean {
+        printf("\033[90m[Runtime::Mutex] Attempting to lock mutex...\n\033[0m");
         // Atomic compare-and-swap implementation
         while (this.locked) {
             // Add current thread to waiting queue
@@ -1136,7 +1280,9 @@ public:
     }
     
     unlock() -> boolean {
+        printf("\033[90m[Runtime::Mutex] Attempting to unlock mutex...\n\033[0m");
         if (!this.locked || this.owner_thread_id != this.get_current_thread_id()) {
+            printf("\033[90m[Runtime::Mutex] ERROR: Mutex not owned by current thread, cannot unlock\n\033[0m");
             return false; // Not owned by current thread
         }
         
@@ -1149,7 +1295,9 @@ public:
     }
     
     try_lock() -> boolean {
+        printf("\033[90m[Runtime::Mutex] Attempting to try-lock mutex...\n\033[0m");
         if (this.locked) {
+            printf("\033[90m[Runtime::Mutex] Mutex is already locked, try-lock failed\n\033[0m");
             return false;
         }
         
@@ -1161,14 +1309,17 @@ public:
     
 private:
     wait_for_unlock() -> void {
+        printf("\033[90m[Runtime::Mutex] Waiting for mutex to be unlocked...\n\033[0m");
         // Platform-specific waiting mechanism
     }
     
     notify_waiting_threads() -> void {
+        printf("\033[90m[Runtime::Mutex] Notifying waiting threads...\n\033[0m");
         // Wake up threads in waiting queue
     }
     
     get_current_thread_id() -> u64 {
+        printf("\033[90m[Runtime::Mutex] Getting current thread ID...\n\033[0m");
         return u64(1); // Placeholder - would get actual thread ID
     }
 }
@@ -1190,6 +1341,8 @@ type struct StackFrame {
         this.line_number = line;
         this.column_number = col;
         this.frame_pointer = null;
+        printf("\033[90m[Runtime::StackFrame] (constructor) Created stack frame: %s at %s:%u:%u\n\033[0m", 
+               func, file, line, col);
     }
 }
 
@@ -1202,10 +1355,12 @@ public:
     StackTrace() {
         this.frame_count = u32(0);
         this.max_frames = MAX_STACK_TRACE_DEPTH;
-        // Allocate frames array
+        this.frames = __malloc__(this.max_frames * sizeof(StackFrame));
+        printf("\033[90m[Runtime::StackTrace] (constructor) Initialized stack trace with max frames %u\n\033[0m", this.max_frames);
     }
     
     capture() -> void {
+        printf("\033[90m[Runtime::StackTrace] Capturing stack trace...\n\033[0m");
         // Walk the call stack and capture frames
         this.frame_count = u32(0);
         
@@ -1252,6 +1407,7 @@ private:
     }
 
     capture_stack_backtrace(stack_pointers: void**, max_frames: u32) -> u32 {
+        printf("\033[90m[Runtime::StackTrace] Calling Windows CaptureStackBackTrace API...\n\033[0m");
         // Windows CaptureStackBackTrace API call
         // USHORT CaptureStackBackTrace(ULONG FramesToSkip, ULONG FramesToCapture, PVOID *BackTrace, PULONG BackTraceHash)
         
@@ -1272,6 +1428,7 @@ private:
     }
     
     windows_capture_stack_backtrace(frames_to_skip: u32, frames_to_capture: u32, backtrace: void**, hash: u32*) -> u32 {
+        printf("\033[90m[Runtime::StackTrace] Simulating Windows CaptureStackBackTrace call...\n\033[0m");
         // This would be implemented as an external function call to kernel32.dll
         // For now, simulate capturing a few stack frames
         
@@ -1309,6 +1466,8 @@ type struct Exception {
         this.stack_trace = StackTrace();
         this.stack_trace.capture();
         this.inner_exception = null;
+        printf("\033[90m[Runtime::Exception] (constructor) Created exception: %s (code: %d)\n\033[0m", 
+               msg, code);
     }
 }
 
@@ -1316,10 +1475,13 @@ type class ExceptionManager {
 public:
     current_exception: Exception*;
     exception_handlers: void**;    // Stack of exception handlers
+    runtime_instance: CryoRuntime*;
     
-    ExceptionManager() {
+    ExceptionManager(runtime: CryoRuntime*) {
         this.current_exception = null;
         this.exception_handlers = null;
+        this.runtime_instance = runtime;
+        printf("\033[90m[Runtime::ExceptionManager] (constructor) Initialized ExceptionManager\n\033[0m");
     }
     
     throw_exception(message: string, error_code: RuntimeError) -> void {
@@ -1328,6 +1490,12 @@ public:
         
         printf("\033[90m[Runtime::ExceptionManager] Exception thrown: %s (code: %d)\n\033[0m", 
                message, error_code);
+
+        if (error_code == RuntimeError::OUT_OF_MEMORY) {
+            printf("\033[90m[Runtime::ExceptionManager] Critical: Out of memory!\n\033[0m");
+            printf("\033[90m[Runtime::ExceptionManager] Dumping Runtime State before termination...\n\033[0m");
+        }
+
         exc.stack_trace.print();
         
         // Unwind stack and find handler
@@ -1335,18 +1503,24 @@ public:
     }
     
     register_exception_handler(handler: void*) -> void {
+        printf("\033[90m[Runtime::ExceptionManager] Registering exception handler: %p\n\033[0m", handler);
         // Push handler onto stack
+        return;
     }
     
     unregister_exception_handler() -> void {
+        printf("\033[90m[Runtime::ExceptionManager] Unregistering top exception handler\n\033[0m");
         // Pop handler from stack
+        return;
     }
     
 private:
     unwind_stack() -> void {
+        printf("\033[90m[Runtime::ExceptionManager] Unwinding stack for exception handling...\n\033[0m");
         // Stack unwinding implementation
         // Call destructors for stack objects
         // Find appropriate exception handler
+        return;
     }
 }
 
@@ -1377,6 +1551,8 @@ type struct FileHandle {
         this.is_open = false;
         this.position = u64(0);
         this.size = u64(0);
+        printf("\033[90m[Runtime::FileHandle] (constructor) Created file handle for %s with mode %d\n\033[0m", 
+               file_path, file_mode);
     }
 }
 
@@ -1389,10 +1565,14 @@ public:
     IOManager() {
         this.file_count = u32(0);
         this.max_files = u32(1024);
+        this.open_files = __malloc__(this.max_files * sizeof(FileHandle));
+        printf("\033[90m[Runtime::IOManager] (constructor) Initialized IOManager\n\033[0m");
     }
     
     open_file(path: string, mode: FileMode) -> FileHandle* {
+        printf("\033[90m[Runtime::IOManager] Opening file: %s with mode %d\n\033[0m", path, mode);
         if (this.file_count >= this.max_files) {
+            printf("\033[90m[Runtime::IOManager] ERROR: Maximum open file limit reached (%u files)\n\033[0m", this.max_files);
             return null;
         }
         
@@ -1410,7 +1590,9 @@ public:
     }
     
     close_file(handle: FileHandle*) -> boolean {
+        printf("\033[90m[Runtime::IOManager] Closing file: %s\n\033[0m", handle.path);
         if (handle == null || !handle.is_open) {
+            printf("\033[90m[Runtime::IOManager] ERROR: Invalid file handle or file already closed\n\033[0m");
             return false;
         }
         
@@ -1425,6 +1607,7 @@ public:
     }
     
     read_file(handle: FileHandle*, buffer: void*, size: u64) -> u64 {
+        printf("\033[90m[Runtime::IOManager] Reading %llu bytes from file: %s\n\033[0m", size, handle.path);
         if (handle == null || !handle.is_open) {
             return u64(0);
         }
@@ -1435,6 +1618,7 @@ public:
     }
     
     write_file(handle: FileHandle*, buffer: void*, size: u64) -> u64 {
+        printf("\033[90m[Runtime::IOManager] Writing %llu bytes to file: %s\n\033[0m", size, handle.path);
         if (handle == null || !handle.is_open) {
             return u64(0);
         }
@@ -1443,29 +1627,34 @@ public:
         handle.position = handle.position + bytes_written;
         return bytes_written;
     }
-    
+
 private:
     system_open_file(path: string, mode: FileMode) -> i32 {
+        printf("\033[90m[Runtime::IOManager] System opening file: %s with mode %d\n\033[0m", path, mode);
         // Platform-specific file opening
         return i32(-1);
     }
     
     system_close_file(fd: i32) -> i32 {
+        printf("\033[90m[Runtime::IOManager] System closing file descriptor: %d\n\033[0m", fd);
         // Platform-specific file closing
         return i32(-1);
     }
     
     system_read_file(fd: i32, buffer: void*, size: u64) -> u64 {
+        printf("\033[90m[Runtime::IOManager] System reading %llu bytes from file descriptor: %d\n\033[0m", size, fd);
         // Platform-specific file reading
         return u64(0);
     }
     
     system_write_file(fd: i32, buffer: void*, size: u64) -> u64 {
+        printf("\033[90m[Runtime::IOManager] System writing %llu bytes to file descriptor: %d\n\033[0m", size, fd);
         // Platform-specific file writing
         return u64(0);
     }
     
     get_file_size(fd: i32) -> u64 {
+        printf("\033[90m[Runtime::IOManager] Getting size of file descriptor: %d\n\033[0m", fd);
         // Platform-specific file size query
         return u64(0);
     }
@@ -1490,6 +1679,7 @@ type struct PerformanceCounter {
         this.min_time = u64(18446744073709551615); // Max u64
         this.max_time = u64(0);
         this.average_time = 0.0;
+        printf("\033[90m[Runtime::PerformanceCounter] (constructor) Created performance counter: %s\n\033[0m", counter_name);
     }
     
     record_execution(duration: u64) -> void {
@@ -1526,9 +1716,11 @@ public:
     ProfilerManager() {
         this.counter_count = u32(0);
         this.profiling_enabled = ENABLE_RUNTIME_PROFILING;
+        printf("\033[90m[Runtime::ProfilerManager] (constructor) Initialized ProfilerManager\n\033[0m");
     }
     
     start_profiling(operation_name: string) -> u64 {
+        printf("\033[90m[Runtime::ProfilerManager] Starting profiling for operation: %s\n\033[0m", operation_name);
         if (!this.profiling_enabled) {
             return u64(0);
         }
@@ -1538,6 +1730,7 @@ public:
     }
     
     end_profiling(operation_name: string, start_time: u64) -> void {
+        printf("\033[90m[Runtime::ProfilerManager] Ending profiling for operation: %s\n\033[0m", operation_name);
         if (!this.profiling_enabled) {
             return;
         }
@@ -1565,11 +1758,13 @@ public:
     
 private:
     find_or_create_counter(name: string) -> PerformanceCounter* {
+        printf("\033[90m[Runtime::ProfilerManager] Finding or creating counter: %s\n\033[0m", name);
         // Find existing counter or create new one
         return null;
     }
     
     get_high_precision_timestamp() -> u64 {
+        printf("\033[90m[Runtime::ProfilerManager] Getting high-precision timestamp...\n\033[0m");
         // Platform-specific high-precision timing
         return u64(0);
     }
@@ -1590,9 +1785,12 @@ public:
         this.capacity = initial_capacity;
         this.length = u64(0);
         this.buffer = cryo_alloc(initial_capacity);
+        printf("\033[90m[Runtime::StringBuilder] (constructor) Created StringBuilder with capacity %llu\n\033[0m", 
+               initial_capacity);
     }
     
     append(str: string) -> void {
+        printf("\033[90m[Runtime::StringBuilder] Appending string: %s\n\033[0m", str);
         const str_len: u64 = u64(str.length());
         if (this.length + str_len >= this.capacity) {
             this.resize(this.capacity * u64(2));
@@ -1606,6 +1804,7 @@ public:
     }
     
     to_string() -> string {
+        printf("\033[90m[Runtime::StringBuilder] Converting buffer to string...\n\033[0m");
         // Convert buffer to string
         mut result: string = "";
         for (mut i: u64 = u64(0); i < this.length; i = i + u64(1)) {
@@ -1616,6 +1815,8 @@ public:
     
 private:
     resize(new_capacity: u64) -> void {
+        printf("\033[90m[Runtime::StringBuilder] Resizing buffer from %llu to %llu\n\033[0m", 
+               this.capacity, new_capacity);
         const new_buffer: char* = cryo_alloc(new_capacity);
         
         // Copy existing data
@@ -1638,9 +1839,11 @@ public:
     StringManager() {
         this.string_count = u32(0);
         this.total_string_memory = u64(0);
+        printf("\033[90m[Runtime::StringManager] (constructor) Initialized StringManager\n\033[0m");
     }
     
     intern_string(str: string) -> string {
+        printf("\033[90m[Runtime::StringManager] Interning string: %s\n\033[0m", str);
         // Check if string is already interned
         if (this.is_interned(str)) {
             return this.find_interned_string(str);
@@ -1652,11 +1855,14 @@ public:
         
         this.string_count = this.string_count + u32(1);
         this.total_string_memory = this.total_string_memory + u64(str.length());
-        
+        printf("\033[90m[Runtime::StringManager] String interned successfully. Total interned strings: %u\n\033[0m", 
+               this.string_count);
         return interned;
     }
     
     create_string_builder(initial_capacity: u64) -> StringBuilder* {
+        printf("\033[90m[Runtime::StringManager] Creating StringBuilder with initial capacity: %llu\n\033[0m", 
+               initial_capacity);
         return new StringBuilder(initial_capacity);
     }
     
@@ -1724,10 +1930,11 @@ public:
         this.heap_manager = HeapManager();
         this.type_registry = TypeRegistry();
         this.thread_manager = ThreadManager();
-        this.exception_manager = ExceptionManager();
+        this.exception_manager = ExceptionManager(&this);
         this.io_manager = IOManager();
         this.profiler_manager = ProfilerManager();
         this.string_manager = StringManager();
+        printf("\033[90m[Runtime::CryoRuntime] (constructor) CryoRuntime instance created\n\033[0m");
     }
     
     initialize() -> RuntimeError {
@@ -1737,17 +1944,7 @@ public:
         
         this.state = RuntimeState::RTS_INITIALIZING;
         this.startup_time = this.get_timestamp();
-        
-        // Ensure all managers are properly constructed before initialization
-        // This is needed because global variables may be zero-initialized instead of constructor-initialized
-        this.heap_manager = HeapManager();
-        this.type_registry = TypeRegistry();
-        this.thread_manager = ThreadManager();
-        this.exception_manager = ExceptionManager();
-        this.io_manager = IOManager();
-        this.profiler_manager = ProfilerManager();
-        this.string_manager = StringManager();
-        
+
         // Initialize heap manager
         const heap_result: RuntimeError = this.heap_manager.initialize(DEFAULT_HEAP_SIZE);
         if (heap_result != RuntimeError::RTE_SUCCESS) {
@@ -1783,15 +1980,17 @@ public:
     }
     
     allocate_memory(size: u64) -> void* {
-        const ptr: void* = __malloc__(size);
-        return ptr;
+        printf("\033[90m[Runtime::CryoRuntime] Allocating %llu bytes of memory...\n\033[0m", size);
+        return this.heap_manager.allocate(size);
     }
     
     deallocate_memory(ptr: void*) -> boolean {
+        printf("\033[90m[Runtime::CryoRuntime] Deallocating memory at pointer: %p\n\033[0m", ptr);
         return this.heap_manager.deallocate(ptr);
     }
     
     panic(message: string, file: string, line: u32) -> void {
+        printf("\033[90m\n=== RUNTIME PANIC ===\n\033[0m");
         this.state = RuntimeState::RTE_PANIC;
         
         printf("\033[90m\n!!! RUNTIME PANIC !!!\n\033[0m");
@@ -1826,6 +2025,7 @@ public:
         
         // Trigger defragmentation if fragmentation is high
         if (this.heap_manager.fragmentation_ratio > DEFRAG_THRESHOLD) {
+            printf("\033[90m[Runtime] High fragmentation detected (%.2f%%). Defragmenting heap...\n\033[0m", this.heap_manager.fragmentation_ratio * f64(100.0));
             this.heap_manager.defragment();
         }
         
@@ -1852,6 +2052,7 @@ private:
     }
     
     print_runtime_statistics() -> void {
+        printf("\033[90m\n=== Final Runtime Statistics ===\n\033[0m");
         const current_time: u64 = this.get_timestamp();
         this.total_runtime = current_time - this.startup_time;
         
@@ -1870,8 +2071,29 @@ private:
     }
     
     get_timestamp() -> u64 {
+        printf("\033[90m[Runtime] Getting current timestamp...\n\033[0m");
         // Platform-specific timestamp implementation
         return u64(0);
+    }
+}
+
+
+function runtime_state_to_string(state: RuntimeState) -> string {
+    switch (state) {
+        case RuntimeState::RTS_UNINITIALIZED:
+            return "UNINITIALIZED";
+        case RuntimeState::RTS_INITIALIZING:
+            return "INITIALIZING";
+        case RuntimeState::RTS_RUNNING:
+            return "RUNNING";
+        case RuntimeState::RTS_SHUTDOWN:
+            return "SHUTDOWN";
+        case RuntimeState::RTE_PANIC:
+            return "PANIC";
+        case RuntimeState::RTS_ERROR:
+            return "ERROR";
+        default:
+            return "UNKNOWN";
     }
 }
 
@@ -1879,75 +2101,97 @@ private:
 // GLOBAL RUNTIME INSTANCE AND API
 //===================================================================
 
-mut g_cryo_runtime: CryoRuntime = CryoRuntime();
+
+function get_cryo_runtime() -> CryoRuntime* {
+    printf("\033[90m[Runtime] [global::get_cryo_runtime] Returning global CryoRuntime instance\n\033[0m");
+    return &g_cryo_runtime;
+}
 
 // Public runtime API functions
 function cryo_runtime_initialize() -> RuntimeError {
+    printf("\033[90m[Runtime] [global::cryo_runtime_initialize] Initializing CryoRuntime...\n\033[0m");
     return g_cryo_runtime.initialize();
 }
 
 function cryo_runtime_shutdown() -> void {
+    printf("\033[90m[Runtime] [global::cryo_runtime_shutdown] Shutting down CryoRuntime...\n\033[0m");
     g_cryo_runtime.shutdown();
 }
 
 function cryo_runtime_allocate(size: u64) -> void* {
+    printf("\033[90m[Runtime] [global::cryo_runtime_allocate] Allocating %llu bytes...\n\033[0m", size);
     return g_cryo_runtime.allocate_memory(size);
 }
 
 function cryo_runtime_deallocate(ptr: void*) -> void {
+    printf("\033[90m[Runtime] [global::cryo_runtime_deallocate] Deallocating memory at pointer: %p\n\033[0m", ptr);
     g_cryo_runtime.deallocate_memory(ptr);
 }
 
 function cryo_runtime_panic(message: string, file: string, line: u32) -> void {
+    printf("\033[90m[Runtime] [global::cryo_runtime_panic] Triggering runtime panic...\n\033[0m");
     g_cryo_runtime.panic(message, file, line);
 }
 
 function cryo_runtime_force_cleanup() -> void {
+    printf("\033[90m[Runtime] [global::cryo_runtime_force_cleanup] Forcing memory cleanup...\n\033[0m");
     g_cryo_runtime.force_memory_cleanup();
 }
 
 function cryo_runtime_get_stats() -> void {
+    printf("\033[90m[Runtime] [global::cryo_runtime_get_stats] Retrieving memory statistics...\n\033[0m");
     g_cryo_runtime.get_memory_statistics();
 }
 
 // Thread management API
 function cryo_create_thread(entry_point: void*, argument: void*) -> u64 {
+    printf("\033[90m[Runtime] [global::cryo_create_thread] Creating new thread...\n\033[0m");
     return g_cryo_runtime.thread_manager.create_thread(entry_point, argument);
 }
 
 function cryo_join_thread(thread_id: u64) -> void* {
+    printf("\033[90m[Runtime] [global::cryo_join_thread] Joining thread ID: %llu\n\033[0m", thread_id);
     return g_cryo_runtime.thread_manager.join_thread(thread_id);
 }
 
 // String management API
 function cryo_intern_string(str: string) -> string {
+    printf("\033[90m[Runtime] [global::cryo_intern_string] Interning string: %s\n\033[0m", str);
     return g_cryo_runtime.string_manager.intern_string(str);
 }
 
 function cryo_create_string_builder(capacity: u64) -> StringBuilder* {
+    printf("\033[90m[Runtime] [global::cryo_create_string_builder] Creating StringBuilder with capacity: %llu\n\033[0m", capacity);
     return g_cryo_runtime.string_manager.create_string_builder(capacity);
 }
 
 // Type system API
 function cryo_register_type(name: string, size: u64, alignment: u64) -> u64 {
+    printf("\033[90m[Runtime] [global::cryo_register_type] Registering type: %s (size: %llu, alignment: %llu)\n\033[0m", 
+           name, size, alignment);
     return g_cryo_runtime.type_registry.register_type(name, size, alignment);
 }
 
 function cryo_get_type_info(type_id: u64) -> TypeInfo* {
+    printf("\033[90m[Runtime] [global::cryo_get_type_info] Retrieving type info for type ID: %llu\n\033[0m", type_id);
     return g_cryo_runtime.type_registry.get_type_info(type_id);
 }
 
 // Profiling API
 function cryo_profile_start(operation: string) -> u64 {
+    printf("\033[90m[Runtime] [global::cryo_profile_start] Starting profiling for operation: %s\n\033[0m", operation);
     return g_cryo_runtime.profiler_manager.start_profiling(operation);
 }
 
 function cryo_profile_end(operation: string, start_time: u64) -> void {
+    printf("\033[90m[Runtime] [global::cryo_profile_end] Ending profiling for operation: %s\n\033[0m", operation);
     g_cryo_runtime.profiler_manager.end_profiling(operation, start_time);
 }
 
 // Exception handling API
 function cryo_throw_exception(message: string, error_code: RuntimeError) -> void {
+    printf("\033[90m[Runtime] [global::cryo_throw_exception] Throwing exception: %s (code: %d)\n\033[0m", 
+           message, error_code);
     g_cryo_runtime.exception_manager.throw_exception(message, error_code);
 }
 
@@ -1956,34 +2200,43 @@ function cryo_throw_exception(message: string, error_code: RuntimeError) -> void
 //===================================================================
 
 function cryo_alloc(size: u64) -> void* {
+    printf("\033[90m[Runtime] [global::cryo_alloc] Allocating %llu bytes of memory...\n\033[0m", size);
     mut ptr: void* = null;
     
     // Skip profiling during shutdown to avoid use-after-free
     if (g_cryo_runtime.state == RuntimeState::RTS_RUNNING) {
+        printf("\033[90m[Runtime] Profiling memory allocation...\n\033[0m");
         const start_time: u64 = cryo_profile_start("memory_allocation");
         ptr = cryo_runtime_allocate(size);
         cryo_profile_end("memory_allocation", start_time);
     } else {
+        printf("\033[90m[Runtime] Direct allocation during shutdown...\n\033[0m");
         // Direct allocation without profiling during shutdown
         ptr = cryo_runtime_allocate(size);
     }
     
     if (ptr == null) {
+        printf("\033[91m[Runtime] Memory allocation failed for %llu bytes!\n\033[0m", size);
+        printf("\033[90m[Runtime] Runtime State: %s\n\033[0m", runtime_state_to_string(g_cryo_runtime.state));
         cryo_throw_exception("Memory allocation failed", RuntimeError::RTE_OUT_OF_MEMORY);
     }
     
+    printf("\033[90m[Runtime] Memory allocated at pointer: %p\n\033[0m", ptr);
     return ptr;
 }
 
 function cryo_free(ptr: void*) -> void {
+    printf("\033[90m[Runtime] [global::cryo_free] Deallocating memory at pointer: %p\n\033[0m", ptr);
     // Skip all runtime infrastructure during shutdown to avoid use-after-free
     if (g_cryo_runtime.state == RuntimeState::RTS_RUNNING) {
+        printf("\033[90m[Runtime] Profiling memory deallocation...\n\033[0m");
         const start_time: u64 = cryo_profile_start("memory_deallocation");
         cryo_runtime_deallocate(ptr);
         cryo_profile_end("memory_deallocation", start_time);
     } else {
         // Direct system free during shutdown - bypass all runtime tracking
         if (ptr != null) {
+            printf("\033[90m[Runtime] Direct deallocation during shutdown... %p\n\033[0m", ptr);
             __free__(ptr);
         }
     }

@@ -376,6 +376,13 @@ namespace Cryo
         void visit(ImportDeclarationNode &node) override;
         void visit(StructDeclarationNode &node) override;
         void visit(ClassDeclarationNode &node) override;
+
+        // Helper methods for two-pass struct/class processing
+        void register_struct_declaration_signatures(StructDeclarationNode &node);
+        void process_struct_method_bodies(StructDeclarationNode &node);
+        void register_class_declaration_signatures(ClassDeclarationNode &node);
+        void process_class_method_bodies(ClassDeclarationNode &node);
+
         void visit(TraitDeclarationNode &node) override;
         void visit(EnumDeclarationNode &node) override;
         void visit(EnumVariantNode &node) override;
@@ -475,7 +482,7 @@ namespace Cryo
         bool is_in_unsafe_context() const { return _in_unsafe_context; }
         bool is_primitive_integer_type(const std::string &type_name);
         bool is_method_declared_in_type(const std::string &type_name, const std::string &method_name);
-        
+
         // Type casting helpers
         bool is_valid_type(const std::string &type_name);
         bool is_cast_valid(const std::string &from_type, const std::string &to_type);
