@@ -355,20 +355,25 @@ namespace Cryo::Linker
 
         // Debug: Check if global constructors are still present before pass run
         auto *global_ctors_before = module->getNamedGlobal("llvm.global_ctors");
-        if (global_ctors_before) {
+        if (global_ctors_before)
+        {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Before PassManager run: @llvm.global_ctors found");
-            
+
             // Mark the global constructor array as used to prevent optimization removal
             global_ctors_before->setLinkage(llvm::GlobalValue::ExternalLinkage);
-            
+
             // Also try to mark any global constructor functions as used
-            for (auto &func : module->getFunctionList()) {
-                if (func.getName().contains("cryo_global_constructors")) {
+            for (auto &func : module->getFunctionList())
+            {
+                if (func.getName().contains("cryo_global_constructors"))
+                {
                     func.setLinkage(llvm::GlobalValue::ExternalLinkage);
                     LOG_DEBUG(Cryo::LogComponent::GENERAL, "Marked function {} as external linkage", func.getName().str());
                 }
             }
-        } else {
+        }
+        else
+        {
             LOG_ERROR(Cryo::LogComponent::GENERAL, "Before PassManager run: @llvm.global_ctors NOT found!");
         }
 
@@ -376,9 +381,12 @@ namespace Cryo::Linker
 
         // Debug: Check if global constructors are still present after pass run
         auto *global_ctors_after = module->getNamedGlobal("llvm.global_ctors");
-        if (global_ctors_after) {
+        if (global_ctors_after)
+        {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "After PassManager run: @llvm.global_ctors found");
-        } else {
+        }
+        else
+        {
             LOG_ERROR(Cryo::LogComponent::GENERAL, "After PassManager run: @llvm.global_ctors REMOVED by PassManager!");
         }
         dest.flush();
@@ -665,7 +673,7 @@ namespace Cryo::Linker
         std::string full_name = lib_name + extension;
 
         // Check runtime paths
-        auto& os = Cryo::Utils::OS::instance();
+        auto &os = Cryo::Utils::OS::instance();
         for (const auto &path : _runtime_paths)
         {
             std::string lib_path = os.join_path(path, full_name);
@@ -750,8 +758,8 @@ namespace Cryo::Linker
 
     bool runtime_library_exists(const std::string &path, const std::string &library_name)
     {
-        auto& os = Cryo::Utils::OS::instance();
-        
+        auto &os = Cryo::Utils::OS::instance();
+
         // Check standard Unix library formats (static and shared)
         std::string static_lib = os.join_path(path, "lib" + library_name + os.get_library_extension(false));
         if (os.path_exists(static_lib))
@@ -766,7 +774,7 @@ namespace Cryo::Linker
         }
 
         // Check Windows-specific formats (without "lib" prefix)
-        if (os.is_windows()) 
+        if (os.is_windows())
         {
             std::string win_static = os.join_path(path, library_name + ".lib");
             if (os.path_exists(win_static))

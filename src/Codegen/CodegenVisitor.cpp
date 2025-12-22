@@ -4612,33 +4612,156 @@ namespace Cryo::Codegen
         else
         {
             // Handle user-defined types
-            llvm::Type *llvm_type = _type_mapper->lookup_type(type_name);
-            if (!llvm_type)
+            // Check cache first to avoid multiple LLVM calls
+            auto cache_it = _sizeof_cache.find(type_name);
+            if (cache_it != _sizeof_cache.end())
             {
-                // Try the old lookup method as fallback
-                auto type_it = _types.find(type_name);
-                if (type_it != _types.end())
-                {
-                    llvm_type = type_it->second;
-                }
-            }
-
-            if (llvm_type)
-            {
-                // Calculate size using LLVM's data layout
-                const llvm::DataLayout &data_layout = module->getDataLayout();
-                uint64_t type_size = data_layout.getTypeAllocSize(llvm_type);
-                size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), type_size);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using cached sizeof result for {}: {} bytes", type_name, cache_it->second);
+                size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), cache_it->second);
             }
             else
             {
-                if (_diagnostic_builder)
+                llvm::Type *llvm_type = _type_mapper->lookup_type(type_name);
+                if (!llvm_type)
                 {
-                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
-                                                      "Unknown type in sizeof expression: " + type_name);
+                    // Try the old lookup method as fallback
+                    auto type_it = _types.find(type_name);
+                    if (type_it != _types.end())
+                    {
+                        llvm_type = type_it->second;
+                    }
                 }
-                // Return 0 as fallback
-                size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+
+                if (llvm_type)
+                {
+                    // Additional safety checks before calculating size
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found LLVM type for sizeof({}), type_id: {}", type_name, llvm_type->getTypeID());
+                    
+                    // Validate that the LLVM type is complete and safe for size calculation
+                    if (llvm_type->isStructTy())
+                    {
+                        llvm::StructType *struct_type = llvm::cast<llvm::StructType>(llvm_type);
+                        if (struct_type->isOpaque())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cannot calculate size of opaque struct type: {}", type_name);
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                                  "Cannot calculate size of opaque struct type: " + type_name);
+                            }
+                            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+                        }
+                        else if (!struct_type->isSized())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cannot calculate size of unsized struct type: {}", type_name);
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                                  "Cannot calculate size of unsized struct type: " + type_name);
+                            }
+                            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+                        }
+                        else
+                        {
+                            // Calculate size using LLVM's data layout
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calculating size for valid struct type: {}", type_name);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "About to get data layout from module");
+                            try
+                            {
+                                const llvm::DataLayout &data_layout = module->getDataLayout();
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Got data layout successfully, about to call getTypeAllocSize");
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "LLVM type pointer: {}, type is valid: {}", 
+                                         static_cast<void*>(llvm_type), llvm_type != nullptr);
+                                uint64_t type_size = data_layout.getTypeAllocSize(llvm_type);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "getTypeAllocSize returned successfully: {} bytes", type_size);
+                                
+                                // Cache the result
+                                _sizeof_cache[type_name] = type_size;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cached sizeof result for {}: {} bytes", type_name, type_size);
+                                
+                                size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), type_size);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully calculated size for {}: {} bytes", type_name, type_size);
+                            }
+                            catch (const std::exception& e)
+                            {
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception while calculating size for {}: {}", type_name, e.what());
+                                if (_diagnostic_builder)
+                                {
+                                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                                      "Error calculating size of struct type: " + type_name);
+                                }
+                                size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+                            }
+                            catch (...)
+                            {
+                                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown exception while calculating size for {}", type_name);
+                                if (_diagnostic_builder)
+                                {
+                                    _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                                      "Unknown error calculating size of struct type: " + type_name);
+                                }
+                                size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+                            }
+                        }
+                    }
+                    else if (!llvm_type->isSized())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cannot calculate size of unsized non-struct type: {}", type_name);
+                        if (_diagnostic_builder)
+                        {
+                            _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                              "Cannot calculate size of unsized type: " + type_name);
+                        }
+                        size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+                    }
+                    else
+                    {
+                        // For non-struct types, calculate size directly
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Calculating size for non-struct type: {}", type_name);
+                        try
+                        {
+                            const llvm::DataLayout &data_layout = module->getDataLayout();
+                            uint64_t type_size = data_layout.getTypeAllocSize(llvm_type);
+                            
+                            // Cache the result
+                            _sizeof_cache[type_name] = type_size;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Cached sizeof result for {}: {} bytes", type_name, type_size);
+                            
+                            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), type_size);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Successfully calculated size for {}: {} bytes", type_name, type_size);
+                        }
+                        catch (const std::exception& e)
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Exception while calculating size for {}: {}", type_name, e.what());
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                                  "Error calculating size of type: " + type_name);
+                            }
+                            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+                        }
+                        catch (...)
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown exception while calculating size for {}", type_name);
+                            if (_diagnostic_builder)
+                            {
+                                _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                                  "Unknown error calculating size of type: " + type_name);
+                            }
+                            size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+                        }
+                    }
+                }
+                else
+                {
+                    if (_diagnostic_builder)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0203_UNDEFINED_TYPE, &node,
+                                                          "Unknown type in sizeof expression: " + type_name);
+                    }
+                    // Return 0 as fallback
+                    size_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+                }
             }
         }
 
@@ -8353,6 +8476,38 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing assignment - left side type: {}",
                           typeid(*node->left()).name());
+                          
+                // Early check: Cast expressions cannot be the left-hand side of assignment
+                if (dynamic_cast<Cryo::CastExpressionNode *>(node->left()))
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, 
+                        "Cast expressions cannot be assigned to - invalid left-hand side of assignment");
+                    return nullptr;
+                }
+                
+                // Early check: Binary expressions cannot be the left-hand side of assignment
+                if (dynamic_cast<Cryo::BinaryExpressionNode *>(node->left()))
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, 
+                        "Binary expressions cannot be assigned to - invalid left-hand side of assignment");
+                    return nullptr;
+                }
+                
+                // Early check: Call expressions cannot be the left-hand side of assignment
+                if (dynamic_cast<Cryo::CallExpressionNode *>(node->left()))
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, 
+                        "Function calls cannot be assigned to - invalid left-hand side of assignment");
+                    return nullptr;
+                }
+                
+                // Early check: Sizeof expressions cannot be the left-hand side of assignment
+                if (dynamic_cast<Cryo::SizeofExpressionNode *>(node->left()))
+                {
+                    _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node, 
+                        "Sizeof expressions cannot be assigned to - invalid left-hand side of assignment");
+                    return nullptr;
+                }
 
                 // For assignment, get the variable address directly without loading its value
                 if (auto *left_identifier = dynamic_cast<IdentifierNode *>(node->left()))
@@ -8684,9 +8839,22 @@ namespace Cryo::Codegen
                 // Handle assignment to member access: obj.field = value
                 else if (auto *left_member_access = dynamic_cast<Cryo::MemberAccessNode *>(node->left()))
                 {
+                    // Add safe member name extraction with null checking
+                    std::string member_name = "<invalid_member>";
+                    try {
+                        if (left_member_access) {
+                            const std::string& member_ref = left_member_access->member();
+                            if (!member_ref.empty()) {
+                                member_name = member_ref;
+                            }
+                        }
+                    } catch (...) {
+                        member_name = "<corrupted_member>";
+                    }
+                    
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing member access assignment: {}:{}",
                               left_member_access->object() ? "has_object" : "no_object",
-                              left_member_access->member());
+                              member_name);
                     // First check if this is a nested member access (e.g., this.position.x)
                     if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(left_member_access->object()))
                     {
@@ -8777,7 +8945,7 @@ namespace Cryo::Codegen
                         return nullptr;
                     }
 
-                    std::string member_name = left_member_access->member();
+                    // member_name is already declared safely above
 
                     // For now, we need to implement proper field access via GEP
                     // This is a simplified version - real implementation would need field index tracking
