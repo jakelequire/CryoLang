@@ -1683,6 +1683,27 @@ namespace Cryo::Codegen
                     if (mapped_return_type)
                     {
                         return_type = mapped_return_type;
+                        
+                        // Additional validation: log the return type mapping for debugging
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Struct method '{}' return type: {} -> LLVM type {}", 
+                                 qualified_name, cryo_return_type->to_string(), (void*)return_type);
+                    }
+                    else
+                    {
+                        // If type mapping fails, use a safer default based on the expected type
+                        LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to map return type '{}' for method '{}', using fallback", 
+                                cryo_return_type->to_string(), qualified_name);
+                        
+                        // Use type kind to determine a safer fallback
+                        if (cryo_return_type->kind() == Cryo::TypeKind::Boolean) {
+                            return_type = llvm::Type::getInt1Ty(context);
+                        } else if (cryo_return_type->kind() == Cryo::TypeKind::Integer) {
+                            return_type = llvm::Type::getInt32Ty(context);
+                        } else if (cryo_return_type->kind() == Cryo::TypeKind::Pointer) {
+                            return_type = llvm::PointerType::getUnqual(context);
+                        } else {
+                            return_type = llvm::Type::getInt32Ty(context); // Safe fallback
+                        }
                     }
                 }
 
@@ -2974,6 +2995,12 @@ namespace Cryo::Codegen
                 if (return_value)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Return value type: {}", return_value->getType()->getTypeID());
+                    
+                    // Debug: Print the actual LLVM instruction
+                    std::string return_str;
+                    llvm::raw_string_ostream rso(return_str);
+                    return_value->print(rso);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Return statement debug - actual return_value: {}", rso.str());
                 }
 
                 if (!return_value)
@@ -3004,6 +3031,62 @@ namespace Cryo::Codegen
                             {
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Performing implicit double to float conversion for return value");
                                 return_value = builder.CreateFPTrunc(return_value, expected_llvm_type);
+                            }
+                            else if (expected_llvm_type->isIntegerTy(1))
+                            {
+                                // Implicit conversion to boolean (i1)
+                                if (actual_type->isIntegerTy())
+                                {
+                                    // Compare against zero to get i1
+                                    llvm::Constant *zero = llvm::ConstantInt::get(actual_type, 0);
+                                    return_value = builder.CreateICmpNE(return_value, zero, "to.bool");
+                                }
+                                else if (actual_type->isPointerTy())
+                                {
+                                    // Compare pointer against null to get i1
+                                    llvm::Constant *null_ptr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(actual_type));
+                                    return_value = builder.CreateICmpNE(return_value, null_ptr, "ptr.to.bool");
+                                }
+                                else if (actual_type->isFloatingPointTy())
+                                {
+                                    // Compare float/double against 0.0 to get i1
+                                    llvm::Constant *zero_fp = llvm::ConstantFP::get(actual_type, 0.0);
+                                    return_value = builder.CreateFCmpONE(return_value, zero_fp, "fp.to.bool");
+                                }
+                                // else: other aggregates not implicitly convertible here
+                            }
+                            else if (expected_llvm_type->isIntegerTy() && actual_type->isIntegerTy())
+                            {
+                                // Normalize integer sizes via cast (zero-extend or truncate)
+                                unsigned from_bits = actual_type->getIntegerBitWidth();
+                                unsigned to_bits = expected_llvm_type->getIntegerBitWidth();
+                                if (from_bits == to_bits)
+                                {
+                                    // no-op
+                                }
+                                else if (from_bits < to_bits)
+                                {
+                                    return_value = builder.CreateZExt(return_value, expected_llvm_type, "zext.ret");
+                                }
+                                else
+                                {
+                                    return_value = builder.CreateTrunc(return_value, expected_llvm_type, "trunc.ret");
+                                }
+                            }
+                            else if (expected_llvm_type->isPointerTy() && actual_type->isPointerTy())
+                            {
+                                // Bitcast between pointer types if needed
+                                return_value = builder.CreateBitCast(return_value, expected_llvm_type, "ptr.cast.ret");
+                            }
+                            else if (expected_llvm_type->isPointerTy() && actual_type->isIntegerTy())
+                            {
+                                // Integer to pointer (e.g., returning address-sized integer)
+                                return_value = builder.CreateIntToPtr(return_value, expected_llvm_type, "int2ptr.ret");
+                            }
+                            else if (expected_llvm_type->isIntegerTy() && actual_type->isPointerTy())
+                            {
+                                // Pointer to integer when function expects integer
+                                return_value = builder.CreatePtrToInt(return_value, expected_llvm_type, "ptr2int.ret");
                             }
                         }
                     }
@@ -3737,6 +3820,11 @@ namespace Cryo::Codegen
             llvm::Value *result = generate_binary_operation(&node);
             if (result)
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "BINARY EXPR DEBUG: Setting current value to result, type: {}", result->getType()->getTypeID());
+                std::string result_str;
+                llvm::raw_string_ostream rso(result_str);
+                result->print(rso);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "BINARY EXPR DEBUG: Result value: {}", rso.str());
                 set_current_value(result);
                 register_value(&node, result);
             }
@@ -6815,6 +6903,22 @@ namespace Cryo::Codegen
                         LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to map return type for function {}, skipping", symbol_name);
                         continue;
                     }
+                    
+                    // CRITICAL: Add additional validation for return type mapping
+                    Cryo::Type *cryo_return_type = func_type->return_type().get();
+                    std::string return_type_name = cryo_return_type ? cryo_return_type->to_string() : "unknown";
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pre-registration: Function '{}' Cryo return type: '{}' -> LLVM type: {} (TypeID: {})",
+                             symbol_name, return_type_name, (void*)return_type, static_cast<int>(return_type->getTypeID()));
+                    
+                    // Validate that boolean functions aren't being mistyped
+                    if (return_type->isIntegerTy(1) && return_type_name != "boolean" && return_type_name != "bool")
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Function '{}' has non-boolean Cryo type '{}' but got i1 LLVM type!", 
+                                 symbol_name, return_type_name);
+                        // Use a safer fallback
+                        return_type = llvm::Type::getInt32Ty(_context_manager.get_context());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using i32 fallback for function '{}'", symbol_name);
+                    }
 
                     // Create LLVM function type with variadic flag
                     llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(return_type, param_types, has_variadic);
@@ -7428,7 +7532,9 @@ namespace Cryo::Codegen
 
                 // Verify the function type matches what we expect
                 llvm::FunctionType *expected_type = llvm::FunctionType::get(return_type, param_types, is_variadic);
-                if (existing_function->getFunctionType() == expected_type)
+                llvm::FunctionType *existing_type = existing_function->getFunctionType();
+                
+                if (existing_type == expected_type)
                 {
                     // Set parameter names on the existing function
                     auto param_it = param_names.begin();
@@ -7444,7 +7550,20 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    LOG_WARN(Cryo::LogComponent::CODEGEN, "Function {} exists but with different signature, creating new one", function_name);
+                    // CRITICAL: Detailed mismatch analysis to prevent IR verification failures
+                    llvm::Type *existing_return = existing_type->getReturnType();
+                    llvm::Type *expected_return = expected_type->getReturnType();
+                    
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL TYPE MISMATCH for function '{}'", function_name);
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Existing return type: {} (TypeID: {})", 
+                             (void*)existing_return, static_cast<int>(existing_return->getTypeID()));
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Expected return type: {} (TypeID: {})", 
+                             (void*)expected_return, static_cast<int>(expected_return->getTypeID()));
+                    
+                    // Force removal and regeneration to prevent IR verification failures
+                    existing_function->eraseFromParent();
+                    _functions.erase(function_name); // Remove from our cache too
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Removed conflicting function declaration for '{}', will regenerate", function_name);
                 }
             }
 
@@ -10057,8 +10176,10 @@ namespace Cryo::Codegen
 
                     // Comparison operations
                     case TokenKind::TK_EQUALEQUAL:
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Evaluating == operation");
                         if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
                         {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Both operands are integers");
                             // Ensure both operands have the same type for ICmp
                             if (left_val->getType() != right_val->getType())
                             {
@@ -10073,6 +10194,7 @@ namespace Cryo::Codegen
                                     right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
                             }
                             result = builder.CreateICmpEQ(left_val, right_val, "eq.tmp");
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Created ICmpEQ, result type: {}", result->getType()->getTypeID());
                         }
                         else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
                         {
@@ -15221,7 +15343,34 @@ namespace Cryo::Codegen
         // Use FunctionRegistry to infer return type based on function metadata
         llvm::Type *return_type = _function_registry->get_function_return_type(c_name, _context_manager.get_context(), _namespace_context);
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry return type for '{}': {}", c_name, (void *)return_type);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry return type for '{}': {} (TypeID: {})", 
+                  c_name, (void *)return_type, return_type ? static_cast<int>(return_type->getTypeID()) : -1);
+        
+        // CRITICAL DEBUGGING: Log when boolean types are assigned
+        if (return_type && return_type->isIntegerTy(1))
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Function '{}' got boolean (i1) return type from FunctionRegistry! This will cause IR verification failure!", c_name);
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Namespace context: '{}'", _namespace_context);
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "  This function will be declared as returning i1 but likely returns ptr/i32");
+        }
+        
+        // CRITICAL FIX: Add additional validation to prevent boolean mistyping
+        // If FunctionRegistry returns i1 (boolean) for functions that clearly shouldn't return boolean,
+        // use a safer default based on function name patterns
+        if (return_type && return_type->isIntegerTy(1)) // i1 = boolean
+        {
+            // Check if this function name suggests it should return something other than boolean
+            if (c_name.find("printf") != std::string::npos || 
+                c_name.find("print") != std::string::npos ||
+                c_name.find("alloc") != std::string::npos ||
+                c_name.find("malloc") != std::string::npos ||
+                c_name.find("get_") != std::string::npos)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Function '{}' was typed as boolean but seems like it should return int/ptr, using i32 default", c_name);
+                return_type = llvm::Type::getInt32Ty(_context_manager.get_context());
+            }
+        }
+        
         if (return_type)
         {
             // Validate the return type before using it
