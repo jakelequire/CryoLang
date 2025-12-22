@@ -333,7 +333,7 @@ stdlib-tcp-gdb:
 		--args $(MAIN_BIN) $(STDLIB_DIR)/net/tcp.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/net/tcp.bc
 
 gdb-runtime:
-	gdb --batch --ex run --ex "bt full" --ex "info registers" --ex quit --args $(MAIN_BIN) $(RUNTIME_DIR)/runtime.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(RUNTIME_BUILD_DIR)/runtime.bc
+	@gdb --batch --ex "handle SIGTRAP stop print" --ex run --ex "bt full" --ex "info registers" --ex "x/10i $rip" --ex quit --args $(MAIN_BIN) $(RUNTIME_DIR)/runtime.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(RUNTIME_BUILD_DIR)/runtime.bc
 
 ast-runtime:
 	@echo "Building runtime with AST dump for debugging..."
