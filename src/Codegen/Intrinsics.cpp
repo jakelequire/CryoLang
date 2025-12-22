@@ -1896,7 +1896,7 @@ namespace Cryo::Codegen
 
         // Since exit() never returns, we should add an unreachable instruction
         builder.CreateUnreachable();
-        
+
         // Return the call instruction as the result (even though exit is void)
         return call_result;
     }

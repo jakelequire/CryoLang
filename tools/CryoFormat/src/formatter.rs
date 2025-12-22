@@ -67,16 +67,16 @@ impl<'a> Formatter<'a> {
     fn format_node(&mut self, node: &AstNode) -> Result<()> {
         match node {
             AstNode::Program { items } => {
-                let mut first = true;
+                let mut prev_item: Option<&AstNode> = None;
                 for item in items {
-                    if !first {
+                    if let Some(prev) = prev_item {
                         self.write_newline();
-                        if self.should_add_blank_line_between_items() {
+                        if self.should_add_blank_line_between(prev, item) {
                             self.write_newline();
                         }
                     }
-                    first = false;
                     self.format_node(item)?;
+                    prev_item = Some(item);
                 }
             }
 
@@ -226,6 +226,7 @@ impl<'a> Formatter<'a> {
             }
 
             AstNode::Expression(expr) => {
+                self.write_indent();
                 self.format_node(expr)?;
                 self.write(";");
             }
@@ -311,11 +312,31 @@ impl<'a> Formatter<'a> {
                 
                 self.format_node(then_branch)?;
                 
-                if let Some(else_stmt) = else_branch {
+                // Handle else/else-if chain
+                let mut current_else = else_branch;
+                while let Some(else_stmt) = current_else {
                     self.write_space();
                     self.write("else");
                     self.write_space();
-                    self.format_node(else_stmt)?;
+                    
+                    // Check if this is an else-if
+                    if let AstNode::IfStatement { condition: next_cond, then_branch: next_then, else_branch: next_else } = else_stmt.as_ref() {
+                        // It's an else-if, write it inline
+                        self.write("if");
+                        self.write_space();
+                        self.write("(");
+                        self.format_node(next_cond)?;
+                        self.write(")");
+                        self.write_space();
+                        self.format_node(next_then)?;
+                        
+                        // Continue with the next else branch
+                        current_else = next_else;
+                    } else {
+                        // It's a regular else block
+                        self.format_node(else_stmt)?;
+                        break;
+                    }
                 }
             }
 
@@ -342,16 +363,50 @@ impl<'a> Formatter<'a> {
                 self.write("(");
                 
                 if let Some(init) = initializer {
-                    self.format_node(init)?;
-                } else {
-                    self.write(";");
+                    // Format initializer without indent and semicolon (we'll add it)
+                    match init.as_ref() {
+                        AstNode::VariableDeclaration { is_mutable, name, type_annotation, initializer } => {
+                            if *is_mutable {
+                                self.write("mut");
+                            } else {
+                                self.write("const");
+                            }
+                            self.write_space();
+                            self.write(name);
+                            if let Some(type_ann) = type_annotation {
+                                self.write(":");
+                                if self.options.spacing.after_colon {
+                                    self.write_space();
+                                }
+                                self.write(type_ann);
+                            }
+                            if let Some(init_val) = initializer {
+                                if self.options.spacing.assignment_operators {
+                                    self.write_space();
+                                }
+                                self.write("=");
+                                if self.options.spacing.assignment_operators {
+                                    self.write_space();
+                                }
+                                self.format_node(init_val)?;
+                            }
+                        }
+                        AstNode::Expression(expr) => {
+                            self.format_node(expr)?;
+                        }
+                        _ => {
+                            self.format_node(init)?;
+                        }
+                    }
                 }
                 
+                self.write(";");
                 self.write_space();
                 
                 if let Some(cond) = condition {
                     self.format_node(cond)?;
                 }
+                
                 self.write(";");
                 
                 if let Some(inc) = increment {
@@ -397,10 +452,20 @@ impl<'a> Formatter<'a> {
         self.needs_spacing = false;
     }
 
-    fn should_add_blank_line_between_items(&self) -> bool {
-        // Add logic for when to add blank lines between top-level items
-        // For now, add blank line between functions and structs
-        true
+    fn should_add_blank_line_between(&self, prev: &AstNode, current: &AstNode) -> bool {
+        // Add blank lines between different types of declarations
+        match (prev, current) {
+            // No blank line between consecutive variable declarations
+            (AstNode::VariableDeclaration { .. }, AstNode::VariableDeclaration { .. }) => false,
+            // Add blank line before/after functions
+            (_, AstNode::FunctionDeclaration { .. }) => true,
+            (AstNode::FunctionDeclaration { .. }, _) => true,
+            // Add blank line before/after structs
+            (_, AstNode::StructDeclaration { .. }) => true,
+            (AstNode::StructDeclaration { .. }, _) => true,
+            // Default: no blank line
+            _ => false,
+        }
     }
 }
 

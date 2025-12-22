@@ -127,9 +127,21 @@ def find_valid_bitcode_files(build_dir):
     for bc_file in all_bc_files:
         if not is_stub_file(bc_file):
             valid_files.append(bc_file)
-            log(f"✓ {Colors.OKGREEN}Valid:{Colors.ENDC} {os.path.basename(bc_file)}")
+            # Show 2 directories up in the path
+            path_parts = Path(bc_file).parts
+            if len(path_parts) >= 2:
+                display_path = os.path.join(*path_parts[-2:])
+            else:
+                display_path = os.path.basename(bc_file)
+            log(f"✓ {Colors.OKGREEN}Valid:{Colors.ENDC} {display_path}")
         else:
-            log(f"⚠ {Colors.WARNING}Stub:{Colors.ENDC} {os.path.basename(bc_file)}", "WARNING")
+            # Show 2 directories up in the path for stub files too
+            path_parts = Path(bc_file).parts
+            if len(path_parts) >= 2:
+                display_path = os.path.join(*path_parts[-2:])
+            else:
+                display_path = os.path.basename(bc_file)
+            log(f"⚠ {Colors.WARNING}Stub:{Colors.ENDC} {display_path}", "WARNING")
     
     return valid_files
 

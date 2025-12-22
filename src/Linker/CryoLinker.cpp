@@ -353,7 +353,34 @@ namespace Cryo::Linker
             return false;
         }
 
+        // Debug: Check if global constructors are still present before pass run
+        auto *global_ctors_before = module->getNamedGlobal("llvm.global_ctors");
+        if (global_ctors_before) {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Before PassManager run: @llvm.global_ctors found");
+            
+            // Mark the global constructor array as used to prevent optimization removal
+            global_ctors_before->setLinkage(llvm::GlobalValue::ExternalLinkage);
+            
+            // Also try to mark any global constructor functions as used
+            for (auto &func : module->getFunctionList()) {
+                if (func.getName().contains("cryo_global_constructors")) {
+                    func.setLinkage(llvm::GlobalValue::ExternalLinkage);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Marked function {} as external linkage", func.getName().str());
+                }
+            }
+        } else {
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "Before PassManager run: @llvm.global_ctors NOT found!");
+        }
+
         pass.run(*module);
+
+        // Debug: Check if global constructors are still present after pass run
+        auto *global_ctors_after = module->getNamedGlobal("llvm.global_ctors");
+        if (global_ctors_after) {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "After PassManager run: @llvm.global_ctors found");
+        } else {
+            LOG_ERROR(Cryo::LogComponent::GENERAL, "After PassManager run: @llvm.global_ctors REMOVED by PassManager!");
+        }
         dest.flush();
 
         return true;

@@ -384,6 +384,9 @@ namespace Cryo::Codegen
         // Current AST node being processed (for error reporting)
         Cryo::ASTNode *_current_node;
 
+        // Expected array element type for array literal generation
+        llvm::Type *_expected_array_element_type;
+
         // Control flags
         bool _stdlib_compilation_mode; // Generate full implementations for imports in stdlib mode
 
