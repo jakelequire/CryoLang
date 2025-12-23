@@ -109,19 +109,19 @@ namespace Cryo::Codegen
          * @brief Generate code for a variable declaration statement
          * @param node Variable declaration node
          */
-        void generate_var_declaration(Cryo::VarDeclarationNode *node);
+        void generate_var_declaration(Cryo::VariableDeclarationNode *node);
 
         /**
          * @brief Generate code for a constant declaration
          * @param node Constant declaration node
          */
-        void generate_const_declaration(Cryo::ConstDeclarationNode *node);
+        // void generate_const_declaration(Cryo::ConstDeclarationNode *node);
 
         /**
          * @brief Generate code for multiple variable declarations
          * @param node Multiple declaration node
          */
-        void generate_multi_declaration(Cryo::MultiVarDeclNode *node);
+        // void generate_multi_declaration(Cryo::MultiVarDeclNode *node);
 
         //===================================================================
         // Special Statements
@@ -138,13 +138,13 @@ namespace Cryo::Codegen
          *
          * Registers cleanup to run at scope exit.
          */
-        void generate_defer(Cryo::DeferStatementNode *node);
+        // void generate_defer(Cryo::DeferStatementNode *node);
 
         /**
          * @brief Generate code for an assert statement
          * @param node Assert statement node
          */
-        void generate_assert(Cryo::AssertStatementNode *node);
+        // void generate_assert(Cryo::AssertStatementNode *node);
 
         //===================================================================
         // Helpers

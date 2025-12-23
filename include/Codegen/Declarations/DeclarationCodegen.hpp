@@ -157,7 +157,7 @@ namespace Cryo::Codegen
          * @param node External function node
          * @return Generated LLVM function
          */
-        llvm::Function *generate_extern_function(Cryo::ExternFunctionNode *node);
+        llvm::Function *generate_extern_function(Cryo::FunctionDeclarationNode *node);
 
         //===================================================================
         // Variable Declarations
@@ -168,21 +168,21 @@ namespace Cryo::Codegen
          * @param node Variable declaration node
          * @return Alloca instruction for the variable
          */
-        llvm::AllocaInst *generate_local_variable(Cryo::VarDeclarationNode *node);
+        llvm::AllocaInst *generate_local_variable(Cryo::VariableDeclarationNode *node);
 
         /**
          * @brief Generate a global variable declaration
          * @param node Variable declaration node
          * @return Global variable
          */
-        llvm::GlobalVariable *generate_global_variable(Cryo::VarDeclarationNode *node);
+        llvm::GlobalVariable *generate_global_variable(Cryo::VariableDeclarationNode *node);
 
         /**
          * @brief Generate a constant declaration
          * @param node Constant declaration node
          * @return Constant value
          */
-        llvm::Constant *generate_constant(Cryo::ConstDeclarationNode *node);
+        llvm::Constant *generate_constant(Cryo::VariableDeclarationNode *node);
 
         //===================================================================
         // Type Declarations
@@ -330,7 +330,7 @@ namespace Cryo::Codegen
          * @param type Variable type
          * @return Constant initializer
          */
-        llvm::Constant *generate_global_initializer(Cryo::VarDeclarationNode *node,
+        llvm::Constant *generate_global_initializer(Cryo::VariableDeclarationNode *node,
                                                      llvm::Type *type);
     };
 

@@ -164,11 +164,11 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ProgramNode");
 
         // Process all top-level declarations
-        for (const auto &decl : node.declarations())
+        for (const auto &stmt : node.statements())
         {
-            if (decl)
+            if (stmt)
             {
-                decl->accept(*this);
+                stmt->accept(*this);
             }
         }
     }
@@ -334,7 +334,7 @@ namespace Cryo::Codegen
 
         // Unsafe blocks generate code like regular blocks
         // (safety checks are disabled at compile-time)
-        for (const auto &stmt : node.body())
+        for (const auto &stmt : node.block()->statements())
         {
             if (stmt)
             {
@@ -677,7 +677,7 @@ namespace Cryo::Codegen
         _has_errors = true;
         _last_error = message;
         _errors.push_back(message);
-        _ctx->report_error(ErrorCode::E0600_CODEGEN_ERROR, node, message);
+        _ctx->report_error(ErrorCode::E0600_CODEGEN_FAILED, node, message);
     }
 
     //===================================================================

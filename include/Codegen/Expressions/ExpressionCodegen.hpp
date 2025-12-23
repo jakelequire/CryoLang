@@ -119,13 +119,6 @@ namespace Cryo::Codegen
          * @param node Literal expression node
          * @return Generated value
          */
-        llvm::Value *generate_literal(Cryo::LiteralExpressionNode *node);
-
-        /**
-         * @brief Generate literal from LiteralNode
-         * @param node Literal node
-         * @return Generated value
-         */
         llvm::Value *generate_literal(Cryo::LiteralNode *node);
 
         /**
@@ -223,14 +216,14 @@ namespace Cryo::Codegen
          * @param node Index expression node
          * @return Element value
          */
-        llvm::Value *generate_index(Cryo::IndexExpressionNode *node);
+        llvm::Value *generate_index(Cryo::ArrayAccessNode *node);
 
         /**
          * @brief Generate index address (for assignment)
          * @param node Index expression node
          * @return Address of element
          */
-        llvm::Value *generate_index_address(Cryo::IndexExpressionNode *node);
+        llvm::Value *generate_index_address(Cryo::ArrayAccessNode *node);
 
         //===================================================================
         // Cast Expressions
