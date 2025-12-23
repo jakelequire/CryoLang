@@ -65,7 +65,7 @@ namespace Cryo::Codegen
          * @brief Generate code for a block statement (compound statement)
          * @param node Block statement node
          */
-        void generate_block(Cryo::BlockNode *node);
+        void generate_block(Cryo::BlockStatementNode *node);
 
         /**
          * @brief Generate code for a list of statements

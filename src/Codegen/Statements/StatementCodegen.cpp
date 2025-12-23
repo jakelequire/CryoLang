@@ -29,8 +29,8 @@ namespace Cryo::Codegen
         // Dispatch based on statement kind
         switch (stmt->kind())
         {
-        case NodeKind::Block:
-            generate_block(static_cast<BlockNode *>(stmt));
+        case NodeKind::BlockStatement:
+            generate_block(static_cast<BlockStatementNode *>(stmt));
             break;
 
         case NodeKind::ExpressionStatement:
@@ -126,15 +126,29 @@ namespace Cryo::Codegen
     // Block Statements
     //===================================================================
 
-    void StatementCodegen::generate_block(Cryo::BlockNode *node)
+    void StatementCodegen::generate_block(Cryo::BlockStatementNode *node)
     {
         if (!node)
             return;
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "StatementCodegen: Generating block with {} statements",
-                  node->statements().size());
+                  node->body().size());
 
-        generate_statement_list(node->statements());
+        // Generate each statement in the block
+        for (const auto &stmt : node->body())
+        {
+            if (!stmt)
+                continue;
+
+            generate(stmt.get());
+
+            // Stop generating if we hit a terminator
+            if (is_terminator(stmt.get()))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "StatementCodegen: Hit terminator, stopping block generation");
+                break;
+            }
+        }
     }
 
     void StatementCodegen::generate_statement_list(

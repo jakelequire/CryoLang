@@ -45,6 +45,11 @@ namespace Cryo::Codegen
          */
         void set_scope_manager(ScopeManager *scope_mgr) { _scope_manager = scope_mgr; }
 
+        /**
+         * @brief Set the statement codegen for block generation
+         */
+        void set_statement_codegen(class StatementCodegen *stmt) { _statements = stmt; }
+
         //===================================================================
         // If/Else Statements
         //===================================================================
@@ -92,6 +97,12 @@ namespace Cryo::Codegen
          * @param node Switch statement AST node
          */
         void generate_switch(Cryo::SwitchStatementNode *node);
+
+        /**
+         * @brief Generate code for a match statement (pattern matching)
+         * @param node Match statement AST node
+         */
+        void generate_match(Cryo::MatchStatementNode *node);
 
         //===================================================================
         // Jump Statements
@@ -162,6 +173,7 @@ namespace Cryo::Codegen
 
         std::stack<BreakableContext> _breakable_stack;
         ScopeManager *_scope_manager = nullptr;
+        StatementCodegen *_statements = nullptr;
 
         //===================================================================
         // Internal Helpers

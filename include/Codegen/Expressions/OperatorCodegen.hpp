@@ -44,6 +44,11 @@ namespace Cryo::Codegen
          */
         void set_memory_codegen(MemoryCodegen *memory) { _memory = memory; }
 
+        /**
+         * @brief Set the call codegen component (for operator overloading)
+         */
+        void set_call_codegen(class CallCodegen *calls) { _calls = calls; }
+
         //===================================================================
         // Main Entry Points
         //===================================================================
@@ -352,6 +357,7 @@ namespace Cryo::Codegen
         //===================================================================
 
         MemoryCodegen *_memory = nullptr;
+        CallCodegen *_calls = nullptr;
 
         /**
          * @brief Generate an operand value from an expression
