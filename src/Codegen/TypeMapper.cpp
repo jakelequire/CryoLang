@@ -476,7 +476,8 @@ namespace Cryo::Codegen
         if (!type)
             return nullptr;
 
-        Type *elem_type = type->element_type();
+        // element_type() returns shared_ptr, use .get() for raw pointer
+        Type *elem_type = type->element_type().get();
         llvm::Type *llvm_elem = map(elem_type);
         if (!llvm_elem)
         {
@@ -520,17 +521,19 @@ namespace Cryo::Codegen
         if (!type)
             return nullptr;
 
-        Type *ret_type = type->return_type();
-        const auto &params = type->parameter_types();
+        // return_type() returns shared_ptr, use .get() for raw pointer
+        Type *ret_type = type->return_type().get();
+        const auto &params = type->parameter_types(); // vector of shared_ptr
 
         llvm::Type *llvm_ret = ret_type ? map(ret_type) : void_type();
 
         std::vector<llvm::Type *> llvm_params;
         llvm_params.reserve(params.size());
 
-        for (auto *param : params)
+        // params is vector of shared_ptr<Type>
+        for (const auto &param : params)
         {
-            llvm::Type *mapped = map(param);
+            llvm::Type *mapped = map(param.get());
             if (mapped)
             {
                 llvm_params.push_back(mapped);
@@ -666,7 +669,8 @@ namespace Cryo::Codegen
             size_t discriminant_size = enum_type->get_discriminant_size();
 
             // Calculate actual payload size from type parameters
-            for (auto &param : type->type_params())
+            // type_parameters() returns vector of shared_ptr
+            for (const auto &param : type->type_parameters())
             {
                 llvm::Type *mapped = map(param.get());
                 if (mapped)
@@ -695,7 +699,8 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Optional<T> is a tagged union: { i8 discriminant, T value }
-        Type *inner = type->wrapped_type();
+        // wrapped_type() returns shared_ptr, use .get() for raw pointer
+        Type *inner = type->wrapped_type().get();
         llvm::Type *inner_llvm = map(inner);
 
         std::string name = "Optional_" + (inner ? inner->name() : "unknown");
