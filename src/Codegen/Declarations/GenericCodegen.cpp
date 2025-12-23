@@ -1,0 +1,508 @@
+#include "Codegen/Declarations/GenericCodegen.hpp"
+#include "Codegen/Declarations/DeclarationCodegen.hpp"
+#include "Codegen/Declarations/TypeCodegen.hpp"
+#include "Utils/Logger.hpp"
+
+namespace Cryo::Codegen
+{
+    //===================================================================
+    // Construction
+    //===================================================================
+
+    GenericCodegen::GenericCodegen(CodegenContext &ctx)
+        : ICodegenComponent(ctx)
+    {
+    }
+
+    //===================================================================
+    // Generic Type Instantiation
+    //===================================================================
+
+    llvm::StructType *GenericCodegen::instantiate_struct(const std::string &generic_name,
+                                                           const std::vector<Cryo::Type *> &type_args)
+    {
+        // Generate mangled name
+        std::string mangled = mangle_type_name(generic_name, type_args);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating struct {} -> {}",
+                  generic_name, mangled);
+
+        // Check cache
+        if (has_type_instantiation(mangled))
+        {
+            llvm::Type *cached = get_cached_type(mangled);
+            if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
+            {
+                return struct_type;
+            }
+        }
+
+        // Check if already exists in LLVM context
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
+        {
+            _type_cache[mangled] = existing;
+            return existing;
+        }
+
+        // Get generic type definition
+        Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
+        if (!generic_def)
+        {
+            report_error(ErrorCode::E0618_TYPE_RESOLUTION_ERROR,
+                         "Unknown generic type: " + generic_name);
+            return nullptr;
+        }
+
+        // Get type parameters from definition
+        std::vector<std::string> type_params;
+        auto *struct_decl = dynamic_cast<StructDeclarationNode *>(generic_def);
+        if (struct_decl && struct_decl->type_parameters())
+        {
+            for (const auto &param : struct_decl->type_parameters()->parameters())
+            {
+                type_params.push_back(param->name());
+            }
+        }
+
+        // Begin type parameter scope
+        begin_type_params(type_params, type_args);
+
+        // Create struct type
+        llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), mangled);
+
+        // Substitute type parameters in fields
+        if (struct_decl)
+        {
+            std::vector<llvm::Type *> field_types = create_substituted_fields(struct_decl->fields());
+            struct_type->setBody(field_types);
+        }
+
+        // End type parameter scope
+        end_type_params();
+
+        // Cache and register
+        _type_cache[mangled] = struct_type;
+        ctx().register_type(mangled, struct_type);
+
+        return struct_type;
+    }
+
+    llvm::StructType *GenericCodegen::instantiate_class(const std::string &generic_name,
+                                                          const std::vector<Cryo::Type *> &type_args)
+    {
+        // Classes are represented as structs in LLVM
+        // Similar to struct instantiation but may include vtable pointer
+
+        std::string mangled = mangle_type_name(generic_name, type_args);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating class {} -> {}",
+                  generic_name, mangled);
+
+        // Check cache
+        if (has_type_instantiation(mangled))
+        {
+            llvm::Type *cached = get_cached_type(mangled);
+            if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
+            {
+                return struct_type;
+            }
+        }
+
+        // Check LLVM context
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
+        {
+            _type_cache[mangled] = existing;
+            return existing;
+        }
+
+        // Get generic definition
+        Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
+        if (!generic_def)
+        {
+            report_error(ErrorCode::E0618_TYPE_RESOLUTION_ERROR,
+                         "Unknown generic class: " + generic_name);
+            return nullptr;
+        }
+
+        // Get type parameters
+        std::vector<std::string> type_params;
+        auto *class_decl = dynamic_cast<ClassDeclarationNode *>(generic_def);
+        if (class_decl && class_decl->type_parameters())
+        {
+            for (const auto &param : class_decl->type_parameters()->parameters())
+            {
+                type_params.push_back(param->name());
+            }
+        }
+
+        // Begin substitution scope
+        begin_type_params(type_params, type_args);
+
+        // Create class struct
+        llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), mangled);
+
+        if (class_decl)
+        {
+            std::vector<llvm::Type *> field_types = create_substituted_fields(class_decl->fields());
+            class_type->setBody(field_types);
+        }
+
+        // End substitution scope
+        end_type_params();
+
+        // Cache and register
+        _type_cache[mangled] = class_type;
+        ctx().register_type(mangled, class_type);
+
+        return class_type;
+    }
+
+    llvm::Type *GenericCodegen::get_instantiated_type(const std::string &generic_name,
+                                                        const std::vector<Cryo::Type *> &type_args)
+    {
+        std::string mangled = mangle_type_name(generic_name, type_args);
+
+        // Check cache first
+        if (has_type_instantiation(mangled))
+        {
+            return get_cached_type(mangled);
+        }
+
+        // Try to instantiate
+        Cryo::ASTNode *def = get_generic_type_def(generic_name);
+        if (!def)
+        {
+            return nullptr;
+        }
+
+        if (dynamic_cast<StructDeclarationNode *>(def))
+        {
+            return instantiate_struct(generic_name, type_args);
+        }
+        else if (dynamic_cast<ClassDeclarationNode *>(def))
+        {
+            return instantiate_class(generic_name, type_args);
+        }
+
+        return nullptr;
+    }
+
+    //===================================================================
+    // Generic Function Instantiation
+    //===================================================================
+
+    llvm::Function *GenericCodegen::instantiate_function(const std::string &generic_name,
+                                                           const std::vector<Cryo::Type *> &type_args)
+    {
+        std::string mangled = mangle_function_name(generic_name, type_args);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating function {} -> {}",
+                  generic_name, mangled);
+
+        // Check cache
+        if (has_function_instantiation(mangled))
+        {
+            return get_cached_function(mangled);
+        }
+
+        // Check module
+        if (llvm::Function *existing = module()->getFunction(mangled))
+        {
+            _function_cache[mangled] = existing;
+            return existing;
+        }
+
+        // Get generic definition
+        Cryo::ASTNode *generic_def = get_generic_function_def(generic_name);
+        if (!generic_def)
+        {
+            report_error(ErrorCode::E0610_FUNCTION_BODY_ERROR,
+                         "Unknown generic function: " + generic_name);
+            return nullptr;
+        }
+
+        auto *func_decl = dynamic_cast<FunctionDeclarationNode *>(generic_def);
+        if (!func_decl)
+        {
+            return nullptr;
+        }
+
+        // Get type parameters
+        std::vector<std::string> type_params;
+        if (func_decl->type_parameters())
+        {
+            for (const auto &param : func_decl->type_parameters()->parameters())
+            {
+                type_params.push_back(param->name());
+            }
+        }
+
+        // Begin substitution scope
+        begin_type_params(type_params, type_args);
+
+        // Create function type with substituted types
+        llvm::FunctionType *fn_type = create_substituted_function_type(func_decl);
+        if (!fn_type)
+        {
+            end_type_params();
+            return nullptr;
+        }
+
+        // Create function
+        llvm::Function *fn = llvm::Function::Create(
+            fn_type,
+            llvm::Function::ExternalLinkage,
+            mangled,
+            module());
+
+        // Generate body if available
+        if (func_decl->body() && _declarations)
+        {
+            // The body generation would need to use substituted types
+            // For now, we just create the declaration
+            // Full body generation would be handled by DeclarationCodegen
+        }
+
+        // End substitution scope
+        end_type_params();
+
+        // Cache and register
+        _function_cache[mangled] = fn;
+        ctx().register_function(mangled, fn);
+
+        return fn;
+    }
+
+    llvm::Function *GenericCodegen::instantiate_method(const std::string &type_name,
+                                                         const std::string &method_name,
+                                                         const std::vector<Cryo::Type *> &type_args)
+    {
+        std::string qualified = type_name + "::" + method_name;
+        return instantiate_function(qualified, type_args);
+    }
+
+    //===================================================================
+    // Type Parameter Handling
+    //===================================================================
+
+    void GenericCodegen::begin_type_params(const std::vector<std::string> &params,
+                                             const std::vector<Cryo::Type *> &args)
+    {
+        TypeParamScope scope;
+
+        size_t count = std::min(params.size(), args.size());
+        for (size_t i = 0; i < count; ++i)
+        {
+            scope.bindings[params[i]] = args[i];
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Binding {} -> {}",
+                      params[i], args[i] ? args[i]->to_string() : "null");
+        }
+
+        _type_param_stack.push_back(std::move(scope));
+    }
+
+    void GenericCodegen::end_type_params()
+    {
+        if (!_type_param_stack.empty())
+        {
+            _type_param_stack.pop_back();
+        }
+    }
+
+    Cryo::Type *GenericCodegen::resolve_type_param(const std::string &param_name)
+    {
+        // Search from innermost to outermost scope
+        for (auto it = _type_param_stack.rbegin(); it != _type_param_stack.rend(); ++it)
+        {
+            auto found = it->bindings.find(param_name);
+            if (found != it->bindings.end())
+            {
+                return found->second;
+            }
+        }
+        return nullptr;
+    }
+
+    Cryo::Type *GenericCodegen::substitute_type_params(Cryo::Type *type)
+    {
+        if (!type)
+            return nullptr;
+
+        // If type is a type parameter, resolve it
+        std::string type_name = type->to_string();
+        if (Cryo::Type *resolved = resolve_type_param(type_name))
+        {
+            return resolved;
+        }
+
+        // TODO: Handle generic types with nested type parameters
+        // e.g., Array<T> where T is a type parameter
+
+        return type;
+    }
+
+    //===================================================================
+    // Name Mangling
+    //===================================================================
+
+    std::string GenericCodegen::mangle_type_name(const std::string &generic_name,
+                                                   const std::vector<Cryo::Type *> &type_args)
+    {
+        if (type_args.empty())
+        {
+            return generic_name;
+        }
+
+        std::string result = generic_name + "_";
+
+        for (size_t i = 0; i < type_args.size(); ++i)
+        {
+            if (i > 0)
+                result += "_";
+
+            if (type_args[i])
+            {
+                std::string arg_name = type_args[i]->to_string();
+                // Replace problematic characters
+                std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                result += arg_name;
+            }
+        }
+
+        return result;
+    }
+
+    std::string GenericCodegen::mangle_function_name(const std::string &generic_name,
+                                                       const std::vector<Cryo::Type *> &type_args)
+    {
+        // Same mangling scheme as types
+        return mangle_type_name(generic_name, type_args);
+    }
+
+    //===================================================================
+    // Instantiation Cache
+    //===================================================================
+
+    bool GenericCodegen::has_type_instantiation(const std::string &mangled_name) const
+    {
+        return _type_cache.find(mangled_name) != _type_cache.end();
+    }
+
+    bool GenericCodegen::has_function_instantiation(const std::string &mangled_name) const
+    {
+        return _function_cache.find(mangled_name) != _function_cache.end();
+    }
+
+    llvm::Type *GenericCodegen::get_cached_type(const std::string &mangled_name)
+    {
+        auto it = _type_cache.find(mangled_name);
+        return (it != _type_cache.end()) ? it->second : nullptr;
+    }
+
+    llvm::Function *GenericCodegen::get_cached_function(const std::string &mangled_name)
+    {
+        auto it = _function_cache.find(mangled_name);
+        return (it != _function_cache.end()) ? it->second : nullptr;
+    }
+
+    //===================================================================
+    // Generic Definition Lookup
+    //===================================================================
+
+    void GenericCodegen::register_generic_type(const std::string &name, Cryo::ASTNode *node)
+    {
+        _generic_types[name] = node;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Registered generic type: {}", name);
+    }
+
+    void GenericCodegen::register_generic_function(const std::string &name, Cryo::ASTNode *node)
+    {
+        _generic_functions[name] = node;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Registered generic function: {}", name);
+    }
+
+    Cryo::ASTNode *GenericCodegen::get_generic_type_def(const std::string &name)
+    {
+        auto it = _generic_types.find(name);
+        return (it != _generic_types.end()) ? it->second : nullptr;
+    }
+
+    Cryo::ASTNode *GenericCodegen::get_generic_function_def(const std::string &name)
+    {
+        auto it = _generic_functions.find(name);
+        return (it != _generic_functions.end()) ? it->second : nullptr;
+    }
+
+    //===================================================================
+    // Internal Helpers
+    //===================================================================
+
+    std::vector<llvm::Type *> GenericCodegen::create_substituted_fields(
+        const std::vector<std::unique_ptr<Cryo::FieldDeclarationNode>> &fields)
+    {
+        std::vector<llvm::Type *> result;
+        result.reserve(fields.size());
+
+        for (const auto &field : fields)
+        {
+            if (!field)
+                continue;
+
+            Cryo::Type *field_type = field->type();
+            Cryo::Type *substituted = substitute_type_params(field_type);
+
+            llvm::Type *llvm_type = get_llvm_type(substituted);
+            if (llvm_type)
+            {
+                result.push_back(llvm_type);
+            }
+        }
+
+        return result;
+    }
+
+    llvm::FunctionType *GenericCodegen::create_substituted_function_type(
+        Cryo::FunctionDeclarationNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        // Substitute return type
+        Cryo::Type *ret_type = substitute_type_params(node->return_type());
+        llvm::Type *llvm_ret = get_llvm_type(ret_type);
+        if (!llvm_ret)
+        {
+            llvm_ret = llvm::Type::getVoidTy(llvm_ctx());
+        }
+
+        // Substitute parameter types
+        std::vector<llvm::Type *> param_types;
+        bool is_variadic = false;
+
+        if (node->parameters())
+        {
+            for (const auto &param : node->parameters()->params())
+            {
+                if (param->is_variadic())
+                {
+                    is_variadic = true;
+                    break;
+                }
+
+                Cryo::Type *param_type = substitute_type_params(param->type());
+                llvm::Type *llvm_param = get_llvm_type(param_type);
+                if (llvm_param)
+                {
+                    param_types.push_back(llvm_param);
+                }
+            }
+        }
+
+        return llvm::FunctionType::get(llvm_ret, param_types, is_variadic);
+    }
+
+} // namespace Cryo::Codegen
