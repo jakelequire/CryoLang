@@ -323,6 +323,9 @@ stdlib-pair:
 stdlib-env:
 	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/env/env.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/env/env.bc
 
+stdlib-strings:
+	@./bin/cryo${BIN_SUFFIX} $(STDLIB_DIR)/strings/strings.cryo --debug --emit-llvm -c --stdlib-mode --ir -o $(STDLIB_BUILD_DIR)/strings/strings.bc
+
 stdlib-tcp-gdb:
 	@echo "Building stdlib TCP module through gdb for debugging..."
 	@gdb -batch \
