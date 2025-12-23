@@ -127,9 +127,9 @@ namespace Cryo::Codegen
         // Get type parameters
         std::vector<std::string> type_params;
         auto *class_decl = dynamic_cast<ClassDeclarationNode *>(generic_def);
-        if (class_decl && class_decl->type_parameters())
+        if (class_decl)
         {
-            for (const auto &param : class_decl->type_parameters()->parameters())
+            for (const auto &param : class_decl->generic_parameters())
             {
                 type_params.push_back(param->name());
             }
@@ -229,9 +229,9 @@ namespace Cryo::Codegen
 
         // Get type parameters
         std::vector<std::string> type_params;
-        if (func_decl->type_parameters())
+        if (func_decl->generic_parameters().size() > 0)
         {
-            for (const auto &param : func_decl->type_parameters()->parameters())
+            for (const auto &param : func_decl->generic_parameters())
             {
                 type_params.push_back(param->name());
             }
@@ -442,7 +442,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     std::vector<llvm::Type *> GenericCodegen::create_substituted_fields(
-        const std::vector<std::unique_ptr<Cryo::FieldDeclarationNode>> &fields)
+        const std::vector<std::unique_ptr<Cryo::StructFieldNode>> &fields)
     {
         std::vector<llvm::Type *> result;
         result.reserve(fields.size());
@@ -452,7 +452,7 @@ namespace Cryo::Codegen
             if (!field)
                 continue;
 
-            Cryo::Type *field_type = field->type();
+            Cryo::Type *field_type = field->get_resolved_type();
             Cryo::Type *substituted = substitute_type_params(field_type);
 
             llvm::Type *llvm_type = get_llvm_type(substituted);
@@ -472,28 +472,23 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Substitute return type
-        Cryo::Type *ret_type = substitute_type_params(node->return_type());
+        Cryo::Type *ret_type = substitute_type_params(node->get_resolved_return_type());
         llvm::Type *llvm_ret = get_llvm_type(ret_type);
         if (!llvm_ret)
         {
             llvm_ret = llvm::Type::getVoidTy(llvm_ctx());
         }
 
+        bool is_variadic = node->is_variadic();
+
         // Substitute parameter types
         std::vector<llvm::Type *> param_types;
-        bool is_variadic = false;
 
-        if (node->parameters())
+        if (node->parameters().size() > 0)
         {
-            for (const auto &param : node->parameters()->params())
+            for (const auto &param : node->parameters())
             {
-                if (param->is_variadic())
-                {
-                    is_variadic = true;
-                    break;
-                }
-
-                Cryo::Type *param_type = substitute_type_params(param->type());
+                Cryo::Type *param_type = substitute_type_params(param->get_resolved_type());
                 llvm::Type *llvm_param = get_llvm_type(param_type);
                 if (llvm_param)
                 {

@@ -56,7 +56,7 @@ namespace Cryo::Codegen
         llvm::LLVMContext &llvm_ctx() { return _ctx.llvm_context(); }
 
         /** @brief Get current module */
-        llvm::Module *module() { return _ctx.module(); }
+        llvm::Module *module() const { return _ctx.module(); }
 
         /** @brief Get type mapper */
         TypeMapper &types() { return _ctx.types(); }

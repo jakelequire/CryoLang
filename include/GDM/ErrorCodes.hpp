@@ -160,7 +160,8 @@ namespace Cryo
     X(E0630_OPTIMIZATION_ERROR, 630)             \
     X(E0631_ENUM_OPERATION_ERROR, 631)           \
     X(E0632_TYPE_RESOLUTION_ERROR, 632)          \
-    x(E0633_FUNCTION_BODY_ERROR, 633)              \
+    X(E0633_FUNCTION_BODY_ERROR, 633)            \
+    X(E0634_VARIABLE_INITIALIZATION_ERROR, 634)  \
                                                  \
     /* Linker Errors (E0700-E0799) */            \
     X(E0700_LINK_ERROR, 700)                     \

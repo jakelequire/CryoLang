@@ -1,5 +1,6 @@
 #include "Codegen/Declarations/DeclarationCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
+#include "Codegen/CodegenVisitor.hpp"
 #include "Utils/Logger.hpp"
 
 #include <llvm/IR/Verifier.h>
@@ -23,7 +24,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0610_FUNCTION_BODY_ERROR, "Null function declaration node");
+            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, "Null function declaration node");
             return nullptr;
         }
 
@@ -40,7 +41,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *fn_type = get_function_type(node);
         if (!fn_type)
         {
-            report_error(ErrorCode::E0610_FUNCTION_BODY_ERROR, node,
+            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
                          "Failed to get function type for: " + name);
             return nullptr;
         }
@@ -65,7 +66,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0610_FUNCTION_BODY_ERROR, "Null function declaration node");
+            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, "Null function declaration node");
             return nullptr;
         }
 
@@ -128,7 +129,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *fn_type = get_function_type(node, true);
         if (!fn_type)
         {
-            report_error(ErrorCode::E0610_FUNCTION_BODY_ERROR, node,
+            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
                          "Failed to get method type for: " + method_name);
             return nullptr;
         }
@@ -143,9 +144,9 @@ namespace Cryo::Codegen
         ++arg_it;
 
         // Name remaining parameters
-        if (node->parameters())
+        if (node->parameters().size() > 0)
         {
-            for (const auto &param : node->parameters()->params())
+            for (const auto &param : node->parameters())
             {
                 if (arg_it != fn->arg_end())
                 {
@@ -161,7 +162,7 @@ namespace Cryo::Codegen
         return fn;
     }
 
-    llvm::Function *DeclarationCodegen::generate_extern_function(Cryo::ExternFunctionNode *node)
+    llvm::Function *DeclarationCodegen::generate_extern_function(Cryo::FunctionDeclarationNode *node)
     {
         if (!node)
             return nullptr;
@@ -176,7 +177,7 @@ namespace Cryo::Codegen
         }
 
         // Get return type
-        llvm::Type *return_type = types().get_type(node->return_type());
+        llvm::Type *return_type = types().get_type(node->get_resolved_return_type());
         if (!return_type)
         {
             return_type = llvm::Type::getVoidTy(llvm_ctx());
@@ -184,18 +185,13 @@ namespace Cryo::Codegen
 
         // Get parameter types
         std::vector<llvm::Type *> param_types;
-        bool is_variadic = false;
+        bool is_variadic = node->is_variadic();
 
-        if (node->parameters())
+        if (node->parameters().size() > 0)
         {
-            for (const auto &param : node->parameters()->params())
+            for (const auto &param : node->parameters())
             {
-                if (param->is_variadic())
-                {
-                    is_variadic = true;
-                    break;
-                }
-                llvm::Type *param_type = types().get_type(param->type());
+                llvm::Type *param_type = types().get_type(param->get_resolved_type());
                 if (param_type)
                 {
                     param_types.push_back(param_type);
@@ -216,7 +212,7 @@ namespace Cryo::Codegen
     // Variable Declarations
     //===================================================================
 
-    llvm::AllocaInst *DeclarationCodegen::generate_local_variable(Cryo::VarDeclarationNode *node)
+    llvm::AllocaInst *DeclarationCodegen::generate_local_variable(Cryo::VariableDeclarationNode *node)
     {
         if (!node)
             return nullptr;
@@ -225,10 +221,10 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating local variable: {}", name);
 
         // Get variable type
-        llvm::Type *var_type = get_llvm_type(node->declared_type());
+        llvm::Type *var_type = get_llvm_type(node->get_resolved_type());
         if (!var_type)
         {
-            report_error(ErrorCode::E0611_VARIABLE_INITIALIZATION_ERROR, node,
+            report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
                          "Unknown type for variable: " + name);
             return nullptr;
         }
@@ -237,7 +233,7 @@ namespace Cryo::Codegen
         llvm::AllocaInst *alloca = create_entry_alloca(var_type, name);
         if (!alloca)
         {
-            report_error(ErrorCode::E0611_VARIABLE_INITIALIZATION_ERROR, node,
+            report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
                          "Failed to allocate variable: " + name);
             return nullptr;
         }
@@ -245,7 +241,8 @@ namespace Cryo::Codegen
         // Generate initializer if present
         if (node->initializer())
         {
-            node->initializer()->accept(ctx().visitor());
+            CodegenVisitor *visitor = ctx().visitor();
+            node->initializer()->accept(*visitor);
             llvm::Value *init_val = get_result();
             if (init_val)
             {
@@ -255,12 +252,12 @@ namespace Cryo::Codegen
         }
 
         // Register in value context
-        values().set_alloca(name, alloca);
+        values().set_value(name, nullptr, alloca);
 
         return alloca;
     }
 
-    llvm::GlobalVariable *DeclarationCodegen::generate_global_variable(Cryo::VarDeclarationNode *node)
+    llvm::GlobalVariable *DeclarationCodegen::generate_global_variable(Cryo::VariableDeclarationNode *node)
     {
         if (!node)
             return nullptr;
@@ -275,10 +272,10 @@ namespace Cryo::Codegen
         }
 
         // Get variable type
-        llvm::Type *var_type = get_llvm_type(node->declared_type());
+        llvm::Type *var_type = get_llvm_type(node->get_resolved_type());
         if (!var_type)
         {
-            report_error(ErrorCode::E0611_VARIABLE_INITIALIZATION_ERROR, node,
+            report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
                          "Unknown type for global variable: " + name);
             return nullptr;
         }
@@ -287,7 +284,7 @@ namespace Cryo::Codegen
         llvm::Constant *initializer = generate_global_initializer(node, var_type);
 
         // Create global variable
-        bool is_constant = node->is_constant();
+        bool is_constant = !node->is_mutable();
         llvm::GlobalValue::LinkageTypes linkage = get_linkage(node);
 
         llvm::GlobalVariable *global = new llvm::GlobalVariable(
@@ -301,7 +298,7 @@ namespace Cryo::Codegen
         return global;
     }
 
-    llvm::Constant *DeclarationCodegen::generate_constant(Cryo::ConstDeclarationNode *node)
+    llvm::Constant *DeclarationCodegen::generate_constant(Cryo::VariableDeclarationNode *node)
     {
         if (!node)
             return nullptr;
@@ -312,7 +309,8 @@ namespace Cryo::Codegen
         // Generate constant value
         if (node->initializer())
         {
-            node->initializer()->accept(ctx().visitor());
+            CodegenVisitor *visitor = ctx().visitor();
+            node->initializer()->accept(*visitor);
             llvm::Value *val = get_result();
             if (auto *constant = llvm::dyn_cast<llvm::Constant>(val))
             {
@@ -320,7 +318,7 @@ namespace Cryo::Codegen
             }
         }
 
-        report_error(ErrorCode::E0611_VARIABLE_INITIALIZATION_ERROR, node,
+        report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
                      "Constant initializer is not a compile-time constant: " + name);
         return nullptr;
     }
@@ -350,7 +348,7 @@ namespace Cryo::Codegen
         std::vector<llvm::Type *> field_types;
         for (const auto &field : node->fields())
         {
-            llvm::Type *field_type = get_llvm_type(field->type());
+            llvm::Type *field_type = get_llvm_type(field->get_resolved_type());
             if (field_type)
             {
                 field_types.push_back(field_type);
@@ -392,7 +390,7 @@ namespace Cryo::Codegen
 
         for (const auto &field : node->fields())
         {
-            llvm::Type *field_type = get_llvm_type(field->type());
+            llvm::Type *field_type = get_llvm_type(field->get_resolved_type());
             if (field_type)
             {
                 field_types.push_back(field_type);
@@ -446,7 +444,7 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Get return type
-        llvm::Type *return_type = get_llvm_type(node->return_type());
+        llvm::Type *return_type = get_llvm_type(node->get_resolved_return_type());
         if (!return_type)
         {
             return_type = llvm::Type::getVoidTy(llvm_ctx());
@@ -462,17 +460,12 @@ namespace Cryo::Codegen
         }
 
         // Add regular parameters
-        bool is_variadic = false;
-        if (node->parameters())
+        bool is_variadic = node->is_variadic();
+        if (node->parameters().size() > 0)
         {
-            for (const auto &param : node->parameters()->params())
+            for (const auto &param : node->parameters())
             {
-                if (param->is_variadic())
-                {
-                    is_variadic = true;
-                    break;
-                }
-                llvm::Type *param_type = get_llvm_type(param->type());
+                llvm::Type *param_type = get_llvm_type(param->get_resolved_type());
                 if (param_type)
                 {
                     param_types.push_back(param_type);
@@ -567,17 +560,15 @@ namespace Cryo::Codegen
                                                    Cryo::FunctionDeclarationNode *node,
                                                    unsigned start_idx)
     {
-        if (!fn || !node || !node->parameters())
+        if (!fn || !node )
             return;
 
         auto arg_it = fn->arg_begin();
         std::advance(arg_it, start_idx);
 
-        for (const auto &param : node->parameters()->params())
+        for (const auto &param : node->parameters())
         {
             if (arg_it == fn->arg_end())
-                break;
-            if (param->is_variadic())
                 break;
 
             arg_it->setName(param->name());
@@ -598,11 +589,12 @@ namespace Cryo::Codegen
         {
             llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
             create_store(&arg, alloca);
-            values().set_alloca(arg.getName().str(), alloca);
+            values().set_value(arg.getName().str(), nullptr, alloca);
         }
 
         // Generate body statements
-        node->body()->accept(ctx().visitor());
+        CodegenVisitor *visitor = ctx().visitor();
+        node->body()->accept(*visitor);
 
         // Add implicit return if needed
         llvm::BasicBlock *current_block = builder().GetInsertBlock();
@@ -708,7 +700,7 @@ namespace Cryo::Codegen
         // fn->addFnAttr(llvm::Attribute::InlineHint);
     }
 
-    llvm::Constant *DeclarationCodegen::generate_global_initializer(Cryo::VarDeclarationNode *node,
+    llvm::Constant *DeclarationCodegen::generate_global_initializer(Cryo::VariableDeclarationNode *node,
                                                                       llvm::Type *type)
     {
         if (!node || !type)
