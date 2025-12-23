@@ -1,0 +1,759 @@
+#include "Codegen/Expressions/ExpressionCodegen.hpp"
+#include "Codegen/Memory/MemoryCodegen.hpp"
+#include "Codegen/Declarations/TypeCodegen.hpp"
+#include "Utils/Logger.hpp"
+
+namespace Cryo::Codegen
+{
+    //===================================================================
+    // Construction
+    //===================================================================
+
+    ExpressionCodegen::ExpressionCodegen(CodegenContext &ctx)
+        : ICodegenComponent(ctx)
+    {
+    }
+
+    //===================================================================
+    // Literal Expressions
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_integer_literal(int64_t value, Cryo::Type *type)
+    {
+        // Determine bit width
+        unsigned bits = 32; // Default to i32
+        if (type)
+        {
+            std::string type_name = type->to_string();
+            if (type_name == "i8" || type_name == "u8")
+                bits = 8;
+            else if (type_name == "i16" || type_name == "u16")
+                bits = 16;
+            else if (type_name == "i32" || type_name == "u32")
+                bits = 32;
+            else if (type_name == "i64" || type_name == "u64")
+                bits = 64;
+            else if (type_name == "i128" || type_name == "u128")
+                bits = 128;
+        }
+
+        return llvm::ConstantInt::get(get_int_type(bits), value, true);
+    }
+
+    llvm::Value *ExpressionCodegen::generate_float_literal(double value, bool is_double)
+    {
+        if (is_double)
+        {
+            return llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_ctx()), value);
+        }
+        else
+        {
+            return llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_ctx()), static_cast<float>(value));
+        }
+    }
+
+    llvm::Value *ExpressionCodegen::generate_bool_literal(bool value)
+    {
+        return llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_ctx()), value ? 1 : 0);
+    }
+
+    llvm::Value *ExpressionCodegen::generate_string_literal(const std::string &value)
+    {
+        // Check cache first
+        auto it = _string_cache.find(value);
+        if (it != _string_cache.end())
+        {
+            return it->second;
+        }
+
+        // Create global string constant
+        llvm::Constant *str_constant = llvm::ConstantDataArray::getString(llvm_ctx(), value, true);
+
+        llvm::GlobalVariable *global = new llvm::GlobalVariable(
+            *module(),
+            str_constant->getType(),
+            true, // isConstant
+            llvm::GlobalValue::PrivateLinkage,
+            str_constant,
+            ".str");
+
+        global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        global->setAlignment(llvm::Align(1));
+
+        // Get pointer to first character
+        llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0);
+        llvm::Value *indices[] = {zero, zero};
+        llvm::Value *ptr = builder().CreateInBoundsGEP(str_constant->getType(), global, indices, "str.ptr");
+
+        // Cache the global (not the GEP, as GEP is instruction-specific)
+        _string_cache[value] = global;
+
+        return ptr;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_char_literal(char value)
+    {
+        return llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_ctx()), static_cast<uint8_t>(value));
+    }
+
+    llvm::Value *ExpressionCodegen::generate_null_literal(Cryo::Type *type)
+    {
+        llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
+        return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr_type));
+    }
+
+    llvm::Value *ExpressionCodegen::generate_literal(Cryo::LiteralExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null literal node");
+            return nullptr;
+        }
+
+        const auto &value = node->value();
+
+        // Check literal type
+        if (std::holds_alternative<int64_t>(value))
+        {
+            return generate_integer_literal(std::get<int64_t>(value), node->resolved_type());
+        }
+        else if (std::holds_alternative<double>(value))
+        {
+            bool is_double = true;
+            if (node->resolved_type())
+            {
+                std::string type_name = node->resolved_type()->to_string();
+                is_double = (type_name != "f32");
+            }
+            return generate_float_literal(std::get<double>(value), is_double);
+        }
+        else if (std::holds_alternative<bool>(value))
+        {
+            return generate_bool_literal(std::get<bool>(value));
+        }
+        else if (std::holds_alternative<std::string>(value))
+        {
+            return generate_string_literal(std::get<std::string>(value));
+        }
+        else if (std::holds_alternative<char>(value))
+        {
+            return generate_char_literal(std::get<char>(value));
+        }
+
+        report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node, "Unknown literal type");
+        return nullptr;
+    }
+
+    //===================================================================
+    // Identifier Expressions
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_identifier(Cryo::IdentifierNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null identifier node");
+            return nullptr;
+        }
+
+        std::string name = node->name();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating identifier: {}", name);
+
+        llvm::Value *value = lookup_variable(name);
+        if (!value)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                         "Unknown identifier: " + name);
+            return nullptr;
+        }
+
+        // If it's an alloca, load the value
+        if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value))
+        {
+            llvm::Type *loaded_type = alloca->getAllocatedType();
+            return create_load(alloca, loaded_type, name + ".load");
+        }
+
+        return value;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_identifier_address(Cryo::IdentifierNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        std::string name = node->name();
+
+        // Try alloca first
+        if (llvm::AllocaInst *alloca = values().get_alloca(name))
+        {
+            return alloca;
+        }
+
+        // Try value context
+        if (llvm::Value *value = values().get_value(name))
+        {
+            // If it's a pointer, return it directly
+            if (value->getType()->isPointerTy())
+            {
+                return value;
+            }
+        }
+
+        // Try global variable
+        if (llvm::GlobalVariable *global = module()->getGlobalVariable(name))
+        {
+            return global;
+        }
+
+        report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                     "Cannot get address of: " + name);
+        return nullptr;
+    }
+
+    llvm::Value *ExpressionCodegen::lookup_variable(const std::string &name)
+    {
+        // Try alloca first
+        if (llvm::AllocaInst *alloca = values().get_alloca(name))
+        {
+            return alloca;
+        }
+
+        // Try value context
+        if (llvm::Value *value = values().get_value(name))
+        {
+            return value;
+        }
+
+        // Try global variable
+        if (llvm::GlobalVariable *global = module()->getGlobalVariable(name))
+        {
+            return global;
+        }
+
+        // Try function
+        if (llvm::Function *func = module()->getFunction(name))
+        {
+            return func;
+        }
+
+        return nullptr;
+    }
+
+    //===================================================================
+    // Member Access Expressions
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_member_access(Cryo::MemberAccessNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null member access node");
+            return nullptr;
+        }
+
+        std::string member_name = node->member();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating member access: {}", member_name);
+
+        // Get member address first
+        llvm::Value *member_ptr = generate_member_address(node);
+        if (!member_ptr)
+        {
+            return nullptr;
+        }
+
+        // Determine the type to load
+        llvm::StructType *struct_type = nullptr;
+        unsigned field_idx = 0;
+        if (resolve_member_info(node->object(), member_name, struct_type, field_idx))
+        {
+            llvm::Type *field_type = struct_type->getElementType(field_idx);
+            return create_load(member_ptr, field_type, member_name + ".load");
+        }
+
+        // Fallback: assume pointer type
+        return member_ptr;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_member_address(Cryo::MemberAccessNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        std::string member_name = node->member();
+
+        // Generate object expression
+        llvm::Value *object = generate(node->object());
+        if (!object)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                         "Failed to generate member access object");
+            return nullptr;
+        }
+
+        // Ensure we have a pointer to the struct
+        if (!object->getType()->isPointerTy())
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                         "Member access requires pointer type");
+            return nullptr;
+        }
+
+        // Resolve struct type and field index
+        llvm::StructType *struct_type = nullptr;
+        unsigned field_idx = 0;
+        if (!resolve_member_info(node->object(), member_name, struct_type, field_idx))
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                         "Cannot resolve member: " + member_name);
+            return nullptr;
+        }
+
+        // Create GEP for field access
+        return create_struct_gep(struct_type, object, field_idx, member_name + ".ptr");
+    }
+
+    int ExpressionCodegen::get_field_index(llvm::StructType *struct_type, const std::string &field_name)
+    {
+        if (!struct_type)
+            return -1;
+
+        // Look up field info from context
+        // This requires the struct to have been registered with field names
+        // For now, return -1 to indicate lookup is needed elsewhere
+
+        return -1;
+    }
+
+    //===================================================================
+    // Index Expressions
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_index(Cryo::IndexExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null index node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating index expression");
+
+        // Get element address
+        llvm::Value *element_ptr = generate_index_address(node);
+        if (!element_ptr)
+        {
+            return nullptr;
+        }
+
+        // Determine element type and load
+        Cryo::Type *array_type = node->array()->resolved_type();
+        if (array_type && array_type->kind() == TypeKind::Array)
+        {
+            llvm::Type *element_type = get_llvm_type(array_type);
+            // Array type gives us the full array, we need element type
+            if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(element_type))
+            {
+                return create_load(element_ptr, arr_type->getElementType(), "elem.load");
+            }
+        }
+
+        // Fallback
+        return element_ptr;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_index_address(Cryo::IndexExpressionNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        // Generate array expression
+        llvm::Value *array_val = generate(node->array());
+        if (!array_val)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                         "Failed to generate array expression");
+            return nullptr;
+        }
+
+        // Generate index expression
+        llvm::Value *index_val = generate(node->index());
+        if (!index_val)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                         "Failed to generate index expression");
+            return nullptr;
+        }
+
+        // Ensure index is integer type
+        if (!index_val->getType()->isIntegerTy())
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                         "Index must be integer type");
+            return nullptr;
+        }
+
+        // Get element type
+        llvm::Type *element_type = nullptr;
+        if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(array_val->getType()))
+        {
+            element_type = arr_type->getElementType();
+        }
+        else
+        {
+            // Assume pointer to elements
+            element_type = llvm::Type::getInt8Ty(llvm_ctx()); // Default
+        }
+
+        // Create GEP
+        return create_array_gep(element_type, array_val, index_val, "elem.ptr");
+    }
+
+    //===================================================================
+    // Cast Expressions
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_cast(Cryo::CastExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null cast node");
+            return nullptr;
+        }
+
+        // Generate source expression
+        llvm::Value *value = generate(node->expression());
+        if (!value)
+        {
+            return nullptr;
+        }
+
+        return generate_cast(value, node->target_type());
+    }
+
+    llvm::Value *ExpressionCodegen::generate_cast(llvm::Value *value, Cryo::Type *target_type)
+    {
+        if (!value || !target_type)
+            return value;
+
+        llvm::Type *llvm_target = get_llvm_type(target_type);
+        if (!llvm_target)
+        {
+            return value;
+        }
+
+        return cast_if_needed(value, llvm_target);
+    }
+
+    //===================================================================
+    // Sizeof/Alignof
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_sizeof(Cryo::SizeofExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null sizeof node");
+            return nullptr;
+        }
+
+        return generate_sizeof(node->target_type());
+    }
+
+    llvm::Value *ExpressionCodegen::generate_sizeof(Cryo::Type *type)
+    {
+        if (!type)
+        {
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
+        }
+
+        llvm::Type *llvm_type = get_llvm_type(type);
+        if (!llvm_type)
+        {
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
+        }
+
+        const llvm::DataLayout &dl = module()->getDataLayout();
+        uint64_t size = dl.getTypeAllocSize(llvm_type);
+
+        return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
+    }
+
+    llvm::Value *ExpressionCodegen::generate_alignof(Cryo::Type *type)
+    {
+        if (!type)
+        {
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1);
+        }
+
+        llvm::Type *llvm_type = get_llvm_type(type);
+        if (!llvm_type)
+        {
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1);
+        }
+
+        const llvm::DataLayout &dl = module()->getDataLayout();
+        uint64_t align = dl.getABITypeAlign(llvm_type).value();
+
+        return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), align);
+    }
+
+    //===================================================================
+    // Address-of and Dereference
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_address_of(Cryo::ExpressionNode *operand)
+    {
+        if (!operand)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null operand for address-of");
+            return nullptr;
+        }
+
+        // Handle different expression types
+        if (auto *id = dynamic_cast<IdentifierNode *>(operand))
+        {
+            return generate_identifier_address(id);
+        }
+        else if (auto *member = dynamic_cast<MemberAccessNode *>(operand))
+        {
+            return generate_member_address(member);
+        }
+        else if (auto *index = dynamic_cast<IndexExpressionNode *>(operand))
+        {
+            return generate_index_address(index);
+        }
+
+        report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, operand,
+                     "Cannot take address of this expression");
+        return nullptr;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_dereference(llvm::Value *operand, Cryo::Type *pointee_type)
+    {
+        if (!operand)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null operand for dereference");
+            return nullptr;
+        }
+
+        if (!operand->getType()->isPointerTy())
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR,
+                         "Cannot dereference non-pointer type");
+            return nullptr;
+        }
+
+        llvm::Type *load_type = nullptr;
+        if (pointee_type)
+        {
+            load_type = get_llvm_type(pointee_type);
+        }
+
+        if (!load_type)
+        {
+            // Default to i8
+            load_type = llvm::Type::getInt8Ty(llvm_ctx());
+        }
+
+        return create_load(operand, load_type, "deref");
+    }
+
+    //===================================================================
+    // Ternary Expression
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_ternary(Cryo::TernaryExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null ternary node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating ternary expression");
+
+        // Generate condition
+        llvm::Value *condition = generate(node->condition());
+        if (!condition)
+        {
+            return nullptr;
+        }
+
+        // Convert to i1 if needed
+        if (!condition->getType()->isIntegerTy(1))
+        {
+            if (condition->getType()->isIntegerTy())
+            {
+                condition = builder().CreateICmpNE(
+                    condition,
+                    llvm::ConstantInt::get(condition->getType(), 0),
+                    "tobool");
+            }
+            else
+            {
+                report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                             "Ternary condition must be boolean");
+                return nullptr;
+            }
+        }
+
+        // Create basic blocks
+        llvm::Function *fn = builder().GetInsertBlock()->getParent();
+        llvm::BasicBlock *then_block = create_block("ternary.then", fn);
+        llvm::BasicBlock *else_block = create_block("ternary.else", fn);
+        llvm::BasicBlock *merge_block = create_block("ternary.merge", fn);
+
+        // Branch on condition
+        builder().CreateCondBr(condition, then_block, else_block);
+
+        // Generate true value
+        builder().SetInsertPoint(then_block);
+        llvm::Value *then_val = generate(node->then_expression());
+        if (!then_val)
+        {
+            return nullptr;
+        }
+        llvm::BasicBlock *then_end = builder().GetInsertBlock();
+        builder().CreateBr(merge_block);
+
+        // Generate false value
+        builder().SetInsertPoint(else_block);
+        llvm::Value *else_val = generate(node->else_expression());
+        if (!else_val)
+        {
+            return nullptr;
+        }
+        llvm::BasicBlock *else_end = builder().GetInsertBlock();
+        builder().CreateBr(merge_block);
+
+        // Create phi node
+        builder().SetInsertPoint(merge_block);
+        llvm::PHINode *phi = builder().CreatePHI(then_val->getType(), 2, "ternary.result");
+        phi->addIncoming(then_val, then_end);
+        phi->addIncoming(cast_if_needed(else_val, then_val->getType()), else_end);
+
+        return phi;
+    }
+
+    //===================================================================
+    // Helpers
+    //===================================================================
+
+    bool ExpressionCodegen::is_lvalue(Cryo::ExpressionNode *expr) const
+    {
+        if (!expr)
+            return false;
+
+        // Identifiers are lvalues
+        if (dynamic_cast<IdentifierNode *>(expr))
+        {
+            return true;
+        }
+
+        // Member access is lvalue
+        if (dynamic_cast<MemberAccessNode *>(expr))
+        {
+            return true;
+        }
+
+        // Index expression is lvalue
+        if (dynamic_cast<IndexExpressionNode *>(expr))
+        {
+            return true;
+        }
+
+        // Dereference is lvalue
+        if (auto *unary = dynamic_cast<UnaryExpressionNode *>(expr))
+        {
+            if (unary->operator_token().kind() == TokenKind::TK_STAR)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    llvm::Value *ExpressionCodegen::generate(Cryo::ExpressionNode *expr)
+    {
+        if (!expr)
+            return nullptr;
+
+        // Use visitor pattern through context
+        expr->accept(ctx().visitor());
+        return get_result();
+    }
+
+    //===================================================================
+    // Internal Helpers
+    //===================================================================
+
+    llvm::IntegerType *ExpressionCodegen::get_int_type(unsigned bits)
+    {
+        return llvm::IntegerType::get(llvm_ctx(), bits);
+    }
+
+    llvm::Value *ExpressionCodegen::load_if_pointer(llvm::Value *value, llvm::Type *expected_type)
+    {
+        if (!value)
+            return nullptr;
+
+        if (value->getType()->isPointerTy() && expected_type && !expected_type->isPointerTy())
+        {
+            return create_load(value, expected_type, "load");
+        }
+
+        return value;
+    }
+
+    bool ExpressionCodegen::resolve_member_info(Cryo::ExpressionNode *object,
+                                                  const std::string &member_name,
+                                                  llvm::StructType *&out_struct_type,
+                                                  unsigned &out_field_idx)
+    {
+        if (!object)
+            return false;
+
+        // Get the type of the object
+        Cryo::Type *obj_type = object->resolved_type();
+        if (!obj_type)
+            return false;
+
+        // Get type name (strip pointer if needed)
+        std::string type_name = obj_type->to_string();
+        if (!type_name.empty() && type_name.back() == '*')
+        {
+            type_name.pop_back();
+        }
+
+        // Look up struct type
+        out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+        if (!out_struct_type)
+        {
+            // Try context registry
+            if (llvm::Type *type = ctx().get_type(type_name))
+            {
+                out_struct_type = llvm::dyn_cast<llvm::StructType>(type);
+            }
+        }
+
+        if (!out_struct_type)
+        {
+            return false;
+        }
+
+        // Look up field index from context's field mapping
+        const auto &field_map = ctx().get_field_indices(type_name);
+        auto it = field_map.find(member_name);
+        if (it != field_map.end())
+        {
+            out_field_idx = it->second;
+            return true;
+        }
+
+        // Fallback: Check symbol table for field info
+        return false;
+    }
+
+} // namespace Cryo::Codegen
