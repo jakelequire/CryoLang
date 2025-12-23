@@ -117,6 +117,18 @@ namespace Cryo::Codegen
             Cryo::SymbolTable &symbols,
             Cryo::DiagnosticManager *diagnostics);
 
+        /**
+         * @brief Set the visitor for AST traversal dispatch
+         * @param visitor The CodegenVisitor instance
+         */
+        void set_visitor(CodegenVisitor *visitor) { _visitor = visitor; }
+
+        /**
+         * @brief Get the visitor for AST traversal
+         * @return CodegenVisitor pointer (may be null during construction)
+         */
+        CodegenVisitor *visitor() { return _visitor; }
+
         ~CodegenContext() = default;
 
         // Non-copyable, non-movable
@@ -228,6 +240,22 @@ namespace Cryo::Codegen
         bool has_value(Cryo::ASTNode *node);
 
         //===================================================================
+        // Type/Function Registration
+        //===================================================================
+
+        /** @brief Register a named type */
+        void register_type(const std::string &name, llvm::Type *type);
+
+        /** @brief Get a registered type by name */
+        llvm::Type *get_type(const std::string &name);
+
+        /** @brief Register a named function */
+        void register_function(const std::string &name, llvm::Function *fn);
+
+        /** @brief Get a registered function by name */
+        llvm::Function *get_function(const std::string &name);
+
+        //===================================================================
         // Current Expression Result
         //===================================================================
 
@@ -296,6 +324,7 @@ namespace Cryo::Codegen
         LLVMContextManager &_llvm;
         Cryo::SymbolTable &_symbols;
         Cryo::DiagnosticManager *_diagnostics;
+        CodegenVisitor *_visitor = nullptr;
 
         //===================================================================
         // Owned Components

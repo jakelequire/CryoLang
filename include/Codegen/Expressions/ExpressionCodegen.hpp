@@ -51,6 +51,21 @@ namespace Cryo::Codegen
          */
         void set_type_codegen(TypeCodegen *types_codegen) { _type_codegen = types_codegen; }
 
+        /**
+         * @brief Set the operator codegen component
+         */
+        void set_operator_codegen(class OperatorCodegen *ops) { _operators = ops; }
+
+        /**
+         * @brief Set the call codegen component
+         */
+        void set_call_codegen(class CallCodegen *calls) { _calls = calls; }
+
+        /**
+         * @brief Set the cast codegen component
+         */
+        void set_cast_codegen(class CastCodegen *casts) { _casts = casts; }
+
         //===================================================================
         // Literal Expressions
         //===================================================================
@@ -105,6 +120,48 @@ namespace Cryo::Codegen
          * @return Generated value
          */
         llvm::Value *generate_literal(Cryo::LiteralExpressionNode *node);
+
+        /**
+         * @brief Generate literal from LiteralNode
+         * @param node Literal node
+         * @return Generated value
+         */
+        llvm::Value *generate_literal(Cryo::LiteralNode *node);
+
+        /**
+         * @brief Generate array literal
+         * @param node Array literal node
+         * @return Generated array value
+         */
+        llvm::Value *generate_array_literal(Cryo::ArrayLiteralNode *node);
+
+        /**
+         * @brief Generate struct literal
+         * @param node Struct literal node
+         * @return Generated struct value
+         */
+        llvm::Value *generate_struct_literal(Cryo::StructLiteralNode *node);
+
+        /**
+         * @brief Generate array access expression
+         * @param node Array access node
+         * @return Element value
+         */
+        llvm::Value *generate_array_access(Cryo::ArrayAccessNode *node);
+
+        /**
+         * @brief Generate new expression (heap allocation)
+         * @param node New expression node
+         * @return Pointer to allocated object
+         */
+        llvm::Value *generate_new(Cryo::NewExpressionNode *node);
+
+        /**
+         * @brief Generate scope resolution expression
+         * @param node Scope resolution node
+         * @return Resolved value
+         */
+        llvm::Value *generate_scope_resolution(Cryo::ScopeResolutionNode *node);
 
         //===================================================================
         // Identifier Expressions
@@ -270,6 +327,9 @@ namespace Cryo::Codegen
     private:
         MemoryCodegen *_memory = nullptr;
         TypeCodegen *_type_codegen = nullptr;
+        OperatorCodegen *_operators = nullptr;
+        CallCodegen *_calls = nullptr;
+        CastCodegen *_casts = nullptr;
 
         //===================================================================
         // Internal Helpers

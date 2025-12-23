@@ -10,11 +10,17 @@
 #include <string>
 #include <vector>
 
+namespace Cryo
+{
+    class TypeChecker; // Forward declaration for import_specialized_methods
+}
+
 namespace Cryo::Codegen
 {
     // Forward declarations
     class MemoryCodegen;
     class TypeCodegen;
+    class GenericCodegen;
 
     /**
      * @brief Handles all declaration code generation
@@ -51,6 +57,73 @@ namespace Cryo::Codegen
          * @brief Set the type codegen component
          */
         void set_type_codegen(TypeCodegen *types) { _type_codegen = types; }
+
+        /**
+         * @brief Set the generic codegen component
+         */
+        void set_generic_codegen(class GenericCodegen *generics) { _generics = generics; }
+
+        /**
+         * @brief Set pre-registration mode
+         */
+        void set_pre_registration_mode(bool enabled) { _pre_registration_mode = enabled; }
+
+        //===================================================================
+        // High-Level Entry Points (called by visitor)
+        //===================================================================
+
+        /**
+         * @brief Generate a function (dispatch to declaration or definition)
+         * @param node Function declaration node
+         * @return Generated function
+         */
+        llvm::Function *generate_function(Cryo::FunctionDeclarationNode *node);
+
+        /**
+         * @brief Generate a variable declaration
+         * @param node Variable declaration node
+         */
+        void generate_variable(Cryo::VariableDeclarationNode *node);
+
+        /**
+         * @brief Generate a struct method
+         * @param node Method node
+         */
+        void generate_method(Cryo::StructMethodNode *node);
+
+        /**
+         * @brief Generate an implementation block
+         * @param node Implementation block node
+         */
+        void generate_impl_block(Cryo::ImplementationBlockNode *node);
+
+        /**
+         * @brief Generate an extern block
+         * @param node Extern block node
+         */
+        void generate_extern_block(Cryo::ExternBlockNode *node);
+
+        /**
+         * @brief Pre-register all functions from symbol table
+         */
+        void pre_register_functions();
+
+        /**
+         * @brief Import specialized methods from TypeChecker
+         * @param type_checker TypeChecker reference
+         */
+        void import_specialized_methods(const Cryo::TypeChecker &type_checker);
+
+        /**
+         * @brief Process global variables recursively
+         * @param node Root AST node
+         */
+        void process_global_variables(Cryo::ASTNode *node);
+
+        /**
+         * @brief Generate global constructor function
+         */
+        void generate_global_constructors();
 
         //===================================================================
         // Function Declarations
@@ -193,6 +266,8 @@ namespace Cryo::Codegen
     private:
         MemoryCodegen *_memory = nullptr;
         TypeCodegen *_type_codegen = nullptr;
+        GenericCodegen *_generics = nullptr;
+        bool _pre_registration_mode = false;
 
         //===================================================================
         // Internal Helpers

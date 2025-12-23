@@ -109,6 +109,40 @@ namespace Cryo::Codegen
     }
 
     //===================================================================
+    // Type/Function Registration
+    //===================================================================
+
+    void CodegenContext::register_type(const std::string &name, llvm::Type *type)
+    {
+        if (!name.empty() && type)
+        {
+            _types[name] = type;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered type: {}", name);
+        }
+    }
+
+    llvm::Type *CodegenContext::get_type(const std::string &name)
+    {
+        auto it = _types.find(name);
+        return (it != _types.end()) ? it->second : nullptr;
+    }
+
+    void CodegenContext::register_function(const std::string &name, llvm::Function *fn)
+    {
+        if (!name.empty() && fn)
+        {
+            _functions[name] = fn;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered function: {}", name);
+        }
+    }
+
+    llvm::Function *CodegenContext::get_function(const std::string &name)
+    {
+        auto it = _functions.find(name);
+        return (it != _functions.end()) ? it->second : nullptr;
+    }
+
+    //===================================================================
     // Source Context
     //===================================================================
 
