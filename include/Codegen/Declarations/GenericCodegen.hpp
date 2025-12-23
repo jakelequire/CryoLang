@@ -261,7 +261,7 @@ namespace Cryo::Codegen
          * @return Vector of substituted LLVM types
          */
         std::vector<llvm::Type *> create_substituted_fields(
-            const std::vector<std::unique_ptr<Cryo::FieldDeclarationNode>> &fields);
+            const std::vector<std::unique_ptr<Cryo::StructFieldNode>> &fields);
 
         /**
          * @brief Create function type with substitution

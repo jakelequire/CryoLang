@@ -486,9 +486,9 @@ namespace Cryo::Codegen
         }
 
         // Check if fixed size array
-        if (type->has_size())
+        if (type->array_size().has_value())
         {
-            size_t size = type->size();
+            size_t size = type->array_size().value();
             return llvm::ArrayType::get(llvm_elem, size);
         }
         else
@@ -618,7 +618,7 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_enum - {}", name);
 
         // Simple enum (no associated data) -> integer
-        if (type->is_simple())
+        if (type->is_simple_enum())
         {
             // Use i32 for discriminant
             return i32_type();
