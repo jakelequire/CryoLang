@@ -1,0 +1,534 @@
+#include "Codegen/Declarations/TypeCodegen.hpp"
+#include "Utils/Logger.hpp"
+
+namespace Cryo::Codegen
+{
+    //===================================================================
+    // Construction
+    //===================================================================
+
+    TypeCodegen::TypeCodegen(CodegenContext &ctx)
+        : ICodegenComponent(ctx)
+    {
+    }
+
+    //===================================================================
+    // Type Resolution
+    //===================================================================
+
+    llvm::Type *TypeCodegen::resolve_type(Cryo::Type *cryo_type)
+    {
+        if (!cryo_type)
+            return nullptr;
+
+        return types().get_type(cryo_type);
+    }
+
+    llvm::Type *TypeCodegen::resolve_type_by_name(const std::string &name)
+    {
+        // Check context registry first
+        if (llvm::Type *type = ctx().get_type(name))
+        {
+            return type;
+        }
+
+        // Check LLVM context for named structs
+        if (llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), name))
+        {
+            return struct_type;
+        }
+
+        // Try type mapper
+        return types().get_type(name);
+    }
+
+    llvm::Type *TypeCodegen::resolve_generic_type(const std::string &base_type,
+                                                    const std::vector<Cryo::Type *> &type_args)
+    {
+        // Build cache key
+        std::string cache_key = base_type + "<";
+        for (size_t i = 0; i < type_args.size(); ++i)
+        {
+            if (i > 0)
+                cache_key += ",";
+            if (type_args[i])
+            {
+                cache_key += type_args[i]->to_string();
+            }
+        }
+        cache_key += ">";
+
+        // Check cache
+        auto it = _generic_cache.find(cache_key);
+        if (it != _generic_cache.end())
+        {
+            return it->second;
+        }
+
+        // Look up base generic type
+        llvm::Type *base = resolve_type_by_name(base_type);
+        if (!base)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown generic base type: {}", base_type);
+            return nullptr;
+        }
+
+        // For struct types, we need to instantiate with the type arguments
+        // This is a simplified version - full generic support would be more complex
+        if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(base))
+        {
+            // Create new struct with substituted types
+            std::string instantiated_name = cache_key;
+            llvm::StructType *new_type = llvm::StructType::create(llvm_ctx(), instantiated_name);
+
+            // For now, just copy the structure
+            // Full implementation would substitute type parameters
+            if (!struct_type->isOpaque())
+            {
+                std::vector<llvm::Type *> elements;
+                for (unsigned i = 0; i < struct_type->getNumElements(); ++i)
+                {
+                    elements.push_back(struct_type->getElementType(i));
+                }
+                new_type->setBody(elements);
+            }
+
+            _generic_cache[cache_key] = new_type;
+            return new_type;
+        }
+
+        return base;
+    }
+
+    //===================================================================
+    // Type Casting
+    //===================================================================
+
+    llvm::Value *TypeCodegen::cast_value(llvm::Value *value, llvm::Type *target_type,
+                                           const std::string &name)
+    {
+        if (!value || !target_type)
+            return value;
+
+        llvm::Type *source_type = value->getType();
+
+        // Same type - no cast needed
+        if (source_type == target_type)
+        {
+            return value;
+        }
+
+        std::string cast_name = name.empty() ? "cast" : name;
+
+        // Integer to integer
+        if (source_type->isIntegerTy() && target_type->isIntegerTy())
+        {
+            return convert_integer(value, target_type, true);
+        }
+
+        // Float to float
+        if (source_type->isFloatingPointTy() && target_type->isFloatingPointTy())
+        {
+            return convert_float(value, target_type);
+        }
+
+        // Integer to float
+        if (source_type->isIntegerTy() && target_type->isFloatingPointTy())
+        {
+            return convert_int_float(value, target_type, true);
+        }
+
+        // Float to integer
+        if (source_type->isFloatingPointTy() && target_type->isIntegerTy())
+        {
+            return convert_int_float(value, target_type, true);
+        }
+
+        // Pointer conversions
+        if (source_type->isPointerTy() && target_type->isPointerTy())
+        {
+            return convert_pointer(value, target_type);
+        }
+
+        // Pointer to integer
+        if (source_type->isPointerTy() && target_type->isIntegerTy())
+        {
+            return builder().CreatePtrToInt(value, target_type, cast_name);
+        }
+
+        // Integer to pointer
+        if (source_type->isIntegerTy() && target_type->isPointerTy())
+        {
+            return builder().CreateIntToPtr(value, target_type, cast_name);
+        }
+
+        LOG_WARN(Cryo::LogComponent::CODEGEN, "Unable to cast between incompatible types");
+        return value;
+    }
+
+    llvm::Value *TypeCodegen::convert_integer(llvm::Value *value, llvm::Type *target_type,
+                                                bool is_signed)
+    {
+        if (!value || !target_type)
+            return value;
+
+        llvm::Type *source_type = value->getType();
+        if (!source_type->isIntegerTy() || !target_type->isIntegerTy())
+        {
+            return value;
+        }
+
+        unsigned src_bits = source_type->getIntegerBitWidth();
+        unsigned dst_bits = target_type->getIntegerBitWidth();
+
+        if (dst_bits > src_bits)
+        {
+            // Extension
+            if (is_signed)
+            {
+                return builder().CreateSExt(value, target_type, "sext");
+            }
+            else
+            {
+                return builder().CreateZExt(value, target_type, "zext");
+            }
+        }
+        else if (dst_bits < src_bits)
+        {
+            // Truncation
+            return builder().CreateTrunc(value, target_type, "trunc");
+        }
+
+        return value;
+    }
+
+    llvm::Value *TypeCodegen::convert_float(llvm::Value *value, llvm::Type *target_type)
+    {
+        if (!value || !target_type)
+            return value;
+
+        llvm::Type *source_type = value->getType();
+        if (!source_type->isFloatingPointTy() || !target_type->isFloatingPointTy())
+        {
+            return value;
+        }
+
+        // Get sizes
+        bool src_is_double = source_type->isDoubleTy();
+        bool dst_is_double = target_type->isDoubleTy();
+
+        if (!src_is_double && dst_is_double)
+        {
+            // Float to double (extension)
+            return builder().CreateFPExt(value, target_type, "fpext");
+        }
+        else if (src_is_double && !dst_is_double)
+        {
+            // Double to float (truncation)
+            return builder().CreateFPTrunc(value, target_type, "fptrunc");
+        }
+
+        return value;
+    }
+
+    llvm::Value *TypeCodegen::convert_int_float(llvm::Value *value, llvm::Type *target_type,
+                                                  bool source_signed)
+    {
+        if (!value || !target_type)
+            return value;
+
+        llvm::Type *source_type = value->getType();
+
+        // Integer to float
+        if (source_type->isIntegerTy() && target_type->isFloatingPointTy())
+        {
+            if (source_signed)
+            {
+                return builder().CreateSIToFP(value, target_type, "sitofp");
+            }
+            else
+            {
+                return builder().CreateUIToFP(value, target_type, "uitofp");
+            }
+        }
+
+        // Float to integer
+        if (source_type->isFloatingPointTy() && target_type->isIntegerTy())
+        {
+            if (source_signed)
+            {
+                return builder().CreateFPToSI(value, target_type, "fptosi");
+            }
+            else
+            {
+                return builder().CreateFPToUI(value, target_type, "fptoui");
+            }
+        }
+
+        return value;
+    }
+
+    llvm::Value *TypeCodegen::convert_pointer(llvm::Value *value, llvm::Type *target_type)
+    {
+        if (!value || !target_type)
+            return value;
+
+        if (!value->getType()->isPointerTy() || !target_type->isPointerTy())
+        {
+            return value;
+        }
+
+        // With opaque pointers, we can just return the value
+        // In older LLVM, we would use CreateBitCast
+        return value;
+    }
+
+    //===================================================================
+    // Type Compatibility
+    //===================================================================
+
+    bool TypeCodegen::are_compatible(llvm::Type *from, llvm::Type *to) const
+    {
+        if (!from || !to)
+            return false;
+
+        if (from == to)
+            return true;
+
+        // Integer compatibility
+        if (from->isIntegerTy() && to->isIntegerTy())
+        {
+            return true;
+        }
+
+        // Float compatibility
+        if (from->isFloatingPointTy() && to->isFloatingPointTy())
+        {
+            return true;
+        }
+
+        // Integer <-> Float
+        if ((from->isIntegerTy() && to->isFloatingPointTy()) ||
+            (from->isFloatingPointTy() && to->isIntegerTy()))
+        {
+            return true;
+        }
+
+        // Pointer compatibility
+        if (from->isPointerTy() && to->isPointerTy())
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    bool TypeCodegen::is_lossy_conversion(llvm::Type *from, llvm::Type *to) const
+    {
+        if (!from || !to)
+            return true;
+
+        // Same type - not lossy
+        if (from == to)
+            return false;
+
+        // Integer truncation
+        if (from->isIntegerTy() && to->isIntegerTy())
+        {
+            return from->getIntegerBitWidth() > to->getIntegerBitWidth();
+        }
+
+        // Float truncation
+        if (from->isFloatingPointTy() && to->isFloatingPointTy())
+        {
+            return from->isDoubleTy() && to->isFloatTy();
+        }
+
+        // Float to integer is always potentially lossy
+        if (from->isFloatingPointTy() && to->isIntegerTy())
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    llvm::Type *TypeCodegen::get_common_type(llvm::Type *lhs, llvm::Type *rhs)
+    {
+        if (!lhs || !rhs)
+            return nullptr;
+
+        if (lhs == rhs)
+            return lhs;
+
+        // Both integers - use larger
+        if (lhs->isIntegerTy() && rhs->isIntegerTy())
+        {
+            unsigned lhs_bits = lhs->getIntegerBitWidth();
+            unsigned rhs_bits = rhs->getIntegerBitWidth();
+            return (lhs_bits >= rhs_bits) ? lhs : rhs;
+        }
+
+        // Both floats - use larger
+        if (lhs->isFloatingPointTy() && rhs->isFloatingPointTy())
+        {
+            return (lhs->isDoubleTy() || rhs->isDoubleTy())
+                       ? llvm::Type::getDoubleTy(llvm_ctx())
+                       : llvm::Type::getFloatTy(llvm_ctx());
+        }
+
+        // Mixed int/float - prefer float
+        if ((lhs->isIntegerTy() && rhs->isFloatingPointTy()) ||
+            (lhs->isFloatingPointTy() && rhs->isIntegerTy()))
+        {
+            return lhs->isFloatingPointTy() ? lhs : rhs;
+        }
+
+        // Both pointers - use first
+        if (lhs->isPointerTy() && rhs->isPointerTy())
+        {
+            return lhs;
+        }
+
+        return nullptr;
+    }
+
+    //===================================================================
+    // Type Layout
+    //===================================================================
+
+    uint64_t TypeCodegen::get_type_size(llvm::Type *type) const
+    {
+        if (!type)
+            return 0;
+
+        const llvm::DataLayout &dl = module()->getDataLayout();
+        return dl.getTypeAllocSize(type);
+    }
+
+    uint64_t TypeCodegen::get_type_alignment(llvm::Type *type) const
+    {
+        if (!type)
+            return 0;
+
+        const llvm::DataLayout &dl = module()->getDataLayout();
+        return dl.getABITypeAlign(type).value();
+    }
+
+    uint64_t TypeCodegen::get_field_offset(llvm::StructType *struct_type, unsigned field_index) const
+    {
+        if (!struct_type || field_index >= struct_type->getNumElements())
+            return 0;
+
+        const llvm::DataLayout &dl = module()->getDataLayout();
+        const llvm::StructLayout *layout = dl.getStructLayout(struct_type);
+        return layout->getElementOffset(field_index);
+    }
+
+    //===================================================================
+    // Pointer Operations
+    //===================================================================
+
+    llvm::PointerType *TypeCodegen::get_pointer_type(llvm::Type *base_type, unsigned address_space)
+    {
+        // With opaque pointers in newer LLVM, all pointers are the same type
+        return llvm::PointerType::get(llvm_ctx(), address_space);
+    }
+
+    llvm::Type *TypeCodegen::get_pointee_type(llvm::Type *ptr_type) const
+    {
+        // With opaque pointers, we can't get pointee type from the pointer itself
+        // The caller must track this separately
+        return nullptr;
+    }
+
+    bool TypeCodegen::is_pointer_type(llvm::Type *type) const
+    {
+        return type && type->isPointerTy();
+    }
+
+    //===================================================================
+    // Array Operations
+    //===================================================================
+
+    llvm::ArrayType *TypeCodegen::get_array_type(llvm::Type *element_type, uint64_t size)
+    {
+        if (!element_type)
+            return nullptr;
+
+        return llvm::ArrayType::get(element_type, size);
+    }
+
+    llvm::Type *TypeCodegen::get_element_type(llvm::ArrayType *array_type) const
+    {
+        if (!array_type)
+            return nullptr;
+
+        return array_type->getElementType();
+    }
+
+    //===================================================================
+    // Struct Operations
+    //===================================================================
+
+    llvm::StructType *TypeCodegen::get_struct_type(const std::string &name,
+                                                     const std::vector<llvm::Type *> &field_types,
+                                                     bool packed)
+    {
+        // Check if already exists
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
+        {
+            return existing;
+        }
+
+        // Create new struct type
+        llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), name);
+        struct_type->setBody(field_types, packed);
+
+        return struct_type;
+    }
+
+    llvm::Type *TypeCodegen::get_field_type(llvm::StructType *struct_type, unsigned field_index) const
+    {
+        if (!struct_type || field_index >= struct_type->getNumElements())
+            return nullptr;
+
+        return struct_type->getElementType(field_index);
+    }
+
+    unsigned TypeCodegen::get_num_fields(llvm::StructType *struct_type) const
+    {
+        if (!struct_type)
+            return 0;
+
+        return struct_type->getNumElements();
+    }
+
+    //===================================================================
+    // Internal Helpers
+    //===================================================================
+
+    unsigned TypeCodegen::get_int_bit_width(llvm::Type *type) const
+    {
+        if (!type || !type->isIntegerTy())
+            return 0;
+
+        return type->getIntegerBitWidth();
+    }
+
+    bool TypeCodegen::is_floating_point(llvm::Type *type) const
+    {
+        return type && type->isFloatingPointTy();
+    }
+
+    bool TypeCodegen::is_signed_integer(Cryo::Type *cryo_type) const
+    {
+        if (!cryo_type)
+            return true; // Default to signed
+
+        // Check type name for unsigned prefix
+        std::string name = cryo_type->to_string();
+        return name.empty() || name[0] != 'u';
+    }
+
+} // namespace Cryo::Codegen
