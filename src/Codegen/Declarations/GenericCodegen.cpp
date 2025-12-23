@@ -48,7 +48,7 @@ namespace Cryo::Codegen
         Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
         if (!generic_def)
         {
-            report_error(ErrorCode::E0618_TYPE_RESOLUTION_ERROR,
+            report_error(ErrorCode::E0632_TYPE_RESOLUTION_ERROR,
                          "Unknown generic type: " + generic_name);
             return nullptr;
         }
@@ -56,9 +56,9 @@ namespace Cryo::Codegen
         // Get type parameters from definition
         std::vector<std::string> type_params;
         auto *struct_decl = dynamic_cast<StructDeclarationNode *>(generic_def);
-        if (struct_decl && struct_decl->type_parameters())
+        if (struct_decl)
         {
-            for (const auto &param : struct_decl->type_parameters()->parameters())
+            for (const auto &param : struct_decl->generic_parameters())
             {
                 type_params.push_back(param->name());
             }
@@ -119,7 +119,7 @@ namespace Cryo::Codegen
         Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
         if (!generic_def)
         {
-            report_error(ErrorCode::E0618_TYPE_RESOLUTION_ERROR,
+            report_error(ErrorCode::E0632_TYPE_RESOLUTION_ERROR,
                          "Unknown generic class: " + generic_name);
             return nullptr;
         }
@@ -216,7 +216,7 @@ namespace Cryo::Codegen
         Cryo::ASTNode *generic_def = get_generic_function_def(generic_name);
         if (!generic_def)
         {
-            report_error(ErrorCode::E0610_FUNCTION_BODY_ERROR,
+            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR,
                          "Unknown generic function: " + generic_name);
             return nullptr;
         }
