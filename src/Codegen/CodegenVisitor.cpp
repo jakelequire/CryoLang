@@ -1683,25 +1683,32 @@ namespace Cryo::Codegen
                     if (mapped_return_type)
                     {
                         return_type = mapped_return_type;
-                        
+
                         // Additional validation: log the return type mapping for debugging
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Struct method '{}' return type: {} -> LLVM type {}", 
-                                 qualified_name, cryo_return_type->to_string(), (void*)return_type);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Struct method '{}' return type: {} -> LLVM type {}",
+                                  qualified_name, cryo_return_type->to_string(), (void *)return_type);
                     }
                     else
                     {
                         // If type mapping fails, use a safer default based on the expected type
-                        LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to map return type '{}' for method '{}', using fallback", 
-                                cryo_return_type->to_string(), qualified_name);
-                        
+                        LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to map return type '{}' for method '{}', using fallback",
+                                 cryo_return_type->to_string(), qualified_name);
+
                         // Use type kind to determine a safer fallback
-                        if (cryo_return_type->kind() == Cryo::TypeKind::Boolean) {
+                        if (cryo_return_type->kind() == Cryo::TypeKind::Boolean)
+                        {
                             return_type = llvm::Type::getInt1Ty(context);
-                        } else if (cryo_return_type->kind() == Cryo::TypeKind::Integer) {
+                        }
+                        else if (cryo_return_type->kind() == Cryo::TypeKind::Integer)
+                        {
                             return_type = llvm::Type::getInt32Ty(context);
-                        } else if (cryo_return_type->kind() == Cryo::TypeKind::Pointer) {
+                        }
+                        else if (cryo_return_type->kind() == Cryo::TypeKind::Pointer)
+                        {
                             return_type = llvm::PointerType::getUnqual(context);
-                        } else {
+                        }
+                        else
+                        {
                             return_type = llvm::Type::getInt32Ty(context); // Safe fallback
                         }
                     }
@@ -2995,7 +3002,7 @@ namespace Cryo::Codegen
                 if (return_value)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Return value type: {}", return_value->getType()->getTypeID());
-                    
+
                     // Debug: Print the actual LLVM instruction
                     std::string return_str;
                     llvm::raw_string_ostream rso(return_str);
@@ -6903,18 +6910,18 @@ namespace Cryo::Codegen
                         LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to map return type for function {}, skipping", symbol_name);
                         continue;
                     }
-                    
+
                     // CRITICAL: Add additional validation for return type mapping
                     Cryo::Type *cryo_return_type = func_type->return_type().get();
                     std::string return_type_name = cryo_return_type ? cryo_return_type->to_string() : "unknown";
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pre-registration: Function '{}' Cryo return type: '{}' -> LLVM type: {} (TypeID: {})",
-                             symbol_name, return_type_name, (void*)return_type, static_cast<int>(return_type->getTypeID()));
-                    
+                              symbol_name, return_type_name, (void *)return_type, static_cast<int>(return_type->getTypeID()));
+
                     // Validate that boolean functions aren't being mistyped
                     if (return_type->isIntegerTy(1) && return_type_name != "boolean" && return_type_name != "bool")
                     {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Function '{}' has non-boolean Cryo type '{}' but got i1 LLVM type!", 
-                                 symbol_name, return_type_name);
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Function '{}' has non-boolean Cryo type '{}' but got i1 LLVM type!",
+                                  symbol_name, return_type_name);
                         // Use a safer fallback
                         return_type = llvm::Type::getInt32Ty(_context_manager.get_context());
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Using i32 fallback for function '{}'", symbol_name);
@@ -7533,7 +7540,7 @@ namespace Cryo::Codegen
                 // Verify the function type matches what we expect
                 llvm::FunctionType *expected_type = llvm::FunctionType::get(return_type, param_types, is_variadic);
                 llvm::FunctionType *existing_type = existing_function->getFunctionType();
-                
+
                 if (existing_type == expected_type)
                 {
                     // Set parameter names on the existing function
@@ -7553,13 +7560,13 @@ namespace Cryo::Codegen
                     // CRITICAL: Detailed mismatch analysis to prevent IR verification failures
                     llvm::Type *existing_return = existing_type->getReturnType();
                     llvm::Type *expected_return = expected_type->getReturnType();
-                    
+
                     LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL TYPE MISMATCH for function '{}'", function_name);
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Existing return type: {} (TypeID: {})", 
-                             (void*)existing_return, static_cast<int>(existing_return->getTypeID()));
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Expected return type: {} (TypeID: {})", 
-                             (void*)expected_return, static_cast<int>(expected_return->getTypeID()));
-                    
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Existing return type: {} (TypeID: {})",
+                              (void *)existing_return, static_cast<int>(existing_return->getTypeID()));
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Expected return type: {} (TypeID: {})",
+                              (void *)expected_return, static_cast<int>(expected_return->getTypeID()));
+
                     // Force removal and regeneration to prevent IR verification failures
                     existing_function->eraseFromParent();
                     _functions.erase(function_name); // Remove from our cache too
@@ -8588,10 +8595,14 @@ namespace Cryo::Codegen
         {
             auto &builder = _context_manager.get_builder();
             llvm::Value *result = nullptr;
+            llvm::Value *right_val = nullptr; // Declare right_val for use throughout the function
             TokenKind op_kind = node->operator_token().kind();
 
+            // Check if comparison evaluation itself
+            bool is_assignment = (op_kind == TokenKind::TK_EQUAL);
+
             // Handle assignment operations specially - don't evaluate left side as regular expression
-            if (op_kind == TokenKind::TK_EQUAL)
+            if (is_assignment)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Processing assignment - left side type: {}",
                           typeid(*node->left()).name());
@@ -8754,7 +8765,7 @@ namespace Cryo::Codegen
                                                                             ptr_val,
                                                                             right_val,
                                                                             llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), type_size),
-                                                                            llvm::ConstantInt::getFalse(context) // is_volatile = false
+                                                                            llvm::ConstantInt::getFalse(context) // isVolatile = false
                                                                         });
 
                                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generated memcpy for struct assignment '{}' (size: {} bytes)", type_name, type_size);
@@ -9379,7 +9390,7 @@ namespace Cryo::Codegen
 
                     // Generate right operand (the value to assign)
                     node->right()->accept(*this);
-                    llvm::Value *right_val = get_current_value();
+                    right_val = get_current_value();
 
                     if (!right_val)
                     {
@@ -9449,345 +9460,31 @@ namespace Cryo::Codegen
                             &mod,
                             llvm::Intrinsic::memcpy,
                             {field_ptr->getType(), right_val->getType(), size_val->getType()});
-                    }
 
-                    // For non-assignment operations, handle based on operator type
-                    // Short-circuit operators (&&, ||) require special handling
-                    if (op_kind == TokenKind::TK_AMPAMP || op_kind == TokenKind::TK_PIPEPIPE)
+                        // Perform the memcpy
+                        builder.CreateCall(memcpy_fn, {field_ptr, right_val, size_val, llvm::ConstantInt::getFalse(_context_manager.get_context())});
+                    }
+                    else
                     {
-                        // For short-circuit evaluation, only evaluate left first
-                        // Right will be evaluated conditionally
-                        node->left()->accept(*this);
-                        llvm::Value *left_val = get_current_value();
-
-                        if (!left_val)
-                        {
-                            std::string error_msg = "Failed to generate left operand of binary expression";
-                            if (node->left())
-                            {
-                                if (auto *id = dynamic_cast<IdentifierNode *>(node->left()))
-                                {
-                                    error_msg += ": identifier '" + id->name() + "' not found";
-                                }
-                                else if (auto *member = dynamic_cast<MemberAccessNode *>(node->left()))
-                                {
-                                    error_msg += ": member access failed";
-                                }
-                            }
-                            report_error(error_msg);
-                            return nullptr;
-                        }
-
-                        auto &llvm_ctx = _context_manager.get_context();
-                        llvm::Function *current_function = builder.GetInsertBlock()->getParent();
-
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT: Entering short-circuit evaluation for operator: {}",
-                                  (op_kind == TokenKind::TK_AMPAMP ? "&&" : "||"));
-
-                        if (op_kind == TokenKind::TK_AMPAMP)
-                        {
-                            // Logical AND: left && right
-                            // If left is false, skip right and return false
-                            llvm::BasicBlock *land_lhs = builder.GetInsertBlock();
-                            llvm::BasicBlock *land_rhs = llvm::BasicBlock::Create(llvm_ctx, "land.rhs", current_function);
-                            llvm::BasicBlock *land_end = llvm::BasicBlock::Create(llvm_ctx, "land.end", current_function);
-
-                            // Convert left to boolean
-                            llvm::Value *left_bool = left_val;
-                            if (!left_val->getType()->isIntegerTy(1))
-                            {
-                                if (left_val->getType()->isIntegerTy())
-                                {
-                                    left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
-                                }
-                                else if (left_val->getType()->isFloatingPointTy())
-                                {
-                                    left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
-                                }
-                                else
-                                {
-                                    _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, "Cannot convert left operand to boolean for logical AND", static_cast<ASTNode *>(node));
-                                    return nullptr;
-                                }
-                            }
-
-                            // Branch: if left is true, evaluate right; otherwise skip to end
-                            builder.CreateCondBr(left_bool, land_rhs, land_end);
-
-                            // Evaluate right operand in land.rhs block
-                            builder.SetInsertPoint(land_rhs);
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: About to evaluate right operand");
-                            node->right()->accept(*this);
-                            llvm::Value *right_val = get_current_value();
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Right operand evaluated, right_val={}, builder now in block: {}",
-                                      (right_val ? "non-null" : "NULL"),
-                                      builder.GetInsertBlock()->getName().str());
-
-                            if (!right_val)
-                            {
-                                // CRITICAL: Before returning error, we must terminate all created blocks
-                                // Terminate the current block and land_end
-                                llvm::BasicBlock *current_block = builder.GetInsertBlock();
-                                if (current_block && !current_block->getTerminator())
-                                {
-                                    builder.CreateBr(land_end);
-                                }
-                                builder.SetInsertPoint(land_end);
-                                builder.CreateUnreachable();
-
-                                // CRITICAL: Move builder to a dummy block so caller doesn't try to add more code
-                                // to the terminated land_end block
-                                llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
-                                builder.SetInsertPoint(dummy_block);
-
-                                _diagnostic_builder->report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Failed to generate right operand for logical AND", static_cast<ASTNode *>(node));
-                                return nullptr;
-                            }
-
-                            // Convert right to boolean
-                            llvm::Value *right_bool = right_val;
-                            std::string type_str;
-                            llvm::raw_string_ostream rso(type_str);
-                            right_val->getType()->print(rso);
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: right_val type: {}", rso.str());
-                            if (!right_val->getType()->isIntegerTy(1))
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: right_val is not i1, attempting conversion");
-                                if (right_val->getType()->isIntegerTy())
-                                {
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Converting integer to boolean");
-                                    right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
-                                }
-                                else if (right_val->getType()->isFloatingPointTy())
-                                {
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Converting float to boolean");
-                                    right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
-                                }
-                                else
-                                {
-                                    std::string err_type_str;
-                                    llvm::raw_string_ostream err_rso(err_type_str);
-                                    right_val->getType()->print(err_rso);
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Cannot convert type to boolean: {}", err_rso.str());
-
-                                    // CRITICAL: Before returning error, we must terminate all created blocks
-                                    // to prevent "does not have terminator" verification errors
-
-                                    // Terminate the current block (where we tried to evaluate right side)
-                                    llvm::BasicBlock *current_block = builder.GetInsertBlock();
-                                    if (current_block && !current_block->getTerminator())
-                                    {
-                                        builder.CreateBr(land_end);
-                                    }
-
-                                    // Terminate land_end with unreachable (this is an error path)
-                                    builder.SetInsertPoint(land_end);
-                                    builder.CreateUnreachable();
-
-                                    // Create a dummy block and position builder there to avoid "terminator in middle" errors
-                                    llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
-                                    builder.SetInsertPoint(dummy_block);
-
-                                    _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, "Cannot convert right operand to boolean for logical AND", static_cast<ASTNode *>(node));
-                                    return nullptr;
-                                }
-                            }
-                            else
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: right_val is already i1, no conversion needed");
-                            }
-
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: About to create branch to land_end");
-                            builder.CreateBr(land_end);
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Branch created");
-                            llvm::BasicBlock *land_rhs_end = builder.GetInsertBlock();
-
-                            // Create PHI node to merge results
-                            builder.SetInsertPoint(land_end);
-                            llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx), 2, "logand.result");
-                            phi->addIncoming(llvm::ConstantInt::getFalse(llvm_ctx), land_lhs);
-                            phi->addIncoming(right_bool, land_rhs_end);
-
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: land_lhs name={}, land_rhs name={}, land_end name={}",
-                                      land_lhs->getName().str(),
-                                      land_rhs_end->getName().str(),
-                                      land_end->getName().str());
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: land_lhs terminator={}, land_rhs terminator={}, land_end terminator={}",
-                                      (land_lhs->getTerminator() != nullptr),
-                                      (land_rhs_end->getTerminator() != nullptr),
-                                      (land_end->getTerminator() != nullptr));
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Builder position after setting to land_end: {}",
-                                      builder.GetInsertBlock()->getName().str());
-
-                            // Note: land_end intentionally has no terminator yet - the caller (if-statement)
-                            // will add the appropriate branch after getting the condition value
-                            return phi;
-                        }
-                        else // TK_PIPEPIPE
-                        {
-                            // Logical OR: left || right
-                            // If left is true, skip right and return true
-                            llvm::BasicBlock *lor_lhs = builder.GetInsertBlock();
-                            llvm::BasicBlock *lor_rhs = llvm::BasicBlock::Create(llvm_ctx, "lor.rhs", current_function);
-                            llvm::BasicBlock *lor_end = llvm::BasicBlock::Create(llvm_ctx, "lor.end", current_function);
-
-                            // Convert left to boolean
-                            llvm::Value *left_bool = left_val;
-                            if (!left_val->getType()->isIntegerTy(1))
-                            {
-                                if (left_val->getType()->isIntegerTy())
-                                {
-                                    left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
-                                }
-                                else if (left_val->getType()->isFloatingPointTy())
-                                {
-                                    left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
-                                }
-                                else
-                                {
-                                    _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, "Cannot convert left operand to boolean for logical OR", static_cast<ASTNode *>(node));
-                                    return nullptr;
-                                }
-                            }
-
-                            // Branch: if left is false, evaluate right; otherwise skip to end
-                            builder.CreateCondBr(left_bool, lor_end, lor_rhs);
-
-                            // Evaluate right operand in lor.rhs block
-                            builder.SetInsertPoint(lor_rhs);
-
-                            // Add debug logging for tracking block termination
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: About to evaluate right operand in block: {}",
-                                      lor_rhs->getName().str());
-
-                            node->right()->accept(*this);
-                            llvm::Value *right_val = get_current_value();
-
-                            // Get the current block after right evaluation - it might have changed due to nested expressions
-                            llvm::BasicBlock *current_after_right = builder.GetInsertBlock();
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: After right evaluation, current block: {}, has terminator: {}",
-                                      current_after_right->getName().str(), current_after_right->getTerminator() != nullptr);
-
-                            if (!right_val)
-                            {
-                                // CRITICAL: Before returning error, we must terminate all created blocks
-                                llvm::BasicBlock *current_block = builder.GetInsertBlock();
-                                if (current_block && !current_block->getTerminator())
-                                {
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating orphaned block: {}",
-                                              current_block->getName().str());
-                                    builder.CreateBr(lor_end);
-                                }
-
-                                // Also check and terminate the original lor_rhs block if it's different and unterminated
-                                if (lor_rhs != current_block && !lor_rhs->getTerminator())
-                                {
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating original lor_rhs block: {}",
-                                              lor_rhs->getName().str());
-                                    builder.SetInsertPoint(lor_rhs);
-                                    builder.CreateBr(lor_end);
-                                }
-
-                                builder.SetInsertPoint(lor_end);
-                                builder.CreateUnreachable();
-
-                                // Create a dummy block and position builder there to avoid "terminator in middle" errors
-                                llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
-                                builder.SetInsertPoint(dummy_block);
-
-                                _diagnostic_builder->report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Failed to generate right operand for logical OR", static_cast<ASTNode *>(node));
-                                return nullptr;
-                            }
-
-                            // IMPORTANT: After evaluating right operand, we might be in a different block
-                            // due to complex expressions (like casts, function calls, etc.)
-                            // We need to get the actual current block before creating the branch
-                            llvm::BasicBlock *right_eval_block = builder.GetInsertBlock();
-
-                            // Convert right to boolean
-                            llvm::Value *right_bool = right_val;
-                            if (!right_val->getType()->isIntegerTy(1))
-                            {
-                                if (right_val->getType()->isIntegerTy())
-                                {
-                                    right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
-                                }
-                                else if (right_val->getType()->isFloatingPointTy())
-                                {
-                                    right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
-                                }
-                                else
-                                {
-                                    // CRITICAL: Before returning error, we must terminate all created blocks
-                                    // to prevent "does not have terminator" verification errors
-
-                                    // Terminate the current block (where we tried to evaluate right side)
-                                    llvm::BasicBlock *current_block = builder.GetInsertBlock();
-                                    if (current_block && !current_block->getTerminator())
-                                    {
-                                        builder.CreateBr(lor_end);
-                                    }
-
-                                    // Terminate lor_end with unreachable (this is an error path)
-                                    builder.SetInsertPoint(lor_end);
-                                    builder.CreateUnreachable();
-
-                                    // Create a dummy block and position builder there to avoid "terminator in middle" errors
-                                    llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
-                                    builder.SetInsertPoint(dummy_block);
-
-                                    _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, "Cannot convert right operand to boolean for logical OR", static_cast<ASTNode *>(node));
-                                    return nullptr;
-                                }
-                            }
-
-                            // Ensure the current block (after evaluating and converting right operand) is terminated
-                            llvm::BasicBlock *final_right_block = builder.GetInsertBlock();
-                            if (!final_right_block->getTerminator())
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating final_right_block: {}",
-                                          final_right_block->getName().str());
-                                builder.CreateBr(lor_end);
-                            }
-
-                            // SAFETY CHECK: Ensure the original lor_rhs block is also terminated if it's different
-                            if (lor_rhs != final_right_block && !lor_rhs->getTerminator())
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating original lor_rhs block: {}",
-                                          lor_rhs->getName().str());
-                                // Save current position
-                                llvm::BasicBlock *saved_position = builder.GetInsertBlock();
-
-                                builder.SetInsertPoint(lor_rhs);
-                                builder.CreateBr(lor_end);
-
-                                // Restore position
-                                builder.SetInsertPoint(saved_position);
-                            }
-
-                            // Use the final block for PHI incoming
-                            llvm::BasicBlock *lor_rhs_end = final_right_block;
-
-                            // Create PHI node to merge results
-                            builder.SetInsertPoint(lor_end);
-                            llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx), 2, "logor.result");
-                            phi->addIncoming(llvm::ConstantInt::getTrue(llvm_ctx), lor_lhs);
-                            phi->addIncoming(right_bool, lor_rhs_end);
-
-                            // CRITICAL DEBUG: Log all lor.rhs blocks to ensure they're properly terminated
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Final block status - lor_lhs: {} (terminated: {}), lor_rhs_end: {} (terminated: {}), lor_end: {} (terminated: {})",
-                                      lor_lhs->getName().str(), lor_lhs->getTerminator() != nullptr,
-                                      lor_rhs_end->getName().str(), lor_rhs_end->getTerminator() != nullptr,
-                                      lor_end->getName().str(), lor_end->getTerminator() != nullptr);
-
-                            // Note: lor_end intentionally has no terminator yet - the caller (if-statement)
-                            // will add the appropriate branch after getting the condition value
-                            return phi;
-                        }
+                        // Normal assignment: store the value directly
+                        create_store(value_to_store, field_ptr);
                     }
 
-                    // For all other operations, generate both operands normally
-                    // Generate left operand
+                    return right_val;
+                }
+
+                _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                                                  "Invalid assignment target - left side must be a variable, member access, or array element");
+                return nullptr;
+            }
+            else
+            {
+                // For non-assignment operations, handle based on operator type
+                // Short-circuit operators (&&, ||) require special handling
+                if (op_kind == TokenKind::TK_AMPAMP || op_kind == TokenKind::TK_PIPEPIPE)
+                {
+                    // For short-circuit evaluation, only evaluate left first
+                    // Right will be evaluated conditionally
                     node->left()->accept(*this);
                     llvm::Value *left_val = get_current_value();
 
@@ -9809,1039 +9506,1370 @@ namespace Cryo::Codegen
                         return nullptr;
                     }
 
-                    // Generate right operand
-                    node->right()->accept(*this);
+                    auto &llvm_ctx = _context_manager.get_context();
+                    llvm::Function *current_function = builder.GetInsertBlock()->getParent();
 
-                    if (!right_val)
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT: Entering short-circuit evaluation for operator: {}",
+                              (op_kind == TokenKind::TK_AMPAMP ? "&&" : "||"));
+
+                    if (op_kind == TokenKind::TK_AMPAMP)
                     {
-                        std::string error_msg = "Failed to generate right operand of binary expression";
-                        if (node->right())
-                        {
-                            if (auto *id = dynamic_cast<IdentifierNode *>(node->right()))
-                            {
-                                error_msg += ": identifier '" + id->name() + "' not found";
-                            }
-                            else if (auto *member = dynamic_cast<MemberAccessNode *>(node->right()))
-                            {
-                                error_msg += ": member access failed";
-                            }
-                        }
-                        report_error(error_msg);
-                        return nullptr;
-                    }
+                        // Logical AND: left && right
+                        // If left is false, skip right and return false
+                        llvm::BasicBlock *land_lhs = builder.GetInsertBlock();
+                        llvm::BasicBlock *land_rhs = llvm::BasicBlock::Create(llvm_ctx, "land.rhs", current_function);
+                        llvm::BasicBlock *land_end = llvm::BasicBlock::Create(llvm_ctx, "land.end", current_function);
 
-                    // Handle binary operations based on operator token
-                    switch (op_kind)
-                    {
-                    case TokenKind::TK_PLUS:
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Handle integer type coercion for different bit widths
-                            llvm::Type *left_type = left_val->getType();
-                            llvm::Type *right_type = right_val->getType();
-
-                            if (left_type != right_type)
-                            {
-                                // Get bit widths
-                                unsigned left_bits = left_type->getIntegerBitWidth();
-                                unsigned right_bits = right_type->getIntegerBitWidth();
-
-                                // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
-                                if (left_bits > right_bits)
-                                {
-                                    // Truncate left operand to match right operand's type
-                                    left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
-                                }
-                                else if (right_bits > left_bits)
-                                {
-                                    // Truncate right operand to match left operand's type
-                                    right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
-                                }
-                            }
-
-                            result = builder.CreateAdd(left_val, right_val, "add.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            // Handle float addition (convert if needed)
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            result = builder.CreateFAdd(left_val, right_val, "fadd.tmp");
-                        }
-                        // Handle string concatenation BEFORE generic pointer arithmetic
-                        // (string + string, string + char, char + string)
-                        else if (left_val->getType()->isPointerTy() && right_val->getType()->isPointerTy())
-                        {
-                            // This is string + string concatenation
-                            result = generate_string_concatenation(left_val, right_val);
-                        }
-                        else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy() &&
-                                 right_val->getType()->getIntegerBitWidth() == 8)
-                        {
-                            // This is string + char concatenation
-                            result = generate_string_char_concatenation(left_val, right_val);
-                        }
-                        else if (left_val->getType()->isIntegerTy() && left_val->getType()->getIntegerBitWidth() == 8 &&
-                                 right_val->getType()->isPointerTy())
-                        {
-                            // This is char + string concatenation
-                            result = generate_char_string_concatenation(left_val, right_val);
-                        }
-                        // Handle generic pointer arithmetic (pointer + integer) as fallback
-                        else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // This is pointer + integer arithmetic - determine element type
-                            llvm::Type *element_type = llvm::Type::getInt8Ty(builder.getContext());
-
-                            // Try to determine the actual pointee type from the left operand
-                            if (auto *id_node = dynamic_cast<IdentifierNode *>(node->left()))
-                            {
-                                std::string var_name = id_node->name();
-
-                                // Look up the variable's resolved type
-                                auto it = _variable_types.find(var_name);
-                                if (it != _variable_types.end() && it->second)
-                                {
-                                    Cryo::Type *var_type = it->second;
-
-                                    // If it's a pointer type, get the pointee type
-                                    if (var_type && var_type->kind() == Cryo::TypeKind::Pointer)
-                                    {
-                                        // Cast to PointerType to get the pointee
-                                        auto *ptr_type = dynamic_cast<Cryo::PointerType *>(var_type);
-                                        if (ptr_type)
-                                        {
-                                            std::shared_ptr<Cryo::Type> pointee_cryo_type = ptr_type->pointee_type();
-                                            if (pointee_cryo_type)
-                                            {
-                                                // Map the pointee type to LLVM type
-                                                llvm::Type *pointee_llvm_type = _type_mapper->map_type(pointee_cryo_type.get());
-                                                if (pointee_llvm_type)
-                                                {
-                                                    element_type = pointee_llvm_type;
-                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                              "Using pointee type for pointer arithmetic on '%s'\n",
-                                                              var_name.c_str());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            result = builder.CreateGEP(element_type, left_val, right_val, "ptr_add");
-                        }
-                        break;
-
-                    case TokenKind::TK_MINUS:
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Handle integer type coercion for different bit widths
-                            llvm::Type *left_type = left_val->getType();
-                            llvm::Type *right_type = right_val->getType();
-
-                            if (left_type != right_type)
-                            {
-                                // Get bit widths
-                                unsigned left_bits = left_type->getIntegerBitWidth();
-                                unsigned right_bits = right_type->getIntegerBitWidth();
-
-                                // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
-                                if (left_bits > right_bits)
-                                {
-                                    // Truncate left operand to match right operand's type
-                                    left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
-                                }
-                                else if (right_bits > left_bits)
-                                {
-                                    // Truncate right operand to match left operand's type
-                                    right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
-                                }
-                            }
-
-                            result = builder.CreateSub(left_val, right_val, "sub.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                        // Convert left to boolean
+                        llvm::Value *left_bool = left_val;
+                        if (!left_val->getType()->isIntegerTy(1))
                         {
                             if (left_val->getType()->isIntegerTy())
                             {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                                left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
                             }
-                            else if (right_val->getType()->isIntegerTy())
+                            else if (left_val->getType()->isFloatingPointTy())
                             {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                                left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
                             }
-                            result = builder.CreateFSub(left_val, right_val, "fsub.tmp");
-                        }
-                        // Handle pointer arithmetic (pointer - integer and pointer - pointer)
-                        else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // This is pointer - integer arithmetic - use GEP with negative offset
-                            llvm::Value *neg_offset = builder.CreateNeg(right_val, "neg_offset");
-
-                            // Try to determine the actual pointee type from the left operand
-                            llvm::Type *element_type = llvm::Type::getInt8Ty(builder.getContext());
-
-                            if (auto *id_node = dynamic_cast<IdentifierNode *>(node->left()))
+                            else
                             {
-                                std::string var_name = id_node->name();
-
-                                // Look up the variable's resolved type
-                                auto it = _variable_types.find(var_name);
-                                if (it != _variable_types.end() && it->second)
-                                {
-                                    Cryo::Type *var_type = it->second;
-
-                                    // If it's a pointer type, get the pointee type
-                                    if (var_type && var_type->kind() == Cryo::TypeKind::Pointer)
-                                    {
-                                        // Cast to PointerType to get the pointee
-                                        auto *ptr_type = dynamic_cast<Cryo::PointerType *>(var_type);
-                                        if (ptr_type)
-                                        {
-                                            std::shared_ptr<Cryo::Type> pointee_cryo_type = ptr_type->pointee_type();
-                                            if (pointee_cryo_type)
-                                            {
-                                                // Map the pointee type to LLVM type
-                                                llvm::Type *pointee_llvm_type = _type_mapper->map_type(pointee_cryo_type.get());
-                                                if (pointee_llvm_type)
-                                                {
-                                                    element_type = pointee_llvm_type;
-                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                              "Using pointee type for pointer arithmetic on '%s'\n",
-                                                              var_name.c_str());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            result = builder.CreateGEP(element_type, left_val, neg_offset, "ptr_sub");
-                        }
-                        else if (left_val->getType()->isPointerTy() && right_val->getType()->isPointerTy())
-                        {
-                            // This is pointer - pointer arithmetic - use ptrtoint and sub
-                            llvm::Module *current_module = _context_manager.get_module();
-                            llvm::Type *intptr_type = builder.getIntPtrTy(current_module->getDataLayout());
-                            llvm::Value *left_int = builder.CreatePtrToInt(left_val, intptr_type, "left_int");
-                            llvm::Value *right_int = builder.CreatePtrToInt(right_val, intptr_type, "right_int");
-                            llvm::Value *diff = builder.CreateSub(left_int, right_int, "ptr_diff");
-
-                            // For proper pointer difference, divide by element size
-                            // Assume 4 bytes for int* for now
-                            llvm::Value *element_size_val = llvm::ConstantInt::get(intptr_type, 4);
-                            result = builder.CreateSDiv(diff, element_size_val, "ptr_diff_elements");
-                        }
-                        break;
-
-                    case TokenKind::TK_STAR: // Multiplication
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Handle integer type coercion for different bit widths
-                            llvm::Type *left_type = left_val->getType();
-                            llvm::Type *right_type = right_val->getType();
-
-                            if (left_type != right_type)
-                            {
-                                // Get bit widths
-                                unsigned left_bits = left_type->getIntegerBitWidth();
-                                unsigned right_bits = right_type->getIntegerBitWidth();
-
-                                // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
-                                if (left_bits > right_bits)
-                                {
-                                    // Truncate left operand to match right operand's type
-                                    left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
-                                }
-                                else if (right_bits > left_bits)
-                                {
-                                    // Truncate right operand to match left operand's type
-                                    right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
-                                }
-                            }
-
-                            result = builder.CreateMul(left_val, right_val, "mul.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            result = builder.CreateFMul(left_val, right_val, "fmul.tmp");
-                        }
-                        break;
-
-                    case TokenKind::TK_SLASH: // Division
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Handle integer type coercion for different bit widths
-                            llvm::Type *left_type = left_val->getType();
-                            llvm::Type *right_type = right_val->getType();
-
-                            if (left_type != right_type)
-                            {
-                                // Get bit widths
-                                unsigned left_bits = left_type->getIntegerBitWidth();
-                                unsigned right_bits = right_type->getIntegerBitWidth();
-
-                                // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
-                                if (left_bits > right_bits)
-                                {
-                                    // Truncate left operand to match right operand's type
-                                    left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
-                                }
-                                else if (right_bits > left_bits)
-                                {
-                                    // Truncate right operand to match left operand's type
-                                    right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
-                                }
-                            }
-
-                            result = builder.CreateSDiv(left_val, right_val, "div.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            result = builder.CreateFDiv(left_val, right_val, "fdiv.tmp");
-                        }
-                        break;
-
-                    case TokenKind::TK_PERCENT: // Modulo
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            result = builder.CreateSRem(left_val, right_val, "mod.tmp");
-                        }
-                        break;
-
-                    // Bit shift operations
-                    case TokenKind::TK_LESSLESS: // Left shift
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type for shifting
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert right operand to match left operand's type
-                                if (left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth())
-                                {
-                                    right_val = builder.CreateZExt(right_val, left_val->getType(), "shift_ext");
-                                }
-                                else if (left_val->getType()->getIntegerBitWidth() < right_val->getType()->getIntegerBitWidth())
-                                {
-                                    right_val = builder.CreateTrunc(right_val, left_val->getType(), "shift_trunc");
-                                }
-                            }
-                            result = builder.CreateShl(left_val, right_val, "shl.tmp");
-                        }
-                        break;
-
-                    case TokenKind::TK_GREATERGREATER: // Right shift
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type for shifting
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert right operand to match left operand's type
-                                if (left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth())
-                                {
-                                    right_val = builder.CreateZExt(right_val, left_val->getType(), "shift_ext");
-                                }
-                                else if (left_val->getType()->getIntegerBitWidth() < right_val->getType()->getIntegerBitWidth())
-                                {
-                                    right_val = builder.CreateTrunc(right_val, left_val->getType(), "shift_trunc");
-                                }
-                            }
-                            // Use arithmetic right shift (sign-extending) for signed types
-                            result = builder.CreateAShr(left_val, right_val, "ashr.tmp");
-                        }
-                        break;
-
-                    // Comparison operations
-                    case TokenKind::TK_EQUALEQUAL:
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Evaluating == operation");
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Both operands are integers");
-                            // Ensure both operands have the same type for ICmp
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateICmpEQ(left_val, right_val, "eq.tmp");
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Created ICmpEQ, result type: {}", result->getType()->getTypeID());
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
-                                     left_val->getType() != right_val->getType())
-                            {
-                                // Handle different float types (f32 vs f64)
-                                if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
-                                {
-                                    right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
-                                }
-                                else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
-                                {
-                                    left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
-                                }
-                            }
-                            result = builder.CreateFCmpOEQ(left_val, right_val, "feq.tmp");
-                        }
-                        else if (left_val->getType()->isPointerTy() || right_val->getType()->isPointerTy())
-                        {
-                            // Pointer comparison - convert both to the same pointer type if needed
-                            llvm::Type *pointer_type = llvm::PointerType::get(_context_manager.get_context(), 0);
-
-                            if (!left_val->getType()->isPointerTy())
-                            {
-                                // Convert integer to pointer if needed (e.g., null constant)
-                                if (left_val->getType()->isIntegerTy())
-                                {
-                                    left_val = builder.CreateIntToPtr(left_val, pointer_type, "int2ptr");
-                                }
-                            }
-
-                            if (!right_val->getType()->isPointerTy())
-                            {
-                                // Convert integer to pointer if needed (e.g., null constant)
-                                if (right_val->getType()->isIntegerTy())
-                                {
-                                    right_val = builder.CreateIntToPtr(right_val, pointer_type, "int2ptr");
-                                }
-                            }
-
-                            result = builder.CreateICmpEQ(left_val, right_val, "ptr_eq.tmp");
-                        }
-                        break;
-
-                    case TokenKind::TK_EXCLAIMEQUAL:
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type for ICmp
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateICmpNE(left_val, right_val, "ne.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            result = builder.CreateFCmpONE(left_val, right_val, "fne.tmp");
-                        }
-                        else if (left_val->getType()->isPointerTy() || right_val->getType()->isPointerTy())
-                        {
-                            // Pointer comparison - convert both to the same pointer type if needed
-                            llvm::Type *pointer_type = llvm::PointerType::get(_context_manager.get_context(), 0);
-
-                            if (!left_val->getType()->isPointerTy())
-                            {
-                                // Convert integer to pointer if needed (e.g., null constant)
-                                if (left_val->getType()->isIntegerTy())
-                                {
-                                    left_val = builder.CreateIntToPtr(left_val, pointer_type, "int2ptr");
-                                }
-                            }
-
-                            if (!right_val->getType()->isPointerTy())
-                            {
-                                // Convert integer to pointer if needed (e.g., null constant)
-                                if (right_val->getType()->isIntegerTy())
-                                {
-                                    right_val = builder.CreateIntToPtr(right_val, pointer_type, "int2ptr");
-                                }
-                            }
-
-                            result = builder.CreateICmpNE(left_val, right_val, "ptr_ne.tmp");
-                        }
-                        break;
-
-                    case TokenKind::TK_L_ANGLE:
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type for ICmp
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateICmpSLT(left_val, right_val, "lt.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
-                                     left_val->getType() != right_val->getType())
-                            {
-                                // Handle different float types (f32 vs f64)
-                                if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
-                                {
-                                    right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
-                                }
-                                else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
-                                {
-                                    left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
-                                }
-                            }
-                            result = builder.CreateFCmpOLT(left_val, right_val, "flt.tmp");
-                        }
-                        break;
-
-                    case TokenKind::TK_R_ANGLE:
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type for ICmp
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateICmpSGT(left_val, right_val, "gt.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
-                                     left_val->getType() != right_val->getType())
-                            {
-                                // Handle different float types (f32 vs f64)
-                                if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
-                                {
-                                    right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
-                                }
-                                else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
-                                {
-                                    left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
-                                }
-                            }
-                            result = builder.CreateFCmpOGT(left_val, right_val, "fgt.tmp");
-                        }
-                        break;
-
-                    case TokenKind::TK_LESSEQUAL:
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type for ICmp
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateICmpSLE(left_val, right_val, "le.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
-                                     left_val->getType() != right_val->getType())
-                            {
-                                // Handle different float types (f32 vs f64)
-                                if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
-                                {
-                                    right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
-                                }
-                                else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
-                                {
-                                    left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
-                                }
-                            }
-                            result = builder.CreateFCmpOLE(left_val, right_val, "fle.tmp");
-                        }
-                        break;
-
-                    case TokenKind::TK_GREATEREQUAL:
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type for ICmp
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateICmpSGE(left_val, right_val, "ge.tmp");
-                        }
-                        else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                        {
-                            if (left_val->getType()->isIntegerTy())
-                            {
-                                left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
-                            }
-                            else if (right_val->getType()->isIntegerTy())
-                            {
-                                right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
-                            }
-                            else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
-                                     left_val->getType() != right_val->getType())
-                            {
-                                // Handle different float types (f32 vs f64)
-                                if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
-                                {
-                                    right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
-                                }
-                                else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
-                                {
-                                    left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
-                                }
-                            }
-                            result = builder.CreateFCmpOGE(left_val, right_val, "fge.tmp");
-                        }
-                        break;
-
-                    // Bitwise operations
-                    case TokenKind::TK_PIPE: // Bitwise OR |
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateOr(left_val, right_val, "bitor.tmp");
-                        }
-                        else
-                        {
-                            _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise OR operation requires integer operands");
-                            return nullptr;
-                        }
-                        break;
-
-                    case TokenKind::TK_AMP: // Bitwise AND &
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateAnd(left_val, right_val, "bitand.tmp");
-                        }
-                        else
-                        {
-                            _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise AND operation requires integer operands");
-                            return nullptr;
-                        }
-                        break;
-
-                    case TokenKind::TK_CARET: // Bitwise XOR ^
-                        if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                        {
-                            // Ensure both operands have the same type
-                            if (left_val->getType() != right_val->getType())
-                            {
-                                // Convert to the larger type
-                                llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                              ? left_val->getType()
-                                                              : right_val->getType();
-
-                                if (left_val->getType() != target_type)
-                                    left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
-                                if (right_val->getType() != target_type)
-                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                            }
-                            result = builder.CreateXor(left_val, right_val, "bitxor.tmp");
-                        }
-                        else
-                        {
-                            _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise XOR operation requires integer operands");
-                            return nullptr;
-                        }
-                        break;
-
-                    // Compound assignment operators
-                    case TokenKind::TK_PLUSEQUAL:
-                    case TokenKind::TK_MINUSEQUAL:
-                    case TokenKind::TK_STAREQUAL:
-                    case TokenKind::TK_SLASHEQUAL:
-                    {
-                        // For compound assignment (e.g., p.x += 10), we need to:
-                        // 1. Load the current value from the left operand
-                        // 2. Perform the operation with the right operand
-                        // 3. Store the result back to the left operand
-
-                        llvm::Value *lvalue_ptr = nullptr;
-
-                        // Get the left-hand side as an lvalue (address)
-                        if (auto *left_identifier = dynamic_cast<IdentifierNode *>(node->left()))
-                        {
-                            std::string var_name = left_identifier->name();
-                            if (_value_context)
-                            {
-                                lvalue_ptr = _value_context->get_alloca(var_name);
-                            }
-                            if (!lvalue_ptr)
-                            {
-                                auto global_it = _globals.find(var_name);
-                                if (global_it != _globals.end())
-                                {
-                                    lvalue_ptr = global_it->second;
-                                }
-                            }
-                        }
-                        else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->left()))
-                        {
-                            // Handle member access (e.g., p.x += 10)
-                            // We need to generate the address of the member, not its value
-                            lvalue_ptr = generate_member_field_address(member_access);
-
-                            // If that failed, try a more simplified approach
-                            if (!lvalue_ptr)
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_member_field_address failed, using fallback");
-                                // Use similar logic to normal member access visitor
-                                llvm::Value *object_ptr = nullptr;
-                                std::string var_name;
-
-                                if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
-                                {
-                                    var_name = identifier->name();
-
-                                    // Try to get the alloca or value
-                                    object_ptr = _value_context->get_alloca(var_name);
-                                    if (!object_ptr)
-                                    {
-                                        object_ptr = _value_context->get_value(var_name);
-                                    }
-                                    if (!object_ptr)
-                                    {
-                                        auto global_it = _globals.find(var_name);
-                                        if (global_it != _globals.end())
-                                        {
-                                            object_ptr = global_it->second;
-                                        }
-                                    }
-                                }
-
-                                if (object_ptr)
-                                {
-                                    std::string member_name = member_access->member();
-
-                                    // Use resolved type from TypeChecker if available
-                                    if (member_access->object() && member_access->object()->has_resolved_type())
-                                    {
-                                        Cryo::Type *resolved_type = member_access->object()->get_resolved_type();
-                                        if (resolved_type)
-                                        {
-                                            // For pointer types, get the pointed-to type
-                                            Cryo::Type *effective_type = resolved_type;
-                                            if (resolved_type->kind() == Cryo::TypeKind::Pointer)
-                                            {
-                                                Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
-                                                effective_type = ptr_type->pointee_type().get();
-
-                                                // For pointer variables, we need to load the pointer first
-                                                object_ptr = builder.CreateLoad(object_ptr->getType(), object_ptr, "struct_ptr");
-                                            }
-
-                                            if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class)
-                                            {
-                                                std::string type_name = effective_type->name();
-                                                llvm::Type *struct_type = _type_mapper->map_type(effective_type);
-                                                int field_index = _type_mapper->get_field_index(type_name, member_name);
-
-                                                if (struct_type && field_index != -1)
-                                                {
-                                                    if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(struct_type))
-                                                    {
-                                                        lvalue_ptr = builder.CreateStructGEP(struct_llvm_type, object_ptr, field_index, member_name + "_ptr");
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, "Cannot convert left operand to boolean for logical AND", static_cast<ASTNode *>(node));
+                                return nullptr;
                             }
                         }
 
-                        if (!lvalue_ptr)
-                        {
-                            _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, "Invalid left-hand side for compound assignment", static_cast<ASTNode *>(node));
-                            return nullptr;
-                        }
+                        // Branch: if left is true, evaluate right; otherwise skip to end
+                        builder.CreateCondBr(left_bool, land_rhs, land_end);
 
-                        // Load the current value - determine the actual field type
-                        llvm::Type *element_type = nullptr;
-
-                        // Try to determine the field type from the struct definition
-                        if (lvalue_ptr)
-                        {
-                            // If lvalue_ptr is a GEP result, we can get the element type from it
-                            if (auto *gep_inst = llvm::dyn_cast<llvm::GetElementPtrInst>(lvalue_ptr))
-                            {
-                                element_type = gep_inst->getResultElementType();
-                            }
-                            else if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(lvalue_ptr))
-                            {
-                                element_type = alloca_inst->getAllocatedType();
-                            }
-                            else if (lvalue_ptr->getType()->isPointerTy())
-                            {
-                                // For now, just assume i32 for pointer element types due to LLVM API changes
-                                element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
-                            }
-                        }
-
-                        // Fallback to i32 if we can't determine the type
-                        if (!element_type)
-                        {
-                            element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
-                        }
-
-                        llvm::Value *current_value = builder.CreateLoad(element_type, lvalue_ptr, "compound.load");
-
-                        // Evaluate the right-hand side
+                        // Evaluate right operand in land.rhs block
+                        builder.SetInsertPoint(land_rhs);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: About to evaluate right operand");
                         node->right()->accept(*this);
                         llvm::Value *right_val = get_current_value();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Right operand evaluated, right_val={}, builder now in block: {}",
+                                  (right_val ? "non-null" : "NULL"),
+                                  builder.GetInsertBlock()->getName().str());
+
                         if (!right_val)
                         {
-                            _diagnostic_builder->report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Failed to evaluate right-hand side of compound assignment", static_cast<ASTNode *>(node));
+                            // CRITICAL: Before returning error, we must terminate all created blocks
+                            // Terminate the current block and land_end
+                            llvm::BasicBlock *current_block = builder.GetInsertBlock();
+                            if (current_block && !current_block->getTerminator())
+                            {
+                                builder.CreateBr(land_end);
+                            }
+                            builder.SetInsertPoint(land_end);
+                            builder.CreateUnreachable();
+
+                            // CRITICAL: Move builder to a dummy block so caller doesn't try to add more code
+                            // to the terminated land_end block
+                            llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
+                            builder.SetInsertPoint(dummy_block);
+
+                            _diagnostic_builder->report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Failed to generate right operand for logical AND", static_cast<ASTNode *>(node));
                             return nullptr;
                         }
 
-                        // Perform the operation based on the compound operator
-                        llvm::Value *operation_result = nullptr;
+                        // Convert right to boolean
+                        llvm::Value *right_bool = right_val;
+                        std::string type_str;
+                        llvm::raw_string_ostream rso(type_str);
+                        right_val->getType()->print(rso);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: right_val type: {}", rso.str());
+                        if (!right_val->getType()->isIntegerTy(1))
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: right_val is not i1, attempting conversion");
+                            if (right_val->getType()->isIntegerTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Converting integer to boolean");
+                                right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
+                            }
+                            else if (right_val->getType()->isFloatingPointTy())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Converting float to boolean");
+                                right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
+                            }
+                            else
+                            {
+                                std::string err_type_str;
+                                llvm::raw_string_ostream err_rso(err_type_str);
+                                right_val->getType()->print(err_rso);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Cannot convert type to boolean: {}", err_rso.str());
 
-                        // Manually perform the operation based on the compound operator type
-                        if (op_kind == TokenKind::TK_PLUSEQUAL)
-                        {
-                            if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                            {
-                                // Handle integer addition with type coercion
-                                if (current_value->getType() != right_val->getType())
+                                // CRITICAL: Before returning error, we must terminate all created blocks
+                                // to prevent "does not have terminator" verification errors
+
+                                // Terminate the current block (where we tried to evaluate right side)
+                                llvm::BasicBlock *current_block = builder.GetInsertBlock();
+                                if (current_block && !current_block->getTerminator())
                                 {
-                                    llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                                  ? current_value->getType()
-                                                                  : right_val->getType();
-                                    if (current_value->getType() != target_type)
-                                        current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
-                                    if (right_val->getType() != target_type)
-                                        right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                                    builder.CreateBr(land_end);
                                 }
-                                operation_result = builder.CreateAdd(current_value, right_val, "add.tmp");
-                            }
-                            else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                            {
-                                if (current_value->getType()->isIntegerTy())
-                                    current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
-                                else if (right_val->getType()->isIntegerTy())
-                                    right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
-                                operation_result = builder.CreateFAdd(current_value, right_val, "fadd.tmp");
+
+                                // Terminate land_end with unreachable (this is an error path)
+                                builder.SetInsertPoint(land_end);
+                                builder.CreateUnreachable();
+
+                                // Create a dummy block and position builder there to avoid "terminator in middle" errors
+                                llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
+                                builder.SetInsertPoint(dummy_block);
+
+                                _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, "Cannot convert right operand to boolean for logical AND", static_cast<ASTNode *>(node));
+                                return nullptr;
                             }
                         }
-                        else if (op_kind == TokenKind::TK_MINUSEQUAL)
+                        else
                         {
-                            if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                            {
-                                if (current_value->getType() != right_val->getType())
-                                {
-                                    llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                                  ? current_value->getType()
-                                                                  : right_val->getType();
-                                    if (current_value->getType() != target_type)
-                                        current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
-                                    if (right_val->getType() != target_type)
-                                        right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                                }
-                                operation_result = builder.CreateSub(current_value, right_val, "sub.tmp");
-                            }
-                            else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                            {
-                                if (current_value->getType()->isIntegerTy())
-                                    current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
-                                else if (right_val->getType()->isIntegerTy())
-                                    right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
-                                operation_result = builder.CreateFSub(current_value, right_val, "fsub.tmp");
-                            }
-                        }
-                        else if (op_kind == TokenKind::TK_STAREQUAL)
-                        {
-                            if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                            {
-                                if (current_value->getType() != right_val->getType())
-                                {
-                                    llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                                  ? current_value->getType()
-                                                                  : right_val->getType();
-                                    if (current_value->getType() != target_type)
-                                        current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
-                                    if (right_val->getType() != target_type)
-                                        right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                                }
-                                operation_result = builder.CreateMul(current_value, right_val, "mul.tmp");
-                            }
-                            else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                            {
-                                if (current_value->getType()->isIntegerTy())
-                                    current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
-                                else if (right_val->getType()->isIntegerTy())
-                                    right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
-                                operation_result = builder.CreateFMul(current_value, right_val, "fmul.tmp");
-                            }
-                        }
-                        else if (op_kind == TokenKind::TK_SLASHEQUAL)
-                        {
-                            if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
-                            {
-                                if (current_value->getType() != right_val->getType())
-                                {
-                                    llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
-                                                                  ? current_value->getType()
-                                                                  : right_val->getType();
-                                    if (current_value->getType() != target_type)
-                                        current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
-                                    if (right_val->getType() != target_type)
-                                        right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
-                                }
-                                operation_result = builder.CreateSDiv(current_value, right_val, "sdiv.tmp");
-                            }
-                            else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
-                            {
-                                if (current_value->getType()->isIntegerTy())
-                                    current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
-                                else if (right_val->getType()->isIntegerTy())
-                                    right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
-                                operation_result = builder.CreateFDiv(current_value, right_val, "fdiv.tmp");
-                            }
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: right_val is already i1, no conversion needed");
                         }
 
-                        if (!operation_result)
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: About to create branch to land_end");
+                        builder.CreateBr(land_end);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Branch created");
+                        llvm::BasicBlock *land_rhs_end = builder.GetInsertBlock();
+
+                        // Create PHI node to merge results
+                        builder.SetInsertPoint(land_end);
+                        llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx), 2, "logand.result");
+                        phi->addIncoming(llvm::ConstantInt::getFalse(llvm_ctx), land_lhs);
+                        phi->addIncoming(right_bool, land_rhs_end);
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: land_lhs name={}, land_rhs name={}, land_end name={}",
+                                  land_lhs->getName().str(),
+                                  land_rhs_end->getName().str(),
+                                  land_end->getName().str());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: land_lhs terminator={}, land_rhs terminator={}, land_end terminator={}",
+                                  (land_lhs->getTerminator() != nullptr),
+                                  (land_rhs_end->getTerminator() != nullptr),
+                                  (land_end->getTerminator() != nullptr));
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Short-circuit AND: Builder position after setting to land_end: {}",
+                                  builder.GetInsertBlock()->getName().str());
+
+                        // Note: land_end intentionally has no terminator yet - the caller (if-statement)
+                        // will add the appropriate branch after getting the condition value
+                        return phi;
+                    }
+                    else // TK_PIPEPIPE
+                    {
+                        // Logical OR: left || right
+                        // If left is true, skip right and return true
+                        llvm::BasicBlock *lor_lhs = builder.GetInsertBlock();
+                        llvm::BasicBlock *lor_rhs = llvm::BasicBlock::Create(llvm_ctx, "lor.rhs", current_function);
+                        llvm::BasicBlock *lor_end = llvm::BasicBlock::Create(llvm_ctx, "lor.end", current_function);
+
+                        // Convert left to boolean
+                        llvm::Value *left_bool = left_val;
+                        if (!left_val->getType()->isIntegerTy(1))
                         {
-                            _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, "Failed to generate operation for compound assignment - operation_result is null", static_cast<ASTNode *>(node));
+                            if (left_val->getType()->isIntegerTy())
+                            {
+                                left_bool = builder.CreateICmpNE(left_val, llvm::ConstantInt::get(left_val->getType(), 0), "tobool");
+                            }
+                            else if (left_val->getType()->isFloatingPointTy())
+                            {
+                                left_bool = builder.CreateFCmpONE(left_val, llvm::ConstantFP::get(left_val->getType(), 0.0), "tobool");
+                            }
+                            else
+                            {
+                                _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, "Cannot convert left operand to boolean for logical OR", static_cast<ASTNode *>(node));
+                                return nullptr;
+                            }
+                        }
+
+                        // Branch: if left is false, evaluate right; otherwise skip to end
+                        builder.CreateCondBr(left_bool, lor_end, lor_rhs);
+
+                        // Evaluate right operand in lor.rhs block
+                        builder.SetInsertPoint(lor_rhs);
+
+                        // Add debug logging for tracking block termination
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: About to evaluate right operand in block: {}",
+                                  lor_rhs->getName().str());
+
+                        node->right()->accept(*this);
+                        llvm::Value *right_val = get_current_value();
+
+                        // Get the current block after right evaluation - it might have changed due to nested expressions
+                        llvm::BasicBlock *current_after_right = builder.GetInsertBlock();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: After right evaluation, current block: {}, has terminator: {}",
+                                  current_after_right->getName().str(), current_after_right->getTerminator() != nullptr);
+
+                        if (!right_val)
+                        {
+                            // CRITICAL: Before returning error, we must terminate all created blocks
+                            llvm::BasicBlock *current_block = builder.GetInsertBlock();
+                            if (current_block && !current_block->getTerminator())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating orphaned block: {}",
+                                          current_block->getName().str());
+                                builder.CreateBr(lor_end);
+                            }
+
+                            // Also check and terminate the original lor_rhs block if it's different and unterminated
+                            if (lor_rhs != current_block && !lor_rhs->getTerminator())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR ERROR: Terminating original lor_rhs block: {}",
+                                          lor_rhs->getName().str());
+                                builder.SetInsertPoint(lor_rhs);
+                                builder.CreateBr(lor_end);
+                            }
+
+                            builder.SetInsertPoint(lor_end);
+                            builder.CreateUnreachable();
+
+                            // Create a dummy block and position builder there to avoid "terminator in middle" errors
+                            llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
+                            builder.SetInsertPoint(dummy_block);
+
+                            _diagnostic_builder->report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Failed to generate right operand for logical OR", static_cast<ASTNode *>(node));
                             return nullptr;
                         }
 
+                        // IMPORTANT: After evaluating right operand, we might be in a different block
+                        // due to complex expressions (like casts, function calls, etc.)
+                        // We need to get the actual current block before creating the branch
+                        llvm::BasicBlock *right_eval_block = builder.GetInsertBlock();
+
+                        // Convert right to boolean
+                        llvm::Value *right_bool = right_val;
+                        if (!right_val->getType()->isIntegerTy(1))
+                        {
+                            if (right_val->getType()->isIntegerTy())
+                            {
+                                right_bool = builder.CreateICmpNE(right_val, llvm::ConstantInt::get(right_val->getType(), 0), "tobool");
+                            }
+                            else if (right_val->getType()->isFloatingPointTy())
+                            {
+                                right_bool = builder.CreateFCmpONE(right_val, llvm::ConstantFP::get(right_val->getType(), 0.0), "tobool");
+                            }
+                            else
+                            {
+                                // CRITICAL: Before returning error, we must terminate all created blocks
+                                // to prevent "does not have terminator" verification errors
+
+                                // Terminate the current block (where we tried to evaluate right side)
+                                llvm::BasicBlock *current_block = builder.GetInsertBlock();
+                                if (current_block && !current_block->getTerminator())
+                                {
+                                    builder.CreateBr(lor_end);
+                                }
+
+                                // Terminate lor_end with unreachable (this is an error path)
+                                builder.SetInsertPoint(lor_end);
+                                builder.CreateUnreachable();
+
+                                // Create a dummy block and position builder there to avoid "terminator in middle" errors
+                                llvm::BasicBlock *dummy_block = llvm::BasicBlock::Create(llvm_ctx, "error.cleanup", current_function);
+                                builder.SetInsertPoint(dummy_block);
+
+                                _diagnostic_builder->report_error(ErrorCode::E0609_TYPE_MAPPING_ERROR, "Cannot convert right operand to boolean for logical OR", static_cast<ASTNode *>(node));
+                                return nullptr;
+                            }
+                        }
+
+                        // Ensure the current block (after evaluating and converting right operand) is terminated
+                        llvm::BasicBlock *final_right_block = builder.GetInsertBlock();
+                        if (!final_right_block->getTerminator())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating final_right_block: {}",
+                                      final_right_block->getName().str());
+                            builder.CreateBr(lor_end);
+                        }
+
+                        // SAFETY CHECK: Ensure the original lor_rhs block is also terminated if it's different
+                        if (lor_rhs != final_right_block && !lor_rhs->getTerminator())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Terminating original lor_rhs block: {}",
+                                      lor_rhs->getName().str());
+                            // Save current position
+                            llvm::BasicBlock *saved_position = builder.GetInsertBlock();
+
+                            builder.SetInsertPoint(lor_rhs);
+                            builder.CreateBr(lor_end);
+
+                            // Restore position
+                            builder.SetInsertPoint(saved_position);
+                        }
+
+                        // Use the final block for PHI incoming
+                        llvm::BasicBlock *lor_rhs_end = final_right_block;
+
+                        // Create PHI node to merge results
+                        builder.SetInsertPoint(lor_end);
+                        llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx), 2, "logor.result");
+                        phi->addIncoming(llvm::ConstantInt::getTrue(llvm_ctx), lor_lhs);
+                        phi->addIncoming(right_bool, lor_rhs_end);
+
+                        // CRITICAL DEBUG: Log all lor.rhs blocks to ensure they're properly terminated
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "SHORT-CIRCUIT OR: Final block status - lor_lhs: {} (terminated: {}), lor_rhs_end: {} (terminated: {}), lor_end: {} (terminated: {})",
+                                  lor_lhs->getName().str(), lor_lhs->getTerminator() != nullptr,
+                                  lor_rhs_end->getName().str(), lor_rhs_end->getTerminator() != nullptr,
+                                  lor_end->getName().str(), lor_end->getTerminator() != nullptr);
+
+                        // Note: lor_end intentionally has no terminator yet - the caller (if-statement)
+                        // will add the appropriate branch after getting the condition value
+                        return phi;
+                    }
+                }
+
+                // For all other operations, generate both operands normally
+                // Generate left operand
+                node->left()->accept(*this);
+                llvm::Value *left_val = get_current_value();
+
+                if (!left_val)
+                {
+                    std::string error_msg = "Failed to generate left operand of binary expression";
+                    if (node->left())
+                    {
+                        if (auto *id = dynamic_cast<IdentifierNode *>(node->left()))
+                        {
+                            error_msg += ": identifier '" + id->name() + "' not found";
+                        }
+                        else if (auto *member = dynamic_cast<MemberAccessNode *>(node->left()))
+                        {
+                            error_msg += ": member access failed";
+                        }
+                    }
+                    report_error(error_msg);
+                    return nullptr;
+                }
+
+                // Generate right operand
+                node->right()->accept(*this);
+                right_val = get_current_value();
+
+                if (!right_val)
+                {
+                    std::string error_msg = "Failed to generate right operand of binary expression";
+                    if (node->right())
+                    {
+                        if (auto *id = dynamic_cast<IdentifierNode *>(node->right()))
+                        {
+                            error_msg += ": identifier '" + id->name() + "' not found";
+                        }
+                        else if (auto *member = dynamic_cast<MemberAccessNode *>(node->right()))
+                        {
+                            error_msg += ": member access failed";
+                        }
+                    }
+                    report_error(error_msg);
+                    return nullptr;
+                }
+
+                // Handle binary operations based on operator token
+                switch (op_kind)
+                {
+                case TokenKind::TK_PLUS:
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Handle integer type coercion for different bit widths
+                        llvm::Type *left_type = left_val->getType();
+                        llvm::Type *right_type = right_val->getType();
+
+                        if (left_type != right_type)
+                        {
+                            // Get bit widths
+                            unsigned left_bits = left_type->getIntegerBitWidth();
+                            unsigned right_bits = right_type->getIntegerBitWidth();
+
+                            // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
+                            if (left_bits > right_bits)
+                            {
+                                // Truncate left operand to match right operand's type
+                                left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
+                            }
+                            else if (right_bits > left_bits)
+                            {
+                                // Truncate right operand to match left operand's type
+                                right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
+                            }
+                        }
+
+                        result = builder.CreateAdd(left_val, right_val, "add.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        // Handle float addition (convert if needed)
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        result = builder.CreateFAdd(left_val, right_val, "fadd.tmp");
+                    }
+                    // Handle string concatenation BEFORE generic pointer arithmetic
+                    // (string + string, string + char, char + string)
+                    else if (left_val->getType()->isPointerTy() && right_val->getType()->isPointerTy())
+                    {
+                        // This is string + string concatenation
+                        result = generate_string_concatenation(left_val, right_val);
+                    }
+                    else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy() &&
+                             right_val->getType()->getIntegerBitWidth() == 8)
+                    {
+                        // This is string + char concatenation
+                        result = generate_string_char_concatenation(left_val, right_val);
+                    }
+                    else if (left_val->getType()->isIntegerTy() && left_val->getType()->getIntegerBitWidth() == 8 &&
+                             right_val->getType()->isPointerTy())
+                    {
+                        // This is char + string concatenation
+                        result = generate_char_string_concatenation(left_val, right_val);
+                    }
+                    // Handle generic pointer arithmetic (pointer + integer) as fallback
+                    else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // This is pointer + integer arithmetic - determine element type
+                        llvm::Type *element_type = llvm::Type::getInt8Ty(builder.getContext());
+
+                        // Try to determine the actual pointee type from the left operand
+                        if (auto *id_node = dynamic_cast<IdentifierNode *>(node->left()))
+                        {
+                            std::string var_name = id_node->name();
+
+                            // Look up the variable's resolved type
+                            auto it = _variable_types.find(var_name);
+                            if (it != _variable_types.end() && it->second)
+                            {
+                                Cryo::Type *var_type = it->second;
+
+                                // If it's a pointer type, get the pointee type
+                                if (var_type && var_type->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    // Cast to PointerType to get the pointee
+                                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(var_type);
+                                    if (ptr_type)
+                                    {
+                                        std::shared_ptr<Cryo::Type> pointee_cryo_type = ptr_type->pointee_type();
+                                        if (pointee_cryo_type)
+                                        {
+                                            // Map the pointee type to LLVM type
+                                            llvm::Type *pointee_llvm_type = _type_mapper->map_type(pointee_cryo_type.get());
+                                            if (pointee_llvm_type)
+                                            {
+                                                element_type = pointee_llvm_type;
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "Using pointee type for pointer arithmetic on '%s'\n",
+                                                          var_name.c_str());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        result = builder.CreateGEP(element_type, left_val, right_val, "ptr_add");
+                    }
+                    break;
+
+                case TokenKind::TK_MINUS:
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Handle integer type coercion for different bit widths
+                        llvm::Type *left_type = left_val->getType();
+                        llvm::Type *right_type = right_val->getType();
+
+                        if (left_type != right_type)
+                        {
+                            // Get bit widths
+                            unsigned left_bits = left_type->getIntegerBitWidth();
+                            unsigned right_bits = right_type->getIntegerBitWidth();
+
+                            // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
+                            if (left_bits > right_bits)
+                            {
+                                // Truncate left operand to match right operand's type
+                                left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
+                            }
+                            else if (right_bits > left_bits)
+                            {
+                                // Truncate right operand to match left operand's type
+                                right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
+                            }
+                        }
+
+                        result = builder.CreateSub(left_val, right_val, "sub.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        result = builder.CreateFSub(left_val, right_val, "fsub.tmp");
+                    }
+                    // Handle pointer arithmetic (pointer - integer and pointer - pointer)
+                    else if (left_val->getType()->isPointerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // This is pointer - integer arithmetic - use GEP with negative offset
+                        llvm::Value *neg_offset = builder.CreateNeg(right_val, "neg_offset");
+
+                        // Try to determine the actual pointee type from the left operand
+                        llvm::Type *element_type = llvm::Type::getInt8Ty(builder.getContext());
+
+                        if (auto *id_node = dynamic_cast<IdentifierNode *>(node->left()))
+                        {
+                            std::string var_name = id_node->name();
+
+                            // Look up the variable's resolved type
+                            auto it = _variable_types.find(var_name);
+                            if (it != _variable_types.end() && it->second)
+                            {
+                                Cryo::Type *var_type = it->second;
+
+                                // If it's a pointer type, get the pointee type
+                                if (var_type && var_type->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    // Cast to PointerType to get the pointee
+                                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(var_type);
+                                    if (ptr_type)
+                                    {
+                                        std::shared_ptr<Cryo::Type> pointee_cryo_type = ptr_type->pointee_type();
+                                        if (pointee_cryo_type)
+                                        {
+                                            // Map the pointee type to LLVM type
+                                            llvm::Type *pointee_llvm_type = _type_mapper->map_type(pointee_cryo_type.get());
+                                            if (pointee_llvm_type)
+                                            {
+                                                element_type = pointee_llvm_type;
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "Using pointee type for pointer arithmetic on '%s'\n",
+                                                          var_name.c_str());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        result = builder.CreateGEP(element_type, left_val, neg_offset, "ptr_sub");
+                    }
+                    else if (left_val->getType()->isPointerTy() && right_val->getType()->isPointerTy())
+                    {
+                        // This is pointer - pointer arithmetic - use ptrtoint and sub
+                        llvm::Module *current_module = _context_manager.get_module();
+                        llvm::Type *intptr_type = builder.getIntPtrTy(current_module->getDataLayout());
+                        llvm::Value *left_int = builder.CreatePtrToInt(left_val, intptr_type, "left_int");
+                        llvm::Value *right_int = builder.CreatePtrToInt(right_val, intptr_type, "right_int");
+                        llvm::Value *diff = builder.CreateSub(left_int, right_int, "ptr_diff");
+
+                        // For proper pointer difference, divide by element size
+                        // Assume 4 bytes for int* for now
+                        llvm::Value *element_size_val = llvm::ConstantInt::get(intptr_type, 4);
+                        result = builder.CreateSDiv(diff, element_size_val, "ptr_diff_elements");
+                    }
+                    break;
+
+                case TokenKind::TK_STAR: // Multiplication
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Handle integer type coercion for different bit widths
+                        llvm::Type *left_type = left_val->getType();
+                        llvm::Type *right_type = right_val->getType();
+
+                        if (left_type != right_type)
+                        {
+                            // Get bit widths
+                            unsigned left_bits = left_type->getIntegerBitWidth();
+                            unsigned right_bits = right_type->getIntegerBitWidth();
+
+                            // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
+                            if (left_bits > right_bits)
+                            {
+                                // Truncate left operand to match right operand's type
+                                left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
+                            }
+                            else if (right_bits > left_bits)
+                            {
+                                // Truncate right operand to match left operand's type
+                                right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
+                            }
+                        }
+
+                        result = builder.CreateMul(left_val, right_val, "mul.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        result = builder.CreateFMul(left_val, right_val, "fmul.tmp");
+                    }
+                    break;
+
+                case TokenKind::TK_SLASH: // Division
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Handle integer type coercion for different bit widths
+                        llvm::Type *left_type = left_val->getType();
+                        llvm::Type *right_type = right_val->getType();
+
+                        if (left_type != right_type)
+                        {
+                            // Get bit widths
+                            unsigned left_bits = left_type->getIntegerBitWidth();
+                            unsigned right_bits = right_type->getIntegerBitWidth();
+
+                            // Convert to the smaller type (this handles the i32 + i8 -> i8 case)
+                            if (left_bits > right_bits)
+                            {
+                                // Truncate left operand to match right operand's type
+                                left_val = builder.CreateTrunc(left_val, right_type, "trunc_left");
+                            }
+                            else if (right_bits > left_bits)
+                            {
+                                // Truncate right operand to match left operand's type
+                                right_val = builder.CreateTrunc(right_val, left_type, "trunc_right");
+                            }
+                        }
+
+                        result = builder.CreateSDiv(left_val, right_val, "div.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        result = builder.CreateFDiv(left_val, right_val, "fdiv.tmp");
+                    }
+                    break;
+
+                case TokenKind::TK_PERCENT: // Modulo
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        result = builder.CreateSRem(left_val, right_val, "mod.tmp");
+                    }
+                    break;
+
+                // Bit shift operations
+                case TokenKind::TK_LESSLESS: // Left shift
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type for shifting
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert right operand to match left operand's type
+                            if (left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth())
+                            {
+                                right_val = builder.CreateZExt(right_val, left_val->getType(), "shift_ext");
+                            }
+                            else if (left_val->getType()->getIntegerBitWidth() < right_val->getType()->getIntegerBitWidth())
+                            {
+                                right_val = builder.CreateTrunc(right_val, left_val->getType(), "shift_trunc");
+                            }
+                        }
+                        result = builder.CreateShl(left_val, right_val, "shl.tmp");
+                    }
+                    break;
+
+                case TokenKind::TK_GREATERGREATER: // Right shift
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type for shifting
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert right operand to match left operand's type
+                            if (left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth())
+                            {
+                                right_val = builder.CreateZExt(right_val, left_val->getType(), "shift_ext");
+                            }
+                            else if (left_val->getType()->getIntegerBitWidth() < right_val->getType()->getIntegerBitWidth())
+                            {
+                                right_val = builder.CreateTrunc(right_val, left_val->getType(), "shift_trunc");
+                            }
+                        }
+                        // Use arithmetic right shift (sign-extending) for signed types
+                        result = builder.CreateAShr(left_val, right_val, "ashr.tmp");
+                    }
+                    break;
+
+                // Comparison operations
+                case TokenKind::TK_EQUALEQUAL:
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Evaluating == operation");
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Both operands are integers");
+                        // Ensure both operands have the same type for ICmp
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateICmpEQ(left_val, right_val, "eq.tmp");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "EQUALITY DEBUG: Created ICmpEQ, result type: {}", result->getType()->getTypeID());
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
+                                 left_val->getType() != right_val->getType())
+                        {
+                            // Handle different float types (f32 vs f64)
+                            if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                            {
+                                right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                            }
+                            else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                            {
+                                left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                            }
+                        }
+                        result = builder.CreateFCmpOEQ(left_val, right_val, "feq.tmp");
+                    }
+                    else if (left_val->getType()->isPointerTy() || right_val->getType()->isPointerTy())
+                    {
+                        // Pointer comparison - convert both to the same pointer type if needed
+                        llvm::Type *pointer_type = llvm::PointerType::get(_context_manager.get_context(), 0);
+
+                        if (!left_val->getType()->isPointerTy())
+                        {
+                            // Convert integer to pointer if needed (e.g., null constant)
+                            if (left_val->getType()->isIntegerTy())
+                            {
+                                left_val = builder.CreateIntToPtr(left_val, pointer_type, "int2ptr");
+                            }
+                        }
+
+                        if (!right_val->getType()->isPointerTy())
+                        {
+                            // Convert integer to pointer if needed (e.g., null constant)
+                            if (right_val->getType()->isIntegerTy())
+                            {
+                                right_val = builder.CreateIntToPtr(right_val, pointer_type, "int2ptr");
+                            }
+                        }
+
+                        result = builder.CreateICmpEQ(left_val, right_val, "ptr_eq.tmp");
+                    }
+                    break;
+
+                case TokenKind::TK_EXCLAIMEQUAL:
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type for ICmp
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateICmpNE(left_val, right_val, "ne.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        result = builder.CreateFCmpONE(left_val, right_val, "fne.tmp");
+                    }
+                    else if (left_val->getType()->isPointerTy() || right_val->getType()->isPointerTy())
+                    {
+                        // Pointer comparison - convert both to the same pointer type if needed
+                        llvm::Type *pointer_type = llvm::PointerType::get(_context_manager.get_context(), 0);
+
+                        if (!left_val->getType()->isPointerTy())
+                        {
+                            // Convert integer to pointer if needed (e.g., null constant)
+                            if (left_val->getType()->isIntegerTy())
+                            {
+                                left_val = builder.CreateIntToPtr(left_val, pointer_type, "int2ptr");
+                            }
+                        }
+
+                        if (!right_val->getType()->isPointerTy())
+                        {
+                            // Convert integer to pointer if needed (e.g., null constant)
+                            if (right_val->getType()->isIntegerTy())
+                            {
+                                right_val = builder.CreateIntToPtr(right_val, pointer_type, "int2ptr");
+                            }
+                        }
+
+                        result = builder.CreateICmpNE(left_val, right_val, "ptr_ne.tmp");
+                    }
+                    break;
+
+                case TokenKind::TK_L_ANGLE:
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type for ICmp
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateICmpSLT(left_val, right_val, "lt.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
+                                 left_val->getType() != right_val->getType())
+                        {
+                            // Handle different float types (f32 vs f64)
+                            if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                            {
+                                right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                            }
+                            else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                            {
+                                left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                            }
+                        }
+                        result = builder.CreateFCmpOLT(left_val, right_val, "flt.tmp");
+                    }
+                    break;
+
+                case TokenKind::TK_R_ANGLE:
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type for ICmp
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateICmpSGT(left_val, right_val, "gt.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
+                                 left_val->getType() != right_val->getType())
+                        {
+                            // Handle different float types (f32 vs f64)
+                            if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                            {
+                                right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                            }
+                            else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                            {
+                                left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                            }
+                        }
+                        result = builder.CreateFCmpOGT(left_val, right_val, "fgt.tmp");
+                    }
+                    break;
+
+                case TokenKind::TK_LESSEQUAL:
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type for ICmp
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateICmpSLE(left_val, right_val, "le.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
+                                 left_val->getType() != right_val->getType())
+                        {
+                            // Handle different float types (f32 vs f64)
+                            if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                            {
+                                right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                            }
+                            else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                            {
+                                left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                            }
+                        }
+                        result = builder.CreateFCmpOLE(left_val, right_val, "fle.tmp");
+                    }
+                    break;
+
+                case TokenKind::TK_GREATEREQUAL:
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type for ICmp
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateICmpSGE(left_val, right_val, "ge.tmp");
+                    }
+                    else if (left_val->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                    {
+                        if (left_val->getType()->isIntegerTy())
+                        {
+                            left_val = builder.CreateSIToFP(left_val, right_val->getType(), "int2float");
+                        }
+                        else if (right_val->getType()->isIntegerTy())
+                        {
+                            right_val = builder.CreateSIToFP(right_val, left_val->getType(), "int2float");
+                        }
+                        else if (left_val->getType()->isFloatingPointTy() && right_val->getType()->isFloatingPointTy() &&
+                                 left_val->getType() != right_val->getType())
+                        {
+                            // Handle different float types (f32 vs f64)
+                            if (left_val->getType()->isDoubleTy() && right_val->getType()->isFloatTy())
+                            {
+                                right_val = builder.CreateFPExt(right_val, left_val->getType(), "f32tof64");
+                            }
+                            else if (left_val->getType()->isFloatTy() && right_val->getType()->isDoubleTy())
+                            {
+                                left_val = builder.CreateFPExt(left_val, right_val->getType(), "f32tof64");
+                            }
+                        }
+                        result = builder.CreateFCmpOGE(left_val, right_val, "fge.tmp");
+                    }
+                    break;
+
+                // Bitwise operations
+                case TokenKind::TK_PIPE: // Bitwise OR |
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateOr(left_val, right_val, "bitor.tmp");
+                    }
+                    else
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise OR operation requires integer operands");
+                        return nullptr;
+                    }
+                    break;
+
+                case TokenKind::TK_AMP: // Bitwise AND &
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateAnd(left_val, right_val, "bitand.tmp");
+                    }
+                    else
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise AND operation requires integer operands");
+                        return nullptr;
+                    }
+                    break;
+
+                case TokenKind::TK_CARET: // Bitwise XOR ^
+                    if (left_val->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                    {
+                        // Ensure both operands have the same type
+                        if (left_val->getType() != right_val->getType())
+                        {
+                            // Convert to the larger type
+                            llvm::Type *target_type = left_val->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                          ? left_val->getType()
+                                                          : right_val->getType();
+
+                            if (left_val->getType() != target_type)
+                                left_val = builder.CreateSExt(left_val, target_type, "sext.tmp");
+                            if (right_val->getType() != target_type)
+                                right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                        }
+                        result = builder.CreateXor(left_val, right_val, "bitxor.tmp");
+                    }
+                    else
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, "Bitwise XOR operation requires integer operands");
+                        return nullptr;
+                    }
+                    break;
+
+                // Compound assignment operators
+                case TokenKind::TK_PLUSEQUAL:
+                case TokenKind::TK_MINUSEQUAL:
+                case TokenKind::TK_STAREQUAL:
+                case TokenKind::TK_SLASHEQUAL:
+                {
+                    // For compound assignment (e.g., p.x += 10), we need to:
+                    // 1. Load the current value from the left operand
+                    // 2. Perform the operation with the right operand
+                    // 3. Store the result back to the left operand
+
+                    llvm::Value *lvalue_ptr = nullptr;
+
+                    // Get the left-hand side as an lvalue (address)
+                    if (auto *left_identifier = dynamic_cast<IdentifierNode *>(node->left()))
+                    {
+                        std::string var_name = left_identifier->name();
+                        if (_value_context)
+                        {
+                            lvalue_ptr = _value_context->get_alloca(var_name);
+                        }
                         if (!lvalue_ptr)
                         {
-                            _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, "Failed to generate operation for compound assignment - lvalue_ptr is null", static_cast<ASTNode *>(node));
-                            return nullptr;
+                            auto global_it = _globals.find(var_name);
+                            if (global_it != _globals.end())
+                            {
+                                lvalue_ptr = global_it->second;
+                            }
                         }
+                    }
+                    else if (auto *member_access = dynamic_cast<MemberAccessNode *>(node->left()))
+                    {
+                        // Handle member access (e.g., p.x += 10)
+                        // We need to generate the address of the member, not its value
+                        lvalue_ptr = generate_member_field_address(member_access);
 
-                        // Store the result back to the lvalue
-                        builder.CreateStore(operation_result, lvalue_ptr);
-                        result = operation_result;
-                        break;
+                        // If that failed, try a more simplified approach
+                        if (!lvalue_ptr)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_member_field_address failed, using fallback");
+                            // Use similar logic to normal member access visitor
+                            llvm::Value *object_ptr = nullptr;
+                            std::string var_name;
+
+                            if (auto identifier = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
+                            {
+                                var_name = identifier->name();
+
+                                // Try to get the alloca or value
+                                object_ptr = _value_context->get_alloca(var_name);
+                                if (!object_ptr)
+                                {
+                                    object_ptr = _value_context->get_value(var_name);
+                                }
+                                if (!object_ptr)
+                                {
+                                    auto global_it = _globals.find(var_name);
+                                    if (global_it != _globals.end())
+                                    {
+                                        object_ptr = global_it->second;
+                                    }
+                                }
+                            }
+
+                            if (object_ptr)
+                            {
+                                std::string member_name = member_access->member();
+
+                                // Use resolved type from TypeChecker if available
+                                if (member_access->object() && member_access->object()->has_resolved_type())
+                                {
+                                    Cryo::Type *resolved_type = member_access->object()->get_resolved_type();
+                                    if (resolved_type)
+                                    {
+                                        // For pointer types, get the pointed-to type
+                                        Cryo::Type *effective_type = resolved_type;
+                                        if (resolved_type->kind() == Cryo::TypeKind::Pointer)
+                                        {
+                                            Cryo::PointerType *ptr_type = static_cast<Cryo::PointerType *>(resolved_type);
+                                            effective_type = ptr_type->pointee_type().get();
+
+                                            // For pointer variables, we need to load the pointer first
+                                            object_ptr = builder.CreateLoad(object_ptr->getType(), object_ptr, "struct_ptr");
+                                        }
+
+                                        if (effective_type->kind() == Cryo::TypeKind::Struct || effective_type->kind() == Cryo::TypeKind::Class)
+                                        {
+                                            std::string type_name = effective_type->name();
+                                            llvm::Type *struct_type = _type_mapper->map_type(effective_type);
+                                            int field_index = _type_mapper->get_field_index(type_name, member_name);
+
+                                            if (struct_type && field_index != -1)
+                                            {
+                                                if (auto *struct_llvm_type = llvm::dyn_cast<llvm::StructType>(struct_type))
+                                                {
+                                                    lvalue_ptr = builder.CreateStructGEP(struct_llvm_type, object_ptr, field_index, member_name + "_ptr");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
-                    default:
-                        _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, "Unsupported binary operator: " + node->operator_token().to_string(), static_cast<ASTNode *>(node));
+                    if (!lvalue_ptr)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, "Invalid left-hand side for compound assignment", static_cast<ASTNode *>(node));
                         return nullptr;
                     }
 
-                    return result;
+                    // Load the current value - determine the actual field type
+                    llvm::Type *element_type = nullptr;
+
+                    // Try to determine the field type from the struct definition
+                    if (lvalue_ptr)
+                    {
+                        // If lvalue_ptr is a GEP result, we can get the element type from it
+                        if (auto *gep_inst = llvm::dyn_cast<llvm::GetElementPtrInst>(lvalue_ptr))
+                        {
+                            element_type = gep_inst->getResultElementType();
+                        }
+                        else if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(lvalue_ptr))
+                        {
+                            element_type = alloca_inst->getAllocatedType();
+                        }
+                        else if (lvalue_ptr->getType()->isPointerTy())
+                        {
+                            // For now, just assume i32 for pointer element types due to LLVM API changes
+                            element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
+                        }
+                    }
+
+                    // Fallback to i32 if we can't determine the type
+                    if (!element_type)
+                    {
+                        element_type = llvm::Type::getInt32Ty(_context_manager.get_context());
+                    }
+
+                    llvm::Value *current_value = builder.CreateLoad(element_type, lvalue_ptr, "compound.load");
+
+                    // Evaluate the right-hand side
+                    node->right()->accept(*this);
+                    llvm::Value *right_val = get_current_value();
+                    if (!right_val)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Failed to evaluate right-hand side of compound assignment", static_cast<ASTNode *>(node));
+                        return nullptr;
+                    }
+
+                    // Perform the operation based on the compound operator
+                    llvm::Value *operation_result = nullptr;
+
+                    // Manually perform the operation based on the compound operator type
+                    if (op_kind == TokenKind::TK_PLUSEQUAL)
+                    {
+                        if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                        {
+                            // Handle integer addition with type coercion
+                            if (current_value->getType() != right_val->getType())
+                            {
+                                llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                              ? current_value->getType()
+                                                              : right_val->getType();
+                                if (current_value->getType() != target_type)
+                                    current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
+                                if (right_val->getType() != target_type)
+                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                            }
+                            operation_result = builder.CreateAdd(current_value, right_val, "add.tmp");
+                        }
+                        else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                        {
+                            if (current_value->getType()->isIntegerTy())
+                                current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
+                            else if (right_val->getType()->isIntegerTy())
+                                right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
+                            operation_result = builder.CreateFAdd(current_value, right_val, "fadd.tmp");
+                        }
+                    }
+                    else if (op_kind == TokenKind::TK_MINUSEQUAL)
+                    {
+                        if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                        {
+                            if (current_value->getType() != right_val->getType())
+                            {
+                                llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                              ? current_value->getType()
+                                                              : right_val->getType();
+                                if (current_value->getType() != target_type)
+                                    current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
+                                if (right_val->getType() != target_type)
+                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                            }
+                            operation_result = builder.CreateSub(current_value, right_val, "sub.tmp");
+                        }
+                        else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                        {
+                            if (current_value->getType()->isIntegerTy())
+                                current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
+                            else if (right_val->getType()->isIntegerTy())
+                                right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
+                            operation_result = builder.CreateFSub(current_value, right_val, "fsub.tmp");
+                        }
+                    }
+                    else if (op_kind == TokenKind::TK_STAREQUAL)
+                    {
+                        if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                        {
+                            if (current_value->getType() != right_val->getType())
+                            {
+                                llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                              ? current_value->getType()
+                                                              : right_val->getType();
+                                if (current_value->getType() != target_type)
+                                    current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
+                                if (right_val->getType() != target_type)
+                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                            }
+                            operation_result = builder.CreateMul(current_value, right_val, "mul.tmp");
+                        }
+                        else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                        {
+                            if (current_value->getType()->isIntegerTy())
+                                current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
+                            else if (right_val->getType()->isIntegerTy())
+                                right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
+                            operation_result = builder.CreateFMul(current_value, right_val, "fmul.tmp");
+                        }
+                    }
+                    else if (op_kind == TokenKind::TK_SLASHEQUAL)
+                    {
+                        if (current_value->getType()->isIntegerTy() && right_val->getType()->isIntegerTy())
+                        {
+                            if (current_value->getType() != right_val->getType())
+                            {
+                                llvm::Type *target_type = current_value->getType()->getIntegerBitWidth() > right_val->getType()->getIntegerBitWidth()
+                                                              ? current_value->getType()
+                                                              : right_val->getType();
+                                if (current_value->getType() != target_type)
+                                    current_value = builder.CreateSExt(current_value, target_type, "sext.tmp");
+                                if (right_val->getType() != target_type)
+                                    right_val = builder.CreateSExt(right_val, target_type, "sext.tmp");
+                            }
+                            operation_result = builder.CreateSDiv(current_value, right_val, "sdiv.tmp");
+                        }
+                        else if (current_value->getType()->isFloatingPointTy() || right_val->getType()->isFloatingPointTy())
+                        {
+                            if (current_value->getType()->isIntegerTy())
+                                current_value = builder.CreateSIToFP(current_value, right_val->getType(), "int2float");
+                            else if (right_val->getType()->isIntegerTy())
+                                right_val = builder.CreateSIToFP(right_val, current_value->getType(), "int2float");
+                            operation_result = builder.CreateFDiv(current_value, right_val, "fdiv.tmp");
+                        }
+                    }
+
+                    if (!operation_result)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, "Failed to generate operation for compound assignment - operation_result is null", static_cast<ASTNode *>(node));
+                        return nullptr;
+                    }
+
+                    if (!lvalue_ptr)
+                    {
+                        _diagnostic_builder->report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, "Failed to generate operation for compound assignment - lvalue_ptr is null", static_cast<ASTNode *>(node));
+                        return nullptr;
+                    }
+
+                    // Store the result back to the lvalue
+                    builder.CreateStore(operation_result, lvalue_ptr);
+                    result = operation_result;
+                    break;
                 }
+
+                default:
+                    _diagnostic_builder->report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, "Unsupported binary operator: " + node->operator_token().to_string(), static_cast<ASTNode *>(node));
+                    return nullptr;
+                }
+
+                return result;
             }
         }
         catch (const std::exception &e)
@@ -15343,9 +15371,9 @@ namespace Cryo::Codegen
         // Use FunctionRegistry to infer return type based on function metadata
         llvm::Type *return_type = _function_registry->get_function_return_type(c_name, _context_manager.get_context(), _namespace_context);
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry return type for '{}': {} (TypeID: {})", 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry return type for '{}': {} (TypeID: {})",
                   c_name, (void *)return_type, return_type ? static_cast<int>(return_type->getTypeID()) : -1);
-        
+
         // CRITICAL DEBUGGING: Log when boolean types are assigned
         if (return_type && return_type->isIntegerTy(1))
         {
@@ -15353,14 +15381,14 @@ namespace Cryo::Codegen
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Namespace context: '{}'", _namespace_context);
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "  This function will be declared as returning i1 but likely returns ptr/i32");
         }
-        
+
         // CRITICAL FIX: Add additional validation to prevent boolean mistyping
         // If FunctionRegistry returns i1 (boolean) for functions that clearly shouldn't return boolean,
         // use a safer default based on function name patterns
         if (return_type && return_type->isIntegerTy(1)) // i1 = boolean
         {
             // Check if this function name suggests it should return something other than boolean
-            if (c_name.find("printf") != std::string::npos || 
+            if (c_name.find("printf") != std::string::npos ||
                 c_name.find("print") != std::string::npos ||
                 c_name.find("alloc") != std::string::npos ||
                 c_name.find("malloc") != std::string::npos ||
@@ -15370,7 +15398,7 @@ namespace Cryo::Codegen
                 return_type = llvm::Type::getInt32Ty(_context_manager.get_context());
             }
         }
-        
+
         if (return_type)
         {
             // Validate the return type before using it
