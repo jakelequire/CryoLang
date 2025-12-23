@@ -32,6 +32,37 @@ namespace Cryo::Codegen
         ~TypeCodegen() = default;
 
         //===================================================================
+        // High-Level Entry Points (called by visitor)
+        //===================================================================
+
+        /**
+         * @brief Generate a struct type and its methods
+         * @param node Struct declaration node
+         * @return Generated struct type
+         */
+        llvm::StructType *generate_struct(Cryo::StructDeclarationNode *node);
+
+        /**
+         * @brief Generate a class type and its methods
+         * @param node Class declaration node
+         * @return Generated class type
+         */
+        llvm::StructType *generate_class(Cryo::ClassDeclarationNode *node);
+
+        /**
+         * @brief Generate an enum type
+         * @param node Enum declaration node
+         * @return Generated enum type
+         */
+        llvm::Type *generate_enum(Cryo::EnumDeclarationNode *node);
+
+        /**
+         * @brief Generate a type alias
+         * @param node Type alias declaration node
+         */
+        void generate_type_alias(Cryo::TypeAliasDeclarationNode *node);
+
+        //===================================================================
         // Type Resolution
         //===================================================================
 
