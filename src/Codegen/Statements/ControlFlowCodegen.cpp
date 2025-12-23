@@ -1,4 +1,5 @@
 #include "Codegen/Statements/ControlFlowCodegen.hpp"
+#include "Codegen/CodegenVisitor.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -73,7 +74,8 @@ namespace Cryo::Codegen
         // Generate then block
         builder().SetInsertPoint(then_block);
         enter_scope(then_block);
-        node->then_statement()->accept(ctx().visitor());
+        CodegenVisitor *visitor = ctx().visitor();
+        node->then_statement()->accept(*visitor);
         exit_scope();
 
         // Ensure current block ends with a branch to merge
@@ -97,7 +99,8 @@ namespace Cryo::Codegen
         {
             builder().SetInsertPoint(else_block);
             enter_scope(else_block);
-            node->else_statement()->accept(ctx().visitor());
+            CodegenVisitor *visitor = ctx().visitor();
+            node->else_statement()->accept(*visitor);
             exit_scope();
 
             // Ensure else ends with branch to merge
@@ -167,7 +170,8 @@ namespace Cryo::Codegen
         // Generate body block
         builder().SetInsertPoint(body_block);
         enter_scope(body_block);
-        node->body()->accept(ctx().visitor());
+        CodegenVisitor *visitor = ctx().visitor();
+        node->body()->accept(*visitor);
         exit_scope();
 
         // Ensure current block ends with branch back to condition
@@ -212,7 +216,8 @@ namespace Cryo::Codegen
         // Generate initialization statement
         if (node->init())
         {
-            node->init()->accept(ctx().visitor());
+            CodegenVisitor *visitor = ctx().visitor();
+            node->init()->accept(*visitor);
         }
 
         // Branch to condition block
@@ -241,7 +246,8 @@ namespace Cryo::Codegen
         enter_scope(body_block);
         if (node->body())
         {
-            node->body()->accept(ctx().visitor());
+            CodegenVisitor *visitor = ctx().visitor();
+            node->body()->accept(*visitor);
         }
         exit_scope();
 
@@ -256,7 +262,8 @@ namespace Cryo::Codegen
         builder().SetInsertPoint(increment_block);
         if (node->update())
         {
-            node->update()->accept(ctx().visitor());
+            CodegenVisitor *visitor = ctx().visitor();
+            node->update()->accept(*visitor);
         }
         // Branch back to condition
         builder().CreateBr(condition_block);
@@ -298,7 +305,8 @@ namespace Cryo::Codegen
         // Generate body block
         builder().SetInsertPoint(body_block);
         enter_scope(body_block);
-        node->body()->accept(ctx().visitor());
+        CodegenVisitor *visitor = ctx().visitor();
+        node->body()->accept(*visitor);
         exit_scope();
 
         // Ensure body ends with branch to condition
@@ -410,9 +418,9 @@ namespace Cryo::Codegen
             llvm::BasicBlock *case_block = create_block("switch.case." + std::to_string(i), function);
 
             // Generate case value and add to switch
-            if (case_node->case_value())
+            if (case_node->value())
             {
-                llvm::Value *case_val = generate_expression(case_node->case_value());
+                llvm::Value *case_val = generate_expression(case_node->value());
                 if (case_val && llvm::isa<llvm::ConstantInt>(case_val))
                 {
                     switch_inst->addCase(llvm::cast<llvm::ConstantInt>(case_val), case_block);
@@ -422,9 +430,13 @@ namespace Cryo::Codegen
             // Generate case body
             builder().SetInsertPoint(case_block);
             enter_scope(case_block);
-            if (case_node->body())
+            if (!case_node->statements().empty())
             {
-                case_node->body()->accept(ctx().visitor());
+                CodegenVisitor *visitor = ctx().visitor();
+                for (const auto &stmt : case_node->statements())
+                {
+                    stmt->accept(*visitor);
+                }
             }
             exit_scope();
 
@@ -447,10 +459,23 @@ namespace Cryo::Codegen
 
         // Generate default block
         builder().SetInsertPoint(default_block);
-        if (node->default_case())
+        CaseStatementNode *default_case = nullptr;
+        for (const auto &case_stmt : node->cases())
+        {
+            if (case_stmt->is_default())
+            {
+                default_case = case_stmt.get();
+                break;
+            }
+        }
+        if (default_case)
         {
             enter_scope(default_block);
-            node->default_case()->accept(ctx().visitor());
+            CodegenVisitor *visitor = ctx().visitor();
+            for (const auto &stmt : default_case->statements())
+            {
+                stmt->accept(*visitor);
+            }
             exit_scope();
         }
 
@@ -485,11 +510,11 @@ namespace Cryo::Codegen
         for (size_t i = 0; i < node->cases().size(); ++i)
         {
             auto *case_node = node->cases()[i].get();
-            if (!case_node || !case_node->case_value())
+            if (!case_node || !case_node->value())
                 continue;
 
             // Generate case value (string)
-            llvm::Value *case_val = generate_expression(case_node->case_value());
+            llvm::Value *case_val = generate_expression(case_node->value());
             if (!case_val)
                 continue;
 
@@ -510,9 +535,13 @@ namespace Cryo::Codegen
             // Generate case body
             builder().SetInsertPoint(case_block);
             enter_scope(case_block);
-            if (case_node->body())
+            if (!case_node->statements().empty())
             {
-                case_node->body()->accept(ctx().visitor());
+                CodegenVisitor *visitor = ctx().visitor();
+                for (const auto &stmt : case_node->statements())
+                {
+                    stmt->accept(*visitor);
+                }
             }
             exit_scope();
 
@@ -532,10 +561,23 @@ namespace Cryo::Codegen
 
         // Generate default block
         builder().SetInsertPoint(default_block);
-        if (node->default_case())
+        CaseStatementNode *default_case = nullptr;
+        for (const auto &case_stmt : node->cases())
+        {
+            if (case_stmt->is_default())
+            {
+                default_case = case_stmt.get();
+                break;
+            }
+        }
+        if (default_case)
         {
             enter_scope(default_block);
-            node->default_case()->accept(ctx().visitor());
+            CodegenVisitor *visitor = ctx().visitor();
+            for (const auto &stmt : default_case->statements())
+            {
+                stmt->accept(*visitor);
+            }
             exit_scope();
         }
 
@@ -561,11 +603,7 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating break");
 
-        // Run destructors for current scope if scope manager available
-        if (_scope_manager)
-        {
-            _scope_manager->generate_break_cleanup(builder());
-        }
+        // The scope cleanup is handled automatically by scope guards
 
         // Branch to exit block
         llvm::BasicBlock *exit_block = _breakable_stack.top().exit_block;
@@ -594,11 +632,7 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating continue");
 
-        // Run destructors for current scope
-        if (_scope_manager)
-        {
-            _scope_manager->generate_continue_cleanup(builder());
-        }
+        // The scope cleanup is handled automatically by scope guards
 
         // Branch to continue target (increment for for-loop, condition for while)
         llvm::BasicBlock *target = ctx.increment_block ? ctx.increment_block : ctx.condition_block;
@@ -612,11 +646,7 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating return");
 
-        // Run all destructors in scope stack
-        if (_scope_manager)
-        {
-            _scope_manager->generate_return_cleanup(builder());
-        }
+        // The scope cleanup is handled automatically by scope guards
 
         if (node && node->expression())
         {
@@ -750,7 +780,8 @@ namespace Cryo::Codegen
 
         builder().SetInsertPoint(block);
         enter_scope(block);
-        stmt->accept(ctx().visitor());
+        CodegenVisitor *visitor = ctx().visitor();
+        stmt->accept(*visitor);
         exit_scope();
     }
 
@@ -760,7 +791,8 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Use visitor pattern through context
-        expr->accept(ctx().visitor());
+        CodegenVisitor *visitor = ctx().visitor();
+        expr->accept(*visitor);
         return get_result();
     }
 
@@ -776,7 +808,7 @@ namespace Cryo::Codegen
     {
         if (_scope_manager)
         {
-            _scope_manager->exit_scope(builder());
+            _scope_manager->exit_scope();
         }
     }
 

@@ -1,7 +1,12 @@
 #include "Codegen/Expressions/ExpressionCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
+#include "Codegen/CodegenVisitor.hpp"
+#include "Lexer/lexer.hpp"
+#include "AST/ASTNode.hpp"
 #include "Utils/Logger.hpp"
+
+#include <stdexcept>
 
 namespace Cryo::Codegen
 {
@@ -102,45 +107,89 @@ namespace Cryo::Codegen
         return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr_type));
     }
 
-    llvm::Value *ExpressionCodegen::generate_literal(Cryo::LiteralExpressionNode *node)
+    llvm::Value *ExpressionCodegen::generate_literal(Cryo::LiteralNode *node)
     {
         if (!node)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null literal node");
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null literal node");
             return nullptr;
         }
 
-        const auto &value = node->value();
+        const std::string &value_str = node->value();
+        TokenKind kind = node->literal_kind();
 
-        // Check literal type
-        if (std::holds_alternative<int64_t>(value))
+        // Parse based on literal kind
+        switch (kind)
         {
-            return generate_integer_literal(std::get<int64_t>(value), node->resolved_type());
-        }
-        else if (std::holds_alternative<double>(value))
-        {
-            bool is_double = true;
-            if (node->resolved_type())
+        case TokenKind::TK_NUMERIC_CONSTANT:
             {
-                std::string type_name = node->resolved_type()->to_string();
-                is_double = (type_name != "f32");
+                // Try to parse as integer first, then float
+                try {
+                    // Check if it contains a decimal point or 'e'/'E'
+                    if (value_str.find('.') != std::string::npos || 
+                        value_str.find('e') != std::string::npos || 
+                        value_str.find('E') != std::string::npos)
+                    {
+                        // Parse as float
+                        double float_value = std::stod(value_str);
+                        bool is_double = true;
+                        if (node->get_resolved_type())
+                        {
+                            std::string type_name = node->get_resolved_type()->to_string();
+                            is_double = (type_name != "f32");
+                        }
+                        return generate_float_literal(float_value, is_double);
+                    }
+                    else
+                    {
+                        // Parse as integer
+                        int64_t int_value = std::stoll(value_str, nullptr, 0); // 0 for auto base detection
+                        return generate_integer_literal(int_value, node->get_resolved_type());
+                    }
+                }
+                catch (const std::exception& e) {
+                    report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node, "Invalid numeric literal: " + value_str);
+                    return nullptr;
+                }
             }
-            return generate_float_literal(std::get<double>(value), is_double);
-        }
-        else if (std::holds_alternative<bool>(value))
-        {
-            return generate_bool_literal(std::get<bool>(value));
-        }
-        else if (std::holds_alternative<std::string>(value))
-        {
-            return generate_string_literal(std::get<std::string>(value));
-        }
-        else if (std::holds_alternative<char>(value))
-        {
-            return generate_char_literal(std::get<char>(value));
+            
+        case TokenKind::TK_BOOLEAN_LITERAL:
+            {
+                bool bool_value = (value_str == "true");
+                return generate_bool_literal(bool_value);
+            }
+            
+        case TokenKind::TK_CHAR_CONSTANT:
+            {
+                if (value_str.length() >= 3 && value_str.front() == '\'' && value_str.back() == '\'')
+                {
+                    char char_value = value_str[1]; // Simple case, handle escapes later
+                    return generate_char_literal(char_value);
+                }
+                else
+                {
+                    report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node, "Invalid char literal: " + value_str);
+                    return nullptr;
+                }
+            }
+            
+        case TokenKind::TK_STRING_LITERAL:
+        case TokenKind::TK_RAW_STRING_LITERAL:
+            {
+                // Remove quotes and handle as string
+                std::string str_value = value_str;
+                if (str_value.length() >= 2 && str_value.front() == '"' && str_value.back() == '"')
+                {
+                    str_value = str_value.substr(1, str_value.length() - 2);
+                }
+                return generate_string_literal(str_value);
+            }
+            
+        default:
+            break;
         }
 
-        report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node, "Unknown literal type");
+        report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node, "Unknown literal type");
         return nullptr;
     }
 
@@ -152,7 +201,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null identifier node");
+            report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Null identifier node");
             return nullptr;
         }
 
@@ -162,7 +211,7 @@ namespace Cryo::Codegen
         llvm::Value *value = lookup_variable(name);
         if (!value)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+            report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
                          "Unknown identifier: " + name);
             return nullptr;
         }
@@ -206,7 +255,7 @@ namespace Cryo::Codegen
             return global;
         }
 
-        report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+        report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
                      "Cannot get address of: " + name);
         return nullptr;
     }
@@ -248,7 +297,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null member access node");
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, "Null member access node");
             return nullptr;
         }
 
@@ -286,7 +335,7 @@ namespace Cryo::Codegen
         llvm::Value *object = generate(node->object());
         if (!object)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
                          "Failed to generate member access object");
             return nullptr;
         }
@@ -294,7 +343,7 @@ namespace Cryo::Codegen
         // Ensure we have a pointer to the struct
         if (!object->getType()->isPointerTy())
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
                          "Member access requires pointer type");
             return nullptr;
         }
@@ -304,7 +353,7 @@ namespace Cryo::Codegen
         unsigned field_idx = 0;
         if (!resolve_member_info(node->object(), member_name, struct_type, field_idx))
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
                          "Cannot resolve member: " + member_name);
             return nullptr;
         }
@@ -329,11 +378,11 @@ namespace Cryo::Codegen
     // Index Expressions
     //===================================================================
 
-    llvm::Value *ExpressionCodegen::generate_index(Cryo::IndexExpressionNode *node)
+    llvm::Value *ExpressionCodegen::generate_index(Cryo::ArrayAccessNode *node)
     {
         if (!node)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null index node");
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, "Null index node");
             return nullptr;
         }
 
@@ -347,7 +396,9 @@ namespace Cryo::Codegen
         }
 
         // Determine element type and load
-        Cryo::Type *array_type = node->array()->resolved_type();
+        // For now, we don't have direct type info from expressions
+        // This would need to be resolved by the type checker
+        Cryo::Type *array_type = nullptr; // node->array()->get_resolved_type();
         if (array_type && array_type->kind() == TypeKind::Array)
         {
             llvm::Type *element_type = get_llvm_type(array_type);
@@ -362,7 +413,7 @@ namespace Cryo::Codegen
         return element_ptr;
     }
 
-    llvm::Value *ExpressionCodegen::generate_index_address(Cryo::IndexExpressionNode *node)
+    llvm::Value *ExpressionCodegen::generate_index_address(Cryo::ArrayAccessNode *node)
     {
         if (!node)
             return nullptr;
@@ -371,7 +422,7 @@ namespace Cryo::Codegen
         llvm::Value *array_val = generate(node->array());
         if (!array_val)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
                          "Failed to generate array expression");
             return nullptr;
         }
@@ -380,7 +431,7 @@ namespace Cryo::Codegen
         llvm::Value *index_val = generate(node->index());
         if (!index_val)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
                          "Failed to generate index expression");
             return nullptr;
         }
@@ -388,7 +439,7 @@ namespace Cryo::Codegen
         // Ensure index is integer type
         if (!index_val->getType()->isIntegerTy())
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
                          "Index must be integer type");
             return nullptr;
         }
@@ -417,7 +468,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null cast node");
+            report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, "Null cast node");
             return nullptr;
         }
 
@@ -428,7 +479,16 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        return generate_cast(value, node->target_type());
+        // For now, handle string-based cast by looking up the type
+        // TODO: Use proper Type* resolution instead of string lookup
+        llvm::Type *llvm_target = types().get_type(node->target_type_name());
+        if (!llvm_target) {
+            report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, node, "Unknown cast target type: " + node->target_type_name());
+            return nullptr;
+        }
+        
+        // For now, cast directly using LLVM type - this needs proper Cryo::Type* conversion
+        return cast_if_needed(value, llvm_target);
     }
 
     llvm::Value *ExpressionCodegen::generate_cast(llvm::Value *value, Cryo::Type *target_type)
@@ -453,11 +513,22 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null sizeof node");
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null sizeof node");
             return nullptr;
         }
 
-        return generate_sizeof(node->target_type());
+        // TODO: Get proper Cryo::Type* from node instead of string lookup
+        llvm::Type *llvm_type = types().get_type(node->type_name());
+        if (!llvm_type) {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Unknown type for sizeof: " + node->type_name());
+            return nullptr;
+        }
+        
+        // Generate sizeof using LLVM type
+        auto &context = ctx().llvm().get_context();
+        auto &data_layout = ctx().llvm().get_module().getDataLayout();
+        uint64_t size = data_layout.getTypeAllocSize(llvm_type);
+        return llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), size);
     }
 
     llvm::Value *ExpressionCodegen::generate_sizeof(Cryo::Type *type)
@@ -506,7 +577,7 @@ namespace Cryo::Codegen
     {
         if (!operand)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null operand for address-of");
+            report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR, "Null operand for address-of");
             return nullptr;
         }
 
@@ -519,12 +590,12 @@ namespace Cryo::Codegen
         {
             return generate_member_address(member);
         }
-        else if (auto *index = dynamic_cast<IndexExpressionNode *>(operand))
+        else if (auto *index = dynamic_cast<ArrayAccessNode *>(operand))
         {
             return generate_index_address(index);
         }
 
-        report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, operand,
+        report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR, operand,
                      "Cannot take address of this expression");
         return nullptr;
     }
@@ -533,13 +604,13 @@ namespace Cryo::Codegen
     {
         if (!operand)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null operand for dereference");
+            report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR, "Null operand for dereference");
             return nullptr;
         }
 
         if (!operand->getType()->isPointerTy())
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR,
+            report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR,
                          "Cannot dereference non-pointer type");
             return nullptr;
         }
@@ -567,7 +638,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null ternary node");
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null ternary node");
             return nullptr;
         }
 
@@ -592,7 +663,7 @@ namespace Cryo::Codegen
             }
             else
             {
-                report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
                              "Ternary condition must be boolean");
                 return nullptr;
             }
@@ -609,7 +680,7 @@ namespace Cryo::Codegen
 
         // Generate true value
         builder().SetInsertPoint(then_block);
-        llvm::Value *then_val = generate(node->then_expression());
+        llvm::Value *then_val = generate(node->true_expression());
         if (!then_val)
         {
             return nullptr;
@@ -619,7 +690,7 @@ namespace Cryo::Codegen
 
         // Generate false value
         builder().SetInsertPoint(else_block);
-        llvm::Value *else_val = generate(node->else_expression());
+        llvm::Value *else_val = generate(node->false_expression());
         if (!else_val)
         {
             return nullptr;
@@ -658,7 +729,7 @@ namespace Cryo::Codegen
         }
 
         // Index expression is lvalue
-        if (dynamic_cast<IndexExpressionNode *>(expr))
+        if (dynamic_cast<ArrayAccessNode *>(expr))
         {
             return true;
         }
@@ -681,7 +752,8 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Use visitor pattern through context
-        expr->accept(ctx().visitor());
+        CodegenVisitor *visitor = ctx().visitor();
+        expr->accept(*visitor);
         return get_result();
     }
 
@@ -716,7 +788,8 @@ namespace Cryo::Codegen
             return false;
 
         // Get the type of the object
-        Cryo::Type *obj_type = object->resolved_type();
+        // For now, we don't have direct type info from expressions
+        Cryo::Type *obj_type = nullptr; // object->get_resolved_type();
         if (!obj_type)
             return false;
 
@@ -744,15 +817,19 @@ namespace Cryo::Codegen
         }
 
         // Look up field index from context's field mapping
-        const auto &field_map = ctx().get_field_indices(type_name);
-        auto it = field_map.find(member_name);
-        if (it != field_map.end())
-        {
-            out_field_idx = it->second;
-            return true;
-        }
+        // For now, use a simplified approach
+        // TODO: Implement proper struct field resolution
+        
+        // const auto &field_map = ctx().get_field_indices(type_name);
+        // auto it = field_map.find(member_name);
+        // if (it != field_map.end())
+        // {
+        //     out_field_idx = it->second;
+        //     return true;
+        // }
 
         // Fallback: Check symbol table for field info
+        // For now, return failure since field mapping is not implemented
         return false;
     }
 
