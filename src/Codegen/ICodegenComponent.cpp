@@ -1,0 +1,276 @@
+#include "Codegen/ICodegenComponent.hpp"
+#include "Utils/Logger.hpp"
+
+namespace Cryo::Codegen
+{
+    //===================================================================
+    // Common Memory Operations
+    //===================================================================
+
+    llvm::AllocaInst *ICodegenComponent::create_entry_alloca(llvm::Function *fn, llvm::Type *type, const std::string &name)
+    {
+        if (!fn || !type)
+            return nullptr;
+
+        // Save current insertion point
+        llvm::IRBuilder<> &b = builder();
+        llvm::BasicBlock *current_block = b.GetInsertBlock();
+        llvm::BasicBlock::iterator current_point = b.GetInsertPoint();
+
+        // Get the entry block
+        llvm::BasicBlock &entry = fn->getEntryBlock();
+
+        // Insert at the beginning of entry block (after any existing allocas)
+        if (entry.empty())
+        {
+            b.SetInsertPoint(&entry);
+        }
+        else
+        {
+            // Find the first non-alloca instruction
+            llvm::BasicBlock::iterator insert_point = entry.begin();
+            while (insert_point != entry.end() && llvm::isa<llvm::AllocaInst>(&*insert_point))
+            {
+                ++insert_point;
+            }
+            b.SetInsertPoint(&entry, insert_point);
+        }
+
+        // Create the alloca
+        llvm::AllocaInst *alloca = b.CreateAlloca(type, nullptr, name);
+
+        // Restore insertion point
+        if (current_block)
+        {
+            b.SetInsertPoint(current_block, current_point);
+        }
+
+        return alloca;
+    }
+
+    llvm::AllocaInst *ICodegenComponent::create_entry_alloca(llvm::Type *type, const std::string &name)
+    {
+        FunctionContext *fn_ctx = ctx().current_function();
+        if (!fn_ctx || !fn_ctx->function)
+            return nullptr;
+
+        return create_entry_alloca(fn_ctx->function, type, name);
+    }
+
+    llvm::Value *ICodegenComponent::create_load(llvm::Value *ptr, llvm::Type *type, const std::string &name)
+    {
+        if (!ptr)
+            return nullptr;
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "create_load called on non-pointer type");
+            return ptr;
+        }
+
+        return builder().CreateLoad(type, ptr, name.empty() ? "load" : name);
+    }
+
+    void ICodegenComponent::create_store(llvm::Value *value, llvm::Value *ptr)
+    {
+        if (!value || !ptr)
+            return;
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "create_store called with non-pointer destination");
+            return;
+        }
+
+        builder().CreateStore(value, ptr);
+    }
+
+    llvm::Value *ICodegenComponent::create_struct_gep(llvm::Type *struct_type, llvm::Value *ptr,
+                                                       unsigned field_idx, const std::string &name)
+    {
+        if (!struct_type || !ptr)
+            return nullptr;
+
+        return builder().CreateStructGEP(struct_type, ptr, field_idx,
+                                         name.empty() ? "field.ptr" : name);
+    }
+
+    llvm::Value *ICodegenComponent::create_array_gep(llvm::Type *element_type, llvm::Value *ptr,
+                                                      llvm::Value *index, const std::string &name)
+    {
+        if (!element_type || !ptr || !index)
+            return nullptr;
+
+        return builder().CreateGEP(element_type, ptr, index,
+                                   name.empty() ? "elem.ptr" : name);
+    }
+
+    //===================================================================
+    // Common Control Flow Operations
+    //===================================================================
+
+    llvm::BasicBlock *ICodegenComponent::create_block(const std::string &name)
+    {
+        FunctionContext *fn_ctx = ctx().current_function();
+        if (!fn_ctx || !fn_ctx->function)
+            return nullptr;
+
+        return create_block(name, fn_ctx->function);
+    }
+
+    llvm::BasicBlock *ICodegenComponent::create_block(const std::string &name, llvm::Function *fn)
+    {
+        if (!fn)
+            return nullptr;
+
+        return llvm::BasicBlock::Create(llvm_ctx(), name, fn);
+    }
+
+    void ICodegenComponent::ensure_valid_insertion_point()
+    {
+        llvm::IRBuilder<> &b = builder();
+        llvm::BasicBlock *current = b.GetInsertBlock();
+
+        // Check if we have a valid insertion point
+        if (!current)
+        {
+            // No current block - try to create one in current function
+            FunctionContext *fn_ctx = ctx().current_function();
+            if (fn_ctx && fn_ctx->function)
+            {
+                llvm::BasicBlock *fallback = create_block("fallback", fn_ctx->function);
+                b.SetInsertPoint(fallback);
+            }
+            return;
+        }
+
+        // Check if current block is already terminated
+        if (current->getTerminator())
+        {
+            // Block is terminated - create a new unreachable block
+            FunctionContext *fn_ctx = ctx().current_function();
+            if (fn_ctx && fn_ctx->function)
+            {
+                llvm::BasicBlock *unreachable = create_block("unreachable", fn_ctx->function);
+                b.SetInsertPoint(unreachable);
+            }
+        }
+    }
+
+    //===================================================================
+    // Common Type Operations
+    //===================================================================
+
+    llvm::Type *ICodegenComponent::get_llvm_type(Cryo::Type *cryo_type)
+    {
+        if (!cryo_type)
+            return nullptr;
+
+        return types().map_type(cryo_type);
+    }
+
+    llvm::Value *ICodegenComponent::cast_if_needed(llvm::Value *value, llvm::Type *target_type)
+    {
+        if (!value || !target_type)
+            return value;
+
+        llvm::Type *source_type = value->getType();
+        if (source_type == target_type)
+            return value;
+
+        llvm::IRBuilder<> &b = builder();
+
+        // Integer to integer
+        if (source_type->isIntegerTy() && target_type->isIntegerTy())
+        {
+            unsigned source_bits = source_type->getIntegerBitWidth();
+            unsigned target_bits = target_type->getIntegerBitWidth();
+
+            if (source_bits < target_bits)
+            {
+                // Extension - assume signed for safety
+                return b.CreateSExt(value, target_type, "sext");
+            }
+            else if (source_bits > target_bits)
+            {
+                // Truncation
+                return b.CreateTrunc(value, target_type, "trunc");
+            }
+        }
+
+        // Float to float
+        if (source_type->isFloatingPointTy() && target_type->isFloatingPointTy())
+        {
+            if (source_type->isFloatTy() && target_type->isDoubleTy())
+            {
+                return b.CreateFPExt(value, target_type, "fpext");
+            }
+            else if (source_type->isDoubleTy() && target_type->isFloatTy())
+            {
+                return b.CreateFPTrunc(value, target_type, "fptrunc");
+            }
+        }
+
+        // Integer to float
+        if (source_type->isIntegerTy() && target_type->isFloatingPointTy())
+        {
+            return b.CreateSIToFP(value, target_type, "sitofp");
+        }
+
+        // Float to integer
+        if (source_type->isFloatingPointTy() && target_type->isIntegerTy())
+        {
+            return b.CreateFPToSI(value, target_type, "fptosi");
+        }
+
+        // Pointer casts (with opaque pointers, usually not needed)
+        if (source_type->isPointerTy() && target_type->isPointerTy())
+        {
+            // With opaque pointers, this is usually a no-op
+            return value;
+        }
+
+        // Can't cast - return original
+        LOG_WARN(Cryo::LogComponent::CODEGEN, "Unable to cast between incompatible types");
+        return value;
+    }
+
+    bool ICodegenComponent::is_alloca(llvm::Value *value) const
+    {
+        return value && llvm::isa<llvm::AllocaInst>(value);
+    }
+
+    //===================================================================
+    // Error Reporting
+    //===================================================================
+
+    void ICodegenComponent::report_error(ErrorCode code, Cryo::ASTNode *node, const std::string &msg)
+    {
+        _ctx.report_error(code, node, msg);
+    }
+
+    void ICodegenComponent::report_error(ErrorCode code, const std::string &msg)
+    {
+        _ctx.report_error(code, msg);
+    }
+
+    //===================================================================
+    // Value Registration
+    //===================================================================
+
+    void ICodegenComponent::register_value(Cryo::ASTNode *node, llvm::Value *value)
+    {
+        _ctx.register_value(node, value);
+    }
+
+    void ICodegenComponent::set_result(llvm::Value *value)
+    {
+        _ctx.set_result(value);
+    }
+
+    llvm::Value *ICodegenComponent::get_result()
+    {
+        return _ctx.get_result();
+    }
+
+} // namespace Cryo::Codegen
