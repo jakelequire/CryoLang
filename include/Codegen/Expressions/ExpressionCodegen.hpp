@@ -1,0 +1,310 @@
+#pragma once
+
+#include "Codegen/ICodegenComponent.hpp"
+#include "Codegen/CodegenContext.hpp"
+#include "AST/ASTNode.hpp"
+
+#include <llvm/IR/Value.h>
+#include <llvm/IR/Type.h>
+#include <string>
+
+namespace Cryo::Codegen
+{
+    // Forward declarations
+    class MemoryCodegen;
+    class TypeCodegen;
+
+    /**
+     * @brief Handles expression code generation
+     *
+     * This class centralizes generation for:
+     * - Literal expressions (int, float, string, bool)
+     * - Identifier expressions (variable references)
+     * - Member access expressions
+     * - Index expressions (array access)
+     * - Cast expressions
+     * - Sizeof/alignof expressions
+     *
+     * Key features:
+     * - Consistent value/address distinction
+     * - Proper handling of lvalues vs rvalues
+     * - String literal pooling
+     * - Null literal handling
+     */
+    class ExpressionCodegen : public ICodegenComponent
+    {
+    public:
+        //===================================================================
+        // Construction
+        //===================================================================
+
+        explicit ExpressionCodegen(CodegenContext &ctx);
+        ~ExpressionCodegen() = default;
+
+        /**
+         * @brief Set the memory codegen component
+         */
+        void set_memory_codegen(MemoryCodegen *memory) { _memory = memory; }
+
+        /**
+         * @brief Set the type codegen component
+         */
+        void set_type_codegen(TypeCodegen *types_codegen) { _type_codegen = types_codegen; }
+
+        //===================================================================
+        // Literal Expressions
+        //===================================================================
+
+        /**
+         * @brief Generate integer literal
+         * @param value Integer value
+         * @param type Target type (determines bit width)
+         * @return Constant integer value
+         */
+        llvm::Value *generate_integer_literal(int64_t value, Cryo::Type *type = nullptr);
+
+        /**
+         * @brief Generate floating-point literal
+         * @param value Float value
+         * @param is_double Whether to use double (true) or float (false)
+         * @return Constant float value
+         */
+        llvm::Value *generate_float_literal(double value, bool is_double = true);
+
+        /**
+         * @brief Generate boolean literal
+         * @param value Boolean value
+         * @return Constant i1 value
+         */
+        llvm::Value *generate_bool_literal(bool value);
+
+        /**
+         * @brief Generate string literal
+         * @param value String value
+         * @return Pointer to string constant
+         */
+        llvm::Value *generate_string_literal(const std::string &value);
+
+        /**
+         * @brief Generate character literal
+         * @param value Character value
+         * @return Constant i8 value
+         */
+        llvm::Value *generate_char_literal(char value);
+
+        /**
+         * @brief Generate null literal
+         * @param type Optional type for typed null
+         * @return Null pointer constant
+         */
+        llvm::Value *generate_null_literal(Cryo::Type *type = nullptr);
+
+        /**
+         * @brief Generate literal from AST node
+         * @param node Literal expression node
+         * @return Generated value
+         */
+        llvm::Value *generate_literal(Cryo::LiteralExpressionNode *node);
+
+        //===================================================================
+        // Identifier Expressions
+        //===================================================================
+
+        /**
+         * @brief Generate identifier expression (variable reference)
+         * @param node Identifier node
+         * @return Variable value (loaded if needed)
+         */
+        llvm::Value *generate_identifier(Cryo::IdentifierNode *node);
+
+        /**
+         * @brief Generate identifier address (for assignment)
+         * @param node Identifier node
+         * @return Address of variable
+         */
+        llvm::Value *generate_identifier_address(Cryo::IdentifierNode *node);
+
+        /**
+         * @brief Lookup and return variable value by name
+         * @param name Variable name
+         * @return Variable value or nullptr
+         */
+        llvm::Value *lookup_variable(const std::string &name);
+
+        //===================================================================
+        // Member Access Expressions
+        //===================================================================
+
+        /**
+         * @brief Generate member access expression
+         * @param node Member access node
+         * @return Member value
+         */
+        llvm::Value *generate_member_access(Cryo::MemberAccessNode *node);
+
+        /**
+         * @brief Generate member address (for assignment)
+         * @param node Member access node
+         * @return Address of member
+         */
+        llvm::Value *generate_member_address(Cryo::MemberAccessNode *node);
+
+        /**
+         * @brief Get field index by name from struct type
+         * @param struct_type Struct type
+         * @param field_name Field name
+         * @return Field index, or -1 if not found
+         */
+        int get_field_index(llvm::StructType *struct_type, const std::string &field_name);
+
+        //===================================================================
+        // Index Expressions
+        //===================================================================
+
+        /**
+         * @brief Generate array index expression
+         * @param node Index expression node
+         * @return Element value
+         */
+        llvm::Value *generate_index(Cryo::IndexExpressionNode *node);
+
+        /**
+         * @brief Generate index address (for assignment)
+         * @param node Index expression node
+         * @return Address of element
+         */
+        llvm::Value *generate_index_address(Cryo::IndexExpressionNode *node);
+
+        //===================================================================
+        // Cast Expressions
+        //===================================================================
+
+        /**
+         * @brief Generate cast expression
+         * @param node Cast expression node
+         * @return Cast value
+         */
+        llvm::Value *generate_cast(Cryo::CastExpressionNode *node);
+
+        /**
+         * @brief Generate explicit type cast
+         * @param value Value to cast
+         * @param target_type Target Cryo type
+         * @return Cast value
+         */
+        llvm::Value *generate_cast(llvm::Value *value, Cryo::Type *target_type);
+
+        //===================================================================
+        // Sizeof/Alignof
+        //===================================================================
+
+        /**
+         * @brief Generate sizeof expression
+         * @param node Sizeof expression node
+         * @return Size value
+         */
+        llvm::Value *generate_sizeof(Cryo::SizeofExpressionNode *node);
+
+        /**
+         * @brief Generate sizeof for a type
+         * @param type Cryo type
+         * @return Size in bytes as i64
+         */
+        llvm::Value *generate_sizeof(Cryo::Type *type);
+
+        /**
+         * @brief Generate alignof expression
+         * @param type Cryo type
+         * @return Alignment in bytes as i64
+         */
+        llvm::Value *generate_alignof(Cryo::Type *type);
+
+        //===================================================================
+        // Address-of and Dereference
+        //===================================================================
+
+        /**
+         * @brief Generate address-of expression
+         * @param operand Operand expression
+         * @return Address of operand
+         */
+        llvm::Value *generate_address_of(Cryo::ExpressionNode *operand);
+
+        /**
+         * @brief Generate dereference expression
+         * @param operand Pointer operand
+         * @param pointee_type Type of pointed-to value
+         * @return Dereferenced value
+         */
+        llvm::Value *generate_dereference(llvm::Value *operand, Cryo::Type *pointee_type);
+
+        //===================================================================
+        // Ternary Expression
+        //===================================================================
+
+        /**
+         * @brief Generate ternary conditional expression
+         * @param node Ternary expression node
+         * @return Result value
+         */
+        llvm::Value *generate_ternary(Cryo::TernaryExpressionNode *node);
+
+        //===================================================================
+        // Helpers
+        //===================================================================
+
+        /**
+         * @brief Check if expression is an lvalue
+         * @param expr Expression to check
+         * @return true if lvalue
+         */
+        bool is_lvalue(Cryo::ExpressionNode *expr) const;
+
+        /**
+         * @brief Generate expression and get result
+         * @param expr Expression to generate
+         * @return Result value
+         */
+        llvm::Value *generate(Cryo::ExpressionNode *expr);
+
+    private:
+        MemoryCodegen *_memory = nullptr;
+        TypeCodegen *_type_codegen = nullptr;
+
+        //===================================================================
+        // Internal Helpers
+        //===================================================================
+
+        /**
+         * @brief Get integer type for bit width
+         * @param bits Bit width
+         * @return Integer type
+         */
+        llvm::IntegerType *get_int_type(unsigned bits);
+
+        /**
+         * @brief Load value if it's a pointer to the expected type
+         * @param value Value that might be a pointer
+         * @param expected_type Expected result type
+         * @return Loaded value or original
+         */
+        llvm::Value *load_if_pointer(llvm::Value *value, llvm::Type *expected_type);
+
+        /**
+         * @brief Get struct type and field info for member access
+         * @param object Object expression
+         * @param member_name Member name
+         * @param out_struct_type Output struct type
+         * @param out_field_idx Output field index
+         * @return true if successful
+         */
+        bool resolve_member_info(Cryo::ExpressionNode *object,
+                                  const std::string &member_name,
+                                  llvm::StructType *&out_struct_type,
+                                  unsigned &out_field_idx);
+
+        // String literal cache
+        std::unordered_map<std::string, llvm::GlobalVariable *> _string_cache;
+    };
+
+} // namespace Cryo::Codegen
