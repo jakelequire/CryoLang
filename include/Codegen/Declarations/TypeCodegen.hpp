@@ -62,6 +62,13 @@ namespace Cryo::Codegen
          */
         void generate_type_alias(Cryo::TypeAliasDeclarationNode *node);
 
+        /**
+         * @brief Map primitive type alias by name
+         * @param name Alias name (e.g., "i32", "u64", "f32")
+         * @return LLVM type or nullptr if not a known primitive
+         */
+        llvm::Type *map_primitive_alias(const std::string &name);
+
         //===================================================================
         // Type Resolution
         //===================================================================

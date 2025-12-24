@@ -660,7 +660,20 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating type alias: {}", alias_name);
 
         // Get the aliased type
-        llvm::Type *aliased_type = types().get_type(node->get_resolved_target_type());
+        llvm::Type *aliased_type = nullptr;
+
+        // First try to get from resolved type
+        if (node->has_resolved_target_type())
+        {
+            aliased_type = types().get_type(node->get_resolved_target_type());
+        }
+
+        // If not resolved, try to map common primitive type aliases by name
+        if (!aliased_type)
+        {
+            aliased_type = map_primitive_alias(alias_name);
+        }
+
         if (!aliased_type)
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN, "Unknown aliased type for: {}", alias_name);
@@ -669,6 +682,52 @@ namespace Cryo::Codegen
 
         // Register the alias
         ctx().register_type(alias_name, aliased_type);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Registered type: {}", alias_name);
+    }
+
+    llvm::Type *TypeCodegen::map_primitive_alias(const std::string &name)
+    {
+        // Map common primitive type aliases
+        if (name == "i1" || name == "bool")
+            return llvm::Type::getInt1Ty(llvm_ctx());
+        if (name == "i8")
+            return llvm::Type::getInt8Ty(llvm_ctx());
+        if (name == "i16")
+            return llvm::Type::getInt16Ty(llvm_ctx());
+        if (name == "i32" || name == "int")
+            return llvm::Type::getInt32Ty(llvm_ctx());
+        if (name == "i64")
+            return llvm::Type::getInt64Ty(llvm_ctx());
+        if (name == "i128")
+            return llvm::Type::getInt128Ty(llvm_ctx());
+
+        // Unsigned integers (same LLVM type as signed, signedness tracked separately)
+        if (name == "u8")
+            return llvm::Type::getInt8Ty(llvm_ctx());
+        if (name == "u16")
+            return llvm::Type::getInt16Ty(llvm_ctx());
+        if (name == "u32")
+            return llvm::Type::getInt32Ty(llvm_ctx());
+        if (name == "u64")
+            return llvm::Type::getInt64Ty(llvm_ctx());
+        if (name == "u128")
+            return llvm::Type::getInt128Ty(llvm_ctx());
+
+        // Floating point
+        if (name == "f32" || name == "float")
+            return llvm::Type::getFloatTy(llvm_ctx());
+        if (name == "f64" || name == "double")
+            return llvm::Type::getDoubleTy(llvm_ctx());
+
+        // Void
+        if (name == "void")
+            return llvm::Type::getVoidTy(llvm_ctx());
+
+        // String (pointer type)
+        if (name == "string" || name == "str")
+            return llvm::PointerType::get(llvm_ctx(), 0);
+
+        return nullptr;
     }
 
 } // namespace Cryo::Codegen
