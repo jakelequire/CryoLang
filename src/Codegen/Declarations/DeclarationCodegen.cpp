@@ -717,4 +717,198 @@ namespace Cryo::Codegen
         return llvm::Constant::getNullValue(type);
     }
 
+    //===================================================================
+    // High-Level Entry Points (called by CodegenVisitor)
+    //===================================================================
+
+    llvm::Function *DeclarationCodegen::generate_function(Cryo::FunctionDeclarationNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        // If function has a body, generate full definition; otherwise just declaration
+        if (node->body())
+        {
+            return generate_function_definition(node);
+        }
+        else
+        {
+            return generate_function_declaration(node);
+        }
+    }
+
+    void DeclarationCodegen::generate_variable(Cryo::VariableDeclarationNode *node)
+    {
+        if (!node)
+            return;
+
+        // Check if we're at global scope or function scope
+        llvm::Function *current_fn = builder().GetInsertBlock()
+                                         ? builder().GetInsertBlock()->getParent()
+                                         : nullptr;
+
+        if (current_fn)
+        {
+            // Local variable
+            generate_local_variable(node);
+        }
+        else
+        {
+            // Global variable
+            generate_global_variable(node);
+        }
+    }
+
+    void DeclarationCodegen::generate_method(Cryo::StructMethodNode *node)
+    {
+        if (!node)
+            return;
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating struct method");
+
+        // Get the parent type name from context
+        std::string parent_type = ctx().current_type_name();
+
+        // The StructMethodNode contains a FunctionDeclarationNode
+        if (node->signature())
+        {
+            generate_method_declaration(node->signature(), parent_type);
+        }
+    }
+
+    void DeclarationCodegen::generate_impl_block(Cryo::ImplementationBlockNode *node)
+    {
+        if (!node)
+            return;
+
+        std::string type_name = node->target_type();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating impl block for {}", type_name);
+
+        // Set current type context
+        std::string previous_type = ctx().current_type_name();
+        ctx().set_current_type_name(type_name);
+
+        // Generate each method in the impl block
+        for (const auto &method : node->methods())
+        {
+            if (auto *fn_node = dynamic_cast<Cryo::FunctionDeclarationNode *>(method.get()))
+            {
+                // Generate as a method with the type prefix
+                if (fn_node->body())
+                {
+                    // Full definition
+                    std::string method_name = generate_method_name(type_name, fn_node->name());
+                    llvm::Function *fn = generate_method_declaration(fn_node, type_name);
+                    if (fn && fn->empty())
+                    {
+                        // Create entry block and generate body
+                        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+                        builder().SetInsertPoint(entry);
+
+                        // Allocate parameters
+                        for (auto &arg : fn->args())
+                        {
+                            llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
+                            create_store(&arg, alloca);
+                            values().set_value(arg.getName().str(), nullptr, alloca);
+                        }
+
+                        // Generate body
+                        CodegenVisitor *visitor = ctx().visitor();
+                        fn_node->body()->accept(*visitor);
+
+                        // Add implicit return if needed
+                        llvm::BasicBlock *current_block = builder().GetInsertBlock();
+                        if (current_block && !current_block->getTerminator())
+                        {
+                            if (fn->getReturnType()->isVoidTy())
+                            {
+                                builder().CreateRetVoid();
+                            }
+                            else
+                            {
+                                builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    generate_method_declaration(fn_node, type_name);
+                }
+            }
+        }
+
+        // Restore previous type context
+        ctx().set_current_type_name(previous_type);
+    }
+
+    void DeclarationCodegen::generate_extern_block(Cryo::ExternBlockNode *node)
+    {
+        if (!node)
+            return;
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating extern block");
+
+        // Generate each declaration in the extern block
+        for (const auto &decl : node->declarations())
+        {
+            if (auto *fn_node = dynamic_cast<Cryo::FunctionDeclarationNode *>(decl.get()))
+            {
+                generate_extern_function(fn_node);
+            }
+            else if (auto *var_node = dynamic_cast<Cryo::VariableDeclarationNode *>(decl.get()))
+            {
+                // External variable declaration
+                generate_global_variable(var_node);
+            }
+        }
+    }
+
+    void DeclarationCodegen::pre_register_functions()
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Pre-registering functions from symbol table");
+
+        // This would iterate through the symbol table and pre-declare all functions
+        // For now, this is a no-op - functions are declared on first use
+    }
+
+    void DeclarationCodegen::import_specialized_methods(const Cryo::TypeChecker &type_checker)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Importing specialized methods");
+
+        // This would import specialized generic methods from the type checker
+        // For now, this is a no-op
+    }
+
+    void DeclarationCodegen::process_global_variables(Cryo::ASTNode *node)
+    {
+        if (!node)
+            return;
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Processing global variables");
+
+        // Walk the AST and generate global variable declarations
+        if (auto *program = dynamic_cast<Cryo::ProgramNode *>(node))
+        {
+            for (const auto &decl : program->declarations())
+            {
+                if (auto *var_node = dynamic_cast<Cryo::VariableDeclarationNode *>(decl.get()))
+                {
+                    generate_global_variable(var_node);
+                }
+            }
+        }
+    }
+
+    void DeclarationCodegen::generate_global_constructors()
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating global constructors");
+
+        // Generate global constructor function that initializes global variables
+        // This creates an __init function that LLVM will call at startup
+
+        // For now, this is a no-op - globals are zero-initialized
+    }
+
 } // namespace Cryo::Codegen
