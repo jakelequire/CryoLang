@@ -847,21 +847,31 @@ namespace Cryo::Codegen
 
     llvm::Function *CallCodegen::resolve_function(const std::string &name)
     {
-        // Try direct lookup first
+        // Try direct lookup in LLVM module first (primary source of truth)
         llvm::Function *fn = module()->getFunction(name);
         if (fn)
             return fn;
 
-        // Try in functions registry
-        auto &functions = ctx().get_functions();
-        auto it = functions.find(name);
-        if (it != functions.end())
-        {
-            return it->second;
-        }
+        // Try in context's function registry (for forward declarations, templates, etc.)
+        fn = ctx().get_function(name);
+        if (fn)
+            return fn;
 
-        // Try with current namespace prefix
-        // This would need access to namespace context
+        // Try with current namespace prefix using SRM
+        std::string qualified = ctx().namespace_context().empty()
+            ? name
+            : ctx().namespace_context() + "::" + name;
+
+        if (qualified != name)
+        {
+            fn = module()->getFunction(qualified);
+            if (fn)
+                return fn;
+
+            fn = ctx().get_function(qualified);
+            if (fn)
+                return fn;
+        }
 
         return nullptr;
     }
@@ -869,19 +879,16 @@ namespace Cryo::Codegen
     llvm::Function *CallCodegen::resolve_method(const std::string &type_name,
                                                 const std::string &method_name)
     {
-        // Try fully qualified name
+        // Try fully qualified name in LLVM module
         std::string qualified = type_name + "::" + method_name;
         llvm::Function *fn = module()->getFunction(qualified);
         if (fn)
             return fn;
 
-        // Try in functions registry
-        auto &functions = ctx().get_functions();
-        auto it = functions.find(qualified);
-        if (it != functions.end())
-        {
-            return it->second;
-        }
+        // Try in context's function registry
+        fn = ctx().get_function(qualified);
+        if (fn)
+            return fn;
 
         return nullptr;
     }
@@ -897,16 +904,15 @@ namespace Cryo::Codegen
 
         for (const auto &ctor_name : ctor_names)
         {
+            // Check LLVM module first
             llvm::Function *fn = module()->getFunction(ctor_name);
             if (fn)
                 return fn;
 
-            auto &functions = ctx().get_functions();
-            auto it = functions.find(ctor_name);
-            if (it != functions.end())
-            {
-                return it->second;
-            }
+            // Check context's function registry
+            fn = ctx().get_function(ctor_name);
+            if (fn)
+                return fn;
         }
 
         return nullptr;
