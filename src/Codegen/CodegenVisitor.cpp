@@ -95,6 +95,15 @@ namespace Cryo::Codegen
         // GenericCodegen needs TypeCodegen for type operations
         _generics->set_type_codegen(_types.get());
 
+        // Wire TypeMapper to GenericCodegen for parameterized type instantiation
+        // This allows TypeMapper to delegate generic type instantiation to GenericCodegen
+        GenericCodegen* generics_ptr = _generics.get();
+        _ctx->types().set_generic_instantiator(
+            [generics_ptr](const std::string& generic_name,
+                           const std::vector<Cryo::Type*>& type_args) -> llvm::StructType* {
+                return generics_ptr->instantiate_struct(generic_name, type_args);
+            });
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Component dependencies wired");
     }
 
@@ -222,6 +231,20 @@ namespace Cryo::Codegen
         NodeTracker tracker(*_ctx, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting StructDeclarationNode: {}", node.name());
 
+        // Check if this is a generic struct template
+        if (!node.generic_parameters().empty())
+        {
+            // Register with GenericCodegen for later instantiation
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Registering generic struct template: {} with {} type parameters",
+                      node.name(), node.generic_parameters().size());
+            _generics->register_generic_type(node.name(), &node);
+
+            // Don't generate the template directly - it will be instantiated when used
+            return;
+        }
+
+        // Generate the struct type
         _types->generate_struct(&node);
     }
 
@@ -230,6 +253,20 @@ namespace Cryo::Codegen
         NodeTracker tracker(*_ctx, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ClassDeclarationNode: {}", node.name());
 
+        // Check if this is a generic class template
+        if (!node.generic_parameters().empty())
+        {
+            // Register with GenericCodegen for later instantiation
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Registering generic class template: {} with {} type parameters",
+                      node.name(), node.generic_parameters().size());
+            _generics->register_generic_type(node.name(), &node);
+
+            // Don't generate the template directly - it will be instantiated when used
+            return;
+        }
+
+        // Generate the class type
         _types->generate_class(&node);
     }
 
