@@ -1,5 +1,6 @@
 #include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
+#include "AST/ASTVisitor.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -954,14 +955,14 @@ namespace Cryo::Codegen
     bool CallCodegen::is_struct_type(const std::string &name) const
     {
         // Check in type registry
-        llvm::Type *type = const_cast<CodegenContext&>(ctx()).get_type(name);
+        llvm::Type *type = const_cast<CodegenContext &>(ctx()).get_type(name);
         return type && type->isStructTy();
     }
 
     bool CallCodegen::is_enum_type(const std::string &name) const
     {
         // Check symbol table for enum
-        Symbol *sym = const_cast<CallCodegen*>(this)->symbols().lookup_symbol(name);
+        Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(name);
         if (sym && sym->kind == SymbolKind::Type && sym->data_type)
         {
             return sym->data_type->kind() == TypeKind::Enum;
