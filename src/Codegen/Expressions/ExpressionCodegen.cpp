@@ -837,4 +837,217 @@ namespace Cryo::Codegen
         return false;
     }
 
+    //===================================================================
+    // Missing Expression Generators
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_array_access(Cryo::ArrayAccessNode *node)
+    {
+        // Delegate to generate_index which handles ArrayAccessNode
+        return generate_index(node);
+    }
+
+    llvm::Value *ExpressionCodegen::generate_array_literal(Cryo::ArrayLiteralNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, "Null array literal node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating array literal");
+
+        const auto &elements = node->elements();
+        if (elements.empty())
+        {
+            // Empty array - return null pointer for now
+            return llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_ctx(), 0));
+        }
+
+        // Generate first element to determine type
+        llvm::Value *first_elem = generate(elements[0].get());
+        if (!first_elem)
+        {
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                         "Failed to generate first array element");
+            return nullptr;
+        }
+
+        llvm::Type *elem_type = first_elem->getType();
+        llvm::ArrayType *array_type = llvm::ArrayType::get(elem_type, elements.size());
+
+        // Allocate array on stack
+        llvm::AllocaInst *array_alloca = create_entry_alloca(array_type, "array.literal");
+
+        // Store each element
+        for (size_t i = 0; i < elements.size(); ++i)
+        {
+            llvm::Value *elem_val = (i == 0) ? first_elem : generate(elements[i].get());
+            if (!elem_val)
+            {
+                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                             "Failed to generate array element at index " + std::to_string(i));
+                return nullptr;
+            }
+
+            // Cast if needed
+            elem_val = cast_if_needed(elem_val, elem_type);
+
+            // Get pointer to element
+            llvm::Value *indices[] = {
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
+            llvm::Value *elem_ptr = builder().CreateInBoundsGEP(array_type, array_alloca, indices,
+                                                                 "elem." + std::to_string(i) + ".ptr");
+            builder().CreateStore(elem_val, elem_ptr);
+        }
+
+        return array_alloca;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_struct_literal(Cryo::StructLiteralNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, "Null struct literal node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating struct literal for {}",
+                  node->struct_type());
+
+        // Look up struct type
+        llvm::Type *struct_type = ctx().get_type(node->struct_type());
+        if (!struct_type || !struct_type->isStructTy())
+        {
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
+                         "Unknown struct type: " + node->struct_type());
+            return nullptr;
+        }
+
+        auto *st = llvm::cast<llvm::StructType>(struct_type);
+
+        // Allocate struct on stack
+        llvm::AllocaInst *struct_alloca = create_entry_alloca(struct_type, node->struct_type() + ".literal");
+
+        // Initialize fields from field initializers
+        const auto &field_initializers = node->field_initializers();
+        for (size_t i = 0; i < field_initializers.size() && i < st->getNumElements(); ++i)
+        {
+            const auto &initializer = field_initializers[i];
+            if (!initializer || !initializer->value())
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN, "Null field initializer at index {}", i);
+                continue;
+            }
+
+            llvm::Value *field_val = generate(initializer->value());
+            if (!field_val)
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to generate struct field {}",
+                         initializer->field_name());
+                continue;
+            }
+
+            // Cast if needed
+            field_val = cast_if_needed(field_val, st->getElementType(i));
+
+            // Get pointer to field
+            llvm::Value *field_ptr = create_struct_gep(struct_type, struct_alloca, i,
+                                                        initializer->field_name() + ".ptr");
+            create_store(field_val, field_ptr);
+        }
+
+        return struct_alloca;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_new(Cryo::NewExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null new expression node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating new expression for {}",
+                  node->type_name());
+
+        // Get the type to allocate
+        llvm::Type *alloc_type = ctx().get_type(node->type_name());
+        if (!alloc_type)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                         "Unknown type for new: " + node->type_name());
+            return nullptr;
+        }
+
+        // Calculate size
+        const llvm::DataLayout &dl = module()->getDataLayout();
+        uint64_t size = dl.getTypeAllocSize(alloc_type);
+
+        // Call malloc
+        llvm::Function *malloc_fn = module()->getFunction("malloc");
+        if (!malloc_fn)
+        {
+            llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
+            llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
+            llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+            malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                "malloc", module());
+        }
+
+        llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
+        llvm::Value *ptr = builder().CreateCall(malloc_fn, {size_val}, "new." + node->type_name());
+
+        // If there are constructor arguments, call constructor
+        // TODO: Handle constructor calls with arguments
+
+        return ptr;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_scope_resolution(Cryo::ScopeResolutionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, "Null scope resolution node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating scope resolution {}::{}",
+                  node->scope_name(), node->member_name());
+
+        // Build fully qualified name
+        std::string qualified_name = node->scope_name() + "::" + node->member_name();
+
+        // Try to find as a function
+        if (llvm::Function *fn = module()->getFunction(qualified_name))
+        {
+            return fn;
+        }
+
+        // Try to find as a global variable
+        if (llvm::GlobalVariable *global = module()->getGlobalVariable(qualified_name))
+        {
+            return global;
+        }
+
+        // Try context registry
+        if (llvm::Function *fn = ctx().get_function(qualified_name))
+        {
+            return fn;
+        }
+
+        // Try as enum variant
+        auto &enum_variants = ctx().enum_variants_map();
+        auto it = enum_variants.find(qualified_name);
+        if (it != enum_variants.end())
+        {
+            return it->second;
+        }
+
+        report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
+                     "Cannot resolve: " + qualified_name);
+        return nullptr;
+    }
+
 } // namespace Cryo::Codegen
