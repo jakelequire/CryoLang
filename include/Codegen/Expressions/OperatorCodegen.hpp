@@ -141,6 +141,13 @@ namespace Cryo::Codegen
         llvm::Value *generate_deref_assignment(Cryo::UnaryExpressionNode *target,
                                                Cryo::ExpressionNode *value_node);
 
+        /**
+         * @brief Generate compound assignment (+=, -=, *=, /=, %=)
+         * @param node Binary expression with compound assignment operator
+         * @return Computed and assigned value
+         */
+        llvm::Value *generate_compound_assignment(Cryo::BinaryExpressionNode *node);
+
         //===================================================================
         // Arithmetic Operations
         //===================================================================

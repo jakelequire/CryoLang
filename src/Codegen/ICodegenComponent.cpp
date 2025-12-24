@@ -180,6 +180,30 @@ namespace Cryo::Codegen
 
         llvm::IRBuilder<> &b = builder();
 
+        // Target is boolean (i1)
+        if (target_type->isIntegerTy(1))
+        {
+            // Pointer to bool: check if not null
+            if (source_type->isPointerTy())
+            {
+                llvm::Value *null_ptr = llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(source_type));
+                return b.CreateICmpNE(value, null_ptr, "tobool");
+            }
+            // Integer to bool: check if not zero
+            if (source_type->isIntegerTy())
+            {
+                return b.CreateICmpNE(value,
+                                      llvm::ConstantInt::get(source_type, 0), "tobool");
+            }
+            // Float to bool: check if not zero
+            if (source_type->isFloatingPointTy())
+            {
+                return b.CreateFCmpUNE(value,
+                                       llvm::ConstantFP::get(source_type, 0.0), "tobool");
+            }
+        }
+
         // Integer to integer
         if (source_type->isIntegerTy() && target_type->isIntegerTy())
         {
