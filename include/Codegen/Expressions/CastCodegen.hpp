@@ -8,11 +8,6 @@
 #include <llvm/IR/Type.h>
 #include <string>
 
-namespace Cryo
-{
-    class ASTVisitor;
-} // forward declaration
-
 namespace Cryo::Codegen
 {
     /**

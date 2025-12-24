@@ -3,6 +3,7 @@
 #include "Codegen/ICodegenComponent.hpp"
 #include "Codegen/CodegenContext.hpp"
 #include "AST/ASTNode.hpp"
+#include "AST/ASTVisitor.hpp"
 #include "Lexer/lexer.hpp"
 
 #include <llvm/IR/Value.h>
@@ -76,12 +77,12 @@ namespace Cryo::Codegen
          */
         enum class BinaryOpClass
         {
-            Assignment,    // =, +=, -=, etc.
-            Arithmetic,    // +, -, *, /, %
-            Comparison,    // ==, !=, <, >, <=, >=
-            Logical,       // &&, ||
-            Bitwise,       // &, |, ^, <<, >>
-            StringConcat,  // + for strings
+            Assignment,   // =, +=, -=, etc.
+            Arithmetic,   // +, -, *, /, %
+            Comparison,   // ==, !=, <, >, <=, >=
+            Logical,      // &&, ||
+            Bitwise,      // &, |, ^, <<, >>
+            StringConcat, // + for strings
             Unknown
         };
 
@@ -111,7 +112,7 @@ namespace Cryo::Codegen
          * @return Assigned value
          */
         llvm::Value *generate_identifier_assignment(Cryo::IdentifierNode *target,
-                                                     Cryo::ExpressionNode *value_node);
+                                                    Cryo::ExpressionNode *value_node);
 
         /**
          * @brief Generate assignment to a member access
@@ -120,7 +121,7 @@ namespace Cryo::Codegen
          * @return Assigned value
          */
         llvm::Value *generate_member_assignment(Cryo::MemberAccessNode *target,
-                                                 Cryo::ExpressionNode *value_node);
+                                                Cryo::ExpressionNode *value_node);
 
         /**
          * @brief Generate assignment to an array element
@@ -129,7 +130,7 @@ namespace Cryo::Codegen
          * @return Assigned value
          */
         llvm::Value *generate_array_assignment(Cryo::ArrayAccessNode *target,
-                                                Cryo::ExpressionNode *value_node);
+                                               Cryo::ExpressionNode *value_node);
 
         /**
          * @brief Generate assignment through a dereferenced pointer
@@ -138,7 +139,7 @@ namespace Cryo::Codegen
          * @return Assigned value
          */
         llvm::Value *generate_deref_assignment(Cryo::UnaryExpressionNode *target,
-                                                Cryo::ExpressionNode *value_node);
+                                               Cryo::ExpressionNode *value_node);
 
         //===================================================================
         // Arithmetic Operations
@@ -153,9 +154,9 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_arithmetic(TokenKind op,
-                                          llvm::Value *lhs,
-                                          llvm::Value *rhs,
-                                          Cryo::Type *result_type = nullptr);
+                                         llvm::Value *lhs,
+                                         llvm::Value *rhs,
+                                         Cryo::Type *result_type = nullptr);
 
         /**
          * @brief Generate integer arithmetic
@@ -166,9 +167,9 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_integer_arithmetic(TokenKind op,
-                                                   llvm::Value *lhs,
-                                                   llvm::Value *rhs,
-                                                   bool is_signed = true);
+                                                 llvm::Value *lhs,
+                                                 llvm::Value *rhs,
+                                                 bool is_signed = true);
 
         /**
          * @brief Generate float arithmetic
@@ -178,8 +179,8 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_float_arithmetic(TokenKind op,
-                                                 llvm::Value *lhs,
-                                                 llvm::Value *rhs);
+                                               llvm::Value *lhs,
+                                               llvm::Value *rhs);
 
         //===================================================================
         // Comparison Operations
@@ -194,9 +195,9 @@ namespace Cryo::Codegen
          * @return Boolean result (i1)
          */
         llvm::Value *generate_comparison(TokenKind op,
-                                          llvm::Value *lhs,
-                                          llvm::Value *rhs,
-                                          Cryo::Type *operand_type = nullptr);
+                                         llvm::Value *lhs,
+                                         llvm::Value *rhs,
+                                         Cryo::Type *operand_type = nullptr);
 
         /**
          * @brief Generate integer comparison
@@ -207,9 +208,9 @@ namespace Cryo::Codegen
          * @return Boolean result (i1)
          */
         llvm::Value *generate_integer_comparison(TokenKind op,
-                                                   llvm::Value *lhs,
-                                                   llvm::Value *rhs,
-                                                   bool is_signed = true);
+                                                 llvm::Value *lhs,
+                                                 llvm::Value *rhs,
+                                                 bool is_signed = true);
 
         /**
          * @brief Generate float comparison
@@ -219,8 +220,8 @@ namespace Cryo::Codegen
          * @return Boolean result (i1)
          */
         llvm::Value *generate_float_comparison(TokenKind op,
-                                                 llvm::Value *lhs,
-                                                 llvm::Value *rhs);
+                                               llvm::Value *lhs,
+                                               llvm::Value *rhs);
 
         /**
          * @brief Generate pointer comparison
@@ -230,8 +231,8 @@ namespace Cryo::Codegen
          * @return Boolean result (i1)
          */
         llvm::Value *generate_pointer_comparison(TokenKind op,
-                                                   llvm::Value *lhs,
-                                                   llvm::Value *rhs);
+                                                 llvm::Value *lhs,
+                                                 llvm::Value *rhs);
 
         //===================================================================
         // Logical Operations
@@ -263,8 +264,8 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_bitwise(TokenKind op,
-                                        llvm::Value *lhs,
-                                        llvm::Value *rhs);
+                                      llvm::Value *lhs,
+                                      llvm::Value *rhs);
 
         //===================================================================
         // String Operations
