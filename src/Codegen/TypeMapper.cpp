@@ -683,14 +683,58 @@ namespace Cryo::Codegen
         }
 
         // Generic struct/class instantiation
+        // First check if it already exists and is complete
         auto existing = lookup_struct(name);
-        if (existing)
+        if (existing && !existing->isOpaque())
         {
             return existing;
         }
 
-        // Create opaque struct - TypeCodegen will complete it
-        return get_or_create_struct(name);
+        // Also check LLVM context directly
+        if (llvm::StructType *llvm_existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
+        {
+            _struct_cache[name] = llvm_existing;
+            if (!llvm_existing->isOpaque())
+            {
+                return llvm_existing;
+            }
+            existing = llvm_existing;
+        }
+
+        // If we have a generic instantiator and type arguments, try to instantiate
+        if (_generic_instantiator && !type->type_parameters().empty())
+        {
+            std::string base_name = type->base_name();
+
+            // Convert shared_ptr types to raw pointers for the callback
+            std::vector<Cryo::Type*> type_args;
+            type_args.reserve(type->type_parameters().size());
+            for (const auto& param : type->type_parameters())
+            {
+                type_args.push_back(param.get());
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "TypeMapper::map_parameterized - invoking generic instantiator for {} with {} type args",
+                      base_name, type_args.size());
+
+            llvm::StructType* instantiated = _generic_instantiator(base_name, type_args);
+            if (instantiated && !instantiated->isOpaque())
+            {
+                _struct_cache[name] = instantiated;
+                return instantiated;
+            }
+        }
+
+        // Fallback: create opaque struct (will be completed later if possible)
+        if (!existing)
+        {
+            existing = get_or_create_struct(name);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "TypeMapper::map_parameterized - returning opaque struct for {}", name);
+        return existing;
     }
 
     llvm::Type *TypeMapper::map_optional(Cryo::OptionalType *type)
