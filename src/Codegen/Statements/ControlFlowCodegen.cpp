@@ -589,6 +589,132 @@ namespace Cryo::Codegen
     }
 
     //===================================================================
+    // Match Statement
+    //===================================================================
+
+    void ControlFlowCodegen::generate_match(Cryo::MatchStatementNode *node)
+    {
+        if (!node)
+            return;
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating match statement");
+
+        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        if (!function)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for match statement");
+            return;
+        }
+
+        // Generate the match expression
+        llvm::Value *match_value = generate_expression(node->expression());
+        if (!match_value)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "Failed to generate match expression");
+            return;
+        }
+
+        // Create end block
+        llvm::BasicBlock *end_block = create_block("match.end", function);
+
+        // Generate arms as a chain of comparisons
+        llvm::BasicBlock *current_test_block = builder().GetInsertBlock();
+
+        for (size_t i = 0; i < node->arms().size(); ++i)
+        {
+            auto *arm = node->arms()[i].get();
+            if (!arm)
+                continue;
+
+            bool is_last = (i == node->arms().size() - 1);
+
+            // Create blocks for this arm
+            llvm::BasicBlock *arm_block = create_block("match.arm." + std::to_string(i), function);
+            llvm::BasicBlock *next_test_block = is_last
+                                                    ? end_block
+                                                    : create_block("match.test." + std::to_string(i + 1), function);
+
+            builder().SetInsertPoint(current_test_block);
+
+            // Generate pattern match
+            Cryo::PatternNode *pattern = arm->pattern();
+            if (pattern)
+            {
+                // Generate comparison based on pattern type
+                llvm::Value *matches = generate_pattern_match(match_value, pattern);
+                if (matches)
+                {
+                    builder().CreateCondBr(matches, arm_block, next_test_block);
+                }
+                else
+                {
+                    // Wildcard/default pattern - always matches
+                    builder().CreateBr(arm_block);
+                }
+            }
+            else
+            {
+                // No pattern - always matches (wildcard)
+                builder().CreateBr(arm_block);
+            }
+
+            // Generate arm body
+            builder().SetInsertPoint(arm_block);
+            enter_scope(arm_block);
+            if (arm->body())
+            {
+                CodegenVisitor *visitor = ctx().visitor();
+                arm->body()->accept(*visitor);
+            }
+            exit_scope();
+
+            // Branch to end
+            llvm::BasicBlock *arm_current = builder().GetInsertBlock();
+            if (arm_current && !arm_current->getTerminator())
+            {
+                builder().CreateBr(end_block);
+            }
+
+            current_test_block = next_test_block;
+        }
+
+        // Continue at end block
+        builder().SetInsertPoint(end_block);
+    }
+
+    llvm::Value *ControlFlowCodegen::generate_pattern_match(llvm::Value *value, Cryo::PatternNode *pattern)
+    {
+        if (!value || !pattern)
+            return nullptr;
+
+        // Handle different pattern types
+        // For now, simple value comparison
+        if (pattern->kind() == Cryo::NodeKind::Pattern)
+        {
+            // Literal pattern - compare values
+            llvm::Value *pattern_val = generate_expression(pattern->value());
+            if (!pattern_val)
+                return nullptr;
+
+            if (value->getType()->isIntegerTy() && pattern_val->getType()->isIntegerTy())
+            {
+                return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
+            }
+            else if (value->getType()->isFloatingPointTy() && pattern_val->getType()->isFloatingPointTy())
+            {
+                return builder().CreateFCmpOEQ(value, pattern_val, "pattern.match");
+            }
+            else if (value->getType()->isPointerTy() && pattern_val->getType()->isPointerTy())
+            {
+                return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
+            }
+        }
+
+        // Wildcard/catch-all pattern returns nullptr to indicate always matches
+        return nullptr;
+    }
+
+    //===================================================================
     // Jump Statements
     //===================================================================
 

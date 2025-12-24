@@ -104,6 +104,14 @@ namespace Cryo::Codegen
          */
         void generate_match(Cryo::MatchStatementNode *node);
 
+        /**
+         * @brief Generate pattern match comparison
+         * @param value Value to match against
+         * @param pattern Pattern to match
+         * @return Boolean comparison result, or nullptr for wildcard patterns
+         */
+        llvm::Value *generate_pattern_match(llvm::Value *value, Cryo::PatternNode *pattern);
+
         //===================================================================
         // Jump Statements
         //===================================================================
