@@ -414,7 +414,7 @@ namespace Cryo::Codegen
                 if (cryo_array_type->kind() == TypeKind::Array)
                 {
                     auto *arr = static_cast<Cryo::ArrayType *>(cryo_array_type);
-                    element_type = get_llvm_type(arr->element_type());
+                    element_type = get_llvm_type(arr->element_type().get());
                 }
                 else if (cryo_array_type->kind() == TypeKind::String)
                 {
@@ -423,7 +423,7 @@ namespace Cryo::Codegen
                 else if (cryo_array_type->kind() == TypeKind::Pointer)
                 {
                     auto *ptr = static_cast<Cryo::PointerType *>(cryo_array_type);
-                    element_type = get_llvm_type(ptr->pointee_type());
+                    element_type = get_llvm_type(ptr->pointee_type().get());
                 }
             }
             // Fallback to i8 for string-like access
@@ -949,7 +949,7 @@ namespace Cryo::Codegen
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
             llvm::Value *elem_ptr = builder().CreateInBoundsGEP(array_type, array_alloca, indices,
-                                                                 "elem." + std::to_string(i) + ".ptr");
+                                                                "elem." + std::to_string(i) + ".ptr");
             builder().CreateStore(elem_val, elem_ptr);
         }
 
@@ -1005,7 +1005,7 @@ namespace Cryo::Codegen
 
             // Get pointer to field
             llvm::Value *field_ptr = create_struct_gep(struct_type, struct_alloca, i,
-                                                        initializer->field_name() + ".ptr");
+                                                       initializer->field_name() + ".ptr");
             create_store(field_val, field_ptr);
         }
 
@@ -1044,7 +1044,7 @@ namespace Cryo::Codegen
             llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
             llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
             malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
-                                                "malloc", module());
+                                               "malloc", module());
         }
 
         llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
