@@ -1,5 +1,7 @@
 #include "Codegen/Expressions/OperatorCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
+#include "AST/ASTVisitor.hpp"
+
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -1047,7 +1049,7 @@ namespace Cryo::Codegen
         if (!expr)
             return nullptr;
 
-        // Visit the expression using the CodegenVisitor to generate its value
+        // Use visitor pattern through context
         CodegenVisitor *visitor = ctx().visitor();
         if (!visitor)
         {

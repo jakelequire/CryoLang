@@ -8,6 +8,11 @@
 #include <llvm/IR/Type.h>
 #include <string>
 
+namespace Cryo
+{
+    class ASTVisitor;
+} // forward declaration
+
 namespace Cryo::Codegen
 {
     /**
@@ -62,7 +67,7 @@ namespace Cryo::Codegen
          * @return Cast value
          */
         llvm::Value *cast_to(llvm::Value *value, llvm::Type *target_type,
-                              const std::string &name = "");
+                             const std::string &name = "");
 
         //===================================================================
         // Integer Conversions
@@ -77,7 +82,7 @@ namespace Cryo::Codegen
          * @return Converted value
          */
         llvm::Value *cast_integer(llvm::Value *value, llvm::Type *target_type,
-                                   bool source_signed, bool target_signed);
+                                  bool source_signed, bool target_signed);
 
         /**
          * @brief Sign-extend integer to larger type
@@ -141,7 +146,7 @@ namespace Cryo::Codegen
          * @return Float value
          */
         llvm::Value *int_to_float(llvm::Value *value, llvm::Type *target_type,
-                                   bool is_signed = true);
+                                  bool is_signed = true);
 
         /**
          * @brief Convert floating-point to integer
@@ -151,7 +156,7 @@ namespace Cryo::Codegen
          * @return Integer value
          */
         llvm::Value *float_to_int(llvm::Value *value, llvm::Type *target_type,
-                                   bool is_signed = true);
+                                  bool is_signed = true);
 
         //===================================================================
         // Pointer Conversions
@@ -216,8 +221,8 @@ namespace Cryo::Codegen
          * @return Cast value (or poison if overflow and no handler)
          */
         llvm::Value *checked_int_cast(llvm::Value *value, llvm::Type *target_type,
-                                       bool source_signed, bool target_signed,
-                                       llvm::BasicBlock *on_overflow = nullptr);
+                                      bool source_signed, bool target_signed,
+                                      llvm::BasicBlock *on_overflow = nullptr);
 
         //===================================================================
         // Type Queries
