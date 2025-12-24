@@ -47,7 +47,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, "Null call expression node");
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, "Null call expression node");
             return nullptr;
         }
 
@@ -92,7 +92,7 @@ namespace Cryo::Codegen
                 std::string variant_name = function_name.substr(sep + 2);
                 return generate_enum_variant(node, enum_name, variant_name);
             }
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Invalid enum variant syntax: " + function_name);
             return nullptr;
         }
@@ -107,7 +107,7 @@ namespace Cryo::Codegen
                 std::string method_name = function_name.substr(sep + 2);
                 return generate_static_method(node, type_name, method_name);
             }
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Invalid static method syntax: " + function_name);
             return nullptr;
         }
@@ -120,13 +120,13 @@ namespace Cryo::Codegen
                 llvm::Value *receiver = generate_expression(member->object());
                 if (!receiver)
                 {
-                    report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+                    report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                                  "Failed to generate receiver for method call");
                     return nullptr;
                 }
                 return generate_instance_method(node, receiver, member->member());
             }
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Invalid instance method call");
             return nullptr;
         }
@@ -136,7 +136,7 @@ namespace Cryo::Codegen
             llvm::Function *fn = resolve_function(function_name);
             if (!fn)
             {
-                report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                              "Unknown function: " + function_name);
                 return nullptr;
             }
@@ -151,13 +151,13 @@ namespace Cryo::Codegen
             {
                 return generate_free_function(node, fn);
             }
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Failed to resolve generic instantiation: " + function_name);
             return nullptr;
         }
 
         default:
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Unhandled call kind for: " + function_name);
             return nullptr;
         }
@@ -263,7 +263,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Value *CallCodegen::generate_primitive_constructor(Cryo::CallExpressionNode *node,
-                                                              const std::string &type_name)
+                                                             const std::string &type_name)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating primitive constructor for type: {}", type_name);
 
@@ -271,7 +271,7 @@ namespace Cryo::Codegen
         auto args = generate_arguments(node->arguments());
         if (args.empty())
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Primitive constructor requires at least one argument");
             return nullptr;
         }
@@ -282,7 +282,7 @@ namespace Cryo::Codegen
 
         if (!target_type)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Unknown primitive type: " + type_name);
             return nullptr;
         }
@@ -371,13 +371,13 @@ namespace Cryo::Codegen
             return builder().CreateIntToPtr(source, target_type, "inttoptr");
         }
 
-        report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+        report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                      "Cannot convert to " + type_name);
         return nullptr;
     }
 
     llvm::Value *CallCodegen::generate_struct_constructor(Cryo::CallExpressionNode *node,
-                                                           const std::string &type_name)
+                                                          const std::string &type_name)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating struct constructor for: {}", type_name);
 
@@ -385,7 +385,7 @@ namespace Cryo::Codegen
         llvm::Type *struct_type = ctx().get_type(type_name);
         if (!struct_type || !struct_type->isStructTy())
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Unknown struct type: " + type_name);
             return nullptr;
         }
@@ -394,7 +394,7 @@ namespace Cryo::Codegen
         llvm::AllocaInst *alloca = create_entry_alloca(struct_type, type_name + ".instance");
         if (!alloca)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Failed to allocate struct instance");
             return nullptr;
         }
@@ -428,7 +428,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CallCodegen::generate_class_constructor(Cryo::CallExpressionNode *node,
-                                                          const std::string &type_name)
+                                                         const std::string &type_name)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating class constructor for: {}", type_name);
 
@@ -436,7 +436,7 @@ namespace Cryo::Codegen
         llvm::Type *class_type = ctx().get_type(type_name);
         if (!class_type || !class_type->isStructTy())
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
                          "Unknown class type: " + type_name);
             return nullptr;
         }
@@ -468,7 +468,7 @@ namespace Cryo::Codegen
 
         if (!heap_ptr)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
                          "Failed to allocate heap memory for class");
             return nullptr;
         }
@@ -501,8 +501,8 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CallCodegen::generate_enum_variant(Cryo::CallExpressionNode *node,
-                                                     const std::string &enum_name,
-                                                     const std::string &variant_name)
+                                                    const std::string &enum_name,
+                                                    const std::string &variant_name)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating enum variant: {}::{}", enum_name, variant_name);
 
@@ -510,7 +510,7 @@ namespace Cryo::Codegen
         llvm::Type *enum_type = ctx().get_type(enum_name);
         if (!enum_type)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
                          "Unknown enum type: " + enum_name);
             return nullptr;
         }
@@ -529,13 +529,13 @@ namespace Cryo::Codegen
         // If no constructor, treat as simple enum value
         // Look up variant index from symbol table
         // For now, return a placeholder
-        report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+        report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
                      "Enum variant constructor not implemented: " + ctor_name);
         return nullptr;
     }
 
     llvm::Value *CallCodegen::generate_intrinsic(Cryo::CallExpressionNode *node,
-                                                  const std::string &intrinsic_name)
+                                                 const std::string &intrinsic_name)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating intrinsic call: {}", intrinsic_name);
 
@@ -549,7 +549,7 @@ namespace Cryo::Codegen
         {
             if (args.empty())
             {
-                report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node, "__malloc__ requires size argument");
+                report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node, "__malloc__ requires size argument");
                 return nullptr;
             }
             llvm::Function *malloc_fn = module()->getFunction("malloc");
@@ -568,7 +568,7 @@ namespace Cryo::Codegen
         {
             if (args.empty())
             {
-                report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node, "__free__ requires pointer argument");
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node, "__free__ requires pointer argument");
                 return nullptr;
             }
             llvm::Function *free_fn = module()->getFunction("free");
@@ -596,13 +596,13 @@ namespace Cryo::Codegen
         }
 
         // Other intrinsics would be handled similarly
-        report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+        report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                      "Unhandled intrinsic: " + intrinsic_name);
         return nullptr;
     }
 
     llvm::Value *CallCodegen::generate_runtime_call(Cryo::CallExpressionNode *node,
-                                                     const std::string &function_name)
+                                                    const std::string &function_name)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating runtime call: {}", function_name);
 
@@ -622,7 +622,7 @@ namespace Cryo::Codegen
 
         if (!fn)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Runtime function not found: " + function_name);
             return nullptr;
         }
@@ -648,8 +648,8 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CallCodegen::generate_static_method(Cryo::CallExpressionNode *node,
-                                                      const std::string &type_name,
-                                                      const std::string &method_name)
+                                                     const std::string &type_name,
+                                                     const std::string &method_name)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating static method: {}::{}", type_name, method_name);
 
@@ -660,7 +660,7 @@ namespace Cryo::Codegen
         llvm::Function *method = resolve_method(type_name, method_name);
         if (!method)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Static method not found: " + type_name + "::" + method_name);
             return nullptr;
         }
@@ -679,14 +679,14 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CallCodegen::generate_instance_method(Cryo::CallExpressionNode *node,
-                                                        llvm::Value *receiver,
-                                                        const std::string &method_name)
+                                                       llvm::Value *receiver,
+                                                       const std::string &method_name)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating instance method: {}", method_name);
 
         if (!receiver)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Null receiver for method call");
             return nullptr;
         }
@@ -703,20 +703,8 @@ namespace Cryo::Codegen
         llvm::Function *method = resolve_method(type_name, method_name);
         if (!method)
         {
-            // Try looking up directly with method name in all registered functions
-            for (auto &[name, fn] : ctx().get_functions())
-            {
-                if (name.find("::" + method_name) != std::string::npos)
-                {
-                    method = fn;
-                    break;
-                }
-            }
-        }
-
-        if (!method)
-        {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node,
+            // Report error if method not found
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Instance method not found: " + method_name);
             return nullptr;
         }
@@ -744,11 +732,11 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CallCodegen::generate_free_function(Cryo::CallExpressionNode *node,
-                                                      llvm::Function *function)
+                                                     llvm::Function *function)
     {
         if (!function)
         {
-            report_error(ErrorCode::E0617_FUNCTION_CALL_ERROR, node, "Null function");
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node, "Null function");
             return nullptr;
         }
 
@@ -813,7 +801,7 @@ namespace Cryo::Codegen
     }
 
     bool CallCodegen::check_argument_compatibility(const std::vector<llvm::Value *> &args,
-                                                    llvm::FunctionType *fn_type)
+                                                   llvm::FunctionType *fn_type)
     {
         if (!fn_type)
             return false;
@@ -879,7 +867,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *CallCodegen::resolve_method(const std::string &type_name,
-                                                 const std::string &method_name)
+                                                const std::string &method_name)
     {
         // Try fully qualified name
         std::string qualified = type_name + "::" + method_name;
@@ -899,7 +887,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *CallCodegen::resolve_constructor(const std::string &type_name,
-                                                      const std::vector<llvm::Type *> &arg_types)
+                                                     const std::vector<llvm::Type *> &arg_types)
     {
         // Try "Type::init" or "Type::new" patterns
         std::vector<std::string> ctor_names = {
@@ -1002,8 +990,8 @@ namespace Cryo::Codegen
     }
 
     bool CallCodegen::extract_member_call_info(Cryo::MemberAccessNode *member,
-                                                std::string &out_type,
-                                                std::string &out_method)
+                                               std::string &out_type,
+                                               std::string &out_method)
     {
         if (!member)
             return false;
@@ -1032,9 +1020,9 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *CallCodegen::get_or_create_function(const std::string &name,
-                                                         llvm::Type *return_type,
-                                                         const std::vector<llvm::Type *> &param_types,
-                                                         bool is_variadic)
+                                                        llvm::Type *return_type,
+                                                        const std::vector<llvm::Type *> &param_types,
+                                                        bool is_variadic)
     {
         llvm::Function *fn = module()->getFunction(name);
         if (fn)
