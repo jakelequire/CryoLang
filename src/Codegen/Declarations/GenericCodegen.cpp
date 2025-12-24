@@ -70,11 +70,19 @@ namespace Cryo::Codegen
         // Create struct type
         llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), mangled);
 
-        // Substitute type parameters in fields
+        // Substitute type parameters in fields and collect field names
+        std::vector<std::string> field_names;
         if (struct_decl)
         {
             std::vector<llvm::Type *> field_types = create_substituted_fields(struct_decl->fields());
             struct_type->setBody(field_types);
+
+            // Collect field names for member access resolution
+            field_names.reserve(struct_decl->fields().size());
+            for (const auto &field : struct_decl->fields())
+            {
+                field_names.push_back(field->name());
+            }
         }
 
         // End type parameter scope
@@ -98,8 +106,16 @@ namespace Cryo::Codegen
         instantiated_name += ">";
         types().register_struct(instantiated_name, struct_type);
 
+        // Register field names for both mangled and unmangled names
+        if (!field_names.empty())
+        {
+            ctx().register_struct_fields(mangled, field_names);
+            ctx().register_struct_fields(instantiated_name, field_names);
+        }
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "GenericCodegen: Registered struct {} (also as {})", mangled, instantiated_name);
+                  "GenericCodegen: Registered struct {} (also as {}) with {} fields",
+                  mangled, instantiated_name, field_names.size());
 
         return struct_type;
     }
@@ -158,10 +174,19 @@ namespace Cryo::Codegen
         // Create class struct
         llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), mangled);
 
+        // Substitute type parameters in fields and collect field names
+        std::vector<std::string> field_names;
         if (class_decl)
         {
             std::vector<llvm::Type *> field_types = create_substituted_fields(class_decl->fields());
             class_type->setBody(field_types);
+
+            // Collect field names for member access resolution
+            field_names.reserve(class_decl->fields().size());
+            for (const auto &field : class_decl->fields())
+            {
+                field_names.push_back(field->name());
+            }
         }
 
         // End substitution scope
@@ -185,8 +210,16 @@ namespace Cryo::Codegen
         instantiated_name += ">";
         types().register_struct(instantiated_name, class_type);
 
+        // Register field names for both mangled and unmangled names
+        if (!field_names.empty())
+        {
+            ctx().register_struct_fields(mangled, field_names);
+            ctx().register_struct_fields(instantiated_name, field_names);
+        }
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "GenericCodegen: Registered class {} (also as {})", mangled, instantiated_name);
+                  "GenericCodegen: Registered class {} (also as {}) with {} fields",
+                  mangled, instantiated_name, field_names.size());
 
         return class_type;
     }
