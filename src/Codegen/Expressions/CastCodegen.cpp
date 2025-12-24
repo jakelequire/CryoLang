@@ -20,7 +20,7 @@ namespace Cryo::Codegen
     {
         if (!node)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, "Null cast expression");
+            report_error(ErrorCode::E0641_NULL_CAST_EXPRESSION, "Null cast expression");
             return nullptr;
         }
 
@@ -32,7 +32,7 @@ namespace Cryo::Codegen
 
         if (!value)
         {
-            report_error(ErrorCode::E0614_EXPRESSION_GENERATION_ERROR, node,
+            report_error(ErrorCode::E0641_NULL_CAST_EXPRESSION, node,
                          "Failed to generate cast source expression");
             return nullptr;
         }
@@ -57,7 +57,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CastCodegen::cast_to(llvm::Value *value, llvm::Type *target_type,
-                                        const std::string &name)
+                                      const std::string &name)
     {
         if (!value || !target_type)
             return value;
@@ -135,7 +135,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Value *CastCodegen::cast_integer(llvm::Value *value, llvm::Type *target_type,
-                                             bool source_signed, bool target_signed)
+                                           bool source_signed, bool target_signed)
     {
         if (!value || !target_type)
             return value;
@@ -244,7 +244,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Value *CastCodegen::int_to_float(llvm::Value *value, llvm::Type *target_type,
-                                            bool is_signed)
+                                           bool is_signed)
     {
         if (!value || !target_type)
             return value;
@@ -260,7 +260,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CastCodegen::float_to_int(llvm::Value *value, llvm::Type *target_type,
-                                            bool is_signed)
+                                           bool is_signed)
     {
         if (!value || !target_type)
             return value;
@@ -380,8 +380,8 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Value *CastCodegen::checked_int_cast(llvm::Value *value, llvm::Type *target_type,
-                                                 bool source_signed, bool target_signed,
-                                                 llvm::BasicBlock *on_overflow)
+                                               bool source_signed, bool target_signed,
+                                               llvm::BasicBlock *on_overflow)
     {
         if (!value || !target_type)
             return value;
