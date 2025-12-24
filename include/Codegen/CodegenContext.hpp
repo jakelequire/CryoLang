@@ -300,6 +300,15 @@ namespace Cryo::Codegen
         /** @brief Get namespace context */
         const std::string &namespace_context() const { return _namespace_context; }
 
+        /** @brief Get current type being processed (for methods) */
+        const std::string &current_type_name() const { return _current_type_name; }
+
+        /** @brief Set current type being processed */
+        void set_current_type_name(const std::string &name) { _current_type_name = name; }
+
+        /** @brief Register an enum variant constant */
+        void register_enum_variant(const std::string &name, llvm::Value *value) { _enum_variants[name] = value; }
+
         //===================================================================
         // Breakable Context Stack (loops, switch)
         //===================================================================
@@ -354,6 +363,7 @@ namespace Cryo::Codegen
         // Source context
         std::string _source_file;
         std::string _namespace_context;
+        std::string _current_type_name;
 
         //===================================================================
         // Cached Mappings

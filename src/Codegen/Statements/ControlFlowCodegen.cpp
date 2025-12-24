@@ -607,7 +607,7 @@ namespace Cryo::Codegen
         }
 
         // Generate the match expression
-        llvm::Value *match_value = generate_expression(node->expression());
+        llvm::Value *match_value = generate_expression(node->expr());
         if (!match_value)
         {
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "Failed to generate match expression");
@@ -687,30 +687,49 @@ namespace Cryo::Codegen
         if (!value || !pattern)
             return nullptr;
 
-        // Handle different pattern types
-        // For now, simple value comparison
-        if (pattern->kind() == Cryo::NodeKind::Pattern)
+        // Handle different pattern types based on pattern_type()
+        switch (pattern->pattern_type())
         {
-            // Literal pattern - compare values
-            llvm::Value *pattern_val = generate_expression(pattern->value());
-            if (!pattern_val)
-                return nullptr;
+        case Cryo::PatternNode::PatternType::Literal:
+        {
+            // Generate literal value
+            if (Cryo::LiteralNode *lit = pattern->literal_value())
+            {
+                llvm::Value *pattern_val = generate_expression(lit);
+                if (!pattern_val)
+                    return nullptr;
 
-            if (value->getType()->isIntegerTy() && pattern_val->getType()->isIntegerTy())
-            {
-                return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
+                if (value->getType()->isIntegerTy() && pattern_val->getType()->isIntegerTy())
+                {
+                    return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
+                }
+                else if (value->getType()->isFloatingPointTy() && pattern_val->getType()->isFloatingPointTy())
+                {
+                    return builder().CreateFCmpOEQ(value, pattern_val, "pattern.match");
+                }
+                else if (value->getType()->isPointerTy() && pattern_val->getType()->isPointerTy())
+                {
+                    return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
+                }
             }
-            else if (value->getType()->isFloatingPointTy() && pattern_val->getType()->isFloatingPointTy())
-            {
-                return builder().CreateFCmpOEQ(value, pattern_val, "pattern.match");
-            }
-            else if (value->getType()->isPointerTy() && pattern_val->getType()->isPointerTy())
-            {
-                return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
-            }
+            break;
+        }
+        case Cryo::PatternNode::PatternType::Identifier:
+            // Identifier pattern binds the value - always matches
+            // Could store value in named variable here
+            return nullptr;
+
+        case Cryo::PatternNode::PatternType::Wildcard:
+            // Wildcard always matches
+            return nullptr;
+
+        case Cryo::PatternNode::PatternType::Enum:
+            // Enum pattern - would need to compare enum discriminant
+            // For now, treat as wildcard
+            return nullptr;
         }
 
-        // Wildcard/catch-all pattern returns nullptr to indicate always matches
+        // Default: wildcard behavior
         return nullptr;
     }
 

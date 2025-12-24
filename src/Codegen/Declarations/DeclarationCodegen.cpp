@@ -764,16 +764,13 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating struct method");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating struct method: {}", node->name());
 
         // Get the parent type name from context
         std::string parent_type = ctx().current_type_name();
 
-        // The StructMethodNode contains a FunctionDeclarationNode
-        if (node->signature())
-        {
-            generate_method_declaration(node->signature(), parent_type);
-        }
+        // StructMethodNode IS a FunctionDeclarationNode, use it directly
+        generate_method_declaration(node, parent_type);
     }
 
     void DeclarationCodegen::generate_impl_block(Cryo::ImplementationBlockNode *node)
@@ -789,53 +786,55 @@ namespace Cryo::Codegen
         ctx().set_current_type_name(type_name);
 
         // Generate each method in the impl block
-        for (const auto &method : node->methods())
+        for (const auto &method : node->method_implementations())
         {
-            if (auto *fn_node = dynamic_cast<Cryo::FunctionDeclarationNode *>(method.get()))
+            // StructMethodNode IS a FunctionDeclarationNode
+            Cryo::StructMethodNode *fn_node = method.get();
+            if (!fn_node)
+                continue;
+
+            // Generate as a method with the type prefix
+            if (fn_node->body())
             {
-                // Generate as a method with the type prefix
-                if (fn_node->body())
+                // Full definition
+                std::string method_name = generate_method_name(type_name, fn_node->name());
+                llvm::Function *fn = generate_method_declaration(fn_node, type_name);
+                if (fn && fn->empty())
                 {
-                    // Full definition
-                    std::string method_name = generate_method_name(type_name, fn_node->name());
-                    llvm::Function *fn = generate_method_declaration(fn_node, type_name);
-                    if (fn && fn->empty())
+                    // Create entry block and generate body
+                    llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+                    builder().SetInsertPoint(entry);
+
+                    // Allocate parameters
+                    for (auto &arg : fn->args())
                     {
-                        // Create entry block and generate body
-                        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
-                        builder().SetInsertPoint(entry);
+                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
+                        create_store(&arg, alloca);
+                        values().set_value(arg.getName().str(), nullptr, alloca);
+                    }
 
-                        // Allocate parameters
-                        for (auto &arg : fn->args())
+                    // Generate body
+                    CodegenVisitor *visitor = ctx().visitor();
+                    fn_node->body()->accept(*visitor);
+
+                    // Add implicit return if needed
+                    llvm::BasicBlock *current_block = builder().GetInsertBlock();
+                    if (current_block && !current_block->getTerminator())
+                    {
+                        if (fn->getReturnType()->isVoidTy())
                         {
-                            llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
-                            create_store(&arg, alloca);
-                            values().set_value(arg.getName().str(), nullptr, alloca);
+                            builder().CreateRetVoid();
                         }
-
-                        // Generate body
-                        CodegenVisitor *visitor = ctx().visitor();
-                        fn_node->body()->accept(*visitor);
-
-                        // Add implicit return if needed
-                        llvm::BasicBlock *current_block = builder().GetInsertBlock();
-                        if (current_block && !current_block->getTerminator())
+                        else
                         {
-                            if (fn->getReturnType()->isVoidTy())
-                            {
-                                builder().CreateRetVoid();
-                            }
-                            else
-                            {
-                                builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
-                            }
+                            builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
                         }
                     }
                 }
-                else
-                {
-                    generate_method_declaration(fn_node, type_name);
-                }
+            }
+            else
+            {
+                generate_method_declaration(fn_node, type_name);
             }
         }
 
@@ -848,19 +847,15 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating extern block");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating extern block with linkage: {}",
+                  node->linkage_type());
 
-        // Generate each declaration in the extern block
-        for (const auto &decl : node->declarations())
+        // Generate each function declaration in the extern block
+        for (const auto &fn_decl : node->function_declarations())
         {
-            if (auto *fn_node = dynamic_cast<Cryo::FunctionDeclarationNode *>(decl.get()))
+            if (fn_decl)
             {
-                generate_extern_function(fn_node);
-            }
-            else if (auto *var_node = dynamic_cast<Cryo::VariableDeclarationNode *>(decl.get()))
-            {
-                // External variable declaration
-                generate_global_variable(var_node);
+                generate_extern_function(fn_decl.get());
             }
         }
     }
@@ -891,9 +886,9 @@ namespace Cryo::Codegen
         // Walk the AST and generate global variable declarations
         if (auto *program = dynamic_cast<Cryo::ProgramNode *>(node))
         {
-            for (const auto &decl : program->declarations())
+            for (const auto &stmt : program->statements())
             {
-                if (auto *var_node = dynamic_cast<Cryo::VariableDeclarationNode *>(decl.get()))
+                if (auto *var_node = dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
                 {
                     generate_global_variable(var_node);
                 }
