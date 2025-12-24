@@ -35,7 +35,13 @@ namespace Cryo::Codegen
             return generate_assignment(node);
         }
 
-        // TODO: Handle compound assignments (+=, -=, etc.) here
+        // Handle compound assignments (+=, -=, etc.)
+        if (op == TokenKind::TK_PLUSEQUAL || op == TokenKind::TK_MINUSEQUAL ||
+            op == TokenKind::TK_STAREQUAL || op == TokenKind::TK_SLASHEQUAL ||
+            op == TokenKind::TK_PERCENTEQUAL)
+        {
+            return generate_compound_assignment(node);
+        }
 
         // Generate operand values
         llvm::Value *lhs = generate_operand(node->left());
@@ -79,6 +85,11 @@ namespace Cryo::Codegen
             return generate_bitwise(op, lhs, rhs);
 
         case BinaryOpClass::StringConcat:
+            // Check if rhs is a char (i8) or other integer, use char concat
+            if (rhs->getType()->isIntegerTy() && !rhs->getType()->isIntegerTy(1))
+            {
+                return generate_string_char_concat(lhs, rhs);
+            }
             return generate_string_concat(lhs, rhs);
 
         default:
@@ -411,6 +422,93 @@ namespace Cryo::Codegen
         }
 
         return value;
+    }
+
+    llvm::Value *OperatorCodegen::generate_compound_assignment(Cryo::BinaryExpressionNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        Cryo::ExpressionNode *lhs_expr = node->left();
+        Cryo::ExpressionNode *rhs_expr = node->right();
+        TokenKind op = node->operator_token().kind();
+
+        // Get the lvalue address
+        llvm::Value *lhs_ptr = get_lvalue_address(lhs_expr);
+        if (!lhs_ptr)
+        {
+            report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                         "Left side of compound assignment must be an lvalue");
+            return nullptr;
+        }
+
+        // Load the current value from the lvalue
+        llvm::Value *current_value = generate_operand(lhs_expr);
+        if (!current_value)
+        {
+            report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                         "Failed to load current value for compound assignment");
+            return nullptr;
+        }
+
+        // Generate the right-hand side value
+        llvm::Value *rhs_value = generate_operand(rhs_expr);
+        if (!rhs_value)
+        {
+            report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                         "Failed to generate right operand for compound assignment");
+            return nullptr;
+        }
+
+        // Ensure compatible types
+        ensure_compatible_types(current_value, rhs_value);
+
+        // Determine the underlying arithmetic operation
+        TokenKind arith_op;
+        switch (op)
+        {
+        case TokenKind::TK_PLUSEQUAL:
+            arith_op = TokenKind::TK_PLUS;
+            break;
+        case TokenKind::TK_MINUSEQUAL:
+            arith_op = TokenKind::TK_MINUS;
+            break;
+        case TokenKind::TK_STAREQUAL:
+            arith_op = TokenKind::TK_STAR;
+            break;
+        case TokenKind::TK_SLASHEQUAL:
+            arith_op = TokenKind::TK_SLASH;
+            break;
+        case TokenKind::TK_PERCENTEQUAL:
+            arith_op = TokenKind::TK_PERCENT;
+            break;
+        default:
+            report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                         "Unsupported compound assignment operator");
+            return nullptr;
+        }
+
+        // Perform the arithmetic operation
+        llvm::Value *result = generate_arithmetic(arith_op, current_value, rhs_value,
+                                                  lhs_expr->get_resolved_type());
+        if (!result)
+        {
+            report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
+                         "Failed to compute compound assignment result");
+            return nullptr;
+        }
+
+        // Store the result back to the lvalue
+        if (_memory)
+        {
+            _memory->create_store(result, lhs_ptr);
+        }
+        else
+        {
+            builder().CreateStore(result, lhs_ptr);
+        }
+
+        return result;
     }
 
     //===================================================================
@@ -808,6 +906,13 @@ namespace Cryo::Codegen
             report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
                          "Could not get string-char concatenation function");
             return nullptr;
+        }
+
+        // Cast the character value to i8 if needed
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(llvm_ctx());
+        if (chr->getType() != i8_type && chr->getType()->isIntegerTy())
+        {
+            chr = builder().CreateTrunc(chr, i8_type, "tochar");
         }
 
         return builder().CreateCall(concat_fn, {str, chr}, "strcat");
