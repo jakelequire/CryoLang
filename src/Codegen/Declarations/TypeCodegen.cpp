@@ -531,4 +531,144 @@ namespace Cryo::Codegen
         return name.empty() || name[0] != 'u';
     }
 
+    //===================================================================
+    // High-Level Type Declaration Generation
+    //===================================================================
+
+    llvm::StructType *TypeCodegen::generate_struct(Cryo::StructDeclarationNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        std::string name = node->name();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating struct: {}", name);
+
+        // Check if already declared
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
+        {
+            return existing;
+        }
+
+        // Create opaque struct first (for recursive types)
+        llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), name);
+
+        // Collect field types
+        std::vector<llvm::Type *> field_types;
+        for (const auto &field : node->fields())
+        {
+            llvm::Type *field_type = types().get_type(field->get_resolved_type());
+            if (field_type)
+            {
+                field_types.push_back(field_type);
+            }
+            else
+            {
+                // Default to i64 for unknown types
+                field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
+            }
+        }
+
+        // Set struct body
+        if (!field_types.empty())
+        {
+            struct_type->setBody(field_types);
+        }
+
+        // Register type
+        ctx().register_type(name, struct_type);
+
+        return struct_type;
+    }
+
+    llvm::StructType *TypeCodegen::generate_class(Cryo::ClassDeclarationNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        std::string name = node->name();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating class: {}", name);
+
+        // Check if already declared
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
+        {
+            return existing;
+        }
+
+        // Create opaque struct
+        llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), name);
+
+        // Collect field types
+        std::vector<llvm::Type *> field_types;
+
+        for (const auto &field : node->fields())
+        {
+            llvm::Type *field_type = types().get_type(field->get_resolved_type());
+            if (field_type)
+            {
+                field_types.push_back(field_type);
+            }
+            else
+            {
+                field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
+            }
+        }
+
+        // Set class body
+        if (!field_types.empty())
+        {
+            class_type->setBody(field_types);
+        }
+
+        // Register type
+        ctx().register_type(name, class_type);
+
+        return class_type;
+    }
+
+    llvm::Type *TypeCodegen::generate_enum(Cryo::EnumDeclarationNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        std::string name = node->name();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating enum: {}", name);
+
+        // Simple enums are just integers
+        llvm::Type *enum_type = llvm::Type::getInt32Ty(llvm_ctx());
+
+        // Register type
+        ctx().register_type(name, enum_type);
+
+        // Generate variant constants
+        int32_t index = 0;
+        for (const auto &variant : node->variants())
+        {
+            std::string variant_name = name + "::" + variant->name();
+            llvm::Constant *value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index++);
+            ctx().register_enum_variant(variant_name, value);
+        }
+
+        return enum_type;
+    }
+
+    void TypeCodegen::generate_type_alias(Cryo::TypeAliasDeclarationNode *node)
+    {
+        if (!node)
+            return;
+
+        std::string alias_name = node->name();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating type alias: {}", alias_name);
+
+        // Get the aliased type
+        llvm::Type *aliased_type = types().get_type(node->aliased_type());
+        if (!aliased_type)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "Unknown aliased type for: {}", alias_name);
+            return;
+        }
+
+        // Register the alias
+        ctx().register_type(alias_name, aliased_type);
+    }
+
 } // namespace Cryo::Codegen
