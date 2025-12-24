@@ -795,6 +795,61 @@ namespace Cryo::Codegen
         std::string type_name = node->target_type();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating impl block for {}", type_name);
 
+        // Skip generic type implementations - they should only be instantiated with concrete types
+        // Generic types have unresolved type parameters like <T>, <T, E>, etc.
+        if (type_name.find('<') != std::string::npos)
+        {
+            // Check if it contains unresolved generic parameters (single capital letters)
+            size_t start = type_name.find('<');
+            size_t end = type_name.find('>');
+            if (start != std::string::npos && end != std::string::npos && end > start)
+            {
+                std::string params = type_name.substr(start + 1, end - start - 1);
+                // Check for simple generic parameters like T, E, K, V (single uppercase letters)
+                // or common patterns like T, E separated by commas
+                bool has_generic_param = false;
+                size_t pos = 0;
+                while (pos < params.length())
+                {
+                    // Skip whitespace
+                    while (pos < params.length() && (params[pos] == ' ' || params[pos] == ','))
+                        pos++;
+                    if (pos >= params.length())
+                        break;
+
+                    // Check if this is a single uppercase letter (generic parameter)
+                    if (std::isupper(params[pos]))
+                    {
+                        size_t param_end = pos + 1;
+                        while (param_end < params.length() && std::isalnum(params[param_end]))
+                            param_end++;
+
+                        // If it's a single letter or looks like a type parameter, it's generic
+                        if (param_end == pos + 1 || (param_end - pos <= 2 && std::isupper(params[pos])))
+                        {
+                            has_generic_param = true;
+                            break;
+                        }
+                        pos = param_end;
+                    }
+                    else
+                    {
+                        // Skip to next separator
+                        while (pos < params.length() && params[pos] != ',' && params[pos] != ' ')
+                            pos++;
+                    }
+                }
+
+                if (has_generic_param)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Skipping generic impl block for {} - will be instantiated with concrete types",
+                              type_name);
+                    return;
+                }
+            }
+        }
+
         // Set current type context
         std::string previous_type = ctx().current_type_name();
         ctx().set_current_type_name(type_name);
