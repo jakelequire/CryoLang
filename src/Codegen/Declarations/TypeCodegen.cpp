@@ -576,6 +576,17 @@ namespace Cryo::Codegen
         ctx().register_type(name, struct_type);
         types().register_struct(name, struct_type);
 
+        // Register field names for member access resolution
+        std::vector<std::string> field_names;
+        field_names.reserve(node->fields().size());
+        for (const auto &field : node->fields())
+        {
+            field_names.push_back(field->name());
+        }
+        ctx().register_struct_fields(name, field_names);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field names for struct {}",
+                  field_names.size(), name);
+
         return struct_type;
     }
 
@@ -619,6 +630,17 @@ namespace Cryo::Codegen
         // Register type in both context and TypeMapper cache for consistency
         ctx().register_type(name, class_type);
         types().register_struct(name, class_type);
+
+        // Register field names for member access resolution
+        std::vector<std::string> field_names;
+        field_names.reserve(node->fields().size());
+        for (const auto &field : node->fields())
+        {
+            field_names.push_back(field->name());
+        }
+        ctx().register_struct_fields(name, field_names);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field names for class {}",
+                  field_names.size(), name);
 
         return class_type;
     }

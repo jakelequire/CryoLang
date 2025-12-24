@@ -376,6 +376,45 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Type *> _global_types;
         std::unordered_map<std::string, llvm::Value *> _enum_variants;
         std::unordered_map<std::string, Cryo::Type *> _variable_types;
+
+        // Struct field index mapping: type_name -> (field_name -> field_index)
+        std::unordered_map<std::string, std::unordered_map<std::string, unsigned>> _struct_field_indices;
+
+    public:
+        //===================================================================
+        // Struct Field Index API
+        //===================================================================
+
+        /** @brief Register a struct's field indices */
+        void register_struct_fields(const std::string &type_name,
+                                     const std::vector<std::string> &field_names)
+        {
+            auto &field_map = _struct_field_indices[type_name];
+            for (unsigned i = 0; i < field_names.size(); ++i)
+            {
+                field_map[field_names[i]] = i;
+            }
+        }
+
+        /** @brief Get field index for a struct field, returns -1 if not found */
+        int get_struct_field_index(const std::string &type_name, const std::string &field_name) const
+        {
+            auto type_it = _struct_field_indices.find(type_name);
+            if (type_it == _struct_field_indices.end())
+                return -1;
+
+            auto field_it = type_it->second.find(field_name);
+            if (field_it == type_it->second.end())
+                return -1;
+
+            return static_cast<int>(field_it->second);
+        }
+
+        /** @brief Check if struct has a field */
+        bool has_struct_field(const std::string &type_name, const std::string &field_name) const
+        {
+            return get_struct_field_index(type_name, field_name) >= 0;
+        }
     };
 
     //=======================================================================
