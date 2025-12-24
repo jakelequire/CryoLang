@@ -543,14 +543,25 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating struct: {}", name);
 
+        llvm::StructType *struct_type = nullptr;
+
         // Check if already declared
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
         {
-            return existing;
+            // If already complete (non-opaque), just return it
+            if (!existing->isOpaque())
+            {
+                return existing;
+            }
+            // Otherwise, we'll complete the opaque struct below
+            struct_type = existing;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Completing opaque struct: {}", name);
         }
-
-        // Create opaque struct first (for recursive types)
-        llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), name);
+        else
+        {
+            // Create opaque struct first (for recursive types)
+            struct_type = llvm::StructType::create(llvm_ctx(), name);
+        }
 
         // Collect field types
         std::vector<llvm::Type *> field_types;
@@ -598,14 +609,25 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating class: {}", name);
 
+        llvm::StructType *class_type = nullptr;
+
         // Check if already declared
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
         {
-            return existing;
+            // If already complete (non-opaque), just return it
+            if (!existing->isOpaque())
+            {
+                return existing;
+            }
+            // Otherwise, we'll complete the opaque struct below
+            class_type = existing;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Completing opaque class: {}", name);
         }
-
-        // Create opaque struct
-        llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), name);
+        else
+        {
+            // Create opaque struct
+            class_type = llvm::StructType::create(llvm_ctx(), name);
+        }
 
         // Collect field types
         std::vector<llvm::Type *> field_types;
