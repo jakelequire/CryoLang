@@ -122,69 +122,71 @@ namespace Cryo::Codegen
         switch (kind)
         {
         case TokenKind::TK_NUMERIC_CONSTANT:
+        {
+            // Try to parse as integer first, then float
+            try
             {
-                // Try to parse as integer first, then float
-                try {
-                    // Check if it contains a decimal point or 'e'/'E'
-                    if (value_str.find('.') != std::string::npos || 
-                        value_str.find('e') != std::string::npos || 
-                        value_str.find('E') != std::string::npos)
-                    {
-                        // Parse as float
-                        double float_value = std::stod(value_str);
-                        bool is_double = true;
-                        if (node->get_resolved_type())
-                        {
-                            std::string type_name = node->get_resolved_type()->to_string();
-                            is_double = (type_name != "f32");
-                        }
-                        return generate_float_literal(float_value, is_double);
-                    }
-                    else
-                    {
-                        // Parse as integer
-                        int64_t int_value = std::stoll(value_str, nullptr, 0); // 0 for auto base detection
-                        return generate_integer_literal(int_value, node->get_resolved_type());
-                    }
-                }
-                catch (const std::exception& e) {
-                    report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node, "Invalid numeric literal: " + value_str);
-                    return nullptr;
-                }
-            }
-            
-        case TokenKind::TK_BOOLEAN_LITERAL:
-            {
-                bool bool_value = (value_str == "true");
-                return generate_bool_literal(bool_value);
-            }
-            
-        case TokenKind::TK_CHAR_CONSTANT:
-            {
-                if (value_str.length() >= 3 && value_str.front() == '\'' && value_str.back() == '\'')
+                // Check if it contains a decimal point or 'e'/'E'
+                if (value_str.find('.') != std::string::npos ||
+                    value_str.find('e') != std::string::npos ||
+                    value_str.find('E') != std::string::npos)
                 {
-                    char char_value = value_str[1]; // Simple case, handle escapes later
-                    return generate_char_literal(char_value);
+                    // Parse as float
+                    double float_value = std::stod(value_str);
+                    bool is_double = true;
+                    if (node->get_resolved_type())
+                    {
+                        std::string type_name = node->get_resolved_type()->to_string();
+                        is_double = (type_name != "f32");
+                    }
+                    return generate_float_literal(float_value, is_double);
                 }
                 else
                 {
-                    report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node, "Invalid char literal: " + value_str);
-                    return nullptr;
+                    // Parse as integer
+                    int64_t int_value = std::stoll(value_str, nullptr, 0); // 0 for auto base detection
+                    return generate_integer_literal(int_value, node->get_resolved_type());
                 }
             }
-            
+            catch (const std::exception &e)
+            {
+                report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node, "Invalid numeric literal: " + value_str);
+                return nullptr;
+            }
+        }
+
+        case TokenKind::TK_BOOLEAN_LITERAL:
+        {
+            bool bool_value = (value_str == "true");
+            return generate_bool_literal(bool_value);
+        }
+
+        case TokenKind::TK_CHAR_CONSTANT:
+        {
+            if (value_str.length() >= 3 && value_str.front() == '\'' && value_str.back() == '\'')
+            {
+                char char_value = value_str[1]; // Simple case, handle escapes later
+                return generate_char_literal(char_value);
+            }
+            else
+            {
+                report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node, "Invalid char literal: " + value_str);
+                return nullptr;
+            }
+        }
+
         case TokenKind::TK_STRING_LITERAL:
         case TokenKind::TK_RAW_STRING_LITERAL:
+        {
+            // Remove quotes and handle as string
+            std::string str_value = value_str;
+            if (str_value.length() >= 2 && str_value.front() == '"' && str_value.back() == '"')
             {
-                // Remove quotes and handle as string
-                std::string str_value = value_str;
-                if (str_value.length() >= 2 && str_value.front() == '"' && str_value.back() == '"')
-                {
-                    str_value = str_value.substr(1, str_value.length() - 2);
-                }
-                return generate_string_literal(str_value);
+                str_value = str_value.substr(1, str_value.length() - 2);
             }
-            
+            return generate_string_literal(str_value);
+        }
+
         default:
             break;
         }
@@ -482,11 +484,12 @@ namespace Cryo::Codegen
         // For now, handle string-based cast by looking up the type
         // TODO: Use proper Type* resolution instead of string lookup
         llvm::Type *llvm_target = types().get_type(node->target_type_name());
-        if (!llvm_target) {
+        if (!llvm_target)
+        {
             report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, node, "Unknown cast target type: " + node->target_type_name());
             return nullptr;
         }
-        
+
         // For now, cast directly using LLVM type - this needs proper Cryo::Type* conversion
         return cast_if_needed(value, llvm_target);
     }
@@ -519,14 +522,15 @@ namespace Cryo::Codegen
 
         // TODO: Get proper Cryo::Type* from node instead of string lookup
         llvm::Type *llvm_type = types().get_type(node->type_name());
-        if (!llvm_type) {
+        if (!llvm_type)
+        {
             report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Unknown type for sizeof: " + node->type_name());
             return nullptr;
         }
-        
+
         // Generate sizeof using LLVM type
-        auto &context = ctx().llvm().get_context();
-        auto &data_layout = ctx().llvm().get_module().getDataLayout();
+        auto &context = llvm_ctx();
+        auto &data_layout = module()->getDataLayout();
         uint64_t size = data_layout.getTypeAllocSize(llvm_type);
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), size);
     }
@@ -780,9 +784,9 @@ namespace Cryo::Codegen
     }
 
     bool ExpressionCodegen::resolve_member_info(Cryo::ExpressionNode *object,
-                                                  const std::string &member_name,
-                                                  llvm::StructType *&out_struct_type,
-                                                  unsigned &out_field_idx)
+                                                const std::string &member_name,
+                                                llvm::StructType *&out_struct_type,
+                                                unsigned &out_field_idx)
     {
         if (!object)
             return false;
@@ -819,7 +823,7 @@ namespace Cryo::Codegen
         // Look up field index from context's field mapping
         // For now, use a simplified approach
         // TODO: Implement proper struct field resolution
-        
+
         // const auto &field_map = ctx().get_field_indices(type_name);
         // auto it = field_map.find(member_name);
         // if (it != field_map.end())

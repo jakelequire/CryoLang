@@ -449,7 +449,9 @@ namespace Cryo::Codegen
         llvm::Value *heap_ptr = nullptr;
         if (_memory)
         {
-            heap_ptr = _memory->heap_allocate(size, "class." + type_name);
+            llvm::Type *i8_type = llvm::Type::getInt8Ty(llvm_ctx());
+            llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
+            heap_ptr = _memory->create_heap_alloc(i8_type, "class." + type_name);
         }
         else
         {
@@ -859,8 +861,8 @@ namespace Cryo::Codegen
 
         // Try with current namespace prefix using SRM
         std::string qualified = ctx().namespace_context().empty()
-            ? name
-            : ctx().namespace_context() + "::" + name;
+                                    ? name
+                                    : ctx().namespace_context() + "::" + name;
 
         if (qualified != name)
         {
@@ -952,14 +954,14 @@ namespace Cryo::Codegen
     bool CallCodegen::is_struct_type(const std::string &name) const
     {
         // Check in type registry
-        llvm::Type *type = ctx().get_type(name);
+        llvm::Type *type = const_cast<CodegenContext&>(ctx()).get_type(name);
         return type && type->isStructTy();
     }
 
     bool CallCodegen::is_enum_type(const std::string &name) const
     {
         // Check symbol table for enum
-        Symbol *sym = symbols().lookup_symbol(name);
+        Symbol *sym = const_cast<CallCodegen*>(this)->symbols().lookup_symbol(name);
         if (sym && sym->kind == SymbolKind::Type && sym->data_type)
         {
             return sym->data_type->kind() == TypeKind::Enum;
@@ -1021,7 +1023,7 @@ namespace Cryo::Codegen
         // Use visitor pattern through context
         // The expression needs to be visited to generate its value
         // This delegates back to the main visitor
-        expr->accept(ctx().visitor());
+        expr->accept(*ctx().visitor());
         return get_result();
     }
 
