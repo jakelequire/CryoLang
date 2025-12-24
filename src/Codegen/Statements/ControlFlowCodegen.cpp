@@ -791,24 +791,63 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating return");
 
-        // The scope cleanup is handled automatically by scope guards
+        // Get the current function's return type
+        llvm::Function *current_fn = builder().GetInsertBlock()
+                                         ? builder().GetInsertBlock()->getParent()
+                                         : nullptr;
+        llvm::Type *expected_ret_type = current_fn ? current_fn->getReturnType() : nullptr;
 
         if (node && node->expression())
         {
             llvm::Value *ret_val = generate_expression(node->expression());
             if (ret_val)
             {
-                builder().CreateRet(ret_val);
+                // Cast return value to match function return type if needed
+                if (expected_ret_type && ret_val->getType() != expected_ret_type)
+                {
+                    ret_val = cast_if_needed(ret_val, expected_ret_type);
+                }
+                if (ret_val)
+                {
+                    builder().CreateRet(ret_val);
+                }
+                else
+                {
+                    // Cast failed, use default value
+                    if (expected_ret_type && !expected_ret_type->isVoidTy())
+                    {
+                        builder().CreateRet(llvm::Constant::getNullValue(expected_ret_type));
+                    }
+                    else
+                    {
+                        builder().CreateRetVoid();
+                    }
+                }
             }
             else
             {
-                // Fall back to void return on error
-                builder().CreateRetVoid();
+                // Expression generation failed - return default value
+                if (expected_ret_type && !expected_ret_type->isVoidTy())
+                {
+                    builder().CreateRet(llvm::Constant::getNullValue(expected_ret_type));
+                }
+                else
+                {
+                    builder().CreateRetVoid();
+                }
             }
         }
         else
         {
-            builder().CreateRetVoid();
+            // No expression - void return or default value
+            if (expected_ret_type && !expected_ret_type->isVoidTy())
+            {
+                builder().CreateRet(llvm::Constant::getNullValue(expected_ret_type));
+            }
+            else
+            {
+                builder().CreateRetVoid();
+            }
         }
     }
 
@@ -943,14 +982,18 @@ namespace Cryo::Codegen
 
     void ControlFlowCodegen::enter_scope(llvm::BasicBlock *block)
     {
+        // Enter both scope manager and value context for variable tracking
         if (_scope_manager)
         {
             _scope_manager->enter_scope(block);
         }
+        values().enter_scope(block ? block->getName().str() : "scope");
     }
 
     void ControlFlowCodegen::exit_scope()
     {
+        // Exit both scope manager and value context
+        values().exit_scope();
         if (_scope_manager)
         {
             _scope_manager->exit_scope();
