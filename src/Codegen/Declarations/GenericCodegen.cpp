@@ -80,9 +80,26 @@ namespace Cryo::Codegen
         // End type parameter scope
         end_type_params();
 
-        // Cache and register
+        // Cache and register in multiple places for consistency
         _type_cache[mangled] = struct_type;
         ctx().register_type(mangled, struct_type);
+        types().register_struct(mangled, struct_type);
+
+        // Also build the unmangled name (e.g., "Array<u64>") for lookup consistency
+        std::string instantiated_name = generic_name + "<";
+        for (size_t i = 0; i < type_args.size(); ++i)
+        {
+            if (i > 0) instantiated_name += ", ";
+            if (type_args[i])
+            {
+                instantiated_name += type_args[i]->to_string();
+            }
+        }
+        instantiated_name += ">";
+        types().register_struct(instantiated_name, struct_type);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "GenericCodegen: Registered struct {} (also as {})", mangled, instantiated_name);
 
         return struct_type;
     }
@@ -150,9 +167,26 @@ namespace Cryo::Codegen
         // End substitution scope
         end_type_params();
 
-        // Cache and register
+        // Cache and register in multiple places for consistency
         _type_cache[mangled] = class_type;
         ctx().register_type(mangled, class_type);
+        types().register_struct(mangled, class_type);
+
+        // Also build the unmangled name (e.g., "MyClass<u64>") for lookup consistency
+        std::string instantiated_name = generic_name + "<";
+        for (size_t i = 0; i < type_args.size(); ++i)
+        {
+            if (i > 0) instantiated_name += ", ";
+            if (type_args[i])
+            {
+                instantiated_name += type_args[i]->to_string();
+            }
+        }
+        instantiated_name += ">";
+        types().register_struct(instantiated_name, class_type);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "GenericCodegen: Registered class {} (also as {})", mangled, instantiated_name);
 
         return class_type;
     }
