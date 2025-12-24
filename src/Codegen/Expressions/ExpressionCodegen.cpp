@@ -390,29 +390,80 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating index expression");
 
-        // Get element address
-        llvm::Value *element_ptr = generate_index_address(node);
+        // Generate array expression to determine element type
+        llvm::Value *array_val = generate(node->array());
+        if (!array_val)
+        {
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                         "Failed to generate array expression");
+            return nullptr;
+        }
+
+        // Determine element type from array type
+        llvm::Type *element_type = nullptr;
+        if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(array_val->getType()))
+        {
+            element_type = arr_type->getElementType();
+        }
+        else if (array_val->getType()->isPointerTy())
+        {
+            // For pointer types (strings, etc.), try to get from resolved type
+            Cryo::Type *cryo_array_type = node->array()->get_resolved_type();
+            if (cryo_array_type)
+            {
+                if (cryo_array_type->kind() == TypeKind::Array)
+                {
+                    auto *arr = static_cast<Cryo::ArrayType *>(cryo_array_type);
+                    element_type = get_llvm_type(arr->element_type());
+                }
+                else if (cryo_array_type->kind() == TypeKind::String)
+                {
+                    element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                }
+                else if (cryo_array_type->kind() == TypeKind::Pointer)
+                {
+                    auto *ptr = static_cast<Cryo::PointerType *>(cryo_array_type);
+                    element_type = get_llvm_type(ptr->pointee_type());
+                }
+            }
+            // Fallback to i8 for string-like access
+            if (!element_type)
+            {
+                element_type = llvm::Type::getInt8Ty(llvm_ctx());
+            }
+        }
+
+        if (!element_type)
+        {
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                         "Could not determine element type for array access");
+            return nullptr;
+        }
+
+        // Generate index expression
+        llvm::Value *index_val = generate(node->index());
+        if (!index_val)
+        {
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                         "Failed to generate index expression");
+            return nullptr;
+        }
+
+        // Ensure index is integer type
+        if (!index_val->getType()->isIntegerTy())
+        {
+            index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+        }
+
+        // Create GEP and load the element
+        llvm::Value *element_ptr = create_array_gep(element_type, array_val, index_val, "elem.ptr");
         if (!element_ptr)
         {
             return nullptr;
         }
 
-        // Determine element type and load
-        // For now, we don't have direct type info from expressions
-        // This would need to be resolved by the type checker
-        Cryo::Type *array_type = nullptr; // node->array()->get_resolved_type();
-        if (array_type && array_type->kind() == TypeKind::Array)
-        {
-            llvm::Type *element_type = get_llvm_type(array_type);
-            // Array type gives us the full array, we need element type
-            if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(element_type))
-            {
-                return create_load(element_ptr, arr_type->getElementType(), "elem.load");
-            }
-        }
-
-        // Fallback
-        return element_ptr;
+        // Load the element value
+        return create_load(element_ptr, element_type, "elem.load");
     }
 
     llvm::Value *ExpressionCodegen::generate_index_address(Cryo::ArrayAccessNode *node)
