@@ -656,11 +656,11 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
-        std::string alias_name = node->name();
+        std::string alias_name = node->alias_name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating type alias: {}", alias_name);
 
         // Get the aliased type
-        llvm::Type *aliased_type = types().get_type(node->aliased_type());
+        llvm::Type *aliased_type = types().get_type(node->get_resolved_target_type());
         if (!aliased_type)
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN, "Unknown aliased type for: {}", alias_name);
