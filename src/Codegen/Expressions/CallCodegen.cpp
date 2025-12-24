@@ -135,6 +135,7 @@ namespace Cryo::Codegen
 
         case CallKind::FreeFunction:
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FreeFunction: resolving '{}'", function_name);
             llvm::Function *fn = resolve_function(function_name);
             if (!fn)
             {
@@ -142,6 +143,8 @@ namespace Cryo::Codegen
                              "Unknown function: " + function_name);
                 return nullptr;
             }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FreeFunction: resolved '{}' to LLVM function '{}'",
+                      function_name, fn->getName().str());
             return generate_free_function(node, fn);
         }
 
@@ -874,10 +877,16 @@ namespace Cryo::Codegen
 
     llvm::Function *CallCodegen::resolve_function(const std::string &name)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_function: Looking up '{}'", name);
+
         // Try direct lookup in LLVM module first (primary source of truth)
         llvm::Function *fn = module()->getFunction(name);
         if (fn)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_function: Found '{}' -> LLVM name '{}'",
+                      name, fn->getName().str());
             return fn;
+        }
 
         // Try in context's function registry (for forward declarations, templates, etc.)
         fn = ctx().get_function(name);
