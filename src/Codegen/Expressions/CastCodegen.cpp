@@ -27,7 +27,7 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CastCodegen: Generating cast expression");
 
         // Generate source expression
-        node->expression()->accept(ctx().visitor());
+        node->expression()->accept(*ctx().visitor());
         llvm::Value *value = get_result();
 
         if (!value)
@@ -37,7 +37,7 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        return generate_implicit_cast(value, node->target_type());
+        return generate_implicit_cast(value, node->get_resolved_type());
     }
 
     llvm::Value *CastCodegen::generate_implicit_cast(llvm::Value *value, Cryo::Type *target_type)
