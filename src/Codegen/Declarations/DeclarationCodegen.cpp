@@ -584,6 +584,14 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating body for function: {}", fn->getName().str());
 
+        // Set current function context for variable allocation
+        auto fn_ctx = std::make_unique<FunctionContext>(fn, node);
+        fn_ctx->entry_block = &fn->getEntryBlock();
+        ctx().set_current_function(std::move(fn_ctx));
+
+        // Enter function scope for local variables
+        values().enter_scope(fn->getName().str());
+
         // Allocate space for parameters
         for (auto &arg : fn->args())
         {
@@ -611,6 +619,12 @@ namespace Cryo::Codegen
                 builder().CreateRet(default_val);
             }
         }
+
+        // Exit function scope
+        values().exit_scope();
+
+        // Clear function context
+        ctx().clear_current_function();
     }
 
     llvm::Function *DeclarationCodegen::generate_default_constructor(const std::string &type_name,
@@ -805,6 +819,14 @@ namespace Cryo::Codegen
                     llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
                     builder().SetInsertPoint(entry);
 
+                    // Set current function context for variable allocation
+                    auto fn_ctx = std::make_unique<FunctionContext>(fn, fn_node);
+                    fn_ctx->entry_block = entry;
+                    ctx().set_current_function(std::move(fn_ctx));
+
+                    // Enter method scope for local variables
+                    values().enter_scope(method_name);
+
                     // Allocate parameters
                     for (auto &arg : fn->args())
                     {
@@ -830,6 +852,12 @@ namespace Cryo::Codegen
                             builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
                         }
                     }
+
+                    // Exit method scope
+                    values().exit_scope();
+
+                    // Clear function context
+                    ctx().clear_current_function();
                 }
             }
             else
