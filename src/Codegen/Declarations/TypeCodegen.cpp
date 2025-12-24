@@ -568,14 +568,13 @@ namespace Cryo::Codegen
             }
         }
 
-        // Set struct body
-        if (!field_types.empty())
-        {
-            struct_type->setBody(field_types);
-        }
+        // Set struct body - always set even if empty to mark as non-opaque
+        struct_type->setBody(field_types);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Set struct {} body with {} fields", name, field_types.size());
 
-        // Register type
+        // Register type in both context and TypeMapper cache for consistency
         ctx().register_type(name, struct_type);
+        types().register_struct(name, struct_type);
 
         return struct_type;
     }
@@ -613,14 +612,13 @@ namespace Cryo::Codegen
             }
         }
 
-        // Set class body
-        if (!field_types.empty())
-        {
-            class_type->setBody(field_types);
-        }
+        // Set class body - always set even if empty to mark as non-opaque
+        class_type->setBody(field_types);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Set class {} body with {} fields", name, field_types.size());
 
-        // Register type
+        // Register type in both context and TypeMapper cache for consistency
         ctx().register_type(name, class_type);
+        types().register_struct(name, class_type);
 
         return class_type;
     }

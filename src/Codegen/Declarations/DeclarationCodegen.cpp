@@ -93,8 +93,24 @@ namespace Cryo::Codegen
         llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
         builder().SetInsertPoint(entry_block);
 
+        // Set up function context for proper scope isolation
+        auto fn_ctx = std::make_unique<FunctionContext>(fn, node);
+        fn_ctx->entry_block = entry_block;
+        ctx().set_current_function(std::move(fn_ctx));
+
+        // Enter function scope (isolates local variables)
+        values().enter_scope(name);
+
+        // Clear any stale result from previous expressions
+        ctx().set_result(nullptr);
+
         // Generate function body
         generate_function_body(fn, node);
+
+        // Exit function scope and clean up
+        values().exit_scope();
+        ctx().clear_current_function();
+        ctx().set_result(nullptr);
 
         // Verify function
         if (llvm::verifyFunction(*fn, &llvm::errs()))
@@ -805,6 +821,17 @@ namespace Cryo::Codegen
                     llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
                     builder().SetInsertPoint(entry);
 
+                    // Set up function context for proper scope isolation
+                    auto fn_ctx = std::make_unique<FunctionContext>(fn, fn_node);
+                    fn_ctx->entry_block = entry;
+                    ctx().set_current_function(std::move(fn_ctx));
+
+                    // Enter function scope
+                    values().enter_scope(method_name);
+
+                    // Clear stale result
+                    ctx().set_result(nullptr);
+
                     // Allocate parameters
                     for (auto &arg : fn->args())
                     {
@@ -830,6 +857,11 @@ namespace Cryo::Codegen
                             builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
                         }
                     }
+
+                    // Exit function scope and clean up
+                    values().exit_scope();
+                    ctx().clear_current_function();
+                    ctx().set_result(nullptr);
                 }
             }
             else
