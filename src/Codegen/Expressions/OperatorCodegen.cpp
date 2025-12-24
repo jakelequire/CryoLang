@@ -45,11 +45,11 @@ namespace Cryo::Codegen
         }
 
         // For logical operators, use short-circuit evaluation
-        if (op == TokenKind::TK_AMPERSAND_AMPERSAND)
+        if (op == TokenKind::TK_AMPAMP)
         {
             return generate_logical_and(node);
         }
-        if (op == TokenKind::TK_PIPE_PIPE)
+        if (op == TokenKind::TK_PIPEPIPE)
         {
             return generate_logical_or(node);
         }
@@ -68,10 +68,10 @@ namespace Cryo::Codegen
         switch (op_class)
         {
         case BinaryOpClass::Arithmetic:
-            return generate_arithmetic(op, lhs, rhs, node->resolved_type());
+            return generate_arithmetic(op, lhs, rhs, node->get_resolved_type());
 
         case BinaryOpClass::Comparison:
-            return generate_comparison(op, lhs, rhs, node->left()->resolved_type());
+            return generate_comparison(op, lhs, rhs, node->left()->get_resolved_type());
 
         case BinaryOpClass::Bitwise:
             return generate_bitwise(op, lhs, rhs);
@@ -81,7 +81,7 @@ namespace Cryo::Codegen
 
         default:
             report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
-                         "Unsupported binary operator: " + node->operator_token().value());
+                         "Unsupported binary operator: " + std::string(node->operator_token().text()));
             return nullptr;
         }
     }
@@ -95,20 +95,20 @@ namespace Cryo::Codegen
         }
 
         TokenKind op = node->operator_token().kind();
-        std::string op_str = node->operator_token().value();
+        std::string op_str = std::string(node->operator_token().text());
 
         // Handle increment/decrement specially (they modify lvalues)
-        if (op == TokenKind::TK_PLUS_PLUS)
+        if (op == TokenKind::TK_PLUSPLUS)
         {
-            return generate_increment(node->operand(), node->is_prefix());
+            return generate_increment(node->operand(), true); // TODO: determine prefix/postfix
         }
-        if (op == TokenKind::TK_MINUS_MINUS)
+        if (op == TokenKind::TK_MINUSMINUS)
         {
-            return generate_decrement(node->operand(), node->is_prefix());
+            return generate_decrement(node->operand(), true); // TODO: determine prefix/postfix
         }
 
         // Handle address-of specially (doesn't evaluate operand)
-        if (op == TokenKind::TK_AMPERSAND)
+        if (op == TokenKind::TK_AMP)
         {
             return generate_address_of(node->operand());
         }
@@ -125,9 +125,9 @@ namespace Cryo::Codegen
         // Dispatch based on operator
         if (op == TokenKind::TK_MINUS)
         {
-            return generate_negation(operand, node->operand()->resolved_type());
+            return generate_negation(operand, node->operand()->get_resolved_type());
         }
-        if (op == TokenKind::TK_BANG)
+        if (op == TokenKind::TK_EXCLAIM)
         {
             return generate_logical_not(operand);
         }
@@ -137,7 +137,7 @@ namespace Cryo::Codegen
         }
         if (op == TokenKind::TK_STAR)
         {
-            return generate_dereference(operand, node->operand()->resolved_type());
+            return generate_dereference(operand, node->operand()->get_resolved_type());
         }
 
         report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR, node,
@@ -155,11 +155,11 @@ namespace Cryo::Codegen
         {
         // Assignment
         case TokenKind::TK_EQUAL:
-        case TokenKind::TK_PLUS_EQUAL:
-        case TokenKind::TK_MINUS_EQUAL:
-        case TokenKind::TK_STAR_EQUAL:
-        case TokenKind::TK_SLASH_EQUAL:
-        case TokenKind::TK_PERCENT_EQUAL:
+        case TokenKind::TK_PLUSEQUAL:
+        case TokenKind::TK_MINUSEQUAL:
+        case TokenKind::TK_STAREQUAL:
+        case TokenKind::TK_SLASHEQUAL:
+        case TokenKind::TK_PERCENTEQUAL:
             return BinaryOpClass::Assignment;
 
         // Arithmetic
@@ -179,25 +179,25 @@ namespace Cryo::Codegen
             return BinaryOpClass::Arithmetic;
 
         // Comparison
-        case TokenKind::TK_EQUAL_EQUAL:
-        case TokenKind::TK_BANG_EQUAL:
-        case TokenKind::TK_LESS_THAN:
-        case TokenKind::TK_GREATER_THAN:
-        case TokenKind::TK_LESS_THAN_EQUAL:
-        case TokenKind::TK_GREATER_THAN_EQUAL:
+        case TokenKind::TK_EQUALEQUAL:
+        case TokenKind::TK_EXCLAIMEQUAL:
+        case TokenKind::TK_L_ANGLE:
+        case TokenKind::TK_R_ANGLE:
+        case TokenKind::TK_LESSEQUAL:
+        case TokenKind::TK_GREATEREQUAL:
             return BinaryOpClass::Comparison;
 
         // Logical
-        case TokenKind::TK_AMPERSAND_AMPERSAND:
-        case TokenKind::TK_PIPE_PIPE:
+        case TokenKind::TK_AMPAMP:
+        case TokenKind::TK_PIPEPIPE:
             return BinaryOpClass::Logical;
 
         // Bitwise
-        case TokenKind::TK_AMPERSAND:
+        case TokenKind::TK_AMP:
         case TokenKind::TK_PIPE:
         case TokenKind::TK_CARET:
-        case TokenKind::TK_LESS_LESS:
-        case TokenKind::TK_GREATER_GREATER:
+        case TokenKind::TK_LESSLESS:
+        case TokenKind::TK_GREATERGREATER:
             return BinaryOpClass::Bitwise;
 
         default:
@@ -244,7 +244,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_identifier_assignment(Cryo::IdentifierNode *target,
-                                                                   Cryo::ExpressionNode *value_node)
+                                                                 Cryo::ExpressionNode *value_node)
     {
         if (!target || !value_node)
             return nullptr;
@@ -294,7 +294,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_member_assignment(Cryo::MemberAccessNode *target,
-                                                               Cryo::ExpressionNode *value_node)
+                                                             Cryo::ExpressionNode *value_node)
     {
         if (!target || !value_node)
             return nullptr;
@@ -331,7 +331,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_array_assignment(Cryo::ArrayAccessNode *target,
-                                                              Cryo::ExpressionNode *value_node)
+                                                            Cryo::ExpressionNode *value_node)
     {
         if (!target || !value_node)
             return nullptr;
@@ -368,7 +368,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_deref_assignment(Cryo::UnaryExpressionNode *target,
-                                                              Cryo::ExpressionNode *value_node)
+                                                            Cryo::ExpressionNode *value_node)
     {
         if (!target || !value_node)
             return nullptr;
@@ -416,9 +416,9 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Value *OperatorCodegen::generate_arithmetic(TokenKind op,
-                                                        llvm::Value *lhs,
-                                                        llvm::Value *rhs,
-                                                        Cryo::Type *result_type)
+                                                      llvm::Value *lhs,
+                                                      llvm::Value *rhs,
+                                                      Cryo::Type *result_type)
     {
         if (!lhs || !rhs)
             return nullptr;
@@ -445,9 +445,9 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_integer_arithmetic(TokenKind op,
-                                                                 llvm::Value *lhs,
-                                                                 llvm::Value *rhs,
-                                                                 bool is_signed)
+                                                              llvm::Value *lhs,
+                                                              llvm::Value *rhs,
+                                                              bool is_signed)
     {
         llvm::IRBuilder<> &b = builder();
 
@@ -480,8 +480,8 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_float_arithmetic(TokenKind op,
-                                                              llvm::Value *lhs,
-                                                              llvm::Value *rhs)
+                                                            llvm::Value *lhs,
+                                                            llvm::Value *rhs)
     {
         llvm::IRBuilder<> &b = builder();
 
@@ -512,9 +512,9 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Value *OperatorCodegen::generate_comparison(TokenKind op,
-                                                        llvm::Value *lhs,
-                                                        llvm::Value *rhs,
-                                                        Cryo::Type *operand_type)
+                                                      llvm::Value *lhs,
+                                                      llvm::Value *rhs,
+                                                      Cryo::Type *operand_type)
     {
         if (!lhs || !rhs)
             return nullptr;
@@ -546,33 +546,33 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_integer_comparison(TokenKind op,
-                                                                 llvm::Value *lhs,
-                                                                 llvm::Value *rhs,
-                                                                 bool is_signed)
+                                                              llvm::Value *lhs,
+                                                              llvm::Value *rhs,
+                                                              bool is_signed)
     {
         llvm::IRBuilder<> &b = builder();
 
         switch (op)
         {
-        case TokenKind::TK_EQUAL_EQUAL:
+        case TokenKind::TK_EQUALEQUAL:
             return b.CreateICmpEQ(lhs, rhs, "eq");
 
-        case TokenKind::TK_BANG_EQUAL:
+        case TokenKind::TK_EXCLAIMEQUAL:
             return b.CreateICmpNE(lhs, rhs, "ne");
 
-        case TokenKind::TK_LESS_THAN:
+        case TokenKind::TK_L_ANGLE:
             return is_signed ? b.CreateICmpSLT(lhs, rhs, "slt")
                              : b.CreateICmpULT(lhs, rhs, "ult");
 
-        case TokenKind::TK_GREATER_THAN:
+        case TokenKind::TK_R_ANGLE:
             return is_signed ? b.CreateICmpSGT(lhs, rhs, "sgt")
                              : b.CreateICmpUGT(lhs, rhs, "ugt");
 
-        case TokenKind::TK_LESS_THAN_EQUAL:
+        case TokenKind::TK_LESSEQUAL:
             return is_signed ? b.CreateICmpSLE(lhs, rhs, "sle")
                              : b.CreateICmpULE(lhs, rhs, "ule");
 
-        case TokenKind::TK_GREATER_THAN_EQUAL:
+        case TokenKind::TK_GREATEREQUAL:
             return is_signed ? b.CreateICmpSGE(lhs, rhs, "sge")
                              : b.CreateICmpUGE(lhs, rhs, "uge");
 
@@ -582,29 +582,29 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_float_comparison(TokenKind op,
-                                                              llvm::Value *lhs,
-                                                              llvm::Value *rhs)
+                                                            llvm::Value *lhs,
+                                                            llvm::Value *rhs)
     {
         llvm::IRBuilder<> &b = builder();
 
         switch (op)
         {
-        case TokenKind::TK_EQUAL_EQUAL:
+        case TokenKind::TK_EQUALEQUAL:
             return b.CreateFCmpOEQ(lhs, rhs, "feq");
 
-        case TokenKind::TK_BANG_EQUAL:
+        case TokenKind::TK_EXCLAIMEQUAL:
             return b.CreateFCmpONE(lhs, rhs, "fne");
 
-        case TokenKind::TK_LESS_THAN:
+        case TokenKind::TK_L_ANGLE:
             return b.CreateFCmpOLT(lhs, rhs, "flt");
 
-        case TokenKind::TK_GREATER_THAN:
+        case TokenKind::TK_R_ANGLE:
             return b.CreateFCmpOGT(lhs, rhs, "fgt");
 
-        case TokenKind::TK_LESS_THAN_EQUAL:
+        case TokenKind::TK_LESSEQUAL:
             return b.CreateFCmpOLE(lhs, rhs, "fle");
 
-        case TokenKind::TK_GREATER_THAN_EQUAL:
+        case TokenKind::TK_GREATEREQUAL:
             return b.CreateFCmpOGE(lhs, rhs, "fge");
 
         default:
@@ -613,17 +613,17 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *OperatorCodegen::generate_pointer_comparison(TokenKind op,
-                                                                 llvm::Value *lhs,
-                                                                 llvm::Value *rhs)
+                                                              llvm::Value *lhs,
+                                                              llvm::Value *rhs)
     {
         llvm::IRBuilder<> &b = builder();
 
         switch (op)
         {
-        case TokenKind::TK_EQUAL_EQUAL:
+        case TokenKind::TK_EQUALEQUAL:
             return b.CreateICmpEQ(lhs, rhs, "ptr_eq");
 
-        case TokenKind::TK_BANG_EQUAL:
+        case TokenKind::TK_EXCLAIMEQUAL:
             return b.CreateICmpNE(lhs, rhs, "ptr_ne");
 
         default:
@@ -744,8 +744,8 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Value *OperatorCodegen::generate_bitwise(TokenKind op,
-                                                     llvm::Value *lhs,
-                                                     llvm::Value *rhs)
+                                                   llvm::Value *lhs,
+                                                   llvm::Value *rhs)
     {
         if (!lhs || !rhs)
             return nullptr;
@@ -754,7 +754,7 @@ namespace Cryo::Codegen
 
         switch (op)
         {
-        case TokenKind::TK_AMPERSAND:
+        case TokenKind::TK_AMP:
             return b.CreateAnd(lhs, rhs, "and");
 
         case TokenKind::TK_PIPE:
@@ -763,10 +763,10 @@ namespace Cryo::Codegen
         case TokenKind::TK_CARET:
             return b.CreateXor(lhs, rhs, "xor");
 
-        case TokenKind::TK_LESS_LESS:
+        case TokenKind::TK_LESSLESS:
             return b.CreateShl(lhs, rhs, "shl");
 
-        case TokenKind::TK_GREATER_GREATER:
+        case TokenKind::TK_GREATERGREATER:
             // Default to arithmetic shift (preserve sign)
             return b.CreateAShr(lhs, rhs, "ashr");
 
@@ -859,8 +859,8 @@ namespace Cryo::Codegen
         if (!operand->getType()->isIntegerTy(1))
         {
             operand = b.CreateICmpNE(operand,
-                                      llvm::Constant::getNullValue(operand->getType()),
-                                      "tobool");
+                                     llvm::Constant::getNullValue(operand->getType()),
+                                     "tobool");
         }
 
         return b.CreateNot(operand, "not");
@@ -1047,14 +1047,20 @@ namespace Cryo::Codegen
         if (!expr)
             return nullptr;
 
-        // Visit the expression and get its value
-        // Note: This relies on the expression visitor being set up
-        // For now, we use a simple approach
-        expr->accept(*static_cast<ASTVisitor *>(&ctx().symbols())); // This won't work directly
+        // Visit the expression using the CodegenVisitor to generate its value
+        CodegenVisitor *visitor = ctx().visitor();
+        if (!visitor)
+        {
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                         "CodegenVisitor not available for expression generation");
+            return nullptr;
+        }
 
-        // TODO: Need a way to generate expression values
-        // For now, return the value from context if registered
-        return ctx().get_value(expr);
+        // Visit the expression to generate its value
+        expr->accept(*visitor);
+
+        // Get the result from the visitor/context
+        return get_result();
     }
 
     llvm::Value *OperatorCodegen::get_lvalue_address(Cryo::ExpressionNode *expr)
@@ -1206,7 +1212,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *fn_type = llvm::FunctionType::get(char_ptr, {char_ptr, char_ptr}, false);
 
         _string_concat_fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
-                                                    "std::Runtime::cryo_strcat", mod);
+                                                   "std::Runtime::cryo_strcat", mod);
         return _string_concat_fn;
     }
 
@@ -1230,7 +1236,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *fn_type = llvm::FunctionType::get(char_ptr, {char_ptr, i8}, false);
 
         _string_char_concat_fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
-                                                         "std::Runtime::cryo_strcat_char", mod);
+                                                        "std::Runtime::cryo_strcat_char", mod);
         return _string_char_concat_fn;
     }
 

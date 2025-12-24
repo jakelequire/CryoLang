@@ -1942,13 +1942,15 @@ namespace Cryo
         if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering struct AST node: {}", struct_decl->name());
-            type_mapper->register_struct_ast_node(struct_decl);
+            // TODO: Implement proper struct registration with AST node
+            // type_mapper->register_struct_ast_node(struct_decl);
         }
         // Register class declarations
         else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(node))
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering class AST node: {}", class_decl->name());
-            type_mapper->register_class_ast_node(class_decl);
+            // TODO: Implement proper class registration with AST node
+            // type_mapper->register_class_ast_node(class_decl);
         }
         // Recurse into program nodes
         else if (auto program = dynamic_cast<ProgramNode *>(node))
