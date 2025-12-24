@@ -1,4 +1,7 @@
 #include "Codegen/Expressions/CastCodegen.hpp"
+#include "Codegen/CodegenVisitor.hpp"
+#include "Codegen/Memory/MemoryCodegen.hpp"
+#include "AST/ASTVisitor.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen

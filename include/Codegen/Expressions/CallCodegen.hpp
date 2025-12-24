@@ -3,6 +3,7 @@
 #include "Codegen/ICodegenComponent.hpp"
 #include "Codegen/CodegenContext.hpp"
 #include "AST/ASTNode.hpp"
+#include "AST/ASTVisitor.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>
@@ -63,16 +64,16 @@ namespace Cryo::Codegen
          */
         enum class CallKind
         {
-            PrimitiveConstructor,  // i32(value), f64(value), etc.
-            StructConstructor,     // MyStruct(args...)
-            ClassConstructor,      // new MyClass(args...)
-            EnumVariant,           // Option::Some(value)
-            Intrinsic,             // __malloc__(size)
-            RuntimeFunction,       // cryo_alloc(...)
-            StaticMethod,          // Type::method(args)
-            InstanceMethod,        // obj.method(args)
-            FreeFunction,          // function(args)
-            GenericInstantiation,  // Array<int>::new()
+            PrimitiveConstructor, // i32(value), f64(value), etc.
+            StructConstructor,    // MyStruct(args...)
+            ClassConstructor,     // new MyClass(args...)
+            EnumVariant,          // Option::Some(value)
+            Intrinsic,            // __malloc__(size)
+            RuntimeFunction,      // cryo_alloc(...)
+            StaticMethod,         // Type::method(args)
+            InstanceMethod,       // obj.method(args)
+            FreeFunction,         // function(args)
+            GenericInstantiation, // Array<int>::new()
             Unknown
         };
 
@@ -94,7 +95,7 @@ namespace Cryo::Codegen
          * @return Converted value
          */
         llvm::Value *generate_primitive_constructor(Cryo::CallExpressionNode *node,
-                                                     const std::string &type_name);
+                                                    const std::string &type_name);
 
         /**
          * @brief Generate struct constructor call
@@ -103,7 +104,7 @@ namespace Cryo::Codegen
          * @return Pointer to constructed struct
          */
         llvm::Value *generate_struct_constructor(Cryo::CallExpressionNode *node,
-                                                  const std::string &type_name);
+                                                 const std::string &type_name);
 
         /**
          * @brief Generate class constructor call (heap allocation)
@@ -112,7 +113,7 @@ namespace Cryo::Codegen
          * @return Pointer to constructed object
          */
         llvm::Value *generate_class_constructor(Cryo::CallExpressionNode *node,
-                                                 const std::string &type_name);
+                                                const std::string &type_name);
 
         /**
          * @brief Generate enum variant constructor
@@ -122,8 +123,8 @@ namespace Cryo::Codegen
          * @return Enum value
          */
         llvm::Value *generate_enum_variant(Cryo::CallExpressionNode *node,
-                                            const std::string &enum_name,
-                                            const std::string &variant_name);
+                                           const std::string &enum_name,
+                                           const std::string &variant_name);
 
         /**
          * @brief Generate intrinsic function call
@@ -132,7 +133,7 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_intrinsic(Cryo::CallExpressionNode *node,
-                                         const std::string &intrinsic_name);
+                                        const std::string &intrinsic_name);
 
         /**
          * @brief Generate runtime function call
@@ -141,7 +142,7 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_runtime_call(Cryo::CallExpressionNode *node,
-                                            const std::string &function_name);
+                                           const std::string &function_name);
 
         /**
          * @brief Generate static method call
@@ -151,8 +152,8 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_static_method(Cryo::CallExpressionNode *node,
-                                             const std::string &type_name,
-                                             const std::string &method_name);
+                                            const std::string &type_name,
+                                            const std::string &method_name);
 
         /**
          * @brief Generate instance method call
@@ -162,8 +163,8 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_instance_method(Cryo::CallExpressionNode *node,
-                                               llvm::Value *receiver,
-                                               const std::string &method_name);
+                                              llvm::Value *receiver,
+                                              const std::string &method_name);
 
         /**
          * @brief Generate free function call
@@ -172,7 +173,7 @@ namespace Cryo::Codegen
          * @return Result value
          */
         llvm::Value *generate_free_function(Cryo::CallExpressionNode *node,
-                                             llvm::Function *function);
+                                            llvm::Function *function);
 
         //===================================================================
         // Argument Handling
@@ -201,7 +202,7 @@ namespace Cryo::Codegen
          * @return true if compatible
          */
         bool check_argument_compatibility(const std::vector<llvm::Value *> &args,
-                                           llvm::FunctionType *fn_type);
+                                          llvm::FunctionType *fn_type);
 
         //===================================================================
         // Function Resolution
@@ -221,7 +222,7 @@ namespace Cryo::Codegen
          * @return LLVM function or nullptr if not found
          */
         llvm::Function *resolve_method(const std::string &type_name,
-                                        const std::string &method_name);
+                                       const std::string &method_name);
 
         /**
          * @brief Resolve a constructor for a type
@@ -230,7 +231,7 @@ namespace Cryo::Codegen
          * @return LLVM function or nullptr if not found
          */
         llvm::Function *resolve_constructor(const std::string &type_name,
-                                             const std::vector<llvm::Type *> &arg_types = {});
+                                            const std::vector<llvm::Type *> &arg_types = {});
 
         //===================================================================
         // Type Checks
@@ -293,8 +294,8 @@ namespace Cryo::Codegen
          * @return true if extraction successful
          */
         bool extract_member_call_info(Cryo::MemberAccessNode *member,
-                                       std::string &out_type,
-                                       std::string &out_method);
+                                      std::string &out_type,
+                                      std::string &out_method);
 
         /**
          * @brief Generate an expression value
@@ -312,9 +313,9 @@ namespace Cryo::Codegen
          * @return Function declaration
          */
         llvm::Function *get_or_create_function(const std::string &name,
-                                                llvm::Type *return_type,
-                                                const std::vector<llvm::Type *> &param_types,
-                                                bool is_variadic = false);
+                                               llvm::Type *return_type,
+                                               const std::vector<llvm::Type *> &param_types,
+                                               bool is_variadic = false);
 
         /**
          * @brief Qualify a runtime function name
