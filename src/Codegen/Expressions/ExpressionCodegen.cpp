@@ -390,14 +390,14 @@ namespace Cryo::Codegen
             return alloca;
         }
 
-        // Try value context
+        // Try value context (which also checks global values via search_scopes)
         if (llvm::Value *value = values().get_value(name))
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' in value context", name);
             return value;
         }
 
-        // Try global value context (set_global_value uses different storage)
+        // Try global value context directly
         if (llvm::Value *global_val = values().get_global_value(name))
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' in global value context", name);
@@ -441,6 +441,40 @@ namespace Cryo::Codegen
         if (llvm::Function *func = module()->getFunction(name))
         {
             return func;
+        }
+
+        // Not found - log detailed diagnostic at ERROR level
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                  "lookup_variable: FAILED to find '{}'. Checking what's available...", name);
+
+        // Log if it exists in global values
+        if (values().has_global_value(name))
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "lookup_variable: '{}' EXISTS in has_global_value but get_global_value returned null?!", name);
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "lookup_variable: '{}' does NOT exist in global values", name);
+        }
+
+        // Check module globals
+        bool found_in_module = false;
+        for (auto &gv : module()->globals())
+        {
+            if (gv.getName() == name)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "lookup_variable: '{}' EXISTS in module globals but getGlobalVariable failed?!", name);
+                found_in_module = true;
+                break;
+            }
+        }
+        if (!found_in_module)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "lookup_variable: '{}' does NOT exist in module globals", name);
         }
 
         return nullptr;
