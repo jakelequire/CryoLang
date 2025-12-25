@@ -166,6 +166,45 @@ namespace Cryo::Codegen
 
     llvm::Type *TypeMapper::get_type(const std::string &name)
     {
+        // Handle pointer types (names ending with '*')
+        if (!name.empty() && name.back() == '*')
+        {
+            // All pointer types in LLVM 15+ are opaque pointers
+            return ptr_type();
+        }
+
+        // Handle primitive types by name
+        if (name == "void")
+            return void_type();
+        if (name == "bool" || name == "boolean")
+            return bool_type();
+        if (name == "i8" || name == "char")
+            return i8_type();
+        if (name == "i16")
+            return i16_type();
+        if (name == "i32" || name == "int")
+            return i32_type();
+        if (name == "i64")
+            return i64_type();
+        if (name == "i128")
+            return i128_type();
+        if (name == "u8")
+            return i8_type();
+        if (name == "u16")
+            return i16_type();
+        if (name == "u32")
+            return i32_type();
+        if (name == "u64")
+            return i64_type();
+        if (name == "u128")
+            return i128_type();
+        if (name == "f32" || name == "float")
+            return f32_type();
+        if (name == "f64" || name == "double")
+            return f64_type();
+        if (name == "string")
+            return string_type();
+
         // Check struct cache first
         auto *st = lookup_struct(name);
         if (st)
