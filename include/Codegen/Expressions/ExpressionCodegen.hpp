@@ -137,6 +137,17 @@ namespace Cryo::Codegen
         llvm::Value *generate_array_literal(Cryo::ArrayLiteralNode *node);
 
         /**
+         * @brief Generate Array<T> constructor call for array literals
+         * @param node Array literal node
+         * @param elements Array elements
+         * @param elem_type Element type
+         * @return Array<T> instance
+         */
+        llvm::Value *generate_array_constructor_call(Cryo::ArrayLiteralNode *node,
+                                                     const std::vector<std::unique_ptr<Cryo::ExpressionNode>> &elements,
+                                                     llvm::Type *elem_type);
+
+        /**
          * @brief Generate struct literal
          * @param node Struct literal node
          * @return Generated struct value
@@ -360,9 +371,9 @@ namespace Cryo::Codegen
          * @return true if successful
          */
         bool resolve_member_info(Cryo::ExpressionNode *object,
-                                  const std::string &member_name,
-                                  llvm::StructType *&out_struct_type,
-                                  unsigned &out_field_idx);
+                                 const std::string &member_name,
+                                 llvm::StructType *&out_struct_type,
+                                 unsigned &out_field_idx);
 
         // String literal cache
         std::unordered_map<std::string, llvm::GlobalVariable *> _string_cache;

@@ -1357,22 +1357,108 @@ namespace Cryo::Codegen
             // Determine element type
             llvm::Type *element_type = nullptr;
             Cryo::Type *array_type = array_access->array()->get_resolved_type();
+
+            // If no resolved type, check variable_types_map (like in ExpressionCodegen)
+            if (!array_type)
+            {
+                if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(array_access->array()))
+                {
+                    std::string array_name = identifier->name();
+                    auto &var_types = ctx().variable_types_map();
+                    auto it = var_types.find(array_name);
+                    if (it != var_types.end())
+                    {
+                        array_type = it->second;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Found in variable_types_map: {}", array_type->to_string());
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: '{}' not found in variable_types_map", array_name);
+                    }
+                }
+            }
+
+            // Also check if the array identifier is pool_sizes specifically
+            if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(array_access->array()))
+            {
+                std::string array_name = identifier->name();
+                if (array_name == "pool_sizes")
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FOUND pool_sizes array access. Type: {}",
+                              array_type ? array_type->to_string() : "NULL");
+                }
+            }
+
+            // Add debug output for the resolved type
+            if (array_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Array resolved type: {} (kind: {})",
+                          array_type->to_string(), static_cast<int>(array_type->kind()));
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: No resolved array type");
+            }
+
             if (array_type)
             {
                 if (array_type->kind() == Cryo::TypeKind::Array)
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected TypeKind::Array");
                     auto *arr_type = dynamic_cast<Cryo::ArrayType *>(array_type);
                     if (arr_type && arr_type->element_type())
                     {
                         element_type = get_llvm_type(arr_type->element_type().get());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Got element type from ArrayType");
                     }
                 }
                 else if (array_type->kind() == Cryo::TypeKind::Pointer)
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected TypeKind::Pointer");
                     auto *ptr_type = dynamic_cast<Cryo::PointerType *>(array_type);
                     if (ptr_type && ptr_type->pointee_type())
                     {
                         element_type = get_llvm_type(ptr_type->pointee_type().get());
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Type kind {} not handled, checking for Array<T> patterns",
+                              static_cast<int>(array_type->kind()));
+
+                    // Check if this is an Array<T> type (Parameterized or Class)
+                    std::string type_str = array_type->to_string();
+                    if (type_str.find("Array<") == 0)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected Array<T> pattern, attempting to extract element type");
+                        // Try to extract element type from Array<T>
+                        // For Array<u64>, we want u64
+                        size_t start = type_str.find('<') + 1;
+                        size_t end = type_str.find('>', start);
+                        if (start != std::string::npos && end != std::string::npos)
+                        {
+                            std::string element_name = type_str.substr(start, end - start);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Extracted element type name: {}", element_name);
+
+                            // Map element type name to LLVM type
+                            if (element_name == "u64" || element_name == "i64")
+                                element_type = llvm::Type::getInt64Ty(llvm_ctx());
+                            else if (element_name == "u32" || element_name == "i32")
+                                element_type = llvm::Type::getInt32Ty(llvm_ctx());
+                            else if (element_name == "u16" || element_name == "i16")
+                                element_type = llvm::Type::getInt16Ty(llvm_ctx());
+                            else if (element_name == "u8" || element_name == "i8")
+                                element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                            else if (element_name == "f64")
+                                element_type = llvm::Type::getDoubleTy(llvm_ctx());
+                            else if (element_name == "f32")
+                                element_type = llvm::Type::getFloatTy(llvm_ctx());
+
+                            if (element_type)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Successfully mapped {} to LLVM type", element_name);
+                            }
+                        }
                     }
                 }
             }
@@ -1380,9 +1466,8 @@ namespace Cryo::Codegen
             if (!element_type)
             {
                 // Fallback to i8 as a generic byte type
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Falling back to i8");
                 element_type = llvm::Type::getInt8Ty(llvm_ctx());
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "get_lvalue_address: Could not determine element type, using i8");
             }
 
             // Create GEP for array element access
