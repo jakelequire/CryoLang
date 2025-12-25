@@ -1350,7 +1350,7 @@ namespace Cryo::Codegen
                     auto *arr_type = dynamic_cast<Cryo::ArrayType *>(array_type);
                     if (arr_type && arr_type->element_type())
                     {
-                        element_type = get_llvm_type(arr_type->element_type());
+                        element_type = get_llvm_type(arr_type->element_type().get());
                     }
                 }
                 else if (array_type->kind() == Cryo::TypeKind::Pointer)
@@ -1358,7 +1358,7 @@ namespace Cryo::Codegen
                     auto *ptr_type = dynamic_cast<Cryo::PointerType *>(array_type);
                     if (ptr_type && ptr_type->pointee_type())
                     {
-                        element_type = get_llvm_type(ptr_type->pointee_type());
+                        element_type = get_llvm_type(ptr_type->pointee_type().get());
                     }
                 }
             }
