@@ -126,7 +126,7 @@ namespace Cryo::Codegen
                                  "Failed to generate receiver for method call");
                     return nullptr;
                 }
-                return generate_instance_method(node, receiver, member->member());
+                return generate_instance_method(node, member, receiver, member->member());
             }
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Invalid instance method call");
@@ -135,6 +135,7 @@ namespace Cryo::Codegen
 
         case CallKind::FreeFunction:
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FreeFunction: resolving '{}'", function_name);
             llvm::Function *fn = resolve_function(function_name);
             if (!fn)
             {
@@ -142,6 +143,8 @@ namespace Cryo::Codegen
                              "Unknown function: " + function_name);
                 return nullptr;
             }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FreeFunction: resolved '{}' to LLVM function '{}'",
+                      function_name, fn->getName().str());
             return generate_free_function(node, fn);
         }
 
@@ -683,6 +686,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *CallCodegen::generate_instance_method(Cryo::CallExpressionNode *node,
+                                                       Cryo::MemberAccessNode *callee,
                                                        llvm::Value *receiver,
                                                        const std::string &method_name)
     {
@@ -698,10 +702,32 @@ namespace Cryo::Codegen
         // Generate arguments
         auto args = generate_arguments(node->arguments());
 
-        // Determine receiver type name
+        // Determine receiver type name from the callee's object expression
         std::string type_name;
-        // Try to look up from variable types or infer from LLVM type
-        // This is a simplified version - full implementation would need type tracking
+        if (callee && callee->object())
+        {
+            Cryo::Type *obj_type = callee->object()->get_resolved_type();
+            if (obj_type)
+            {
+                type_name = obj_type->to_string();
+                // Strip pointer suffix if present
+                if (!type_name.empty() && type_name.back() == '*')
+                {
+                    type_name.pop_back();
+                }
+                // Handle pointer types explicitly
+                if (obj_type->kind() == Cryo::TypeKind::Pointer)
+                {
+                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(obj_type);
+                    if (ptr_type && ptr_type->pointee_type())
+                    {
+                        type_name = ptr_type->pointee_type()->to_string();
+                    }
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Instance method receiver type: {}", type_name);
+            }
+        }
 
         // Resolve the method
         llvm::Function *method = resolve_method(type_name, method_name);
@@ -851,10 +877,16 @@ namespace Cryo::Codegen
 
     llvm::Function *CallCodegen::resolve_function(const std::string &name)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_function: Looking up '{}'", name);
+
         // Try direct lookup in LLVM module first (primary source of truth)
         llvm::Function *fn = module()->getFunction(name);
         if (fn)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_function: Found '{}' -> LLVM name '{}'",
+                      name, fn->getName().str());
             return fn;
+        }
 
         // Try in context's function registry (for forward declarations, templates, etc.)
         fn = ctx().get_function(name);

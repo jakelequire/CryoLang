@@ -25,9 +25,20 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace Cryo::Codegen
 {
+    /**
+     * @brief Callback type for generic type instantiation
+     *
+     * Takes the base generic name and type arguments, returns the instantiated LLVM type.
+     * This allows TypeMapper to delegate generic instantiation to GenericCodegen.
+     */
+    using GenericInstantiator = std::function<llvm::StructType*(
+        const std::string& generic_name,
+        const std::vector<Cryo::Type*>& type_args)>;
+
     /**
      * @brief Maps CryoLang Type* to LLVM Type*
      *
@@ -59,6 +70,20 @@ namespace Cryo::Codegen
         // Non-copyable
         TypeMapper(const TypeMapper &) = delete;
         TypeMapper &operator=(const TypeMapper &) = delete;
+
+        /**
+         * @brief Set the generic instantiator callback
+         *
+         * This callback is invoked when mapping a ParameterizedType that
+         * results in an opaque struct. The callback should instantiate
+         * the generic type with the given type arguments.
+         *
+         * @param instantiator Callback function for generic instantiation
+         */
+        void set_generic_instantiator(GenericInstantiator instantiator)
+        {
+            _generic_instantiator = std::move(instantiator);
+        }
 
         //===================================================================
         // Primary Interface
@@ -334,6 +359,9 @@ namespace Cryo::Codegen
 
         // Struct cache - keyed by name for forward declarations
         std::unordered_map<std::string, llvm::StructType *> _struct_cache;
+
+        // Generic instantiator callback - for parameterized types
+        GenericInstantiator _generic_instantiator;
 
         // Error state
         bool _has_error = false;

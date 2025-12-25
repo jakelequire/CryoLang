@@ -93,8 +93,24 @@ namespace Cryo::Codegen
         llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
         builder().SetInsertPoint(entry_block);
 
+        // Set up function context for proper scope isolation
+        auto fn_ctx = std::make_unique<FunctionContext>(fn, node);
+        fn_ctx->entry_block = entry_block;
+        ctx().set_current_function(std::move(fn_ctx));
+
+        // Enter function scope (isolates local variables)
+        values().enter_scope(name);
+
+        // Clear any stale result from previous expressions
+        ctx().set_result(nullptr);
+
         // Generate function body
         generate_function_body(fn, node);
+
+        // Exit function scope and clean up
+        values().exit_scope();
+        ctx().clear_current_function();
+        ctx().set_result(nullptr);
 
         // Verify function
         if (llvm::verifyFunction(*fn, &llvm::errs()))
@@ -108,7 +124,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *DeclarationCodegen::generate_method_declaration(Cryo::FunctionDeclarationNode *node,
-                                                                      const std::string &parent_type)
+                                                                    const std::string &parent_type)
     {
         if (!node)
             return nullptr;
@@ -136,7 +152,7 @@ namespace Cryo::Codegen
 
         // Create function
         llvm::Function *fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
-                                                     method_name, module());
+                                                    method_name, module());
 
         // Name parameters (first is 'this')
         auto arg_it = fn->arg_begin();
@@ -202,7 +218,7 @@ namespace Cryo::Codegen
         // Create function type and declaration
         llvm::FunctionType *fn_type = llvm::FunctionType::get(return_type, param_types, is_variadic);
         llvm::Function *fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
-                                                     name, module());
+                                                    name, module());
 
         ctx().register_function(name, fn);
         return fn;
@@ -438,7 +454,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::FunctionType *DeclarationCodegen::get_function_type(Cryo::FunctionDeclarationNode *node,
-                                                                bool has_this_param)
+                                                              bool has_this_param)
     {
         if (!node)
             return nullptr;
@@ -477,8 +493,8 @@ namespace Cryo::Codegen
     }
 
     std::string DeclarationCodegen::mangle_function_name(const std::string &name,
-                                                           const std::vector<std::string> &namespace_parts,
-                                                           const std::vector<Cryo::Type *> &param_types)
+                                                         const std::vector<std::string> &namespace_parts,
+                                                         const std::vector<Cryo::Type *> &param_types)
     {
         std::string result;
 
@@ -510,8 +526,8 @@ namespace Cryo::Codegen
     }
 
     std::string DeclarationCodegen::generate_method_name(const std::string &type_name,
-                                                           const std::string &method_name,
-                                                           const std::vector<Cryo::Type *> &param_types)
+                                                         const std::string &method_name,
+                                                         const std::vector<Cryo::Type *> &param_types)
     {
         std::string result = type_name + "::" + method_name;
 
@@ -535,8 +551,8 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *DeclarationCodegen::get_or_create_function(const std::string &name,
-                                                                 llvm::FunctionType *fn_type,
-                                                                 llvm::GlobalValue::LinkageTypes linkage)
+                                                               llvm::FunctionType *fn_type,
+                                                               llvm::GlobalValue::LinkageTypes linkage)
     {
         llvm::Function *fn = module()->getFunction(name);
         if (fn)
@@ -557,10 +573,10 @@ namespace Cryo::Codegen
     //===================================================================
 
     void DeclarationCodegen::generate_parameters(llvm::Function *fn,
-                                                   Cryo::FunctionDeclarationNode *node,
-                                                   unsigned start_idx)
+                                                 Cryo::FunctionDeclarationNode *node,
+                                                 unsigned start_idx)
     {
-        if (!fn || !node )
+        if (!fn || !node)
             return;
 
         auto arg_it = fn->arg_begin();
@@ -577,7 +593,7 @@ namespace Cryo::Codegen
     }
 
     void DeclarationCodegen::generate_function_body(llvm::Function *fn,
-                                                      Cryo::FunctionDeclarationNode *node)
+                                                    Cryo::FunctionDeclarationNode *node)
     {
         if (!fn || !node || !node->body())
             return;
@@ -628,7 +644,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *DeclarationCodegen::generate_default_constructor(const std::string &type_name,
-                                                                       llvm::StructType *struct_type)
+                                                                     llvm::StructType *struct_type)
     {
         std::string ctor_name = type_name + "::init";
 
@@ -644,7 +660,7 @@ namespace Cryo::Codegen
             llvm::Type::getVoidTy(llvm_ctx()), {this_type}, false);
 
         llvm::Function *ctor = llvm::Function::Create(ctor_type, llvm::Function::ExternalLinkage,
-                                                       ctor_name, module());
+                                                      ctor_name, module());
 
         // Create body
         llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", ctor);
@@ -667,7 +683,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *DeclarationCodegen::generate_destructor(const std::string &type_name,
-                                                              llvm::StructType *class_type)
+                                                            llvm::StructType *class_type)
     {
         std::string dtor_name = type_name + "::destroy";
 
@@ -683,7 +699,7 @@ namespace Cryo::Codegen
             llvm::Type::getVoidTy(llvm_ctx()), {this_type}, false);
 
         llvm::Function *dtor = llvm::Function::Create(dtor_type, llvm::Function::ExternalLinkage,
-                                                       dtor_name, module());
+                                                      dtor_name, module());
 
         // Create empty body (subclasses can override)
         llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", dtor);
@@ -702,7 +718,7 @@ namespace Cryo::Codegen
     }
 
     void DeclarationCodegen::apply_function_attributes(llvm::Function *fn,
-                                                         Cryo::FunctionDeclarationNode *node)
+                                                       Cryo::FunctionDeclarationNode *node)
     {
         if (!fn || !node)
             return;
@@ -715,7 +731,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Constant *DeclarationCodegen::generate_global_initializer(Cryo::VariableDeclarationNode *node,
-                                                                      llvm::Type *type)
+                                                                    llvm::Type *type)
     {
         if (!node || !type)
             return llvm::Constant::getNullValue(type);
@@ -723,8 +739,39 @@ namespace Cryo::Codegen
         // If there's an initializer, try to evaluate it
         if (node->initializer())
         {
-            // For simple cases, we can evaluate at compile time
-            // Complex cases would need constant folding
+            // Visit the initializer expression to get its value
+            CodegenVisitor *visitor = ctx().visitor();
+            if (visitor)
+            {
+                node->initializer()->accept(*visitor);
+                llvm::Value *val = get_result();
+                if (auto *constant = llvm::dyn_cast<llvm::Constant>(val))
+                {
+                    // Cast to target type if needed
+                    if (constant->getType() != type)
+                    {
+                        // Handle integer to integer casts
+                        if (constant->getType()->isIntegerTy() && type->isIntegerTy())
+                        {
+                            return llvm::ConstantExpr::getIntegerCast(constant, type, true);
+                        }
+                        // Handle float to float casts
+                        if (constant->getType()->isFloatingPointTy() && type->isFloatingPointTy())
+                        {
+                            return llvm::ConstantExpr::getFPCast(constant, type);
+                        }
+                        // For other cases, just use the constant as-is and let LLVM handle it
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "Global initializer type mismatch for '{}', may cause issues",
+                                 node->name());
+                    }
+                    return constant;
+                }
+                // If not a constant, log a warning
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "Global initializer for '{}' is not a compile-time constant, using zero",
+                         node->name());
+            }
         }
 
         // Default to zero initializer
@@ -782,9 +829,63 @@ namespace Cryo::Codegen
 
         // Get the parent type name from context
         std::string parent_type = ctx().current_type_name();
+        std::string method_name = generate_method_name(parent_type, node->name());
 
-        // StructMethodNode IS a FunctionDeclarationNode, use it directly
-        generate_method_declaration(node, parent_type);
+        // Generate method declaration
+        llvm::Function *fn = generate_method_declaration(node, parent_type);
+
+        // If the method has a body and the function is empty, generate the body
+        if (fn && node->body() && fn->empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Generating body for method: {}", method_name);
+
+            // Create entry block and generate body
+            llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+            builder().SetInsertPoint(entry);
+
+            // Set up function context for proper scope isolation
+            auto fn_ctx = std::make_unique<FunctionContext>(fn, node);
+            fn_ctx->entry_block = entry;
+            ctx().set_current_function(std::move(fn_ctx));
+
+            // Enter function scope
+            values().enter_scope(method_name);
+
+            // Clear stale result
+            ctx().set_result(nullptr);
+
+            // Allocate parameters
+            for (auto &arg : fn->args())
+            {
+                llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
+                create_store(&arg, alloca);
+                values().set_value(arg.getName().str(), nullptr, alloca);
+            }
+
+            // Generate body
+            CodegenVisitor *visitor = ctx().visitor();
+            node->body()->accept(*visitor);
+
+            // Add implicit return if needed
+            llvm::BasicBlock *current_block = builder().GetInsertBlock();
+            if (current_block && !current_block->getTerminator())
+            {
+                if (fn->getReturnType()->isVoidTy())
+                {
+                    builder().CreateRetVoid();
+                }
+                else
+                {
+                    builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                }
+            }
+
+            // Exit function scope and clean up
+            values().exit_scope();
+            ctx().clear_current_function();
+            ctx().set_result(nullptr);
+        }
     }
 
     void DeclarationCodegen::generate_impl_block(Cryo::ImplementationBlockNode *node)
@@ -874,13 +975,16 @@ namespace Cryo::Codegen
                     llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
                     builder().SetInsertPoint(entry);
 
-                    // Set current function context for variable allocation
+                    // Set up function context for proper scope isolation
                     auto fn_ctx = std::make_unique<FunctionContext>(fn, fn_node);
                     fn_ctx->entry_block = entry;
                     ctx().set_current_function(std::move(fn_ctx));
 
-                    // Enter method scope for local variables
+                    // Enter function scope
                     values().enter_scope(method_name);
+
+                    // Clear stale result
+                    ctx().set_result(nullptr);
 
                     // Allocate parameters
                     for (auto &arg : fn->args())
@@ -908,11 +1012,10 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    // Exit method scope
+                    // Exit function scope and clean up
                     values().exit_scope();
-
-                    // Clear function context
                     ctx().clear_current_function();
+                    ctx().set_result(nullptr);
                 }
             }
             else
