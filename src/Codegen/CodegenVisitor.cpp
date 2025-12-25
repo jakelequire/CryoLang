@@ -458,16 +458,54 @@ namespace Cryo::Codegen
             _types->generate_struct(&node);
         }
 
-        // If we're in "type only" mode, skip method generation
+        // Generate method declarations even in "type only" mode to enable forward references
+        // This allows global variables and other code to call struct methods before their bodies are generated
+        if (!node.methods().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Generating method declarations for struct {} (defer_bodies={})",
+                      node.name(), _defer_method_generation);
+
+            // Set current type context for method generation
+            std::string previous_type = _ctx->current_type_name();
+            _ctx->set_current_type_name(node.name());
+
+            // Always generate method declarations (function signatures) - needed for forward references
+            for (const auto &method : node.methods())
+            {
+                if (method)
+                {
+                    _declarations->generate_method_declaration(method.get(), node.name());
+                }
+            }
+
+            // Only generate method bodies if we're not deferring them
+            if (!_defer_method_generation)
+            {
+                // Generate method bodies
+                for (const auto &method : node.methods())
+                {
+                    if (method)
+                    {
+                        _declarations->generate_method(method.get());
+                    }
+                }
+            }
+
+            // Restore previous type context
+            _ctx->set_current_type_name(previous_type);
+        }
+
+        // If we're in "type only" mode, we're done after generating declarations
         if (_defer_method_generation)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "CodegenVisitor: Deferring method generation for struct {}", node.name());
+                      "CodegenVisitor: Deferred method body generation for struct {}", node.name());
             return;
         }
 
-        // Generate struct methods if any are defined inline
-        if (!node.methods().empty())
+        // Generate struct methods if any are defined inline (this section is for legacy compatibility)
+        if (!node.methods().empty() && false) // Disabled since we handle this above
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "CodegenVisitor: Generating {} methods for struct {}",
@@ -527,16 +565,61 @@ namespace Cryo::Codegen
             _types->generate_class(&node);
         }
 
-        // If we're in "type only" mode, skip method generation
+        // Generate method declarations even in "type only" mode to enable forward references
+        // This allows global variables and other code to call class methods before their bodies are generated
+        if (!node.methods().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Generating method declarations for class {} (defer_bodies={})",
+                      node.name(), _defer_method_generation);
+
+            // Set current type context for method generation
+            std::string previous_type = _ctx->current_type_name();
+            _ctx->set_current_type_name(node.name());
+
+            // Always generate method declarations (function signatures) - needed for forward references
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Generating method declarations for class {}", node.name());
+
+            for (const auto &method : node.methods())
+            {
+                if (method)
+                {
+                    _declarations->generate_method_declaration(method.get(), node.name());
+                }
+            }
+
+            // Only generate method bodies if we're not deferring them
+            if (!_defer_method_generation)
+            {
+                // Second pass: Generate method bodies
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Generating method bodies for class {}", node.name());
+
+                for (const auto &method : node.methods())
+                {
+                    if (method)
+                    {
+                        // Generate the method body (declaration already exists)
+                        _declarations->generate_method(method.get());
+                    }
+                }
+            }
+
+            // Restore previous type context
+            _ctx->set_current_type_name(previous_type);
+        }
+
+        // If we're in "type only" mode, we're done after generating declarations
         if (_defer_method_generation)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "CodegenVisitor: Deferring method generation for class {}", node.name());
+                      "CodegenVisitor: Deferred method body generation for class {}", node.name());
             return;
         }
 
-        // Generate class methods (unlike structs, class methods are defined inline)
-        if (!node.methods().empty())
+        // Generate class methods (legacy compatibility section - now handled above)
+        if (!node.methods().empty() && false) // Disabled since we handle this above
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "CodegenVisitor: Generating {} methods for class {}",

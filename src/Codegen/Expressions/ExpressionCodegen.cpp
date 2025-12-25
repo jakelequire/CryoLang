@@ -588,49 +588,207 @@ namespace Cryo::Codegen
             report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, "Null index node");
             return nullptr;
         }
-
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating index expression");
 
-        // Generate array expression to determine element type
-        llvm::Value *array_val = generate(node->array());
-        if (!array_val)
-        {
-            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                         "Failed to generate array expression");
-            return nullptr;
-        }
-
-        // Determine element type from array type
+        // For array access, we need to handle stack-allocated arrays differently
+        llvm::Value *array_ptr = nullptr;
         llvm::Type *element_type = nullptr;
-        if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(array_val->getType()))
+
+        // Check if this is a simple identifier (stack-allocated array or Array<T>)
+        if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node->array()))
         {
-            element_type = arr_type->getElementType();
-        }
-        else if (array_val->getType()->isPointerTy())
-        {
-            // For pointer types (strings, etc.), try to get from resolved type
-            Cryo::Type *cryo_array_type = node->array()->get_resolved_type();
-            if (cryo_array_type)
+            std::string array_name = identifier->name();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: *** Processing array access for identifier: '{}'", array_name);
+
+            // Check if this is an Array<T> type first
+            Cryo::Type *resolved_type = identifier->get_resolved_type();
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Identifier resolved type: {}",
+                      resolved_type ? resolved_type->to_string() : "null");
+
+            // Fallback: if identifier doesn't have resolved type, check variable_types_map
+            if (!resolved_type)
             {
-                if (cryo_array_type->kind() == TypeKind::Array)
+                auto &var_types = ctx().variable_types_map();
+                auto it = var_types.find(array_name);
+                if (it != var_types.end())
                 {
-                    auto *arr = static_cast<Cryo::ArrayType *>(cryo_array_type);
-                    element_type = get_llvm_type(arr->element_type().get());
+                    resolved_type = it->second;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "ExpressionCodegen: Found type in variable_types_map for '{}': {}",
+                              array_name, resolved_type->to_string());
                 }
-                else if (cryo_array_type->kind() == TypeKind::String)
+                else
                 {
-                    element_type = llvm::Type::getInt8Ty(llvm_ctx());
-                }
-                else if (cryo_array_type->kind() == TypeKind::Pointer)
-                {
-                    auto *ptr = static_cast<Cryo::PointerType *>(cryo_array_type);
-                    element_type = get_llvm_type(ptr->pointee_type().get());
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "ExpressionCodegen: Variable '{}' not found in variable_types_map. Available variables:",
+                              array_name);
+                    for (const auto &pair : var_types)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "  - {}: {}", pair.first, pair.second->to_string());
+                    }
                 }
             }
-            // Fallback to i8 for string-like access
-            if (!element_type)
+
+            if (resolved_type && resolved_type->kind() == TypeKind::Array)
             {
-                element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                auto *cryo_array_type = static_cast<Cryo::ArrayType *>(resolved_type);
+                std::string element_type_name = cryo_array_type->element_type()->name();
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Detected Array<{}> access for variable: {}", element_type_name, array_name);
+
+                // This is an Array<T> type (like u64[] which is Array<u64>)
+                // We need to access the 'elements' field first: arr[index] becomes arr.elements[index]
+
+                // Generate the Array<T> instance
+                llvm::Value *array_instance = generate(node->array());
+                if (!array_instance)
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Failed to generate Array<T> instance");
+                    return nullptr;
+                }
+
+                // Get the element type from the Cryo array type
+                element_type = get_llvm_type(cryo_array_type->element_type().get());
+                if (!element_type)
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Could not determine element type for Array<T>");
+                    return nullptr;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> element type determined: {} (LLVM type: {})",
+                          element_type_name, element_type->getTypeID());
+
+                // Generate index expression
+                llvm::Value *index_val = generate(node->index());
+                if (!index_val)
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Failed to generate index expression");
+                    return nullptr;
+                }
+
+                // Ensure index is integer type
+                if (!index_val->getType()->isIntegerTy())
+                {
+                    index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> index value generated successfully");
+
+                // Access the 'elements' field (first field in Array<T> struct)
+                // Get the Array<T> struct type from the Cryo type system
+                llvm::Type *array_struct_type = get_llvm_type(resolved_type);
+                if (!array_struct_type || !array_struct_type->isStructTy())
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Array<T> does not map to a struct type");
+                    return nullptr;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> struct type verified");
+
+                llvm::Value *elements_ptr = builder().CreateStructGEP(
+                    llvm::cast<llvm::StructType>(array_struct_type),
+                    array_instance,
+                    0, // 'elements' is the first field
+                    array_name + ".elements.ptr");
+
+                // Load the elements pointer (T*)
+                llvm::Value *elements_array = create_load(elements_ptr,
+                                                          llvm::PointerType::get(element_type, 0),
+                                                          array_name + ".elements.load");
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> elements pointer loaded successfully");
+
+                // Now do pointer arithmetic: elements_array[index]
+                llvm::Value *element_ptr = builder().CreateGEP(
+                    element_type,
+                    elements_array,
+                    index_val,
+                    "elem.ptr");
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> element pointer created successfully");
+
+                // Load and return the element value
+                llvm::Value *result = create_load(element_ptr, element_type, "elem.load");
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> element value loaded successfully, returning element");
+                return result;
+            }
+
+            // Additional logging for debugging
+            if (!resolved_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "*** No resolved type found for '{}', falling back to traditional array access",
+                          array_name);
+            }
+
+            // Try to get the alloca directly for traditional stack-allocated arrays
+            if (llvm::AllocaInst *alloca = values().get_alloca(array_name))
+            {
+                llvm::Type *allocated_type = alloca->getAllocatedType();
+
+                // Check if it's an array type
+                if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(allocated_type))
+                {
+                    array_ptr = alloca;
+                    element_type = arr_type->getElementType();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Found stack-allocated traditional array: {}, element type determined from alloca", array_name);
+                }
+            }
+        }
+
+        // If we didn't find a stack array, use the standard path
+        if (!array_ptr)
+        {
+            // Generate array expression
+            llvm::Value *array_val = generate(node->array());
+            if (!array_val)
+            {
+                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                             "Failed to generate array expression");
+                return nullptr;
+            }
+
+            array_ptr = array_val;
+
+            // Determine element type from array type
+            if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(array_val->getType()))
+            {
+                element_type = arr_type->getElementType();
+            }
+            else if (array_val->getType()->isPointerTy())
+            {
+                // For pointer types (strings, etc.), try to get from resolved type
+                Cryo::Type *cryo_array_type = node->array()->get_resolved_type();
+                if (cryo_array_type)
+                {
+                    if (cryo_array_type->kind() == TypeKind::Array)
+                    {
+                        auto *arr = static_cast<Cryo::ArrayType *>(cryo_array_type);
+                        element_type = get_llvm_type(arr->element_type().get());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Determined element type from resolved Cryo array type for non-stack array");
+                    }
+                    else if (cryo_array_type->kind() == TypeKind::String)
+                    {
+                        element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                    }
+                    else if (cryo_array_type->kind() == TypeKind::Pointer)
+                    {
+                        auto *ptr = static_cast<Cryo::PointerType *>(cryo_array_type);
+                        element_type = get_llvm_type(ptr->pointee_type().get());
+                    }
+                }
+                // Fallback to i8 for string-like access only if we still don't have an element type
+                if (!element_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Falling back to i8 element type for array access");
+                    element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                }
             }
         }
 
@@ -656,8 +814,27 @@ namespace Cryo::Codegen
             index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
         }
 
-        // Create GEP and load the element
-        llvm::Value *element_ptr = create_array_gep(element_type, array_val, index_val, "elem.ptr");
+        // For stack-allocated arrays, we need to use InBoundsGEP with proper indices
+        llvm::Value *element_ptr = nullptr;
+        if (llvm::isa<llvm::AllocaInst>(array_ptr) &&
+            llvm::isa<llvm::ArrayType>(static_cast<llvm::AllocaInst *>(array_ptr)->getAllocatedType()))
+        {
+            // For stack arrays, we need [0, index] indices
+            std::vector<llvm::Value *> indices = {
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                index_val};
+            element_ptr = builder().CreateInBoundsGEP(
+                static_cast<llvm::AllocaInst *>(array_ptr)->getAllocatedType(),
+                array_ptr,
+                indices,
+                "elem.ptr");
+        }
+        else
+        {
+            // For pointer arrays, use single index
+            element_ptr = create_array_gep(element_type, array_ptr, index_val, "elem.ptr");
+        }
+
         if (!element_ptr)
         {
             return nullptr;
@@ -672,13 +849,140 @@ namespace Cryo::Codegen
         if (!node)
             return nullptr;
 
-        // Generate array expression
-        llvm::Value *array_val = generate(node->array());
-        if (!array_val)
+        // For array access, we need to handle stack-allocated arrays differently
+        llvm::Value *array_ptr = nullptr;
+        llvm::Type *element_type = nullptr;
+
+        // Check if this is a simple identifier (stack-allocated array or Array<T>)
+        if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node->array()))
         {
-            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                         "Failed to generate array expression");
-            return nullptr;
+            std::string array_name = identifier->name();
+
+            // Check if this is an Array<T> type first
+            Cryo::Type *resolved_type = identifier->get_resolved_type();
+
+            // Fallback: if identifier doesn't have resolved type, check variable_types_map
+            if (!resolved_type)
+            {
+                auto &var_types = ctx().variable_types_map();
+                auto it = var_types.find(array_name);
+                if (it != var_types.end())
+                {
+                    resolved_type = it->second;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "ExpressionCodegen: Found Array<T> type in variable_types_map for address '{}': {}",
+                              array_name, resolved_type->to_string());
+                }
+            }
+
+            if (resolved_type && resolved_type->kind() == TypeKind::Array)
+            {
+                auto *cryo_array_type = static_cast<Cryo::ArrayType *>(resolved_type);
+                std::string element_type_name = cryo_array_type->element_type()->name();
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected Array<{}> address access for variable: {}", element_type_name, array_name);
+
+                // This is an Array<T> type (like u64[] which is Array<u64>)
+                // We need to access the 'elements' field first: arr[index] becomes arr.elements[index]
+
+                // Generate the Array<T> instance
+                llvm::Value *array_instance = generate(node->array());
+                if (!array_instance)
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Failed to generate Array<T> instance for address");
+                    return nullptr;
+                }
+
+                // Get the element type from the Cryo array type
+                element_type = get_llvm_type(cryo_array_type->element_type().get());
+                if (!element_type)
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Could not determine element type for Array<T> address");
+                    return nullptr;
+                }
+
+                // Generate index expression
+                llvm::Value *index_val = generate(node->index());
+                if (!index_val)
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Failed to generate index expression for address");
+                    return nullptr;
+                }
+
+                // Ensure index is integer type
+                if (!index_val->getType()->isIntegerTy())
+                {
+                    index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+                }
+
+                // Access the 'elements' field (first field in Array<T> struct)
+                // Get the Array<T> struct type from the Cryo type system
+                llvm::Type *array_struct_type = get_llvm_type(resolved_type);
+                if (!array_struct_type || !array_struct_type->isStructTy())
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Array<T> does not map to a struct type for address");
+                    return nullptr;
+                }
+
+                llvm::Value *elements_ptr = builder().CreateStructGEP(
+                    llvm::cast<llvm::StructType>(array_struct_type),
+                    array_instance,
+                    0, // 'elements' is the first field
+                    array_name + ".elements.ptr");
+
+                // Load the elements pointer (T*)
+                llvm::Value *elements_array = create_load(elements_ptr,
+                                                          llvm::PointerType::get(element_type, 0),
+                                                          array_name + ".elements.load");
+
+                // Return address of elements_array[index]
+                return builder().CreateGEP(
+                    element_type,
+                    elements_array,
+                    index_val,
+                    "elem.ptr");
+            }
+
+            // Try to get the alloca directly for traditional stack-allocated arrays
+            if (llvm::AllocaInst *alloca = values().get_alloca(array_name))
+            {
+                llvm::Type *allocated_type = alloca->getAllocatedType();
+
+                // Check if it's an array type
+                if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(allocated_type))
+                {
+                    array_ptr = alloca;
+                    element_type = arr_type->getElementType();
+                }
+            }
+        }
+
+        // If we didn't find a stack array, use the standard path
+        if (!array_ptr)
+        {
+            // Generate array expression
+            array_ptr = generate(node->array());
+            if (!array_ptr)
+            {
+                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                             "Failed to generate array expression");
+                return nullptr;
+            }
+
+            // Get element type
+            if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(array_ptr->getType()))
+            {
+                element_type = arr_type->getElementType();
+            }
+            else
+            {
+                // Assume pointer to elements
+                element_type = llvm::Type::getInt8Ty(llvm_ctx()); // Default
+            }
         }
 
         // Generate index expression
@@ -698,20 +1002,25 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Get element type
-        llvm::Type *element_type = nullptr;
-        if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(array_val->getType()))
+        // For stack-allocated arrays, we need to use InBoundsGEP with proper indices
+        if (llvm::isa<llvm::AllocaInst>(array_ptr) &&
+            llvm::isa<llvm::ArrayType>(static_cast<llvm::AllocaInst *>(array_ptr)->getAllocatedType()))
         {
-            element_type = arr_type->getElementType();
+            // For stack arrays, we need [0, index] indices
+            std::vector<llvm::Value *> indices = {
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                index_val};
+            return builder().CreateInBoundsGEP(
+                static_cast<llvm::AllocaInst *>(array_ptr)->getAllocatedType(),
+                array_ptr,
+                indices,
+                "elem.ptr");
         }
         else
         {
-            // Assume pointer to elements
-            element_type = llvm::Type::getInt8Ty(llvm_ctx()); // Default
+            // For pointer arrays, use single index
+            return create_array_gep(element_type, array_ptr, index_val, "elem.ptr");
         }
-
-        // Create GEP
-        return create_array_gep(element_type, array_val, index_val, "elem.ptr");
     }
 
     //===================================================================
@@ -1200,6 +1509,24 @@ namespace Cryo::Codegen
         }
 
         llvm::Type *elem_type = first_elem->getType();
+
+        // Check if this array literal is being used to initialize an Array<T> type
+        // by looking at the context or expected type
+        Cryo::Type *resolved_type = node->get_resolved_type();
+        if (resolved_type)
+        {
+            std::string type_name = resolved_type->to_string();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Array literal resolved type: {}", type_name);
+
+            // Check if this is an Array<T> type (syntactic sugar for u64[], i32[], etc.)
+            if (type_name.find("Array<") == 0 || type_name.find("[]") != std::string::npos)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Detected Array<T> type, generating Array constructor call");
+                return generate_array_constructor_call(node, elements, elem_type);
+            }
+        }
+
+        // Fallback to traditional C-style array for non-Array<T> types
         llvm::ArrayType *array_type = llvm::ArrayType::get(elem_type, elements.size());
 
         // Allocate array on stack
@@ -1229,6 +1556,92 @@ namespace Cryo::Codegen
         }
 
         return array_alloca;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_array_constructor_call(Cryo::ArrayLiteralNode *node,
+                                                                    const std::vector<std::unique_ptr<Cryo::ExpressionNode>> &elements,
+                                                                    llvm::Type *elem_type)
+    {
+        // Add basic debug output that will definitely show up
+        std::string type_str;
+        llvm::raw_string_ostream rso(type_str);
+        elem_type->print(rso);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating Array<T> constructor call");
+
+        // First, create a traditional C-style array to hold the elements
+        llvm::ArrayType *raw_array_type = llvm::ArrayType::get(elem_type, elements.size());
+        llvm::AllocaInst *elements_array = create_entry_alloca(raw_array_type, "array.elements");
+
+        // Store each element in the raw array
+        for (size_t i = 0; i < elements.size(); ++i)
+        {
+            llvm::Value *elem_val = generate(elements[i].get());
+            if (!elem_val)
+            {
+                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                             "Failed to generate array element at index " + std::to_string(i));
+                return nullptr;
+            }
+
+            // Cast if needed
+            elem_val = cast_if_needed(elem_val, elem_type);
+
+            // Get pointer to element
+            llvm::Value *indices[] = {
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
+            llvm::Value *elem_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, indices,
+                                                                "elem." + std::to_string(i) + ".ptr");
+            builder().CreateStore(elem_val, elem_ptr);
+        }
+
+        // Get Array<T> struct type
+        Cryo::Type *resolved_type = node->get_resolved_type();
+        if (!resolved_type)
+        {
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node, "No resolved Array<T> type");
+            return nullptr;
+        }
+
+        llvm::Type *array_struct_type = get_llvm_type(resolved_type);
+        if (!array_struct_type)
+        {
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node, "Failed to get LLVM Array<T> struct type");
+            return nullptr;
+        }
+
+        // Create Array<T> instance
+        llvm::AllocaInst *array_instance = create_entry_alloca(array_struct_type, "array.instance");
+
+        // Get pointer to the raw array data (elements field)
+        llvm::Value *array_data_indices[] = {
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0)};
+        llvm::Value *array_data_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, array_data_indices, "array.data.ptr");
+
+        // Set elements field (field 0)
+        if (llvm::StructType *struct_type = llvm::dyn_cast<llvm::StructType>(array_struct_type))
+        {
+            llvm::Value *elements_field_ptr = builder().CreateStructGEP(struct_type, array_instance, 0, "elements.ptr");
+            builder().CreateStore(array_data_ptr, elements_field_ptr);
+
+            // Set length field (field 1)
+            llvm::Value *length_field_ptr = builder().CreateStructGEP(struct_type, array_instance, 1, "length.ptr");
+            llvm::Value *length_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), elements.size());
+            builder().CreateStore(length_val, length_field_ptr);
+
+            // Set capacity field (field 2) - same as length for array literals
+            llvm::Value *capacity_field_ptr = builder().CreateStructGEP(struct_type, array_instance, 2, "capacity.ptr");
+            builder().CreateStore(length_val, capacity_field_ptr);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Created Array<T> instance with {} elements", elements.size());
+            return array_instance;
+        }
+        else
+        {
+            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node, "Array<T> type is not a struct type");
+            return nullptr;
+        }
     }
 
     llvm::Value *ExpressionCodegen::generate_struct_literal(Cryo::StructLiteralNode *node)
