@@ -823,6 +823,84 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Handle Array<T> type class (when kind is Struct/Generic, not Array)
+            // This handles cases where the resolved type is "Array<u64>" from the type class
+            if (resolved_type && resolved_type->kind() != TypeKind::Array)
+            {
+                std::string type_name = resolved_type->to_string();
+                if (type_name.find("Array<") == 0 || type_name.find("[]") != std::string::npos)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "*** Detected Array<T> type class (kind: {}) for variable: {}",
+                              static_cast<int>(resolved_type->kind()), array_name);
+
+                    // Get the alloca - it should be the Array<T> struct type
+                    llvm::AllocaInst *array_alloca = values().get_alloca(array_name);
+                    if (array_alloca)
+                    {
+                        llvm::Type *alloca_type = array_alloca->getAllocatedType();
+                        if (alloca_type && alloca_type->isStructTy())
+                        {
+                            llvm::StructType *struct_type = llvm::cast<llvm::StructType>(alloca_type);
+
+                            // Try to determine element type from the type name
+                            // For "Array<u64>", extract "u64" and map it
+                            llvm::Type *elem_type = nullptr;
+                            size_t start = type_name.find('<');
+                            size_t end = type_name.rfind('>');
+                            if (start != std::string::npos && end != std::string::npos && end > start)
+                            {
+                                std::string elem_type_name = type_name.substr(start + 1, end - start - 1);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Extracted element type name: {}", elem_type_name);
+
+                                // Map common type names to LLVM types
+                                if (elem_type_name == "u64" || elem_type_name == "i64")
+                                    elem_type = llvm::Type::getInt64Ty(llvm_ctx());
+                                else if (elem_type_name == "u32" || elem_type_name == "i32")
+                                    elem_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                else if (elem_type_name == "u16" || elem_type_name == "i16")
+                                    elem_type = llvm::Type::getInt16Ty(llvm_ctx());
+                                else if (elem_type_name == "u8" || elem_type_name == "i8")
+                                    elem_type = llvm::Type::getInt8Ty(llvm_ctx());
+                                else if (elem_type_name == "f64")
+                                    elem_type = llvm::Type::getDoubleTy(llvm_ctx());
+                                else if (elem_type_name == "f32")
+                                    elem_type = llvm::Type::getFloatTy(llvm_ctx());
+                                else if (elem_type_name == "bool" || elem_type_name == "boolean")
+                                    elem_type = llvm::Type::getInt1Ty(llvm_ctx());
+                            }
+
+                            if (elem_type)
+                            {
+                                // Generate index expression
+                                llvm::Value *index_val = generate(node->index());
+                                if (index_val)
+                                {
+                                    if (!index_val->getType()->isIntegerTy())
+                                        index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+
+                                    // Access elements field (field 0) of Array<T> struct
+                                    llvm::Value *elements_ptr = builder().CreateStructGEP(
+                                        struct_type, array_alloca, 0, array_name + ".elements.ptr");
+
+                                    llvm::Value *elements_array = create_load(elements_ptr,
+                                                                              llvm::PointerType::get(elem_type, 0),
+                                                                              array_name + ".elements.load");
+
+                                    llvm::Value *element_ptr = builder().CreateGEP(
+                                        elem_type, elements_array, index_val, "elem.ptr");
+
+                                    llvm::Value *result = create_load(element_ptr, elem_type, "elem.load");
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "*** Array<T> type class element loaded successfully");
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Additional logging for debugging
             if (!resolved_type)
             {
