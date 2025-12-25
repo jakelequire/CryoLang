@@ -333,7 +333,25 @@ namespace Cryo::Codegen
         // Check if already exists
         if (llvm::GlobalVariable *existing = module()->getGlobalVariable(name))
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Global variable already exists: {}", name);
+            // If it exists but is just an external declaration (no initializer),
+            // we should update it with the actual initializer
+            if (!existing->hasInitializer() && node->initializer())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Global '{}' exists as external declaration, adding initializer", name);
+
+                // Generate initializer
+                llvm::Constant *initializer = generate_global_initializer(node, existing->getValueType());
+                if (initializer)
+                {
+                    existing->setInitializer(initializer);
+                    existing->setConstant(!node->is_mutable());
+                }
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Global variable already exists: {}", name);
+            }
             return existing;
         }
 
