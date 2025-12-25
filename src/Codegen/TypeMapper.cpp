@@ -691,7 +691,22 @@ namespace Cryo::Codegen
         }
 
         std::string name = type->get_instantiated_name();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_parameterized - {}", name);
+        std::string base_name = type->base_name();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_parameterized - {} (base: {})", name, base_name);
+
+        // Handle built-in parameterized types specially
+        if (base_name == "Array" && !type->type_parameters().empty())
+        {
+            // Array<T> is represented as a pointer to T (dynamic array)
+            // For fixed-size arrays, use the ArrayType directly
+            Type *elem_type = type->type_parameters()[0].get();
+            llvm::Type *llvm_elem = map(elem_type);
+            if (llvm_elem)
+            {
+                // Dynamic arrays are represented as pointers
+                return llvm::PointerType::get(llvm_elem, 0);
+            }
+        }
 
         // Check if it's a parameterized enum (Option, Result, etc.)
         auto *enum_type = dynamic_cast<ParameterizedEnumType *>(type);
