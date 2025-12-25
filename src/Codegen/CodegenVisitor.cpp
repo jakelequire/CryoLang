@@ -177,6 +177,56 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ProgramNode with {} statements",
                   node.statements().size());
 
+        // DIAGNOSTIC: Dump all statement types
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== DIAGNOSTIC: Statement types in ProgramNode ===");
+        int stmt_idx = 0;
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  [{}] nullptr", stmt_idx++);
+                continue;
+            }
+            std::string type_name = "Unknown";
+            if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()))
+                type_name = "EnumDeclarationNode";
+            else if (dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()))
+                type_name = "StructDeclarationNode";
+            else if (dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()))
+                type_name = "ClassDeclarationNode";
+            else if (auto *var = dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
+                type_name = "VariableDeclarationNode(" + var->name() + ")";
+            else if (auto *fn = dynamic_cast<Cryo::FunctionDeclarationNode *>(stmt.get()))
+                type_name = "FunctionDeclarationNode(" + fn->name() + ")";
+            else if (dynamic_cast<Cryo::ImplementationBlockNode *>(stmt.get()))
+                type_name = "ImplementationBlockNode";
+            else if (dynamic_cast<Cryo::ExternBlockNode *>(stmt.get()))
+                type_name = "ExternBlockNode";
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                type_name = "DeclarationStatementNode";
+                if (decl_stmt->declaration())
+                {
+                    if (dynamic_cast<Cryo::EnumDeclarationNode *>(decl_stmt->declaration()))
+                        type_name += "(EnumDeclarationNode)";
+                    else if (dynamic_cast<Cryo::StructDeclarationNode *>(decl_stmt->declaration()))
+                        type_name += "(StructDeclarationNode)";
+                    else if (dynamic_cast<Cryo::ClassDeclarationNode *>(decl_stmt->declaration()))
+                        type_name += "(ClassDeclarationNode)";
+                    else if (auto *inner_var = dynamic_cast<Cryo::VariableDeclarationNode *>(decl_stmt->declaration()))
+                        type_name += "(VariableDeclarationNode:" + inner_var->name() + ")";
+                    else if (auto *inner_fn = dynamic_cast<Cryo::FunctionDeclarationNode *>(decl_stmt->declaration()))
+                        type_name += "(FunctionDeclarationNode:" + inner_fn->name() + ")";
+                    else
+                        type_name += "(other)";
+                }
+            }
+            else if (dynamic_cast<Cryo::ImportDeclarationNode *>(stmt.get()))
+                type_name = "ImportDeclarationNode";
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  [{}] {}", stmt_idx++, type_name);
+        }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== END DIAGNOSTIC ===");
+
         // Multi-pass processing to ensure proper dependency order
 
         // Pass 0: Process all enum declarations first (for enum variant resolution)
@@ -234,6 +284,14 @@ namespace Cryo::Codegen
         }
 
         // Pass 2: Process all global variable/constant declarations (for identifier resolution)
+        // IMPORTANT: Clear any insert point to ensure globals are detected as global, not local
+        llvm::BasicBlock *prev_block = _ctx->builder().GetInsertBlock();
+        if (prev_block)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Clearing stale insert block: {}",
+                      prev_block->getName().str());
+            _ctx->builder().ClearInsertionPoint();
+        }
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Processing global variable/constant declarations");
         int var_count = 0;
         for (const auto &stmt : node.statements())
