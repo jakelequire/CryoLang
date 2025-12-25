@@ -288,8 +288,19 @@ namespace Cryo::Codegen
             return existing;
         }
 
-        // Get variable type
-        llvm::Type *var_type = get_llvm_type(node->get_resolved_type());
+        // Get variable type from the AST node's resolved type
+        Cryo::Type *cryo_type = node->get_resolved_type();
+        if (!cryo_type)
+        {
+            report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
+                         "No resolved type for global variable: " + name);
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Global '{}' has Cryo type: {}",
+                  name, cryo_type->to_string());
+
+        llvm::Type *var_type = get_llvm_type(cryo_type);
         if (!var_type)
         {
             report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
@@ -297,8 +308,33 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Log the LLVM type for debugging
+        std::string type_str;
+        llvm::raw_string_ostream rso(type_str);
+        var_type->print(rso);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Global '{}' LLVM type: {}",
+                  name, type_str);
+
         // Generate initializer
         llvm::Constant *initializer = generate_global_initializer(node, var_type);
+
+        // Log the initializer type for debugging
+        if (initializer)
+        {
+            std::string init_type_str;
+            llvm::raw_string_ostream init_rso(init_type_str);
+            initializer->getType()->print(init_rso);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Global '{}' initializer type: {}",
+                      name, init_type_str);
+
+            // Verify type match before creating global
+            if (initializer->getType() != var_type)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: TYPE MISMATCH for global '{}': var_type vs init_type",
+                          name);
+            }
+        }
 
         // Create global variable
         bool is_constant = !node->is_mutable();

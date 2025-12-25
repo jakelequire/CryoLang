@@ -381,21 +381,33 @@ namespace Cryo::Codegen
 
     llvm::Value *ExpressionCodegen::lookup_variable(const std::string &name)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Looking for '{}'", name);
+
         // Try alloca first
         if (llvm::AllocaInst *alloca = values().get_alloca(name))
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' as alloca", name);
             return alloca;
         }
 
         // Try value context
         if (llvm::Value *value = values().get_value(name))
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' in value context", name);
             return value;
         }
 
-        // Try global variable
+        // Try global value context (set_global_value uses different storage)
+        if (llvm::Value *global_val = values().get_global_value(name))
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' in global value context", name);
+            return global_val;
+        }
+
+        // Try global variable from module
         if (llvm::GlobalVariable *global = module()->getGlobalVariable(name))
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' as module global", name);
             return global;
         }
 
