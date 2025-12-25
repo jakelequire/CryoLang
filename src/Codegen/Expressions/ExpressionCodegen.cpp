@@ -670,6 +670,51 @@ namespace Cryo::Codegen
                 // Check if this ArrayType maps to a struct (Array<T> class) or native LLVM array
                 llvm::Type *array_llvm_type = get_llvm_type(resolved_type);
 
+                // Debug: Log what type we got
+                if (array_llvm_type)
+                {
+                    std::string llvm_type_str;
+                    llvm::raw_string_ostream rso(llvm_type_str);
+                    array_llvm_type->print(rso);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "*** Array<T> LLVM type: {}, isStructTy: {}, isArrayTy: {}, isPointerTy: {}",
+                              llvm_type_str,
+                              array_llvm_type->isStructTy() ? "true" : "false",
+                              array_llvm_type->isArrayTy() ? "true" : "false",
+                              array_llvm_type->isPointerTy() ? "true" : "false");
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> LLVM type is NULL - using direct struct access");
+
+                    // Even if get_llvm_type fails, we know this is an Array<T> type
+                    // Try to get the alloca and use the known Array<T> struct layout
+                    llvm::AllocaInst *array_alloca = values().get_alloca(array_name);
+                    if (array_alloca)
+                    {
+                        llvm::Type *alloca_type = array_alloca->getAllocatedType();
+                        if (alloca_type && alloca_type->isStructTy())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Using alloca type for Array<T> struct access");
+                            llvm::StructType *struct_type = llvm::cast<llvm::StructType>(alloca_type);
+
+                            llvm::Value *elements_ptr = builder().CreateStructGEP(
+                                struct_type, array_alloca, 0, array_name + ".elements.ptr");
+
+                            llvm::Value *elements_array = create_load(elements_ptr,
+                                                                      llvm::PointerType::get(element_type, 0),
+                                                                      array_name + ".elements.load");
+
+                            llvm::Value *element_ptr = builder().CreateGEP(
+                                element_type, elements_array, index_val, "elem.ptr");
+
+                            llvm::Value *result = create_load(element_ptr, element_type, "elem.load");
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> element loaded via alloca type");
+                            return result;
+                        }
+                    }
+                }
+
                 if (array_llvm_type && array_llvm_type->isStructTy())
                 {
                     // This is an Array<T> class (struct with elements field)
