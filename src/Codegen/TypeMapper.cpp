@@ -540,13 +540,13 @@ namespace Cryo::Codegen
 
         // Create the Array<T> struct type: { T* elements, u64 length, u64 capacity }
         std::vector<llvm::Type *> fields = {
-            llvm::PointerType::get(_ctx.get_context(), 0), // elements: T* (opaque pointer)
-            llvm::Type::getInt64Ty(_ctx.get_context()),    // length: u64
-            llvm::Type::getInt64Ty(_ctx.get_context())     // capacity: u64
+            llvm::PointerType::get(llvm_ctx(), 0), // elements: T* (opaque pointer)
+            llvm::Type::getInt64Ty(llvm_ctx()),    // length: u64
+            llvm::Type::getInt64Ty(llvm_ctx())     // capacity: u64
         };
 
         llvm::StructType *array_struct = llvm::StructType::create(
-            _ctx.get_context(), fields, array_struct_name);
+            llvm_ctx(), fields, array_struct_name);
 
         // Cache it for future use
         _struct_cache[array_struct_name] = array_struct;
