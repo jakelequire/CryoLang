@@ -725,8 +725,39 @@ namespace Cryo::Codegen
         // If there's an initializer, try to evaluate it
         if (node->initializer())
         {
-            // For simple cases, we can evaluate at compile time
-            // Complex cases would need constant folding
+            // Visit the initializer expression to get its value
+            CodegenVisitor *visitor = ctx().visitor();
+            if (visitor)
+            {
+                node->initializer()->accept(*visitor);
+                llvm::Value *val = get_result();
+                if (auto *constant = llvm::dyn_cast<llvm::Constant>(val))
+                {
+                    // Cast to target type if needed
+                    if (constant->getType() != type)
+                    {
+                        // Handle integer to integer casts
+                        if (constant->getType()->isIntegerTy() && type->isIntegerTy())
+                        {
+                            return llvm::ConstantExpr::getIntegerCast(constant, type, true);
+                        }
+                        // Handle float to float casts
+                        if (constant->getType()->isFloatingPointTy() && type->isFloatingPointTy())
+                        {
+                            return llvm::ConstantExpr::getFPCast(constant, type);
+                        }
+                        // For other cases, just use the constant as-is and let LLVM handle it
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "Global initializer type mismatch for '{}', may cause issues",
+                                 node->name());
+                    }
+                    return constant;
+                }
+                // If not a constant, log a warning
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "Global initializer for '{}' is not a compile-time constant, using zero",
+                         node->name());
+            }
         }
 
         // Default to zero initializer

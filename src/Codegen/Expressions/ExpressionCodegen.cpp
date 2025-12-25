@@ -225,6 +225,13 @@ namespace Cryo::Codegen
             return create_load(alloca, loaded_type, name + ".load");
         }
 
+        // If it's a global variable, load the value
+        if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(value))
+        {
+            llvm::Type *loaded_type = global->getValueType();
+            return create_load(global, loaded_type, name + ".load");
+        }
+
         return value;
     }
 
