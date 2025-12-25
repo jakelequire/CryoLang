@@ -753,12 +753,30 @@ namespace Cryo::Codegen
                         // Handle integer to integer casts
                         if (constant->getType()->isIntegerTy() && type->isIntegerTy())
                         {
-                            return llvm::ConstantExpr::getIntegerCast(constant, type, true);
+                            if (auto constInt = llvm::dyn_cast<llvm::ConstantInt>(constant))
+                            {
+                                llvm::IntegerType *dstIntTy = llvm::cast<llvm::IntegerType>(type);
+                                return llvm::ConstantInt::get(dstIntTy, constInt->getValue());
+                            }
+                            // Fallback: use bitcast or return as-is
+                            return constant;
                         }
                         // Handle float to float casts
                         if (constant->getType()->isFloatingPointTy() && type->isFloatingPointTy())
                         {
-                            return llvm::ConstantExpr::getFPCast(constant, type);
+                            if (auto constFP = llvm::dyn_cast<llvm::ConstantFP>(constant))
+                            {
+                                if (type->isFloatTy())
+                                {
+                                    return llvm::ConstantFP::get(type, constFP->getValueAPF().convertToFloat());
+                                }
+                                else if (type->isDoubleTy())
+                                {
+                                    return llvm::ConstantFP::get(type, constFP->getValueAPF().convertToDouble());
+                                }
+                            }
+                            // Fallback: use bitcast or return as-is
+                            return constant;
                         }
                         // For other cases, just use the constant as-is and let LLVM handle it
                         LOG_WARN(Cryo::LogComponent::CODEGEN,
