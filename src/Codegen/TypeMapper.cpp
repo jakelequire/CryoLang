@@ -718,15 +718,36 @@ namespace Cryo::Codegen
         // Handle built-in parameterized types specially
         if (base_name == "Array" && !type->type_parameters().empty())
         {
-            // Array<T> is represented as a pointer to T (dynamic array)
-            // For fixed-size arrays, use the ArrayType directly
+            // Array<T> should be represented as the Array<T> struct type: {ptr, i64, i64}
+            // This matches how map_array() handles TypeKind::Array
             Type *elem_type = type->type_parameters()[0].get();
-            llvm::Type *llvm_elem = map(elem_type);
-            if (llvm_elem)
+            std::string array_struct_name = "Array<" + (elem_type ? elem_type->to_string() : "unknown") + ">";
+
+            // Check if we already have this struct type cached
+            auto it = _struct_cache.find(array_struct_name);
+            if (it != _struct_cache.end())
             {
-                // Dynamic arrays are represented as pointers
-                return llvm::PointerType::get(llvm_elem, 0);
+                return it->second;
             }
+
+            // Create the Array<T> struct type: { T* elements, u64 length, u64 capacity }
+            std::vector<llvm::Type *> fields = {
+                llvm::PointerType::get(llvm_ctx(), 0), // elements: T* (opaque pointer)
+                llvm::Type::getInt64Ty(llvm_ctx()),    // length: u64
+                llvm::Type::getInt64Ty(llvm_ctx())     // capacity: u64
+            };
+
+            llvm::StructType *array_struct = llvm::StructType::create(
+                llvm_ctx(), fields, array_struct_name);
+
+            // Cache it for future use
+            _struct_cache[array_struct_name] = array_struct;
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "TypeMapper: Created Array<{}> struct type for parameterized Array type",
+                      elem_type ? elem_type->to_string() : "unknown");
+
+            return array_struct;
         }
 
         // Check if it's a parameterized enum (Option, Result, etc.)
