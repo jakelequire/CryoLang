@@ -185,9 +185,19 @@ namespace Cryo::Codegen
         {
             if (!stmt)
                 continue;
+            // Check for direct EnumDeclarationNode
             if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()))
             {
                 stmt->accept(*this);
+            }
+            // Also check for DeclarationStatementNode wrapping an EnumDeclarationNode
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                if (decl_stmt->declaration() &&
+                    dynamic_cast<Cryo::EnumDeclarationNode *>(decl_stmt->declaration()))
+                {
+                    stmt->accept(*this);
+                }
             }
         }
 
@@ -197,10 +207,21 @@ namespace Cryo::Codegen
         {
             if (!stmt)
                 continue;
+            // Check for direct StructDeclarationNode or ClassDeclarationNode
             if (dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()) ||
                 dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()))
             {
                 stmt->accept(*this);
+            }
+            // Also check for DeclarationStatementNode wrapping a struct/class
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                if (decl_stmt->declaration() &&
+                    (dynamic_cast<Cryo::StructDeclarationNode *>(decl_stmt->declaration()) ||
+                     dynamic_cast<Cryo::ClassDeclarationNode *>(decl_stmt->declaration())))
+                {
+                    stmt->accept(*this);
+                }
             }
         }
 
@@ -210,9 +231,19 @@ namespace Cryo::Codegen
         {
             if (!stmt)
                 continue;
-            if (auto *var_decl = dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
+            // Check for direct VariableDeclarationNode
+            if (dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
             {
                 stmt->accept(*this);
+            }
+            // Also check for DeclarationStatementNode wrapping a VariableDeclarationNode
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                if (decl_stmt->declaration() &&
+                    dynamic_cast<Cryo::VariableDeclarationNode *>(decl_stmt->declaration()))
+                {
+                    stmt->accept(*this);
+                }
             }
         }
 
@@ -222,13 +253,25 @@ namespace Cryo::Codegen
         {
             if (!stmt)
                 continue;
-            // Skip already processed types
+            // Skip already processed types (direct declarations)
             if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()) ||
                 dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()) ||
                 dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()) ||
                 dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
             {
                 continue;
+            }
+            // Skip DeclarationStatementNode wrapping already-processed declaration types
+            if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                auto *inner = decl_stmt->declaration();
+                if (inner && (dynamic_cast<Cryo::EnumDeclarationNode *>(inner) ||
+                              dynamic_cast<Cryo::StructDeclarationNode *>(inner) ||
+                              dynamic_cast<Cryo::ClassDeclarationNode *>(inner) ||
+                              dynamic_cast<Cryo::VariableDeclarationNode *>(inner)))
+                {
+                    continue;
+                }
             }
             stmt->accept(*this);
         }
