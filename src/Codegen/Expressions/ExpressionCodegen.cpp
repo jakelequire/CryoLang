@@ -411,29 +411,26 @@ namespace Cryo::Codegen
             return global;
         }
 
-        // Try with current namespace prefix
-        std::string current_ns = ctx().namespace_context();
-        if (!current_ns.empty())
-        {
-            std::string qualified = current_ns + "::" + name;
-            if (llvm::GlobalVariable *global = module()->getGlobalVariable(qualified))
-            {
-                return global;
-            }
-        }
+        // Use SRM to generate all possible name candidates
+        // This handles: current namespace, imported namespaces, aliases, global scope
+        auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Variable);
 
-        // Try common namespace prefixes (for constants from runtime, core, etc.)
-        static const std::vector<std::string> common_namespaces = {
-            "std::Runtime::", "std::core::", "std::IO::", "Runtime::"};
-
-        for (const auto &ns : common_namespaces)
+        for (const auto &candidate : candidates)
         {
-            std::string ns_qualified = ns + name;
-            if (llvm::GlobalVariable *global = module()->getGlobalVariable(ns_qualified))
+            // Try global variable with this candidate name
+            if (llvm::GlobalVariable *global = module()->getGlobalVariable(candidate))
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "lookup_variable: Found '{}' in namespace -> '{}'", name, ns_qualified);
+                          "lookup_variable: Found '{}' as '{}'", name, candidate);
                 return global;
+            }
+
+            // Try global value context with this candidate name
+            if (llvm::Value *global_val = values().get_global_value(candidate))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "lookup_variable: Found '{}' in global values as '{}'", name, candidate);
+                return global_val;
             }
         }
 
