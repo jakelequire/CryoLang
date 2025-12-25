@@ -228,6 +228,12 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== END DIAGNOSTIC ===");
 
         // Multi-pass processing to ensure proper dependency order
+        // Order is critical:
+        //   Pass 0: Enums (so enum variants can be used in types and code)
+        //   Pass 1: Struct/Class TYPES only (so types can be used for globals and parameters)
+        //   Pass 2: Global variables (so they can be used in struct methods and functions)
+        //   Pass 3: Struct/Class METHOD BODIES (now globals are available)
+        //   Pass 4: Functions, impl blocks, etc.
 
         // Pass 0: Process all enum declarations first (for enum variant resolution)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processing enum declarations");
@@ -259,8 +265,10 @@ namespace Cryo::Codegen
         }
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processed {} enum declarations", enum_count);
 
-        // Pass 1: Process all struct/class type declarations (for type resolution)
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing struct/class type declarations");
+        // Pass 1: Generate struct/class TYPES only (NOT method bodies yet)
+        // This allows globals to reference struct types, and struct methods to reference globals
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing struct/class TYPE declarations (types only, no method bodies)");
+        _defer_method_generation = true; // Flag to skip method body generation
         for (const auto &stmt : node.statements())
         {
             if (!stmt)
@@ -282,6 +290,7 @@ namespace Cryo::Codegen
                 }
             }
         }
+        _defer_method_generation = false;
 
         // Pass 2: Process all global variable/constant declarations (for identifier resolution)
         // IMPORTANT: Clear any insert point to ensure globals are detected as global, not local
@@ -321,8 +330,34 @@ namespace Cryo::Codegen
         }
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Processed {} global variable declarations", var_count);
 
-        // Pass 3: Process remaining declarations (functions, impl blocks, extern blocks, etc.)
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 3: Processing remaining declarations");
+        // Pass 3: Generate struct/class METHOD BODIES (now globals are available)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 3: Processing struct/class method bodies");
+        _generate_method_bodies_only = true; // Flag to only generate method bodies, skip type generation
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            // Check for direct StructDeclarationNode or ClassDeclarationNode
+            if (dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()) ||
+                dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()))
+            {
+                stmt->accept(*this);
+            }
+            // Also check for DeclarationStatementNode wrapping a struct/class
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                if (decl_stmt->declaration() &&
+                    (dynamic_cast<Cryo::StructDeclarationNode *>(decl_stmt->declaration()) ||
+                     dynamic_cast<Cryo::ClassDeclarationNode *>(decl_stmt->declaration())))
+                {
+                    stmt->accept(*this);
+                }
+            }
+        }
+        _generate_method_bodies_only = false;
+
+        // Pass 4: Process remaining declarations (functions, impl blocks, extern blocks, etc.)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 4: Processing remaining declarations (functions, impl blocks, etc.)");
         for (const auto &stmt : node.statements())
         {
             if (!stmt)
@@ -400,7 +435,8 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::StructDeclarationNode &node)
     {
         NodeTracker tracker(*_ctx, &node);
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting StructDeclarationNode: {}", node.name());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting StructDeclarationNode: {} (defer_methods={}, methods_only={})",
+                  node.name(), _defer_method_generation, _generate_method_bodies_only);
 
         // Check if this is a generic struct template
         if (!node.generic_parameters().empty())
@@ -415,8 +451,20 @@ namespace Cryo::Codegen
             return;
         }
 
-        // Generate the struct type
-        _types->generate_struct(&node);
+        // Pass 1: Generate struct TYPE only (when _defer_method_generation is true)
+        if (!_generate_method_bodies_only)
+        {
+            // Generate the struct type
+            _types->generate_struct(&node);
+        }
+
+        // If we're in "type only" mode, skip method generation
+        if (_defer_method_generation)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Deferring method generation for struct {}", node.name());
+            return;
+        }
 
         // Generate struct methods if any are defined inline
         if (!node.methods().empty())
@@ -456,7 +504,8 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::ClassDeclarationNode &node)
     {
         NodeTracker tracker(*_ctx, &node);
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ClassDeclarationNode: {}", node.name());
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ClassDeclarationNode: {} (defer_methods={}, methods_only={})",
+                  node.name(), _defer_method_generation, _generate_method_bodies_only);
 
         // Check if this is a generic class template
         if (!node.generic_parameters().empty())
@@ -471,8 +520,20 @@ namespace Cryo::Codegen
             return;
         }
 
-        // Generate the class type (struct layout)
-        _types->generate_class(&node);
+        // Pass 1: Generate class TYPE only (when _defer_method_generation is true)
+        if (!_generate_method_bodies_only)
+        {
+            // Generate the class type (struct layout)
+            _types->generate_class(&node);
+        }
+
+        // If we're in "type only" mode, skip method generation
+        if (_defer_method_generation)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Deferring method generation for class {}", node.name());
+            return;
+        }
 
         // Generate class methods (unlike structs, class methods are defined inline)
         if (!node.methods().empty())
@@ -488,7 +549,7 @@ namespace Cryo::Codegen
             // Two-pass approach: First generate all method declarations (forward references)
             // This ensures that methods can call other methods defined later in the class
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Pass 1: Generating method declarations for class {}", node.name());
+                      "Generating method declarations for class {}", node.name());
 
             for (const auto &method : node.methods())
             {
@@ -500,7 +561,7 @@ namespace Cryo::Codegen
 
             // Second pass: Generate method bodies
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Pass 2: Generating method bodies for class {}", node.name());
+                      "Generating method bodies for class {}", node.name());
 
             for (const auto &method : node.methods())
             {
