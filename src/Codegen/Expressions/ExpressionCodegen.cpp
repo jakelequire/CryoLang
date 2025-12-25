@@ -638,18 +638,6 @@ namespace Cryo::Codegen
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Detected Array<{}> access for variable: {}", element_type_name, array_name);
 
-                // This is an Array<T> type (like u64[] which is Array<u64>)
-                // We need to access the 'elements' field first: arr[index] becomes arr.elements[index]
-
-                // Generate the Array<T> instance
-                llvm::Value *array_instance = generate(node->array());
-                if (!array_instance)
-                {
-                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                                 "Failed to generate Array<T> instance");
-                    return nullptr;
-                }
-
                 // Get the element type from the Cryo array type
                 element_type = get_llvm_type(cryo_array_type->element_type().get());
                 if (!element_type)
@@ -679,44 +667,115 @@ namespace Cryo::Codegen
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> index value generated successfully");
 
-                // Access the 'elements' field (first field in Array<T> struct)
-                // Get the Array<T> struct type from the Cryo type system
-                llvm::Type *array_struct_type = get_llvm_type(resolved_type);
-                if (!array_struct_type || !array_struct_type->isStructTy())
+                // Check if this ArrayType maps to a struct (Array<T> class) or native LLVM array
+                llvm::Type *array_llvm_type = get_llvm_type(resolved_type);
+
+                if (array_llvm_type && array_llvm_type->isStructTy())
                 {
-                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                                 "Array<T> does not map to a struct type");
-                    return nullptr;
+                    // This is an Array<T> class (struct with elements field)
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> is a struct type - accessing elements field");
+
+                    // Generate the Array<T> instance
+                    llvm::Value *array_instance = generate(node->array());
+                    if (!array_instance)
+                    {
+                        report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                     "Failed to generate Array<T> instance");
+                        return nullptr;
+                    }
+
+                    llvm::Value *elements_ptr = builder().CreateStructGEP(
+                        llvm::cast<llvm::StructType>(array_llvm_type),
+                        array_instance,
+                        0, // 'elements' is the first field
+                        array_name + ".elements.ptr");
+
+                    // Load the elements pointer (T*)
+                    llvm::Value *elements_array = create_load(elements_ptr,
+                                                              llvm::PointerType::get(element_type, 0),
+                                                              array_name + ".elements.load");
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> elements pointer loaded successfully");
+
+                    // Now do pointer arithmetic: elements_array[index]
+                    llvm::Value *element_ptr = builder().CreateGEP(
+                        element_type,
+                        elements_array,
+                        index_val,
+                        "elem.ptr");
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> element pointer created successfully");
+
+                    // Load and return the element value
+                    llvm::Value *result = create_load(element_ptr, element_type, "elem.load");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> element value loaded successfully, returning element");
+                    return result;
                 }
+                else if (array_llvm_type && array_llvm_type->isArrayTy())
+                {
+                    // This is a native LLVM array type (like [5 x i64])
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** ArrayType is native LLVM array - using direct array access");
 
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> struct type verified");
+                    // Get the alloca for the array
+                    llvm::AllocaInst *array_alloca = values().get_alloca(array_name);
+                    if (!array_alloca)
+                    {
+                        report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                     "Failed to find alloca for native array");
+                        return nullptr;
+                    }
 
-                llvm::Value *elements_ptr = builder().CreateStructGEP(
-                    llvm::cast<llvm::StructType>(array_struct_type),
-                    array_instance,
-                    0, // 'elements' is the first field
-                    array_name + ".elements.ptr");
+                    // For native arrays, use GEP with [0, index] to access element
+                    std::vector<llvm::Value *> indices = {
+                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0),
+                        index_val};
 
-                // Load the elements pointer (T*)
-                llvm::Value *elements_array = create_load(elements_ptr,
-                                                          llvm::PointerType::get(element_type, 0),
-                                                          array_name + ".elements.load");
+                    llvm::Value *element_ptr = builder().CreateInBoundsGEP(
+                        array_llvm_type,
+                        array_alloca,
+                        indices,
+                        "elem.ptr");
 
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> elements pointer loaded successfully");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Native array element pointer created successfully");
 
-                // Now do pointer arithmetic: elements_array[index]
-                llvm::Value *element_ptr = builder().CreateGEP(
-                    element_type,
-                    elements_array,
-                    index_val,
-                    "elem.ptr");
+                    // Load and return the element value
+                    llvm::Value *result = create_load(element_ptr, element_type, "elem.load");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Native array element value loaded successfully");
+                    return result;
+                }
+                else if (array_llvm_type && array_llvm_type->isPointerTy())
+                {
+                    // This is a dynamic array (pointer type like i64*)
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** ArrayType is pointer (dynamic array) - using pointer access");
 
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> element pointer created successfully");
+                    // Generate the array pointer value
+                    llvm::Value *array_ptr_val = generate(node->array());
+                    if (!array_ptr_val)
+                    {
+                        report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                     "Failed to generate array pointer");
+                        return nullptr;
+                    }
 
-                // Load and return the element value
-                llvm::Value *result = create_load(element_ptr, element_type, "elem.load");
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> element value loaded successfully, returning element");
-                return result;
+                    // For pointer arrays, use GEP with single index
+                    llvm::Value *element_ptr = builder().CreateGEP(
+                        element_type,
+                        array_ptr_val,
+                        index_val,
+                        "elem.ptr");
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Dynamic array element pointer created successfully");
+
+                    // Load and return the element value
+                    llvm::Value *result = create_load(element_ptr, element_type, "elem.load");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Dynamic array element value loaded successfully");
+                    return result;
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "*** ArrayType has unexpected LLVM type, falling through to generic handling");
+                }
             }
 
             // Additional logging for debugging
