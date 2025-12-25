@@ -831,14 +831,29 @@ namespace Cryo::Codegen
                 if (type_name.find("Array<") == 0 || type_name.find("[]") != std::string::npos)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "*** Detected Array<T> type class (kind: {}) for variable: {}",
-                              static_cast<int>(resolved_type->kind()), array_name);
+                              "*** Detected Array<T> type class (kind: {}) for variable: '{}', type_name: '{}'",
+                              static_cast<int>(resolved_type->kind()), array_name, type_name);
 
                     // Get the alloca - it should be the Array<T> struct type
                     llvm::AllocaInst *array_alloca = values().get_alloca(array_name);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "*** Array<T> type class: get_alloca('{}') returned: {}",
+                              array_name, array_alloca ? "valid" : "NULL");
+
                     if (array_alloca)
                     {
                         llvm::Type *alloca_type = array_alloca->getAllocatedType();
+                        std::string alloca_type_str = "NULL";
+                        if (alloca_type)
+                        {
+                            llvm::raw_string_ostream rso(alloca_type_str);
+                            alloca_type->print(rso);
+                        }
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "*** Array<T> type class: alloca type: {}, isStructTy: {}",
+                                  alloca_type_str,
+                                  (alloca_type && alloca_type->isStructTy()) ? "true" : "false");
+
                         if (alloca_type && alloca_type->isStructTy())
                         {
                             llvm::StructType *struct_type = llvm::cast<llvm::StructType>(alloca_type);
@@ -851,7 +866,7 @@ namespace Cryo::Codegen
                             if (start != std::string::npos && end != std::string::npos && end > start)
                             {
                                 std::string elem_type_name = type_name.substr(start + 1, end - start - 1);
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Extracted element type name: {}", elem_type_name);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Extracted element type name: '{}'", elem_type_name);
 
                                 // Map common type names to LLVM types
                                 if (elem_type_name == "u64" || elem_type_name == "i64")
@@ -868,10 +883,13 @@ namespace Cryo::Codegen
                                     elem_type = llvm::Type::getFloatTy(llvm_ctx());
                                 else if (elem_type_name == "bool" || elem_type_name == "boolean")
                                     elem_type = llvm::Type::getInt1Ty(llvm_ctx());
+                                else
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Unknown element type name: '{}'", elem_type_name);
                             }
 
                             if (elem_type)
                             {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Element type mapped successfully, generating index");
                                 // Generate index expression
                                 llvm::Value *index_val = generate(node->index());
                                 if (index_val)
@@ -895,6 +913,10 @@ namespace Cryo::Codegen
                                               "*** Array<T> type class element loaded successfully");
                                     return result;
                                 }
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Failed to map element type");
                             }
                         }
                     }
