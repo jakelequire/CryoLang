@@ -312,6 +312,10 @@ namespace Cryo::Codegen
             initializer,
             name);
 
+        // Register in value context for later lookup
+        values().set_value(name, nullptr, global);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Registered global variable: {}", name);
+
         return global;
     }
 

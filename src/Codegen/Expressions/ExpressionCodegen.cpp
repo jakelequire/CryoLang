@@ -1307,10 +1307,23 @@ namespace Cryo::Codegen
 
         // Try as enum variant
         auto &enum_variants = ctx().enum_variants_map();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Looking for enum variant: {} (map has {} entries)",
+                  qualified_name, enum_variants.size());
         auto it = enum_variants.find(qualified_name);
         if (it != enum_variants.end())
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Found enum variant: {}", qualified_name);
             return it->second;
+        }
+
+        // Log available variants for debugging
+        if (!enum_variants.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Available enum variants:");
+            for (const auto &[name, val] : enum_variants)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - {}", name);
+            }
         }
 
         report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
