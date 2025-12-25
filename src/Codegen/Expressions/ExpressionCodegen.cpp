@@ -495,24 +495,29 @@ namespace Cryo::Codegen
         std::string member_name = node->member();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating member access: {}", member_name);
 
-        // Get member address first
+        // First resolve the member info to get struct type and field index
+        llvm::StructType *struct_type = nullptr;
+        unsigned field_idx = 0;
+        if (!resolve_member_info(node->object(), member_name, struct_type, field_idx))
+        {
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
+                         "Cannot resolve member: " + member_name);
+            return nullptr;
+        }
+
+        // Get member address
         llvm::Value *member_ptr = generate_member_address(node);
         if (!member_ptr)
         {
             return nullptr;
         }
 
-        // Determine the type to load
-        llvm::StructType *struct_type = nullptr;
-        unsigned field_idx = 0;
-        if (resolve_member_info(node->object(), member_name, struct_type, field_idx))
-        {
-            llvm::Type *field_type = struct_type->getElementType(field_idx);
-            return create_load(member_ptr, field_type, member_name + ".load");
-        }
-
-        // Fallback: assume pointer type
-        return member_ptr;
+        // Load the field value using the resolved type information
+        llvm::Type *field_type = struct_type->getElementType(field_idx);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "ExpressionCodegen: Loading member '{}' with field type ID {}",
+                  member_name, field_type->getTypeID());
+        return create_load(member_ptr, field_type, member_name + ".load");
     }
 
     llvm::Value *ExpressionCodegen::generate_member_address(Cryo::MemberAccessNode *node)

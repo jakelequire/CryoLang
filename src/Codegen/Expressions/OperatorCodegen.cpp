@@ -619,8 +619,22 @@ namespace Cryo::Codegen
         if (!lhs || !rhs)
             return nullptr;
 
+        // Log type information for debugging
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "generate_comparison: lhs type = {}, rhs type = {}",
+                  lhs->getType()->getTypeID(), rhs->getType()->getTypeID());
+
         // Ensure compatible types
-        ensure_compatible_types(lhs, rhs);
+        if (!ensure_compatible_types(lhs, rhs))
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "generate_comparison: Types are incompatible and cannot be converted. "
+                      "lhs type ID = {}, rhs type ID = {}",
+                      lhs->getType()->getTypeID(), rhs->getType()->getTypeID());
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                         "Cannot compare values of incompatible types");
+            return nullptr;
+        }
 
         llvm::Type *type = lhs->getType();
 
@@ -1441,6 +1455,10 @@ namespace Cryo::Codegen
         llvm::Type *lhs_type = lhs->getType();
         llvm::Type *rhs_type = rhs->getType();
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "ensure_compatible_types: lhs type ID = {}, rhs type ID = {}",
+                  lhs_type->getTypeID(), rhs_type->getTypeID());
+
         if (lhs_type == rhs_type)
             return true;
 
@@ -1449,6 +1467,10 @@ namespace Cryo::Codegen
         {
             unsigned lhs_bits = lhs_type->getIntegerBitWidth();
             unsigned rhs_bits = rhs_type->getIntegerBitWidth();
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ensure_compatible_types: Integer promotion - lhs bits = {}, rhs bits = {}",
+                      lhs_bits, rhs_bits);
 
             if (lhs_bits < rhs_bits)
             {
@@ -1474,6 +1496,21 @@ namespace Cryo::Codegen
             }
             return true;
         }
+
+        // Pointer comparison (both should be pointers)
+        if (lhs_type->isPointerTy() && rhs_type->isPointerTy())
+        {
+            // Opaque pointers in LLVM 15+ are compatible
+            return true;
+        }
+
+        // Log detailed error for debugging
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                  "ensure_compatible_types: Cannot convert between incompatible types. "
+                  "lhs is integer: {}, lhs is pointer: {}, lhs is float: {}; "
+                  "rhs is integer: {}, rhs is pointer: {}, rhs is float: {}",
+                  lhs_type->isIntegerTy(), lhs_type->isPointerTy(), lhs_type->isFloatingPointTy(),
+                  rhs_type->isIntegerTy(), rhs_type->isPointerTy(), rhs_type->isFloatingPointTy());
 
         return false;
     }
