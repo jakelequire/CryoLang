@@ -673,7 +673,8 @@ namespace Cryo::Codegen
             return nullptr;
 
         std::string name = node->name();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating enum: {}", name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating enum: {} with {} variants",
+                  name, node->variants().size());
 
         // Simple enums are just integers
         llvm::Type *enum_type = llvm::Type::getInt32Ty(llvm_ctx());
@@ -688,8 +689,11 @@ namespace Cryo::Codegen
             std::string variant_name = name + "::" + variant->name();
             llvm::Constant *value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index++);
             ctx().register_enum_variant(variant_name, value);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered enum variant: {} = {}",
+                      variant_name, index - 1);
         }
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Finished generating enum: {}", name);
         return enum_type;
     }
 
