@@ -25,24 +25,87 @@ namespace Cryo::Codegen
 
     llvm::Value *ExpressionCodegen::generate_integer_literal(int64_t value, Cryo::Type *type)
     {
-        // Determine bit width
+        // Determine bit width and signedness
         unsigned bits = 32; // Default to i32
+        bool is_signed = true;
         if (type)
         {
             std::string type_name = type->to_string();
-            if (type_name == "i8" || type_name == "u8")
+            if (type_name == "i8")
+            {
                 bits = 8;
-            else if (type_name == "i16" || type_name == "u16")
+                is_signed = true;
+            }
+            else if (type_name == "u8")
+            {
+                bits = 8;
+                is_signed = false;
+            }
+            else if (type_name == "i16")
+            {
                 bits = 16;
-            else if (type_name == "i32" || type_name == "u32")
+                is_signed = true;
+            }
+            else if (type_name == "u16")
+            {
+                bits = 16;
+                is_signed = false;
+            }
+            else if (type_name == "i32")
+            {
                 bits = 32;
-            else if (type_name == "i64" || type_name == "u64")
+                is_signed = true;
+            }
+            else if (type_name == "u32")
+            {
+                bits = 32;
+                is_signed = false;
+            }
+            else if (type_name == "i64")
+            {
                 bits = 64;
-            else if (type_name == "i128" || type_name == "u128")
+                is_signed = true;
+            }
+            else if (type_name == "u64")
+            {
+                bits = 64;
+                is_signed = false;
+            }
+            else if (type_name == "i128")
+            {
+                bits = 128;
+                is_signed = true;
+            }
+            else if (type_name == "u128")
+            {
+                bits = 128;
+                is_signed = false;
+            }
+        }
+
+        return llvm::ConstantInt::get(get_int_type(bits), value, is_signed);
+    }
+
+    llvm::Value *ExpressionCodegen::generate_unsigned_integer_literal(uint64_t value, Cryo::Type *type)
+    {
+        // Determine bit width for unsigned types
+        unsigned bits = 64; // Default to u64 for large unsigned values
+        if (type)
+        {
+            std::string type_name = type->to_string();
+            if (type_name == "u8")
+                bits = 8;
+            else if (type_name == "u16")
+                bits = 16;
+            else if (type_name == "u32")
+                bits = 32;
+            else if (type_name == "u64")
+                bits = 64;
+            else if (type_name == "u128")
                 bits = 128;
         }
 
-        return llvm::ConstantInt::get(get_int_type(bits), value, true);
+        return llvm::ConstantInt::get(get_int_type(bits), value, false);
     }
 
     llvm::Value *ExpressionCodegen::generate_float_literal(double value, bool is_double)
@@ -143,9 +206,27 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    // Parse as integer
-                    int64_t int_value = std::stoll(value_str, nullptr, 0); // 0 for auto base detection
-                    return generate_integer_literal(int_value, node->get_resolved_type());
+                    // Parse as integer - check if type is unsigned
+                    Cryo::Type *resolved_type = node->get_resolved_type();
+                    bool is_unsigned = false;
+                    if (resolved_type)
+                    {
+                        std::string type_name = resolved_type->to_string();
+                        is_unsigned = (type_name.length() > 0 && type_name[0] == 'u');
+                    }
+
+                    if (is_unsigned)
+                    {
+                        // Parse as unsigned for u8, u16, u32, u64, u128
+                        uint64_t uint_value = std::stoull(value_str, nullptr, 0);
+                        return generate_unsigned_integer_literal(uint_value, resolved_type);
+                    }
+                    else
+                    {
+                        // Parse as signed for i8, i16, i32, i64, i128
+                        int64_t int_value = std::stoll(value_str, nullptr, 0);
+                        return generate_integer_literal(int_value, resolved_type);
+                    }
                 }
             }
             catch (const std::exception &e)
@@ -287,6 +368,32 @@ namespace Cryo::Codegen
         if (llvm::GlobalVariable *global = module()->getGlobalVariable(name))
         {
             return global;
+        }
+
+        // Try with current namespace prefix
+        std::string current_ns = ctx().namespace_context();
+        if (!current_ns.empty())
+        {
+            std::string qualified = current_ns + "::" + name;
+            if (llvm::GlobalVariable *global = module()->getGlobalVariable(qualified))
+            {
+                return global;
+            }
+        }
+
+        // Try common namespace prefixes (for constants from runtime, core, etc.)
+        static const std::vector<std::string> common_namespaces = {
+            "std::Runtime::", "std::core::", "std::IO::", "Runtime::"};
+
+        for (const auto &ns : common_namespaces)
+        {
+            std::string ns_qualified = ns + name;
+            if (llvm::GlobalVariable *global = module()->getGlobalVariable(ns_qualified))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "lookup_variable: Found '{}' in namespace -> '{}'", name, ns_qualified);
+                return global;
+            }
         }
 
         // Try function

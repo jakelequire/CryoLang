@@ -97,12 +97,15 @@ namespace Cryo::Codegen
 
         // Wire TypeMapper to GenericCodegen for parameterized type instantiation
         // This allows TypeMapper to delegate generic type instantiation to GenericCodegen
+        // We use get_instantiated_type which properly dispatches to either instantiate_struct
+        // or instantiate_class based on whether the generic definition is a struct or class
         GenericCodegen *generics_ptr = _generics.get();
         _ctx->types().set_generic_instantiator(
             [generics_ptr](const std::string &generic_name,
                            const std::vector<Cryo::Type *> &type_args) -> llvm::StructType *
             {
-                return generics_ptr->instantiate_struct(generic_name, type_args);
+                llvm::Type *type = generics_ptr->get_instantiated_type(generic_name, type_args);
+                return llvm::dyn_cast_or_null<llvm::StructType>(type);
             });
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Component dependencies wired");
