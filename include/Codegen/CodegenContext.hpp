@@ -76,7 +76,11 @@ namespace Cryo::Codegen
      */
     struct BreakableContext
     {
-        enum Type { Loop, Switch };
+        enum Type
+        {
+            Loop,
+            Switch
+        };
 
         Type context_type;
         llvm::BasicBlock *condition_block;
@@ -387,7 +391,7 @@ namespace Cryo::Codegen
 
         /** @brief Register a struct's field indices */
         void register_struct_fields(const std::string &type_name,
-                                     const std::vector<std::string> &field_names)
+                                    const std::vector<std::string> &field_names)
         {
             auto &field_map = _struct_field_indices[type_name];
             for (unsigned i = 0; i < field_names.size(); ++i)

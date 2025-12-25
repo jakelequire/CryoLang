@@ -1286,6 +1286,35 @@ namespace Cryo
             current_scope->declare_symbol(enum_decl->name(), SymbolKind::Type,
                                           enum_decl->location(), enum_type, scope_name);
 
+            // IMMEDIATELY register enum variants in codegen context to prevent early reference issues
+            // This ensures variants are available when struct constructors reference them during pre-registration
+            if (_codegen && _codegen->ensure_visitor_initialized())
+            {
+                auto *visitor = _codegen->get_visitor();
+                auto &enum_variants_map = visitor->context().enum_variants_map();
+                
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registering enum variants for {}", enum_decl->name());
+                
+                // For simple enums, register integer constants for each variant
+                if (is_simple_enum)
+                {
+                    for (size_t i = 0; i < variant_names.size(); ++i)
+                    {
+                        std::string qualified_name = enum_decl->name() + "::" + variant_names[i];
+                        
+                        // Create integer constant for this variant
+                        llvm::Constant *variant_const = llvm::ConstantInt::get(
+                            llvm::Type::getInt32Ty(visitor->context().llvm_context()), 
+                            static_cast<uint64_t>(i)
+                        );
+                        
+                        // Register in enum_variants_map
+                        enum_variants_map[qualified_name] = variant_const;
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registered enum variant: {} = {}", qualified_name, i);
+                    }
+                }
+            }
+
             // Register generic enum templates if this enum has generic parameters
             if (!enum_decl->generic_parameters().empty())
             {
@@ -1420,12 +1449,40 @@ namespace Cryo
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to load import '{}': {}", import_decl->path(), result.error_message);
             }
         }
-        // Skip variable declarations in first pass - they don't need forward declaration
-        // and will be processed by TypeChecker in second pass
+        // Handle global constants in first pass to prevent early reference issues
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Skip variable declarations in collect_declarations_pass
-            // They will be properly handled by TypeChecker
+            // Only handle global constants - regular variables are processed by TypeChecker
+            if (var_decl->is_global() && !var_decl->is_mutable() && var_decl->has_initializer())
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registering global constant: {}", var_decl->name());
+                
+                // IMMEDIATELY register global constant in codegen context to prevent early reference issues
+                if (_codegen && _codegen->ensure_visitor_initialized())
+                {
+                    auto *visitor = _codegen->get_visitor();
+                    
+                    // Pre-register global constant with a placeholder value
+                    // The actual value will be generated later during proper codegen
+                    llvm::GlobalVariable *global_var = new llvm::GlobalVariable(
+                        *visitor->context().module(),
+                        visitor->context().types().map(var_decl->get_resolved_type()),
+                        true, // is_constant
+                        llvm::GlobalValue::ExternalLinkage,
+                        nullptr, // initializer will be set later
+                        var_decl->name()
+                    );
+                    
+                    // Store in globals map for later retrieval
+                    visitor->context().globals_map()[var_decl->name()] = global_var;
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registered global constant: {}", var_decl->name());
+                }
+                
+                // Still register in symbol table for type checking
+                current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
+                                              var_decl->location(), var_decl->get_resolved_type(), scope_name);
+            }
+            // Skip other variable declarations - they will be properly handled by TypeChecker
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
