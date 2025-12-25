@@ -307,6 +307,13 @@ namespace Cryo::Codegen
         llvm::Value *generate_expression(Cryo::ExpressionNode *expr);
 
         /**
+         * @brief Generate the address of a member access for use as method receiver
+         * @param node Member access node (e.g., this.heap_manager)
+         * @return Pointer to the member field
+         */
+        llvm::Value *generate_member_receiver_address(Cryo::MemberAccessNode *node);
+
+        /**
          * @brief Create function declaration if not exists
          * @param name Function name
          * @param return_type Return type
