@@ -266,8 +266,32 @@ namespace Cryo::Codegen
             return;
         }
 
-        // Generate the class type
+        // Generate the class type (struct layout)
         _types->generate_class(&node);
+
+        // Generate class methods (unlike structs, class methods are defined inline)
+        if (!node.methods().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Generating {} methods for class {}",
+                      node.methods().size(), node.name());
+
+            // Set current type context for method generation
+            std::string previous_type = _ctx->current_type_name();
+            _ctx->set_current_type_name(node.name());
+
+            for (const auto &method : node.methods())
+            {
+                if (method)
+                {
+                    // Generate the method with qualified name (ClassName::methodName)
+                    _declarations->generate_method(method.get());
+                }
+            }
+
+            // Restore previous type context
+            _ctx->set_current_type_name(previous_type);
+        }
     }
 
     void CodegenVisitor::visit(Cryo::EnumDeclarationNode &node)

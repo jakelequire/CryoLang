@@ -784,9 +784,63 @@ namespace Cryo::Codegen
 
         // Get the parent type name from context
         std::string parent_type = ctx().current_type_name();
+        std::string method_name = generate_method_name(parent_type, node->name());
 
-        // StructMethodNode IS a FunctionDeclarationNode, use it directly
-        generate_method_declaration(node, parent_type);
+        // Generate method declaration
+        llvm::Function *fn = generate_method_declaration(node, parent_type);
+
+        // If the method has a body and the function is empty, generate the body
+        if (fn && node->body() && fn->empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Generating body for method: {}", method_name);
+
+            // Create entry block and generate body
+            llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+            builder().SetInsertPoint(entry);
+
+            // Set up function context for proper scope isolation
+            auto fn_ctx = std::make_unique<FunctionContext>(fn, node);
+            fn_ctx->entry_block = entry;
+            ctx().set_current_function(std::move(fn_ctx));
+
+            // Enter function scope
+            values().enter_scope(method_name);
+
+            // Clear stale result
+            ctx().set_result(nullptr);
+
+            // Allocate parameters
+            for (auto &arg : fn->args())
+            {
+                llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
+                create_store(&arg, alloca);
+                values().set_value(arg.getName().str(), nullptr, alloca);
+            }
+
+            // Generate body
+            CodegenVisitor *visitor = ctx().visitor();
+            node->body()->accept(*visitor);
+
+            // Add implicit return if needed
+            llvm::BasicBlock *current_block = builder().GetInsertBlock();
+            if (current_block && !current_block->getTerminator())
+            {
+                if (fn->getReturnType()->isVoidTy())
+                {
+                    builder().CreateRetVoid();
+                }
+                else
+                {
+                    builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                }
+            }
+
+            // Exit function scope and clean up
+            values().exit_scope();
+            ctx().clear_current_function();
+            ctx().set_result(nullptr);
+        }
     }
 
     void DeclarationCodegen::generate_impl_block(Cryo::ImplementationBlockNode *node)
