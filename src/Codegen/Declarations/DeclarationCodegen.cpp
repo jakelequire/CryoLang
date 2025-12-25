@@ -722,6 +722,37 @@ namespace Cryo::Codegen
             values().set_value(arg.getName().str(), nullptr, alloca);
         }
 
+        // Register parameter types in variable_types_map for Array<T> detection
+        // This is critical for array access to correctly determine element types
+        const auto &ast_params = node->parameters();
+        size_t param_idx = 0;
+        for (auto &arg : fn->args())
+        {
+            if (param_idx < ast_params.size())
+            {
+                Cryo::Type *param_type = ast_params[param_idx]->get_resolved_type();
+                if (param_type)
+                {
+                    std::string param_name = arg.getName().str();
+                    ctx().variable_types_map()[param_name] = param_type;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Registered function parameter type: {} -> {} (kind: {})",
+                              param_name, param_type->to_string(),
+                              static_cast<int>(param_type->kind()));
+
+                    // Special logging for Array<T> parameters
+                    if (param_type->kind() == TypeKind::Array ||
+                        param_type->to_string().find("[]") != std::string::npos)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: *** Registered Array<T> parameter: {} with type: {}",
+                                  param_name, param_type->to_string());
+                    }
+                }
+            }
+            param_idx++;
+        }
+
         // Generate body statements
         CodegenVisitor *visitor = ctx().visitor();
         node->body()->accept(*visitor);
@@ -1054,6 +1085,46 @@ namespace Cryo::Codegen
                                   parent_type, this_type->to_string());
                     }
                 }
+            }
+
+            // Register all parameter types in variable_types_map for Array<T> detection
+            // StructMethodNode inherits from FunctionDeclarationNode so parameters() is available
+            const auto &ast_params = node->parameters();
+            size_t param_idx = 0;
+            for (auto &arg : fn->args())
+            {
+                // Skip 'this' as it's handled above
+                if (arg.getName() == "this")
+                {
+                    param_idx++;
+                    continue;
+                }
+
+                // Account for 'this' parameter offset - AST params don't include 'this'
+                size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                if (ast_idx < ast_params.size())
+                {
+                    Cryo::Type *param_type = ast_params[ast_idx]->get_resolved_type();
+                    if (param_type)
+                    {
+                        std::string param_name = arg.getName().str();
+                        ctx().variable_types_map()[param_name] = param_type;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Registered method parameter type: {} -> {} (kind: {})",
+                                  param_name, param_type->to_string(),
+                                  static_cast<int>(param_type->kind()));
+
+                        // Special logging for Array<T> parameters
+                        if (param_type->kind() == TypeKind::Array ||
+                            param_type->to_string().find("[]") != std::string::npos)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "DeclarationCodegen: *** Registered Array<T> method parameter: {} with type: {}",
+                                      param_name, param_type->to_string());
+                        }
+                    }
+                }
+                param_idx++;
             }
 
             // Generate body
