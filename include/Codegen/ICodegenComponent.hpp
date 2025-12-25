@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Codegen/CodegenContext.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Type.h>
@@ -8,6 +9,7 @@
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Function.h>
 #include <string>
+#include <vector>
 
 namespace Cryo::Codegen
 {
@@ -66,6 +68,83 @@ namespace Cryo::Codegen
 
         /** @brief Get symbol table */
         Cryo::SymbolTable &symbols() { return _ctx.symbols(); }
+
+        //===================================================================
+        // Symbol Resolution (SRM)
+        //===================================================================
+
+        /** @brief Get symbol resolution manager */
+        Cryo::SRM::SymbolResolutionManager &srm() { return _ctx.srm(); }
+
+        /** @brief Get symbol resolution context */
+        Cryo::SRM::SymbolResolutionContext &srm_context() { return _ctx.srm_context(); }
+
+        /**
+         * @brief Generate all lookup candidates for a symbol name
+         *
+         * Uses SRM to generate candidates based on:
+         * - Current namespace context
+         * - Imported namespaces (from import statements)
+         * - Namespace aliases
+         * - Parent namespaces
+         * - Global scope
+         *
+         * @param name Symbol name to look up
+         * @param kind Symbol kind (Function, Type, Variable, etc.)
+         * @return Vector of possible qualified names to try
+         */
+        std::vector<std::string> generate_lookup_candidates(
+            const std::string &name, Cryo::SymbolKind kind);
+
+        /**
+         * @brief Resolve a function by trying all SRM-generated candidates
+         * @param name Function name (may be unqualified)
+         * @return Found LLVM function, or nullptr if not found
+         */
+        llvm::Function *resolve_function_by_name(const std::string &name);
+
+        /**
+         * @brief Resolve a type by trying all SRM-generated candidates
+         * @param name Type name (may be unqualified)
+         * @return Found LLVM type, or nullptr if not found
+         */
+        llvm::Type *resolve_type_by_name(const std::string &name);
+
+        /**
+         * @brief Resolve a method by trying all SRM-generated candidates
+         * @param type_name Type that owns the method
+         * @param method_name Method name
+         * @return Found LLVM function, or nullptr if not found
+         */
+        llvm::Function *resolve_method_by_name(
+            const std::string &type_name, const std::string &method_name);
+
+        /**
+         * @brief Generate a fully qualified name for a symbol
+         *
+         * Uses current namespace context to qualify the name.
+         * If name is already qualified (contains ::), returns as-is.
+         *
+         * @param name Symbol name
+         * @param kind Symbol kind
+         * @return Fully qualified name
+         */
+        std::string qualify_symbol_name(const std::string &name, Cryo::SymbolKind kind);
+
+        /**
+         * @brief Build a method name using SRM conventions
+         * @param type_name Owning type name
+         * @param method_name Method name
+         * @return Qualified method name (e.g., "std::Runtime::StackTrace::capture")
+         */
+        std::string build_method_name(const std::string &type_name, const std::string &method_name);
+
+        /**
+         * @brief Build a constructor name using SRM conventions
+         * @param type_name Type name
+         * @return Constructor name (e.g., "std::Runtime::StackTrace::StackTrace")
+         */
+        std::string build_constructor_name(const std::string &type_name);
 
         //===================================================================
         // Common Memory Operations

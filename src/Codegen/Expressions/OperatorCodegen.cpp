@@ -1524,17 +1524,19 @@ namespace Cryo::Codegen
         if (!mod)
             return nullptr;
 
-        // Look for existing function
-        _string_concat_fn = mod->getFunction("std::Runtime::cryo_strcat");
+        // Use SRM to resolve the function name
+        _string_concat_fn = resolve_function_by_name("cryo_strcat");
         if (_string_concat_fn)
             return _string_concat_fn;
 
-        // Create declaration
+        // Create declaration with qualified name
         llvm::Type *char_ptr = llvm::PointerType::get(llvm_ctx(), 0);
         llvm::FunctionType *fn_type = llvm::FunctionType::get(char_ptr, {char_ptr, char_ptr}, false);
 
+        // Use SRM to qualify the function name
+        std::string qualified_name = qualify_symbol_name("cryo_strcat", Cryo::SymbolKind::Function);
         _string_concat_fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
-                                                   "std::Runtime::cryo_strcat", mod);
+                                                   qualified_name, mod);
         return _string_concat_fn;
     }
 
@@ -1547,18 +1549,20 @@ namespace Cryo::Codegen
         if (!mod)
             return nullptr;
 
-        // Look for existing function
-        _string_char_concat_fn = mod->getFunction("std::Runtime::cryo_strcat_char");
+        // Use SRM to resolve the function name
+        _string_char_concat_fn = resolve_function_by_name("cryo_strcat_char");
         if (_string_char_concat_fn)
             return _string_char_concat_fn;
 
-        // Create declaration
+        // Create declaration with qualified name
         llvm::Type *char_ptr = llvm::PointerType::get(llvm_ctx(), 0);
         llvm::Type *i8 = llvm::Type::getInt8Ty(llvm_ctx());
         llvm::FunctionType *fn_type = llvm::FunctionType::get(char_ptr, {char_ptr, i8}, false);
 
+        // Use SRM to qualify the function name
+        std::string qualified_name = qualify_symbol_name("cryo_strcat_char", Cryo::SymbolKind::Function);
         _string_char_concat_fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
-                                                        "std::Runtime::cryo_strcat_char", mod);
+                                                        qualified_name, mod);
         return _string_char_concat_fn;
     }
 

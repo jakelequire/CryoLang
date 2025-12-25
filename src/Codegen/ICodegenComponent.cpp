@@ -1,8 +1,177 @@
 #include "Codegen/ICodegenComponent.hpp"
 #include "Utils/Logger.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
 
 namespace Cryo::Codegen
 {
+    //===================================================================
+    // Symbol Resolution (SRM)
+    //===================================================================
+
+    std::vector<std::string> ICodegenComponent::generate_lookup_candidates(
+        const std::string &name, Cryo::SymbolKind kind)
+    {
+        // Use SRM to generate all possible name variations based on:
+        // - Current namespace context
+        // - Imported namespaces
+        // - Namespace aliases
+        // - Parent namespaces
+        // - Global scope
+        return srm().generate_lookup_candidates(name, kind);
+    }
+
+    llvm::Function *ICodegenComponent::resolve_function_by_name(const std::string &name)
+    {
+        // Generate all possible candidates using SRM
+        auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Function);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_function_by_name: Looking for '{}', {} candidates generated",
+                  name, candidates.size());
+
+        for (const auto &candidate : candidates)
+        {
+            // Try LLVM module first
+            if (llvm::Function *fn = module()->getFunction(candidate))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_function_by_name: Found '{}' as '{}'", name, candidate);
+                return fn;
+            }
+
+            // Try context's function registry
+            if (llvm::Function *fn = ctx().get_function(candidate))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_function_by_name: Found '{}' in registry as '{}'", name, candidate);
+                return fn;
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_function_by_name: '{}' not found after trying {} candidates",
+                  name, candidates.size());
+        return nullptr;
+    }
+
+    llvm::Type *ICodegenComponent::resolve_type_by_name(const std::string &name)
+    {
+        // Generate all possible candidates using SRM
+        auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Type);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_type_by_name: Looking for '{}', {} candidates generated",
+                  name, candidates.size());
+
+        for (const auto &candidate : candidates)
+        {
+            // Try context's type registry
+            if (llvm::Type *type = ctx().get_type(candidate))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_type_by_name: Found '{}' as '{}'", name, candidate);
+                return type;
+            }
+
+            // Try LLVM context directly for struct types
+            if (auto *st = llvm::StructType::getTypeByName(llvm_ctx(), candidate))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_type_by_name: Found '{}' in LLVM context as '{}'", name, candidate);
+                return st;
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_type_by_name: '{}' not found after trying {} candidates",
+                  name, candidates.size());
+        return nullptr;
+    }
+
+    llvm::Function *ICodegenComponent::resolve_method_by_name(
+        const std::string &type_name, const std::string &method_name)
+    {
+        // First, generate candidates for the type name
+        auto type_candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_method_by_name: Looking for '{}.{}', {} type candidates",
+                  type_name, method_name, type_candidates.size());
+
+        // For each type candidate, try to find the method
+        for (const auto &type_candidate : type_candidates)
+        {
+            // Build qualified method name: Type::method
+            std::string qualified_method = type_candidate + "::" + method_name;
+
+            // Try LLVM module
+            if (llvm::Function *fn = module()->getFunction(qualified_method))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found '{}.{}' as '{}'",
+                          type_name, method_name, qualified_method);
+                return fn;
+            }
+
+            // Try context's function registry
+            if (llvm::Function *fn = ctx().get_function(qualified_method))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found '{}.{}' in registry as '{}'",
+                          type_name, method_name, qualified_method);
+                return fn;
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_method_by_name: '{}.{}' not found", type_name, method_name);
+        return nullptr;
+    }
+
+    std::string ICodegenComponent::qualify_symbol_name(const std::string &name, Cryo::SymbolKind kind)
+    {
+        // If already qualified, return as-is
+        if (name.find("::") != std::string::npos)
+        {
+            return name;
+        }
+
+        // Use SRM context to create a qualified identifier
+        auto identifier = srm_context().create_qualified_identifier(name, kind);
+        if (identifier)
+        {
+            return identifier->to_string();
+        }
+
+        // Fallback: return original name
+        return name;
+    }
+
+    std::string ICodegenComponent::build_method_name(
+        const std::string &type_name, const std::string &method_name)
+    {
+        // Parse the type name to get namespace parts and base name
+        auto [ns_parts, base_type] = Cryo::SRM::Utils::parse_qualified_name(type_name);
+
+        // Build the method name: namespace::Type::method
+        std::vector<std::string> method_parts = ns_parts;
+        method_parts.push_back(base_type);
+
+        return Cryo::SRM::Utils::build_qualified_name(method_parts, method_name);
+    }
+
+    std::string ICodegenComponent::build_constructor_name(const std::string &type_name)
+    {
+        // Parse the type name to get namespace parts and base name
+        auto [ns_parts, base_type] = Cryo::SRM::Utils::parse_qualified_name(type_name);
+
+        // Constructor name is Type::Type
+        std::vector<std::string> ctor_parts = ns_parts;
+        ctor_parts.push_back(base_type);
+
+        return Cryo::SRM::Utils::build_qualified_name(ctor_parts, base_type);
+    }
+
     //===================================================================
     // Common Memory Operations
     //===================================================================
