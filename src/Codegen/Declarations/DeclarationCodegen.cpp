@@ -172,8 +172,19 @@ namespace Cryo::Codegen
             }
         }
 
-        // Register
+        // Register with simple type name (e.g., StackTrace::capture)
         ctx().register_function(method_name, fn);
+
+        // Also register with fully-qualified namespace path for SRM-based lookups
+        std::string ns_context = ctx().namespace_context();
+        if (!ns_context.empty())
+        {
+            // Build qualified name: namespace::Type::method
+            std::string qualified_method = ns_context + "::" + method_name;
+            ctx().register_function(qualified_method, fn);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Also registered method as: {}", qualified_method);
+        }
 
         return fn;
     }
