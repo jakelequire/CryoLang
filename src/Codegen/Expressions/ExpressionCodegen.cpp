@@ -675,18 +675,18 @@ namespace Cryo::Codegen
                     // This is an Array<T> class (struct with elements field)
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Array<T> is a struct type - accessing elements field");
 
-                    // Generate the Array<T> instance
-                    llvm::Value *array_instance = generate(node->array());
-                    if (!array_instance)
+                    // Get the alloca for the Array<T> struct - we need a pointer for GEP, not a loaded value
+                    llvm::AllocaInst *array_alloca = values().get_alloca(array_name);
+                    if (!array_alloca)
                     {
                         report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                                     "Failed to generate Array<T> instance");
+                                     "Failed to find alloca for Array<T> struct");
                         return nullptr;
                     }
 
                     llvm::Value *elements_ptr = builder().CreateStructGEP(
                         llvm::cast<llvm::StructType>(array_llvm_type),
-                        array_instance,
+                        array_alloca,
                         0, // 'elements' is the first field
                         array_name + ".elements.ptr");
 
