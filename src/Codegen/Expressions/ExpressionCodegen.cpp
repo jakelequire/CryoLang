@@ -225,6 +225,13 @@ namespace Cryo::Codegen
             return create_load(alloca, loaded_type, name + ".load");
         }
 
+        // If it's a global variable, load the value
+        if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(value))
+        {
+            llvm::Type *loaded_type = global->getValueType();
+            return create_load(global, loaded_type, name + ".load");
+        }
+
         return value;
     }
 
@@ -842,20 +849,37 @@ namespace Cryo::Codegen
         if (!object)
             return false;
 
-        // Get the type of the object
-        // For now, we don't have direct type info from expressions
-        Cryo::Type *obj_type = nullptr; // object->get_resolved_type();
+        // Get the resolved type of the object expression
+        Cryo::Type *obj_type = object->get_resolved_type();
         if (!obj_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_member_info: No resolved type for object");
             return false;
+        }
 
-        // Get type name (strip pointer if needed)
+        // Get type name (handle pointer types)
         std::string type_name = obj_type->to_string();
-        if (!type_name.empty() && type_name.back() == '*')
+
+        // Handle pointer types - get the pointee type name
+        if (obj_type->kind() == Cryo::TypeKind::Pointer)
+        {
+            auto *ptr_type = dynamic_cast<Cryo::PointerType *>(obj_type);
+            if (ptr_type && ptr_type->pointee_type())
+            {
+                type_name = ptr_type->pointee_type()->to_string();
+            }
+        }
+        else if (!type_name.empty() && type_name.back() == '*')
         {
             type_name.pop_back();
         }
 
-        // Look up struct type
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_member_info: Looking up type '{}' for member '{}'",
+                  type_name, member_name);
+
+        // Look up struct type in LLVM context
         out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
         if (!out_struct_type)
         {
@@ -868,24 +892,26 @@ namespace Cryo::Codegen
 
         if (!out_struct_type)
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_member_info: Struct type '{}' not found", type_name);
             return false;
         }
 
-        // Look up field index from context's field mapping
-        // For now, use a simplified approach
-        // TODO: Implement proper struct field resolution
+        // Look up field index using the new CodegenContext API
+        int field_idx = ctx().get_struct_field_index(type_name, member_name);
+        if (field_idx < 0)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_member_info: Field '{}' not found in struct '{}'",
+                      member_name, type_name);
+            return false;
+        }
 
-        // const auto &field_map = ctx().get_field_indices(type_name);
-        // auto it = field_map.find(member_name);
-        // if (it != field_map.end())
-        // {
-        //     out_field_idx = it->second;
-        //     return true;
-        // }
-
-        // Fallback: Check symbol table for field info
-        // For now, return failure since field mapping is not implemented
-        return false;
+        out_field_idx = static_cast<unsigned>(field_idx);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_member_info: Resolved {}.{} to index {}",
+                  type_name, member_name, out_field_idx);
+        return true;
     }
 
     //===================================================================

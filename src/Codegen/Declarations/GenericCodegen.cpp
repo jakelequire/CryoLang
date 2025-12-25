@@ -70,19 +70,52 @@ namespace Cryo::Codegen
         // Create struct type
         llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), mangled);
 
-        // Substitute type parameters in fields
+        // Substitute type parameters in fields and collect field names
+        std::vector<std::string> field_names;
         if (struct_decl)
         {
             std::vector<llvm::Type *> field_types = create_substituted_fields(struct_decl->fields());
             struct_type->setBody(field_types);
+
+            // Collect field names for member access resolution
+            field_names.reserve(struct_decl->fields().size());
+            for (const auto &field : struct_decl->fields())
+            {
+                field_names.push_back(field->name());
+            }
         }
 
         // End type parameter scope
         end_type_params();
 
-        // Cache and register
+        // Cache and register in multiple places for consistency
         _type_cache[mangled] = struct_type;
         ctx().register_type(mangled, struct_type);
+        types().register_struct(mangled, struct_type);
+
+        // Also build the unmangled name (e.g., "Array<u64>") for lookup consistency
+        std::string instantiated_name = generic_name + "<";
+        for (size_t i = 0; i < type_args.size(); ++i)
+        {
+            if (i > 0) instantiated_name += ", ";
+            if (type_args[i])
+            {
+                instantiated_name += type_args[i]->to_string();
+            }
+        }
+        instantiated_name += ">";
+        types().register_struct(instantiated_name, struct_type);
+
+        // Register field names for both mangled and unmangled names
+        if (!field_names.empty())
+        {
+            ctx().register_struct_fields(mangled, field_names);
+            ctx().register_struct_fields(instantiated_name, field_names);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "GenericCodegen: Registered struct {} (also as {}) with {} fields",
+                  mangled, instantiated_name, field_names.size());
 
         return struct_type;
     }
@@ -141,18 +174,52 @@ namespace Cryo::Codegen
         // Create class struct
         llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), mangled);
 
+        // Substitute type parameters in fields and collect field names
+        std::vector<std::string> field_names;
         if (class_decl)
         {
             std::vector<llvm::Type *> field_types = create_substituted_fields(class_decl->fields());
             class_type->setBody(field_types);
+
+            // Collect field names for member access resolution
+            field_names.reserve(class_decl->fields().size());
+            for (const auto &field : class_decl->fields())
+            {
+                field_names.push_back(field->name());
+            }
         }
 
         // End substitution scope
         end_type_params();
 
-        // Cache and register
+        // Cache and register in multiple places for consistency
         _type_cache[mangled] = class_type;
         ctx().register_type(mangled, class_type);
+        types().register_struct(mangled, class_type);
+
+        // Also build the unmangled name (e.g., "MyClass<u64>") for lookup consistency
+        std::string instantiated_name = generic_name + "<";
+        for (size_t i = 0; i < type_args.size(); ++i)
+        {
+            if (i > 0) instantiated_name += ", ";
+            if (type_args[i])
+            {
+                instantiated_name += type_args[i]->to_string();
+            }
+        }
+        instantiated_name += ">";
+        types().register_struct(instantiated_name, class_type);
+
+        // Register field names for both mangled and unmangled names
+        if (!field_names.empty())
+        {
+            ctx().register_struct_fields(mangled, field_names);
+            ctx().register_struct_fields(instantiated_name, field_names);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "GenericCodegen: Registered class {} (also as {}) with {} fields",
+                  mangled, instantiated_name, field_names.size());
 
         return class_type;
     }

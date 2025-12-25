@@ -158,11 +158,13 @@ namespace Cryo::Codegen
         /**
          * @brief Generate instance method call
          * @param node Call expression
+         * @param callee The member access node representing the method call
          * @param receiver Receiver object value
          * @param method_name Method name
          * @return Result value
          */
         llvm::Value *generate_instance_method(Cryo::CallExpressionNode *node,
+                                              Cryo::MemberAccessNode *callee,
                                               llvm::Value *receiver,
                                               const std::string &method_name);
 
