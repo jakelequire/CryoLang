@@ -284,6 +284,7 @@ namespace Cryo::Codegen
         // Check if already exists
         if (llvm::GlobalVariable *existing = module()->getGlobalVariable(name))
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Global variable already exists: {}", name);
             return existing;
         }
 
@@ -437,13 +438,16 @@ namespace Cryo::Codegen
         // Register type
         ctx().register_type(name, enum_type);
 
-        // Generate variant constants
+        // Generate variant constants and register them
         int32_t index = 0;
         for (const auto &variant : node->variants())
         {
             std::string variant_name = name + "::" + variant->name();
             llvm::Constant *value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index++);
-            // Could store in a constant registry
+            // Register enum variant in the context for scope resolution lookup
+            ctx().register_enum_variant(variant_name, value);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Registered enum variant: {} = {}",
+                      variant_name, index - 1);
         }
 
         return enum_type;

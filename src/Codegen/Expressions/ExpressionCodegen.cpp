@@ -223,9 +223,18 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        // Parse as signed for i8, i16, i32, i64, i128
-                        int64_t int_value = std::stoll(value_str, nullptr, 0);
-                        return generate_integer_literal(int_value, resolved_type);
+                        // Try signed first, fall back to unsigned for large values
+                        try
+                        {
+                            int64_t int_value = std::stoll(value_str, nullptr, 0);
+                            return generate_integer_literal(int_value, resolved_type);
+                        }
+                        catch (const std::out_of_range &)
+                        {
+                            // Value too large for signed int64_t, try as unsigned
+                            uint64_t uint_value = std::stoull(value_str, nullptr, 0);
+                            return generate_unsigned_integer_literal(uint_value, resolved_type);
+                        }
                     }
                 }
             }
@@ -266,6 +275,14 @@ namespace Cryo::Codegen
                 str_value = str_value.substr(1, str_value.length() - 2);
             }
             return generate_string_literal(str_value);
+        }
+
+        case TokenKind::TK_KW_NULL:
+        case TokenKind::TK_KW_NIL:
+        case TokenKind::TK_KW_NONE:
+        {
+            // Null/nil/none literals - return null pointer
+            return generate_null_literal(node->get_resolved_type());
         }
 
         default:

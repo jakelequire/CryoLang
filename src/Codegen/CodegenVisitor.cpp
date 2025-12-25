@@ -174,16 +174,66 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::ProgramNode &node)
     {
         NodeTracker tracker(*_ctx, &node);
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ProgramNode");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ProgramNode with {} statements",
+                  node.statements().size());
 
-        // Process all top-level declarations
+        // Multi-pass processing to ensure proper dependency order
+
+        // Pass 0: Process all enum declarations first (for enum variant resolution)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processing enum declarations");
         for (const auto &stmt : node.statements())
         {
-            if (stmt)
+            if (!stmt)
+                continue;
+            if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()))
             {
                 stmt->accept(*this);
             }
         }
+
+        // Pass 1: Process all struct/class type declarations (for type resolution)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing struct/class type declarations");
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            if (dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()) ||
+                dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()))
+            {
+                stmt->accept(*this);
+            }
+        }
+
+        // Pass 2: Process all global variable/constant declarations (for identifier resolution)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Processing global variable/constant declarations");
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            if (auto *var_decl = dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
+            {
+                stmt->accept(*this);
+            }
+        }
+
+        // Pass 3: Process remaining declarations (functions, impl blocks, extern blocks, etc.)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 3: Processing remaining declarations");
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            // Skip already processed types
+            if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()) ||
+                dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()) ||
+                dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()) ||
+                dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
+            {
+                continue;
+            }
+            stmt->accept(*this);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Completed ProgramNode processing");
     }
 
     void CodegenVisitor::visit(Cryo::DeclarationNode &node)
