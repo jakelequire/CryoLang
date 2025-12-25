@@ -25,7 +25,7 @@ namespace Cryo::Codegen
             return;
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "StatementCodegen: Generating statement of kind {}",
-                  static_cast<int>(stmt->kind()));
+                  NodeKindToString(stmt->kind()));
 
         // Dispatch based on statement kind
         switch (stmt->kind())
@@ -330,7 +330,7 @@ namespace Cryo::Codegen
     bool StatementCodegen::needs_terminator() const
     {
         // Cast away const for this query operation
-        auto* non_const_this = const_cast<StatementCodegen*>(this);
+        auto *non_const_this = const_cast<StatementCodegen *>(this);
         llvm::BasicBlock *current_block = non_const_this->builder().GetInsertBlock();
         return current_block && !current_block->getTerminator();
     }
@@ -351,7 +351,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *StatementCodegen::generate_initializer(Cryo::ExpressionNode *init_expr,
-                                                          llvm::Type *var_type)
+                                                        llvm::Type *var_type)
     {
         if (!init_expr)
             return nullptr;
