@@ -1581,6 +1581,20 @@ namespace Cryo::Codegen
             if (type_name.find("Array<") == 0 || type_name.find("[]") != std::string::npos)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Detected Array<T> type, generating Array constructor call");
+
+                // Get the correct element type from the Cryo Array type, not from the generated elements
+                // This ensures u64[] uses i64, not i32 (which integer literals default to)
+                if (resolved_type->kind() == TypeKind::Array)
+                {
+                    auto *arr_type = static_cast<Cryo::ArrayType *>(resolved_type);
+                    llvm::Type *cryo_elem_type = get_llvm_type(arr_type->element_type().get());
+                    if (cryo_elem_type)
+                    {
+                        elem_type = cryo_elem_type;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Using element type from Cryo Array type");
+                    }
+                }
+
                 return generate_array_constructor_call(node, elements, elem_type);
             }
         }
