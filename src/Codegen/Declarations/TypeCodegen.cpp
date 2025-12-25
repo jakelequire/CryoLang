@@ -684,13 +684,25 @@ namespace Cryo::Codegen
 
         // Generate variant constants
         int32_t index = 0;
+        std::string ns_context = ctx().namespace_context();
         for (const auto &variant : node->variants())
         {
             std::string variant_name = name + "::" + variant->name();
             llvm::Constant *value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index++);
+
+            // Register with simple name (EnumName::Variant)
             ctx().register_enum_variant(variant_name, value);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered enum variant: {} = {}",
                       variant_name, index - 1);
+
+            // Also register with fully-qualified name (namespace::EnumName::Variant)
+            if (!ns_context.empty())
+            {
+                std::string qualified_variant = ns_context + "::" + variant_name;
+                ctx().register_enum_variant(qualified_variant, value);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "TypeCodegen: Also registered enum variant as: {}", qualified_variant);
+            }
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Finished generating enum: {}", name);

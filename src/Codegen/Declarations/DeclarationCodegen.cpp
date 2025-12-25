@@ -349,7 +349,19 @@ namespace Cryo::Codegen
             name);
 
         // Register in value context for later lookup
+        // Register with simple name
         values().set_global_value(name, global);
+
+        // Also register with fully-qualified name (namespace::name) for SRM-based lookups
+        std::string ns_context = ctx().namespace_context();
+        if (!ns_context.empty())
+        {
+            std::string qualified_name = ns_context + "::" + name;
+            values().set_global_value(qualified_name, global);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Also registered global as: {}", qualified_name);
+        }
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Registered global variable: {}", name);
 
         return global;
