@@ -246,6 +246,40 @@ namespace Cryo::Codegen
 
         // Generate the struct type
         _types->generate_struct(&node);
+
+        // Generate struct methods if any are defined inline
+        if (!node.methods().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Generating {} methods for struct {}",
+                      node.methods().size(), node.name());
+
+            // Set current type context for method generation
+            std::string previous_type = _ctx->current_type_name();
+            _ctx->set_current_type_name(node.name());
+
+            // Two-pass approach: First generate all method declarations (forward references)
+            // This ensures that methods can call other methods defined later in the struct
+            for (const auto &method : node.methods())
+            {
+                if (method)
+                {
+                    _declarations->generate_method_declaration(method.get(), node.name());
+                }
+            }
+
+            // Second pass: Generate method bodies
+            for (const auto &method : node.methods())
+            {
+                if (method)
+                {
+                    _declarations->generate_method(method.get());
+                }
+            }
+
+            // Restore previous type context
+            _ctx->set_current_type_name(previous_type);
+        }
     }
 
     void CodegenVisitor::visit(Cryo::ClassDeclarationNode &node)
@@ -280,6 +314,17 @@ namespace Cryo::Codegen
             std::string previous_type = _ctx->current_type_name();
             _ctx->set_current_type_name(node.name());
 
+            // Two-pass approach: First generate all method declarations (forward references)
+            // This ensures that methods can call other methods defined later in the class
+            for (const auto &method : node.methods())
+            {
+                if (method)
+                {
+                    _declarations->generate_method_declaration(method.get(), node.name());
+                }
+            }
+
+            // Second pass: Generate method bodies
             for (const auto &method : node.methods())
             {
                 if (method)

@@ -973,7 +973,18 @@ namespace Cryo::Codegen
         std::string previous_type = ctx().current_type_name();
         ctx().set_current_type_name(type_name);
 
-        // Generate each method in the impl block
+        // Two-pass approach: First generate all method declarations (forward references)
+        // This ensures that methods can call other methods defined later in the impl block
+        for (const auto &method : node->method_implementations())
+        {
+            Cryo::StructMethodNode *fn_node = method.get();
+            if (fn_node)
+            {
+                generate_method_declaration(fn_node, type_name);
+            }
+        }
+
+        // Second pass: Generate method bodies
         for (const auto &method : node->method_implementations())
         {
             // StructMethodNode IS a FunctionDeclarationNode
@@ -986,7 +997,7 @@ namespace Cryo::Codegen
             {
                 // Full definition
                 std::string method_name = generate_method_name(type_name, fn_node->name());
-                llvm::Function *fn = generate_method_declaration(fn_node, type_name);
+                llvm::Function *fn = module()->getFunction(method_name);
                 if (fn && fn->empty())
                 {
                     // Create entry block and generate body
@@ -1035,10 +1046,6 @@ namespace Cryo::Codegen
                     ctx().clear_current_function();
                     ctx().set_result(nullptr);
                 }
-            }
-            else
-            {
-                generate_method_declaration(fn_node, type_name);
             }
         }
 
