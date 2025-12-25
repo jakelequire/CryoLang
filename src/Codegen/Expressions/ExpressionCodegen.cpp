@@ -251,6 +251,18 @@ namespace Cryo::Codegen
             return generate_bool_literal(bool_value);
         }
 
+        case TokenKind::TK_KW_TRUE:
+        {
+            // Boolean keyword 'true'
+            return generate_bool_literal(true);
+        }
+
+        case TokenKind::TK_KW_FALSE:
+        {
+            // Boolean keyword 'false'
+            return generate_bool_literal(false);
+        }
+
         case TokenKind::TK_CHAR_CONSTANT:
         {
             if (value_str.length() >= 3 && value_str.front() == '\'' && value_str.back() == '\'')
