@@ -1307,7 +1307,7 @@ namespace Cryo::Codegen
 
         // Try as enum variant
         auto &enum_variants = ctx().enum_variants_map();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Looking for enum variant: {} (map has {} entries)",
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Attempting to resolve: {} (enum map has {} entries)",
                   qualified_name, enum_variants.size());
         auto it = enum_variants.find(qualified_name);
         if (it != enum_variants.end())
@@ -1316,14 +1316,19 @@ namespace Cryo::Codegen
             return it->second;
         }
 
-        // Log available variants for debugging
+        // Log available variants for debugging at ERROR level so it definitely shows
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Failed to find '{}' in enum variants", qualified_name);
         if (!enum_variants.empty())
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Available enum variants:");
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Available enum variants ({} total):", enum_variants.size());
             for (const auto &[name, val] : enum_variants)
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - {}", name);
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "  - {}", name);
             }
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Enum variants map is EMPTY!");
         }
 
         report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
