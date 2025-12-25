@@ -542,7 +542,43 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating enum variant: {}::{}", enum_name, variant_name);
 
-        // Look up the enum type
+        std::string qualified_variant = enum_name + "::" + variant_name;
+
+        // Generate arguments
+        auto args = generate_arguments(node->arguments());
+
+        // Look for variant constructor function (for complex variants with payloads)
+        llvm::Function *ctor = module()->getFunction(qualified_variant);
+        if (ctor)
+        {
+            return builder().CreateCall(ctor, args, variant_name);
+        }
+
+        // For simple enum variants (no payload), look up the registered constant value
+        auto &enum_variants = ctx().enum_variants_map();
+        auto it = enum_variants.find(qualified_variant);
+        if (it != enum_variants.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Found simple enum variant: {} -> constant", qualified_variant);
+            return it->second;
+        }
+
+        // Try with namespace prefix
+        std::string current_ns = ctx().namespace_context();
+        if (!current_ns.empty())
+        {
+            std::string ns_qualified = current_ns + "::" + qualified_variant;
+            it = enum_variants.find(ns_qualified);
+            if (it != enum_variants.end())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Found simple enum variant with namespace: {} -> constant", ns_qualified);
+                return it->second;
+            }
+        }
+
+        // Look up the enum type to check if it exists
         llvm::Type *enum_type = ctx().get_type(enum_name);
         if (!enum_type)
         {
@@ -551,22 +587,8 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Generate arguments
-        auto args = generate_arguments(node->arguments());
-
-        // Look for variant constructor
-        std::string ctor_name = enum_name + "::" + variant_name;
-        llvm::Function *ctor = module()->getFunction(ctor_name);
-        if (ctor)
-        {
-            return builder().CreateCall(ctor, args, variant_name);
-        }
-
-        // If no constructor, treat as simple enum value
-        // Look up variant index from symbol table
-        // For now, return a placeholder
         report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
-                     "Enum variant constructor not implemented: " + ctor_name);
+                     "Enum variant not found: " + qualified_variant);
         return nullptr;
     }
 
@@ -756,6 +778,27 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Instance method receiver type: {}", type_name);
             }
+
+            // Fallback: try to get type from variable_types_map
+            if (type_name.empty())
+            {
+                if (auto *id = dynamic_cast<IdentifierNode *>(callee->object()))
+                {
+                    auto &var_types = ctx().variable_types_map();
+                    auto it = var_types.find(id->name());
+                    if (it != var_types.end() && it->second)
+                    {
+                        type_name = it->second->to_string();
+                        // Strip pointer suffix if present
+                        if (!type_name.empty() && type_name.back() == '*')
+                        {
+                            type_name.pop_back();
+                        }
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Instance method receiver type from variable map: {}", type_name);
+                    }
+                }
+            }
         }
 
         // Resolve the method
@@ -938,14 +981,145 @@ namespace Cryo::Codegen
                 return fn;
         }
 
+        // Try to find in imported namespaces
+        // Common patterns: std::IO::printf, std::Runtime::...
+        static const std::vector<std::string> common_namespaces = {
+            "std::IO::", "std::Runtime::", "std::core::", "IO::"};
+
+        for (const auto &ns : common_namespaces)
+        {
+            std::string ns_qualified = ns + name;
+            fn = module()->getFunction(ns_qualified);
+            if (fn)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_function: Found '{}' in namespace -> '{}'", name, ns_qualified);
+                return fn;
+            }
+        }
+
+        // Check for common C library functions and create declarations if needed
+        fn = get_or_create_c_function(name);
+        if (fn)
+            return fn;
+
+        return nullptr;
+    }
+
+    llvm::Function *CallCodegen::get_or_create_c_function(const std::string &name)
+    {
+        // Map of common C functions to their signatures
+        // For variadic functions: {return_type, fixed_param_types, is_variadic}
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(llvm_ctx());
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
+        llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
+        llvm::Type *void_type = llvm::Type::getVoidTy(llvm_ctx());
+
+        if (name == "printf" || name == "IO::printf" || name == "std::IO::printf")
+        {
+            llvm::Function *fn = module()->getFunction("printf");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type}, true);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "printf", module());
+            }
+            return fn;
+        }
+
+        if (name == "sprintf")
+        {
+            llvm::Function *fn = module()->getFunction("sprintf");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type, ptr_type}, true);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "sprintf", module());
+            }
+            return fn;
+        }
+
+        if (name == "snprintf")
+        {
+            llvm::Function *fn = module()->getFunction("snprintf");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type, i64_type, ptr_type}, true);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "snprintf", module());
+            }
+            return fn;
+        }
+
+        if (name == "fprintf")
+        {
+            llvm::Function *fn = module()->getFunction("fprintf");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type, ptr_type}, true);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "fprintf", module());
+            }
+            return fn;
+        }
+
+        if (name == "puts")
+        {
+            llvm::Function *fn = module()->getFunction("puts");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "puts", module());
+            }
+            return fn;
+        }
+
+        if (name == "putchar")
+        {
+            llvm::Function *fn = module()->getFunction("putchar");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {i32_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "putchar", module());
+            }
+            return fn;
+        }
+
+        if (name == "exit")
+        {
+            llvm::Function *fn = module()->getFunction("exit");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(void_type, {i32_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "exit", module());
+            }
+            return fn;
+        }
+
+        if (name == "abort")
+        {
+            llvm::Function *fn = module()->getFunction("abort");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(void_type, {}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "abort", module());
+            }
+            return fn;
+        }
+
         return nullptr;
     }
 
     llvm::Function *CallCodegen::resolve_method(const std::string &type_name,
                                                 const std::string &method_name)
     {
+        if (type_name.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_method: Empty type name for method {}", method_name);
+            return nullptr;
+        }
+
         // Try fully qualified name in LLVM module
         std::string qualified = type_name + "::" + method_name;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_method: Trying '{}'", qualified);
+
         llvm::Function *fn = module()->getFunction(qualified);
         if (fn)
             return fn;
@@ -954,6 +1128,32 @@ namespace Cryo::Codegen
         fn = ctx().get_function(qualified);
         if (fn)
             return fn;
+
+        // Try with current namespace prefix
+        std::string current_ns = ctx().namespace_context();
+        if (!current_ns.empty())
+        {
+            std::string ns_qualified = current_ns + "::" + qualified;
+            fn = module()->getFunction(ns_qualified);
+            if (fn)
+                return fn;
+        }
+
+        // Try common namespace prefixes
+        static const std::vector<std::string> common_namespaces = {
+            "std::Runtime::", "std::core::", "std::IO::", "Runtime::"};
+
+        for (const auto &ns : common_namespaces)
+        {
+            std::string ns_qualified = ns + qualified;
+            fn = module()->getFunction(ns_qualified);
+            if (fn)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method: Found '{}' in namespace -> '{}'", method_name, ns_qualified);
+                return fn;
+            }
+        }
 
         return nullptr;
     }
