@@ -280,11 +280,28 @@ namespace Cryo::Codegen
             std::string previous_type = _ctx->current_type_name();
             _ctx->set_current_type_name(node.name());
 
+            // Two-pass approach: First generate all method declarations (forward references)
+            // This ensures that methods can call other methods defined later in the class
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Pass 1: Generating method declarations for class {}", node.name());
+
             for (const auto &method : node.methods())
             {
                 if (method)
                 {
-                    // Generate the method with qualified name (ClassName::methodName)
+                    _declarations->generate_method_declaration(method.get(), node.name());
+                }
+            }
+
+            // Second pass: Generate method bodies
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Pass 2: Generating method bodies for class {}", node.name());
+
+            for (const auto &method : node.methods())
+            {
+                if (method)
+                {
+                    // Generate the method body (declaration already exists)
                     _declarations->generate_method(method.get());
                 }
             }
