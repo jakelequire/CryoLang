@@ -237,6 +237,12 @@ namespace Cryo::Codegen
         bool _stdlib_compilation_mode = false;
         bool _pre_registration_mode = false;
 
+        // Multi-pass processing flags for struct/class method body generation
+        // When true, struct/class visitors skip method body generation
+        bool _defer_method_generation = false;
+        // When true, struct/class visitors only generate method bodies (type already exists)
+        bool _generate_method_bodies_only = false;
+
         //===================================================================
         // Helper Methods
         //===================================================================
