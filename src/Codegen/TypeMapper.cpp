@@ -524,17 +524,38 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Check if fixed size array
-        if (type->array_size().has_value())
+        // In Cryo, T[] syntax is syntactic sugar for Array<T> which is a struct type:
+        // type class Array<T> { elements: T*; length: u64; capacity: u64; }
+        // So we always return the Array<T> struct type, NOT native LLVM arrays.
+
+        // Generate a unique name for this Array<T> instantiation
+        std::string array_struct_name = "Array<" + (elem_type ? elem_type->to_string() : "unknown") + ">";
+
+        // Check if we already have this struct type cached
+        auto it = _struct_cache.find(array_struct_name);
+        if (it != _struct_cache.end())
         {
-            size_t size = type->array_size().value();
-            return llvm::ArrayType::get(llvm_elem, size);
+            return it->second;
         }
-        else
-        {
-            // Dynamic array - represent as pointer
-            return llvm::PointerType::get(llvm_elem, 0);
-        }
+
+        // Create the Array<T> struct type: { T* elements, u64 length, u64 capacity }
+        std::vector<llvm::Type *> fields = {
+            llvm::PointerType::get(_ctx.get_context(), 0), // elements: T* (opaque pointer)
+            llvm::Type::getInt64Ty(_ctx.get_context()),    // length: u64
+            llvm::Type::getInt64Ty(_ctx.get_context())     // capacity: u64
+        };
+
+        llvm::StructType *array_struct = llvm::StructType::create(
+            _ctx.get_context(), fields, array_struct_name);
+
+        // Cache it for future use
+        _struct_cache[array_struct_name] = array_struct;
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "TypeMapper: Created Array<{}> struct type for array syntax",
+                  elem_type ? elem_type->to_string() : "unknown");
+
+        return array_struct;
     }
 
     llvm::Type *TypeMapper::map_pointer(Cryo::PointerType *type)
