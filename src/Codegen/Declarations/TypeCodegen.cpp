@@ -543,14 +543,25 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating struct: {}", name);
 
+        llvm::StructType *struct_type = nullptr;
+
         // Check if already declared
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
         {
-            return existing;
+            // If already complete (non-opaque), just return it
+            if (!existing->isOpaque())
+            {
+                return existing;
+            }
+            // Otherwise, we'll complete the opaque struct below
+            struct_type = existing;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Completing opaque struct: {}", name);
         }
-
-        // Create opaque struct first (for recursive types)
-        llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), name);
+        else
+        {
+            // Create opaque struct first (for recursive types)
+            struct_type = llvm::StructType::create(llvm_ctx(), name);
+        }
 
         // Collect field types
         std::vector<llvm::Type *> field_types;
@@ -568,14 +579,24 @@ namespace Cryo::Codegen
             }
         }
 
-        // Set struct body
-        if (!field_types.empty())
-        {
-            struct_type->setBody(field_types);
-        }
+        // Set struct body - always set even if empty to mark as non-opaque
+        struct_type->setBody(field_types);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Set struct {} body with {} fields", name, field_types.size());
 
-        // Register type
+        // Register type in both context and TypeMapper cache for consistency
         ctx().register_type(name, struct_type);
+        types().register_struct(name, struct_type);
+
+        // Register field names for member access resolution
+        std::vector<std::string> field_names;
+        field_names.reserve(node->fields().size());
+        for (const auto &field : node->fields())
+        {
+            field_names.push_back(field->name());
+        }
+        ctx().register_struct_fields(name, field_names);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field names for struct {}",
+                  field_names.size(), name);
 
         return struct_type;
     }
@@ -588,14 +609,25 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating class: {}", name);
 
+        llvm::StructType *class_type = nullptr;
+
         // Check if already declared
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
         {
-            return existing;
+            // If already complete (non-opaque), just return it
+            if (!existing->isOpaque())
+            {
+                return existing;
+            }
+            // Otherwise, we'll complete the opaque struct below
+            class_type = existing;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Completing opaque class: {}", name);
         }
-
-        // Create opaque struct
-        llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), name);
+        else
+        {
+            // Create opaque struct
+            class_type = llvm::StructType::create(llvm_ctx(), name);
+        }
 
         // Collect field types
         std::vector<llvm::Type *> field_types;
@@ -613,14 +645,24 @@ namespace Cryo::Codegen
             }
         }
 
-        // Set class body
-        if (!field_types.empty())
-        {
-            class_type->setBody(field_types);
-        }
+        // Set class body - always set even if empty to mark as non-opaque
+        class_type->setBody(field_types);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Set class {} body with {} fields", name, field_types.size());
 
-        // Register type
+        // Register type in both context and TypeMapper cache for consistency
         ctx().register_type(name, class_type);
+        types().register_struct(name, class_type);
+
+        // Register field names for member access resolution
+        std::vector<std::string> field_names;
+        field_names.reserve(node->fields().size());
+        for (const auto &field : node->fields())
+        {
+            field_names.push_back(field->name());
+        }
+        ctx().register_struct_fields(name, field_names);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field names for class {}",
+                  field_names.size(), name);
 
         return class_type;
     }
