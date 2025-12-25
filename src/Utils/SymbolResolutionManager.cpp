@@ -443,12 +443,29 @@ namespace Cryo::SRM {
     }
 
     std::unique_ptr<TypeIdentifier> SymbolResolutionContext::create_type_identifier(
-        const std::string& type_name, 
-        Cryo::TypeKind kind, 
+        const std::string& type_name,
+        Cryo::TypeKind kind,
         const std::vector<Cryo::Type*>& template_params) const {
-        
+
         return std::make_unique<TypeIdentifier>(
             namespace_stack_, type_name, kind, template_params);
+    }
+
+    std::unique_ptr<QualifiedIdentifier> SymbolResolutionContext::create_qualified_identifier(
+        const std::string& name, Cryo::SymbolKind kind) const {
+
+        return std::make_unique<QualifiedIdentifier>(
+            namespace_stack_, name, kind);
+    }
+
+    std::unique_ptr<FunctionIdentifier> SymbolResolutionContext::create_function_identifier(
+        const std::string& name,
+        const std::vector<Cryo::Type*>& params,
+        Cryo::Type* return_type,
+        FunctionIdentifier::FunctionType func_type) const {
+
+        return std::make_unique<FunctionIdentifier>(
+            namespace_stack_, name, params, return_type, func_type);
     }
 
     void SymbolResolutionContext::dump_context(std::ostream& os) const {
