@@ -119,13 +119,42 @@ namespace Cryo::Codegen
             // For instance methods, we need to generate the receiver
             if (auto *member = dynamic_cast<MemberAccessNode *>(node->callee()))
             {
-                llvm::Value *receiver = generate_expression(member->object());
+                llvm::Value *receiver = nullptr;
+
+                // Check if the receiver object is itself a member access (e.g., this.heap_manager)
+                // In that case, we need the address (pointer) to the member, not the loaded value
+                if (auto *nested_member = dynamic_cast<MemberAccessNode *>(member->object()))
+                {
+                    // Generate member address for nested member access
+                    receiver = generate_member_receiver_address(nested_member);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Generated member address for nested receiver: {}",
+                              nested_member->member());
+                }
+                else
+                {
+                    // For simple receivers (like 'this'), generate the expression value
+                    receiver = generate_expression(member->object());
+                }
+
                 if (!receiver)
                 {
                     report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                                  "Failed to generate receiver for method call");
                     return nullptr;
                 }
+
+                // Ensure receiver is a pointer type (methods expect ptr to self)
+                if (!receiver->getType()->isPointerTy())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Method receiver is not a pointer, creating temporary storage");
+                    // Create an alloca to store the value and pass the pointer
+                    llvm::AllocaInst *temp = create_entry_alloca(receiver->getType(), "method.receiver.tmp");
+                    builder().CreateStore(receiver, temp);
+                    receiver = temp;
+                }
+
                 return generate_instance_method(node, member, receiver, member->member());
             }
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
@@ -1059,6 +1088,123 @@ namespace Cryo::Codegen
         // This delegates back to the main visitor
         expr->accept(*ctx().visitor());
         return get_result();
+    }
+
+    llvm::Value *CallCodegen::generate_member_receiver_address(Cryo::MemberAccessNode *node)
+    {
+        if (!node)
+            return nullptr;
+
+        std::string member_name = node->member();
+
+        // Generate the object expression to get the base pointer
+        llvm::Value *object = generate_expression(node->object());
+        if (!object)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_member_receiver_address: Failed to generate object");
+            return nullptr;
+        }
+
+        // Ensure we have a pointer to the struct
+        if (!object->getType()->isPointerTy())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_member_receiver_address: Object is not a pointer type");
+            return nullptr;
+        }
+
+        // Resolve struct type and field index
+        llvm::StructType *struct_type = nullptr;
+        std::string type_name;
+
+        // Get the resolved type of the object expression
+        Cryo::Type *obj_type = node->object()->get_resolved_type();
+        if (obj_type)
+        {
+            type_name = obj_type->to_string();
+            // Handle pointer types - get the pointee type name
+            if (obj_type->kind() == Cryo::TypeKind::Pointer)
+            {
+                auto *ptr_type = dynamic_cast<Cryo::PointerType *>(obj_type);
+                if (ptr_type && ptr_type->pointee_type())
+                {
+                    type_name = ptr_type->pointee_type()->to_string();
+                }
+            }
+            else if (!type_name.empty() && type_name.back() == '*')
+            {
+                type_name.pop_back();
+            }
+        }
+        else
+        {
+            // Fallback: Check if this is the 'this' identifier
+            if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node->object()))
+            {
+                if (identifier->name() == "this")
+                {
+                    // Try to get 'this' type from variable_types_map
+                    auto &var_types = ctx().variable_types_map();
+                    auto it = var_types.find("this");
+                    if (it != var_types.end() && it->second)
+                    {
+                        type_name = it->second->to_string();
+                        if (!type_name.empty() && type_name.back() == '*')
+                        {
+                            type_name.pop_back();
+                        }
+                    }
+                    else
+                    {
+                        // Fallback to current_type_name if available
+                        type_name = ctx().current_type_name();
+                    }
+                }
+            }
+        }
+
+        if (type_name.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_member_receiver_address: Could not determine type for member access");
+            return nullptr;
+        }
+
+        // Look up struct type in LLVM context
+        struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+        if (!struct_type)
+        {
+            // Try context registry
+            if (llvm::Type *type = ctx().get_type(type_name))
+            {
+                struct_type = llvm::dyn_cast<llvm::StructType>(type);
+            }
+        }
+
+        if (!struct_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_member_receiver_address: Struct type '{}' not found", type_name);
+            return nullptr;
+        }
+
+        // Look up field index
+        int field_idx = ctx().get_struct_field_index(type_name, member_name);
+        if (field_idx < 0)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_member_receiver_address: Field '{}' not found in struct '{}'",
+                      member_name, type_name);
+            return nullptr;
+        }
+
+        // Create GEP for field access - returns pointer to the member field
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "generate_member_receiver_address: Creating GEP for {}.{} at index {}",
+                  type_name, member_name, field_idx);
+        return create_struct_gep(struct_type, object, static_cast<unsigned>(field_idx),
+                                 member_name + ".ptr");
     }
 
     llvm::Function *CallCodegen::get_or_create_function(const std::string &name,
