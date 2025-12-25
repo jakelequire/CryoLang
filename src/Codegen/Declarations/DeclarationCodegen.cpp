@@ -829,6 +829,8 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen::generate_variable called for: {}", node->name());
+
         // Check if we're at global scope or function scope
         llvm::Function *current_fn = builder().GetInsertBlock()
                                          ? builder().GetInsertBlock()->getParent()
@@ -837,11 +839,15 @@ namespace Cryo::Codegen
         if (current_fn)
         {
             // Local variable
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: {} is local variable (in function {})",
+                      node->name(), current_fn->getName().str());
             generate_local_variable(node);
         }
         else
         {
             // Global variable
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: {} is global variable (no current function)",
+                      node->name());
             generate_global_variable(node);
         }
     }

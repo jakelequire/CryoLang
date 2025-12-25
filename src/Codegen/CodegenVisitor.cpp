@@ -181,25 +181,33 @@ namespace Cryo::Codegen
 
         // Pass 0: Process all enum declarations first (for enum variant resolution)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processing enum declarations");
+        int enum_count = 0;
         for (const auto &stmt : node.statements())
         {
             if (!stmt)
                 continue;
             // Check for direct EnumDeclarationNode
-            if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()))
+            if (auto *enum_decl = dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()))
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Found direct enum declaration: {}", enum_decl->name());
                 stmt->accept(*this);
+                enum_count++;
             }
             // Also check for DeclarationStatementNode wrapping an EnumDeclarationNode
             else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
             {
-                if (decl_stmt->declaration() &&
-                    dynamic_cast<Cryo::EnumDeclarationNode *>(decl_stmt->declaration()))
+                if (decl_stmt->declaration())
                 {
-                    stmt->accept(*this);
+                    if (auto *inner_enum = dynamic_cast<Cryo::EnumDeclarationNode *>(decl_stmt->declaration()))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Found wrapped enum declaration: {}", inner_enum->name());
+                        stmt->accept(*this);
+                        enum_count++;
+                    }
                 }
             }
         }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processed {} enum declarations", enum_count);
 
         // Pass 1: Process all struct/class type declarations (for type resolution)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 1: Processing struct/class type declarations");
@@ -227,25 +235,33 @@ namespace Cryo::Codegen
 
         // Pass 2: Process all global variable/constant declarations (for identifier resolution)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Processing global variable/constant declarations");
+        int var_count = 0;
         for (const auto &stmt : node.statements())
         {
             if (!stmt)
                 continue;
             // Check for direct VariableDeclarationNode
-            if (dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
+            if (auto *var_decl = dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Found direct variable declaration: {}", var_decl->name());
                 stmt->accept(*this);
+                var_count++;
             }
             // Also check for DeclarationStatementNode wrapping a VariableDeclarationNode
             else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
             {
-                if (decl_stmt->declaration() &&
-                    dynamic_cast<Cryo::VariableDeclarationNode *>(decl_stmt->declaration()))
+                if (decl_stmt->declaration())
                 {
-                    stmt->accept(*this);
+                    if (auto *inner_var = dynamic_cast<Cryo::VariableDeclarationNode *>(decl_stmt->declaration()))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Found wrapped variable declaration: {}", inner_var->name());
+                        stmt->accept(*this);
+                        var_count++;
+                    }
                 }
             }
         }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Processed {} global variable declarations", var_count);
 
         // Pass 3: Process remaining declarations (functions, impl blocks, extern blocks, etc.)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 3: Processing remaining declarations");
