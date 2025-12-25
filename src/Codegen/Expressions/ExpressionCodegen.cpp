@@ -411,6 +411,14 @@ namespace Cryo::Codegen
             return global;
         }
 
+        // Check enum variants map for constants
+        auto &enum_variants = ctx().enum_variants_map();
+        if (enum_variants.find(name) != enum_variants.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' as enum variant", name);
+            return enum_variants[name];
+        }
+
         // Use SRM to generate all possible name candidates
         // This handles: current namespace, imported namespaces, aliases, global scope
         auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Variable);
@@ -440,39 +448,41 @@ namespace Cryo::Codegen
             return func;
         }
 
-        // Not found - log detailed diagnostic at ERROR level
-        LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                  "lookup_variable: FAILED to find '{}'. Checking what's available...", name);
+        // Not found - log at DEBUG level instead of ERROR to avoid premature diagnostics
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "lookup_variable: '{}' not found in immediate lookup, may be forward-declared", name);
 
-        // Log if it exists in global values
+        // Log availability check at DEBUG level for troubleshooting
         if (values().has_global_value(name))
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                      "lookup_variable: '{}' EXISTS in has_global_value but get_global_value returned null?!", name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "lookup_variable: '{}' exists in global values but failed regular lookup", name);
         }
         else
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "lookup_variable: '{}' does NOT exist in global values", name);
         }
 
-        // Check module globals
+        // Check module globals at DEBUG level
         bool found_in_module = false;
         for (auto &gv : module()->globals())
         {
             if (gv.getName() == name)
             {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                          "lookup_variable: '{}' EXISTS in module globals but getGlobalVariable failed?!", name);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "lookup_variable: '{}' exists in module globals but getGlobalVariable failed", name);
                 found_in_module = true;
                 break;
             }
         }
         if (!found_in_module)
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "lookup_variable: '{}' does NOT exist in module globals", name);
         }
+
+        // Return nullptr to allow deferred resolution in later compilation phases
 
         return nullptr;
     }
@@ -1396,7 +1406,7 @@ namespace Cryo::Codegen
         }
 
         // Log failure for debugging
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Failed to find '{}'", qualified_name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Failed to find '{}'", qualified_name);
         auto &enum_variants = ctx().enum_variants_map();
         if (!enum_variants.empty() && enum_variants.size() <= 20)
         {
