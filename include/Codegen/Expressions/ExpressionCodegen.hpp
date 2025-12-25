@@ -79,6 +79,14 @@ namespace Cryo::Codegen
         llvm::Value *generate_integer_literal(int64_t value, Cryo::Type *type = nullptr);
 
         /**
+         * @brief Generate unsigned integer literal (for large unsigned values like U64_MAX)
+         * @param value Unsigned integer value
+         * @param type Target type (determines bit width)
+         * @return Constant unsigned integer value
+         */
+        llvm::Value *generate_unsigned_integer_literal(uint64_t value, Cryo::Type *type = nullptr);
+
+        /**
          * @brief Generate floating-point literal
          * @param value Float value
          * @param is_double Whether to use double (true) or float (false)

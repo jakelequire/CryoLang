@@ -333,6 +333,13 @@ namespace Cryo::Codegen
          */
         std::string qualify_runtime_function(const std::string &name);
 
+        /**
+         * @brief Get or create a C library function declaration
+         * @param name Function name (e.g., "printf", "sprintf")
+         * @return Function declaration, or nullptr if not a known C function
+         */
+        llvm::Function *get_or_create_c_function(const std::string &name);
+
         // Static sets for type checking
         static const std::unordered_set<std::string> _primitive_types;
         static const std::unordered_set<std::string> _runtime_functions;
