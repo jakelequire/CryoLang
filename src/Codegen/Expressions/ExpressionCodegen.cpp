@@ -1694,7 +1694,10 @@ namespace Cryo::Codegen
             builder().CreateStore(length_val, capacity_field_ptr);
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Created Array<T> instance with {} elements", elements.size());
-            return array_instance;
+
+            // Load and return the struct value, not the alloca pointer
+            // This is necessary because the caller will store this value into another alloca
+            return create_load(array_instance, struct_type, "array.value");
         }
         else
         {
