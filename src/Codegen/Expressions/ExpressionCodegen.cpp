@@ -1335,48 +1335,76 @@ namespace Cryo::Codegen
         // Build fully qualified name
         std::string qualified_name = node->scope_name() + "::" + node->member_name();
 
-        // Try to find as a function
-        if (llvm::Function *fn = module()->getFunction(qualified_name))
+        // Helper lambda to try finding a qualified name
+        auto try_find = [this](const std::string &name) -> llvm::Value *
         {
-            return fn;
-        }
+            // Try as function
+            if (llvm::Function *fn = module()->getFunction(name))
+                return fn;
 
-        // Try to find as a global variable
-        if (llvm::GlobalVariable *global = module()->getGlobalVariable(qualified_name))
-        {
-            return global;
-        }
+            // Try as global variable
+            if (llvm::GlobalVariable *global = module()->getGlobalVariable(name))
+                return global;
 
-        // Try context registry
-        if (llvm::Function *fn = ctx().get_function(qualified_name))
-        {
-            return fn;
-        }
+            // Try context function registry
+            if (llvm::Function *fn = ctx().get_function(name))
+                return fn;
 
-        // Try as enum variant
-        auto &enum_variants = ctx().enum_variants_map();
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Attempting to resolve: {} (enum map has {} entries)",
-                  qualified_name, enum_variants.size());
-        auto it = enum_variants.find(qualified_name);
-        if (it != enum_variants.end())
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Found enum variant: {}", qualified_name);
-            return it->second;
-        }
-
-        // Log available variants for debugging at ERROR level so it definitely shows
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Failed to find '{}' in enum variants", qualified_name);
-        if (!enum_variants.empty())
-        {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Available enum variants ({} total):", enum_variants.size());
-            for (const auto &[name, val] : enum_variants)
+            // Try as enum variant
+            auto &enum_variants = ctx().enum_variants_map();
+            auto it = enum_variants.find(name);
+            if (it != enum_variants.end())
             {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN, "  - {}", name);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Found enum variant: {}", name);
+                return it->second;
+            }
+
+            return nullptr;
+        };
+
+        // First try exact match
+        if (llvm::Value *result = try_find(qualified_name))
+        {
+            return result;
+        }
+
+        // Use SRM to generate lookup candidates for scope resolution
+        // This handles: current namespace prefix, imported namespaces, etc.
+        auto candidates = generate_lookup_candidates(qualified_name, Cryo::SymbolKind::Type);
+        for (const auto &candidate : candidates)
+        {
+            if (llvm::Value *result = try_find(candidate))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "ExpressionCodegen: Found '{}' as '{}'", qualified_name, candidate);
+                return result;
             }
         }
-        else
+
+        // Also try with just the member name in case scope is current namespace
+        auto member_candidates = generate_lookup_candidates(node->member_name(), Cryo::SymbolKind::Type);
+        for (const auto &candidate : member_candidates)
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Enum variants map is EMPTY!");
+            // Build candidate with original scope
+            std::string scoped_candidate = node->scope_name() + "::" + candidate;
+            if (llvm::Value *result = try_find(scoped_candidate))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "ExpressionCodegen: Found '{}' as '{}'", qualified_name, scoped_candidate);
+                return result;
+            }
+        }
+
+        // Log failure for debugging
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Failed to find '{}'", qualified_name);
+        auto &enum_variants = ctx().enum_variants_map();
+        if (!enum_variants.empty() && enum_variants.size() <= 20)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Available enum variants ({} total):", enum_variants.size());
+            for (const auto &[name, val] : enum_variants)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  - {}", name);
+            }
         }
 
         report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
