@@ -1194,8 +1194,186 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // TODO: Handle member access, array access
-        // These require more complex logic to compute the address
+        // Handle member access (e.g., this.field, obj.field)
+        if (auto *member = dynamic_cast<Cryo::MemberAccessNode *>(expr))
+        {
+            std::string member_name = member->member();
+
+            // Generate the object expression to get the base pointer
+            llvm::Value *object = generate_operand(member->object());
+            if (!object)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Failed to generate member access object");
+                return nullptr;
+            }
+
+            // Ensure we have a pointer to the struct
+            if (!object->getType()->isPointerTy())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Member access object is not a pointer type");
+                return nullptr;
+            }
+
+            // Resolve struct type and field index
+            llvm::StructType *struct_type = nullptr;
+            unsigned field_idx = 0;
+
+            // Get the resolved type of the object expression
+            Cryo::Type *obj_type = member->object()->get_resolved_type();
+            std::string type_name;
+
+            if (obj_type)
+            {
+                type_name = obj_type->to_string();
+                // Handle pointer types - get the pointee type name
+                if (obj_type->kind() == Cryo::TypeKind::Pointer)
+                {
+                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(obj_type);
+                    if (ptr_type && ptr_type->pointee_type())
+                    {
+                        type_name = ptr_type->pointee_type()->to_string();
+                    }
+                }
+                else if (!type_name.empty() && type_name.back() == '*')
+                {
+                    type_name.pop_back();
+                }
+            }
+            else
+            {
+                // Fallback: Check if this is the 'this' identifier
+                if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(member->object()))
+                {
+                    if (identifier->name() == "this")
+                    {
+                        // Try to get 'this' type from variable_types_map
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find("this");
+                        if (it != var_types.end() && it->second)
+                        {
+                            type_name = it->second->to_string();
+                            if (!type_name.empty() && type_name.back() == '*')
+                            {
+                                type_name.pop_back();
+                            }
+                        }
+                        else
+                        {
+                            // Fallback to current_type_name if available
+                            type_name = ctx().current_type_name();
+                        }
+                    }
+                }
+            }
+
+            if (type_name.empty())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Could not determine type for member access");
+                return nullptr;
+            }
+
+            // Look up struct type in LLVM context
+            struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+            if (!struct_type)
+            {
+                // Try context registry
+                if (llvm::Type *type = ctx().get_type(type_name))
+                {
+                    struct_type = llvm::dyn_cast<llvm::StructType>(type);
+                }
+            }
+
+            if (!struct_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Struct type '{}' not found", type_name);
+                return nullptr;
+            }
+
+            // Look up field index
+            int field_idx_signed = ctx().get_struct_field_index(type_name, member_name);
+            if (field_idx_signed < 0)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Field '{}' not found in struct '{}'",
+                          member_name, type_name);
+                return nullptr;
+            }
+            field_idx = static_cast<unsigned>(field_idx_signed);
+
+            // Create GEP for field access
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "get_lvalue_address: Creating GEP for {}.{} at index {}",
+                      type_name, member_name, field_idx);
+            return create_struct_gep(struct_type, object, field_idx, member_name + ".ptr");
+        }
+
+        // Handle array access (e.g., arr[i])
+        if (auto *array_access = dynamic_cast<Cryo::ArrayAccessNode *>(expr))
+        {
+            // Generate array pointer
+            llvm::Value *array_val = generate_operand(array_access->array());
+            if (!array_val)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Failed to generate array expression");
+                return nullptr;
+            }
+
+            // Generate index
+            llvm::Value *index_val = generate_operand(array_access->index());
+            if (!index_val)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Failed to generate array index");
+                return nullptr;
+            }
+
+            // Ensure array is a pointer
+            if (!array_val->getType()->isPointerTy())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Array expression is not a pointer type");
+                return nullptr;
+            }
+
+            // Determine element type
+            llvm::Type *element_type = nullptr;
+            Cryo::Type *array_type = array_access->array()->get_resolved_type();
+            if (array_type)
+            {
+                if (array_type->kind() == Cryo::TypeKind::Array)
+                {
+                    auto *arr_type = dynamic_cast<Cryo::ArrayType *>(array_type);
+                    if (arr_type && arr_type->element_type())
+                    {
+                        element_type = get_llvm_type(arr_type->element_type());
+                    }
+                }
+                else if (array_type->kind() == Cryo::TypeKind::Pointer)
+                {
+                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(array_type);
+                    if (ptr_type && ptr_type->pointee_type())
+                    {
+                        element_type = get_llvm_type(ptr_type->pointee_type());
+                    }
+                }
+            }
+
+            if (!element_type)
+            {
+                // Fallback to i8 as a generic byte type
+                element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Could not determine element type, using i8");
+            }
+
+            // Create GEP for array element access
+            return create_array_gep(element_type, array_val, index_val, "array.elem.ptr");
+        }
 
         return nullptr;
     }
