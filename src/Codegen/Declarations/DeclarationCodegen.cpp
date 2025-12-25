@@ -248,12 +248,26 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating local variable: {}", name);
 
         // Get variable type
-        llvm::Type *var_type = get_llvm_type(node->get_resolved_type());
+        Cryo::Type *cryo_var_type = node->get_resolved_type();
+        llvm::Type *var_type = get_llvm_type(cryo_var_type);
         if (!var_type)
         {
             report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
                          "Unknown type for variable: " + name);
             return nullptr;
+        }
+
+        // Debug: Log the LLVM type being used
+        {
+            std::string llvm_type_str;
+            llvm::raw_string_ostream rso(llvm_type_str);
+            var_type->print(rso);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Variable '{}' Cryo type: {}, LLVM type: {}, isStructTy: {}",
+                      name,
+                      cryo_var_type ? cryo_var_type->to_string() : "null",
+                      llvm_type_str,
+                      var_type->isStructTy() ? "true" : "false");
         }
 
         // Create alloca in entry block
