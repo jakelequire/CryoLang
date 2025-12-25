@@ -281,6 +281,30 @@ namespace Cryo::Codegen
         // Register in value context
         values().set_value(name, nullptr, alloca);
 
+        // Register the variable type in variable_types_map for Array<T> detection
+        Cryo::Type *resolved_type = node->get_resolved_type();
+        if (resolved_type)
+        {
+            ctx().variable_types_map()[name] = resolved_type;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Registered local variable type: {} -> {} (kind: {})",
+                      name, resolved_type->to_string(),
+                      static_cast<int>(resolved_type->kind()));
+
+            // Special logging for potential Array<T> types
+            if (resolved_type->kind() == TypeKind::Array || resolved_type->to_string().find("[]") != std::string::npos)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: *** Registered Array<T> variable: {} with type: {}",
+                          name, resolved_type->to_string());
+            }
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: No resolved type available for local variable: {}", name);
+        }
+
         return alloca;
     }
 
@@ -374,6 +398,21 @@ namespace Cryo::Codegen
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Registered global variable: {}", name);
+
+        // Register the variable type in variable_types_map for Array<T> detection
+        if (cryo_type)
+        {
+            ctx().variable_types_map()[name] = cryo_type;
+            // Also register qualified name if exists
+            if (!ns_context.empty())
+            {
+                std::string qualified_name = ns_context + "::" + name;
+                ctx().variable_types_map()[qualified_name] = cryo_type;
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Registered global variable type: {} -> {}",
+                      name, cryo_type->to_string());
+        }
 
         return global;
     }

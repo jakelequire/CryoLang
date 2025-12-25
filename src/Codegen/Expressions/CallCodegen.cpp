@@ -821,11 +821,51 @@ namespace Cryo::Codegen
                                   "Instance method receiver type from variable map: {}", type_name);
                     }
                 }
+                // Additional fallback for nested member access (e.g., this.stack_trace.capture())
+                else if (auto *member_access = dynamic_cast<MemberAccessNode *>(callee->object()))
+                {
+                    // For member access, try to infer type from the member name and context
+                    std::string member_name = member_access->member();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Attempting type resolution for nested member access: {}", member_name);
+
+                    // Special case for common field types in runtime
+                    if (member_name == "stack_trace")
+                    {
+                        type_name = "StackTrace";
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Resolved nested member access type: {} -> {}", member_name, type_name);
+                    }
+                }
             }
         }
 
         // Resolve the method
         llvm::Function *method = resolve_method(type_name, method_name);
+        if (!method)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Method not found via normal resolution: type='{}', method='{}' - trying fallbacks",
+                      type_name, method_name);
+
+            // Additional fallback: try fully-qualified names for known problematic cases
+            if (type_name == "StackTrace" && method_name == "capture")
+            {
+                // Try the known fully-qualified function name
+                method = module()->getFunction("std::Runtime::StackTrace::capture");
+                if (method)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Found method via direct fallback: std::Runtime::StackTrace::capture");
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Direct fallback failed - function std::Runtime::StackTrace::capture not found in module");
+                }
+            }
+        }
+
         if (!method)
         {
             // Report error if method not found

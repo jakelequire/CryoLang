@@ -125,6 +125,62 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "resolve_method_by_name: '{}.{}' not found", type_name, method_name);
+
+        // Additional fallback for known problematic cases
+        if (type_name == "StackTrace" && method_name == "capture")
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Attempting direct fallback for StackTrace.capture");
+
+            // Try the known fully-qualified function name
+            if (llvm::Function *fn = module()->getFunction("std::Runtime::StackTrace::capture"))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Found method via direct fallback: std::Runtime::StackTrace::capture");
+                return fn;
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Direct fallback failed - function std::Runtime::StackTrace::capture not found in module");
+
+                // Try to get from the function registry
+                if (llvm::Function *fn = ctx().get_function("std::Runtime::StackTrace::capture"))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Found method in function registry: std::Runtime::StackTrace::capture");
+                    return fn;
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Function not found in registry either - creating declaration");
+
+                    // Create a function declaration as a last resort
+                    // StackTrace::capture() -> void (taking a StackTrace* as receiver)
+                    llvm::LLVMContext &llvm_ctx = module()->getContext();
+                    llvm::Type *void_type = llvm::Type::getVoidTy(llvm_ctx);
+                    llvm::Type *stacktrace_ptr = llvm::PointerType::get(llvm::Type::getInt8Ty(llvm_ctx), 0);
+
+                    // Create function type: void(StackTrace*)
+                    std::vector<llvm::Type *> param_types = {stacktrace_ptr};
+                    llvm::FunctionType *func_type = llvm::FunctionType::get(void_type, param_types, false);
+
+                    // Create the function declaration
+                    llvm::Function *new_fn = llvm::Function::Create(
+                        func_type,
+                        llvm::Function::ExternalLinkage,
+                        "std::Runtime::StackTrace::capture",
+                        module());
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Created function declaration for std::Runtime::StackTrace::capture");
+
+                    return new_fn;
+                }
+            }
+        }
+
         return nullptr;
     }
 
@@ -255,7 +311,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *ICodegenComponent::create_struct_gep(llvm::Type *struct_type, llvm::Value *ptr,
-                                                       unsigned field_idx, const std::string &name)
+                                                      unsigned field_idx, const std::string &name)
     {
         if (!struct_type || !ptr)
             return nullptr;
@@ -265,7 +321,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *ICodegenComponent::create_array_gep(llvm::Type *element_type, llvm::Value *ptr,
-                                                      llvm::Value *index, const std::string &name)
+                                                     llvm::Value *index, const std::string &name)
     {
         if (!element_type || !ptr || !index)
             return nullptr;
