@@ -97,10 +97,11 @@ namespace Cryo::Codegen
 
         // Wire TypeMapper to GenericCodegen for parameterized type instantiation
         // This allows TypeMapper to delegate generic type instantiation to GenericCodegen
-        GenericCodegen* generics_ptr = _generics.get();
+        GenericCodegen *generics_ptr = _generics.get();
         _ctx->types().set_generic_instantiator(
-            [generics_ptr](const std::string& generic_name,
-                           const std::vector<Cryo::Type*>& type_args) -> llvm::StructType* {
+            [generics_ptr](const std::string &generic_name,
+                           const std::vector<Cryo::Type *> &type_args) -> llvm::StructType *
+            {
                 return generics_ptr->instantiate_struct(generic_name, type_args);
             });
 
@@ -316,6 +317,9 @@ namespace Cryo::Codegen
 
             // Two-pass approach: First generate all method declarations (forward references)
             // This ensures that methods can call other methods defined later in the class
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Pass 1: Generating method declarations for class {}", node.name());
+
             for (const auto &method : node.methods())
             {
                 if (method)
@@ -325,11 +329,14 @@ namespace Cryo::Codegen
             }
 
             // Second pass: Generate method bodies
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Pass 2: Generating method bodies for class {}", node.name());
+
             for (const auto &method : node.methods())
             {
                 if (method)
                 {
-                    // Generate the method with qualified name (ClassName::methodName)
+                    // Generate the method body (declaration already exists)
                     _declarations->generate_method(method.get());
                 }
             }

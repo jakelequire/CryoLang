@@ -879,6 +879,24 @@ namespace Cryo::Codegen
                 llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
                 create_store(&arg, alloca);
                 values().set_value(arg.getName().str(), nullptr, alloca);
+
+                // Register 'this' type in variable_types_map for member access resolution
+                if (arg.getName() == "this")
+                {
+                    // Get the Cryo type for the current struct/class
+                    Cryo::Type *this_type = ctx().symbols().get_type_context()->get_struct_type(parent_type);
+                    if (!this_type)
+                    {
+                        this_type = ctx().symbols().get_type_context()->get_class_type(parent_type);
+                    }
+                    if (this_type)
+                    {
+                        ctx().variable_types_map()["this"] = this_type;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Registered 'this' type for struct method: {} -> {}",
+                                  parent_type, this_type->to_string());
+                    }
+                }
             }
 
             // Generate body
@@ -975,6 +993,10 @@ namespace Cryo::Codegen
 
         // Two-pass approach: First generate all method declarations (forward references)
         // This ensures that methods can call other methods defined later in the impl block
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Pass 1: Generating {} method declarations for {}",
+                  node->method_implementations().size(), type_name);
+
         for (const auto &method : node->method_implementations())
         {
             Cryo::StructMethodNode *fn_node = method.get();
@@ -985,6 +1007,9 @@ namespace Cryo::Codegen
         }
 
         // Second pass: Generate method bodies
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Pass 2: Generating method bodies for {}", type_name);
+
         for (const auto &method : node->method_implementations())
         {
             // StructMethodNode IS a FunctionDeclarationNode
@@ -992,10 +1017,10 @@ namespace Cryo::Codegen
             if (!fn_node)
                 continue;
 
-            // Generate as a method with the type prefix
+            // Generate method body
             if (fn_node->body())
             {
-                // Full definition
+                // Full definition - function should already be declared
                 std::string method_name = generate_method_name(type_name, fn_node->name());
                 llvm::Function *fn = module()->getFunction(method_name);
                 if (fn && fn->empty())
@@ -1021,6 +1046,24 @@ namespace Cryo::Codegen
                         llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
                         create_store(&arg, alloca);
                         values().set_value(arg.getName().str(), nullptr, alloca);
+
+                        // Register 'this' type in variable_types_map for member access resolution
+                        if (arg.getName() == "this")
+                        {
+                            // Get the Cryo type for the current struct/class
+                            Cryo::Type *this_type = ctx().symbols().get_type_context()->get_struct_type(type_name);
+                            if (!this_type)
+                            {
+                                this_type = ctx().symbols().get_type_context()->get_class_type(type_name);
+                            }
+                            if (this_type)
+                            {
+                                ctx().variable_types_map()["this"] = this_type;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Registered 'this' type for method: {} -> {}",
+                                          type_name, this_type->to_string());
+                            }
+                        }
                     }
 
                     // Generate body
@@ -1047,6 +1090,7 @@ namespace Cryo::Codegen
                     ctx().set_result(nullptr);
                 }
             }
+            // Note: methods without bodies were already declared in pass 1
         }
 
         // Restore previous type context

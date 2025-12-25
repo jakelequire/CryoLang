@@ -853,9 +853,64 @@ namespace Cryo::Codegen
         Cryo::Type *obj_type = object->get_resolved_type();
         if (!obj_type)
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_member_info: No resolved type for object");
-            return false;
+            // Fallback: Check if this is the 'this' identifier
+            if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(object))
+            {
+                if (identifier->name() == "this")
+                {
+                    // Try to get 'this' type from variable_types_map
+                    auto &var_types = ctx().variable_types_map();
+                    auto it = var_types.find("this");
+                    if (it != var_types.end() && it->second)
+                    {
+                        obj_type = it->second;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_member_info: Resolved 'this' type from variable_types_map: {}",
+                                  obj_type->to_string());
+                    }
+                    else
+                    {
+                        // Fallback to current_type_name if available
+                        const std::string &current_type = ctx().current_type_name();
+                        if (!current_type.empty())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: Using current_type_name for 'this': {}",
+                                      current_type);
+
+                            // Look up the struct type directly
+                            out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), current_type);
+                            if (!out_struct_type)
+                            {
+                                if (llvm::Type *type = ctx().get_type(current_type))
+                                {
+                                    out_struct_type = llvm::dyn_cast<llvm::StructType>(type);
+                                }
+                            }
+
+                            if (out_struct_type)
+                            {
+                                int field_idx = ctx().get_struct_field_index(current_type, member_name);
+                                if (field_idx >= 0)
+                                {
+                                    out_field_idx = static_cast<unsigned>(field_idx);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_member_info: Resolved this.{} to index {} via current_type_name",
+                                              member_name, out_field_idx);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!obj_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_member_info: No resolved type for object");
+                return false;
+            }
         }
 
         // Get type name (handle pointer types)
