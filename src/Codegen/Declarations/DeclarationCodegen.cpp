@@ -794,17 +794,45 @@ namespace Cryo::Codegen
                     // Cast to target type if needed
                     if (constant->getType() != type)
                     {
-                        // Handle integer to integer casts
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_global_initializer: Casting for '{}' from source to target type",
+                                  node->name());
+
+                        // Handle integer to integer casts (with proper bit width handling)
                         if (constant->getType()->isIntegerTy() && type->isIntegerTy())
                         {
                             if (auto constInt = llvm::dyn_cast<llvm::ConstantInt>(constant))
                             {
                                 llvm::IntegerType *dstIntTy = llvm::cast<llvm::IntegerType>(type);
-                                return llvm::ConstantInt::get(dstIntTy, constInt->getValue());
+                                llvm::APInt value = constInt->getValue();
+
+                                // Extend or truncate the APInt to match destination bit width
+                                unsigned srcBits = value.getBitWidth();
+                                unsigned dstBits = dstIntTy->getBitWidth();
+
+                                if (dstBits > srcBits)
+                                {
+                                    // Zero-extend for unsigned types
+                                    value = value.zext(dstBits);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "generate_global_initializer: Zero-extended {} bits -> {} bits for '{}'",
+                                              srcBits, dstBits, node->name());
+                                }
+                                else if (dstBits < srcBits)
+                                {
+                                    // Truncate
+                                    value = value.trunc(dstBits);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "generate_global_initializer: Truncated {} bits -> {} bits for '{}'",
+                                              srcBits, dstBits, node->name());
+                                }
+
+                                return llvm::ConstantInt::get(dstIntTy, value);
                             }
                             // Fallback: use bitcast or return as-is
                             return constant;
                         }
+
                         // Handle float to float casts
                         if (constant->getType()->isFloatingPointTy() && type->isFloatingPointTy())
                         {
@@ -822,6 +850,24 @@ namespace Cryo::Codegen
                             // Fallback: use bitcast or return as-is
                             return constant;
                         }
+
+                        // Handle float to integer casts (for hex literals that got parsed as float)
+                        if (constant->getType()->isFloatingPointTy() && type->isIntegerTy())
+                        {
+                            if (auto constFP = llvm::dyn_cast<llvm::ConstantFP>(constant))
+                            {
+                                llvm::IntegerType *dstIntTy = llvm::cast<llvm::IntegerType>(type);
+                                // Convert double to integer by reinterpreting the bit pattern
+                                // This handles cases like 0xDEADBEEF being parsed as float
+                                double fpVal = constFP->getValueAPF().convertToDouble();
+                                uint64_t intVal = static_cast<uint64_t>(fpVal);
+                                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                         "generate_global_initializer: Converting float {} to int {} for '{}' (possible literal parsing issue)",
+                                         fpVal, intVal, node->name());
+                                return llvm::ConstantInt::get(dstIntTy, intVal);
+                            }
+                        }
+
                         // For other cases, just use the constant as-is and let LLVM handle it
                         LOG_WARN(Cryo::LogComponent::CODEGEN,
                                  "Global initializer type mismatch for '{}', may cause issues",
