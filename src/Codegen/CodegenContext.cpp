@@ -1,5 +1,7 @@
 #include "Codegen/CodegenContext.hpp"
 #include "Utils/Logger.hpp"
+#include "Utils/SymbolResolutionManager.hpp"
+#include <sstream>
 
 namespace Cryo::Codegen
 {
@@ -155,6 +157,53 @@ namespace Cryo::Codegen
         if (_diagnostics)
         {
             _diagnostic_builder = std::make_unique<CodegenDiagnosticBuilder>(_diagnostics, source_file);
+        }
+
+        // Sync SRM context with namespace
+        // Parse namespace_ctx (e.g., "std::Runtime") and push to SRM stack
+        if (!namespace_ctx.empty() && _srm_context)
+        {
+            // First, clear any existing namespace stack in SRM
+            while (!_srm_context->get_current_namespace_path().empty())
+            {
+                _srm_context->pop_namespace();
+            }
+
+            // Parse the namespace context into parts (split on "::")
+            std::vector<std::string> ns_parts;
+            size_t start = 0;
+            size_t end = 0;
+            while ((end = namespace_ctx.find("::", start)) != std::string::npos)
+            {
+                std::string part = namespace_ctx.substr(start, end - start);
+                if (!part.empty())
+                {
+                    ns_parts.push_back(part);
+                }
+                start = end + 2; // Skip "::"
+            }
+            // Add the last part
+            if (start < namespace_ctx.length())
+            {
+                std::string last_part = namespace_ctx.substr(start);
+                if (!last_part.empty())
+                {
+                    ns_parts.push_back(last_part);
+                }
+            }
+
+            // Push each namespace part to SRM
+            for (const auto &ns_part : ns_parts)
+            {
+                _srm_context->push_namespace(ns_part);
+            }
+
+            // Also add the full namespace as an imported namespace
+            _srm_context->add_imported_namespace(namespace_ctx);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "SRM context synced with namespace: '{}' ({} parts)",
+                      namespace_ctx, ns_parts.size());
         }
     }
 
