@@ -415,56 +415,24 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating struct constructor for: {}", type_name);
 
-        // Try to resolve the type name with namespace prefix if needed
+        // Use SRM-based type resolution to find the struct type
+        // This handles: current namespace, imported namespaces, aliases, global scope
+        llvm::Type *struct_type = resolve_type_by_name(type_name);
+
+        // Determine the resolved type name for constructor lookup
         std::string resolved_type_name = type_name;
-        llvm::Type *struct_type = ctx().get_type(type_name);
-
-        // If not found, try with namespace prefix
-        if (!struct_type || !struct_type->isStructTy())
+        if (struct_type)
         {
-            std::string current_ns = ctx().namespace_context();
-            if (!current_ns.empty())
+            // Try to get the actual qualified name from the candidates
+            auto candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+            for (const auto &candidate : candidates)
             {
-                std::string ns_qualified = current_ns + "::" + type_name;
-                struct_type = ctx().get_type(ns_qualified);
-                if (struct_type && struct_type->isStructTy())
+                if (ctx().get_type(candidate) == struct_type ||
+                    llvm::StructType::getTypeByName(llvm_ctx(), candidate) == struct_type)
                 {
-                    resolved_type_name = ns_qualified;
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "Resolved struct type with namespace: {}", resolved_type_name);
-                }
-            }
-        }
-
-        // Try common namespace prefixes
-        if (!struct_type || !struct_type->isStructTy())
-        {
-            static const std::vector<std::string> common_namespaces = {
-                "std::Runtime::", "std::core::", "std::IO::"};
-
-            for (const auto &ns : common_namespaces)
-            {
-                std::string ns_qualified = ns + type_name;
-                struct_type = ctx().get_type(ns_qualified);
-                if (struct_type && struct_type->isStructTy())
-                {
-                    resolved_type_name = ns_qualified;
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "Resolved struct type in namespace: {}", resolved_type_name);
+                    resolved_type_name = candidate;
                     break;
                 }
-            }
-        }
-
-        // Last resort: try LLVM context directly
-        if (!struct_type || !struct_type->isStructTy())
-        {
-            llvm::StructType *st = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
-            if (st)
-            {
-                struct_type = st;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "Found struct type in LLVM context: {}", type_name);
             }
         }
 
@@ -1006,51 +974,14 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_function: Looking up '{}'", name);
 
-        // Try direct lookup in LLVM module first (primary source of truth)
-        llvm::Function *fn = module()->getFunction(name);
+        // Use SRM-based function resolution
+        // This handles: current namespace, imported namespaces, aliases, global scope
+        llvm::Function *fn = resolve_function_by_name(name);
         if (fn)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_function: Found '{}' -> LLVM name '{}'",
                       name, fn->getName().str());
             return fn;
-        }
-
-        // Try in context's function registry (for forward declarations, templates, etc.)
-        fn = ctx().get_function(name);
-        if (fn)
-            return fn;
-
-        // Try with current namespace prefix using SRM
-        std::string qualified = ctx().namespace_context().empty()
-                                    ? name
-                                    : ctx().namespace_context() + "::" + name;
-
-        if (qualified != name)
-        {
-            fn = module()->getFunction(qualified);
-            if (fn)
-                return fn;
-
-            fn = ctx().get_function(qualified);
-            if (fn)
-                return fn;
-        }
-
-        // Try to find in imported namespaces
-        // Common patterns: std::IO::printf, std::Runtime::...
-        static const std::vector<std::string> common_namespaces = {
-            "std::IO::", "std::Runtime::", "std::core::", "IO::"};
-
-        for (const auto &ns : common_namespaces)
-        {
-            std::string ns_qualified = ns + name;
-            fn = module()->getFunction(ns_qualified);
-            if (fn)
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_function: Found '{}' in namespace -> '{}'", name, ns_qualified);
-                return fn;
-            }
         }
 
         // Check for common C library functions and create declarations if needed
@@ -1171,136 +1102,59 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Try fully qualified name in LLVM module
-        std::string qualified = type_name + "::" + method_name;
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "resolve_method: Trying '{}'", qualified);
-
-        llvm::Function *fn = module()->getFunction(qualified);
-        if (fn)
-            return fn;
-
-        // Try in context's function registry
-        fn = ctx().get_function(qualified);
-        if (fn)
-            return fn;
-
-        // Try with current namespace prefix
-        std::string current_ns = ctx().namespace_context();
-        if (!current_ns.empty())
-        {
-            std::string ns_qualified = current_ns + "::" + qualified;
-            fn = module()->getFunction(ns_qualified);
-            if (fn)
-                return fn;
-        }
-
-        // Try common namespace prefixes
-        static const std::vector<std::string> common_namespaces = {
-            "std::Runtime::", "std::core::", "std::IO::", "Runtime::"};
-
-        for (const auto &ns : common_namespaces)
-        {
-            std::string ns_qualified = ns + qualified;
-            fn = module()->getFunction(ns_qualified);
-            if (fn)
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_method: Found '{}' in namespace -> '{}'", method_name, ns_qualified);
-                return fn;
-            }
-        }
-
-        return nullptr;
+        // Use SRM-based method resolution
+        // This handles: namespace qualification, imports, and aliases
+        return resolve_method_by_name(type_name, method_name);
     }
 
     llvm::Function *CallCodegen::resolve_constructor(const std::string &type_name,
                                                      const std::vector<llvm::Type *> &arg_types)
     {
-        // Extract the simple type name (last component) for constructor patterns
-        std::string simple_name = type_name;
-        size_t last_sep = type_name.rfind("::");
-        if (last_sep != std::string::npos)
-        {
-            simple_name = type_name.substr(last_sep + 2);
-        }
-
-        // Try "Type::init", "Type::new", and "Type::Type" patterns
-        std::vector<std::string> ctor_names = {
-            type_name + "::init",
-            type_name + "::new",
-            type_name + "::" + simple_name};
-
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "resolve_constructor: Looking for constructor of type '{}' (simple name: '{}')",
-                  type_name, simple_name);
+                  "resolve_constructor: Looking for constructor of type '{}'", type_name);
 
-        for (const auto &ctor_name : ctor_names)
+        // Generate type candidates using SRM
+        auto type_candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+
+        // Extract simple name for constructor patterns
+        auto get_simple_name = [](const std::string &name) -> std::string
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_constructor: Trying '{}'", ctor_name);
+            size_t last_sep = name.rfind("::");
+            return (last_sep != std::string::npos) ? name.substr(last_sep + 2) : name;
+        };
 
-            // Check LLVM module first
-            llvm::Function *fn = module()->getFunction(ctor_name);
-            if (fn)
+        // For each type candidate, try constructor patterns
+        for (const auto &type_candidate : type_candidates)
+        {
+            std::string simple_name = get_simple_name(type_candidate);
+
+            // Try "Type::init", "Type::new", and "Type::Type" patterns
+            std::vector<std::string> ctor_names = {
+                type_candidate + "::init",
+                type_candidate + "::new",
+                type_candidate + "::" + simple_name};
+
+            for (const auto &ctor_name : ctor_names)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_constructor: Found '{}' in module", ctor_name);
-                return fn;
-            }
+                          "resolve_constructor: Trying '{}'", ctor_name);
 
-            // Check context's function registry
-            fn = ctx().get_function(ctor_name);
-            if (fn)
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_constructor: Found '{}' in function registry", ctor_name);
-                return fn;
-            }
-        }
-
-        // If type_name is not namespace-qualified, try adding namespace prefixes
-        if (type_name.find("::") == std::string::npos)
-        {
-            // Try with current namespace
-            std::string current_ns = ctx().namespace_context();
-            if (!current_ns.empty())
-            {
-                std::string ns_type = current_ns + "::" + type_name;
-                llvm::Function *fn = resolve_constructor(ns_type, arg_types);
+                // Check LLVM module first
+                llvm::Function *fn = module()->getFunction(ctor_name);
                 if (fn)
-                    return fn;
-            }
-
-            // Try common namespaces
-            static const std::vector<std::string> common_namespaces = {
-                "std::Runtime", "std::core", "std::IO"};
-
-            for (const auto &ns : common_namespaces)
-            {
-                std::string ns_type = ns + "::" + type_name;
-                // Build constructor names for this namespace
-                std::vector<std::string> ns_ctor_names = {
-                    ns_type + "::init",
-                    ns_type + "::new",
-                    ns_type + "::" + type_name};
-
-                for (const auto &ctor_name : ns_ctor_names)
                 {
-                    llvm::Function *fn = module()->getFunction(ctor_name);
-                    if (fn)
-                    {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "resolve_constructor: Found '{}' with namespace prefix", ctor_name);
-                        return fn;
-                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_constructor: Found '{}' in module", ctor_name);
+                    return fn;
+                }
 
-                    fn = ctx().get_function(ctor_name);
-                    if (fn)
-                    {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "resolve_constructor: Found '{}' in registry with namespace", ctor_name);
-                        return fn;
-                    }
+                // Check context's function registry
+                fn = ctx().get_function(ctor_name);
+                if (fn)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_constructor: Found '{}' in function registry", ctor_name);
+                    return fn;
                 }
             }
         }
@@ -1343,52 +1197,33 @@ namespace Cryo::Codegen
 
     bool CallCodegen::is_struct_type(const std::string &name) const
     {
-        // Check in type registry - first without namespace
-        llvm::Type *type = const_cast<CodegenContext &>(ctx()).get_type(name);
-        if (type && type->isStructTy())
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "is_struct_type: Found '{}' in type registry", name);
-            return true;
-        }
+        // Use SRM to generate type candidates and check if any is a struct type
+        auto &non_const_ctx = const_cast<CodegenContext &>(ctx());
+        auto candidates = non_const_ctx.srm().generate_lookup_candidates(name, Cryo::SymbolKind::Type);
 
-        // Try with namespace prefix
-        std::string current_ns = const_cast<CodegenContext &>(ctx()).namespace_context();
-        if (!current_ns.empty())
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "is_struct_type: Checking '{}' with {} candidates", name, candidates.size());
+
+        for (const auto &candidate : candidates)
         {
-            std::string ns_qualified = current_ns + "::" + name;
-            type = const_cast<CodegenContext &>(ctx()).get_type(ns_qualified);
+            // Check in type registry
+            llvm::Type *type = non_const_ctx.get_type(candidate);
             if (type && type->isStructTy())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "is_struct_type: Found '{}' with namespace prefix as '{}'", name, ns_qualified);
+                          "is_struct_type: Found '{}' as '{}'", name, candidate);
                 return true;
             }
-        }
 
-        // Try common namespace prefixes
-        static const std::vector<std::string> common_namespaces = {
-            "std::Runtime::", "std::core::", "std::IO::"};
-
-        for (const auto &ns : common_namespaces)
-        {
-            std::string ns_qualified = ns + name;
-            type = const_cast<CodegenContext &>(ctx()).get_type(ns_qualified);
-            if (type && type->isStructTy())
+            // Check LLVM context directly
+            llvm::StructType *struct_type = llvm::StructType::getTypeByName(
+                non_const_ctx.llvm_context(), candidate);
+            if (struct_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "is_struct_type: Found '{}' in namespace '{}'", name, ns_qualified);
+                          "is_struct_type: Found '{}' in LLVM context as '{}'", name, candidate);
                 return true;
             }
-        }
-
-        // Also try looking up by name in LLVM context directly
-        llvm::StructType *struct_type = llvm::StructType::getTypeByName(
-            const_cast<CodegenContext &>(ctx()).llvm_context(), name);
-        if (struct_type)
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "is_struct_type: Found '{}' in LLVM context", name);
-            return true;
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "is_struct_type: '{}' not found as struct type", name);
@@ -1596,12 +1431,23 @@ namespace Cryo::Codegen
 
     std::string CallCodegen::qualify_runtime_function(const std::string &name)
     {
-        // Runtime functions are typically in std::Runtime namespace
-        if (name.find("::") == std::string::npos)
+        // If already qualified, return as-is
+        if (name.find("::") != std::string::npos)
         {
-            return "std::Runtime::" + name;
+            return name;
         }
-        return name;
+
+        // Try to find the function using SRM-based resolution first
+        // This will check imported namespaces and aliases
+        llvm::Function *fn = resolve_function_by_name(name);
+        if (fn)
+        {
+            return fn->getName().str();
+        }
+
+        // Fallback: use SRM to qualify with current namespace context
+        // Runtime functions are registered with their full namespace during codegen
+        return qualify_symbol_name(name, Cryo::SymbolKind::Function);
     }
 
 } // namespace Cryo::Codegen
