@@ -1497,12 +1497,12 @@ namespace Cryo
         if (func_name == "_user_main_")
         {
             // Create argc: i32 parameter
-            Type *i32_type = _context.types().get_int32_type();
+            Type *i32_type = _context.types().get_i32_type();
             auto argc_param = _builder.create_variable_declaration(start_loc, "argc", i32_type);
             func_decl->add_parameter(std::move(argc_param));
 
             // Create argv: ptr parameter (pointer to string array)
-            Type *ptr_type = _context.types().get_pointer_type(_context.types().get_int8_type());
+            Type *ptr_type = _context.types().create_pointer_type(_context.types().get_i8_type());
             auto argv_param = _builder.create_variable_declaration(start_loc, "argv", ptr_type);
             func_decl->add_parameter(std::move(argv_param));
         }
