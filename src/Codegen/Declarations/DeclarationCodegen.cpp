@@ -132,11 +132,24 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating method: {}::{}",
                   parent_type, node->name());
 
-        // Generate qualified method name
-        std::string method_name = generate_method_name(parent_type, node->name());
+        // Generate base method name (Type::method)
+        std::string base_method_name = generate_method_name(parent_type, node->name());
 
-        // Check if already declared
-        if (llvm::Function *existing = module()->getFunction(method_name))
+        // Build fully-qualified name if we have a namespace context
+        std::string ns_context = ctx().namespace_context();
+        std::string llvm_fn_name = base_method_name;
+        if (!ns_context.empty())
+        {
+            // Use fully-qualified name: namespace::Type::method
+            llvm_fn_name = ns_context + "::" + base_method_name;
+        }
+
+        // Check if already declared (check both names to handle existing declarations)
+        if (llvm::Function *existing = module()->getFunction(llvm_fn_name))
+        {
+            return existing;
+        }
+        if (llvm::Function *existing = module()->getFunction(base_method_name))
         {
             return existing;
         }
@@ -146,13 +159,13 @@ namespace Cryo::Codegen
         if (!fn_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
-                         "Failed to get method type for: " + method_name);
+                         "Failed to get method type for: " + llvm_fn_name);
             return nullptr;
         }
 
-        // Create function
+        // Create function with fully-qualified name
         llvm::Function *fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
-                                                    method_name, module());
+                                                    llvm_fn_name, module());
 
         // Name parameters (first is 'this')
         auto arg_it = fn->arg_begin();
@@ -172,18 +185,18 @@ namespace Cryo::Codegen
             }
         }
 
-        // Register with simple type name (e.g., StackTrace::capture)
-        ctx().register_function(method_name, fn);
-
-        // Also register with fully-qualified namespace path for SRM-based lookups
-        std::string ns_context = ctx().namespace_context();
-        if (!ns_context.empty())
+        // Register with both names for lookups
+        ctx().register_function(llvm_fn_name, fn);
+        if (llvm_fn_name != base_method_name)
         {
-            // Build qualified name: namespace::Type::method
-            std::string qualified_method = ns_context + "::" + method_name;
-            ctx().register_function(qualified_method, fn);
+            ctx().register_function(base_method_name, fn);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Also registered method as: {}", qualified_method);
+                      "DeclarationCodegen: Registered method as: {} (also as {})", llvm_fn_name, base_method_name);
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Registered method as: {}", llvm_fn_name);
         }
 
         return fn;
@@ -1067,16 +1080,24 @@ namespace Cryo::Codegen
 
         // Get the parent type name from context
         std::string parent_type = ctx().current_type_name();
-        std::string method_name = generate_method_name(parent_type, node->name());
+        std::string base_method_name = generate_method_name(parent_type, node->name());
 
-        // Generate method declaration
+        // Build fully-qualified name for logging
+        std::string ns_context = ctx().namespace_context();
+        std::string method_name = base_method_name;
+        if (!ns_context.empty())
+        {
+            method_name = ns_context + "::" + base_method_name;
+        }
+
+        // Generate method declaration (will return existing if already created)
         llvm::Function *fn = generate_method_declaration(node, parent_type);
 
         // If the method has a body and the function is empty, generate the body
         if (fn && node->body() && fn->empty())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Generating body for method: {}", method_name);
+                      "DeclarationCodegen: Generating body for method: {}", fn->getName().str());
 
             // Create entry block and generate body
             llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
