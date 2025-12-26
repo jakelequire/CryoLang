@@ -1492,7 +1492,22 @@ namespace Cryo
         // Set variadic flag if detected
         func_decl->set_variadic(is_variadic);
 
-        // Add parameters to function
+        // For _user_main_, inject argc and argv parameters to match runtime's expected signature
+        // The runtime declares: declare i32 @_user_main_(i32, ptr)
+        if (func_name == "_user_main_")
+        {
+            // Create argc: i32 parameter
+            Type *i32_type = _context.types().get_int32_type();
+            auto argc_param = _builder.create_variable_declaration(start_loc, "argc", i32_type);
+            func_decl->add_parameter(std::move(argc_param));
+
+            // Create argv: ptr parameter (pointer to string array)
+            Type *ptr_type = _context.types().get_pointer_type(_context.types().get_int8_type());
+            auto argv_param = _builder.create_variable_declaration(start_loc, "argv", ptr_type);
+            func_decl->add_parameter(std::move(argv_param));
+        }
+
+        // Add user-defined parameters to function
         for (auto &param : params)
         {
             func_decl->add_parameter(std::move(param));
