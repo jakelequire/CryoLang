@@ -327,7 +327,129 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Store the value
+        // Get the types involved
+        llvm::Type *member_ptr_type = member_ptr->getType();
+        llvm::Type *value_type = value->getType();
+        
+        if (!member_ptr_type->isPointerTy())
+        {
+            report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, target,
+                         "Member address is not a pointer type");
+            return nullptr;
+        }
+        
+        // For LLVM 20+, we need to get the pointed-to type differently
+        // We'll check if it's an AllocaInst or GEP and extract the type accordingly
+        llvm::Type *member_field_type = nullptr;
+        if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(member_ptr))
+        {
+            member_field_type = alloca_inst->getAllocatedType();
+        }
+        else if (auto *gep_inst = llvm::dyn_cast<llvm::GetElementPtrInst>(member_ptr))
+        {
+            member_field_type = gep_inst->getResultElementType();
+        }
+        else
+        {
+            // For other cases, we can't easily determine the pointed-to type in LLVM 20+
+            // Fall back to regular store
+            if (_memory)
+            {
+                _memory->create_store(value, member_ptr);
+            }
+            else
+            {
+                builder().CreateStore(value, member_ptr);
+            }
+            return value;
+        }
+        
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Member assignment: member_field_type={}, value_type={}",
+                  member_field_type->getTypeID(),
+                  value_type->getTypeID());
+
+        // Check if we're assigning a struct value to a struct field
+        if (member_field_type->isStructTy() && value_type->isPointerTy())
+        {
+            // For LLVM 20+, we need to determine the pointed-to type differently
+            llvm::Type *value_pointed_type = nullptr;
+            if (auto *value_alloca = llvm::dyn_cast<llvm::AllocaInst>(value))
+            {
+                value_pointed_type = value_alloca->getAllocatedType();
+            }
+            else if (auto *value_gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value))
+            {
+                value_pointed_type = value_gep->getResultElementType();
+            }
+            else
+            {
+                // Can't determine type, fall back to regular store
+                if (_memory)
+                {
+                    _memory->create_store(value, member_ptr);
+                }
+                else
+                {
+                    builder().CreateStore(value, member_ptr);
+                }
+                return value;
+            }
+            
+            // If value points to the same struct type as the field expects
+            if (value_pointed_type == member_field_type)
+            {
+                // Check if the struct type is fully defined (sized) before attempting memcpy
+                if (!member_field_type->isSized())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Member assignment: Struct type is not sized, falling back to regular store");
+                    
+                    // Fall back to regular store for unsized struct types
+                    if (_memory)
+                    {
+                        _memory->create_store(value, member_ptr);
+                    }
+                    else
+                    {
+                        builder().CreateStore(value, member_ptr);
+                    }
+                    return value;
+                }
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Member assignment: Struct value assignment detected, using memcpy");
+                
+                // Use memcpy to copy the struct value instead of storing pointer
+                auto &dl = module()->getDataLayout();
+                uint64_t struct_size = dl.getTypeAllocSize(member_field_type);
+                
+                // Create memcpy call
+                llvm::Type *i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(llvm_ctx()), 0);
+                llvm::Type *size_type = dl.getIntPtrType(llvm_ctx());
+                
+                // Cast pointers to i8* for memcpy
+                llvm::Value *dest = builder().CreateBitCast(member_ptr, i8_ptr_type, "dest.cast");
+                llvm::Value *src = builder().CreateBitCast(value, i8_ptr_type, "src.cast");
+                llvm::Value *size_val = llvm::ConstantInt::get(size_type, struct_size);
+                
+                // Call memcpy intrinsic
+                llvm::Function *memcpy_fn = llvm::Intrinsic::getDeclaration(
+                    module(),
+                    llvm::Intrinsic::memcpy,
+                    {i8_ptr_type, i8_ptr_type, size_type}
+                );
+                
+                builder().CreateCall(memcpy_fn, {dest, src, size_val, llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_ctx()), false)});
+                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Member assignment: Memcpy complete for struct of size {} bytes", struct_size);
+                
+                return value;
+            }
+        }
+
+        // Regular assignment for non-struct types or when types don't match
         if (_memory)
         {
             _memory->create_store(value, member_ptr);
