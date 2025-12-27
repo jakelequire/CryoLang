@@ -1875,9 +1875,16 @@ namespace Cryo
 
         if (node.initializer())
         {
+            // Set expected type context for contextual typing (especially important for array literals)
+            Type *previous_expected_type = _current_expected_type;
+            _current_expected_type = declared_type;
+            
             // Visit the initializer to determine its type
             node.initializer()->accept(*this);
             inferred_type = node.initializer()->get_resolved_type();
+            
+            // Restore previous expected type context
+            _current_expected_type = previous_expected_type;
         }
 
         // Determine final type
@@ -3936,13 +3943,46 @@ namespace Cryo
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "Visiting ArrayLiteralNode with {} elements", node.size());
 
-        // Visit all elements first
+        // Check if we have an expected type context (e.g., from variable declaration)
+        Type *expected_element_type = nullptr;
+        if (_current_expected_type)
+        {
+            // If expected type is an Array<T>, extract the T
+            if (_current_expected_type->kind() == TypeKind::Array)
+            {
+                auto *array_type = static_cast<ArrayType *>(_current_expected_type);
+                expected_element_type = array_type->element_type().get();
+                LOG_DEBUG(Cryo::LogComponent::AST, "ArrayLiteral: Using expected element type '{}' from context", expected_element_type->name());
+            }
+            else if (_current_expected_type->kind() == TypeKind::Parameterized)
+            {
+                auto *param_type = static_cast<ParameterizedType *>(_current_expected_type);
+                if (param_type->base_name() == "Array" && param_type->parameter_count() > 0)
+                {
+                    expected_element_type = param_type->type_parameters()[0].get();
+                    LOG_DEBUG(Cryo::LogComponent::AST, "ArrayLiteral: Using expected element type '{}' from parameterized Array<T>", expected_element_type->name());
+                }
+            }
+        }
+
+        // Visit all elements and apply expected type context
         Type *common_element_type = nullptr;
         for (const auto &element : node.elements())
         {
             if (element)
             {
+                // Set expected type for element if we have one
+                Type *previous_expected = _current_expected_type;
+                if (expected_element_type)
+                {
+                    _current_expected_type = expected_element_type;
+                }
+                
                 element->accept(*this);
+                
+                // Restore previous expected type
+                _current_expected_type = previous_expected;
+                
                 if (element->has_resolved_type())
                 {
                     Type *element_type = element->get_resolved_type();
@@ -7352,13 +7392,21 @@ namespace Cryo
                 return _type_context.get_i64_type();
             }
 
-            // No suffix - use heuristic based on content
+            // No suffix - use contextual typing if available, otherwise fall back to default heuristic
             if (value.find('.') != std::string::npos)
             {
                 return _type_context.get_default_float_type();
             }
             else
             {
+                // Check if we have an expected type context for integer literals
+                if (_current_expected_type && is_integer_type(_current_expected_type))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Using expected type '{}' for integer literal '{}'", 
+                              _current_expected_type->name(), value);
+                    return _current_expected_type;
+                }
+                
                 return _type_context.get_int_type();
             }
         }
