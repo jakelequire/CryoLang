@@ -177,12 +177,9 @@ namespace Cryo::Codegen
 
         // Arithmetic
         case TokenKind::TK_PLUS:
-            // Special case: + can be string concatenation
-            if (left_type && left_type->isPointerTy())
-            {
-                // Could be string concatenation - caller needs to verify
-                return BinaryOpClass::StringConcat;
-            }
+            // For now, always treat pointer + as arithmetic (pointer arithmetic)
+            // String concatenation should be handled through explicit string operations
+            // TODO: Implement proper type analysis to distinguish string vs pointer arithmetic
             return BinaryOpClass::Arithmetic;
 
         case TokenKind::TK_MINUS:
@@ -523,7 +520,16 @@ namespace Cryo::Codegen
         if (!lhs || !rhs)
             return nullptr;
 
-        // Ensure compatible types
+        llvm::Type *lhs_type = lhs->getType();
+        llvm::Type *rhs_type = rhs->getType();
+
+        // Handle pointer arithmetic
+        if (lhs_type->isPointerTy() && rhs_type->isIntegerTy())
+        {
+            return generate_pointer_arithmetic(op, lhs, rhs);
+        }
+
+        // Ensure compatible types for non-pointer arithmetic
         ensure_compatible_types(lhs, rhs);
 
         llvm::Type *type = lhs->getType();
@@ -603,6 +609,43 @@ namespace Cryo::Codegen
             return b.CreateFRem(lhs, rhs, "frem");
 
         default:
+            return nullptr;
+        }
+    }
+
+    llvm::Value *OperatorCodegen::generate_pointer_arithmetic(TokenKind op,
+                                                              llvm::Value *ptr,
+                                                              llvm::Value *offset)
+    {
+        llvm::IRBuilder<> &b = builder();
+        llvm::LLVMContext &ctx = llvm_ctx();
+
+        switch (op)
+        {
+        case TokenKind::TK_PLUS:
+            // For pointer + offset, use CreateGEP with byte-level arithmetic
+            // Convert to i8* for byte-level arithmetic, then cast back
+            {
+                llvm::Type *i8_type = llvm::Type::getInt8Ty(ctx);
+                llvm::Value *byte_ptr = b.CreateBitCast(ptr, llvm::PointerType::get(ctx, 0), "byte.ptr");
+                llvm::Value *result_ptr = b.CreateGEP(i8_type, byte_ptr, offset, "ptr.add");
+                // Cast back to original pointer type
+                return b.CreateBitCast(result_ptr, ptr->getType(), "ptr.result");
+            }
+
+        case TokenKind::TK_MINUS:
+            // For pointer - offset, use negative offset
+            {
+                llvm::Value *neg_offset = b.CreateNeg(offset, "neg.offset");
+                llvm::Type *i8_type_sub = llvm::Type::getInt8Ty(ctx);
+                llvm::Value *byte_ptr_sub = b.CreateBitCast(ptr, llvm::PointerType::get(ctx, 0), "byte.ptr");
+                llvm::Value *result_ptr_sub = b.CreateGEP(i8_type_sub, byte_ptr_sub, neg_offset, "ptr.sub");
+                return b.CreateBitCast(result_ptr_sub, ptr->getType(), "ptr.result");
+            }
+
+        default:
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                         "Unsupported pointer arithmetic operation");
             return nullptr;
         }
     }
