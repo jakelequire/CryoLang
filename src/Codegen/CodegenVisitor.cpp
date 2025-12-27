@@ -385,6 +385,10 @@ namespace Cryo::Codegen
             stmt->accept(*this);
         }
 
+        // Generate global constructors after all declarations are processed
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating global constructors...");
+        generate_global_constructors();
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Completed ProgramNode processing");
     }
 
