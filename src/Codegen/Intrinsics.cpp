@@ -984,20 +984,20 @@ namespace Cryo::Codegen
         auto &context = _context_manager.get_context();
         auto *module = _context_manager.get_module();
 
-        // On Windows, printf is often not directly exported, so use vfprintf with stdout
-        // Create vfprintf function type: int vfprintf(FILE* stream, const char* format, va_list args)
+        // On Windows, use fprintf with stdout (fprintf is variadic, vfprintf takes va_list)
+        // Create fprintf function type: int fprintf(FILE* stream, const char* format, ...)
         llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0); // FILE* and const char*
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType *vfprintf_type = llvm::FunctionType::get(
-            int_type, {char_ptr_type, char_ptr_type}, true); // FILE*, format, ...
+        llvm::FunctionType *fprintf_type = llvm::FunctionType::get(
+            int_type, {char_ptr_type, char_ptr_type}, true); // FILE*, format, ... (variadic)
 
-        // Get or create vfprintf function (this is available on Windows)
-        llvm::Function *vfprintf_func = get_or_create_libc_function("vfprintf", vfprintf_type);
+        // Get or create fprintf function (this is available on Windows and is variadic)
+        llvm::Function *fprintf_func = get_or_create_libc_function("fprintf", fprintf_type);
 
         // Add Windows calling convention
         if (module->getTargetTriple().find("windows") != std::string::npos)
         {
-            vfprintf_func->setCallingConv(llvm::CallingConv::Win64);
+            fprintf_func->setCallingConv(llvm::CallingConv::Win64);
         }
 
         // Get stdout - use __acrt_iob_func or __iob_func to get stdout
@@ -1053,8 +1053,8 @@ namespace Cryo::Codegen
             converted_args.push_back(arg);
         }
 
-        // Call vfprintf with properly converted arguments for Windows ABI
-        llvm::CallInst *call = builder.CreateCall(vfprintf_func, converted_args, "printf.result");
+        // Call fprintf with properly converted arguments for Windows ABI
+        llvm::CallInst *call = builder.CreateCall(fprintf_func, converted_args, "printf.result");
 
         // WINDOWS x64 ABI FIX: Ensure the call uses the correct calling convention
         if (module->getTargetTriple().find("windows") != std::string::npos)
