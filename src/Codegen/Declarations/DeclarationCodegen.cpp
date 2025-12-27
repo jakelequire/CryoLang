@@ -28,8 +28,26 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        std::string name = node->name();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating function declaration: {}", name);
+        // Generate properly qualified function name using namespace context
+        std::string name;
+        std::string ns_context = ctx().namespace_context();
+        
+        // Special case: main and _user_main_ functions should never be namespace qualified
+        if (node->name() == "main" || node->name() == "_user_main_")
+        {
+            name = node->name();
+        }
+        else if (!ns_context.empty())
+        {
+            // Use fully-qualified name: namespace::function
+            name = ns_context + "::" + node->name();
+        }
+        else
+        {
+            name = node->name();
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating function declaration: {} (namespace: '{}')", name, ns_context);
 
         // Check if already declared
         if (llvm::Function *existing = module()->getFunction(name))
@@ -56,8 +74,17 @@ namespace Cryo::Codegen
         // Name parameters
         generate_parameters(fn, node);
 
-        // Register in context
+        // Register in context with the qualified name
         ctx().register_function(name, fn);
+        
+        // Also register with the unqualified name for backward compatibility
+        std::string unqualified_name = node->name();
+        if (name != unqualified_name)
+        {
+            ctx().register_function(unqualified_name, fn);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Also registered function as: {}", unqualified_name);
+        }
 
         return fn;
     }
@@ -70,8 +97,26 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        std::string name = node->name();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating function definition: {}", name);
+        // Generate properly qualified function name using namespace context
+        std::string name;
+        std::string ns_context = ctx().namespace_context();
+        
+        // Special case: main and _user_main_ functions should never be namespace qualified
+        if (node->name() == "main" || node->name() == "_user_main_")
+        {
+            name = node->name();
+        }
+        else if (!ns_context.empty())
+        {
+            // Use fully-qualified name: namespace::function
+            name = ns_context + "::" + node->name();
+        }
+        else
+        {
+            name = node->name();
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating function definition: {} (namespace: '{}')", name, ns_context);
 
         // Get or create declaration
         llvm::Function *fn = module()->getFunction(name);
