@@ -993,6 +993,12 @@ namespace Cryo::Codegen
         // Get or create printf function
         llvm::Function *printf_func = get_or_create_libc_function("printf", printf_type);
 
+        // Set Windows calling convention if on Windows
+        if (module->getTargetTriple().find("windows") != std::string::npos)
+        {
+            printf_func->setCallingConv(llvm::CallingConv::Win64);
+        }
+
         // Ensure format argument is a pointer
         if (!args[0]->getType()->isPointerTy())
         {
@@ -1029,6 +1035,12 @@ namespace Cryo::Codegen
 
         // Call printf
         llvm::CallInst *call = builder.CreateCall(printf_func, converted_args, "printf.result");
+
+        // Set Windows calling convention on the call if on Windows
+        if (module->getTargetTriple().find("windows") != std::string::npos)
+        {
+            call->setCallingConv(llvm::CallingConv::Win64);
+        }
 
         return call;
     }
