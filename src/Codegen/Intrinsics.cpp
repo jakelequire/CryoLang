@@ -1609,6 +1609,10 @@ namespace Cryo::Codegen
         {
             function_name = "std::Runtime::" + name;
         }
+        
+        // System functions use their original names (printf, malloc, etc.)
+        // The namespace qualification in DeclarationCodegen ensures stdlib functions
+        // like std::IO::printf don't conflict with these system function names
 
         llvm::Function *func = module->getFunction(function_name);
 
