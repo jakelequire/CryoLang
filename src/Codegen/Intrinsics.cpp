@@ -993,11 +993,9 @@ namespace Cryo::Codegen
         // Get or create printf function
         llvm::Function *printf_func = get_or_create_libc_function("printf", printf_type);
 
-        // Set Windows calling convention if on Windows
-        if (module->getTargetTriple().find("windows") != std::string::npos)
-        {
-            printf_func->setCallingConv(llvm::CallingConv::Win64);
-        }
+        // Note: Don't explicitly set calling convention - let LLVM use the default
+        // based on the target triple. The old codegen didn't set any calling convention
+        // and worked correctly.
 
         // Ensure format argument is a pointer
         if (!args[0]->getType()->isPointerTy())
@@ -1036,12 +1034,6 @@ namespace Cryo::Codegen
         // Call printf
         llvm::CallInst *call = builder.CreateCall(printf_func, converted_args, "printf.result");
 
-        // Set Windows calling convention on the call if on Windows
-        if (module->getTargetTriple().find("windows") != std::string::npos)
-        {
-            call->setCallingConv(llvm::CallingConv::Win64);
-        }
-
         return call;
     }
 
@@ -1072,14 +1064,7 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // WINDOWS x64 ABI FIX: Set the correct calling convention for Windows variadic functions
-        auto *module = _context_manager.get_module();
-        if (module->getTargetTriple().find("windows") != std::string::npos)
-        {
-            sprintf_func->setCallingConv(llvm::CallingConv::Win64);
-        }
-
-        // WINDOWS x64 ABI FIX: Convert arguments to ensure proper ABI compliance
+        // Convert arguments for variadic call ABI compliance
         std::vector<llvm::Value *> converted_args;
         converted_args.reserve(args.size());
 
@@ -1107,14 +1092,8 @@ namespace Cryo::Codegen
             converted_args.push_back(arg);
         }
 
-        // Call sprintf with properly converted arguments for Windows ABI
+        // Call sprintf
         llvm::CallInst *call = builder.CreateCall(sprintf_func, converted_args, "sprintf.result");
-
-        // WINDOWS x64 ABI FIX: Ensure the call uses the correct calling convention
-        if (module->getTargetTriple().find("windows") != std::string::npos)
-        {
-            call->setCallingConv(llvm::CallingConv::Win64);
-        }
 
         return call;
     }
