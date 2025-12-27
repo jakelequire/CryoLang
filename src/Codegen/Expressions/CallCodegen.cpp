@@ -1,6 +1,7 @@
 #include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
+#include "Codegen/Intrinsics.hpp"
 #include "AST/ASTVisitor.hpp"
 #include "Utils/Logger.hpp"
 
@@ -217,6 +218,13 @@ namespace Cryo::Codegen
             if (is_primitive_constructor(name))
             {
                 return CallKind::PrimitiveConstructor;
+            }
+
+            // STDLIB FUNCTION INTRINSIC REDIRECTION: Handle problematic stdlib functions
+            // Redirect printf directly to intrinsic to avoid variadic forwarding issues
+            if (name == "printf" || name == "IO::printf" || name == "std::IO::printf")
+            {
+                return CallKind::Intrinsic;
             }
 
             // Check for intrinsics
@@ -663,17 +671,18 @@ namespace Cryo::Codegen
             return builder().CreateCall(free_fn, {args[0]});
         }
 
-        if (intrinsic_name == "__printf__")
+        if (intrinsic_name == "__printf__" || intrinsic_name == "printf" || 
+            intrinsic_name == "IO::printf" || intrinsic_name == "std::IO::printf")
         {
-            llvm::Function *printf_fn = module()->getFunction("printf");
-            if (!printf_fn)
-            {
-                llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
-                llvm::Type *i32_type = llvm::Type::getInt32Ty(llvm_ctx());
-                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type}, true);
-                printf_fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "printf", module());
-            }
-            return builder().CreateCall(printf_fn, args, "printf_result");
+            // Use the full intrinsic system with Windows ABI fixes
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "[STDLIB REDIRECT] Redirecting {} to __printf__ intrinsic", intrinsic_name);
+            
+            // Generate arguments
+            auto args = generate_arguments(node->arguments());
+            
+            // Delegate to the proper intrinsic system that handles Windows ABI
+            Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
+            return intrinsic_gen.generate_intrinsic_call(node, "__printf__", args);
         }
 
         // Other intrinsics would be handled similarly
