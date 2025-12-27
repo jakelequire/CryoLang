@@ -1743,6 +1743,10 @@ namespace Cryo::Codegen
                 return generate_array_constructor_call(node, elements, elem_type);
             }
         }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Array literal has NO resolved type - may need to infer from context");
+        }
 
         // Fallback to traditional C-style array for non-Array<T> types
         llvm::ArrayType *array_type = llvm::ArrayType::get(elem_type, elements.size());
