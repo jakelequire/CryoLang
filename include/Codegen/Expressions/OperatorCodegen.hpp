@@ -189,6 +189,17 @@ namespace Cryo::Codegen
                                                llvm::Value *lhs,
                                                llvm::Value *rhs);
 
+        /**
+         * @brief Generate pointer arithmetic
+         * @param op Operator token kind
+         * @param ptr Pointer operand
+         * @param offset Integer offset operand
+         * @return Result value
+         */
+        llvm::Value *generate_pointer_arithmetic(TokenKind op,
+                                                 llvm::Value *ptr,
+                                                 llvm::Value *offset);
+
         //===================================================================
         // Comparison Operations
         //===================================================================
