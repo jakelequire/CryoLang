@@ -984,20 +984,36 @@ namespace Cryo::Codegen
         auto &context = _context_manager.get_context();
         auto *module = _context_manager.get_module();
 
-        // Create printf function type: int printf(const char* format, ...)
-        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        // On Windows, printf is often not directly exported, so use vfprintf with stdout
+        // Create vfprintf function type: int vfprintf(FILE* stream, const char* format, va_list args)
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0); // FILE* and const char*
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType *printf_type = llvm::FunctionType::get(
-            int_type, {char_ptr_type}, true); // variadic
+        llvm::FunctionType *vfprintf_type = llvm::FunctionType::get(
+            int_type, {char_ptr_type, char_ptr_type}, true); // FILE*, format, ...
 
-        // Get or create the real printf function
-        llvm::Function *real_printf_func = get_or_create_libc_function("printf", printf_type);
+        // Get or create vfprintf function (this is available on Windows)
+        llvm::Function *vfprintf_func = get_or_create_libc_function("vfprintf", vfprintf_type);
 
-        // WINDOWS x64 ABI FIX: Set the correct calling convention for Windows variadic functions
+        // Add Windows calling convention
         if (module->getTargetTriple().find("windows") != std::string::npos)
         {
-            real_printf_func->setCallingConv(llvm::CallingConv::Win64);
+            vfprintf_func->setCallingConv(llvm::CallingConv::Win64);
         }
+
+        // Get stdout - use __acrt_iob_func or __iob_func to get stdout
+        // Create __acrt_iob_func function: FILE* __acrt_iob_func(int index)
+        llvm::FunctionType *iob_func_type = llvm::FunctionType::get(
+            char_ptr_type, {llvm::Type::getInt32Ty(context)}, false);
+        llvm::Function *iob_func = get_or_create_libc_function("__acrt_iob_func", iob_func_type);
+        
+        if (module->getTargetTriple().find("windows") != std::string::npos)
+        {
+            iob_func->setCallingConv(llvm::CallingConv::Win64);
+        }
+
+        // Get stdout (index 1 for __acrt_iob_func: stdin=0, stdout=1, stderr=2)
+        llvm::Value *stdout_index = llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1);
+        llvm::Value *stdout_file = builder.CreateCall(iob_func, {stdout_index}, "stdout");
 
         // Ensure format argument is a pointer
         if (!args[0]->getType()->isPointerTy())
@@ -1008,7 +1024,10 @@ namespace Cryo::Codegen
 
         // WINDOWS x64 ABI FIX: Convert arguments to ensure proper ABI compliance
         std::vector<llvm::Value *> converted_args;
-        converted_args.reserve(args.size());
+        converted_args.reserve(args.size() + 1); // +1 for stdout
+
+        // Add stdout as first argument
+        converted_args.push_back(stdout_file);
 
         for (size_t i = 0; i < args.size(); ++i)
         {
@@ -1034,8 +1053,8 @@ namespace Cryo::Codegen
             converted_args.push_back(arg);
         }
 
-        // Call printf with properly converted arguments for Windows ABI
-        llvm::CallInst *call = builder.CreateCall(real_printf_func, converted_args, "printf.result");
+        // Call vfprintf with properly converted arguments for Windows ABI
+        llvm::CallInst *call = builder.CreateCall(vfprintf_func, converted_args, "printf.result");
 
         // WINDOWS x64 ABI FIX: Ensure the call uses the correct calling convention
         if (module->getTargetTriple().find("windows") != std::string::npos)
