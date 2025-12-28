@@ -203,6 +203,13 @@ namespace Cryo::Codegen
         void register_generic_type(const std::string &name, Cryo::ASTNode *node);
 
         /**
+         * @brief Check if a type is a registered generic template
+         * @param name Type name to check
+         * @return true if the type is a generic template
+         */
+        bool is_generic_template(const std::string &name) const;
+
+        /**
          * @brief Register a generic function definition
          * @param name Generic function name
          * @param node AST node for the generic function

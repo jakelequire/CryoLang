@@ -1,4 +1,5 @@
 #include "Codegen/Declarations/DeclarationCodegen.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Utils/Logger.hpp"
@@ -173,6 +174,15 @@ namespace Cryo::Codegen
     {
         if (!node)
             return nullptr;
+
+        // Skip methods of generic templates - they should only be instantiated with concrete types
+        if (_generics && !parent_type.empty() && _generics->is_generic_template(parent_type))
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping method declaration '{}' of generic template '{}'",
+                      node->name(), parent_type);
+            return nullptr;
+        }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating method: {}::{}",
                   parent_type, node->name());
@@ -1133,6 +1143,15 @@ namespace Cryo::Codegen
 
         // Get the parent type name from context
         std::string parent_type = ctx().current_type_name();
+
+        // Skip methods of generic templates - they should only be instantiated with concrete types
+        if (_generics && !parent_type.empty() && _generics->is_generic_template(parent_type))
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping method '{}' of generic template '{}'",
+                      node->name(), parent_type);
+            return;
+        }
         std::string base_method_name = generate_method_name(parent_type, node->name());
 
         // Build fully-qualified name for logging
