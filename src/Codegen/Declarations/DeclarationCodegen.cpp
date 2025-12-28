@@ -972,6 +972,14 @@ namespace Cryo::Codegen
             {
                 node->initializer()->accept(*visitor);
                 llvm::Value *val = get_result();
+                // Guard against null - dyn_cast asserts on null
+                if (!val)
+                {
+                    LOG_WARN(Cryo::LogComponent::CODEGEN,
+                             "generate_global_initializer: No result for initializer of '{}'",
+                             node->name());
+                    return llvm::Constant::getNullValue(type);
+                }
                 if (auto *constant = llvm::dyn_cast<llvm::Constant>(val))
                 {
                     // Cast to target type if needed
