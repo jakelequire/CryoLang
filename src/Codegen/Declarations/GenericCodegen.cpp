@@ -580,6 +580,11 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Registered generic type: {}", name);
     }
 
+    bool GenericCodegen::is_generic_template(const std::string &name) const
+    {
+        return _generic_types.find(name) != _generic_types.end();
+    }
+
     void GenericCodegen::register_generic_function(const std::string &name, Cryo::ASTNode *node)
     {
         _generic_functions[name] = node;

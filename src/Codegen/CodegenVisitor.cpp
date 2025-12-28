@@ -729,6 +729,16 @@ namespace Cryo::Codegen
         NodeTracker tracker(*_ctx, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting StructMethodNode: {}", node.name());
 
+        // Skip methods of generic templates - they should only be instantiated with concrete types
+        std::string current_type = _ctx->current_type_name();
+        if (!current_type.empty() && _generics->is_generic_template(current_type))
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Skipping method '{}' of generic template '{}'",
+                      node.name(), current_type);
+            return;
+        }
+
         _declarations->generate_method(&node);
     }
 
