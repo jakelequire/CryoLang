@@ -504,8 +504,27 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating class constructor for: {}", type_name);
 
-        // Look up the class type
-        llvm::Type *class_type = ctx().get_type(type_name);
+        // Use SRM-based type resolution to find the class type
+        // This handles: current namespace, imported namespaces, aliases, global scope
+        llvm::Type *class_type = resolve_type_by_name(type_name);
+
+        // Determine the resolved type name for constructor lookup
+        std::string resolved_type_name = type_name;
+        if (class_type)
+        {
+            // Try to get the actual qualified name from the candidates
+            auto candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+            for (const auto &candidate : candidates)
+            {
+                if (ctx().get_type(candidate) == class_type ||
+                    llvm::StructType::getTypeByName(llvm_ctx(), candidate) == class_type)
+                {
+                    resolved_type_name = candidate;
+                    break;
+                }
+            }
+        }
+
         if (!class_type || !class_type->isStructTy())
         {
             report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
@@ -550,8 +569,8 @@ namespace Cryo::Codegen
         // Generate arguments
         auto args = generate_arguments(node->arguments());
 
-        // Look for constructor
-        llvm::Function *ctor = resolve_constructor(type_name);
+        // Look for constructor - use the resolved type name
+        llvm::Function *ctor = resolve_constructor(resolved_type_name);
         if (ctor)
         {
             std::vector<llvm::Value *> ctor_args;
