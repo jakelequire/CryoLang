@@ -239,7 +239,14 @@ namespace Cryo::Codegen
                 return CallKind::RuntimeFunction;
             }
 
-            // Check if it's a known struct type
+            // Check if it's a known class type (heap-allocated) - check BEFORE struct
+            // Classes and structs both use LLVM struct types, but classes use heap allocation
+            if (is_class_type(name))
+            {
+                return CallKind::ClassConstructor;
+            }
+
+            // Check if it's a known struct type (stack-allocated)
             if (is_struct_type(name))
             {
                 return CallKind::StructConstructor;
@@ -1287,6 +1294,34 @@ namespace Cryo::Codegen
         {
             return sym->data_type->kind() == TypeKind::Enum;
         }
+        return false;
+    }
+
+    bool CallCodegen::is_class_type(const std::string &name) const
+    {
+        // Use SRM to generate type candidates and check if any is a class type
+        auto &non_const_ctx = const_cast<CodegenContext &>(ctx());
+        auto candidates = non_const_ctx.srm().generate_lookup_candidates(name, Cryo::SymbolKind::Type);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "is_class_type: Checking '{}' with {} candidates", name, candidates.size());
+
+        for (const auto &candidate : candidates)
+        {
+            // Check symbol table for class type
+            Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(candidate);
+            if (sym && sym->kind == SymbolKind::Type && sym->data_type)
+            {
+                if (sym->data_type->kind() == TypeKind::Class)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "is_class_type: Found '{}' as class type via '{}'", name, candidate);
+                    return true;
+                }
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "is_class_type: '{}' not found as class type", name);
         return false;
     }
 

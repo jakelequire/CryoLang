@@ -274,6 +274,13 @@ namespace Cryo::Codegen
          */
         bool is_enum_type(const std::string &name) const;
 
+        /**
+         * @brief Check if a name is a known class type (heap-allocated)
+         * @param name Name to check
+         * @return true if class type
+         */
+        bool is_class_type(const std::string &name) const;
+
     private:
         //===================================================================
         // Internal Helpers
