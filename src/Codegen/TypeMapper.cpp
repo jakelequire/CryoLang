@@ -805,9 +805,29 @@ namespace Cryo::Codegen
             // Convert shared_ptr types to raw pointers for the callback
             std::vector<Cryo::Type*> type_args;
             type_args.reserve(type->type_parameters().size());
+            bool has_uninstantiated_param = false;
+
             for (const auto& param : type->type_parameters())
             {
-                type_args.push_back(param.get());
+                Cryo::Type* arg = param.get();
+                type_args.push_back(arg);
+
+                // Check if this type argument is an uninstantiated type parameter
+                if (arg && (arg->kind() == TypeKind::Generic ||
+                    ((arg->kind() == TypeKind::Struct || arg->kind() == TypeKind::Class) &&
+                     !llvm::StructType::getTypeByName(llvm_ctx(), arg->to_string()))))
+                {
+                    has_uninstantiated_param = true;
+                }
+            }
+
+            // Skip instantiation if any type arg is uninstantiated
+            if (has_uninstantiated_param)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "TypeMapper::map_parameterized - skipping {} (has uninstantiated type params)",
+                          name);
+                return ptr_type();
             }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
