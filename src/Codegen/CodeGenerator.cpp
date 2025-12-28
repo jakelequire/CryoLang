@@ -78,6 +78,12 @@ namespace Cryo::Codegen
                 {
                     _visitor->set_stdlib_compilation_mode(true);
                 }
+
+                // Apply any pending source info that was set before visitor creation
+                if (!_pending_source_file.empty() || !_pending_namespace_context.empty())
+                {
+                    _visitor->set_source_info(_pending_source_file, _pending_namespace_context);
+                }
             }
 
             // Generate IR by visiting the AST
@@ -302,6 +308,11 @@ namespace Cryo::Codegen
 
     void CodeGenerator::set_source_info(const std::string &source_file, const std::string &namespace_context)
     {
+        // Store source info for later application when visitor is created
+        _pending_source_file = source_file;
+        _pending_namespace_context = namespace_context;
+
+        // Apply immediately if visitor already exists
         if (_visitor)
         {
             _visitor->set_source_info(source_file, namespace_context);
