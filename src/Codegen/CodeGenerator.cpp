@@ -140,6 +140,12 @@ namespace Cryo::Codegen
                 _visitor->set_stdlib_compilation_mode(true);
             }
 
+            // Apply any pending source info that was set before visitor creation
+            if (!_pending_source_file.empty() || !_pending_namespace_context.empty())
+            {
+                _visitor->set_source_info(_pending_source_file, _pending_namespace_context);
+            }
+
             return true;
         }
         catch (const std::exception &e)

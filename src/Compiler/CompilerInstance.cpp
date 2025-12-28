@@ -402,6 +402,10 @@ namespace Cryo
             std::string namespace_for_module = _current_namespace.empty() ? "cryo_program" : _current_namespace;
             _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module, _diagnostic_manager.get());
 
+            // Set source info immediately after creating CodeGenerator
+            // This ensures namespace context is available for analyze() which may initialize the visitor
+            _codegen->set_source_info(_source_file, _current_namespace);
+
             // Configure stdlib compilation mode if enabled
             if (_stdlib_compilation_mode)
             {
