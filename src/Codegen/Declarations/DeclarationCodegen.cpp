@@ -184,6 +184,36 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Additional check: detect uninstantiated type parameters in signature
+        // This catches cases where the generic template check above didn't work
+        for (const auto &param : node->parameters())
+        {
+            if (param && param->get_resolved_type())
+            {
+                Cryo::Type *ptype = param->get_resolved_type();
+                // Check for Generic type kind or undefined struct/class types
+                if (ptype->kind() == TypeKind::Generic)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping method '{}' - param '{}' has generic type '{}'",
+                              node->name(), param->name(), ptype->to_string());
+                    return nullptr;
+                }
+                if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
+                {
+                    // Check if this type exists in LLVM context - if not, it's likely a type parameter
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    if (!existing)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Skipping method '{}' - param '{}' has undefined type '{}'",
+                                  node->name(), param->name(), ptype->to_string());
+                        return nullptr;
+                    }
+                }
+            }
+        }
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating method: {}::{}",
                   parent_type, node->name());
 
@@ -1152,6 +1182,34 @@ namespace Cryo::Codegen
                       node->name(), parent_type);
             return;
         }
+
+        // Additional check: detect uninstantiated type parameters in signature
+        for (const auto &param : node->parameters())
+        {
+            if (param && param->get_resolved_type())
+            {
+                Cryo::Type *ptype = param->get_resolved_type();
+                if (ptype->kind() == TypeKind::Generic)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping method '{}' - param has generic type '{}'",
+                              node->name(), ptype->to_string());
+                    return;
+                }
+                if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
+                {
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    if (!existing)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Skipping method '{}' - param has undefined type '{}'",
+                                  node->name(), ptype->to_string());
+                        return;
+                    }
+                }
+            }
+        }
+
         std::string base_method_name = generate_method_name(parent_type, node->name());
 
         // Build fully-qualified name for logging
