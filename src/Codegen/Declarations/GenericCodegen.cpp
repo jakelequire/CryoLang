@@ -31,9 +31,13 @@ namespace Cryo::Codegen
         if (has_type_instantiation(mangled))
         {
             llvm::Type *cached = get_cached_type(mangled);
-            if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
+            // Guard against null - dyn_cast asserts on null
+            if (cached)
             {
-                return struct_type;
+                if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
+                {
+                    return struct_type;
+                }
             }
         }
 
@@ -135,9 +139,13 @@ namespace Cryo::Codegen
         if (has_type_instantiation(mangled))
         {
             llvm::Type *cached = get_cached_type(mangled);
-            if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
+            // Guard against null - dyn_cast asserts on null
+            if (cached)
             {
-                return struct_type;
+                if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
+                {
+                    return struct_type;
+                }
             }
         }
 

@@ -543,6 +543,17 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating struct: {}", name);
 
+        // CRITICAL: Do not generate struct types for generic templates
+        // Generic templates should only be instantiated when used with concrete types
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "TypeCodegen: Skipping generic struct template '{}' with {} type parameters",
+                      name, node->generic_parameters().size());
+            // Return nullptr - the template will be instantiated with concrete types when used
+            return nullptr;
+        }
+
         llvm::StructType *struct_type = nullptr;
 
         // Check if already declared
@@ -608,6 +619,17 @@ namespace Cryo::Codegen
 
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating class: {}", name);
+
+        // CRITICAL: Do not generate class types for generic templates
+        // Generic templates should only be instantiated when used with concrete types
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "TypeCodegen: Skipping generic class template '{}' with {} type parameters",
+                      name, node->generic_parameters().size());
+            // Return nullptr - the template will be instantiated with concrete types when used
+            return nullptr;
+        }
 
         llvm::StructType *class_type = nullptr;
 
