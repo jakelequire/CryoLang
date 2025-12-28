@@ -5307,15 +5307,15 @@ namespace Cryo
             return struct_type;
         }
 
-        // Try to resolve as a class type
-        Type *class_type = _context.types().get_class_type(type_str);
+        // Try to resolve as a class type (lookup only, don't create)
+        Type *class_type = _context.types().lookup_class_type(type_str);
         if (class_type && class_type->kind() != TypeKind::Unknown)
         {
             return class_type;
         }
 
-        // Try to resolve as an enum type
-        Type *enum_type = _context.types().get_enum_type(type_str, {}, false);
+        // Try to resolve as an enum type (lookup only, don't create)
+        Type *enum_type = _context.types().lookup_enum_type(type_str);
         if (enum_type && enum_type->kind() != TypeKind::Unknown)
         {
             return enum_type;

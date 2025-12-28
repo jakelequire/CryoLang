@@ -1999,6 +1999,18 @@ namespace Cryo
         return result;
     }
 
+    Type *TypeContext::lookup_class_type(const std::string &name)
+    {
+        auto it = _class_types.find(name);
+        if (it != _class_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Return null if not found - don't create
+        return nullptr;
+    }
+
     Type *TypeContext::get_trait_type(const std::string &name)
     {
         auto it = _trait_types.find(name);
