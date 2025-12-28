@@ -1228,6 +1228,7 @@ namespace Cryo
         Type *get_struct_type(const std::string &name);
         Type *lookup_struct_type(const std::string &name); // Lookup existing struct type without creating
         Type *get_class_type(const std::string &name);
+        Type *lookup_class_type(const std::string &name); // Lookup existing class type without creating
         Type *get_trait_type(const std::string &name);
         Type *get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple);
         Type *lookup_enum_type(const std::string &name); // Lookup existing enum type only
