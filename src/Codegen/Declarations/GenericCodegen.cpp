@@ -21,6 +21,38 @@ namespace Cryo::Codegen
     llvm::StructType *GenericCodegen::instantiate_struct(const std::string &generic_name,
                                                            const std::vector<Cryo::Type *> &type_args)
     {
+        // Check if any type arguments are uninstantiated type parameters
+        // This happens when compiling generic templates where K, V, T etc. aren't yet concrete
+        for (const auto &arg : type_args)
+        {
+            if (!arg)
+                continue;
+
+            // TypeKind::Generic means it's an uninstantiated type parameter
+            if (arg->kind() == TypeKind::Generic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Skipping instantiation of {} - type arg '{}' is a generic parameter",
+                          generic_name, arg->to_string());
+                return nullptr;
+            }
+
+            // Also check if this would map to an opaque/undefined struct
+            // This catches cases where type parameters are misclassified as Struct types
+            if (arg->kind() == TypeKind::Struct || arg->kind() == TypeKind::Class)
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg->to_string());
+                if (!existing || existing->isOpaque())
+                {
+                    // This is likely an uninstantiated type parameter masquerading as a struct
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Skipping instantiation of {} - type arg '{}' is undefined/opaque",
+                              generic_name, arg->to_string());
+                    return nullptr;
+                }
+            }
+        }
+
         // Generate mangled name
         std::string mangled = mangle_type_name(generic_name, type_args);
 
@@ -129,6 +161,33 @@ namespace Cryo::Codegen
     {
         // Classes are represented as structs in LLVM
         // Similar to struct instantiation but may include vtable pointer
+
+        // Check if any type arguments are uninstantiated type parameters
+        for (const auto &arg : type_args)
+        {
+            if (!arg)
+                continue;
+
+            if (arg->kind() == TypeKind::Generic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Skipping class instantiation of {} - type arg '{}' is a generic parameter",
+                          generic_name, arg->to_string());
+                return nullptr;
+            }
+
+            if (arg->kind() == TypeKind::Struct || arg->kind() == TypeKind::Class)
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg->to_string());
+                if (!existing || existing->isOpaque())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Skipping class instantiation of {} - type arg '{}' is undefined/opaque",
+                              generic_name, arg->to_string());
+                    return nullptr;
+                }
+            }
+        }
 
         std::string mangled = mangle_type_name(generic_name, type_args);
 
@@ -269,6 +328,33 @@ namespace Cryo::Codegen
     llvm::Function *GenericCodegen::instantiate_function(const std::string &generic_name,
                                                            const std::vector<Cryo::Type *> &type_args)
     {
+        // Check if any type arguments are uninstantiated type parameters
+        for (const auto &arg : type_args)
+        {
+            if (!arg)
+                continue;
+
+            if (arg->kind() == TypeKind::Generic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Skipping function instantiation of {} - type arg '{}' is a generic parameter",
+                          generic_name, arg->to_string());
+                return nullptr;
+            }
+
+            if (arg->kind() == TypeKind::Struct || arg->kind() == TypeKind::Class)
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg->to_string());
+                if (!existing || existing->isOpaque())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Skipping function instantiation of {} - type arg '{}' is undefined/opaque",
+                              generic_name, arg->to_string());
+                    return nullptr;
+                }
+            }
+        }
+
         std::string mangled = mangle_function_name(generic_name, type_args);
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating function {} -> {}",
