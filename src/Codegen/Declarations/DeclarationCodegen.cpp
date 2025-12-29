@@ -1642,11 +1642,10 @@ namespace Cryo::Codegen
         }
 
         llvm::LLVMContext &ctx = llvm_ctx();
-        llvm::IRBuilder<> &b = builder();
 
         // Check if we need global constructors (look for global variables with non-trivial types)
         std::vector<llvm::GlobalVariable*> globals_needing_ctors;
-        
+
         for (auto &global : mod->globals())
         {
             if (!global.hasInitializer() || global.getInitializer()->isNullValue())
@@ -1657,8 +1656,8 @@ namespace Cryo::Codegen
                 {
                     // Struct types may need constructor calls
                     globals_needing_ctors.push_back(&global);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
-                             "Found global variable '{}' that may need constructor call", 
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                             "Found global variable '{}' that may need constructor call",
                              global.getName().str());
                 }
             }
@@ -1677,13 +1676,13 @@ namespace Cryo::Codegen
             llvm::Function::InternalLinkage,
             "__cryo_global_constructors",
             mod);
-        
+
         global_ctor->addFnAttr(llvm::Attribute::NoInline);
         global_ctor->addFnAttr(llvm::Attribute::OptimizeNone);
 
-        // Create function body
+        // Create function body with a LOCAL builder to avoid corrupting shared builder state
         llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(ctx, "entry", global_ctor);
-        b.SetInsertPoint(entry_block);
+        llvm::IRBuilder<> local_builder(entry_block);
 
         // Generate constructor calls for globals that need them
         for (llvm::GlobalVariable *global : globals_needing_ctors)
@@ -1700,29 +1699,29 @@ namespace Cryo::Codegen
                     std::string ctor_name = "std::Runtime::CryoRuntime::CryoRuntime";
                     if (llvm::Function *ctor_func = mod->getFunction(ctor_name))
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
-                                 "Calling CryoRuntime constructor '{}' for global '{}'", 
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                 "Calling CryoRuntime constructor '{}' for global '{}'",
                                  ctor_name, global_name);
-                        
+
                         std::vector<llvm::Value*> ctor_args = { global };
-                        b.CreateCall(ctor_func, ctor_args);
+                        local_builder.CreateCall(ctor_func, ctor_args);
                         continue;
                     }
                 }
-                
+
                 // Generic constructor lookup
                 std::string ctor_name = type_name + "::init";
-                
+
                 // Look for constructor function
                 if (llvm::Function *ctor_func = mod->getFunction(ctor_name))
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
-                             "Calling constructor '{}' for global '{}'", 
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                             "Calling constructor '{}' for global '{}'",
                              ctor_name, global_name);
-                    
+
                     // Call constructor with global variable as 'this' pointer
                     std::vector<llvm::Value*> ctor_args = { global };
-                    b.CreateCall(ctor_func, ctor_args);
+                    local_builder.CreateCall(ctor_func, ctor_args);
                 }
                 else
                 {
@@ -1732,27 +1731,27 @@ namespace Cryo::Codegen
                         type_name + "::" + type_name,
                         "std::Runtime::" + type_name + "::" + type_name
                     };
-                    
+
                     bool found = false;
                     for (const std::string &alt_name : alt_names)
                     {
                         if (llvm::Function *alt_ctor = mod->getFunction(alt_name))
                         {
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
-                                     "Calling constructor '{}' for global '{}'", 
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                     "Calling constructor '{}' for global '{}'",
                                      alt_name, global_name);
-                            
+
                             std::vector<llvm::Value*> ctor_args = { global };
-                            b.CreateCall(alt_ctor, ctor_args);
+                            local_builder.CreateCall(alt_ctor, ctor_args);
                             found = true;
                             break;
                         }
                     }
-                    
+
                     if (!found)
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
-                                 "No constructor found for type '{}' (tried multiple patterns)", 
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                 "No constructor found for type '{}' (tried multiple patterns)",
                                  type_name);
                     }
                 }
@@ -1760,7 +1759,7 @@ namespace Cryo::Codegen
         }
 
         // Return from global constructor
-        b.CreateRetVoid();
+        local_builder.CreateRetVoid();
 
         // Register with LLVM's global constructor mechanism
         llvm::Type *i32_type = llvm::Type::getInt32Ty(ctx);
