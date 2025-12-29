@@ -473,43 +473,71 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // IMPORTANT: For class types, ensure we use the struct type, not a pointer type.
+        // IMPORTANT: For class types or uninstantiated generic types that resolve to pointers,
+        // we need to use the actual struct type, not a pointer type.
+        // This handles forward references where a variable is declared before its class definition.
         // Classes are value types when declared as variables (the variable holds the struct inline),
         // not reference types (which would be a pointer to heap-allocated memory).
-        // If the LLVM type came back as a pointer but the Cryo type is Class (not Pointer),
-        // we need to get the actual struct type.
-        if (cryo_type->kind() == Cryo::TypeKind::Class && var_type->isPointerTy())
+        bool is_class_or_generic = (cryo_type->kind() == Cryo::TypeKind::Class ||
+                                    cryo_type->kind() == Cryo::TypeKind::Generic);
+        if (is_class_or_generic && var_type->isPointerTy())
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "DeclarationCodegen: Global '{}' has Class type but got pointer LLVM type. "
-                     "Looking up struct type directly.", name);
+                     "DeclarationCodegen: Global '{}' has {} type but got pointer LLVM type. "
+                     "Looking up struct type directly.",
+                     name, Cryo::TypeKindToString(cryo_type->kind()));
 
-            // Get the class type's name and look up the struct directly
-            std::string class_name = cryo_type->name();
-            llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), class_name);
+            // Get the type's name and look up the struct directly
+            std::string type_name = cryo_type->name();
+            llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
             if (!struct_type)
             {
                 // Try with namespace context
                 std::string ns_context = ctx().namespace_context();
                 if (!ns_context.empty())
                 {
-                    std::string qualified_name = ns_context + "::" + class_name;
+                    std::string qualified_name = ns_context + "::" + type_name;
                     struct_type = llvm::StructType::getTypeByName(llvm_ctx(), qualified_name);
+                    if (struct_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Found struct type with qualified name '{}'", qualified_name);
+                    }
+                }
+            }
+            if (!struct_type)
+            {
+                // Try common namespace patterns for runtime types
+                std::vector<std::string> candidates = {
+                    type_name,
+                    "std::Runtime::" + type_name,
+                    "std::runtime::" + type_name,
+                    "Runtime::" + type_name
+                };
+                for (const auto &candidate : candidates)
+                {
+                    struct_type = llvm::StructType::getTypeByName(llvm_ctx(), candidate);
+                    if (struct_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Found struct type with candidate name '{}'", candidate);
+                        break;
+                    }
                 }
             }
             if (!struct_type)
             {
                 // Create an opaque struct as fallback - it should be completed when the class is processed
-                struct_type = llvm::StructType::create(llvm_ctx(), class_name);
+                struct_type = llvm::StructType::create(llvm_ctx(), type_name);
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Created opaque struct for class '{}'", class_name);
+                          "DeclarationCodegen: Created opaque struct for type '{}'", type_name);
             }
             if (struct_type)
             {
                 var_type = struct_type;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Using struct type '{}' for class global '{}'",
-                          class_name, name);
+                          "DeclarationCodegen: Using struct type '{}' for global '{}'",
+                          type_name, name);
             }
         }
 
