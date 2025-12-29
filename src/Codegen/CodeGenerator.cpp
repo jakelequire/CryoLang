@@ -256,6 +256,19 @@ namespace Cryo::Codegen
             }
         }
 
+        // CRITICAL DEBUG: Dump the module IR to a file before verification for debugging
+        // This helps identify which instruction is causing verification failures
+        if (active_module)
+        {
+            std::error_code ec;
+            llvm::raw_fd_ostream debug_ir("cryo_debug_ir.ll", ec);
+            if (!ec)
+            {
+                active_module->print(debug_ir, nullptr);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Dumped module IR to cryo_debug_ir.ll for debugging");
+            }
+        }
+
         if (!_context_manager->verify_module_with_details("", verification_errors))
         {
             // Try to get the current AST node from the visitor for better error location
