@@ -726,7 +726,7 @@ namespace Cryo::Codegen
         auto args = generate_arguments(node->arguments());
 
         // Get qualified runtime function name
-        std::string qualified_name = qualify_runtime_function(function_name);
+        std::string qualified_name = "std::Runtime::" + function_name;
 
         // Look up or create function declaration
         llvm::Function *fn = module()->getFunction(qualified_name);
@@ -738,9 +738,19 @@ namespace Cryo::Codegen
 
         if (!fn)
         {
-            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
-                         "Runtime function not found: " + function_name);
-            return nullptr;
+            // Runtime function not found - create a declaration for it
+            // This allows linking to resolve the actual implementation later
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Runtime function '{}' not found, creating declaration as '{}'",
+                      function_name, qualified_name);
+
+            fn = declare_runtime_function(function_name, qualified_name);
+            if (!fn)
+            {
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                             "Runtime function not found and could not create declaration: " + function_name);
+                return nullptr;
+            }
         }
 
         // Prepare arguments with type coercion
@@ -1551,6 +1561,150 @@ namespace Cryo::Codegen
         // Fallback: use SRM to qualify with current namespace context
         // Runtime functions are registered with their full namespace during codegen
         return qualify_symbol_name(name, Cryo::SymbolKind::Function);
+    }
+
+    llvm::Function *CallCodegen::declare_runtime_function(const std::string &unqualified_name,
+                                                           const std::string &qualified_name)
+    {
+        // Map of runtime function signatures
+        // Format: function_name -> (return_type, {param_types}, is_variadic)
+        llvm::Type *void_ty = llvm::Type::getVoidTy(llvm_ctx());
+        llvm::Type *ptr_ty = llvm::PointerType::get(llvm_ctx(), 0);
+        llvm::Type *i64_ty = llvm::Type::getInt64Ty(llvm_ctx());
+        llvm::Type *i32_ty = llvm::Type::getInt32Ty(llvm_ctx());
+
+        llvm::FunctionType *fn_type = nullptr;
+
+        // Memory allocation functions
+        if (unqualified_name == "cryo_alloc" || unqualified_name == "cryo_malloc")
+        {
+            // void* cryo_alloc(i64 size)
+            fn_type = llvm::FunctionType::get(ptr_ty, {i64_ty}, false);
+        }
+        else if (unqualified_name == "cryo_free")
+        {
+            // void cryo_free(void* ptr)
+            fn_type = llvm::FunctionType::get(void_ty, {ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_realloc")
+        {
+            // void* cryo_realloc(void* ptr, i64 size)
+            fn_type = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty}, false);
+        }
+        else if (unqualified_name == "cryo_calloc")
+        {
+            // void* cryo_calloc(i64 count, i64 size)
+            fn_type = llvm::FunctionType::get(ptr_ty, {i64_ty, i64_ty}, false);
+        }
+        // String functions
+        else if (unqualified_name == "cryo_strlen")
+        {
+            // i64 cryo_strlen(void* str)
+            fn_type = llvm::FunctionType::get(i64_ty, {ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_strcmp")
+        {
+            // i32 cryo_strcmp(void* s1, void* s2)
+            fn_type = llvm::FunctionType::get(i32_ty, {ptr_ty, ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_strcpy" || unqualified_name == "cryo_strcat")
+        {
+            // void* cryo_strcpy/strcat(void* dest, void* src)
+            fn_type = llvm::FunctionType::get(ptr_ty, {ptr_ty, ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_strdup")
+        {
+            // void* cryo_strdup(void* str)
+            fn_type = llvm::FunctionType::get(ptr_ty, {ptr_ty}, false);
+        }
+        // Memory functions
+        else if (unqualified_name == "cryo_memcpy" || unqualified_name == "cryo_memmove")
+        {
+            // void* cryo_memcpy/memmove(void* dest, void* src, i64 size)
+            fn_type = llvm::FunctionType::get(ptr_ty, {ptr_ty, ptr_ty, i64_ty}, false);
+        }
+        else if (unqualified_name == "cryo_memset")
+        {
+            // void* cryo_memset(void* ptr, i32 value, i64 size)
+            fn_type = llvm::FunctionType::get(ptr_ty, {ptr_ty, i32_ty, i64_ty}, false);
+        }
+        else if (unqualified_name == "cryo_memcmp")
+        {
+            // i32 cryo_memcmp(void* s1, void* s2, i64 size)
+            fn_type = llvm::FunctionType::get(i32_ty, {ptr_ty, ptr_ty, i64_ty}, false);
+        }
+        // Runtime functions
+        else if (unqualified_name == "cryo_runtime_allocate")
+        {
+            // void* cryo_runtime_allocate(i64 size)
+            fn_type = llvm::FunctionType::get(ptr_ty, {i64_ty}, false);
+        }
+        else if (unqualified_name == "cryo_runtime_deallocate")
+        {
+            // void cryo_runtime_deallocate(void* ptr)
+            fn_type = llvm::FunctionType::get(void_ty, {ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_runtime_initialize")
+        {
+            // void cryo_runtime_initialize()
+            fn_type = llvm::FunctionType::get(void_ty, {}, false);
+        }
+        // Print/output functions
+        else if (unqualified_name == "cryo_print" || unqualified_name == "cryo_println")
+        {
+            // void cryo_print/println(void* str)
+            fn_type = llvm::FunctionType::get(void_ty, {ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_to_string")
+        {
+            // void* cryo_to_string(i64 value)
+            fn_type = llvm::FunctionType::get(ptr_ty, {i64_ty}, false);
+        }
+        // Error handling
+        else if (unqualified_name == "cryo_panic")
+        {
+            // void cryo_panic(void* msg)
+            fn_type = llvm::FunctionType::get(void_ty, {ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_assert")
+        {
+            // void cryo_assert(i32 condition, void* msg)
+            fn_type = llvm::FunctionType::get(void_ty, {i32_ty, ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_throw_exception")
+        {
+            // void cryo_throw_exception(void* msg, i32 code)
+            fn_type = llvm::FunctionType::get(void_ty, {ptr_ty, i32_ty}, false);
+        }
+        // Profiling
+        else if (unqualified_name == "cryo_profile_start")
+        {
+            // i64 cryo_profile_start(void* name)
+            fn_type = llvm::FunctionType::get(i64_ty, {ptr_ty}, false);
+        }
+        else if (unqualified_name == "cryo_profile_end")
+        {
+            // void cryo_profile_end(void* name, i64 start_time)
+            fn_type = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty}, false);
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "Unknown runtime function '{}' - cannot create declaration", unqualified_name);
+            return nullptr;
+        }
+
+        // Create the function declaration
+        llvm::Function *fn = llvm::Function::Create(
+            fn_type,
+            llvm::Function::ExternalLinkage,
+            qualified_name,
+            module());
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Created runtime function declaration: {}", qualified_name);
+
+        return fn;
     }
 
 } // namespace Cryo::Codegen

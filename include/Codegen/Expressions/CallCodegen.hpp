@@ -341,6 +341,15 @@ namespace Cryo::Codegen
         std::string qualify_runtime_function(const std::string &name);
 
         /**
+         * @brief Declare a runtime function with proper signature
+         * @param unqualified_name Unqualified function name (e.g., "cryo_alloc")
+         * @param qualified_name Qualified function name (e.g., "std::Runtime::cryo_alloc")
+         * @return Function declaration, or nullptr if unknown function
+         */
+        llvm::Function *declare_runtime_function(const std::string &unqualified_name,
+                                                  const std::string &qualified_name);
+
+        /**
          * @brief Get or create a C library function declaration
          * @param name Function name (e.g., "printf", "sprintf")
          * @return Function declaration, or nullptr if not a known C function
