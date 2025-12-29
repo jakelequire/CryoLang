@@ -1,4 +1,5 @@
 #include "Codegen/Expressions/OperatorCodegen.hpp"
+#include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "AST/ASTVisitor.hpp"
@@ -281,7 +282,85 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Generate the value to assign
+        // Check if this is a class constructor call being assigned to a value-type variable
+        // In this case, we need to construct in-place rather than heap-allocating
+        if (auto *call_node = dynamic_cast<Cryo::CallExpressionNode *>(value_node))
+        {
+            // Get the function name being called
+            std::string callee_name;
+            if (auto *callee_id = dynamic_cast<Cryo::IdentifierNode *>(call_node->callee()))
+            {
+                callee_name = callee_id->name();
+            }
+
+            // Check if this is a class type constructor
+            if (!callee_name.empty() && _calls && _calls->is_class_type(callee_name))
+            {
+                // Get the target variable's type
+                llvm::Type *var_type = nullptr;
+                if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(var_ptr))
+                {
+                    var_type = alloca->getAllocatedType();
+                }
+                else if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(var_ptr))
+                {
+                    var_type = global->getValueType();
+                }
+
+                // If the target is a struct type (value type), construct in-place
+                if (var_type && var_type->isStructTy())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "In-place class construction for '{}' of type '{}'",
+                              var_name, callee_name);
+
+                    // Generate constructor arguments
+                    std::vector<llvm::Value *> args;
+                    for (const auto &arg : call_node->arguments())
+                    {
+                        if (arg)
+                        {
+                            llvm::Value *arg_val = generate_operand(arg.get());
+                            if (arg_val)
+                            {
+                                args.push_back(arg_val);
+                            }
+                        }
+                    }
+
+                    // Look for the constructor function
+                    llvm::Function *ctor = _calls ? _calls->resolve_constructor(callee_name) : nullptr;
+                    if (ctor)
+                    {
+                        // Call constructor with var_ptr as 'this'
+                        std::vector<llvm::Value *> ctor_args;
+                        ctor_args.push_back(var_ptr);
+                        ctor_args.insert(ctor_args.end(), args.begin(), args.end());
+                        builder().CreateCall(ctor, ctor_args);
+                        return var_ptr;
+                    }
+                    else
+                    {
+                        // No constructor found - initialize fields directly if there are args
+                        auto *st = llvm::cast<llvm::StructType>(var_type);
+                        for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
+                        {
+                            llvm::Value *field_ptr = builder().CreateStructGEP(var_type, var_ptr, i,
+                                                                                "field." + std::to_string(i));
+                            llvm::Value *arg = args[i];
+                            if (arg->getType() != st->getElementType(i))
+                            {
+                                arg = cast_if_needed(arg, st->getElementType(i));
+                            }
+                            builder().CreateStore(arg, field_ptr);
+                        }
+                        return var_ptr;
+                    }
+                }
+            }
+        }
+
+        // Generate the value to assign (standard path)
         llvm::Value *value = generate_operand(value_node);
         if (!value)
         {
