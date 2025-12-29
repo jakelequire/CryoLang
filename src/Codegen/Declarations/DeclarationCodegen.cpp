@@ -1648,6 +1648,24 @@ namespace Cryo::Codegen
 
         for (auto &global : mod->globals())
         {
+            // Skip LLVM internal globals
+            if (global.getName().starts_with("llvm.") || global.getName().starts_with(".str"))
+            {
+                continue;
+            }
+
+            // Skip runtime-internal globals that handle their own initialization
+            // g_cryo_runtime is initialized by CryoRuntime::initialize(), not through llvm.global_ctors
+            std::string gname = global.getName().str();
+            if (gname == "g_cryo_runtime" || gname.starts_with("g_cryo_") ||
+                gname.find("CryoRuntime") != std::string::npos)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                         "Skipping runtime-internal global '{}' (handled by runtime initialization)",
+                         gname);
+                continue;
+            }
+
             if (!global.hasInitializer() || global.getInitializer()->isNullValue())
             {
                 // This global is zero-initialized but might need constructor call
@@ -1692,22 +1710,6 @@ namespace Cryo::Codegen
             {
                 std::string type_name = struct_type->hasName() ? struct_type->getName().str() : "unnamed_struct";
                 std::string global_name = global->getName().str();
-                
-                // Special handling for g_cryo_runtime global
-                if (global_name == "g_cryo_runtime" && type_name == "CryoRuntime")
-                {
-                    std::string ctor_name = "std::Runtime::CryoRuntime::CryoRuntime";
-                    if (llvm::Function *ctor_func = mod->getFunction(ctor_name))
-                    {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                 "Calling CryoRuntime constructor '{}' for global '{}'",
-                                 ctor_name, global_name);
-
-                        std::vector<llvm::Value*> ctor_args = { global };
-                        local_builder.CreateCall(ctor_func, ctor_args);
-                        continue;
-                    }
-                }
 
                 // Generic constructor lookup
                 std::string ctor_name = type_name + "::init";
