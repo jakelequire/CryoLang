@@ -1740,6 +1740,14 @@ namespace Cryo
                                 _source_file == "runtime/runtime" ||
                                 _source_file == "std::Runtime.cryo");
 
+        // Skip auto-import if we're in stdlib compilation mode to avoid circular dependencies
+        // Exception: runtime files already handled above with intrinsics + core/types
+        if (_stdlib_compilation_mode && !is_runtime_file)
+        {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports in stdlib compilation mode");
+            return;
+        }
+
         if (!_auto_imports_enabled)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imports disabled");
@@ -1747,25 +1755,23 @@ namespace Cryo
         }
 
         // Skip auto-import if we're compiling the core/types module itself to avoid circular dependencies
-        bool is_core_types = (_source_file.find("core/types.cryo") != std::string::npos ||
-                              _source_file.find("stdlib/core/types.cryo") != std::string::npos ||
-                              _source_file.find("core\\types.cryo") != std::string::npos ||
-                              _source_file.find("stdlib\\core\\types.cryo") != std::string::npos ||
-                              _source_file.find("std::Core") != std::string::npos);
-
-        if (is_core_types)
+        if (_source_file.find("core/types.cryo") != std::string::npos ||
+            _source_file.find("stdlib/core/types.cryo") != std::string::npos ||
+            _source_file.find("core\\types.cryo") != std::string::npos ||
+            _source_file.find("stdlib\\core\\types.cryo") != std::string::npos ||
+            _source_file.find("std::Core") != std::string::npos)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports when compiling core/types module itself");
             return;
         }
 
-        // In stdlib mode, we still need to import core/types for fundamental types (Array, Option, Result, etc.)
-        // but skip other auto-imports to avoid circular dependencies
+        // Check if we're in stdlib mode and only allow core/types for runtime files
+        bool stdlib_mode_runtime_exception = _stdlib_compilation_mode && is_runtime_file;
 
         if (is_runtime_file)
         {
-            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file detected: {}, stdlib_mode: {}",
-                      _source_file, _stdlib_compilation_mode);
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file detected: {}, stdlib_mode: {}, exception_active: {}",
+                      _source_file, _stdlib_compilation_mode, stdlib_mode_runtime_exception);
         }
 
         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: core/types");
@@ -1817,12 +1823,10 @@ namespace Cryo
             }
         }
 
-        // Skip remaining auto-imports if we're in stdlib mode
-        // All stdlib files get core/types (for Array, Option, Result, etc.) but not other auto-imports
-        // to avoid circular dependencies
-        if (_stdlib_compilation_mode)
+        // Skip remaining auto-imports if we're in stdlib mode (except for runtime files which only get core/types)
+        if (stdlib_mode_runtime_exception)
         {
-            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Stdlib file in stdlib mode: only auto-imported core/types, skipping other imports");
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file in stdlib mode: only auto-imported core/types, skipping other imports");
             return;
         }
 
