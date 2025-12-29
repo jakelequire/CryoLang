@@ -128,6 +128,10 @@ namespace Cryo::Codegen
                 return nullptr;
         }
 
+        // Always ensure parameters are named - the function might have been
+        // pre-declared by CallCodegen::get_or_create_function without parameter names
+        generate_parameters(fn, node);
+
         // Skip if already has a body
         if (!fn->empty())
         {
@@ -135,27 +139,14 @@ namespace Cryo::Codegen
             return fn;
         }
 
-        // Create entry block
+        // Create entry block - generate_function_body will handle context/scope setup
         llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
         builder().SetInsertPoint(entry_block);
 
-        // Set up function context for proper scope isolation
-        auto fn_ctx = std::make_unique<FunctionContext>(fn, node);
-        fn_ctx->entry_block = entry_block;
-        ctx().set_current_function(std::move(fn_ctx));
-
-        // Enter function scope (isolates local variables)
-        values().enter_scope(name);
-
-        // Clear any stale result from previous expressions
-        ctx().set_result(nullptr);
-
-        // Generate function body
+        // Generate function body (handles context/scope setup and teardown)
         generate_function_body(fn, node);
 
-        // Exit function scope and clean up
-        values().exit_scope();
-        ctx().clear_current_function();
+        // Clear any stale result from previous expressions
         ctx().set_result(nullptr);
 
         // Verify function
