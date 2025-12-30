@@ -1723,8 +1723,18 @@ namespace Cryo::Codegen
                 std::string type_name = struct_type->hasName() ? struct_type->getName().str() : "unnamed_struct";
                 std::string global_name = global->getName().str();
 
-                // Generic constructor lookup
-                std::string ctor_name = type_name + "::init";
+                // Extract base type name (without namespace) for constructor lookup
+                // e.g., "std::Runtime::CryoRuntime" -> "CryoRuntime"
+                std::string base_type_name = type_name;
+                size_t last_sep = type_name.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    base_type_name = type_name.substr(last_sep + 2);
+                }
+
+                // Generic constructor lookup - constructor is TypeName::TypeName
+                // For namespaced types: std::Runtime::CryoRuntime::CryoRuntime
+                std::string ctor_name = type_name + "::" + base_type_name;
 
                 // Look for constructor function
                 if (llvm::Function *ctor_func = mod->getFunction(ctor_name))
@@ -1741,9 +1751,10 @@ namespace Cryo::Codegen
                 {
                     // Try alternative naming patterns
                     std::vector<std::string> alt_names = {
+                        type_name + "::init",
                         type_name + "()",
-                        type_name + "::" + type_name,
-                        "std::Runtime::" + type_name + "::" + type_name
+                        base_type_name + "::" + base_type_name,  // For non-namespaced lookup
+                        "std::Runtime::" + base_type_name + "::" + base_type_name
                     };
 
                     bool found = false;
