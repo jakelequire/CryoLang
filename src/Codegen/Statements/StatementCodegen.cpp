@@ -293,8 +293,9 @@ namespace Cryo::Codegen
             }
         }
 
-        // Register in value context
-        values().set_value(name, nullptr, alloca);
+        // Register in value context with the alloca type for proper type tracking
+        // The 4th parameter (alloca_type) is needed for correct store/load operations
+        values().set_value(name, nullptr, alloca, var_type);
     }
 
     //===================================================================
