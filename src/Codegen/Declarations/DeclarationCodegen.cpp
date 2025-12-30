@@ -542,6 +542,17 @@ namespace Cryo::Codegen
         // Generate initializer
         llvm::Constant *initializer = generate_global_initializer(node, var_type);
 
+        // Track if this global has an explicit initializer in source code
+        // Only globals with explicit initializers like `= Type()` should have constructors called
+        // Globals declared without initializer like `mut x: Type;` should NOT be auto-constructed
+        if (node->initializer() && var_type->isStructTy())
+        {
+            _globals_with_explicit_initializers.insert(name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Global '{}' has explicit initializer, will call constructor",
+                      name);
+        }
+
         // Log the initializer type for debugging
         if (initializer)
         {
@@ -1658,18 +1669,27 @@ namespace Cryo::Codegen
                 continue;
             }
 
-            if (!global.hasInitializer() || global.getInitializer()->isNullValue())
+            // Only process globals that have explicit initializers in source code
+            // (e.g., `mut x: Type = Type();`)
+            // Globals declared without initializers (e.g., `mut x: Type;`) should NOT
+            // be auto-constructed - the user is responsible for initializing them
+            std::string global_name = global.getName().str();
+            if (_globals_with_explicit_initializers.find(global_name) != _globals_with_explicit_initializers.end())
             {
-                // This global is zero-initialized but might need constructor call
                 llvm::Type *global_type = global.getValueType();
                 if (global_type->isStructTy())
                 {
-                    // Struct types may need constructor calls
                     globals_needing_ctors.push_back(&global);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                             "Found global variable '{}' that may need constructor call",
-                             global.getName().str());
+                             "Global '{}' has explicit initializer, will call constructor",
+                             global_name);
                 }
+            }
+            else if (global.getValueType()->isStructTy())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                         "Global '{}' declared without initializer, skipping auto-construction",
+                         global_name);
             }
         }
 
