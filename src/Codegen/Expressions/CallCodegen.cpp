@@ -134,8 +134,49 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    // For simple receivers (like 'this'), generate the expression value
-                    receiver = generate_expression(member->object());
+                    // For simple receivers, we need to check if it's a global variable
+                    // Global struct variables need their ADDRESS passed to methods, not the loaded value
+                    // Otherwise modifications won't persist back to the global
+                    if (auto *identifier = dynamic_cast<IdentifierNode *>(member->object()))
+                    {
+                        std::string name = identifier->name();
+
+                        // Check if it's a global variable
+                        if (llvm::GlobalVariable *global = module()->getGlobalVariable(name))
+                        {
+                            // For global struct variables, return the global's address directly
+                            // This allows methods to modify the global in-place
+                            receiver = global;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Using global variable address for method receiver: {}", name);
+                        }
+                        else
+                        {
+                            // Try with namespace qualification
+                            auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Variable);
+                            for (const auto &candidate : candidates)
+                            {
+                                if (llvm::GlobalVariable *g = module()->getGlobalVariable(candidate))
+                                {
+                                    receiver = g;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Using qualified global variable address for method receiver: {}", candidate);
+                                    break;
+                                }
+                            }
+                        }
+
+                        // If not a global, fall back to generating the expression
+                        if (!receiver)
+                        {
+                            receiver = generate_expression(member->object());
+                        }
+                    }
+                    else
+                    {
+                        // For other receivers (like 'this'), generate the expression value
+                        receiver = generate_expression(member->object());
+                    }
                 }
 
                 if (!receiver)
