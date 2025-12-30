@@ -411,14 +411,6 @@ namespace Cryo::Codegen
             return global;
         }
 
-        // Check enum variants map for constants
-        auto &enum_variants = ctx().enum_variants_map();
-        if (enum_variants.find(name) != enum_variants.end())
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' as enum variant", name);
-            return enum_variants[name];
-        }
-
         // Use SRM to generate all possible name candidates
         // This handles: current namespace, imported namespaces, aliases, global scope
         auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Variable);
@@ -445,7 +437,16 @@ namespace Cryo::Codegen
         // Try function
         if (llvm::Function *func = module()->getFunction(name))
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' as function", name);
             return func;
+        }
+
+        // Check enum variants map for constants (lower priority than functions)
+        auto &enum_variants = ctx().enum_variants_map();
+        if (enum_variants.find(name) != enum_variants.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' as enum variant", name);
+            return enum_variants[name];
         }
 
         // Not found - log at DEBUG level instead of ERROR to avoid premature diagnostics

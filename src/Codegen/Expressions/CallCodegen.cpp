@@ -580,7 +580,20 @@ namespace Cryo::Codegen
         }
         else
         {
-            // Initialize fields
+            // Log the failure for debugging
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                     "Constructor not found for type '{}'. Available functions:", resolved_type_name);
+            
+            // List available functions for debugging
+            for (auto &fn : module()->getFunctionList())
+            {
+                if (fn.getName().contains("CryoRuntime"))
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Available: {}", fn.getName().str());
+                }
+            }
+
+            // Initialize fields as fallback
             auto *st = llvm::cast<llvm::StructType>(class_type);
             for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
             {
@@ -1213,11 +1226,17 @@ namespace Cryo::Codegen
         {
             std::string simple_name = get_simple_name(type_candidate);
 
-            // Try "Type::init", "Type::new", and "Type::Type" patterns
+            // Try multiple constructor patterns including exact matches
             std::vector<std::string> ctor_names = {
+                // Standard patterns
                 type_candidate + "::init",
-                type_candidate + "::new",
-                type_candidate + "::" + simple_name};
+                type_candidate + "::new", 
+                type_candidate + "::" + simple_name,
+                // Exact match for CryoRuntime
+                "std::Runtime::CryoRuntime::CryoRuntime",
+                // Also try the simple name directly
+                simple_name + "::" + simple_name
+            };
 
             for (const auto &ctor_name : ctor_names)
             {
