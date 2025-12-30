@@ -863,22 +863,26 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::ExpressionStatementNode &node)
     {
         NodeTracker tracker(*_ctx, &node);
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                  "=== EXPR STMT DEBUG: Visiting ExpressionStatementNode");
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ExpressionStatementNode");
 
         // Generate expression for side effects
         if (node.expression())
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, 
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                      "=== EXPR STMT DEBUG: Processing expression in statement");
             node.expression()->accept(*this);
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, 
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                      "=== EXPR STMT DEBUG: Finished processing expression");
+
+            // Clear the result - expression statements discard their value
+            // This prevents lingering results from affecting subsequent operations
+            _ctx->set_result(nullptr);
         }
         else
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, 
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                      "=== EXPR STMT DEBUG: No expression in statement!");
         }
     }
