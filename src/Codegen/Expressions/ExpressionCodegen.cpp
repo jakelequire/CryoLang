@@ -1978,19 +1978,19 @@ namespace Cryo::Codegen
         const llvm::DataLayout &dl = module()->getDataLayout();
         uint64_t size = dl.getTypeAllocSize(alloc_type);
 
-        // Call malloc
-        llvm::Function *malloc_fn = module()->getFunction("malloc");
-        if (!malloc_fn)
+        // Call cryo_alloc (runtime heap allocator)
+        llvm::Function *cryo_alloc_fn = module()->getFunction("std::Runtime::cryo_alloc");
+        if (!cryo_alloc_fn)
         {
             llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
             llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
-            llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
-            malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
-                                               "malloc", module());
+            llvm::FunctionType *cryo_alloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+            cryo_alloc_fn = llvm::Function::Create(cryo_alloc_type, llvm::Function::ExternalLinkage,
+                                                   "std::Runtime::cryo_alloc", module());
         }
 
         llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
-        llvm::Value *ptr = builder().CreateCall(malloc_fn, {size_val}, "new." + node->type_name());
+        llvm::Value *ptr = builder().CreateCall(cryo_alloc_fn, {size_val}, "new." + node->type_name());
 
         // If there are constructor arguments, call constructor
         // TODO: Handle constructor calls with arguments

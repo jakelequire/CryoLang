@@ -573,37 +573,17 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Classes are reference types - always heap allocated
-        // This differs from structs which are value types (stack allocated)
-        // When you call ClassName(), you get a heap-allocated instance
-        // This allows storing the result in pointer fields without dangling references
-        auto &dl = module()->getDataLayout();
-        uint64_t size = dl.getTypeAllocSize(class_type);
+        // Classes and structs have same allocation semantics: value by default
+        // 'new' keyword determines heap allocation, absence means value/stack allocation
+        // ClassName() creates value instance (stack allocated)
+        // new ClassName() creates pointer instance (heap allocated via cryo_alloc)
 
-        llvm::Value *heap_ptr = nullptr;
-        if (_memory)
+        // Allocate on stack (value semantics)
+        llvm::AllocaInst *alloca = create_entry_alloca(class_type, type_name + ".instance");
+        if (!alloca)
         {
-            heap_ptr = _memory->create_heap_alloc(class_type, "class." + type_name);
-        }
-        else
-        {
-            // Fallback: call malloc directly
-            llvm::Function *malloc_fn = module()->getFunction("malloc");
-            if (!malloc_fn)
-            {
-                llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
-                llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
-                llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
-                malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", module());
-            }
-            llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
-            heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "heap_alloc");
-        }
-
-        if (!heap_ptr)
-        {
-            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
-                         "Failed to allocate heap memory for class");
+            report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
+                         "Failed to allocate class instance");
             return nullptr;
         }
 
@@ -616,8 +596,9 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "Found constructor for {}, calling with {} args", resolved_type_name, args.size() + 1);
+            // Call constructor with allocated memory and arguments
             std::vector<llvm::Value *> ctor_args;
-            ctor_args.push_back(heap_ptr);
+            ctor_args.push_back(alloca);
             ctor_args.insert(ctor_args.end(), args.begin(), args.end());
             builder().CreateCall(ctor, ctor_args);
         }
@@ -631,13 +612,13 @@ namespace Cryo::Codegen
             auto *st = llvm::cast<llvm::StructType>(class_type);
             for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
             {
-                llvm::Value *field_ptr = create_struct_gep(class_type, heap_ptr, i, "field." + std::to_string(i));
+                llvm::Value *field_ptr = create_struct_gep(class_type, alloca, i, "field." + std::to_string(i));
                 llvm::Value *arg = cast_if_needed(args[i], st->getElementType(i));
                 create_store(arg, field_ptr);
             }
         }
 
-        return heap_ptr;
+        return alloca;
     }
 
     llvm::Value *CallCodegen::generate_enum_variant(Cryo::CallExpressionNode *node,
