@@ -137,9 +137,29 @@ namespace Cryo::Codegen
         llvm::TargetOptions options;
         auto reloc_model = llvm::Reloc::PIC_;
 
+        // Use Large code model on Windows to avoid relocation truncation errors
+        // (IMAGE_REL_AMD64_ADDR32 against '.rdata')
+        // On other platforms, use Small code model for efficiency
+        std::optional<llvm::CodeModel::Model> code_model;
+        if (_target_triple.find("windows") != std::string::npos ||
+            _target_triple.find("win32") != std::string::npos ||
+            _target_triple.find("mingw") != std::string::npos ||
+            _target_triple.find("msvc") != std::string::npos)
+        {
+            // Windows x64 needs Large code model to handle addresses > 2GB
+            code_model = llvm::CodeModel::Large;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "Using Large code model for Windows target: {}", _target_triple);
+        }
+        else
+        {
+            // Other platforms can use Small code model
+            code_model = llvm::CodeModel::Small;
+        }
+
         _target_machine = std::unique_ptr<llvm::TargetMachine>(
             target->createTargetMachine(_target_triple, _cpu_target, _target_features,
-                                        options, reloc_model));
+                                        options, reloc_model, code_model));
 
         if (!_target_machine)
         {

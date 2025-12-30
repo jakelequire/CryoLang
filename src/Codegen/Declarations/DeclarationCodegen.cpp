@@ -1757,22 +1757,26 @@ namespace Cryo::Codegen
 
         // Register with LLVM's global constructor mechanism
         llvm::Type *i32_type = llvm::Type::getInt32Ty(ctx);
-        llvm::Type *ctor_ptr_type = global_ctor->getType();
-        llvm::Type *i8_ptr_type = llvm::PointerType::get(ctx, 0);
+        // In opaque pointer mode (LLVM 15+), all pointers are just 'ptr'
+        // global_ctor->getType() returns FunctionType, NOT a pointer type
+        // We need PointerType for the struct entry
+        llvm::PointerType *ptr_type = llvm::PointerType::get(ctx, 0);
 
-        // Create array type for global_ctors entry: { i32, void()*, i8* }
+        // Create array type for global_ctors entry: { i32, ptr, ptr }
+        // The standard @llvm.global_ctors format uses opaque pointers
         std::vector<llvm::Type*> ctor_entry_types = {
-            i32_type,      // priority
-            ctor_ptr_type, // constructor function pointer  
-            i8_ptr_type    // associated data (null)
+            i32_type,  // priority
+            ptr_type,  // constructor function pointer (opaque ptr)
+            ptr_type   // associated data (null)
         };
         llvm::StructType *ctor_entry_type = llvm::StructType::get(ctx, ctor_entry_types);
 
         // Create the global_ctors entry
+        // Note: global_ctor (llvm::Function*) is already a Constant and pointer-compatible
         std::vector<llvm::Constant*> ctor_entry_values = {
-            llvm::ConstantInt::get(i32_type, 65535), // priority (default)
-            global_ctor,                             // constructor function
-            llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(i8_ptr_type)) // no associated data
+            llvm::ConstantInt::get(i32_type, 65535),     // priority (default)
+            global_ctor,                                  // constructor function (Function* is a Constant*)
+            llvm::ConstantPointerNull::get(ptr_type)     // no associated data
         };
         llvm::Constant *ctor_entry = llvm::ConstantStruct::get(ctor_entry_type, ctor_entry_values);
 

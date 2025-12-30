@@ -78,21 +78,27 @@ namespace Cryo::Codegen
         node->then_statement()->accept(*visitor);
         exit_scope();
 
-        // Ensure current block ends with a branch to merge
-        llvm::BasicBlock *current_block = builder().GetInsertBlock();
-        if (current_block && !current_block->getTerminator())
+        // Track if then branch has a path to merge block
+        bool then_falls_through = false;
+        llvm::BasicBlock *then_end_block = builder().GetInsertBlock();
+        if (then_end_block && !then_end_block->getTerminator())
         {
             builder().CreateBr(merge_block);
+            then_falls_through = true;
         }
 
-        // Also ensure then_block itself has terminator
+        // Also ensure then_block itself has terminator (for nested control flow)
         if (then_block && !then_block->getTerminator())
         {
             llvm::BasicBlock *saved_block = builder().GetInsertBlock();
             builder().SetInsertPoint(then_block);
             builder().CreateBr(merge_block);
+            then_falls_through = true;
             builder().SetInsertPoint(saved_block);
         }
+
+        // Track if else branch has a path to merge block
+        bool else_falls_through = false;
 
         // Generate else block if present
         if (else_block && node->else_statement())
@@ -103,16 +109,34 @@ namespace Cryo::Codegen
             node->else_statement()->accept(*visitor);
             exit_scope();
 
-            // Ensure else ends with branch to merge
+            // Check if else ends with branch to merge
             llvm::BasicBlock *else_current = builder().GetInsertBlock();
             if (else_current && !else_current->getTerminator())
             {
                 builder().CreateBr(merge_block);
+                else_falls_through = true;
             }
         }
+        else if (!else_block)
+        {
+            // No else clause means the false branch goes directly to merge
+            else_falls_through = true;
+        }
 
-        // Continue with merge block
-        builder().SetInsertPoint(merge_block);
+        // Only continue with merge block if at least one branch falls through to it
+        // If both branches terminate (break/return/continue), merge block is unreachable
+        if (then_falls_through || else_falls_through)
+        {
+            builder().SetInsertPoint(merge_block);
+        }
+        else
+        {
+            // Both branches terminated - merge block is dead code
+            // Remove it from the function to avoid LLVM verification errors
+            merge_block->eraseFromParent();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "ControlFlowCodegen: Removed unreachable merge block (both branches terminate)");
+        }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: If statement complete");
     }
