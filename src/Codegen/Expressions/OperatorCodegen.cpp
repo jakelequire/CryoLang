@@ -474,7 +474,101 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Generate the value to assign
+        // Check if this is a class/struct constructor call being assigned to a member field
+        // In this case, we need to construct in-place rather than heap-allocating
+        if (auto *call_node = dynamic_cast<Cryo::CallExpressionNode *>(value_node))
+        {
+            std::string callee_name;
+            if (auto *callee_id = dynamic_cast<Cryo::IdentifierNode *>(call_node->callee()))
+            {
+                callee_name = callee_id->name();
+            }
+
+            if (!callee_name.empty() && _calls)
+            {
+                // Get the member field's type to determine if it's a struct type
+                llvm::Type *member_field_type = nullptr;
+                if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(member_ptr))
+                {
+                    member_field_type = alloca_inst->getAllocatedType();
+                }
+                else if (auto *gep_inst = llvm::dyn_cast<llvm::GetElementPtrInst>(member_ptr))
+                {
+                    member_field_type = gep_inst->getResultElementType();
+                }
+
+                bool is_class = _calls->is_class_type(callee_name);
+                bool is_struct_field = member_field_type && member_field_type->isStructTy();
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Member assignment: callee='{}', is_class={}, is_struct_field={}",
+                          callee_name, is_class, is_struct_field);
+
+                // If the target field is a struct type and we're calling a class/struct constructor,
+                // construct in-place instead of heap-allocating
+                if (is_struct_field && (is_class || _calls->is_struct_type(callee_name)))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Member assignment: In-place construction for '{}' into struct field",
+                              callee_name);
+
+                    // Generate constructor arguments
+                    std::vector<llvm::Value *> args;
+                    for (const auto &arg : call_node->arguments())
+                    {
+                        if (arg)
+                        {
+                            llvm::Value *arg_val = generate_operand(arg.get());
+                            if (arg_val)
+                            {
+                                args.push_back(arg_val);
+                            }
+                        }
+                    }
+
+                    // Look for the constructor function
+                    llvm::Function *ctor = _calls->resolve_constructor(callee_name);
+                    if (ctor)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Member assignment: Calling constructor '{}' in-place with {} args",
+                                  ctor->getName().str(), args.size());
+
+                        // Call constructor with member_ptr as 'this' pointer
+                        std::vector<llvm::Value *> ctor_args;
+                        ctor_args.push_back(member_ptr);
+                        ctor_args.insert(ctor_args.end(), args.begin(), args.end());
+                        builder().CreateCall(ctor, ctor_args);
+                        return member_ptr;
+                    }
+                    else
+                    {
+                        // No constructor found - initialize fields directly if there are args
+                        if (!args.empty() && member_field_type)
+                        {
+                            auto *st = llvm::dyn_cast<llvm::StructType>(member_field_type);
+                            if (st)
+                            {
+                                for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
+                                {
+                                    llvm::Value *field_ptr = builder().CreateStructGEP(member_field_type, member_ptr, i,
+                                                                                        "field." + std::to_string(i));
+                                    llvm::Value *arg = args[i];
+                                    if (arg->getType() != st->getElementType(i))
+                                    {
+                                        arg = cast_if_needed(arg, st->getElementType(i));
+                                    }
+                                    builder().CreateStore(arg, field_ptr);
+                                }
+                                return member_ptr;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Generate the value to assign (standard path)
         llvm::Value *value = generate_operand(value_node);
         if (!value)
         {
