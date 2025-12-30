@@ -1878,26 +1878,29 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        std::string type_name = node->struct_type();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating struct literal for {}",
-                  node->struct_type());
+                  type_name);
 
         // Look up struct type
-        llvm::Type *struct_type = ctx().get_type(node->struct_type());
+        llvm::Type *struct_type = ctx().get_type(type_name);
         if (!struct_type || !struct_type->isStructTy())
         {
             report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
-                         "Unknown struct type: " + node->struct_type());
+                         "Unknown struct type: " + type_name);
             return nullptr;
         }
 
         auto *st = llvm::cast<llvm::StructType>(struct_type);
 
         // Allocate struct on stack
-        llvm::AllocaInst *struct_alloca = create_entry_alloca(struct_type, node->struct_type() + ".literal");
+        llvm::AllocaInst *struct_alloca = create_entry_alloca(struct_type, type_name + ".literal");
 
         // Initialize fields from field initializers
+        // IMPORTANT: Use field name lookup to get correct index, NOT positional index
+        // Fields may be provided in any order (e.g., Point { y: 5, x: 10 })
         const auto &field_initializers = node->field_initializers();
-        for (size_t i = 0; i < field_initializers.size() && i < st->getNumElements(); ++i)
+        for (size_t i = 0; i < field_initializers.size(); ++i)
         {
             const auto &initializer = field_initializers[i];
             if (!initializer || !initializer->value())
@@ -1906,21 +1909,46 @@ namespace Cryo::Codegen
                 continue;
             }
 
+            std::string field_name = initializer->field_name();
+
+            // Look up the actual field index by name - this handles fields in any order
+            int field_idx = ctx().get_struct_field_index(type_name, field_name);
+            if (field_idx < 0)
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "Field '{}' not found in struct '{}', skipping", field_name, type_name);
+                continue;
+            }
+
+            // Verify field index is valid
+            if (static_cast<unsigned>(field_idx) >= st->getNumElements())
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "Field index {} out of bounds for struct '{}' with {} elements",
+                         field_idx, type_name, st->getNumElements());
+                continue;
+            }
+
             llvm::Value *field_val = generate(initializer->value());
             if (!field_val)
             {
                 LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to generate struct field {}",
-                         initializer->field_name());
+                         field_name);
                 continue;
             }
 
-            // Cast if needed
-            field_val = cast_if_needed(field_val, st->getElementType(i));
+            // Cast if needed - use the correct field type based on looked-up index
+            field_val = cast_if_needed(field_val, st->getElementType(field_idx));
 
-            // Get pointer to field
-            llvm::Value *field_ptr = create_struct_gep(struct_type, struct_alloca, i,
-                                                       initializer->field_name() + ".ptr");
+            // Get pointer to field using correct index
+            llvm::Value *field_ptr = create_struct_gep(struct_type, struct_alloca,
+                                                       static_cast<unsigned>(field_idx),
+                                                       field_name + ".ptr");
             create_store(field_val, field_ptr);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "Initialized struct field '{}' at index {} (type: {})",
+                     field_name, field_idx, type_name);
         }
 
         return struct_alloca;
