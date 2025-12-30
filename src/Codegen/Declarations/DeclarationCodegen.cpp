@@ -1287,8 +1287,13 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Generating body for method: {}", fn->getName().str());
-
-            // Create entry block and generate body
+                
+                // Special debug for main function
+                if (fn->getName().contains("main")) 
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                             "=== MAIN FUNCTION DEBUG: Starting body generation for '{}'", fn->getName().str());
+                }
             llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
             builder().SetInsertPoint(entry);
 
@@ -1645,15 +1650,11 @@ namespace Cryo::Codegen
                 continue;
             }
 
-            // Skip runtime-internal globals that handle their own initialization
-            // g_cryo_runtime is initialized by CryoRuntime::initialize(), not through llvm.global_ctors
+            // Skip LLVM internal globals and some runtime internals
+            // but allow proper user-defined globals to be processed normally
             std::string gname = global.getName().str();
-            if (gname == "g_cryo_runtime" || gname.starts_with("g_cryo_") ||
-                gname.find("CryoRuntime") != std::string::npos)
+            if (gname.starts_with("llvm.") || gname.starts_with(".str"))
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                         "Skipping runtime-internal global '{}' (handled by runtime initialization)",
-                         gname);
                 continue;
             }
 
