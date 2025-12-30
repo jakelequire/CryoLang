@@ -532,37 +532,13 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Calculate size
-        auto &dl = module()->getDataLayout();
-        uint64_t size = dl.getTypeAllocSize(class_type);
-
-        // Allocate on heap using memory codegen if available
-        llvm::Value *heap_ptr = nullptr;
-        if (_memory)
-        {
-            llvm::Type *i8_type = llvm::Type::getInt8Ty(llvm_ctx());
-            llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
-            heap_ptr = _memory->create_heap_alloc(i8_type, "class." + type_name);
-        }
-        else
-        {
-            // Fallback: call malloc directly
-            llvm::Function *malloc_fn = module()->getFunction("malloc");
-            if (!malloc_fn)
-            {
-                llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
-                llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
-                llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
-                malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", module());
-            }
-            llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
-            heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "heap_alloc");
-        }
-
-        if (!heap_ptr)
+        // Allocate on STACK - class constructors without 'new' are value types
+        // Heap allocation only happens via NewExpressionNode
+        llvm::AllocaInst *alloca = create_entry_alloca(class_type, type_name + ".instance");
+        if (!alloca)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
-                         "Failed to allocate heap memory for class");
+                         "Failed to allocate class instance on stack");
             return nullptr;
         }
 
@@ -573,37 +549,30 @@ namespace Cryo::Codegen
         llvm::Function *ctor = resolve_constructor(resolved_type_name);
         if (ctor)
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Found constructor for {}, calling with {} args", resolved_type_name, args.size() + 1);
             std::vector<llvm::Value *> ctor_args;
-            ctor_args.push_back(heap_ptr);
+            ctor_args.push_back(alloca);
             ctor_args.insert(ctor_args.end(), args.begin(), args.end());
             builder().CreateCall(ctor, ctor_args);
         }
         else
         {
             // Log the failure for debugging
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Constructor not found for type '{}'. Available functions:", resolved_type_name);
-            
-            // List available functions for debugging
-            for (auto &fn : module()->getFunctionList())
-            {
-                if (fn.getName().contains("CryoRuntime"))
-                {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "  Available: {}", fn.getName().str());
-                }
-            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "No explicit constructor for {}, initializing fields directly", resolved_type_name);
 
             // Initialize fields as fallback
             auto *st = llvm::cast<llvm::StructType>(class_type);
             for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
             {
-                llvm::Value *field_ptr = create_struct_gep(class_type, heap_ptr, i, "field." + std::to_string(i));
+                llvm::Value *field_ptr = create_struct_gep(class_type, alloca, i, "field." + std::to_string(i));
                 llvm::Value *arg = cast_if_needed(args[i], st->getElementType(i));
                 create_store(arg, field_ptr);
             }
         }
 
-        return heap_ptr;
+        return alloca;
     }
 
     llvm::Value *CallCodegen::generate_enum_variant(Cryo::CallExpressionNode *node,
