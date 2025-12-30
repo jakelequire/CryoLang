@@ -9,6 +9,7 @@
 #include <llvm/IR/Type.h>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 namespace Cryo
 {
@@ -268,6 +269,10 @@ namespace Cryo::Codegen
         TypeCodegen *_type_codegen = nullptr;
         GenericCodegen *_generics = nullptr;
         bool _pre_registration_mode = false;
+
+        // Track globals that have explicit initializers and need constructor calls
+        // Only globals in this set will have constructors called in __cryo_global_constructors
+        std::unordered_set<std::string> _globals_with_explicit_initializers;
 
         //===================================================================
         // Internal Helpers
