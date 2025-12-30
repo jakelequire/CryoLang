@@ -1,4 +1,5 @@
 #include "Codegen/Declarations/TypeCodegen.hpp"
+#include "AST/Type.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -573,19 +574,28 @@ namespace Cryo::Codegen
             // Create opaque struct first (for recursive types)
             struct_type = llvm::StructType::create(llvm_ctx(), name);
         }
-
         // Collect field types
         std::vector<llvm::Type *> field_types;
         for (const auto &field : node->fields())
         {
-            llvm::Type *field_type = types().get_type(field->get_resolved_type());
-            if (field_type)
+            Cryo::Type *cryo_field_type = field->get_resolved_type();
+            if (cryo_field_type)
             {
-                field_types.push_back(field_type);
+                // Use the main type mapping method like the old implementation did
+                llvm::Type *field_type = types().map(cryo_field_type);
+                if (field_type)
+                {
+                    field_types.push_back(field_type);
+                }
+                else
+                {
+                    // Default to i64 for unknown types
+                    field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
+                }
             }
             else
             {
-                // Default to i64 for unknown types
+                // Default to i64 for unresolved types
                 field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
             }
         }
@@ -656,13 +666,39 @@ namespace Cryo::Codegen
 
         for (const auto &field : node->fields())
         {
-            llvm::Type *field_type = types().get_type(field->get_resolved_type());
-            if (field_type)
+            Cryo::Type *cryo_field_type = field->get_resolved_type();
+            if (cryo_field_type)
             {
-                field_types.push_back(field_type);
+                // DEBUG: Log the actual type kind for class fields
+                std::string type_kind_str = "unknown";
+                switch (cryo_field_type->kind())
+                {
+                    case Cryo::TypeKind::Class: type_kind_str = "Class"; break;
+                    case Cryo::TypeKind::Pointer: type_kind_str = "Pointer"; break;
+                    case Cryo::TypeKind::Struct: type_kind_str = "Struct"; break;
+                    case Cryo::TypeKind::Integer: type_kind_str = "Integer"; break;
+                    default: type_kind_str = TypeKindToString(cryo_field_type->kind()); break;
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': type='{}', kind='{}'", 
+                         field->name(), cryo_field_type->name(), type_kind_str);
+                
+                // Use the main type mapping method like the old implementation did
+                llvm::Type *field_type = types().map(cryo_field_type);
+                if (field_type)
+                {
+                    field_types.push_back(field_type);
+                }
+                else
+                {
+                    // Default to i64 for unknown types
+                    field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
+                }
             }
             else
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': resolved type is NULL", 
+                         field->name());
+                // Default to i64 for unresolved types
                 field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
             }
         }

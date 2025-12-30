@@ -135,10 +135,27 @@ namespace Cryo::Codegen
 
         case TypeKind::Generic:
             // Generic type parameters should be instantiated before codegen
-            // Use opaque pointer as fallback
-            LOG_WARN(Cryo::LogComponent::CODEGEN, "Generic type '{}' not instantiated, using ptr",
-                     cryo_type->name());
-            result = ptr_type();
+            // However, sometimes concrete class types are misclassified as Generic
+            // Try to resolve as a concrete class first
+            {
+                std::string type_name = cryo_type->name();
+                
+                // Try to find a struct type with this name (classes become structs in LLVM)
+                llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+                if (struct_type && !struct_type->isOpaque())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic type '{}' resolved to concrete struct type", type_name);
+                    result = struct_type;
+                }
+                else
+                {
+                    // Fallback: create/get opaque struct for the class name
+                    struct_type = get_or_create_struct(type_name);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic type '{}' resolved to struct type (opaque: {})", 
+                             type_name, struct_type->isOpaque() ? "yes" : "no");
+                    result = struct_type;
+                }
+            }
             break;
 
         case TypeKind::Auto:
