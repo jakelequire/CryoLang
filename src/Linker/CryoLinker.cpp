@@ -330,7 +330,9 @@ namespace Cryo::Linker
         auto cpu = "generic";
         auto features = "";
         llvm::TargetOptions opt;
-        auto rm = std::make_optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
+        
+        // Use Static relocation model instead of PIC to avoid address space issues
+        auto rm = std::make_optional<llvm::Reloc::Model>(llvm::Reloc::Static);
         auto target_machine = std::unique_ptr<llvm::TargetMachine>(
             target->createTargetMachine(target_triple, cpu, features, opt, rm));
 
@@ -543,8 +545,8 @@ namespace Cryo::Linker
                                                                  // Skip PIE flags on Windows as they can cause runtime issues with MinGW
 #else
         full_command.push_back("clang++"); // Use system clang++ on other platforms
-        // Add PIE-related flags now that libcryo.a is compiled with -fPIC
-        full_command.push_back("-fPIE");
+        // Use static linking to avoid PIE-related address space conflicts
+        full_command.push_back("-no-pie");
         // Add debug symbols for better debugging
         full_command.push_back("-g");
 #endif

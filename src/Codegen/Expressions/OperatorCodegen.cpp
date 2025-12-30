@@ -222,6 +222,8 @@ namespace Cryo::Codegen
 
     llvm::Value *OperatorCodegen::generate_assignment(Cryo::BinaryExpressionNode *node)
     {
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== ASSIGNMENT DEBUG: Starting assignment generation ===");
+        
         if (!node)
             return nullptr;
 
@@ -258,25 +260,60 @@ namespace Cryo::Codegen
                                                                  Cryo::ExpressionNode *value_node)
     {
         if (!target || !value_node)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                     "Assignment: Null target or value_node: target={}, value_node={}", 
+                     (void*)target, (void*)value_node);
             return nullptr;
+        }
 
         std::string var_name = target->name();
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                 "Assignment: Processing assignment to variable '{}'", var_name);
 
         // Find the variable's storage location
         llvm::Value *var_ptr = values().get_alloca(var_name);
         if (!var_ptr)
         {
-            // Try global
-            auto &globals = ctx().globals_map();
-            auto it = globals.find(var_name);
-            if (it != globals.end())
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                     "Assignment: Variable '{}' not found in alloca, trying globals", var_name);
+            // Try global from ValueContext first
+            var_ptr = values().get_global_value(var_name);
+            if (var_ptr)
             {
-                var_ptr = it->second;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                         "Assignment: Found variable '{}' in ValueContext globals", var_name);
             }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                         "Assignment: Variable '{}' not found in ValueContext globals, trying CodegenContext", var_name);
+                // Try global from CodegenContext as fallback
+                auto &globals = ctx().globals_map();
+                auto it = globals.find(var_name);
+                if (it != globals.end())
+                {
+                    var_ptr = it->second;
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                             "Assignment: Found variable '{}' in CodegenContext globals", var_name);
+                }
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                             "Assignment: Variable '{}' not found in CodegenContext globals either", var_name);
+                }
+            }
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                     "Assignment: Found variable '{}' in alloca", var_name);
         }
 
         if (!var_ptr)
         {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                     "Assignment: Variable '{}' lookup FAILED - undefined variable", var_name);
             report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, target,
                          "Undefined variable: " + var_name);
             return nullptr;
@@ -286,75 +323,115 @@ namespace Cryo::Codegen
         // In this case, we need to construct in-place rather than heap-allocating
         if (auto *call_node = dynamic_cast<Cryo::CallExpressionNode *>(value_node))
         {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                     "Assignment: Processing call expression for variable '{}'", var_name);
+
             // Get the function name being called
             std::string callee_name;
             if (auto *callee_id = dynamic_cast<Cryo::IdentifierNode *>(call_node->callee()))
             {
                 callee_name = callee_id->name();
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                         "Assignment: Callee name is '{}'", callee_name);
             }
 
             // Check if this is a class type constructor
-            if (!callee_name.empty() && _calls && _calls->is_class_type(callee_name))
+            bool is_class = _calls ? _calls->is_class_type(callee_name) : false;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                     "Assignment: Callee '{}' is_class_type={}, _calls={}", 
+                     callee_name, is_class, (void*)_calls);
+
+            if (!callee_name.empty() && _calls)
             {
                 // Get the target variable's type
                 llvm::Type *var_type = nullptr;
                 if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(var_ptr))
                 {
                     var_type = alloca->getAllocatedType();
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                             "Assignment: Variable '{}' is AllocaInst, type={}", 
+                             var_name, var_type ? "present" : "null");
                 }
                 else if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(var_ptr))
                 {
                     var_type = global->getValueType();
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                             "Assignment: Variable '{}' is GlobalVariable, type={}", 
+                             var_name, var_type ? "present" : "null");
                 }
 
-                // If the target is a struct type (value type), construct in-place
-                if (var_type && var_type->isStructTy())
+                // If the target is a struct type (value type), try constructor-based assignment
+                bool is_struct = var_type ? var_type->isStructTy() : false;
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                         "Assignment: Variable '{}' type isStructTy={}", var_name, is_struct);
+
+                if (var_type && is_struct)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "In-place class construction for '{}' of type '{}'",
-                              var_name, callee_name);
+                    // Check if class type or try constructor anyway
+                    bool try_constructor = is_class || call_node->arguments().empty();
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                              "Assignment: Try constructor for '{}': is_class={}, try_constructor={}",
+                              callee_name, is_class, try_constructor);
 
-                    // Generate constructor arguments
-                    std::vector<llvm::Value *> args;
-                    for (const auto &arg : call_node->arguments())
+                    if (try_constructor)
                     {
-                        if (arg)
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                  "Assignment: Starting in-place construction for '{}' of type '{}'",
+                                  var_name, callee_name);
+
+                        // Generate constructor arguments
+                        std::vector<llvm::Value *> args;
+                        for (const auto &arg : call_node->arguments())
                         {
-                            llvm::Value *arg_val = generate_operand(arg.get());
-                            if (arg_val)
+                            if (arg)
                             {
-                                args.push_back(arg_val);
+                                llvm::Value *arg_val = generate_operand(arg.get());
+                                if (arg_val)
+                                {
+                                    args.push_back(arg_val);
+                                }
                             }
                         }
-                    }
 
-                    // Look for the constructor function
-                    llvm::Function *ctor = _calls ? _calls->resolve_constructor(callee_name) : nullptr;
-                    if (ctor)
-                    {
-                        // Call constructor with var_ptr as 'this'
-                        std::vector<llvm::Value *> ctor_args;
-                        ctor_args.push_back(var_ptr);
-                        ctor_args.insert(ctor_args.end(), args.begin(), args.end());
-                        builder().CreateCall(ctor, ctor_args);
-                        return var_ptr;
-                    }
-                    else
-                    {
-                        // No constructor found - initialize fields directly if there are args
-                        auto *st = llvm::cast<llvm::StructType>(var_type);
-                        for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
+                        // Look for the constructor function
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                 "Assignment: Calling resolve_constructor for '{}'", callee_name);
+                        llvm::Function *ctor = _calls->resolve_constructor(callee_name);
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                 "Assignment: Constructor resolved: {}", ctor ? "SUCCESS" : "FAILED");
+                        
+                        if (ctor)
                         {
-                            llvm::Value *field_ptr = builder().CreateStructGEP(var_type, var_ptr, i,
-                                                                                "field." + std::to_string(i));
-                            llvm::Value *arg = args[i];
-                            if (arg->getType() != st->getElementType(i))
-                            {
-                                arg = cast_if_needed(arg, st->getElementType(i));
-                            }
-                            builder().CreateStore(arg, field_ptr);
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                     "Assignment: Calling constructor '{}' with {} args", 
+                                     ctor->getName().str(), args.size());
+                            // Call constructor with var_ptr as 'this'
+                            std::vector<llvm::Value *> ctor_args;
+                            ctor_args.push_back(var_ptr);
+                            ctor_args.insert(ctor_args.end(), args.begin(), args.end());
+                            builder().CreateCall(ctor, ctor_args);
+                            return var_ptr;
                         }
-                        return var_ptr;
+                        else
+                        {
+                            // No constructor found - try direct field initialization if there are args
+                            if (!args.empty())
+                            {
+                                auto *st = llvm::cast<llvm::StructType>(var_type);
+                                for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
+                                {
+                                    llvm::Value *field_ptr = builder().CreateStructGEP(var_type, var_ptr, i,
+                                                                                        "field." + std::to_string(i));
+                                    llvm::Value *arg = args[i];
+                                    if (arg->getType() != st->getElementType(i))
+                                    {
+                                        arg = cast_if_needed(arg, st->getElementType(i));
+                                    }
+                                    builder().CreateStore(arg, field_ptr);
+                                }
+                                return var_ptr;
+                            }
+                        }
                     }
                 }
             }
