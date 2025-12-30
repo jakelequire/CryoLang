@@ -1076,6 +1076,24 @@ namespace Cryo::Codegen
         // If there's an initializer, try to evaluate it
         if (node->initializer())
         {
+            // Check if the initializer is a constructor call for a class/struct type
+            // Constructor calls generate runtime instructions (malloc, calls) that can't be
+            // used as constant initializers. These must be handled by the global constructor
+            // mechanism instead. Return zeroinitializer and let generate_global_constructors
+            // call the constructor at runtime.
+            if (type->isStructTy())
+            {
+                // Check if it's a call expression (constructor call)
+                if (dynamic_cast<Cryo::CallExpressionNode *>(node->initializer()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_global_initializer: '{}' has struct type with constructor call, "
+                              "using zeroinitializer (constructor will be called via global_ctors)",
+                              node->name());
+                    return llvm::Constant::getNullValue(type);
+                }
+            }
+
             // Visit the initializer expression to get its value
             CodegenVisitor *visitor = ctx().visitor();
             if (visitor)
