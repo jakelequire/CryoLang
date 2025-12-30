@@ -10,12 +10,14 @@
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
+#include <llvm/Support/CodeGen.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/TargetParser/Host.h>
 #include <iostream>
 #include <filesystem>
 #include <cstdlib>
+#include <optional>
 
 namespace Cryo::Linker
 {
@@ -330,11 +332,32 @@ namespace Cryo::Linker
         auto cpu = "generic";
         auto features = "";
         llvm::TargetOptions opt;
-        
-        // Use Static relocation model instead of PIC to avoid address space issues
-        auto rm = std::make_optional<llvm::Reloc::Model>(llvm::Reloc::Static);
+
+        // Use PIC relocation model for compatibility
+        auto rm = std::make_optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
+
+        // Use Large code model on Windows to avoid relocation truncation errors
+        // (IMAGE_REL_AMD64_ADDR32 against '.rdata')
+        // On other platforms, use Small code model for efficiency
+        std::optional<llvm::CodeModel::Model> code_model;
+        if (target_triple.find("windows") != std::string::npos ||
+            target_triple.find("win32") != std::string::npos ||
+            target_triple.find("mingw") != std::string::npos ||
+            target_triple.find("msvc") != std::string::npos)
+        {
+            // Windows x64 needs Large code model to handle addresses > 2GB
+            code_model = llvm::CodeModel::Large;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                     "CryoLinker: Using Large code model for Windows target: {}", target_triple);
+        }
+        else
+        {
+            // Other platforms can use Small code model
+            code_model = llvm::CodeModel::Small;
+        }
+
         auto target_machine = std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(target_triple, cpu, features, opt, rm));
+            target->createTargetMachine(target_triple, cpu, features, opt, rm, code_model));
 
         module->setDataLayout(target_machine->createDataLayout());
 
