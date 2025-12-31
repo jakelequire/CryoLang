@@ -513,19 +513,46 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Get member address
-        llvm::Value *member_ptr = generate_member_address(node);
-        if (!member_ptr)
+        // Generate the object value
+        llvm::Value *object = generate(node->object());
+        if (!object)
         {
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
+                         "Failed to generate member access object");
             return nullptr;
         }
 
-        // Load the field value using the resolved type information
-        llvm::Type *field_type = struct_type->getElementType(field_idx);
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "ExpressionCodegen: Loading member '{}' with field type ID {}",
-                  member_name, field_type->getTypeID());
-        return create_load(member_ptr, field_type, member_name + ".load");
+        // Check if the object is a struct value or a pointer to a struct
+        if (object->getType()->isPointerTy())
+        {
+            // Object is a pointer to a struct - use GEP + load (original path)
+            llvm::Value *member_ptr = generate_member_address(node);
+            if (!member_ptr)
+            {
+                return nullptr;
+            }
+
+            // Load the field value using the resolved type information
+            llvm::Type *field_type = struct_type->getElementType(field_idx);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: Loading member '{}' from pointer with field type ID {}",
+                      member_name, field_type->getTypeID());
+            return create_load(member_ptr, field_type, member_name + ".load");
+        }
+        else if (llvm::isa<llvm::StructType>(object->getType()))
+        {
+            // Object is a struct value - use extractvalue directly
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: Extracting member '{}' from struct value at index {}",
+                      member_name, field_idx);
+            return builder().CreateExtractValue(object, {field_idx}, member_name + ".extract");
+        }
+        else
+        {
+            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
+                         "Member access requires struct value or pointer to struct");
+            return nullptr;
+        }
     }
 
     llvm::Value *ExpressionCodegen::generate_member_address(Cryo::MemberAccessNode *node)
