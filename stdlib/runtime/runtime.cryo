@@ -437,19 +437,31 @@ public:
             return true; // Deallocating null is valid
         }
         
-        // With malloc fallback, all pointers are freed the same way
-        // Just call free directly and update our tracking
-        __free__(ptr);
-        
-        // Update deallocation counter (we can't track exact size without metadata)
-        this.total_deallocated += u64(1);
-        
-        // Update fragmentation calculation
-        this.calculate_fragmentation();
+        // Route to the appropriate deallocator based on where the memory was allocated
+        if (this.is_small_pool_pointer(ptr)) {
+            printf("\033[90m[Runtime::HeapManager] Routing to small pool deallocator\n\033[0m");
+            return this.deallocate_small(ptr);
+        } else if (this.is_medium_allocator_pointer(ptr)) {
+            printf("\033[90m[Runtime::HeapManager] Routing to medium allocator deallocator\n\033[0m");
+            return this.deallocate_medium(ptr);
+        } else if (this.is_large_allocator_pointer(ptr)) {
+            printf("\033[90m[Runtime::HeapManager] Routing to large allocator deallocator\n\033[0m");
+            return this.deallocate_large(ptr);
+        } else {
+            // Fallback: assume it was allocated with malloc fallback
+            printf("\033[90m[Runtime::HeapManager] Using malloc fallback deallocator\n\033[0m");
+            __free__(ptr);
+            
+            // Update deallocation counter (we can't track exact size without metadata)
+            this.total_deallocated += u64(1);
+            
+            // Update fragmentation calculation
+            this.calculate_fragmentation();
 
-        printf("\033[90m[Runtime::HeapManager] Deallocation complete for pointer %p\n\033[0m", ptr);
-        
-        return true;
+            printf("\033[90m[Runtime::HeapManager] Deallocation complete for pointer %p\n\033[0m", ptr);
+            
+            return true;
+        }
     }
     
     defragment() -> void {
@@ -1102,9 +1114,12 @@ private:
             return false;
         }
         
-        const ptr_addr: u8* = ptr as u8*;
-        const region_start: u8* = this.medium_region_base as u8*;
-        const region_end: u8* = region_start + this.medium_region_size;
+        const ptr_addr: u64 = ptr as u64;
+        const region_start: u64 = this.medium_region_base as u64;
+        const region_end: u64 = region_start + this.medium_region_size;
+        
+        printf("\033[90m[Runtime::HeapManager] Pointer check: ptr=0x%llx, region_start=0x%llx, region_end=0x%llx\n\033[0m", 
+               ptr_addr, region_start, region_end);
         
         // Check if pointer is within medium allocation region
         if (ptr_addr < region_start || ptr_addr >= region_end) {
@@ -1112,11 +1127,14 @@ private:
             return false;
         }
         
+        printf("\033[90m[Runtime::HeapManager] Pointer %p is within medium allocation region, checking header\n\033[0m", ptr);
+        
         // Additional validation: try to get header and check magic number
         const header: MediumBlockHeader* = this.get_header_from_user_pointer(ptr);
+        const is_valid: boolean = (header != null && header.magic == BLOCK_MAGIC);
         printf("\033[90m[Runtime::HeapManager] Pointer %p belongs to medium allocator: %s\n\033[0m", 
-               ptr, (header != null && header.magic == BLOCK_MAGIC) ? "true" : "false");
-        return (header != null && header.magic == BLOCK_MAGIC);
+               ptr, is_valid ? "true" : "false");
+        return is_valid;
     }
     
     is_large_allocator_pointer(ptr: void*) -> boolean {
