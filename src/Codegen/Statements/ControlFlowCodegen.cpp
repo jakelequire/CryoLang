@@ -432,14 +432,33 @@ namespace Cryo::Codegen
         llvm::SwitchInst *switch_inst = builder().CreateSwitch(switch_value, default_block, num_cases);
 
         // Generate case blocks
-        llvm::BasicBlock *prev_block = nullptr;
+        std::vector<llvm::BasicBlock *> case_blocks;
+        
+        // Pre-create all case blocks for fallthrough references
         for (size_t i = 0; i < node->cases().size(); ++i)
         {
             auto *case_node = node->cases()[i].get();
-            if (!case_node)
-                continue;
+            if (case_node && !case_node->is_default())
+            {
+                llvm::BasicBlock *case_block = create_block("switch.case." + std::to_string(i), function);
+                case_blocks.push_back(case_block);
+            }
+            else
+            {
+                case_blocks.push_back(nullptr); // Placeholder for default case
+            }
+        }
+        
+        // Generate case blocks
+        for (size_t i = 0; i < node->cases().size(); ++i)
+        {
+            auto *case_node = node->cases()[i].get();
+            if (!case_node || case_node->is_default())
+                continue; // Skip default case, handled separately
 
-            llvm::BasicBlock *case_block = create_block("switch.case." + std::to_string(i), function);
+            llvm::BasicBlock *case_block = case_blocks[i];
+            if (!case_block)
+                continue;
 
             // Generate case value and add to switch
             if (case_node->value())
@@ -464,21 +483,37 @@ namespace Cryo::Codegen
             }
             exit_scope();
 
-            // Fall through to next case if no break (handled by break statement)
-            // Default: branch to end
+            // Handle fallthrough: if no terminator exists, fall through to next case or end
             llvm::BasicBlock *current = builder().GetInsertBlock();
             if (current && !current->getTerminator())
             {
-                // Check if there's a next case for fallthrough
-                if (i + 1 < node->cases().size())
+                // Find next non-default case for fallthrough
+                llvm::BasicBlock *fallthrough_target = end_block;
+                for (size_t j = i + 1; j < case_blocks.size(); ++j)
                 {
-                    // Create next case block reference for fallthrough
-                    // Note: fallthrough is implicit if no break
+                    if (case_blocks[j])
+                    {
+                        fallthrough_target = case_blocks[j];
+                        break;
+                    }
                 }
-                builder().CreateBr(end_block);
+                
+                // If no more cases, fall through to default if it exists, otherwise end
+                if (fallthrough_target == end_block)
+                {
+                    // Check if default case exists
+                    for (const auto &case_stmt : node->cases())
+                    {
+                        if (case_stmt->is_default())
+                        {
+                            fallthrough_target = default_block;
+                            break;
+                        }
+                    }
+                }
+                
+                builder().CreateBr(fallthrough_target);
             }
-
-            prev_block = case_block;
         }
 
         // Generate default block
