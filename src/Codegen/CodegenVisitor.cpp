@@ -13,6 +13,7 @@
 #include "Codegen/Declarations/DeclarationCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
+#include "AST/TypeChecker.hpp"
 
 #include "Utils/Logger.hpp"
 
@@ -864,17 +865,17 @@ namespace Cryo::Codegen
     {
         NodeTracker tracker(*_ctx, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                 "=== EXPR STMT DEBUG: Visiting ExpressionStatementNode");
+                  "=== EXPR STMT DEBUG: Visiting ExpressionStatementNode");
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ExpressionStatementNode");
 
         // Generate expression for side effects
         if (node.expression())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "=== EXPR STMT DEBUG: Processing expression in statement");
+                      "=== EXPR STMT DEBUG: Processing expression in statement");
             node.expression()->accept(*this);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "=== EXPR STMT DEBUG: Finished processing expression");
+                      "=== EXPR STMT DEBUG: Finished processing expression");
 
             // Clear the result - expression statements discard their value
             // This prevents lingering results from affecting subsequent operations
@@ -883,7 +884,7 @@ namespace Cryo::Codegen
         else
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "=== EXPR STMT DEBUG: No expression in statement!");
+                      "=== EXPR STMT DEBUG: No expression in statement!");
         }
     }
 
@@ -955,23 +956,23 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::BinaryExpressionNode &node)
     {
         NodeTracker tracker(*_ctx, &node);
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, 
-                 "=== BINARY EXPR DEBUG: Visiting BinaryExpressionNode, operator: {}", 
-                 static_cast<int>(node.operator_token().kind()));
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                  "=== BINARY EXPR DEBUG: Visiting BinaryExpressionNode, operator: {}",
+                  static_cast<int>(node.operator_token().kind()));
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting BinaryExpressionNode");
 
         llvm::Value *result = _operators->generate_binary(&node);
         if (result)
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, 
-                     "=== BINARY EXPR DEBUG: Generated binary result successfully");
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "=== BINARY EXPR DEBUG: Generated binary result successfully");
             _ctx->set_result(result);
             _ctx->register_value(&node, result);
         }
         else
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, 
-                     "=== BINARY EXPR DEBUG: Binary generation returned null!");
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "=== BINARY EXPR DEBUG: Binary generation returned null!");
         }
     }
 
@@ -1165,7 +1166,47 @@ namespace Cryo::Codegen
     void CodegenVisitor::import_namespace_aliases(const Cryo::TypeChecker &type_checker)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Importing namespace aliases");
-        // Namespace aliases are handled by SRM context
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Importing namespace aliases and imported namespaces");
+
+        // Get the TypeChecker's SRM context
+        const auto *type_checker_srm = type_checker.get_srm_context();
+        if (!type_checker_srm)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeChecker has no SRM context, skipping import");
+            return;
+        }
+
+        // Get our SRM context
+        auto *codegen_srm = &_ctx->srm_context();
+        if (!codegen_srm)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenContext has no SRM context, skipping import");
+            return;
+        }
+
+        // Import namespace aliases from TypeChecker
+        const auto &source_aliases = type_checker_srm->get_namespace_aliases();
+        int alias_count = 0;
+        for (const auto &[alias, full_namespace] : source_aliases)
+        {
+            codegen_srm->register_namespace_alias(alias, full_namespace);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported namespace alias: '{}' -> '{}'", alias, full_namespace);
+            alias_count++;
+        }
+
+        // Import imported namespaces from TypeChecker (critical for unqualified function resolution)
+        const auto &source_imports = type_checker_srm->get_imported_namespaces();
+        int import_count = 0;
+        for (const auto &imported_ns : source_imports)
+        {
+            codegen_srm->add_imported_namespace(imported_ns);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported namespace: '{}'", imported_ns);
+            import_count++;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Namespace import complete. Aliases: {}, Imported namespaces: {}",
+                  alias_count, import_count);
     }
 
     void CodegenVisitor::process_global_variables_recursively(ASTNode *node)
