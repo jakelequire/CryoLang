@@ -1,6 +1,7 @@
 #include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Intrinsics.hpp"
 #include "AST/ASTVisitor.hpp"
 #include "Utils/Logger.hpp"
@@ -221,7 +222,116 @@ namespace Cryo::Codegen
 
         case CallKind::GenericInstantiation:
         {
-            // Handle generic instantiation - resolve the specialized function
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericInstantiation: Processing '{}'", function_name);
+
+            // Parse the generic type name: "GenericStruct<int>" -> base="GenericStruct", type_args=["int"]
+            size_t open_bracket = function_name.find('<');
+            size_t close_bracket = function_name.rfind('>');
+
+            if (open_bracket == std::string::npos || close_bracket == std::string::npos)
+            {
+                // Fallback to function resolution
+                llvm::Function *fn = resolve_function(function_name);
+                if (fn)
+                {
+                    return generate_free_function(node, fn);
+                }
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                             "Failed to resolve generic instantiation: " + function_name);
+                return nullptr;
+            }
+
+            std::string base_name = function_name.substr(0, open_bracket);
+            std::string type_args_str = function_name.substr(open_bracket + 1, close_bracket - open_bracket - 1);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericInstantiation: base='{}', type_args_str='{}'", base_name, type_args_str);
+
+            // Get the GenericCodegen component
+            CodegenVisitor *visitor = ctx().visitor();
+            GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+
+            if (!generics)
+            {
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                             "GenericCodegen not available for: " + function_name);
+                return nullptr;
+            }
+
+            // Check if base_name is a registered generic struct template
+            if (generics->is_generic_template(base_name))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: '{}' is a generic template, instantiating as struct constructor",
+                          base_name);
+
+                // Parse type arguments (simple single type arg for now)
+                // TODO: Handle multiple type arguments with proper parsing
+                std::vector<Cryo::Type *> type_args;
+
+                // Trim whitespace from type_args_str
+                size_t start = type_args_str.find_first_not_of(" \t");
+                size_t end = type_args_str.find_last_not_of(" \t");
+                if (start != std::string::npos && end != std::string::npos)
+                {
+                    type_args_str = type_args_str.substr(start, end - start + 1);
+                }
+
+                // Resolve the type argument
+                Cryo::Type *arg_type = symbols().get_type_context()->get_type_by_name(type_args_str);
+                if (!arg_type)
+                {
+                    // Try common primitive types
+                    if (type_args_str == "int" || type_args_str == "i32")
+                    {
+                        arg_type = symbols().get_type_context()->get_integer_type(32, true);
+                    }
+                    else if (type_args_str == "i64")
+                    {
+                        arg_type = symbols().get_type_context()->get_integer_type(64, true);
+                    }
+                    else if (type_args_str == "f32" || type_args_str == "float")
+                    {
+                        arg_type = symbols().get_type_context()->get_float_type(32);
+                    }
+                    else if (type_args_str == "f64" || type_args_str == "double")
+                    {
+                        arg_type = symbols().get_type_context()->get_float_type(64);
+                    }
+                    else if (type_args_str == "string")
+                    {
+                        arg_type = symbols().get_type_context()->get_string_type();
+                    }
+                    else if (type_args_str == "bool" || type_args_str == "boolean")
+                    {
+                        arg_type = symbols().get_type_context()->get_boolean_type();
+                    }
+                }
+
+                if (arg_type)
+                {
+                    type_args.push_back(arg_type);
+                }
+
+                // Instantiate the generic struct type
+                llvm::StructType *instantiated_type = generics->instantiate_struct(base_name, type_args);
+                if (!instantiated_type)
+                {
+                    report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                                 "Failed to instantiate generic struct: " + function_name);
+                    return nullptr;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: Instantiated struct type '{}'",
+                          instantiated_type->getName().str());
+
+                // Now generate the struct constructor call using the mangled name
+                return generate_struct_constructor(node, instantiated_type->getName().str());
+            }
+
+            // Not a generic struct, try as a function
             llvm::Function *fn = resolve_function(function_name);
             if (fn)
             {

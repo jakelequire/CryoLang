@@ -1247,4 +1247,9 @@ namespace Cryo::Codegen
         return &_ctx->srm_context();
     }
 
+    GenericCodegen *CodegenVisitor::get_generics() const
+    {
+        return _generics.get();
+    }
+
 } // namespace Cryo::Codegen
