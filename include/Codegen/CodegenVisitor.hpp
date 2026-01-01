@@ -193,6 +193,7 @@ namespace Cryo::Codegen
         Cryo::ASTNode *get_current_node() const;
         Cryo::SRM::SymbolResolutionManager *get_srm_manager() const;
         Cryo::SRM::SymbolResolutionContext *get_srm_context() const;
+        GenericCodegen *get_generics() const;
 
         /**
          * @brief Get the codegen context (for component access)
