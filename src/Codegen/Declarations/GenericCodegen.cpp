@@ -1,6 +1,7 @@
 #include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Declarations/DeclarationCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
+#include "Codegen/CodegenVisitor.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -121,13 +122,84 @@ namespace Cryo::Codegen
             }
         }
 
-        // End type parameter scope
-        end_type_params();
-
-        // Cache and register in multiple places for consistency
+        // Cache and register in multiple places for consistency BEFORE generating methods
+        // This ensures the struct type is available for self-referential types
         _type_cache[mangled] = struct_type;
         ctx().register_type(mangled, struct_type);
         types().register_struct(mangled, struct_type);
+
+        // Generate methods for the instantiated struct while type params are still in scope
+        // This ensures type parameters like T are substituted with concrete types (e.g., int)
+        if (struct_decl && _declarations)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Generating {} methods for instantiated struct {}",
+                      struct_decl->methods().size(), mangled);
+
+            for (const auto &method : struct_decl->methods())
+            {
+                if (!method)
+                    continue;
+
+                // Generate method with the mangled struct name as parent type
+                llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
+                if (fn && method->body() && fn->empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Generating method body: {}::{}",
+                              mangled, method->name());
+
+                    // Create entry block
+                    llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+                    builder().SetInsertPoint(entry);
+
+                    // Set up function context
+                    auto fn_ctx = std::make_unique<FunctionContext>(fn, method.get());
+                    fn_ctx->entry_block = entry;
+                    ctx().set_current_function(std::move(fn_ctx));
+
+                    // Enter function scope
+                    values().enter_scope(fn->getName().str());
+
+                    // Allocate parameters
+                    for (auto &arg : fn->args())
+                    {
+                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
+                        create_store(&arg, alloca);
+                        values().set_value(arg.getName().str(), nullptr, alloca);
+                    }
+
+                    // Generate method body - type params are still active so T->int works
+                    CodegenVisitor *visitor = ctx().visitor();
+                    if (visitor && method->body())
+                    {
+                        method->body()->accept(*visitor);
+                    }
+
+                    // Add implicit return if needed
+                    llvm::BasicBlock *current_block = builder().GetInsertBlock();
+                    if (current_block && !current_block->getTerminator())
+                    {
+                        if (fn->getReturnType()->isVoidTy())
+                        {
+                            builder().CreateRetVoid();
+                        }
+                        else
+                        {
+                            builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                        }
+                    }
+
+                    // Clean up
+                    values().exit_scope();
+                    ctx().clear_current_function();
+                    ctx().set_result(nullptr);
+                }
+            }
+        }
+
+        // End type parameter scope AFTER methods are generated
+        end_type_params();
 
         // Also build the unmangled name (e.g., "Array<u64>") for lookup consistency
         std::string instantiated_name = generic_name + "<";
@@ -256,13 +328,82 @@ namespace Cryo::Codegen
             }
         }
 
-        // End substitution scope
-        end_type_params();
-
-        // Cache and register in multiple places for consistency
+        // Cache and register in multiple places for consistency BEFORE generating methods
         _type_cache[mangled] = class_type;
         ctx().register_type(mangled, class_type);
         types().register_struct(mangled, class_type);
+
+        // Generate methods for the instantiated class while type params are still in scope
+        if (class_decl && _declarations)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Generating {} methods for instantiated class {}",
+                      class_decl->methods().size(), mangled);
+
+            for (const auto &method : class_decl->methods())
+            {
+                if (!method)
+                    continue;
+
+                // Generate method with the mangled class name as parent type
+                llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
+                if (fn && method->body() && fn->empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Generating method body: {}::{}",
+                              mangled, method->name());
+
+                    // Create entry block
+                    llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+                    builder().SetInsertPoint(entry);
+
+                    // Set up function context
+                    auto fn_ctx = std::make_unique<FunctionContext>(fn, method.get());
+                    fn_ctx->entry_block = entry;
+                    ctx().set_current_function(std::move(fn_ctx));
+
+                    // Enter function scope
+                    values().enter_scope(fn->getName().str());
+
+                    // Allocate parameters
+                    for (auto &arg : fn->args())
+                    {
+                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
+                        create_store(&arg, alloca);
+                        values().set_value(arg.getName().str(), nullptr, alloca);
+                    }
+
+                    // Generate method body - type params are still active
+                    CodegenVisitor *visitor = ctx().visitor();
+                    if (visitor && method->body())
+                    {
+                        method->body()->accept(*visitor);
+                    }
+
+                    // Add implicit return if needed
+                    llvm::BasicBlock *current_block = builder().GetInsertBlock();
+                    if (current_block && !current_block->getTerminator())
+                    {
+                        if (fn->getReturnType()->isVoidTy())
+                        {
+                            builder().CreateRetVoid();
+                        }
+                        else
+                        {
+                            builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                        }
+                    }
+
+                    // Clean up
+                    values().exit_scope();
+                    ctx().clear_current_function();
+                    ctx().set_result(nullptr);
+                }
+            }
+        }
+
+        // End substitution scope AFTER methods are generated
+        end_type_params();
 
         // Also build the unmangled name (e.g., "MyClass<u64>") for lookup consistency
         std::string instantiated_name = generic_name + "<";
@@ -460,6 +601,11 @@ namespace Cryo::Codegen
         }
 
         _type_param_stack.push_back(std::move(scope));
+
+        // Set the type parameter resolver on TypeMapper so type lookups can resolve T, E, etc.
+        types().set_type_param_resolver([this](const std::string &name) -> Cryo::Type * {
+            return this->resolve_type_param(name);
+        });
     }
 
     void GenericCodegen::end_type_params()
@@ -467,6 +613,12 @@ namespace Cryo::Codegen
         if (!_type_param_stack.empty())
         {
             _type_param_stack.pop_back();
+        }
+
+        // If the stack is now empty, clear the type parameter resolver
+        if (_type_param_stack.empty())
+        {
+            types().clear_type_param_resolver();
         }
     }
 

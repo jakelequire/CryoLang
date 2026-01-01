@@ -40,6 +40,14 @@ namespace Cryo::Codegen
         const std::vector<Cryo::Type*>& type_args)>;
 
     /**
+     * @brief Callback type for resolving type parameters during generic instantiation
+     *
+     * Takes a type parameter name (e.g., "T") and returns the substituted concrete type,
+     * or nullptr if not in a generic instantiation context.
+     */
+    using TypeParameterResolver = std::function<Cryo::Type*(const std::string& param_name)>;
+
+    /**
      * @brief Maps CryoLang Type* to LLVM Type*
      *
      * Focused type mapper that handles:
@@ -83,6 +91,28 @@ namespace Cryo::Codegen
         void set_generic_instantiator(GenericInstantiator instantiator)
         {
             _generic_instantiator = std::move(instantiator);
+        }
+
+        /**
+         * @brief Set the type parameter resolver callback
+         *
+         * This callback is invoked when mapping a Generic type (type parameter like T).
+         * The callback should return the substituted concrete type if we're in a
+         * generic instantiation context, or nullptr otherwise.
+         *
+         * @param resolver Callback function for type parameter resolution
+         */
+        void set_type_param_resolver(TypeParameterResolver resolver)
+        {
+            _type_param_resolver = std::move(resolver);
+        }
+
+        /**
+         * @brief Clear the type parameter resolver
+         */
+        void clear_type_param_resolver()
+        {
+            _type_param_resolver = nullptr;
         }
 
         //===================================================================
@@ -362,6 +392,9 @@ namespace Cryo::Codegen
 
         // Generic instantiator callback - for parameterized types
         GenericInstantiator _generic_instantiator;
+
+        // Type parameter resolver callback - for generic type parameters (T, E, etc.)
+        TypeParameterResolver _type_param_resolver;
 
         // Error state
         bool _has_error = false;

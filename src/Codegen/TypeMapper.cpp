@@ -135,12 +135,26 @@ namespace Cryo::Codegen
 
         case TypeKind::Generic:
             // Generic type parameters should be instantiated before codegen
-            // However, sometimes concrete class types are misclassified as Generic
-            // Try to resolve as a concrete class first
+            // First, check if we're in a generic instantiation context and can resolve the type parameter
             {
                 std::string type_name = cryo_type->name();
-                
-                // Try to find a struct type with this name (classes become structs in LLVM)
+
+                // Try to resolve via type parameter resolver (during generic instantiation)
+                if (_type_param_resolver)
+                {
+                    Cryo::Type *resolved = _type_param_resolver(type_name);
+                    if (resolved && resolved != cryo_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "TypeMapper: Resolved type parameter '{}' to concrete type '{}'",
+                                  type_name, resolved->to_string());
+                        // Recursively map the resolved concrete type
+                        result = map(resolved);
+                        break;
+                    }
+                }
+
+                // Not in generic context or couldn't resolve - try to find concrete struct
                 llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
                 if (struct_type && !struct_type->isOpaque())
                 {
@@ -151,7 +165,7 @@ namespace Cryo::Codegen
                 {
                     // Fallback: create/get opaque struct for the class name
                     struct_type = get_or_create_struct(type_name);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic type '{}' resolved to struct type (opaque: {})", 
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generic type '{}' resolved to struct type (opaque: {})",
                              type_name, struct_type->isOpaque() ? "yes" : "no");
                     result = struct_type;
                 }
