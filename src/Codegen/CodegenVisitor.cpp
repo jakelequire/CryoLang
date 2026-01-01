@@ -1164,8 +1164,47 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::import_namespace_aliases(const Cryo::TypeChecker &type_checker)
     {
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Importing namespace aliases");
-        // Namespace aliases are handled by SRM context
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Importing namespace aliases and imported namespaces");
+
+        // Get the TypeChecker's SRM context
+        const auto *type_checker_srm = type_checker.get_srm_context();
+        if (!type_checker_srm)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeChecker has no SRM context, skipping import");
+            return;
+        }
+
+        // Get our SRM context
+        auto *codegen_srm = &_ctx->srm_context();
+        if (!codegen_srm)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenContext has no SRM context, skipping import");
+            return;
+        }
+
+        // Import namespace aliases from TypeChecker
+        const auto &source_aliases = type_checker_srm->get_namespace_aliases();
+        int alias_count = 0;
+        for (const auto &[alias, full_namespace] : source_aliases)
+        {
+            codegen_srm->register_namespace_alias(alias, full_namespace);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported namespace alias: '{}' -> '{}'", alias, full_namespace);
+            alias_count++;
+        }
+
+        // Import imported namespaces from TypeChecker (critical for unqualified function resolution)
+        const auto &source_imports = type_checker_srm->get_imported_namespaces();
+        int import_count = 0;
+        for (const auto &imported_ns : source_imports)
+        {
+            codegen_srm->add_imported_namespace(imported_ns);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Imported namespace: '{}'", imported_ns);
+            import_count++;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Namespace import complete. Aliases: {}, Imported namespaces: {}",
+                  alias_count, import_count);
     }
 
     void CodegenVisitor::process_global_variables_recursively(ASTNode *node)
