@@ -1216,6 +1216,101 @@ namespace Cryo::Codegen
         if (fn)
             return fn;
 
+        // Try to create forward declaration from symbol table lookup
+        // This handles imported stdlib functions that aren't in the LLVM module yet
+        fn = create_forward_declaration_from_symbol(name);
+        if (fn)
+            return fn;
+
+        return nullptr;
+    }
+
+    llvm::Function *CallCodegen::create_forward_declaration_from_symbol(const std::string &name)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "create_forward_declaration_from_symbol: Trying to find '{}' in symbol table", name);
+
+        // Generate lookup candidates using SRM (includes imported namespaces)
+        auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Function);
+
+        for (const auto &candidate : candidates)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "create_forward_declaration_from_symbol: Trying candidate '{}'", candidate);
+
+            // Try to find the function in the symbol table
+            Cryo::Symbol *symbol = symbols().lookup_symbol(candidate);
+            if (!symbol)
+            {
+                // Try parsing the candidate into namespace and function name parts
+                size_t last_sep = candidate.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    std::string ns = candidate.substr(0, last_sep);
+                    std::string fn_name = candidate.substr(last_sep + 2);
+                    symbol = symbols().lookup_namespaced_symbol(ns, fn_name);
+                }
+            }
+
+            if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->data_type)
+            {
+                Cryo::FunctionType *func_type = dynamic_cast<Cryo::FunctionType *>(symbol->data_type);
+                if (func_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "create_forward_declaration_from_symbol: Found function '{}' in symbol table", candidate);
+
+                    // Build LLVM function type from Cryo function type
+                    llvm::Type *return_type = types().map(func_type->return_type().get());
+                    if (!return_type)
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                  "Failed to map return type for function '{}'", candidate);
+                        continue;
+                    }
+
+                    std::vector<llvm::Type *> param_types;
+                    for (const auto &param : func_type->param_types())
+                    {
+                        llvm::Type *pt = types().map(param.get());
+                        if (!pt)
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                      "Failed to map parameter type for function '{}'", candidate);
+                            break;
+                        }
+                        param_types.push_back(pt);
+                    }
+
+                    if (param_types.size() != func_type->param_types().size())
+                    {
+                        continue; // Failed to map all parameter types
+                    }
+
+                    // Create the function type
+                    llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(
+                        return_type, param_types, func_type->is_variadic());
+
+                    // Create the function declaration with the qualified name
+                    llvm::Function *fn = llvm::Function::Create(
+                        llvm_func_type,
+                        llvm::Function::ExternalLinkage,
+                        candidate,
+                        module());
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "create_forward_declaration_from_symbol: Created forward declaration for '{}'", candidate);
+
+                    // Register in context for future lookups
+                    ctx().register_function(candidate, fn);
+
+                    return fn;
+                }
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "create_forward_declaration_from_symbol: Could not find '{}' in symbol table", name);
         return nullptr;
     }
 

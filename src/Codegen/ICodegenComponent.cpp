@@ -29,6 +29,13 @@ namespace Cryo::Codegen
                   "resolve_function_by_name: Looking for '{}', {} candidates generated",
                   name, candidates.size());
 
+        // Log all candidates for debugging
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_function_by_name: Candidate {}: '{}'", i, candidates[i]);
+        }
+
         for (const auto &candidate : candidates)
         {
             // Try LLVM module first
