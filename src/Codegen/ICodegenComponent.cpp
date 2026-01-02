@@ -144,7 +144,7 @@ namespace Cryo::Codegen
                   "resolve_method_by_name: '{}.{}' not found after SRM lookup", type_name, method_name);
 
         // Fallback for primitive type methods (string, i32, u64, etc.)
-        // These are registered with simple names like "string::length" in generate_method_declaration
+        // These are defined in std::core::Types with fully qualified names
         static const std::unordered_set<std::string> primitive_types = {
             "string", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
             "f32", "f64", "bool", "char", "boolean"};
@@ -188,6 +188,57 @@ namespace Cryo::Codegen
                           "resolve_method_by_name: Found primitive method in registry: {}", stdlib_method);
                 return fn;
             }
+
+            // Method not found in current module - create an extern declaration
+            // This is needed for cross-module calls (e.g., brainfuck.cryo calling types.cryo methods)
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Creating extern declaration for primitive method: {}", stdlib_method);
+
+            // Get the 'this' pointer type for the primitive
+            llvm::Type *this_type = llvm::PointerType::get(llvm_ctx(), 0); // Opaque pointer
+
+            // Determine return type based on known primitive methods
+            llvm::Type *return_type = nullptr;
+            if (method_name == "length" || method_name == "is_even" || method_name == "is_odd" ||
+                method_name == "max_size")
+            {
+                // These return u32 or the primitive type
+                if (type_name == "string")
+                    return_type = llvm::Type::getInt32Ty(llvm_ctx()); // u32
+                else
+                    return_type = llvm::Type::getInt1Ty(llvm_ctx()); // boolean for is_even/is_odd
+            }
+            else if (method_name == "to_upper" || method_name == "to_lower" || method_name == "to_string")
+            {
+                return_type = llvm::PointerType::get(llvm_ctx(), 0); // Returns string (ptr)
+            }
+            else if (method_name == "test_method")
+            {
+                return_type = llvm::Type::getVoidTy(llvm_ctx());
+            }
+            else
+            {
+                // Default to i32 for unknown methods
+                return_type = llvm::Type::getInt32Ty(llvm_ctx());
+            }
+
+            // Create function type: return_type(ptr this)
+            std::vector<llvm::Type *> param_types = {this_type};
+            llvm::FunctionType *fn_type = llvm::FunctionType::get(return_type, param_types, false);
+
+            // Create extern declaration
+            llvm::Function *fn = llvm::Function::Create(
+                fn_type,
+                llvm::Function::ExternalLinkage,
+                stdlib_method,
+                module());
+
+            // Register in context
+            ctx().register_function(stdlib_method, fn);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Created extern declaration for: {}", stdlib_method);
+            return fn;
         }
 
         // Additional fallback for known problematic cases
