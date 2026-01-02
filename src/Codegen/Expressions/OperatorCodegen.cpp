@@ -73,12 +73,44 @@ namespace Cryo::Codegen
 
         // Check for string concatenation BEFORE classifying based on single operand type
         // This handles cases like: char + string, string + char, string + string
+        // IMPORTANT: We must check the AST's resolved type, not just LLVM pointer types,
+        // because dereferenced pointers to integers are also pointer types at LLVM level
         if (op == TokenKind::TK_PLUS)
         {
-            bool lhs_is_string = lhs->getType()->isPointerTy();
-            bool rhs_is_string = rhs->getType()->isPointerTy();
-            bool lhs_is_char = lhs->getType()->isIntegerTy() && !lhs->getType()->isIntegerTy(1);
-            bool rhs_is_char = rhs->getType()->isIntegerTy() && !rhs->getType()->isIntegerTy(1);
+            // Check semantic types from AST to determine if operands are strings
+            auto is_string_type = [](Cryo::Type *type) -> bool
+            {
+                if (!type)
+                    return false;
+                // Check for string type
+                if (type->kind() == Cryo::TypeKind::String)
+                    return true;
+                // Check for pointer to char (C-style string)
+                if (type->kind() == Cryo::TypeKind::Pointer)
+                {
+                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(type);
+                    if (ptr_type && ptr_type->pointee_type())
+                    {
+                        return ptr_type->pointee_type()->kind() == Cryo::TypeKind::Char;
+                    }
+                }
+                return false;
+            };
+
+            auto is_char_type = [](Cryo::Type *type) -> bool
+            {
+                if (!type)
+                    return false;
+                return type->kind() == Cryo::TypeKind::Char;
+            };
+
+            Cryo::Type *lhs_type = node->left()->get_resolved_type();
+            Cryo::Type *rhs_type = node->right()->get_resolved_type();
+
+            bool lhs_is_string = is_string_type(lhs_type);
+            bool rhs_is_string = is_string_type(rhs_type);
+            bool lhs_is_char = is_char_type(lhs_type);
+            bool rhs_is_char = is_char_type(rhs_type);
 
             // string + string
             if (lhs_is_string && rhs_is_string)
