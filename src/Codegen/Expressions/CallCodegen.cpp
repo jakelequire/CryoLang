@@ -422,6 +422,9 @@ namespace Cryo::Codegen
         {
             std::string method_name = member->member();
 
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "classify_call: MemberAccessNode with member '{}'", method_name);
+
             // Check if method is an intrinsic
             if (is_intrinsic(method_name))
             {
@@ -433,9 +436,14 @@ namespace Cryo::Codegen
             {
                 std::string obj_name = obj_id->name();
 
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "classify_call: Object identifier is '{}'", obj_name);
+
                 // Check if it's an enum variant
                 if (is_enum_type(obj_name))
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' is an enum type, returning EnumVariant", obj_name);
                     return CallKind::EnumVariant;
                 }
 
@@ -450,6 +458,9 @@ namespace Cryo::Codegen
                 {
                     return CallKind::InstanceMethod;
                 }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "classify_call: '{}::{}' falling through to FreeFunction", obj_name, method_name);
 
                 // Could be a namespace-qualified function
                 return CallKind::FreeFunction;
