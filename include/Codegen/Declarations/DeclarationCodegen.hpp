@@ -210,6 +210,19 @@ namespace Cryo::Codegen
          */
         llvm::Type *generate_enum_declaration(Cryo::EnumDeclarationNode *node);
 
+        /**
+         * @brief Generate constructor function for an enum variant with payload
+         * @param enum_node The enum declaration
+         * @param variant The variant to generate constructor for
+         * @param discriminant_value The discriminant value for this variant
+         * @param enum_type The LLVM struct type for the enum
+         */
+        void generate_enum_variant_constructor(
+            Cryo::EnumDeclarationNode *enum_node,
+            Cryo::EnumVariantNode *variant,
+            int32_t discriminant_value,
+            llvm::Type *enum_type);
+
         //===================================================================
         // Helpers
         //===================================================================
