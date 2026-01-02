@@ -1270,7 +1270,7 @@ namespace Cryo::Codegen
                     }
 
                     std::vector<llvm::Type *> param_types;
-                    for (const auto &param : func_type->param_types())
+                    for (const auto &param : func_type->parameter_types())
                     {
                         llvm::Type *pt = types().map(param.get());
                         if (!pt)
@@ -1282,7 +1282,7 @@ namespace Cryo::Codegen
                         param_types.push_back(pt);
                     }
 
-                    if (param_types.size() != func_type->param_types().size())
+                    if (param_types.size() != func_type->parameter_types().size())
                     {
                         continue; // Failed to map all parameter types
                     }
