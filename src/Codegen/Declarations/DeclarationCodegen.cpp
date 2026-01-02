@@ -387,6 +387,15 @@ namespace Cryo::Codegen
                     is_struct_value_type = (kind == TypeKind::Struct || kind == TypeKind::Class);
                 }
 
+                // Fallback: if Cryo type didn't indicate struct but LLVM type is a named struct,
+                // treat it as a struct value type. Named structs (like %SingleStruct) are user-defined
+                // structs, while anonymous structs are typically arrays or tuples.
+                if (!is_struct_value_type && var_type->isStructTy())
+                {
+                    auto *struct_type = llvm::cast<llvm::StructType>(var_type);
+                    is_struct_value_type = struct_type->hasName();
+                }
+
                 if (is_struct_value_type && var_type->isStructTy() && init_val->getType()->isPointerTy())
                 {
                     // The init_val is a pointer to the struct data, memcpy to our alloca
