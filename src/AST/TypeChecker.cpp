@@ -9149,6 +9149,10 @@ namespace Cryo
         {
             return "std::IO"; // Map io/stdio to std::IO
         }
+        if (module_path == "strings/strings")
+        {
+            return "std::String"; // Map strings/strings to std::String
+        }
 
         // Process path segments
         std::vector<std::string> segments;
