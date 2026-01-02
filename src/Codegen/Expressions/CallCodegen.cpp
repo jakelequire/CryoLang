@@ -1571,6 +1571,16 @@ namespace Cryo::Codegen
 
     bool CallCodegen::is_enum_type(const std::string &name) const
     {
+        // First try direct lookup with the unqualified name
+        // Enums are registered with just their name (e.g., "Shape"), not namespace-qualified
+        Cryo::Type *direct_lookup = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(name);
+        if (direct_lookup)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "is_enum_type: Found '{}' as enum type via direct lookup", name);
+            return true;
+        }
+
         // Use SRM to generate type candidates and check if any is an enum type
         auto &non_const_ctx = const_cast<CodegenContext &>(ctx());
         auto candidates = non_const_ctx.srm().generate_lookup_candidates(name, Cryo::SymbolKind::Type);
@@ -1580,7 +1590,7 @@ namespace Cryo::Codegen
 
         for (const auto &candidate : candidates)
         {
-            // First try TypeContext's enum type lookup (most reliable for enums)
+            // Try TypeContext's enum type lookup
             Cryo::Type *enum_type = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(candidate);
             if (enum_type)
             {
