@@ -1,6 +1,7 @@
 #include "Codegen/Expressions/ExpressionCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Lexer/lexer.hpp"
 #include "AST/ASTNode.hpp"
