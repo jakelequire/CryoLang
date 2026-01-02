@@ -1580,14 +1580,23 @@ namespace Cryo::Codegen
 
         for (const auto &candidate : candidates)
         {
-            // Check symbol table for enum type
+            // First try TypeContext's enum type lookup (most reliable for enums)
+            Cryo::Type *enum_type = symbols().get_type_context()->lookup_enum_type(candidate);
+            if (enum_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "is_enum_type: Found '{}' as enum type via TypeContext lookup '{}'", name, candidate);
+                return true;
+            }
+
+            // Also check symbol table for enum type
             Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(candidate);
             if (sym && sym->kind == SymbolKind::Type && sym->data_type)
             {
                 if (sym->data_type->kind() == TypeKind::Enum)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "is_enum_type: Found '{}' as enum type via '{}'", name, candidate);
+                              "is_enum_type: Found '{}' as enum type via symbol table '{}'", name, candidate);
                     return true;
                 }
             }
