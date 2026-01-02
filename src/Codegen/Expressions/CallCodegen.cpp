@@ -171,6 +171,25 @@ namespace Cryo::Codegen
                         if (!receiver)
                         {
                             receiver = generate_expression(member->object());
+
+                            // CRITICAL FIX: For pointer-type variables (like MemoryPool*), we need to
+                            // LOAD the pointer value from the alloca, not pass the alloca address.
+                            // Example: pool_ptr: MemoryPool* stored in %pool_ptr = alloca ptr
+                            //   - We need to load the ptr value: %loaded = load ptr, ptr %pool_ptr
+                            //   - Then pass %loaded as 'this', not %pool_ptr
+                            Cryo::Type *obj_type = member->object()->get_resolved_type();
+                            if (obj_type && obj_type->kind() == Cryo::TypeKind::Pointer)
+                            {
+                                // The variable is a pointer type - we need the loaded pointer value
+                                // Check if receiver is an alloca (meaning we got the variable's address)
+                                if (receiver && llvm::isa<llvm::AllocaInst>(receiver))
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Loading pointer value from alloca for pointer-type receiver: {}", name);
+                                    receiver = builder().CreateLoad(
+                                        llvm::PointerType::get(llvm_ctx(), 0), receiver, name + ".ptr.load");
+                                }
+                            }
                         }
                     }
                     else
