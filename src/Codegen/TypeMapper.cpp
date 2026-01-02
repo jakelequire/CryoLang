@@ -429,6 +429,15 @@ namespace Cryo::Codegen
             return it->second;
         }
 
+        // Check LLVM context for an existing struct with this name before creating a new one
+        // This prevents duplicate struct types (e.g., %Shape vs %Shape.0) when the type
+        // was created by other codegen paths but not cached here
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
+        {
+            _struct_cache[name] = existing;
+            return existing;
+        }
+
         // Create opaque struct type
         llvm::StructType *st = llvm::StructType::create(llvm_ctx(), name);
         _struct_cache[name] = st;
