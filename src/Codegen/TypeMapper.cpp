@@ -725,17 +725,30 @@ namespace Cryo::Codegen
         }
 
         // Complex enum (tagged union) -> struct
-        auto existing = lookup_struct(name);
-        if (existing && !existing->isOpaque())
+        // First check if there's already a complete type in the LLVM context
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
         {
-            return existing;
+            if (!existing->isOpaque())
+            {
+                _struct_cache[name] = existing;
+                return existing;
+            }
         }
 
-        // Calculate payload size
-        size_t payload_size = calculate_enum_payload_size(type);
-        size_t discriminant_size = type->get_discriminant_size();
+        // Check our struct cache
+        auto cached = lookup_struct(name);
+        if (cached && !cached->isOpaque())
+        {
+            return cached;
+        }
 
-        return create_tagged_union(name, discriminant_size, payload_size);
+        // For complex enums, create an opaque struct and let DeclarationCodegen complete it.
+        // DeclarationCodegen has access to the full AST and calculates the correct payload size.
+        // This avoids payload size mismatches between TypeMapper and DeclarationCodegen.
+        llvm::StructType *st = cached ? cached : get_or_create_struct(name);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_enum - created opaque enum struct '{}'", name);
+        return st;
     }
 
     llvm::Type *TypeMapper::map_parameterized(Cryo::ParameterizedType *type)
