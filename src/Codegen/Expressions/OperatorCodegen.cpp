@@ -1077,7 +1077,17 @@ namespace Cryo::Codegen
         // Handle pointer arithmetic
         if (lhs_type->isPointerTy() && rhs_type->isIntegerTy())
         {
-            return generate_pointer_arithmetic(op, lhs, rhs);
+            // Get the element type from the Cryo type system
+            llvm::Type *element_type = nullptr;
+            if (result_type && result_type->kind() == Cryo::TypeKind::Pointer)
+            {
+                auto *ptr_type = dynamic_cast<Cryo::PointerType *>(result_type);
+                if (ptr_type && ptr_type->pointee_type())
+                {
+                    element_type = resolve_type_by_name(ptr_type->pointee_type()->to_string());
+                }
+            }
+            return generate_pointer_arithmetic(op, lhs, rhs, element_type);
         }
 
         // Ensure compatible types for non-pointer arithmetic
@@ -1166,22 +1176,50 @@ namespace Cryo::Codegen
 
     llvm::Value *OperatorCodegen::generate_pointer_arithmetic(TokenKind op,
                                                               llvm::Value *ptr,
-                                                              llvm::Value *offset)
+                                                              llvm::Value *offset,
+                                                              llvm::Type *element_type)
     {
         llvm::IRBuilder<> &b = builder();
         llvm::LLVMContext &ctx = llvm_ctx();
+
+        // If we have a known element type, use proper scaled pointer arithmetic
+        // This ensures ptr + 1 advances by sizeof(element_type), not by 1 byte
+        if (element_type)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Pointer arithmetic with element type (size matters)");
+
+            switch (op)
+            {
+            case TokenKind::TK_PLUS:
+                // Use GEP with the actual element type for proper scaling
+                return b.CreateGEP(element_type, ptr, offset, "ptr.add");
+
+            case TokenKind::TK_MINUS:
+                {
+                    llvm::Value *neg_offset = b.CreateNeg(offset, "neg.offset");
+                    return b.CreateGEP(element_type, ptr, neg_offset, "ptr.sub");
+                }
+
+            default:
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                             "Unsupported pointer arithmetic operation");
+                return nullptr;
+            }
+        }
+
+        // Fallback: byte-level arithmetic when element type is unknown
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Pointer arithmetic fallback to byte-level (no element type)");
 
         switch (op)
         {
         case TokenKind::TK_PLUS:
             // For pointer + offset, use CreateGEP with byte-level arithmetic
-            // Convert to i8* for byte-level arithmetic, then cast back
             {
                 llvm::Type *i8_type = llvm::Type::getInt8Ty(ctx);
-                llvm::Value *byte_ptr = b.CreateBitCast(ptr, llvm::PointerType::get(ctx, 0), "byte.ptr");
-                llvm::Value *result_ptr = b.CreateGEP(i8_type, byte_ptr, offset, "ptr.add");
-                // Cast back to original pointer type
-                return b.CreateBitCast(result_ptr, ptr->getType(), "ptr.result");
+                llvm::Value *result_ptr = b.CreateGEP(i8_type, ptr, offset, "ptr.add.bytes");
+                return result_ptr;
             }
 
         case TokenKind::TK_MINUS:
@@ -1189,9 +1227,8 @@ namespace Cryo::Codegen
             {
                 llvm::Value *neg_offset = b.CreateNeg(offset, "neg.offset");
                 llvm::Type *i8_type_sub = llvm::Type::getInt8Ty(ctx);
-                llvm::Value *byte_ptr_sub = b.CreateBitCast(ptr, llvm::PointerType::get(ctx, 0), "byte.ptr");
-                llvm::Value *result_ptr_sub = b.CreateGEP(i8_type_sub, byte_ptr_sub, neg_offset, "ptr.sub");
-                return b.CreateBitCast(result_ptr_sub, ptr->getType(), "ptr.result");
+                llvm::Value *result_ptr_sub = b.CreateGEP(i8_type_sub, ptr, neg_offset, "ptr.sub.bytes");
+                return result_ptr_sub;
             }
 
         default:

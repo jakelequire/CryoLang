@@ -198,7 +198,8 @@ namespace Cryo::Codegen
          */
         llvm::Value *generate_pointer_arithmetic(TokenKind op,
                                                  llvm::Value *ptr,
-                                                 llvm::Value *offset);
+                                                 llvm::Value *offset,
+                                                 llvm::Type *element_type = nullptr);
 
         //===================================================================
         // Comparison Operations
