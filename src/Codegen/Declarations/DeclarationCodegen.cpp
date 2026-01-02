@@ -796,6 +796,14 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Registered enum variant: {} = {}",
                       variant_name, index);
 
+            // Register variant field types for pattern matching
+            if (!variant->is_simple_variant())
+            {
+                ctx().register_enum_variant_fields(variant_name, variant->associated_types());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Registered {} field types for variant {}", variant->associated_types().size(), variant_name);
+            }
+
             // For complex variants, generate constructor function
             if (!is_simple && !variant->is_simple_variant())
             {
