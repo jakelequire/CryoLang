@@ -733,26 +733,150 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating enum: {}", name);
 
-        // Simple enums are just integers
-        // Tagged unions would need struct representation
-        llvm::Type *enum_type = llvm::Type::getInt32Ty(llvm_ctx());
+        // Check if this is a simple enum or complex enum with payloads
+        bool is_simple = true;
+        size_t max_payload_size = 0;
+        for (const auto &variant : node->variants())
+        {
+            if (!variant->is_simple_variant())
+            {
+                is_simple = false;
+                // Calculate payload size for this variant
+                size_t variant_payload = 0;
+                for (const auto &type_name : variant->associated_types())
+                {
+                    llvm::Type *field_type = types().get_type(type_name);
+                    if (field_type)
+                    {
+                        variant_payload += module()->getDataLayout().getTypeAllocSize(field_type);
+                    }
+                    else
+                    {
+                        // Default to 8 bytes for unknown types
+                        variant_payload += 8;
+                    }
+                }
+                max_payload_size = std::max(max_payload_size, variant_payload);
+            }
+        }
+
+        llvm::Type *enum_type = nullptr;
+
+        if (is_simple)
+        {
+            // Simple enums are just integers
+            enum_type = llvm::Type::getInt32Ty(llvm_ctx());
+        }
+        else
+        {
+            // Complex enums are tagged unions: { i32 discriminant, [payload_size x i8] }
+            llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
+            llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
+
+            llvm::StructType *enum_struct = llvm::StructType::create(llvm_ctx(), name);
+            enum_struct->setBody({discriminant_type, payload_type}, false);
+            enum_type = enum_struct;
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Created tagged union for enum '{}': payload size = {} bytes", name, max_payload_size);
+        }
 
         // Register type
         ctx().register_type(name, enum_type);
 
-        // Generate variant constants and register them
+        // Generate variant constants and constructor functions
         int32_t index = 0;
         for (const auto &variant : node->variants())
         {
             std::string variant_name = name + "::" + variant->name();
-            llvm::Constant *value = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index++);
-            // Register enum variant in the context for scope resolution lookup
-            ctx().register_enum_variant(variant_name, value);
+            llvm::Constant *discriminant = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index);
+
+            // Register discriminant value
+            ctx().register_enum_variant(variant_name, discriminant);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Registered enum variant: {} = {}",
-                      variant_name, index - 1);
+                      variant_name, index);
+
+            // For complex variants, generate constructor function
+            if (!is_simple && !variant->is_simple_variant())
+            {
+                generate_enum_variant_constructor(node, variant.get(), index, enum_type);
+            }
+
+            index++;
         }
 
         return enum_type;
+    }
+
+    void DeclarationCodegen::generate_enum_variant_constructor(
+        Cryo::EnumDeclarationNode *enum_node,
+        Cryo::EnumVariantNode *variant,
+        int32_t discriminant_value,
+        llvm::Type *enum_type)
+    {
+        std::string enum_name = enum_node->name();
+        std::string variant_name = variant->name();
+        std::string ctor_name = enum_name + "::" + variant_name;
+
+        // Build parameter types from associated types
+        std::vector<llvm::Type *> param_types;
+        for (const auto &type_name : variant->associated_types())
+        {
+            llvm::Type *param_type = types().get_type(type_name);
+            if (!param_type)
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "Unknown type '{}' in enum variant {}", type_name, ctor_name);
+                return;
+            }
+            param_types.push_back(param_type);
+        }
+
+        // Create function type: (...fields) -> EnumType
+        llvm::FunctionType *ctor_type = llvm::FunctionType::get(enum_type, param_types, false);
+        llvm::Function *ctor = llvm::Function::Create(
+            ctor_type, llvm::Function::ExternalLinkage, ctor_name, module());
+
+        // Create entry block
+        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", ctor);
+        llvm::IRBuilder<> ctor_builder(entry);
+
+        // Allocate the enum struct
+        llvm::AllocaInst *enum_alloca = ctor_builder.CreateAlloca(enum_type, nullptr, "enum_val");
+
+        // Store the discriminant
+        llvm::Value *disc_ptr = ctor_builder.CreateStructGEP(enum_type, enum_alloca, 0, "disc_ptr");
+        ctor_builder.CreateStore(
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), discriminant_value),
+            disc_ptr);
+
+        // Store the payload fields
+        llvm::Value *payload_ptr = ctor_builder.CreateStructGEP(enum_type, enum_alloca, 1, "payload_ptr");
+
+        size_t offset = 0;
+        size_t arg_idx = 0;
+        for (auto &arg : ctor->args())
+        {
+            llvm::Type *arg_type = arg.getType();
+
+            // Calculate pointer to this field in the payload
+            llvm::Value *field_ptr = ctor_builder.CreateConstGEP1_32(
+                llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, offset, "field_ptr");
+
+            // Bitcast to correct type pointer and store
+            field_ptr = ctor_builder.CreateBitCast(field_ptr, llvm::PointerType::get(arg_type, 0));
+            ctor_builder.CreateStore(&arg, field_ptr);
+
+            offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+            arg_idx++;
+        }
+
+        // Load and return the enum value
+        llvm::Value *result = ctor_builder.CreateLoad(enum_type, enum_alloca, "result");
+        ctor_builder.CreateRet(result);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Generated enum variant constructor: {} with {} parameters", ctor_name, param_types.size());
     }
 
     //===================================================================
