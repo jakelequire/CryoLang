@@ -2,6 +2,8 @@
 #include "Utils/Logger.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 
+#include <unordered_set>
+
 namespace Cryo::Codegen
 {
     //===================================================================
@@ -139,7 +141,54 @@ namespace Cryo::Codegen
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "resolve_method_by_name: '{}.{}' not found", type_name, method_name);
+                  "resolve_method_by_name: '{}.{}' not found after SRM lookup", type_name, method_name);
+
+        // Fallback for primitive type methods (string, i32, u64, etc.)
+        // These are registered with simple names like "string::length" in generate_method_declaration
+        static const std::unordered_set<std::string> primitive_types = {
+            "string", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
+            "f32", "f64", "bool", "char", "boolean"};
+
+        if (primitive_types.find(type_name) != primitive_types.end())
+        {
+            // Try simple type::method name
+            std::string simple_method = type_name + "::" + method_name;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Trying primitive fallback '{}'", simple_method);
+
+            if (llvm::Function *fn = module()->getFunction(simple_method))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found primitive method via module: {}", simple_method);
+                return fn;
+            }
+
+            if (llvm::Function *fn = ctx().get_function(simple_method))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found primitive method via registry: {}", simple_method);
+                return fn;
+            }
+
+            // Try with std::core::Types:: prefix (where primitive impl blocks live)
+            std::string stdlib_method = "std::core::Types::" + simple_method;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Trying stdlib fallback '{}'", stdlib_method);
+
+            if (llvm::Function *fn = module()->getFunction(stdlib_method))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found primitive method via stdlib: {}", stdlib_method);
+                return fn;
+            }
+
+            if (llvm::Function *fn = ctx().get_function(stdlib_method))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found primitive method in registry: {}", stdlib_method);
+                return fn;
+            }
+        }
 
         // Additional fallback for known problematic cases
         if (type_name == "StackTrace" && method_name == "capture")
