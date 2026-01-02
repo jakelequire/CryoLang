@@ -851,12 +851,12 @@ namespace Cryo::Codegen
                     if (ptr_type && ptr_type->pointee_type())
                     {
                         // Try to resolve the pointee type to LLVM type
-                        pointee_type = _calls->resolve_type_by_name(ptr_type->pointee_type()->to_string());
+                        pointee_type = resolve_type_by_name(ptr_type->pointee_type()->to_string());
                     }
                 }
 
                 // Check if callee_name resolves to a struct type
-                llvm::Type *struct_type = _calls->resolve_type_by_name(callee_name);
+                llvm::Type *struct_type = resolve_type_by_name(callee_name);
                 if (struct_type && struct_type->isStructTy())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -937,10 +937,10 @@ namespace Cryo::Codegen
                  value_resolved_type->kind() == Cryo::TypeKind::Class))
             {
                 // Get the struct type to determine size
-                llvm::Type *struct_type = _calls->resolve_type_by_name(value_resolved_type->to_string());
+                llvm::Type *struct_type = resolve_type_by_name(value_resolved_type->to_string());
                 if (struct_type && struct_type->isStructTy())
                 {
-                    auto &data_layout = ctx().module().getDataLayout();
+                    auto &data_layout = ctx().module()->getDataLayout();
                     uint64_t size = data_layout.getTypeAllocSize(struct_type);
 
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
