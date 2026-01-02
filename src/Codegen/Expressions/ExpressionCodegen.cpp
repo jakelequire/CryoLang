@@ -897,17 +897,17 @@ namespace Cryo::Codegen
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Extracted element type name: '{}'", elem_type_name);
 
                                 // Map common type names to LLVM types
-                                if (elem_type_name == "u64" || elem_type_name == "i64")
+                                if (elem_type_name == "u64" || elem_type_name == "i64" || elem_type_name == "long")
                                     elem_type = llvm::Type::getInt64Ty(llvm_ctx());
-                                else if (elem_type_name == "u32" || elem_type_name == "i32")
+                                else if (elem_type_name == "u32" || elem_type_name == "i32" || elem_type_name == "int")
                                     elem_type = llvm::Type::getInt32Ty(llvm_ctx());
-                                else if (elem_type_name == "u16" || elem_type_name == "i16")
+                                else if (elem_type_name == "u16" || elem_type_name == "i16" || elem_type_name == "short")
                                     elem_type = llvm::Type::getInt16Ty(llvm_ctx());
-                                else if (elem_type_name == "u8" || elem_type_name == "i8")
+                                else if (elem_type_name == "u8" || elem_type_name == "i8" || elem_type_name == "byte")
                                     elem_type = llvm::Type::getInt8Ty(llvm_ctx());
-                                else if (elem_type_name == "f64")
+                                else if (elem_type_name == "f64" || elem_type_name == "double")
                                     elem_type = llvm::Type::getDoubleTy(llvm_ctx());
-                                else if (elem_type_name == "f32")
+                                else if (elem_type_name == "f32" || elem_type_name == "float")
                                     elem_type = llvm::Type::getFloatTy(llvm_ctx());
                                 else if (elem_type_name == "bool" || elem_type_name == "boolean")
                                     elem_type = llvm::Type::getInt1Ty(llvm_ctx());
@@ -1992,8 +1992,81 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating new expression for {}",
                   node->type_name());
 
-        // Get the type to allocate
-        llvm::Type *alloc_type = ctx().get_type(node->type_name());
+        llvm::Type *alloc_type = nullptr;
+        std::string type_name_for_alloc = node->type_name();
+
+        // Check if this is a generic type instantiation
+        if (!node->generic_args().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generic new expression with {} type args",
+                      node->generic_args().size());
+
+            // Get GenericCodegen via visitor
+            auto *generics = ctx().visitor() ? ctx().visitor()->get_generics() : nullptr;
+            if (!generics)
+            {
+                report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                             "GenericCodegen not available for generic type instantiation");
+                return nullptr;
+            }
+
+            // Convert string type arguments to Cryo::Type*
+            std::vector<Cryo::Type *> type_args;
+            for (const auto &type_arg_str : node->generic_args())
+            {
+                Cryo::Type *arg_type = symbols().get_type_context()->lookup_struct_type(type_arg_str);
+                if (!arg_type)
+                {
+                    arg_type = symbols().get_type_context()->lookup_class_type(type_arg_str);
+                }
+                if (!arg_type)
+                {
+                    // Try common primitive types
+                    if (type_arg_str == "int" || type_arg_str == "i32")
+                        arg_type = symbols().get_type_context()->get_i32_type();
+                    else if (type_arg_str == "i64" || type_arg_str == "long")
+                        arg_type = symbols().get_type_context()->get_i64_type();
+                    else if (type_arg_str == "f32" || type_arg_str == "float")
+                        arg_type = symbols().get_type_context()->get_f32_type();
+                    else if (type_arg_str == "f64" || type_arg_str == "double")
+                        arg_type = symbols().get_type_context()->get_f64_type();
+                    else if (type_arg_str == "string")
+                        arg_type = symbols().get_type_context()->get_string_type();
+                    else if (type_arg_str == "bool" || type_arg_str == "boolean")
+                        arg_type = symbols().get_type_context()->get_boolean_type();
+                }
+
+                if (arg_type)
+                {
+                    type_args.push_back(arg_type);
+                }
+                else
+                {
+                    LOG_WARN(Cryo::LogComponent::CODEGEN,
+                             "ExpressionCodegen: Failed to resolve type argument: {}", type_arg_str);
+                }
+            }
+
+            // Instantiate the generic type
+            llvm::StructType *instantiated_type = generics->instantiate_struct(node->type_name(), type_args);
+            if (!instantiated_type)
+            {
+                report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                             "Failed to instantiate generic type: " + node->type_name());
+                return nullptr;
+            }
+
+            alloc_type = instantiated_type;
+            type_name_for_alloc = instantiated_type->getName().str();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: Instantiated generic type: {}", type_name_for_alloc);
+        }
+        else
+        {
+            // Get the type to allocate (non-generic)
+            alloc_type = ctx().get_type(node->type_name());
+        }
+
         if (!alloc_type)
         {
             report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
@@ -2017,10 +2090,30 @@ namespace Cryo::Codegen
         }
 
         llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
-        llvm::Value *ptr = builder().CreateCall(cryo_alloc_fn, {size_val}, "new." + node->type_name());
+        llvm::Value *ptr = builder().CreateCall(cryo_alloc_fn, {size_val}, "new." + type_name_for_alloc);
 
         // If there are constructor arguments, call constructor
-        // TODO: Handle constructor calls with arguments
+        if (!node->arguments().empty())
+        {
+            // Look up the constructor for the type
+            std::string ctor_name = type_name_for_alloc + "::" + node->type_name();
+            llvm::Function *ctor_fn = module()->getFunction(ctor_name);
+            if (ctor_fn)
+            {
+                std::vector<llvm::Value *> ctor_args;
+                ctor_args.push_back(ptr); // 'this' pointer
+
+                // Generate constructor arguments
+                for (const auto &arg : node->arguments())
+                {
+                    llvm::Value *arg_val = generate(arg.get());
+                    if (arg_val)
+                        ctor_args.push_back(arg_val);
+                }
+
+                builder().CreateCall(ctor_fn, ctor_args);
+            }
+        }
 
         return ptr;
     }
