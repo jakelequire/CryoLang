@@ -1,6 +1,7 @@
 #include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Intrinsics.hpp"
 #include "AST/ASTVisitor.hpp"
 #include "Utils/Logger.hpp"
@@ -221,7 +222,120 @@ namespace Cryo::Codegen
 
         case CallKind::GenericInstantiation:
         {
-            // Handle generic instantiation - resolve the specialized function
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericInstantiation: Processing '{}'", function_name);
+
+            // Parse the generic type name: "GenericStruct<int>" -> base="GenericStruct", type_args=["int"]
+            size_t open_bracket = function_name.find('<');
+            size_t close_bracket = function_name.rfind('>');
+
+            if (open_bracket == std::string::npos || close_bracket == std::string::npos)
+            {
+                // Fallback to function resolution
+                llvm::Function *fn = resolve_function(function_name);
+                if (fn)
+                {
+                    return generate_free_function(node, fn);
+                }
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                             "Failed to resolve generic instantiation: " + function_name);
+                return nullptr;
+            }
+
+            std::string base_name = function_name.substr(0, open_bracket);
+            std::string type_args_str = function_name.substr(open_bracket + 1, close_bracket - open_bracket - 1);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericInstantiation: base='{}', type_args_str='{}'", base_name, type_args_str);
+
+            // Get the GenericCodegen component
+            CodegenVisitor *visitor = ctx().visitor();
+            GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+
+            if (!generics)
+            {
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                             "GenericCodegen not available for: " + function_name);
+                return nullptr;
+            }
+
+            // Check if base_name is a registered generic struct template
+            if (generics->is_generic_template(base_name))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: '{}' is a generic template, instantiating as struct constructor",
+                          base_name);
+
+                // Parse type arguments (simple single type arg for now)
+                // TODO: Handle multiple type arguments with proper parsing
+                std::vector<Cryo::Type *> type_args;
+
+                // Trim whitespace from type_args_str
+                size_t start = type_args_str.find_first_not_of(" \t");
+                size_t end = type_args_str.find_last_not_of(" \t");
+                if (start != std::string::npos && end != std::string::npos)
+                {
+                    type_args_str = type_args_str.substr(start, end - start + 1);
+                }
+
+                // Resolve the type argument - try struct/class types first
+                Cryo::Type *arg_type = symbols().get_type_context()->lookup_struct_type(type_args_str);
+                if (!arg_type)
+                {
+                    arg_type = symbols().get_type_context()->lookup_class_type(type_args_str);
+                }
+                if (!arg_type)
+                {
+                    // Try common primitive types using convenience methods
+                    if (type_args_str == "int" || type_args_str == "i32")
+                    {
+                        arg_type = symbols().get_type_context()->get_i32_type();
+                    }
+                    else if (type_args_str == "i64")
+                    {
+                        arg_type = symbols().get_type_context()->get_i64_type();
+                    }
+                    else if (type_args_str == "f32" || type_args_str == "float")
+                    {
+                        arg_type = symbols().get_type_context()->get_f32_type();
+                    }
+                    else if (type_args_str == "f64" || type_args_str == "double")
+                    {
+                        arg_type = symbols().get_type_context()->get_f64_type();
+                    }
+                    else if (type_args_str == "string")
+                    {
+                        arg_type = symbols().get_type_context()->get_string_type();
+                    }
+                    else if (type_args_str == "bool" || type_args_str == "boolean")
+                    {
+                        arg_type = symbols().get_type_context()->get_boolean_type();
+                    }
+                }
+
+                if (arg_type)
+                {
+                    type_args.push_back(arg_type);
+                }
+
+                // Instantiate the generic struct type
+                llvm::StructType *instantiated_type = generics->instantiate_struct(base_name, type_args);
+                if (!instantiated_type)
+                {
+                    report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                                 "Failed to instantiate generic struct: " + function_name);
+                    return nullptr;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: Instantiated struct type '{}'",
+                          instantiated_type->getName().str());
+
+                // Now generate the struct constructor call using the mangled name
+                return generate_struct_constructor(node, instantiated_type->getName().str());
+            }
+
+            // Not a generic struct, try as a function
             llvm::Function *fn = resolve_function(function_name);
             if (fn)
             {
@@ -308,6 +422,9 @@ namespace Cryo::Codegen
         {
             std::string method_name = member->member();
 
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "classify_call: MemberAccessNode with member '{}'", method_name);
+
             // Check if method is an intrinsic
             if (is_intrinsic(method_name))
             {
@@ -319,9 +436,14 @@ namespace Cryo::Codegen
             {
                 std::string obj_name = obj_id->name();
 
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "classify_call: Object identifier is '{}'", obj_name);
+
                 // Check if it's an enum variant
                 if (is_enum_type(obj_name))
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' is an enum type, returning EnumVariant", obj_name);
                     return CallKind::EnumVariant;
                 }
 
@@ -336,6 +458,9 @@ namespace Cryo::Codegen
                 {
                     return CallKind::InstanceMethod;
                 }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "classify_call: '{}::{}' falling through to FreeFunction", obj_name, method_name);
 
                 // Could be a namespace-qualified function
                 return CallKind::FreeFunction;
@@ -1124,6 +1249,101 @@ namespace Cryo::Codegen
         if (fn)
             return fn;
 
+        // Try to create forward declaration from symbol table lookup
+        // This handles imported stdlib functions that aren't in the LLVM module yet
+        fn = create_forward_declaration_from_symbol(name);
+        if (fn)
+            return fn;
+
+        return nullptr;
+    }
+
+    llvm::Function *CallCodegen::create_forward_declaration_from_symbol(const std::string &name)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "create_forward_declaration_from_symbol: Trying to find '{}' in symbol table", name);
+
+        // Generate lookup candidates using SRM (includes imported namespaces)
+        auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Function);
+
+        for (const auto &candidate : candidates)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "create_forward_declaration_from_symbol: Trying candidate '{}'", candidate);
+
+            // Try to find the function in the symbol table
+            Cryo::Symbol *symbol = symbols().lookup_symbol(candidate);
+            if (!symbol)
+            {
+                // Try parsing the candidate into namespace and function name parts
+                size_t last_sep = candidate.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    std::string ns = candidate.substr(0, last_sep);
+                    std::string fn_name = candidate.substr(last_sep + 2);
+                    symbol = symbols().lookup_namespaced_symbol(ns, fn_name);
+                }
+            }
+
+            if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->data_type)
+            {
+                Cryo::FunctionType *func_type = dynamic_cast<Cryo::FunctionType *>(symbol->data_type);
+                if (func_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "create_forward_declaration_from_symbol: Found function '{}' in symbol table", candidate);
+
+                    // Build LLVM function type from Cryo function type
+                    llvm::Type *return_type = types().map(func_type->return_type().get());
+                    if (!return_type)
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                  "Failed to map return type for function '{}'", candidate);
+                        continue;
+                    }
+
+                    std::vector<llvm::Type *> param_types;
+                    for (const auto &param : func_type->parameter_types())
+                    {
+                        llvm::Type *pt = types().map(param.get());
+                        if (!pt)
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                      "Failed to map parameter type for function '{}'", candidate);
+                            break;
+                        }
+                        param_types.push_back(pt);
+                    }
+
+                    if (param_types.size() != func_type->parameter_types().size())
+                    {
+                        continue; // Failed to map all parameter types
+                    }
+
+                    // Create the function type
+                    llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(
+                        return_type, param_types, func_type->is_variadic());
+
+                    // Create the function declaration with the qualified name
+                    llvm::Function *fn = llvm::Function::Create(
+                        llvm_func_type,
+                        llvm::Function::ExternalLinkage,
+                        candidate,
+                        module());
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "create_forward_declaration_from_symbol: Created forward declaration for '{}'", candidate);
+
+                    // Register in context for future lookups
+                    ctx().register_function(candidate, fn);
+
+                    return fn;
+                }
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "create_forward_declaration_from_symbol: Could not find '{}' in symbol table", name);
         return nullptr;
     }
 
@@ -1373,12 +1593,48 @@ namespace Cryo::Codegen
 
     bool CallCodegen::is_enum_type(const std::string &name) const
     {
-        // Check symbol table for enum
-        Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(name);
-        if (sym && sym->kind == SymbolKind::Type && sym->data_type)
+        // First try direct lookup with the unqualified name
+        // Enums are registered with just their name (e.g., "Shape"), not namespace-qualified
+        Cryo::Type *direct_lookup = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(name);
+        if (direct_lookup)
         {
-            return sym->data_type->kind() == TypeKind::Enum;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "is_enum_type: Found '{}' as enum type via direct lookup", name);
+            return true;
         }
+
+        // Use SRM to generate type candidates and check if any is an enum type
+        auto &non_const_ctx = const_cast<CodegenContext &>(ctx());
+        auto candidates = non_const_ctx.srm().generate_lookup_candidates(name, Cryo::SymbolKind::Type);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "is_enum_type: Checking '{}' with {} candidates", name, candidates.size());
+
+        for (const auto &candidate : candidates)
+        {
+            // Try TypeContext's enum type lookup
+            Cryo::Type *enum_type = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(candidate);
+            if (enum_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "is_enum_type: Found '{}' as enum type via TypeContext lookup '{}'", name, candidate);
+                return true;
+            }
+
+            // Also check symbol table for enum type
+            Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(candidate);
+            if (sym && sym->kind == SymbolKind::Type && sym->data_type)
+            {
+                if (sym->data_type->kind() == TypeKind::Enum)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "is_enum_type: Found '{}' as enum type via symbol table '{}'", name, candidate);
+                    return true;
+                }
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "is_enum_type: '{}' not found as enum type", name);
         return false;
     }
 
