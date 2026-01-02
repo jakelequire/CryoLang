@@ -813,7 +813,7 @@ namespace Cryo::Codegen
         if (!target || !value_node)
             return nullptr;
 
-        // Generate the pointer value
+        // Generate the pointer value (this is where we'll store to)
         llvm::Value *ptr = generate_operand(target->operand());
         if (!ptr)
         {
@@ -829,7 +829,95 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Generate the value to assign
+        // Check if this is a struct constructor call being assigned through a pointer
+        // In this case, we need to construct in-place rather than on the stack
+        if (auto *call_node = dynamic_cast<Cryo::CallExpressionNode *>(value_node))
+        {
+            std::string callee_name;
+            if (auto *callee_ident = dynamic_cast<Cryo::IdentifierNode *>(call_node->callee()))
+            {
+                callee_name = callee_ident->name();
+            }
+
+            if (!callee_name.empty())
+            {
+                // Get the pointed-to type from the AST
+                Cryo::Type *target_resolved_type = target->operand()->get_resolved_type();
+                llvm::Type *pointee_type = nullptr;
+
+                if (target_resolved_type && target_resolved_type->kind() == Cryo::TypeKind::Pointer)
+                {
+                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(target_resolved_type);
+                    if (ptr_type && ptr_type->pointee_type())
+                    {
+                        // Try to resolve the pointee type to LLVM type
+                        pointee_type = _calls->resolve_type_by_name(ptr_type->pointee_type()->to_string());
+                    }
+                }
+
+                // Check if callee_name resolves to a struct type
+                llvm::Type *struct_type = _calls->resolve_type_by_name(callee_name);
+                if (struct_type && struct_type->isStructTy())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Deref assignment: detected struct constructor call for '{}', constructing in-place",
+                              callee_name);
+
+                    // Generate constructor arguments
+                    std::vector<llvm::Value *> args;
+                    for (const auto &arg : call_node->arguments())
+                    {
+                        if (arg)
+                        {
+                            llvm::Value *arg_val = generate_operand(arg.get());
+                            if (arg_val)
+                            {
+                                args.push_back(arg_val);
+                            }
+                        }
+                    }
+
+                    // Look for the constructor function
+                    llvm::Function *ctor = _calls->resolve_constructor(callee_name);
+                    if (ctor)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Deref assignment: Calling constructor '{}' in-place with {} args",
+                                  ctor->getName().str(), args.size());
+
+                        // Call constructor with ptr as 'this' pointer (in-place construction)
+                        std::vector<llvm::Value *> ctor_args;
+                        ctor_args.push_back(ptr);
+                        ctor_args.insert(ctor_args.end(), args.begin(), args.end());
+                        builder().CreateCall(ctor, ctor_args);
+                        return ptr;
+                    }
+                    else
+                    {
+                        // No constructor found - initialize fields directly
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Deref assignment: No constructor for '{}', initializing fields directly",
+                                  callee_name);
+
+                        auto *st = llvm::cast<llvm::StructType>(struct_type);
+                        for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
+                        {
+                            llvm::Value *field_ptr = builder().CreateStructGEP(struct_type, ptr, i,
+                                                                                "field." + std::to_string(i));
+                            llvm::Value *arg = args[i];
+                            if (arg->getType() != st->getElementType(i))
+                            {
+                                arg = cast_if_needed(arg, st->getElementType(i));
+                            }
+                            builder().CreateStore(arg, field_ptr);
+                        }
+                        return ptr;
+                    }
+                }
+            }
+        }
+
+        // Generate the value to assign (standard path for non-struct-constructor cases)
         llvm::Value *value = generate_operand(value_node);
         if (!value)
         {
@@ -838,7 +926,40 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Store the value through the pointer
+        // Check if we're assigning a struct value - need to memcpy instead of simple store
+        if (value->getType()->isPointerTy())
+        {
+            // The value might be a pointer to a struct (e.g., from a previous constructor)
+            // Check if we should do a memcpy
+            Cryo::Type *value_resolved_type = value_node->get_resolved_type();
+            if (value_resolved_type &&
+                (value_resolved_type->kind() == Cryo::TypeKind::Struct ||
+                 value_resolved_type->kind() == Cryo::TypeKind::Class))
+            {
+                // Get the struct type to determine size
+                llvm::Type *struct_type = _calls->resolve_type_by_name(value_resolved_type->to_string());
+                if (struct_type && struct_type->isStructTy())
+                {
+                    auto &data_layout = ctx().module().getDataLayout();
+                    uint64_t size = data_layout.getTypeAllocSize(struct_type);
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Deref assignment: memcpy struct of size {} bytes", size);
+
+                    // Use memcpy to copy struct contents
+                    builder().CreateMemCpy(
+                        ptr,                                              // dest
+                        llvm::MaybeAlign(data_layout.getABITypeAlign(struct_type)),  // dest align
+                        value,                                            // src
+                        llvm::MaybeAlign(data_layout.getABITypeAlign(struct_type)),  // src align
+                        size                                              // size
+                    );
+                    return ptr;
+                }
+            }
+        }
+
+        // Store the value through the pointer (standard path for primitives)
         if (_memory)
         {
             _memory->create_store(value, ptr);
