@@ -912,6 +912,8 @@ namespace Cryo::Codegen
                                     elem_type = llvm::Type::getFloatTy(llvm_ctx());
                                 else if (elem_type_name == "bool" || elem_type_name == "boolean")
                                     elem_type = llvm::Type::getInt1Ty(llvm_ctx());
+                                else if (elem_type_name == "string")
+                                    elem_type = llvm::PointerType::get(llvm_ctx(), 0); // Opaque pointer for strings
                                 else
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Unknown element type name: '{}'", elem_type_name);
                             }
