@@ -376,9 +376,18 @@ namespace Cryo::Codegen
             llvm::Value *init_val = get_result();
             if (init_val)
             {
-                // Special handling for struct types: if the initializer returns a pointer
-                // to a struct (e.g., from a struct literal), we need to memcpy instead of store
-                if (var_type->isStructTy() && init_val->getType()->isPointerTy())
+                // Special handling for struct/class value types: if the initializer returns a pointer
+                // to a struct (e.g., from a struct literal), we need to memcpy instead of store.
+                // IMPORTANT: Only do this for actual Struct/Class types, not Arrays which may also
+                // be represented as LLVM struct types.
+                bool is_struct_value_type = false;
+                if (cryo_var_type)
+                {
+                    TypeKind kind = cryo_var_type->kind();
+                    is_struct_value_type = (kind == TypeKind::Struct || kind == TypeKind::Class);
+                }
+
+                if (is_struct_value_type && var_type->isStructTy() && init_val->getType()->isPointerTy())
                 {
                     // The init_val is a pointer to the struct data, memcpy to our alloca
                     auto &data_layout = module()->getDataLayout();
