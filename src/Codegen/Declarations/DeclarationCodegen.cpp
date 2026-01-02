@@ -1659,6 +1659,22 @@ namespace Cryo::Codegen
                 // Full definition - function should already be declared
                 std::string method_name = generate_method_name(type_name, fn_node->name());
                 llvm::Function *fn = module()->getFunction(method_name);
+
+                // Also try with namespace prefix if not found
+                if (!fn)
+                {
+                    std::string ns_context = ctx().namespace_context();
+                    if (!ns_context.empty())
+                    {
+                        std::string namespaced_name = ns_context + "::" + method_name;
+                        fn = module()->getFunction(namespaced_name);
+                        if (fn)
+                        {
+                            method_name = namespaced_name; // Update for scope entry below
+                        }
+                    }
+                }
+
                 if (fn && fn->empty())
                 {
                     // Create entry block and generate body
