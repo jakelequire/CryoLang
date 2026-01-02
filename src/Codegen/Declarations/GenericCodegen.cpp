@@ -145,6 +145,11 @@ namespace Cryo::Codegen
                       "GenericCodegen: Generating {} methods for instantiated struct {}",
                       struct_decl->methods().size(), mangled);
 
+            // Save parent context before generating methods
+            auto saved_fn_ctx = ctx().release_current_function();
+            llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
+            std::string saved_type_name = ctx().current_type_name();
+
             for (const auto &method : struct_decl->methods())
             {
                 if (!method)
@@ -202,13 +207,22 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    // Clean up
+                    // Clean up method scope
                     values().exit_scope();
-                    ctx().clear_current_function();
-                    ctx().set_current_type_name(""); // Clear current type
                     ctx().set_result(nullptr);
                 }
             }
+
+            // Restore parent context after generating all methods
+            if (saved_fn_ctx)
+            {
+                ctx().set_current_function(std::move(saved_fn_ctx));
+            }
+            if (saved_insert_block)
+            {
+                builder().SetInsertPoint(saved_insert_block);
+            }
+            ctx().set_current_type_name(saved_type_name);
         }
 
         // End type parameter scope AFTER methods are generated
@@ -362,6 +376,11 @@ namespace Cryo::Codegen
                       "GenericCodegen: Generating {} methods for instantiated class {}",
                       class_decl->methods().size(), mangled);
 
+            // Save parent context before generating methods
+            auto saved_fn_ctx = ctx().release_current_function();
+            llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
+            std::string saved_type_name = ctx().current_type_name();
+
             for (const auto &method : class_decl->methods())
             {
                 if (!method)
@@ -419,13 +438,22 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    // Clean up
+                    // Clean up method scope
                     values().exit_scope();
-                    ctx().clear_current_function();
-                    ctx().set_current_type_name(""); // Clear current type
                     ctx().set_result(nullptr);
                 }
             }
+
+            // Restore parent context after generating all methods
+            if (saved_fn_ctx)
+            {
+                ctx().set_current_function(std::move(saved_fn_ctx));
+            }
+            if (saved_insert_block)
+            {
+                builder().SetInsertPoint(saved_insert_block);
+            }
+            ctx().set_current_type_name(saved_type_name);
         }
 
         // End substitution scope AFTER methods are generated
