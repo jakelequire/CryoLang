@@ -224,6 +224,9 @@ namespace Cryo::Codegen
         /** @brief Clear current function context */
         void clear_current_function();
 
+        /** @brief Release ownership of current function context (for save/restore) */
+        std::unique_ptr<FunctionContext> release_current_function() { return std::move(_current_function); }
+
         /** @brief Get current AST node being processed */
         Cryo::ASTNode *current_node() { return _current_node; }
 
