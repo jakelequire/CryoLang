@@ -128,6 +128,15 @@ namespace Cryo::Codegen
         ctx().register_type(mangled, struct_type);
         types().register_struct(mangled, struct_type);
 
+        // Register field names BEFORE generating methods so this.field accesses work
+        if (!field_names.empty())
+        {
+            ctx().register_struct_fields(mangled, field_names);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Pre-registered {} field names for struct {} before method generation",
+                      field_names.size(), mangled);
+        }
+
         // Generate methods for the instantiated struct while type params are still in scope
         // This ensures type parameters like T are substituted with concrete types (e.g., int)
         if (struct_decl && _declarations)
