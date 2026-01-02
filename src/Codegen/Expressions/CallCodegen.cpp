@@ -278,26 +278,30 @@ namespace Cryo::Codegen
                     type_args_str = type_args_str.substr(start, end - start + 1);
                 }
 
-                // Resolve the type argument
-                Cryo::Type *arg_type = symbols().get_type_context()->get_type_by_name(type_args_str);
+                // Resolve the type argument - try struct/class types first
+                Cryo::Type *arg_type = symbols().get_type_context()->lookup_struct_type(type_args_str);
                 if (!arg_type)
                 {
-                    // Try common primitive types
+                    arg_type = symbols().get_type_context()->lookup_class_type(type_args_str);
+                }
+                if (!arg_type)
+                {
+                    // Try common primitive types using convenience methods
                     if (type_args_str == "int" || type_args_str == "i32")
                     {
-                        arg_type = symbols().get_type_context()->get_integer_type(32, true);
+                        arg_type = symbols().get_type_context()->get_i32_type();
                     }
                     else if (type_args_str == "i64")
                     {
-                        arg_type = symbols().get_type_context()->get_integer_type(64, true);
+                        arg_type = symbols().get_type_context()->get_i64_type();
                     }
                     else if (type_args_str == "f32" || type_args_str == "float")
                     {
-                        arg_type = symbols().get_type_context()->get_float_type(32);
+                        arg_type = symbols().get_type_context()->get_f32_type();
                     }
                     else if (type_args_str == "f64" || type_args_str == "double")
                     {
-                        arg_type = symbols().get_type_context()->get_float_type(64);
+                        arg_type = symbols().get_type_context()->get_f64_type();
                     }
                     else if (type_args_str == "string")
                     {
