@@ -345,6 +345,28 @@ namespace Cryo::Codegen
             return CallKind::InstanceMethod;
         }
 
+        // Handle scope resolution (e.g., Shape::Circle for enum variants)
+        if (auto *scope = dynamic_cast<ScopeResolutionNode *>(node->callee()))
+        {
+            std::string scope_name = scope->scope_name();
+            std::string member_name = scope->member_name();
+
+            // Check if it's an enum variant
+            if (is_enum_type(scope_name))
+            {
+                return CallKind::EnumVariant;
+            }
+
+            // Check if it's a static method call
+            if (is_struct_type(scope_name) || is_class_type(scope_name))
+            {
+                return CallKind::StaticMethod;
+            }
+
+            // Could be a namespace-qualified function
+            return CallKind::FreeFunction;
+        }
+
         return CallKind::Unknown;
     }
 
@@ -1411,6 +1433,12 @@ namespace Cryo::Codegen
                 return obj_name + "::" + member->member();
             }
             return member->member();
+        }
+
+        // Handle scope resolution (e.g., Shape::Circle for enum variants)
+        if (auto *scope = dynamic_cast<ScopeResolutionNode *>(callee))
+        {
+            return scope->scope_name() + "::" + scope->member_name();
         }
 
         return "";
