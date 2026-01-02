@@ -1356,6 +1356,8 @@ namespace Cryo::Codegen
         llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
         llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
         llvm::Type *void_type = llvm::Type::getVoidTy(llvm_ctx());
+        llvm::Type *float_type = llvm::Type::getFloatTy(llvm_ctx());
+        llvm::Type *i1_type = llvm::Type::getInt1Ty(llvm_ctx());
 
         if (name == "printf" || name == "IO::printf" || name == "std::IO::printf")
         {
@@ -1364,6 +1366,55 @@ namespace Cryo::Codegen
             {
                 llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type}, true);
                 fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "printf", module());
+            }
+            return fn;
+        }
+
+        // Handle stdlib IO functions - map unqualified names to qualified names
+        if (name == "println" || name == "IO::println" || name == "std::IO::println")
+        {
+            std::string qualified_name = "std::IO::println";
+            llvm::Function *fn = module()->getFunction(qualified_name);
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, qualified_name, module());
+            }
+            return fn;
+        }
+
+        if (name == "print_int" || name == "IO::print_int" || name == "std::IO::print_int")
+        {
+            std::string qualified_name = "std::IO::print_int";
+            llvm::Function *fn = module()->getFunction(qualified_name);
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {i32_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, qualified_name, module());
+            }
+            return fn;
+        }
+
+        if (name == "print_float" || name == "IO::print_float" || name == "std::IO::print_float")
+        {
+            std::string qualified_name = "std::IO::print_float";
+            llvm::Function *fn = module()->getFunction(qualified_name);
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {float_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, qualified_name, module());
+            }
+            return fn;
+        }
+
+        if (name == "print_bool" || name == "IO::print_bool" || name == "std::IO::print_bool")
+        {
+            std::string qualified_name = "std::IO::print_bool";
+            llvm::Function *fn = module()->getFunction(qualified_name);
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {i1_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, qualified_name, module());
             }
             return fn;
         }
