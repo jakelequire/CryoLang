@@ -821,26 +821,27 @@ namespace Cryo::Codegen
         else
         {
             // Complex enums are tagged unions: { i32 discriminant, [payload_size x i8] }
-            // First check if there's an existing struct type with this name to avoid duplicates
+            llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
+            llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
+
+            // Check if there's an existing struct type with this name
             llvm::StructType *enum_struct = llvm::StructType::getTypeByName(llvm_ctx(), name);
 
             if (enum_struct && !enum_struct->isOpaque())
             {
-                // Use existing type - it was already created (e.g., by TypeMapper)
+                // Type already exists and is complete - use it
                 enum_type = enum_struct;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Reusing existing tagged union for enum '{}'", name);
             }
             else
             {
-                // Create new struct type
-                llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
-                llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
-
+                // Create or complete the struct type
                 if (!enum_struct)
                 {
                     enum_struct = llvm::StructType::create(llvm_ctx(), name);
                 }
+                // Set the body (completes the type if it was opaque)
                 enum_struct->setBody({discriminant_type, payload_type}, false);
                 enum_type = enum_struct;
 
