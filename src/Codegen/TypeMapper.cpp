@@ -722,32 +722,6 @@ namespace Cryo::Codegen
             return existing;
         }
 
-        // Register variant field types for pattern matching
-        // This ensures field types are available even when enum is processed via TypeMapper
-        const auto &variants = type->get_variant_metadata();
-        for (const auto &variant : variants)
-        {
-            if (variant.has_data && !variant.field_types.empty())
-            {
-                std::string qualified_variant = name + "::" + variant.name;
-                std::vector<std::string> type_names;
-                for (const auto &field_type : variant.field_types)
-                {
-                    if (field_type)
-                    {
-                        type_names.push_back(field_type->name());
-                    }
-                }
-                if (!type_names.empty())
-                {
-                    _ctx.register_enum_variant_fields(qualified_variant, type_names);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "TypeMapper: Registered {} field types for variant {}",
-                              type_names.size(), qualified_variant);
-                }
-            }
-        }
-
         // Calculate payload size
         size_t payload_size = calculate_enum_payload_size(type);
         size_t discriminant_size = type->get_discriminant_size();
