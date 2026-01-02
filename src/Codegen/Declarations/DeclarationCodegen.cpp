@@ -5,6 +5,7 @@
 #include "Utils/Logger.hpp"
 
 #include <llvm/IR/Verifier.h>
+#include <unordered_set>
 
 namespace Cryo::Codegen
 {
@@ -211,13 +212,25 @@ namespace Cryo::Codegen
         // Generate base method name (Type::method)
         std::string base_method_name = generate_method_name(parent_type, node->name());
 
-        // Build fully-qualified name if we have a namespace context
+        // Check if parent_type is a primitive type - primitive methods should NOT be namespace-qualified
+        static const std::unordered_set<std::string> primitive_types = {
+            "string", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
+            "f32", "f64", "bool", "char", "boolean"};
+        bool is_primitive = primitive_types.find(parent_type) != primitive_types.end();
+
+        // Build fully-qualified name if we have a namespace context (but not for primitives)
         std::string ns_context = ctx().namespace_context();
         std::string llvm_fn_name = base_method_name;
-        if (!ns_context.empty())
+        if (!ns_context.empty() && !is_primitive)
         {
             // Use fully-qualified name: namespace::Type::method
             llvm_fn_name = ns_context + "::" + base_method_name;
+        }
+
+        if (is_primitive)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Primitive type method - using simple name: {}", base_method_name);
         }
 
         // Check if already declared (check both names to handle existing declarations)
