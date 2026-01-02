@@ -1,5 +1,7 @@
 #include "Codegen/Statements/ControlFlowCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
+#include "AST/ASTNode.hpp"
+#include "AST/Type.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -720,6 +722,13 @@ namespace Cryo::Codegen
             // Generate arm body
             builder().SetInsertPoint(arm_block);
             enter_scope(arm_block);
+
+            // Bind pattern variables if this is an enum pattern
+            if (pattern && pattern->pattern_type() == Cryo::PatternNode::PatternType::Enum)
+            {
+                bind_enum_pattern_variables(match_value, pattern);
+            }
+
             if (arm->body())
             {
                 CodegenVisitor *visitor = ctx().visitor();
@@ -783,13 +792,144 @@ namespace Cryo::Codegen
             return nullptr;
 
         case Cryo::PatternNode::PatternType::Enum:
-            // Enum pattern - would need to compare enum discriminant
-            // For now, treat as wildcard
+        {
+            // Cast to EnumPatternNode to get variant info
+            auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(pattern);
+            if (!enum_pattern)
+                return nullptr;
+
+            std::string enum_name = enum_pattern->enum_name();
+            std::string variant_name = enum_pattern->variant_name();
+            std::string qualified_variant = enum_name + "::" + variant_name;
+
+            // Look up the discriminant value for this variant
+            auto &enum_variants = ctx().enum_variants_map();
+            auto it = enum_variants.find(qualified_variant);
+            if (it == enum_variants.end())
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "Unknown enum variant in pattern: {}", qualified_variant);
+                return nullptr;
+            }
+
+            llvm::Value *expected_discriminant = it->second;
+
+            // Check if value is a tagged union struct or simple enum
+            if (value->getType()->isStructTy())
+            {
+                // Tagged union - extract discriminant from first field
+                llvm::Value *discriminant = builder().CreateExtractValue(value, 0, "discriminant");
+                return builder().CreateICmpEQ(discriminant, expected_discriminant, "pattern.match");
+            }
+            else if (value->getType()->isIntegerTy())
+            {
+                // Simple enum - compare directly
+                return builder().CreateICmpEQ(value, expected_discriminant, "pattern.match");
+            }
+
             return nullptr;
+        }
         }
 
         // Default: wildcard behavior
         return nullptr;
+    }
+
+    void ControlFlowCodegen::bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern)
+    {
+        auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(pattern);
+        if (!enum_pattern)
+            return;
+
+        const auto &bound_vars = enum_pattern->bound_variables();
+        if (bound_vars.empty())
+            return;
+
+        std::string enum_name = enum_pattern->enum_name();
+        std::string variant_name = enum_pattern->variant_name();
+
+        // Get the enum type information from the type context
+        Cryo::Type *cryo_enum_type = symbols().get_type_context()->lookup_enum_type(enum_name);
+        if (!cryo_enum_type)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Cannot find enum type '{}' for pattern binding", enum_name);
+            return;
+        }
+
+        auto *enum_type = dynamic_cast<Cryo::EnumType *>(cryo_enum_type);
+        if (!enum_type)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Type '{}' is not an enum type", enum_name);
+            return;
+        }
+
+        // Get variant metadata to find field types
+        const Cryo::EnumVariant *variant_info = enum_type->get_variant_info(variant_name);
+        if (!variant_info)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Cannot find variant info for {}", variant_name);
+            return;
+        }
+
+        // The value should be a tagged union struct
+        if (!value->getType()->isStructTy())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Expected struct type for enum pattern binding");
+            return;
+        }
+
+        // Extract the payload (field 1 of the struct)
+        llvm::Value *payload = builder().CreateExtractValue(value, 1, "payload");
+
+        // Bind each variable by extracting from the payload
+        size_t offset = 0;
+        for (size_t i = 0; i < bound_vars.size() && i < variant_info->field_types.size(); ++i)
+        {
+            const std::string &var_name = bound_vars[i];
+            Cryo::Type *field_cryo_type = variant_info->field_types[i].get();
+
+            // Get the LLVM type for this field
+            llvm::Type *field_type = types().map(field_cryo_type);
+            if (!field_type)
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "Unknown type for pattern variable '{}'", var_name);
+                continue;
+            }
+
+            // The payload is [N x i8], we need to extract from the right offset
+            // First get a pointer to the payload array
+            llvm::Type *struct_type = value->getType();
+            llvm::Value *value_alloca = builder().CreateAlloca(struct_type, nullptr, "enum_tmp");
+            builder().CreateStore(value, value_alloca);
+
+            llvm::Value *payload_ptr = builder().CreateStructGEP(struct_type, value_alloca, 1, "payload_ptr");
+
+            // Calculate field pointer with offset
+            llvm::Value *field_ptr = builder().CreateConstGEP1_32(
+                llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, offset, "field_ptr");
+
+            // Cast to field type pointer and load
+            field_ptr = builder().CreateBitCast(field_ptr, llvm::PointerType::get(field_type, 0));
+            llvm::Value *field_value = builder().CreateLoad(field_type, field_ptr, var_name);
+
+            // Create alloca for the variable and store the value
+            llvm::AllocaInst *var_alloca = builder().CreateAlloca(field_type, nullptr, var_name + "_alloca");
+            builder().CreateStore(field_value, var_alloca);
+
+            // Register the variable in the current scope
+            values().set_value(var_name, field_value, var_alloca, field_type);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Bound pattern variable '{}' from enum variant {}", var_name, variant_name);
+
+            // Advance offset
+            offset += module()->getDataLayout().getTypeAllocSize(field_type);
+        }
     }
 
     //===================================================================

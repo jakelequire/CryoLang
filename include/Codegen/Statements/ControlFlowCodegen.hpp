@@ -112,6 +112,13 @@ namespace Cryo::Codegen
          */
         llvm::Value *generate_pattern_match(llvm::Value *value, Cryo::PatternNode *pattern);
 
+        /**
+         * @brief Bind pattern variables for an enum pattern match
+         * @param value The matched enum value
+         * @param pattern The enum pattern containing bound variables
+         */
+        void bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern);
+
         //===================================================================
         // Jump Statements
         //===================================================================
