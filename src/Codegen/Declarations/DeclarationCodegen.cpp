@@ -390,10 +390,20 @@ namespace Cryo::Codegen
                 // Fallback: if Cryo type didn't indicate struct but LLVM type is a named struct,
                 // treat it as a struct value type. Named structs (like %SingleStruct) are user-defined
                 // structs, while anonymous structs are typically arrays or tuples.
+                // IMPORTANT: Exclude Array<T> types which are also named structs but have special
+                // initialization semantics.
                 if (!is_struct_value_type && var_type->isStructTy())
                 {
                     auto *struct_type = llvm::cast<llvm::StructType>(var_type);
-                    is_struct_value_type = struct_type->hasName();
+                    if (struct_type->hasName())
+                    {
+                        llvm::StringRef struct_name = struct_type->getName();
+                        // Exclude Array<T> types - they use store, not memcpy
+                        if (!struct_name.starts_with("Array<"))
+                        {
+                            is_struct_value_type = true;
+                        }
+                    }
                 }
 
                 if (is_struct_value_type && var_type->isStructTy() && init_val->getType()->isPointerTy())
