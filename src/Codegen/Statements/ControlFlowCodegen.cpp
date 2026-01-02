@@ -865,51 +865,25 @@ namespace Cryo::Codegen
 
         std::string enum_name = enum_pattern->enum_name();
         std::string variant_name = enum_pattern->variant_name();
+        std::string qualified_variant = enum_name + "::" + variant_name;
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "Binding {} pattern variables for {}::{}", bound_vars.size(), enum_name, variant_name);
+                  "Binding {} pattern variables for {}", bound_vars.size(), qualified_variant);
 
-        // Look up the enum declaration from the symbol table to get field types
-        Cryo::Symbol *enum_symbol = symbols().lookup_symbol(enum_name);
-        if (!enum_symbol || !enum_symbol->node)
+        // Look up the variant field types from CodegenContext
+        const std::vector<std::string> *field_types = ctx().get_enum_variant_fields(qualified_variant);
+        if (!field_types)
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Cannot find enum symbol '{}' for pattern binding", enum_name);
+                     "Cannot find field types for enum variant '{}'", qualified_variant);
             return;
         }
 
-        auto *enum_decl = dynamic_cast<Cryo::EnumDeclarationNode *>(enum_symbol->node);
-        if (!enum_decl)
+        if (field_types->size() != bound_vars.size())
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Symbol '{}' is not an enum declaration", enum_name);
-            return;
-        }
-
-        // Find the variant in the enum declaration
-        Cryo::EnumVariantNode *variant_node = nullptr;
-        for (const auto &v : enum_decl->variants())
-        {
-            if (v->name() == variant_name)
-            {
-                variant_node = v.get();
-                break;
-            }
-        }
-
-        if (!variant_node)
-        {
-            LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Cannot find variant '{}' in enum '{}'", variant_name, enum_name);
-            return;
-        }
-
-        const auto &associated_types = variant_node->associated_types();
-        if (associated_types.size() != bound_vars.size())
-        {
-            LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Mismatch: {} bound variables but {} associated types",
-                     bound_vars.size(), associated_types.size());
+                     "Mismatch: {} bound variables but {} field types",
+                     bound_vars.size(), field_types->size());
         }
 
         // The value should be a tagged union struct
@@ -931,10 +905,10 @@ namespace Cryo::Codegen
 
         // Bind each variable by extracting from the payload
         size_t offset = 0;
-        for (size_t i = 0; i < bound_vars.size() && i < associated_types.size(); ++i)
+        for (size_t i = 0; i < bound_vars.size() && i < field_types->size(); ++i)
         {
             const std::string &var_name = bound_vars[i];
-            const std::string &type_name = associated_types[i];
+            const std::string &type_name = (*field_types)[i];
 
             // Get the LLVM type for this field
             llvm::Type *field_type = types().get_type(type_name);

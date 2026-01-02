@@ -313,6 +313,19 @@ namespace Cryo::Codegen
         /** @brief Register an enum variant constant */
         void register_enum_variant(const std::string &name, llvm::Value *value) { _enum_variants[name] = value; }
 
+        /** @brief Register enum variant field types (for pattern matching) */
+        void register_enum_variant_fields(const std::string &variant_name, const std::vector<std::string> &field_types)
+        {
+            _enum_variant_fields[variant_name] = field_types;
+        }
+
+        /** @brief Get enum variant field types */
+        const std::vector<std::string> *get_enum_variant_fields(const std::string &variant_name) const
+        {
+            auto it = _enum_variant_fields.find(variant_name);
+            return it != _enum_variant_fields.end() ? &it->second : nullptr;
+        }
+
         //===================================================================
         // Breakable Context Stack (loops, switch)
         //===================================================================
@@ -379,6 +392,7 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::GlobalVariable *> _globals;
         std::unordered_map<std::string, llvm::Type *> _global_types;
         std::unordered_map<std::string, llvm::Value *> _enum_variants;
+        std::unordered_map<std::string, std::vector<std::string>> _enum_variant_fields;
         std::unordered_map<std::string, Cryo::Type *> _variable_types;
 
         // Struct field index mapping: type_name -> (field_name -> field_index)
