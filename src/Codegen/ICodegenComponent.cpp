@@ -49,6 +49,14 @@ namespace Cryo::Codegen
             // Try context's function registry
             if (llvm::Function *fn = ctx().get_function(candidate))
             {
+                // Validate that the function is properly formed
+                if (fn->getName().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_function_by_name: Found '{}' in registry as '{}' but function has empty name, skipping",
+                              name, candidate);
+                    continue;
+                }
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_function_by_name: Found '{}' in registry as '{}'", name, candidate);
                 return fn;
