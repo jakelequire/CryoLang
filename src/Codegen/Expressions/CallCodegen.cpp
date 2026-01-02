@@ -1581,7 +1581,7 @@ namespace Cryo::Codegen
         for (const auto &candidate : candidates)
         {
             // First try TypeContext's enum type lookup (most reliable for enums)
-            Cryo::Type *enum_type = symbols().get_type_context()->lookup_enum_type(candidate);
+            Cryo::Type *enum_type = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(candidate);
             if (enum_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
