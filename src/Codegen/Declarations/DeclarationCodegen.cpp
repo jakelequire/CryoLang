@@ -376,8 +376,31 @@ namespace Cryo::Codegen
             llvm::Value *init_val = get_result();
             if (init_val)
             {
-                llvm::Value *cast_val = cast_if_needed(init_val, var_type);
-                create_store(cast_val, alloca);
+                // Special handling for struct types: if the initializer returns a pointer
+                // to a struct (e.g., from a struct literal), we need to memcpy instead of store
+                if (var_type->isStructTy() && init_val->getType()->isPointerTy())
+                {
+                    // The init_val is a pointer to the struct data, memcpy to our alloca
+                    auto &data_layout = module()->getDataLayout();
+                    uint64_t size = data_layout.getTypeAllocSize(var_type);
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Struct initialization via memcpy for '{}', size {} bytes",
+                              name, size);
+
+                    builder().CreateMemCpy(
+                        alloca,                                                    // dest
+                        llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // dest align
+                        init_val,                                                  // src
+                        llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // src align
+                        size                                                       // size
+                    );
+                }
+                else
+                {
+                    llvm::Value *cast_val = cast_if_needed(init_val, var_type);
+                    create_store(cast_val, alloca);
+                }
             }
         }
 
