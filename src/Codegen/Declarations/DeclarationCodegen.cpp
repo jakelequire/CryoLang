@@ -784,6 +784,16 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating enum: {}", name);
 
+        // Skip generic enum declarations - they should only be generated when instantiated
+        // with concrete type parameters. Generic enums like Option<T> will be codegen'd
+        // when monomorphized (e.g., Option<int>, Option<string>).
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Skipping generic enum '{}' - will be generated on instantiation", name);
+            return nullptr;
+        }
+
         // Check if this is a simple enum or complex enum with payloads
         bool is_simple = true;
         size_t max_payload_size = 0;
