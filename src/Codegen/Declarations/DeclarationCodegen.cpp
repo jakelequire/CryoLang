@@ -821,15 +821,32 @@ namespace Cryo::Codegen
         else
         {
             // Complex enums are tagged unions: { i32 discriminant, [payload_size x i8] }
-            llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
-            llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
+            // First check if there's an existing struct type with this name to avoid duplicates
+            llvm::StructType *enum_struct = llvm::StructType::getTypeByName(llvm_ctx(), name);
 
-            llvm::StructType *enum_struct = llvm::StructType::create(llvm_ctx(), name);
-            enum_struct->setBody({discriminant_type, payload_type}, false);
-            enum_type = enum_struct;
+            if (enum_struct && !enum_struct->isOpaque())
+            {
+                // Use existing type - it was already created (e.g., by TypeMapper)
+                enum_type = enum_struct;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Reusing existing tagged union for enum '{}'", name);
+            }
+            else
+            {
+                // Create new struct type
+                llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
+                llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
 
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Created tagged union for enum '{}': payload size = {} bytes", name, max_payload_size);
+                if (!enum_struct)
+                {
+                    enum_struct = llvm::StructType::create(llvm_ctx(), name);
+                }
+                enum_struct->setBody({discriminant_type, payload_type}, false);
+                enum_type = enum_struct;
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Created tagged union for enum '{}': payload size = {} bytes", name, max_payload_size);
+            }
         }
 
         // Register type
