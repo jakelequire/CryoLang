@@ -167,6 +167,9 @@ namespace Cryo::Codegen
                     fn_ctx->entry_block = entry;
                     ctx().set_current_function(std::move(fn_ctx));
 
+                    // Set current type name for this.field resolution
+                    ctx().set_current_type_name(mangled);
+
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
 
@@ -202,6 +205,7 @@ namespace Cryo::Codegen
                     // Clean up
                     values().exit_scope();
                     ctx().clear_current_function();
+                    ctx().set_current_type_name(""); // Clear current type
                     ctx().set_result(nullptr);
                 }
             }
@@ -342,6 +346,15 @@ namespace Cryo::Codegen
         ctx().register_type(mangled, class_type);
         types().register_struct(mangled, class_type);
 
+        // Register field names BEFORE generating methods so this.field accesses work
+        if (!field_names.empty())
+        {
+            ctx().register_struct_fields(mangled, field_names);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Pre-registered {} field names for class {} before method generation",
+                      field_names.size(), mangled);
+        }
+
         // Generate methods for the instantiated class while type params are still in scope
         if (class_decl && _declarations)
         {
@@ -370,6 +383,9 @@ namespace Cryo::Codegen
                     auto fn_ctx = std::make_unique<FunctionContext>(fn, method.get());
                     fn_ctx->entry_block = entry;
                     ctx().set_current_function(std::move(fn_ctx));
+
+                    // Set current type name for this.field resolution
+                    ctx().set_current_type_name(mangled);
 
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
@@ -406,6 +422,7 @@ namespace Cryo::Codegen
                     // Clean up
                     values().exit_scope();
                     ctx().clear_current_function();
+                    ctx().set_current_type_name(""); // Clear current type
                     ctx().set_result(nullptr);
                 }
             }
