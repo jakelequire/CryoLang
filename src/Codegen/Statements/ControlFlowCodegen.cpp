@@ -866,68 +866,86 @@ namespace Cryo::Codegen
         std::string enum_name = enum_pattern->enum_name();
         std::string variant_name = enum_pattern->variant_name();
 
-        // Get the enum type information from the type context
-        Cryo::Type *cryo_enum_type = symbols().get_type_context()->lookup_enum_type(enum_name);
-        if (!cryo_enum_type)
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "Binding {} pattern variables for {}::{}", bound_vars.size(), enum_name, variant_name);
+
+        // Look up the enum declaration from the symbol table to get field types
+        Cryo::Symbol *enum_symbol = symbols().lookup_symbol(enum_name);
+        if (!enum_symbol || !enum_symbol->node)
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Cannot find enum type '{}' for pattern binding", enum_name);
+                     "Cannot find enum symbol '{}' for pattern binding", enum_name);
             return;
         }
 
-        auto *enum_type = dynamic_cast<Cryo::EnumType *>(cryo_enum_type);
-        if (!enum_type)
+        auto *enum_decl = dynamic_cast<Cryo::EnumDeclarationNode *>(enum_symbol->node);
+        if (!enum_decl)
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Type '{}' is not an enum type", enum_name);
+                     "Symbol '{}' is not an enum declaration", enum_name);
             return;
         }
 
-        // Get variant metadata to find field types
-        const Cryo::EnumVariant *variant_info = enum_type->get_variant_info(variant_name);
-        if (!variant_info)
+        // Find the variant in the enum declaration
+        Cryo::EnumVariantNode *variant_node = nullptr;
+        for (const auto &v : enum_decl->variants())
+        {
+            if (v->name() == variant_name)
+            {
+                variant_node = v.get();
+                break;
+            }
+        }
+
+        if (!variant_node)
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Cannot find variant info for {}", variant_name);
+                     "Cannot find variant '{}' in enum '{}'", variant_name, enum_name);
             return;
+        }
+
+        const auto &associated_types = variant_node->associated_types();
+        if (associated_types.size() != bound_vars.size())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "Mismatch: {} bound variables but {} associated types",
+                     bound_vars.size(), associated_types.size());
         }
 
         // The value should be a tagged union struct
         if (!value->getType()->isStructTy())
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Expected struct type for enum pattern binding");
+                     "Expected struct type for enum pattern binding, got {}",
+                     value->getType()->isIntegerTy() ? "integer" : "other");
             return;
         }
 
-        // Extract the payload (field 1 of the struct)
-        llvm::Value *payload = builder().CreateExtractValue(value, 1, "payload");
+        // Allocate the enum value so we can get pointers into it
+        llvm::Type *struct_type = value->getType();
+        llvm::Value *value_alloca = builder().CreateAlloca(struct_type, nullptr, "enum_tmp");
+        builder().CreateStore(value, value_alloca);
+
+        // Get pointer to payload (field 1 of the struct)
+        llvm::Value *payload_ptr = builder().CreateStructGEP(struct_type, value_alloca, 1, "payload_ptr");
 
         // Bind each variable by extracting from the payload
         size_t offset = 0;
-        for (size_t i = 0; i < bound_vars.size() && i < variant_info->field_types.size(); ++i)
+        for (size_t i = 0; i < bound_vars.size() && i < associated_types.size(); ++i)
         {
             const std::string &var_name = bound_vars[i];
-            Cryo::Type *field_cryo_type = variant_info->field_types[i].get();
+            const std::string &type_name = associated_types[i];
 
             // Get the LLVM type for this field
-            llvm::Type *field_type = types().map(field_cryo_type);
+            llvm::Type *field_type = types().get_type(type_name);
             if (!field_type)
             {
                 LOG_WARN(Cryo::LogComponent::CODEGEN,
-                         "Unknown type for pattern variable '{}'", var_name);
+                         "Unknown type '{}' for pattern variable '{}'", type_name, var_name);
                 continue;
             }
 
-            // The payload is [N x i8], we need to extract from the right offset
-            // First get a pointer to the payload array
-            llvm::Type *struct_type = value->getType();
-            llvm::Value *value_alloca = builder().CreateAlloca(struct_type, nullptr, "enum_tmp");
-            builder().CreateStore(value, value_alloca);
-
-            llvm::Value *payload_ptr = builder().CreateStructGEP(struct_type, value_alloca, 1, "payload_ptr");
-
-            // Calculate field pointer with offset
+            // Calculate field pointer with offset into the payload byte array
             llvm::Value *field_ptr = builder().CreateConstGEP1_32(
                 llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, offset, "field_ptr");
 
@@ -943,9 +961,10 @@ namespace Cryo::Codegen
             values().set_value(var_name, field_value, var_alloca, field_type);
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Bound pattern variable '{}' from enum variant {}", var_name, variant_name);
+                      "Bound pattern variable '{}' (type: {}) from enum variant {}",
+                      var_name, type_name, variant_name);
 
-            // Advance offset
+            // Advance offset by the size of this field
             offset += module()->getDataLayout().getTypeAllocSize(field_type);
         }
     }
