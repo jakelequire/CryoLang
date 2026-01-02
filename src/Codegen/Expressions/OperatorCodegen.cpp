@@ -71,6 +71,32 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Check for string concatenation BEFORE classifying based on single operand type
+        // This handles cases like: char + string, string + char, string + string
+        if (op == TokenKind::TK_PLUS)
+        {
+            bool lhs_is_string = lhs->getType()->isPointerTy();
+            bool rhs_is_string = rhs->getType()->isPointerTy();
+            bool lhs_is_char = lhs->getType()->isIntegerTy() && !lhs->getType()->isIntegerTy(1);
+            bool rhs_is_char = rhs->getType()->isIntegerTy() && !rhs->getType()->isIntegerTy(1);
+
+            // string + string
+            if (lhs_is_string && rhs_is_string)
+            {
+                return generate_string_concat(lhs, rhs);
+            }
+            // string + char
+            if (lhs_is_string && rhs_is_char)
+            {
+                return generate_string_char_concat(lhs, rhs);
+            }
+            // char + string
+            if (lhs_is_char && rhs_is_string)
+            {
+                return generate_char_string_concat(lhs, rhs);
+            }
+        }
+
         // Classify and dispatch
         BinaryOpClass op_class = classify_binary_op(op, lhs->getType());
 
@@ -1443,10 +1469,67 @@ namespace Cryo::Codegen
         if (!chr || !str)
             return nullptr;
 
-        // Similar to string_char but with swapped semantics
-        // This would call a different runtime function
-        LOG_WARN(Cryo::LogComponent::CODEGEN, "char-string concatenation not fully implemented");
-        return generate_string_char_concat(str, chr); // Fallback
+        llvm::IRBuilder<> &b = builder();
+        llvm::LLVMContext &ctx = llvm_ctx();
+        llvm::Module *mod = module();
+
+        // Types we'll need
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(ctx);
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(ctx);
+        llvm::Type *ptr_type = llvm::PointerType::get(ctx, 0);
+
+        // Cast the character value to i8 if needed
+        if (chr->getType() != i8_type && chr->getType()->isIntegerTy())
+        {
+            chr = b.CreateTrunc(chr, i8_type, "tochar");
+        }
+
+        // Get or declare strlen
+        llvm::Function *strlen_fn = mod->getFunction("strlen");
+        if (!strlen_fn)
+        {
+            llvm::FunctionType *strlen_type = llvm::FunctionType::get(i64_type, {ptr_type}, false);
+            strlen_fn = llvm::Function::Create(strlen_type, llvm::Function::ExternalLinkage, "strlen", mod);
+        }
+
+        // Get or declare malloc
+        llvm::Function *malloc_fn = mod->getFunction("malloc");
+        if (!malloc_fn)
+        {
+            llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+            malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", mod);
+        }
+
+        // Get or declare memcpy
+        llvm::Function *memcpy_fn = mod->getFunction("memcpy");
+        if (!memcpy_fn)
+        {
+            llvm::FunctionType *memcpy_type = llvm::FunctionType::get(ptr_type, {ptr_type, ptr_type, i64_type}, false);
+            memcpy_fn = llvm::Function::Create(memcpy_type, llvm::Function::ExternalLinkage, "memcpy", mod);
+        }
+
+        // 1. Get the length of the original string
+        llvm::Value *str_len = b.CreateCall(strlen_fn, {str}, "str.len");
+
+        // 2. Allocate new memory: 1 (for char) + original_len + 1 (for null terminator)
+        llvm::Value *new_len = b.CreateAdd(str_len, llvm::ConstantInt::get(i64_type, 2), "new.len");
+        llvm::Value *new_str = b.CreateCall(malloc_fn, {new_len}, "new.str");
+
+        // 3. Store the character at position 0
+        b.CreateStore(chr, new_str);
+
+        // 4. Copy the original string starting at position 1
+        llvm::Value *str_pos = b.CreateGEP(i8_type, new_str, llvm::ConstantInt::get(i64_type, 1), "str.pos");
+        b.CreateCall(memcpy_fn, {str_pos, str, str_len});
+
+        // 5. Add null terminator at position str_len + 1
+        llvm::Value *null_pos = b.CreateGEP(i8_type, new_str,
+                                            b.CreateAdd(str_len, llvm::ConstantInt::get(i64_type, 1)),
+                                            "null.pos");
+        b.CreateStore(llvm::ConstantInt::get(i8_type, 0), null_pos);
+
+        // 6. Return the new string
+        return new_str;
     }
 
     //===================================================================
