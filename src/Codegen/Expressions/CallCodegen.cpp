@@ -1419,6 +1419,43 @@ namespace Cryo::Codegen
             return fn;
         }
 
+        // Handle stdlib String functions
+        if (name == "_int_to_string" || name == "String::_int_to_string" || name == "std::String::_int_to_string")
+        {
+            std::string qualified_name = "std::String::_int_to_string";
+            llvm::Function *fn = module()->getFunction(qualified_name);
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(ptr_type, {i32_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, qualified_name, module());
+            }
+            return fn;
+        }
+
+        if (name == "_float_to_string" || name == "String::_float_to_string" || name == "std::String::_float_to_string")
+        {
+            std::string qualified_name = "std::String::_float_to_string";
+            llvm::Function *fn = module()->getFunction(qualified_name);
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(ptr_type, {float_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, qualified_name, module());
+            }
+            return fn;
+        }
+
+        if (name == "from_char" || name == "String::from_char" || name == "std::String::from_char")
+        {
+            std::string qualified_name = "std::String::from_char";
+            llvm::Function *fn = module()->getFunction(qualified_name);
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(ptr_type, {llvm::Type::getInt8Ty(llvm_ctx())}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, qualified_name, module());
+            }
+            return fn;
+        }
+
         if (name == "sprintf")
         {
             llvm::Function *fn = module()->getFunction("sprintf");
