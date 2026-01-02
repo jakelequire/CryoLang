@@ -29,6 +29,13 @@ namespace Cryo::Codegen
                   "resolve_function_by_name: Looking for '{}', {} candidates generated",
                   name, candidates.size());
 
+        // Log all candidates for debugging
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_function_by_name: Candidate {}: '{}'", i, candidates[i]);
+        }
+
         for (const auto &candidate : candidates)
         {
             // Try LLVM module first
@@ -42,6 +49,14 @@ namespace Cryo::Codegen
             // Try context's function registry
             if (llvm::Function *fn = ctx().get_function(candidate))
             {
+                // Validate that the function is properly formed
+                if (fn->getName().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_function_by_name: Found '{}' in registry as '{}' but function has empty name, skipping",
+                              name, candidate);
+                    continue;
+                }
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_function_by_name: Found '{}' in registry as '{}'", name, candidate);
                 return fn;

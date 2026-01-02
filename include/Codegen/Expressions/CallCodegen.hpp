@@ -356,6 +356,18 @@ namespace Cryo::Codegen
          */
         llvm::Function *get_or_create_c_function(const std::string &name);
 
+        /**
+         * @brief Create forward declaration for a function from symbol table lookup
+         *
+         * Looks up the function in the symbol table using SRM candidates (including
+         * imported namespaces) and creates an LLVM function declaration if found.
+         * This handles imported stdlib functions that aren't in the LLVM module yet.
+         *
+         * @param name Function name (may be unqualified)
+         * @return Function declaration, or nullptr if not found in symbol table
+         */
+        llvm::Function *create_forward_declaration_from_symbol(const std::string &name);
+
         // Static sets for type checking
         static const std::unordered_set<std::string> _primitive_types;
         static const std::unordered_set<std::string> _runtime_functions;

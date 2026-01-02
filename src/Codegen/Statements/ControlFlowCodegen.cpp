@@ -572,12 +572,30 @@ namespace Cryo::Codegen
         {
             auto *case_node = node->cases()[i].get();
             if (!case_node || !case_node->value())
+            {
+                // Skip cases without values (like default), but ensure current block has terminator
+                // This can happen if previous iteration set insert point to a "next" block
+                llvm::BasicBlock *current = builder().GetInsertBlock();
+                if (current && !current->getTerminator())
+                {
+                    // Branch to default block - we'll continue checking remaining cases
+                    builder().CreateBr(default_block);
+                }
                 continue;
+            }
 
             // Generate case value (string)
             llvm::Value *case_val = generate_expression(case_node->value());
             if (!case_val)
+            {
+                // Same fix for failed expression generation
+                llvm::BasicBlock *current = builder().GetInsertBlock();
+                if (current && !current->getTerminator())
+                {
+                    builder().CreateBr(default_block);
+                }
                 continue;
+            }
 
             // Compare strings
             llvm::Value *cmp_result = builder().CreateCall(strcmp_fn, {switch_value, case_val}, "strcmp.result");
