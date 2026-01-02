@@ -1560,12 +1560,29 @@ namespace Cryo::Codegen
 
     bool CallCodegen::is_enum_type(const std::string &name) const
     {
-        // Check symbol table for enum
-        Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(name);
-        if (sym && sym->kind == SymbolKind::Type && sym->data_type)
+        // Use SRM to generate type candidates and check if any is an enum type
+        auto &non_const_ctx = const_cast<CodegenContext &>(ctx());
+        auto candidates = non_const_ctx.srm().generate_lookup_candidates(name, Cryo::SymbolKind::Type);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "is_enum_type: Checking '{}' with {} candidates", name, candidates.size());
+
+        for (const auto &candidate : candidates)
         {
-            return sym->data_type->kind() == TypeKind::Enum;
+            // Check symbol table for enum type
+            Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(candidate);
+            if (sym && sym->kind == SymbolKind::Type && sym->data_type)
+            {
+                if (sym->data_type->kind() == TypeKind::Enum)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "is_enum_type: Found '{}' as enum type via '{}'", name, candidate);
+                    return true;
+                }
+            }
         }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "is_enum_type: '{}' not found as enum type", name);
         return false;
     }
 
