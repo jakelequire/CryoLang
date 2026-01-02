@@ -670,7 +670,9 @@ namespace Cryo::Codegen
         NodeTracker tracker(*_ctx, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting EnumDeclarationNode: {}", node.name());
 
-        _types->generate_enum(&node);
+        // Use DeclarationCodegen which properly handles complex enums with payloads
+        // (generates tagged union types, constructor functions, and registers field types)
+        _declarations->generate_enum_declaration(&node);
     }
 
     void CodegenVisitor::visit(Cryo::EnumVariantNode &node)
