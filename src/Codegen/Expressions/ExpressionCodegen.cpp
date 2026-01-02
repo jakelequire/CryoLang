@@ -2093,9 +2093,38 @@ namespace Cryo::Codegen
         // If there are constructor arguments, call constructor
         if (!node->arguments().empty())
         {
-            // Look up the constructor for the type
-            std::string ctor_name = type_name_for_alloc + "::" + node->type_name();
-            llvm::Function *ctor_fn = module()->getFunction(ctor_name);
+            // Look up the constructor using multiple patterns (consistent with CallCodegen)
+            llvm::Function *ctor_fn = nullptr;
+
+            // Try various constructor name patterns
+            std::vector<std::string> ctor_patterns = {
+                type_name_for_alloc + "::" + node->type_name(),  // Point::Point
+                type_name_for_alloc + "::init",                   // Point::init
+                type_name_for_alloc + "::new",                    // Point::new
+                node->type_name() + "::" + node->type_name(),    // Also try simple name
+            };
+
+            for (const auto &ctor_name : ctor_patterns)
+            {
+                ctor_fn = module()->getFunction(ctor_name);
+                if (ctor_fn)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_new: Found constructor '{}' for type {}",
+                              ctor_name, type_name_for_alloc);
+                    break;
+                }
+                // Also try context's function registry
+                ctor_fn = ctx().get_function(ctor_name);
+                if (ctor_fn)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_new: Found constructor '{}' in registry for type {}",
+                              ctor_name, type_name_for_alloc);
+                    break;
+                }
+            }
+
             if (ctor_fn)
             {
                 std::vector<llvm::Value *> ctor_args;
@@ -2110,6 +2139,12 @@ namespace Cryo::Codegen
                 }
 
                 builder().CreateCall(ctor_fn, ctor_args);
+            }
+            else
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "generate_new: No constructor found for type '{}', memory will be uninitialized",
+                         type_name_for_alloc);
             }
         }
 
