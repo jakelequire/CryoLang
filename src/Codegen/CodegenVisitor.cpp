@@ -13,6 +13,7 @@
 #include "Codegen/Declarations/DeclarationCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
+#include "AST/TypeChecker.hpp"
 
 #include "Utils/Logger.hpp"
 
@@ -864,17 +865,17 @@ namespace Cryo::Codegen
     {
         NodeTracker tracker(*_ctx, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                 "=== EXPR STMT DEBUG: Visiting ExpressionStatementNode");
+                  "=== EXPR STMT DEBUG: Visiting ExpressionStatementNode");
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ExpressionStatementNode");
 
         // Generate expression for side effects
         if (node.expression())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "=== EXPR STMT DEBUG: Processing expression in statement");
+                      "=== EXPR STMT DEBUG: Processing expression in statement");
             node.expression()->accept(*this);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "=== EXPR STMT DEBUG: Finished processing expression");
+                      "=== EXPR STMT DEBUG: Finished processing expression");
 
             // Clear the result - expression statements discard their value
             // This prevents lingering results from affecting subsequent operations
@@ -883,7 +884,7 @@ namespace Cryo::Codegen
         else
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "=== EXPR STMT DEBUG: No expression in statement!");
+                      "=== EXPR STMT DEBUG: No expression in statement!");
         }
     }
 
@@ -955,23 +956,23 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::BinaryExpressionNode &node)
     {
         NodeTracker tracker(*_ctx, &node);
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, 
-                 "=== BINARY EXPR DEBUG: Visiting BinaryExpressionNode, operator: {}", 
-                 static_cast<int>(node.operator_token().kind()));
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                  "=== BINARY EXPR DEBUG: Visiting BinaryExpressionNode, operator: {}",
+                  static_cast<int>(node.operator_token().kind()));
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting BinaryExpressionNode");
 
         llvm::Value *result = _operators->generate_binary(&node);
         if (result)
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, 
-                     "=== BINARY EXPR DEBUG: Generated binary result successfully");
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "=== BINARY EXPR DEBUG: Generated binary result successfully");
             _ctx->set_result(result);
             _ctx->register_value(&node, result);
         }
         else
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, 
-                     "=== BINARY EXPR DEBUG: Binary generation returned null!");
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "=== BINARY EXPR DEBUG: Binary generation returned null!");
         }
     }
 
@@ -1243,6 +1244,11 @@ namespace Cryo::Codegen
     Cryo::SRM::SymbolResolutionContext *CodegenVisitor::get_srm_context() const
     {
         return &_ctx->srm_context();
+    }
+
+    GenericCodegen *CodegenVisitor::get_generics() const
+    {
+        return _generics.get();
     }
 
 } // namespace Cryo::Codegen
