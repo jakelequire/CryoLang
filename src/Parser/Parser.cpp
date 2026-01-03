@@ -5142,6 +5142,7 @@ namespace Cryo
         while (is_type_token() ||
                _current_token.is(TokenKind::TK_L_ANGLE) ||
                _current_token.is(TokenKind::TK_R_ANGLE) ||
+               _current_token.is(TokenKind::TK_GREATERGREATER) || // Handle >> in nested generics
                _current_token.is(TokenKind::TK_L_SQUARE) ||
                _current_token.is(TokenKind::TK_R_SQUARE) ||
                _current_token.is(TokenKind::TK_NUMERIC_CONSTANT) ||
@@ -5161,6 +5162,11 @@ namespace Cryo
             else if (_current_token.is(TokenKind::TK_R_ANGLE))
             {
                 angle_bracket_depth--;
+            }
+            else if (_current_token.is(TokenKind::TK_GREATERGREATER))
+            {
+                // >> represents two closing angle brackets in generic types
+                angle_bracket_depth -= 2;
             }
 
             LOG_DEBUG(LogComponent::PARSER, "Collecting token: {} ({})",
