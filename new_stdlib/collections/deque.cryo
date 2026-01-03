@@ -1,0 +1,630 @@
+///! Deque - Double-Ended Queue
+///!
+///! A double-ended queue implemented with a growable ring buffer.
+///! Provides O(1) push and pop at both ends.
+
+namespace std::collections::deque;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+
+// ============================================================================
+// Deque
+// ============================================================================
+
+/// A double-ended queue implemented as a ring buffer.
+type struct Deque<T> {
+    /// Pointer to the buffer.
+    buf: T*;
+    /// Index of the first element.
+    head: u64;
+    /// Number of elements.
+    len: u64;
+    /// Capacity of the buffer.
+    cap: u64;
+}
+
+implement struct Deque<T> {
+    /// Creates a new empty Deque.
+    static function new() -> Deque<T> {
+        return Deque {
+            buf: null,
+            head: 0,
+            len: 0,
+            cap: 0
+        };
+    }
+
+    /// Creates a Deque with the specified capacity.
+    static function with_capacity(capacity: u64) -> Deque<T> {
+        if (capacity == 0) {
+            return Deque::new();
+        }
+
+        // Round up to power of 2 for efficient modulo
+        mut actual_cap: u64 = 1;
+        while (actual_cap < capacity) {
+            actual_cap = actual_cap * 2;
+        }
+
+        const buf: T* = malloc(sizeof(T) * actual_cap);
+        if (buf == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        return Deque {
+            buf: buf,
+            head: 0,
+            len: 0,
+            cap: actual_cap
+        };
+    }
+
+    // ========================================================================
+    // Capacity
+    // ========================================================================
+
+    /// Returns the number of elements.
+    function len(self) -> u64 {
+        return self.len;
+    }
+
+    /// Returns the capacity.
+    function capacity(self) -> u64 {
+        return self.cap;
+    }
+
+    /// Returns true if the deque is empty.
+    function is_empty(self) -> boolean {
+        return self.len == 0;
+    }
+
+    /// Returns true if the deque is full.
+    function is_full(self) -> boolean {
+        return self.len == self.cap;
+    }
+
+    /// Reserves capacity for at least `additional` more elements.
+    function reserve(self: &mut Deque<T>, additional: u64) -> void {
+        const required: u64 = self.len + additional;
+        if (required <= self.cap) {
+            return;
+        }
+
+        mut new_cap: u64 = self.cap;
+        if (new_cap == 0) {
+            new_cap = 4;
+        }
+        while (new_cap < required) {
+            new_cap = new_cap * 2;
+        }
+
+        self.grow(new_cap);
+    }
+
+    /// Shrinks the capacity to fit.
+    function shrink_to_fit(self: &mut Deque<T>) -> void {
+        if (self.len == 0) {
+            if (self.buf != null) {
+                free(self.buf);
+                self.buf = null;
+                self.cap = 0;
+            }
+            return;
+        }
+
+        // Round up to power of 2
+        mut new_cap: u64 = 1;
+        while (new_cap < self.len) {
+            new_cap = new_cap * 2;
+        }
+
+        if (new_cap < self.cap) {
+            self.grow(new_cap);
+        }
+    }
+
+    // ========================================================================
+    // Access
+    // ========================================================================
+
+    /// Returns the front element.
+    function front(self) -> Option<T> {
+        if (self.len == 0) {
+            return Option::None;
+        }
+        return Option::Some(self.buf[self.head]);
+    }
+
+    /// Returns a reference to the front element.
+    function front_ref(self) -> T* {
+        if (self.len == 0) {
+            return null;
+        }
+        return &self.buf[self.head];
+    }
+
+    /// Returns the back element.
+    function back(self) -> Option<T> {
+        if (self.len == 0) {
+            return Option::None;
+        }
+        return Option::Some(self.buf[self.wrap_index(self.head + self.len - 1)]);
+    }
+
+    /// Returns a reference to the back element.
+    function back_ref(self) -> T* {
+        if (self.len == 0) {
+            return null;
+        }
+        return &self.buf[self.wrap_index(self.head + self.len - 1)];
+    }
+
+    /// Gets an element at the given index.
+    function get(self, index: u64) -> Option<T> {
+        if (index >= self.len) {
+            return Option::None;
+        }
+        return Option::Some(self.buf[self.wrap_index(self.head + index)]);
+    }
+
+    /// Gets a reference to an element at the given index.
+    function get_ref(self, index: u64) -> T* {
+        if (index >= self.len) {
+            return null;
+        }
+        return &self.buf[self.wrap_index(self.head + index)];
+    }
+
+    /// Sets an element at the given index.
+    function set(self: &mut Deque<T>, index: u64, value: T) -> void {
+        if (index >= self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+        self.buf[self.wrap_index(self.head + index)] = value;
+    }
+
+    // ========================================================================
+    // Modification - Front
+    // ========================================================================
+
+    /// Pushes a value to the front.
+    function push_front(self: &mut Deque<T>, value: T) -> void {
+        if (self.len == self.cap) {
+            self.reserve(1);
+        }
+
+        // Move head backwards
+        if (self.head == 0) {
+            self.head = self.cap - 1;
+        } else {
+            self.head = self.head - 1;
+        }
+
+        self.buf[self.head] = value;
+        self.len = self.len + 1;
+    }
+
+    /// Pops a value from the front.
+    function pop_front(self: &mut Deque<T>) -> Option<T> {
+        if (self.len == 0) {
+            return Option::None;
+        }
+
+        const value: T = self.buf[self.head];
+        self.head = self.wrap_index(self.head + 1);
+        self.len = self.len - 1;
+
+        return Option::Some(value);
+    }
+
+    // ========================================================================
+    // Modification - Back
+    // ========================================================================
+
+    /// Pushes a value to the back.
+    function push_back(self: &mut Deque<T>, value: T) -> void {
+        if (self.len == self.cap) {
+            self.reserve(1);
+        }
+
+        const tail: u64 = self.wrap_index(self.head + self.len);
+        self.buf[tail] = value;
+        self.len = self.len + 1;
+    }
+
+    /// Pops a value from the back.
+    function pop_back(self: &mut Deque<T>) -> Option<T> {
+        if (self.len == 0) {
+            return Option::None;
+        }
+
+        self.len = self.len - 1;
+        const tail: u64 = self.wrap_index(self.head + self.len);
+        return Option::Some(self.buf[tail]);
+    }
+
+    // ========================================================================
+    // Modification - Indexed
+    // ========================================================================
+
+    /// Inserts a value at the given index.
+    function insert(self: &mut Deque<T>, index: u64, value: T) -> void {
+        if (index > self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        if (self.len == self.cap) {
+            self.reserve(1);
+        }
+
+        if (index == 0) {
+            self.push_front(value);
+            return;
+        }
+
+        if (index == self.len) {
+            self.push_back(value);
+            return;
+        }
+
+        // Decide whether to shift front or back portion
+        if (index < self.len / 2) {
+            // Shift front portion left
+            if (self.head == 0) {
+                self.head = self.cap - 1;
+            } else {
+                self.head = self.head - 1;
+            }
+
+            // Shift elements
+            mut i: u64 = 0;
+            while (i < index) {
+                const from: u64 = self.wrap_index(self.head + i + 1);
+                const to: u64 = self.wrap_index(self.head + i);
+                self.buf[to] = self.buf[from];
+                i = i + 1;
+            }
+        } else {
+            // Shift back portion right
+            mut i: u64 = self.len;
+            while (i > index) {
+                const from: u64 = self.wrap_index(self.head + i - 1);
+                const to: u64 = self.wrap_index(self.head + i);
+                self.buf[to] = self.buf[from];
+                i = i - 1;
+            }
+        }
+
+        self.buf[self.wrap_index(self.head + index)] = value;
+        self.len = self.len + 1;
+    }
+
+    /// Removes the element at the given index.
+    function remove(self: &mut Deque<T>, index: u64) -> T {
+        if (index >= self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const value: T = self.buf[self.wrap_index(self.head + index)];
+
+        if (index == 0) {
+            self.head = self.wrap_index(self.head + 1);
+        } else if (index < self.len / 2) {
+            // Shift front portion right
+            mut i: u64 = index;
+            while (i > 0) {
+                const from: u64 = self.wrap_index(self.head + i - 1);
+                const to: u64 = self.wrap_index(self.head + i);
+                self.buf[to] = self.buf[from];
+                i = i - 1;
+            }
+            self.head = self.wrap_index(self.head + 1);
+        } else {
+            // Shift back portion left
+            mut i: u64 = index;
+            while (i < self.len - 1) {
+                const from: u64 = self.wrap_index(self.head + i + 1);
+                const to: u64 = self.wrap_index(self.head + i);
+                self.buf[to] = self.buf[from];
+                i = i + 1;
+            }
+        }
+
+        self.len = self.len - 1;
+        return value;
+    }
+
+    /// Swap-removes the element at the given index.
+    function swap_remove_front(self: &mut Deque<T>, index: u64) -> T {
+        if (index >= self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const value: T = self.buf[self.wrap_index(self.head + index)];
+
+        if (index != 0) {
+            self.swap(0, index);
+        }
+
+        self.head = self.wrap_index(self.head + 1);
+        self.len = self.len - 1;
+
+        return value;
+    }
+
+    /// Swap-removes the element at the given index (back variant).
+    function swap_remove_back(self: &mut Deque<T>, index: u64) -> T {
+        if (index >= self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const value: T = self.buf[self.wrap_index(self.head + index)];
+
+        if (index != self.len - 1) {
+            self.swap(index, self.len - 1);
+        }
+
+        self.len = self.len - 1;
+
+        return value;
+    }
+
+    // ========================================================================
+    // Bulk Operations
+    // ========================================================================
+
+    /// Clears the deque.
+    function clear(self: &mut Deque<T>) -> void {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    /// Rotates the deque left by n positions.
+    function rotate_left(self: &mut Deque<T>, n: u64) -> void {
+        if (self.len <= 1 || n == 0) {
+            return;
+        }
+
+        const k: u64 = n % self.len;
+        self.head = self.wrap_index(self.head + k);
+    }
+
+    /// Rotates the deque right by n positions.
+    function rotate_right(self: &mut Deque<T>, n: u64) -> void {
+        if (self.len <= 1 || n == 0) {
+            return;
+        }
+
+        const k: u64 = n % self.len;
+        if (self.head >= k) {
+            self.head = self.head - k;
+        } else {
+            self.head = self.cap - (k - self.head);
+        }
+    }
+
+    /// Swaps two elements.
+    function swap(self: &mut Deque<T>, a: u64, b: u64) -> void {
+        if (a >= self.len || b >= self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const idx_a: u64 = self.wrap_index(self.head + a);
+        const idx_b: u64 = self.wrap_index(self.head + b);
+
+        const temp: T = self.buf[idx_a];
+        self.buf[idx_a] = self.buf[idx_b];
+        self.buf[idx_b] = temp;
+    }
+
+    // ========================================================================
+    // Searching
+    // ========================================================================
+
+    /// Returns true if the deque contains the value.
+    function contains(self, value: T) -> boolean {
+        return self.find(value).is_some();
+    }
+
+    /// Finds the index of the first occurrence.
+    function find(self, value: T) -> Option<u64> {
+        mut i: u64 = 0;
+        while (i < self.len) {
+            if (self.buf[self.wrap_index(self.head + i)] == value) {
+                return Option::Some(i);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    // ========================================================================
+    // Iteration
+    // ========================================================================
+
+    /// Creates an iterator over the deque.
+    function iter(self) -> DequeIter<T> {
+        return DequeIter {
+            deque: &self,
+            current: 0
+        };
+    }
+
+    // ========================================================================
+    // Internal Helpers
+    // ========================================================================
+
+    /// Wraps an index within the buffer bounds.
+    function wrap_index(self, index: u64) -> u64 {
+        if (self.cap == 0) {
+            return 0;
+        }
+        // Using bitwise AND since capacity is always power of 2
+        return index & (self.cap - 1);
+    }
+
+    /// Grows the buffer to the new capacity.
+    function grow(self: &mut Deque<T>, new_cap: u64) -> void {
+        const new_buf: T* = malloc(sizeof(T) * new_cap);
+        if (new_buf == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        // Copy elements in order
+        if (self.len > 0) {
+            const tail: u64 = self.wrap_index(self.head + self.len);
+
+            if (self.head < tail) {
+                // Elements are contiguous
+                memcpy(new_buf, &self.buf[self.head], sizeof(T) * self.len);
+            } else {
+                // Elements wrap around
+                const first_part: u64 = self.cap - self.head;
+                memcpy(new_buf, &self.buf[self.head], sizeof(T) * first_part);
+                memcpy(&new_buf[first_part], self.buf, sizeof(T) * tail);
+            }
+        }
+
+        if (self.buf != null) {
+            free(self.buf);
+        }
+
+        self.buf = new_buf;
+        self.head = 0;
+        self.cap = new_cap;
+    }
+
+    // ========================================================================
+    // Memory Management
+    // ========================================================================
+
+    /// Drops the deque.
+    function drop(self) -> void {
+        if (self.buf != null) {
+            free(self.buf);
+        }
+    }
+
+    /// Clones the deque.
+    function clone(self) -> Deque<T> {
+        if (self.len == 0) {
+            return Deque::new();
+        }
+
+        const result: Deque<T> = Deque::with_capacity(self.len);
+
+        mut i: u64 = 0;
+        while (i < self.len) {
+            result.push_back(self.buf[self.wrap_index(self.head + i)]);
+            i = i + 1;
+        }
+
+        return result;
+    }
+
+    /// Converts to a contiguous Vec-like layout.
+    function make_contiguous(self: &mut Deque<T>) -> T* {
+        if (self.len == 0) {
+            return self.buf;
+        }
+
+        const tail: u64 = self.wrap_index(self.head + self.len);
+
+        if (self.head < tail || self.head == 0) {
+            // Already contiguous
+            return &self.buf[self.head];
+        }
+
+        // Need to make contiguous
+        self.grow(self.cap);
+        return self.buf;
+    }
+}
+
+// ============================================================================
+// Iterator
+// ============================================================================
+
+/// Iterator over a Deque.
+type struct DequeIter<T> {
+    deque: Deque<T>*;
+    current: u64;
+}
+
+implement struct DequeIter<T> {
+    function has_next(self) -> boolean {
+        return self.current < self.deque.len;
+    }
+
+    function next(self: &mut DequeIter<T>) -> Option<T> {
+        if (self.current >= self.deque.len) {
+            return Option::None;
+        }
+
+        const index: u64 = self.deque.wrap_index(self.deque.head + self.current);
+        const value: T = self.deque.buf[index];
+        self.current = self.current + 1;
+        return Option::Some(value);
+    }
+
+    function remaining(self) -> u64 {
+        return self.deque.len - self.current;
+    }
+}
+
+// ============================================================================
+// Stack Interface
+// ============================================================================
+
+/// Uses the deque as a stack (LIFO).
+implement struct Deque<T> {
+    /// Pushes to the stack (alias for push_back).
+    function push(self: &mut Deque<T>, value: T) -> void {
+        self.push_back(value);
+    }
+
+    /// Pops from the stack (alias for pop_back).
+    function pop(self: &mut Deque<T>) -> Option<T> {
+        return self.pop_back();
+    }
+
+    /// Peeks at the top of the stack.
+    function peek(self) -> Option<T> {
+        return self.back();
+    }
+}
+
+// ============================================================================
+// Queue Interface
+// ============================================================================
+
+/// Uses the deque as a queue (FIFO).
+implement struct Deque<T> {
+    /// Enqueues a value (alias for push_back).
+    function enqueue(self: &mut Deque<T>, value: T) -> void {
+        self.push_back(value);
+    }
+
+    /// Dequeues a value (alias for pop_front).
+    function dequeue(self: &mut Deque<T>) -> Option<T> {
+        return self.pop_front();
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a new empty Deque.
+function deque<T>() -> Deque<T> {
+    return Deque::new();
+}
+
+/// Creates a Deque with capacity.
+function deque_with_capacity<T>(capacity: u64) -> Deque<T> {
+    return Deque::with_capacity(capacity);
+}
+

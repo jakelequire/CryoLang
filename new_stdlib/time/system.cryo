@@ -1,0 +1,721 @@
+///! System Time - Wall Clock Time
+///!
+///! System time for wall-clock time and calendar operations.
+
+namespace std::time::system;
+
+import <core/intrinsics>;
+import <core/option>;
+import <time/duration>;
+
+// ============================================================================
+// SystemTime
+// ============================================================================
+
+/// A measurement of the system clock.
+///
+/// Unlike `Instant`, this time can go backwards (e.g., due to NTP adjustments).
+type struct SystemTime {
+    secs: u64;
+    nanos: u32;
+}
+
+implement struct SystemTime {
+    /// The UNIX epoch (1970-01-01 00:00:00 UTC).
+    static function unix_epoch() -> SystemTime {
+        return SystemTime { secs: 0, nanos: 0 };
+    }
+
+    /// Returns the current system time.
+    static function now() -> SystemTime {
+        mut ts: timespec;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return SystemTime {
+            secs: ts.tv_sec as u64,
+            nanos: ts.tv_nsec as u32
+        };
+    }
+
+    /// Creates a SystemTime from seconds since UNIX epoch.
+    static function from_unix_secs(secs: u64) -> SystemTime {
+        return SystemTime { secs: secs, nanos: 0 };
+    }
+
+    /// Creates a SystemTime from seconds and nanoseconds since UNIX epoch.
+    static function from_unix(secs: u64, nanos: u32) -> SystemTime {
+        return SystemTime { secs: secs, nanos: nanos };
+    }
+
+    /// Returns the duration since the UNIX epoch.
+    function duration_since_epoch(self) -> Duration {
+        return Duration::new(self.secs, self.nanos);
+    }
+
+    /// Returns the duration since another SystemTime.
+    function duration_since(self, earlier: SystemTime) -> Result<Duration, SystemTimeError> {
+        if (earlier.secs > self.secs) {
+            return Result::Err(SystemTimeError { duration: earlier.duration_since_epoch().sub(self.duration_since_epoch()) });
+        }
+        if (earlier.secs == self.secs && earlier.nanos > self.nanos) {
+            return Result::Err(SystemTimeError { duration: Duration::new(0, earlier.nanos - self.nanos) });
+        }
+
+        mut secs: u64 = self.secs - earlier.secs;
+        mut nanos: i64 = (self.nanos as i64) - (earlier.nanos as i64);
+
+        if (nanos < 0) {
+            secs = secs - 1;
+            nanos = nanos + 1_000_000_000;
+        }
+
+        return Result::Ok(Duration::new(secs, nanos as u32));
+    }
+
+    /// Returns the elapsed time since this SystemTime.
+    function elapsed(self) -> Result<Duration, SystemTimeError> {
+        return SystemTime::now().duration_since(self);
+    }
+
+    /// Adds a duration to this SystemTime.
+    function add(self, duration: Duration) -> SystemTime {
+        mut total_nanos: u64 = (self.nanos as u64) + (duration.subsec_nanos() as u64);
+        const extra_secs: u64 = total_nanos / 1_000_000_000;
+        total_nanos = total_nanos % 1_000_000_000;
+
+        return SystemTime {
+            secs: self.secs + duration.as_secs() + extra_secs,
+            nanos: total_nanos as u32
+        };
+    }
+
+    /// Checked addition.
+    function checked_add(self, duration: Duration) -> Option<SystemTime> {
+        mut total_nanos: u64 = (self.nanos as u64) + (duration.subsec_nanos() as u64);
+        const extra_secs: u64 = total_nanos / 1_000_000_000;
+        total_nanos = total_nanos % 1_000_000_000;
+
+        const max_u64: u64 = 18446744073709551615;
+        if (self.secs > max_u64 - duration.as_secs() - extra_secs) {
+            return Option::None;
+        }
+
+        return Option::Some(SystemTime {
+            secs: self.secs + duration.as_secs() + extra_secs,
+            nanos: total_nanos as u32
+        });
+    }
+
+    /// Subtracts a duration from this SystemTime.
+    function sub(self, duration: Duration) -> SystemTime {
+        mut secs: u64 = self.secs - duration.as_secs();
+        mut nanos: i64 = (self.nanos as i64) - (duration.subsec_nanos() as i64);
+
+        if (nanos < 0) {
+            secs = secs - 1;
+            nanos = nanos + 1_000_000_000;
+        }
+
+        return SystemTime {
+            secs: secs,
+            nanos: nanos as u32
+        };
+    }
+
+    /// Checked subtraction.
+    function checked_sub(self, duration: Duration) -> Option<SystemTime> {
+        if (duration.as_secs() > self.secs) {
+            return Option::None;
+        }
+        if (duration.as_secs() == self.secs && duration.subsec_nanos() > self.nanos) {
+            return Option::None;
+        }
+
+        return Option::Some(self.sub(duration));
+    }
+
+    /// Compares two SystemTimes.
+    function cmp(self, other: SystemTime) -> i32 {
+        if (self.secs < other.secs) {
+            return -1;
+        }
+        if (self.secs > other.secs) {
+            return 1;
+        }
+        if (self.nanos < other.nanos) {
+            return -1;
+        }
+        if (self.nanos > other.nanos) {
+            return 1;
+        }
+        return 0;
+    }
+
+    /// Returns true if self is before other.
+    function lt(self, other: SystemTime) -> boolean {
+        return self.cmp(other) < 0;
+    }
+
+    /// Returns true if self is before or equal to other.
+    function le(self, other: SystemTime) -> boolean {
+        return self.cmp(other) <= 0;
+    }
+
+    /// Returns true if self is after other.
+    function gt(self, other: SystemTime) -> boolean {
+        return self.cmp(other) > 0;
+    }
+
+    /// Returns true if self is after or equal to other.
+    function ge(self, other: SystemTime) -> boolean {
+        return self.cmp(other) >= 0;
+    }
+
+    /// Returns true if times are equal.
+    function eq(self, other: SystemTime) -> boolean {
+        return self.secs == other.secs && self.nanos == other.nanos;
+    }
+
+    /// Returns seconds since UNIX epoch.
+    function as_unix_secs(self) -> u64 {
+        return self.secs;
+    }
+
+    /// Returns nanoseconds component.
+    function subsec_nanos(self) -> u32 {
+        return self.nanos;
+    }
+}
+
+/// Error when computing duration between SystemTimes.
+type struct SystemTimeError {
+    duration: Duration;
+}
+
+implement struct SystemTimeError {
+    /// Returns the positive duration that the second time is ahead.
+    function duration(self) -> Duration {
+        return self.duration;
+    }
+}
+
+// ============================================================================
+// DateTime (UTC)
+// ============================================================================
+
+/// A date and time in UTC.
+type struct DateTime {
+    year: i32;
+    month: u8;      // 1-12
+    day: u8;        // 1-31
+    hour: u8;       // 0-23
+    minute: u8;     // 0-59
+    second: u8;     // 0-59
+    nanosecond: u32;
+}
+
+implement struct DateTime {
+    /// Creates a DateTime from components.
+    static function new(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> DateTime {
+        return DateTime {
+            year: year,
+            month: month,
+            day: day,
+            hour: hour,
+            minute: minute,
+            second: second,
+            nanosecond: 0
+        };
+    }
+
+    /// Creates a DateTime with nanoseconds.
+    static function with_nanos(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32) -> DateTime {
+        return DateTime {
+            year: year,
+            month: month,
+            day: day,
+            hour: hour,
+            minute: minute,
+            second: second,
+            nanosecond: nanos
+        };
+    }
+
+    /// Returns the current UTC date and time.
+    static function now() -> DateTime {
+        const time: SystemTime = SystemTime::now();
+        return DateTime::from_system_time(time);
+    }
+
+    /// Creates a DateTime from a SystemTime.
+    static function from_system_time(time: SystemTime) -> DateTime {
+        mut secs: u64 = time.secs;
+
+        // Calculate time components
+        const secs_per_day: u64 = 86400;
+        const secs_per_hour: u64 = 3600;
+        const secs_per_minute: u64 = 60;
+
+        mut days: u64 = secs / secs_per_day;
+        secs = secs % secs_per_day;
+
+        const hour: u8 = (secs / secs_per_hour) as u8;
+        secs = secs % secs_per_hour;
+
+        const minute: u8 = (secs / secs_per_minute) as u8;
+        const second: u8 = (secs % secs_per_minute) as u8;
+
+        // Calculate date from days since epoch (1970-01-01)
+        // Using a simplified algorithm
+        mut year: i32 = 1970;
+        mut remaining_days: u64 = days;
+
+        // Fast forward by years
+        loop {
+            const days_in_year: u64 = if (is_leap_year(year)) { 366 } else { 365 };
+            if (remaining_days < days_in_year) {
+                break;
+            }
+            remaining_days = remaining_days - days_in_year;
+            year = year + 1;
+        }
+
+        // Calculate month and day
+        mut month: u8 = 1;
+        loop {
+            const days_in_month: u64 = days_in_month_for(year, month) as u64;
+            if (remaining_days < days_in_month) {
+                break;
+            }
+            remaining_days = remaining_days - days_in_month;
+            month = month + 1;
+        }
+
+        const day: u8 = (remaining_days + 1) as u8;
+
+        return DateTime {
+            year: year,
+            month: month,
+            day: day,
+            hour: hour,
+            minute: minute,
+            second: second,
+            nanosecond: time.nanos
+        };
+    }
+
+    /// Converts to a SystemTime.
+    function to_system_time(self) -> SystemTime {
+        // Calculate days since epoch
+        mut days: u64 = 0;
+        mut year: i32 = 1970;
+
+        while (year < self.year) {
+            days = days + if (is_leap_year(year)) { 366 } else { 365 };
+            year = year + 1;
+        }
+
+        mut month: u8 = 1;
+        while (month < self.month) {
+            days = days + (days_in_month_for(self.year, month) as u64);
+            month = month + 1;
+        }
+
+        days = days + ((self.day - 1) as u64);
+
+        const secs: u64 = days * 86400 +
+                          (self.hour as u64) * 3600 +
+                          (self.minute as u64) * 60 +
+                          (self.second as u64);
+
+        return SystemTime::from_unix(secs, self.nanosecond);
+    }
+
+    /// Returns the year.
+    function year(self) -> i32 { return self.year; }
+
+    /// Returns the month (1-12).
+    function month(self) -> u8 { return self.month; }
+
+    /// Returns the day of month (1-31).
+    function day(self) -> u8 { return self.day; }
+
+    /// Returns the hour (0-23).
+    function hour(self) -> u8 { return self.hour; }
+
+    /// Returns the minute (0-59).
+    function minute(self) -> u8 { return self.minute; }
+
+    /// Returns the second (0-59).
+    function second(self) -> u8 { return self.second; }
+
+    /// Returns the nanosecond.
+    function nanosecond(self) -> u32 { return self.nanosecond; }
+
+    /// Returns the day of the year (1-366).
+    function day_of_year(self) -> u16 {
+        mut day: u16 = 0;
+        mut month: u8 = 1;
+        while (month < self.month) {
+            day = day + (days_in_month_for(self.year, month) as u16);
+            month = month + 1;
+        }
+        return day + (self.day as u16);
+    }
+
+    /// Returns the day of the week (0 = Monday, 6 = Sunday).
+    function weekday(self) -> u8 {
+        // Zeller's congruence (modified for Monday = 0)
+        mut y: i32 = self.year;
+        mut m: i32 = self.month as i32;
+
+        if (m < 3) {
+            m = m + 12;
+            y = y - 1;
+        }
+
+        const k: i32 = y % 100;
+        const j: i32 = y / 100;
+
+        mut h: i32 = self.day as i32 + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 - 2 * j;
+        h = ((h % 7) + 6) % 7;
+
+        return h as u8;
+    }
+
+    /// Returns the ISO week number (1-53).
+    function week_number(self) -> u8 {
+        const doy: u16 = self.day_of_year();
+        const dow: u8 = self.weekday();
+        const week: u16 = (doy + 6 - (dow as u16)) / 7;
+        if (week == 0) {
+            return 52;
+        }
+        return week as u8;
+    }
+
+    /// Returns true if this is a leap year.
+    function is_leap_year(self) -> boolean {
+        return is_leap_year(self.year);
+    }
+
+    /// Adds a duration to the datetime.
+    function add(self, duration: Duration) -> DateTime {
+        const time: SystemTime = self.to_system_time().add(duration);
+        return DateTime::from_system_time(time);
+    }
+
+    /// Subtracts a duration from the datetime.
+    function sub(self, duration: Duration) -> DateTime {
+        const time: SystemTime = self.to_system_time().sub(duration);
+        return DateTime::from_system_time(time);
+    }
+
+    /// Returns the duration between two datetimes.
+    function duration_since(self, earlier: DateTime) -> Duration {
+        const self_time: SystemTime = self.to_system_time();
+        const earlier_time: SystemTime = earlier.to_system_time();
+
+        match (self_time.duration_since(earlier_time)) {
+            Result::Ok(d) => { return d; }
+            Result::Err(e) => { return Duration::zero(); }
+        }
+    }
+
+    /// Compares two DateTimes.
+    function cmp(self, other: DateTime) -> i32 {
+        if (self.year != other.year) {
+            return if (self.year < other.year) { -1 } else { 1 };
+        }
+        if (self.month != other.month) {
+            return if (self.month < other.month) { -1 } else { 1 };
+        }
+        if (self.day != other.day) {
+            return if (self.day < other.day) { -1 } else { 1 };
+        }
+        if (self.hour != other.hour) {
+            return if (self.hour < other.hour) { -1 } else { 1 };
+        }
+        if (self.minute != other.minute) {
+            return if (self.minute < other.minute) { -1 } else { 1 };
+        }
+        if (self.second != other.second) {
+            return if (self.second < other.second) { -1 } else { 1 };
+        }
+        if (self.nanosecond != other.nanosecond) {
+            return if (self.nanosecond < other.nanosecond) { -1 } else { 1 };
+        }
+        return 0;
+    }
+
+    /// Returns true if self is before other.
+    function lt(self, other: DateTime) -> boolean {
+        return self.cmp(other) < 0;
+    }
+
+    /// Returns true if self is before or equal to other.
+    function le(self, other: DateTime) -> boolean {
+        return self.cmp(other) <= 0;
+    }
+
+    /// Returns true if self is after other.
+    function gt(self, other: DateTime) -> boolean {
+        return self.cmp(other) > 0;
+    }
+
+    /// Returns true if self is after or equal to other.
+    function ge(self, other: DateTime) -> boolean {
+        return self.cmp(other) >= 0;
+    }
+
+    /// Returns true if datetimes are equal.
+    function eq(self, other: DateTime) -> boolean {
+        return self.cmp(other) == 0;
+    }
+}
+
+// ============================================================================
+// Date
+// ============================================================================
+
+/// A date without time.
+type struct Date {
+    year: i32;
+    month: u8;
+    day: u8;
+}
+
+implement struct Date {
+    /// Creates a new date.
+    static function new(year: i32, month: u8, day: u8) -> Date {
+        return Date { year: year, month: month, day: day };
+    }
+
+    /// Returns today's date in UTC.
+    static function today() -> Date {
+        const dt: DateTime = DateTime::now();
+        return Date { year: dt.year, month: dt.month, day: dt.day };
+    }
+
+    /// Returns the year.
+    function year(self) -> i32 { return self.year; }
+
+    /// Returns the month.
+    function month(self) -> u8 { return self.month; }
+
+    /// Returns the day.
+    function day(self) -> u8 { return self.day; }
+
+    /// Returns the weekday.
+    function weekday(self) -> u8 {
+        const dt: DateTime = DateTime::new(self.year, self.month, self.day, 0, 0, 0);
+        return dt.weekday();
+    }
+
+    /// Converts to DateTime at midnight.
+    function at_midnight(self) -> DateTime {
+        return DateTime::new(self.year, self.month, self.day, 0, 0, 0);
+    }
+
+    /// Converts to DateTime at the given time.
+    function at(self, hour: u8, minute: u8, second: u8) -> DateTime {
+        return DateTime::new(self.year, self.month, self.day, hour, minute, second);
+    }
+
+    /// Adds days to the date.
+    function add_days(self, days: i32) -> Date {
+        const dt: DateTime = self.at_midnight();
+        const new_dt: DateTime = dt.add(Duration::from_secs((days * 86400) as u64));
+        return Date { year: new_dt.year, month: new_dt.month, day: new_dt.day };
+    }
+
+    /// Subtracts days from the date.
+    function sub_days(self, days: i32) -> Date {
+        return self.add_days(-days);
+    }
+
+    /// Returns the number of days between two dates.
+    function days_since(self, earlier: Date) -> i64 {
+        const self_dt: DateTime = self.at_midnight();
+        const earlier_dt: DateTime = earlier.at_midnight();
+        const duration: Duration = self_dt.duration_since(earlier_dt);
+        return (duration.as_secs() / 86400) as i64;
+    }
+}
+
+// ============================================================================
+// Time
+// ============================================================================
+
+/// A time without date.
+type struct Time {
+    hour: u8;
+    minute: u8;
+    second: u8;
+    nanosecond: u32;
+}
+
+implement struct Time {
+    /// Creates a new time.
+    static function new(hour: u8, minute: u8, second: u8) -> Time {
+        return Time { hour: hour, minute: minute, second: second, nanosecond: 0 };
+    }
+
+    /// Creates a time with nanoseconds.
+    static function with_nanos(hour: u8, minute: u8, second: u8, nanos: u32) -> Time {
+        return Time { hour: hour, minute: minute, second: second, nanosecond: nanos };
+    }
+
+    /// Returns the current time in UTC.
+    static function now() -> Time {
+        const dt: DateTime = DateTime::now();
+        return Time {
+            hour: dt.hour,
+            minute: dt.minute,
+            second: dt.second,
+            nanosecond: dt.nanosecond
+        };
+    }
+
+    /// Midnight (00:00:00).
+    static function midnight() -> Time {
+        return Time::new(0, 0, 0);
+    }
+
+    /// Noon (12:00:00).
+    static function noon() -> Time {
+        return Time::new(12, 0, 0);
+    }
+
+    /// Returns the hour.
+    function hour(self) -> u8 { return self.hour; }
+
+    /// Returns the minute.
+    function minute(self) -> u8 { return self.minute; }
+
+    /// Returns the second.
+    function second(self) -> u8 { return self.second; }
+
+    /// Returns the nanosecond.
+    function nanosecond(self) -> u32 { return self.nanosecond; }
+
+    /// Returns seconds since midnight.
+    function as_secs_since_midnight(self) -> u32 {
+        return (self.hour as u32) * 3600 + (self.minute as u32) * 60 + (self.second as u32);
+    }
+
+    /// Creates a time from seconds since midnight.
+    static function from_secs_since_midnight(secs: u32) -> Time {
+        const hour: u8 = (secs / 3600) as u8;
+        const minute: u8 = ((secs % 3600) / 60) as u8;
+        const second: u8 = (secs % 60) as u8;
+        return Time::new(hour, minute, second);
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Returns true if the year is a leap year.
+function is_leap_year(year: i32) -> boolean {
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+/// Returns the number of days in the given month.
+function days_in_month_for(year: i32, month: u8) -> u8 {
+    match (month) {
+        1 => { return 31; }
+        2 => { return if (is_leap_year(year)) { 29 } else { 28 }; }
+        3 => { return 31; }
+        4 => { return 30; }
+        5 => { return 31; }
+        6 => { return 30; }
+        7 => { return 31; }
+        8 => { return 31; }
+        9 => { return 30; }
+        10 => { return 31; }
+        11 => { return 30; }
+        12 => { return 31; }
+        _ => { return 0; }
+    }
+}
+
+/// Returns the name of the month.
+function month_name(month: u8) -> string {
+    match (month) {
+        1 => { return "January"; }
+        2 => { return "February"; }
+        3 => { return "March"; }
+        4 => { return "April"; }
+        5 => { return "May"; }
+        6 => { return "June"; }
+        7 => { return "July"; }
+        8 => { return "August"; }
+        9 => { return "September"; }
+        10 => { return "October"; }
+        11 => { return "November"; }
+        12 => { return "December"; }
+        _ => { return "Unknown"; }
+    }
+}
+
+/// Returns the short name of the month.
+function month_short_name(month: u8) -> string {
+    match (month) {
+        1 => { return "Jan"; }
+        2 => { return "Feb"; }
+        3 => { return "Mar"; }
+        4 => { return "Apr"; }
+        5 => { return "May"; }
+        6 => { return "Jun"; }
+        7 => { return "Jul"; }
+        8 => { return "Aug"; }
+        9 => { return "Sep"; }
+        10 => { return "Oct"; }
+        11 => { return "Nov"; }
+        12 => { return "Dec"; }
+        _ => { return "???"; }
+    }
+}
+
+/// Returns the name of the weekday.
+function weekday_name(weekday: u8) -> string {
+    match (weekday) {
+        0 => { return "Monday"; }
+        1 => { return "Tuesday"; }
+        2 => { return "Wednesday"; }
+        3 => { return "Thursday"; }
+        4 => { return "Friday"; }
+        5 => { return "Saturday"; }
+        6 => { return "Sunday"; }
+        _ => { return "Unknown"; }
+    }
+}
+
+/// Returns the short name of the weekday.
+function weekday_short_name(weekday: u8) -> string {
+    match (weekday) {
+        0 => { return "Mon"; }
+        1 => { return "Tue"; }
+        2 => { return "Wed"; }
+        3 => { return "Thu"; }
+        4 => { return "Fri"; }
+        5 => { return "Sat"; }
+        6 => { return "Sun"; }
+        _ => { return "???"; }
+    }
+}
+
+// ============================================================================
+// Types and Intrinsics
+// ============================================================================
+
+type struct timespec {
+    tv_sec: i64;
+    tv_nsec: i64;
+}
+
+const CLOCK_REALTIME: i32 = 0;
+
+intrinsic function clock_gettime(clk_id: i32, tp: timespec*) -> i32;
+

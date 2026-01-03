@@ -1,0 +1,623 @@
+///! Format - Core Formatting
+///!
+///! Core formatting types and functions for converting values to strings.
+
+namespace std::fmt::format;
+
+import <core/intrinsics>;
+import <core/option>;
+import <collections/string>;
+import <collections/vec>;
+import <alloc/global>;
+
+// ============================================================================
+// Alignment
+// ============================================================================
+
+/// Text alignment for formatted output.
+enum Alignment {
+    Left;
+    Right;
+    Center;
+}
+
+// ============================================================================
+// FormatSpec
+// ============================================================================
+
+/// Format specification for a value.
+type struct FormatSpec {
+    fill: u8;           // Fill character
+    align: Alignment;   // Alignment
+    sign: boolean;      // Show sign for positive numbers
+    alternate: boolean; // Alternate form (0x, 0b, etc.)
+    zero_pad: boolean;  // Zero padding
+    width: Option<u64>; // Minimum width
+    precision: Option<u64>; // Precision for floats
+}
+
+implement struct FormatSpec {
+    /// Creates a default format spec.
+    static function default() -> FormatSpec {
+        return FormatSpec {
+            fill: ' ',
+            align: Alignment::Left,
+            sign: false,
+            alternate: false,
+            zero_pad: false,
+            width: Option::None,
+            precision: Option::None
+        };
+    }
+
+    /// Sets the fill character.
+    function with_fill(self, fill: u8) -> FormatSpec {
+        self.fill = fill;
+        return self;
+    }
+
+    /// Sets the alignment.
+    function with_align(self, align: Alignment) -> FormatSpec {
+        self.align = align;
+        return self;
+    }
+
+    /// Sets the sign display.
+    function with_sign(self, sign: boolean) -> FormatSpec {
+        self.sign = sign;
+        return self;
+    }
+
+    /// Sets alternate form.
+    function with_alternate(self, alt: boolean) -> FormatSpec {
+        self.alternate = alt;
+        return self;
+    }
+
+    /// Sets zero padding.
+    function with_zero_pad(self, pad: boolean) -> FormatSpec {
+        self.zero_pad = pad;
+        return self;
+    }
+
+    /// Sets the minimum width.
+    function with_width(self, width: u64) -> FormatSpec {
+        self.width = Option::Some(width);
+        return self;
+    }
+
+    /// Sets the precision.
+    function with_precision(self, precision: u64) -> FormatSpec {
+        self.precision = Option::Some(precision);
+        return self;
+    }
+}
+
+// ============================================================================
+// Formatter
+// ============================================================================
+
+/// A formatter for building formatted strings.
+type struct Formatter {
+    buffer: String;
+    spec: FormatSpec;
+}
+
+implement struct Formatter {
+    /// Creates a new formatter with default spec.
+    static function new() -> Formatter {
+        return Formatter {
+            buffer: String::new(),
+            spec: FormatSpec::default()
+        };
+    }
+
+    /// Creates a formatter with a specific spec.
+    static function with_spec(spec: FormatSpec) -> Formatter {
+        return Formatter {
+            buffer: String::new(),
+            spec: spec
+        };
+    }
+
+    /// Returns the format spec.
+    function spec(self) -> FormatSpec {
+        return self.spec;
+    }
+
+    /// Writes a string to the formatter.
+    function write_str(self: &mut Formatter, s: string) -> void {
+        self.buffer.push_str(s);
+    }
+
+    /// Writes a String to the formatter.
+    function write_string(self: &mut Formatter, s: String) -> void {
+        self.buffer.push_string(s);
+    }
+
+    /// Writes a single character.
+    function write_char(self: &mut Formatter, c: u8) -> void {
+        self.buffer.push(c);
+    }
+
+    /// Writes formatted padding.
+    function write_padding(self: &mut Formatter, count: u64) -> void {
+        mut i: u64 = 0;
+        while (i < count) {
+            self.buffer.push(self.spec.fill);
+            i = i + 1;
+        }
+    }
+
+    /// Writes a value with padding according to spec.
+    function write_padded(self: &mut Formatter, value: string) -> void {
+        const len: u64 = strlen(value);
+
+        match (self.spec.width) {
+            Option::None => {
+                self.write_str(value);
+            }
+            Option::Some(width) => {
+                if (len >= width) {
+                    self.write_str(value);
+                } else {
+                    const padding: u64 = width - len;
+
+                    match (self.spec.align) {
+                        Alignment::Left => {
+                            self.write_str(value);
+                            self.write_padding(padding);
+                        }
+                        Alignment::Right => {
+                            self.write_padding(padding);
+                            self.write_str(value);
+                        }
+                        Alignment::Center => {
+                            const left_pad: u64 = padding / 2;
+                            const right_pad: u64 = padding - left_pad;
+                            self.write_padding(left_pad);
+                            self.write_str(value);
+                            self.write_padding(right_pad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the formatted string.
+    function finish(self) -> String {
+        return self.buffer;
+    }
+
+    /// Clears the buffer.
+    function clear(self: &mut Formatter) -> void {
+        self.buffer.clear();
+    }
+}
+
+// ============================================================================
+// Integer Formatting
+// ============================================================================
+
+/// Formats an i64 as a decimal string.
+function format_i64(value: i64) -> String {
+    if (value == 0) {
+        return String::from_cstr("0");
+    }
+
+    mut buffer: u8[21];  // Max i64 length + sign + null
+    mut pos: u64 = 20;
+    mut n: i64 = value;
+    const negative: boolean = n < 0;
+
+    if (negative) {
+        n = -n;
+    }
+
+    while (n > 0) {
+        pos = pos - 1;
+        buffer[pos] = ('0' + (n % 10)) as u8;
+        n = n / 10;
+    }
+
+    if (negative) {
+        pos = pos - 1;
+        buffer[pos] = '-';
+    }
+
+    buffer[20] = 0;
+    return String::from_cstr(&buffer[pos] as string);
+}
+
+/// Formats a u64 as a decimal string.
+function format_u64(value: u64) -> String {
+    if (value == 0) {
+        return String::from_cstr("0");
+    }
+
+    mut buffer: u8[21];
+    mut pos: u64 = 20;
+    mut n: u64 = value;
+
+    while (n > 0) {
+        pos = pos - 1;
+        buffer[pos] = ('0' + (n % 10)) as u8;
+        n = n / 10;
+    }
+
+    buffer[20] = 0;
+    return String::from_cstr(&buffer[pos] as string);
+}
+
+/// Formats a u64 as a hexadecimal string.
+function format_hex(value: u64, uppercase: boolean) -> String {
+    if (value == 0) {
+        return String::from_cstr("0");
+    }
+
+    const hex_chars_lower: string = "0123456789abcdef";
+    const hex_chars_upper: string = "0123456789ABCDEF";
+    const hex_chars: string = if (uppercase) { hex_chars_upper } else { hex_chars_lower };
+
+    mut buffer: u8[17];
+    mut pos: u64 = 16;
+    mut n: u64 = value;
+
+    while (n > 0) {
+        pos = pos - 1;
+        buffer[pos] = hex_chars[n & 0xF];
+        n = n >> 4;
+    }
+
+    buffer[16] = 0;
+    return String::from_cstr(&buffer[pos] as string);
+}
+
+/// Formats a u64 as a hexadecimal string with 0x prefix.
+function format_hex_prefixed(value: u64, uppercase: boolean) -> String {
+    mut result: String = String::from_cstr(if (uppercase) { "0X" } else { "0x" });
+    result.push_string(format_hex(value, uppercase));
+    return result;
+}
+
+/// Formats a u64 as a binary string.
+function format_binary(value: u64) -> String {
+    if (value == 0) {
+        return String::from_cstr("0");
+    }
+
+    mut buffer: u8[65];
+    mut pos: u64 = 64;
+    mut n: u64 = value;
+
+    while (n > 0) {
+        pos = pos - 1;
+        buffer[pos] = '0' + ((n & 1) as u8);
+        n = n >> 1;
+    }
+
+    buffer[64] = 0;
+    return String::from_cstr(&buffer[pos] as string);
+}
+
+/// Formats a u64 as a binary string with 0b prefix.
+function format_binary_prefixed(value: u64) -> String {
+    mut result: String = String::from_cstr("0b");
+    result.push_string(format_binary(value));
+    return result;
+}
+
+/// Formats a u64 as an octal string.
+function format_octal(value: u64) -> String {
+    if (value == 0) {
+        return String::from_cstr("0");
+    }
+
+    mut buffer: u8[23];
+    mut pos: u64 = 22;
+    mut n: u64 = value;
+
+    while (n > 0) {
+        pos = pos - 1;
+        buffer[pos] = '0' + ((n & 7) as u8);
+        n = n >> 3;
+    }
+
+    buffer[22] = 0;
+    return String::from_cstr(&buffer[pos] as string);
+}
+
+/// Formats a u64 as an octal string with 0o prefix.
+function format_octal_prefixed(value: u64) -> String {
+    mut result: String = String::from_cstr("0o");
+    result.push_string(format_octal(value));
+    return result;
+}
+
+// ============================================================================
+// Float Formatting
+// ============================================================================
+
+/// Formats an f64 as a decimal string.
+function format_f64(value: f64, precision: u64) -> String {
+    // Handle special cases
+    if (is_nan(value)) {
+        return String::from_cstr("NaN");
+    }
+    if (is_infinite(value)) {
+        if (value < 0.0) {
+            return String::from_cstr("-inf");
+        }
+        return String::from_cstr("inf");
+    }
+
+    mut result: String = String::new();
+
+    mut v: f64 = value;
+    if (v < 0.0) {
+        result.push('-');
+        v = -v;
+    }
+
+    // Integer part
+    const int_part: u64 = v as u64;
+    result.push_string(format_u64(int_part));
+
+    // Decimal part
+    result.push('.');
+
+    v = v - (int_part as f64);
+    mut i: u64 = 0;
+    while (i < precision) {
+        v = v * 10.0;
+        const digit: u64 = v as u64;
+        result.push('0' + (digit as u8));
+        v = v - (digit as f64);
+        i = i + 1;
+    }
+
+    return result;
+}
+
+/// Formats an f64 in scientific notation.
+function format_f64_scientific(value: f64, precision: u64, uppercase: boolean) -> String {
+    if (is_nan(value)) {
+        return String::from_cstr("NaN");
+    }
+    if (is_infinite(value)) {
+        if (value < 0.0) {
+            return String::from_cstr("-inf");
+        }
+        return String::from_cstr("inf");
+    }
+
+    mut result: String = String::new();
+
+    mut v: f64 = value;
+    if (v < 0.0) {
+        result.push('-');
+        v = -v;
+    }
+
+    // Normalize to [1, 10)
+    mut exponent: i32 = 0;
+    if (v != 0.0) {
+        while (v >= 10.0) {
+            v = v / 10.0;
+            exponent = exponent + 1;
+        }
+        while (v < 1.0) {
+            v = v * 10.0;
+            exponent = exponent - 1;
+        }
+    }
+
+    // Format mantissa
+    const int_part: u64 = v as u64;
+    result.push('0' + (int_part as u8));
+    result.push('.');
+
+    v = v - (int_part as f64);
+    mut i: u64 = 0;
+    while (i < precision) {
+        v = v * 10.0;
+        const digit: u64 = v as u64;
+        result.push('0' + (digit as u8));
+        v = v - (digit as f64);
+        i = i + 1;
+    }
+
+    // Exponent
+    result.push(if (uppercase) { 'E' } else { 'e' });
+    if (exponent >= 0) {
+        result.push('+');
+    }
+    result.push_string(format_i64(exponent as i64));
+
+    return result;
+}
+
+/// Formats an f32 as a decimal string.
+function format_f32(value: f32, precision: u64) -> String {
+    return format_f64(value as f64, precision);
+}
+
+// ============================================================================
+// Boolean and Pointer Formatting
+// ============================================================================
+
+/// Formats a boolean.
+function format_bool(value: boolean) -> String {
+    if (value) {
+        return String::from_cstr("true");
+    }
+    return String::from_cstr("false");
+}
+
+/// Formats a pointer.
+function format_ptr(value: void*) -> String {
+    if (value == null) {
+        return String::from_cstr("null");
+    }
+    return format_hex_prefixed(value as u64, false);
+}
+
+// ============================================================================
+// Character Formatting
+// ============================================================================
+
+/// Formats a character, escaping special characters.
+function format_char_escaped(c: u8) -> String {
+    mut result: String = String::new();
+
+    match (c) {
+        '\n' => { result.push_str("\\n"); }
+        '\r' => { result.push_str("\\r"); }
+        '\t' => { result.push_str("\\t"); }
+        '\\' => { result.push_str("\\\\"); }
+        '\'' => { result.push_str("\\'"); }
+        '"' => { result.push_str("\\\""); }
+        '\0' => { result.push_str("\\0"); }
+        _ => {
+            if (c >= 32 && c < 127) {
+                result.push(c);
+            } else {
+                result.push_str("\\x");
+                result.push_string(format_hex(c as u64, false));
+            }
+        }
+    }
+
+    return result;
+}
+
+/// Formats a string, escaping special characters.
+function format_string_escaped(s: string) -> String {
+    mut result: String = String::new();
+    result.push('"');
+
+    mut i: u64 = 0;
+    while (s[i] != 0) {
+        result.push_string(format_char_escaped(s[i]));
+        i = i + 1;
+    }
+
+    result.push('"');
+    return result;
+}
+
+// ============================================================================
+// Padding and Alignment
+// ============================================================================
+
+/// Pads a string to the left.
+function pad_left(s: String, width: u64, fill: u8) -> String {
+    const len: u64 = s.len();
+    if (len >= width) {
+        return s;
+    }
+
+    mut result: String = String::with_capacity(width);
+    mut i: u64 = 0;
+    while (i < width - len) {
+        result.push(fill);
+        i = i + 1;
+    }
+    result.push_string(s);
+    return result;
+}
+
+/// Pads a string to the right.
+function pad_right(s: String, width: u64, fill: u8) -> String {
+    const len: u64 = s.len();
+    if (len >= width) {
+        return s;
+    }
+
+    mut result: String = s.clone();
+    mut i: u64 = len;
+    while (i < width) {
+        result.push(fill);
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Centers a string.
+function center(s: String, width: u64, fill: u8) -> String {
+    const len: u64 = s.len();
+    if (len >= width) {
+        return s;
+    }
+
+    const padding: u64 = width - len;
+    const left_pad: u64 = padding / 2;
+    const right_pad: u64 = padding - left_pad;
+
+    mut result: String = String::with_capacity(width);
+
+    mut i: u64 = 0;
+    while (i < left_pad) {
+        result.push(fill);
+        i = i + 1;
+    }
+
+    result.push_string(s);
+
+    i = 0;
+    while (i < right_pad) {
+        result.push(fill);
+        i = i + 1;
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+/// Converts an i32 to a string.
+function i32_to_string(value: i32) -> String {
+    return format_i64(value as i64);
+}
+
+/// Converts an i64 to a string.
+function i64_to_string(value: i64) -> String {
+    return format_i64(value);
+}
+
+/// Converts a u32 to a string.
+function u32_to_string(value: u32) -> String {
+    return format_u64(value as u64);
+}
+
+/// Converts a u64 to a string.
+function u64_to_string(value: u64) -> String {
+    return format_u64(value);
+}
+
+/// Converts an f32 to a string.
+function f32_to_string(value: f32) -> String {
+    return format_f32(value, 6);
+}
+
+/// Converts an f64 to a string.
+function f64_to_string(value: f64) -> String {
+    return format_f64(value, 6);
+}
+
+/// Converts a boolean to a string.
+function bool_to_string(value: boolean) -> String {
+    return format_bool(value);
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function strlen(s: string) -> u64;
+intrinsic function is_nan(value: f64) -> boolean;
+intrinsic function is_infinite(value: f64) -> boolean;
+

@@ -1,0 +1,600 @@
+///! Pointer Operations Module
+///!
+///! This module provides utilities for working with raw pointers, including
+///! smart pointer types, non-null pointers, and pointer manipulation functions.
+///!
+///! # Safety
+///! Working with raw pointers is inherently unsafe. Most functions in this
+///! module assume the caller has verified pointer validity.
+
+namespace std::core::ptr;
+
+import <core/intrinsics>;
+import <core/mem>;
+import <core/option>;
+
+// ============================================================================
+// Null Pointer Constant
+// ============================================================================
+
+/// Returns a null pointer of type T.
+function null<T>() -> T* {
+    return null;
+}
+
+/// Returns a null mutable pointer of type T.
+function null_mut<T>() -> T* {
+    return null;
+}
+
+// ============================================================================
+// NonNull Pointer Type
+// ============================================================================
+
+/// A non-null pointer type. Provides compile-time guarantee that the
+/// pointer is never null.
+type struct NonNull<T> {
+    ptr: T*;
+}
+
+implement struct NonNull<T> {
+    /// Creates a NonNull from a pointer.
+    /// Returns None if the pointer is null.
+    static function new(ptr: T*) -> Option<NonNull<T>> {
+        if (ptr == null) {
+            return Option::None;
+        }
+        return Option::Some(NonNull { ptr: ptr });
+    }
+
+    /// Creates a NonNull from a pointer without checking.
+    ///
+    /// # Safety
+    /// The caller must ensure the pointer is not null.
+    static function new_unchecked(ptr: T*) -> NonNull<T> {
+        return NonNull { ptr: ptr };
+    }
+
+    /// Creates a dangling but well-aligned NonNull pointer.
+    /// Useful as a placeholder that will never be dereferenced.
+    static function dangling() -> NonNull<T> {
+        return NonNull { ptr: alignof(T) };
+    }
+
+    /// Returns the raw pointer.
+    function as_ptr(self) -> T* {
+        return self.ptr;
+    }
+
+    /// Returns a mutable reference to the pointed value.
+    function as_mut(self) -> T* {
+        return self.ptr;
+    }
+
+    /// Casts to a pointer of a different type.
+    function cast<U>(self) -> NonNull<U> {
+        return NonNull { ptr: self.ptr };
+    }
+
+    /// Calculates an offset from a pointer.
+    function offset(self, count: i64) -> NonNull<T> {
+        const new_ptr: T* = mem::offset(self.ptr, count);
+        return NonNull { ptr: new_ptr };
+    }
+
+    /// Adds an offset to the pointer.
+    function add(self, count: u64) -> NonNull<T> {
+        return self.offset(count);
+    }
+
+    /// Subtracts an offset from the pointer.
+    function sub(self, count: u64) -> NonNull<T> {
+        return self.offset(-count);
+    }
+
+    /// Reads the value from the pointer.
+    function read(self) -> T {
+        return *self.ptr;
+    }
+
+    /// Writes a value to the pointer.
+    function write(self, value: T) -> void {
+        *self.ptr = value;
+    }
+
+    /// Replaces the value at the pointer, returning the old value.
+    function replace(self, value: T) -> T {
+        const old: T = *self.ptr;
+        *self.ptr = value;
+        return old;
+    }
+
+    /// Swaps the values at two NonNull pointers.
+    function swap(self, other: NonNull<T>) -> void {
+        mem::swap(self.ptr, other.ptr);
+    }
+}
+
+// ============================================================================
+// Unique Pointer (Owned Heap Pointer)
+// ============================================================================
+
+/// A unique owning pointer. When dropped, frees the underlying memory.
+type struct Unique<T> {
+    ptr: NonNull<T>;
+}
+
+implement struct Unique<T> {
+    /// Allocates a new value on the heap.
+    static function new(value: T) -> Unique<T> {
+        const ptr: T* = malloc(sizeof(T));
+        if (ptr == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        *ptr = value;
+        return Unique { ptr: NonNull::new_unchecked(ptr) };
+    }
+
+    /// Creates a Unique from a raw pointer.
+    ///
+    /// # Safety
+    /// The pointer must have been allocated with malloc and not be aliased.
+    static function from_raw(ptr: T*) -> Unique<T> {
+        return Unique { ptr: NonNull::new_unchecked(ptr) };
+    }
+
+    /// Returns the raw pointer without deallocating.
+    function into_raw(self) -> T* {
+        return self.ptr.as_ptr();
+    }
+
+    /// Returns a reference to the raw pointer.
+    function as_ptr(self) -> T* {
+        return self.ptr.as_ptr();
+    }
+
+    /// Returns a reference to the value.
+    function get(self) -> T* {
+        return self.ptr.as_ptr();
+    }
+
+    /// Returns the value and deallocates.
+    function take(self) -> T {
+        const value: T = *self.ptr.as_ptr();
+        free(self.ptr.as_ptr());
+        return value;
+    }
+
+    /// Replaces the value, returning the old one.
+    function replace(self, value: T) -> T {
+        return self.ptr.replace(value);
+    }
+
+    /// Swaps the values of two Unique pointers.
+    function swap(self, other: &mut Unique<T>) -> void {
+        self.ptr.swap(other.ptr);
+    }
+
+    /// Deallocates the pointer.
+    function free(self) -> void {
+        free(self.ptr.as_ptr());
+    }
+}
+
+// ============================================================================
+// Shared Pointer (Reference Counted)
+// ============================================================================
+
+/// Control block for reference counted pointers.
+type struct RcControlBlock<T> {
+    value: T;
+    strong_count: u64;
+    weak_count: u64;
+}
+
+/// A reference-counted smart pointer.
+type struct Rc<T> {
+    ctrl: RcControlBlock<T>*;
+}
+
+implement struct Rc<T> {
+    /// Creates a new Rc with the given value.
+    static function new(value: T) -> Rc<T> {
+        const ctrl: RcControlBlock<T>* = malloc(sizeof(RcControlBlock<T>));
+        if (ctrl == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        ctrl.value = value;
+        ctrl.strong_count = 1;
+        ctrl.weak_count = 0;
+        return Rc { ctrl: ctrl };
+    }
+
+    /// Returns a reference to the value.
+    function get(self) -> T* {
+        return &self.ctrl.value;
+    }
+
+    /// Returns the value (panics if not the only reference).
+    function try_unwrap(self) -> Option<T> {
+        if (self.ctrl.strong_count == 1) {
+            const value: T = self.ctrl.value;
+            free(self.ctrl);
+            return Option::Some(value);
+        }
+        return Option::None;
+    }
+
+    /// Returns the strong reference count.
+    function strong_count(self) -> u64 {
+        return self.ctrl.strong_count;
+    }
+
+    /// Returns the weak reference count.
+    function weak_count(self) -> u64 {
+        return self.ctrl.weak_count;
+    }
+
+    /// Returns true if this is the only strong reference.
+    function is_unique(self) -> boolean {
+        return self.ctrl.strong_count == 1;
+    }
+
+    /// Clones the Rc, incrementing the reference count.
+    function clone(self) -> Rc<T> {
+        self.ctrl.strong_count = self.ctrl.strong_count + 1;
+        return Rc { ctrl: self.ctrl };
+    }
+
+    /// Creates a weak reference to this Rc.
+    function downgrade(self) -> Weak<T> {
+        self.ctrl.weak_count = self.ctrl.weak_count + 1;
+        return Weak { ctrl: self.ctrl };
+    }
+
+    /// Decrements the reference count and deallocates if zero.
+    function drop(self) -> void {
+        self.ctrl.strong_count = self.ctrl.strong_count - 1;
+        if (self.ctrl.strong_count == 0) {
+            // Value can be dropped
+            if (self.ctrl.weak_count == 0) {
+                free(self.ctrl);
+            }
+        }
+    }
+
+    /// Gets a mutable reference if this is the only strong reference.
+    function get_mut(self) -> Option<T*> {
+        if (self.ctrl.strong_count == 1 && self.ctrl.weak_count == 0) {
+            return Option::Some(&self.ctrl.value);
+        }
+        return Option::None;
+    }
+
+    /// Makes a mutable reference to the value, cloning if necessary.
+    function make_mut(self: &mut Rc<T>) -> T* {
+        if (self.ctrl.strong_count > 1) {
+            // Clone the value
+            const new_ctrl: RcControlBlock<T>* = malloc(sizeof(RcControlBlock<T>));
+            if (new_ctrl == null) {
+                panic("allocation failed", FILE, LINE);
+            }
+            new_ctrl.value = self.ctrl.value; // Copy
+            new_ctrl.strong_count = 1;
+            new_ctrl.weak_count = 0;
+
+            // Decrement old
+            self.ctrl.strong_count = self.ctrl.strong_count - 1;
+            self.ctrl = new_ctrl;
+        }
+        return &self.ctrl.value;
+    }
+}
+
+/// A weak reference to an Rc.
+type struct Weak<T> {
+    ctrl: RcControlBlock<T>*;
+}
+
+implement struct Weak<T> {
+    /// Creates a new empty weak reference.
+    static function new() -> Weak<T> {
+        return Weak { ctrl: null };
+    }
+
+    /// Attempts to upgrade to an Rc.
+    /// Returns None if the value has been dropped.
+    function upgrade(self) -> Option<Rc<T>> {
+        if (self.ctrl == null || self.ctrl.strong_count == 0) {
+            return Option::None;
+        }
+        self.ctrl.strong_count = self.ctrl.strong_count + 1;
+        return Option::Some(Rc { ctrl: self.ctrl });
+    }
+
+    /// Returns the strong reference count, or 0 if dropped.
+    function strong_count(self) -> u64 {
+        if (self.ctrl == null) {
+            return 0;
+        }
+        return self.ctrl.strong_count;
+    }
+
+    /// Returns the weak reference count.
+    function weak_count(self) -> u64 {
+        if (self.ctrl == null) {
+            return 0;
+        }
+        return self.ctrl.weak_count;
+    }
+
+    /// Clones the weak reference.
+    function clone(self) -> Weak<T> {
+        if (self.ctrl != null) {
+            self.ctrl.weak_count = self.ctrl.weak_count + 1;
+        }
+        return Weak { ctrl: self.ctrl };
+    }
+
+    /// Drops the weak reference.
+    function drop(self) -> void {
+        if (self.ctrl != null) {
+            self.ctrl.weak_count = self.ctrl.weak_count - 1;
+            if (self.ctrl.strong_count == 0 && self.ctrl.weak_count == 0) {
+                free(self.ctrl);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Pointer Reading and Writing
+// ============================================================================
+
+/// Reads a value from a pointer.
+function read<T>(src: T*) -> T {
+    return *src;
+}
+
+/// Reads a value from a pointer without moving it.
+function read_volatile<T>(src: T*) -> T {
+    return mem::volatile_read(src);
+}
+
+/// Reads an unaligned value from a pointer.
+function read_unaligned<T>(src: T*) -> T {
+    mut result: T;
+    memcpy(&result, src, sizeof(T));
+    return result;
+}
+
+/// Writes a value to a pointer.
+function write<T>(dst: T*, src: T) -> void {
+    *dst = src;
+}
+
+/// Writes a value to a pointer without reading the old value.
+function write_volatile<T>(dst: T*, src: T) -> void {
+    mem::volatile_write(dst, src);
+}
+
+/// Writes an unaligned value to a pointer.
+function write_unaligned<T>(dst: T*, src: T) -> void {
+    memcpy(dst, &src, sizeof(T));
+}
+
+/// Writes bytes to a pointer.
+function write_bytes<T>(dst: T*, val: u8, count: u64) -> void {
+    memset(dst, val, count * sizeof(T));
+}
+
+// ============================================================================
+// Pointer Comparison
+// ============================================================================
+
+/// Compares two pointers for equality.
+function eq<T>(a: T*, b: T*) -> boolean {
+    return a == b;
+}
+
+/// Returns true if a is less than b.
+function lt<T>(a: T*, b: T*) -> boolean {
+    return a < b;
+}
+
+/// Returns true if a is less than or equal to b.
+function le<T>(a: T*, b: T*) -> boolean {
+    return a <= b;
+}
+
+/// Returns true if a is greater than b.
+function gt<T>(a: T*, b: T*) -> boolean {
+    return a > b;
+}
+
+/// Returns true if a is greater than or equal to b.
+function ge<T>(a: T*, b: T*) -> boolean {
+    return a >= b;
+}
+
+// ============================================================================
+// Pointer Hashing
+// ============================================================================
+
+/// Returns a hash of a pointer (its address).
+function hash<T>(ptr: T*) -> u64 {
+    return ptr;
+}
+
+// ============================================================================
+// Slice from Raw Parts
+// ============================================================================
+
+/// A slice representing a contiguous sequence of elements.
+type struct Slice<T> {
+    ptr: T*;
+    len: u64;
+}
+
+implement struct Slice<T> {
+    /// Creates a slice from raw parts.
+    ///
+    /// # Safety
+    /// - `ptr` must be valid for `len` elements.
+    /// - The total size must not overflow.
+    static function from_raw_parts(ptr: T*, len: u64) -> Slice<T> {
+        return Slice { ptr: ptr, len: len };
+    }
+
+    /// Creates an empty slice.
+    static function empty() -> Slice<T> {
+        return Slice { ptr: null, len: 0 };
+    }
+
+    /// Returns the length of the slice.
+    function len(self) -> u64 {
+        return self.len;
+    }
+
+    /// Returns true if the slice is empty.
+    function is_empty(self) -> boolean {
+        return self.len == 0;
+    }
+
+    /// Returns a pointer to the first element.
+    function as_ptr(self) -> T* {
+        return self.ptr;
+    }
+
+    /// Returns the element at the given index.
+    function get(self, index: u64) -> Option<T> {
+        if (index >= self.len) {
+            return Option::None;
+        }
+        return Option::Some(self.ptr[index]);
+    }
+
+    /// Returns a reference to the element at the given index.
+    /// Panics if out of bounds.
+    function index(self, index: u64) -> T* {
+        if (index >= self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+        return &self.ptr[index];
+    }
+
+    /// Returns the first element.
+    function first(self) -> Option<T> {
+        return self.get(0);
+    }
+
+    /// Returns the last element.
+    function last(self) -> Option<T> {
+        if (self.len == 0) {
+            return Option::None;
+        }
+        return self.get(self.len - 1);
+    }
+
+    /// Returns a sub-slice.
+    function slice(self, start: u64, end: u64) -> Slice<T> {
+        if (start > end || end > self.len) {
+            panic("slice bounds out of range", FILE, LINE);
+        }
+        return Slice {
+            ptr: mem::offset(self.ptr, start),
+            len: end - start
+        };
+    }
+
+    /// Splits the slice at the given index.
+    function split_at(self, mid: u64) -> Pair<Slice<T>, Slice<T>> {
+        if (mid > self.len) {
+            panic("split index out of bounds", FILE, LINE);
+        }
+        return Pair {
+            first: Slice { ptr: self.ptr, len: mid },
+            second: Slice { ptr: mem::offset(self.ptr, mid), len: self.len - mid }
+        };
+    }
+
+    /// Copies elements from another slice.
+    function copy_from_slice(self: &mut Slice<T>, src: Slice<T>) -> void {
+        if (self.len != src.len) {
+            panic("slice lengths don't match", FILE, LINE);
+        }
+        mem::copy(self.ptr, src.ptr, self.len);
+    }
+
+    /// Fills the slice with a value.
+    function fill(self: &mut Slice<T>, value: T) -> void {
+        mut i: u64 = 0;
+        while (i < self.len) {
+            self.ptr[i] = value;
+            i = i + 1;
+        }
+    }
+
+    /// Reverses the slice in place.
+    function reverse(self: &mut Slice<T>) -> void {
+        if (self.len <= 1) {
+            return;
+        }
+        mut left: u64 = 0;
+        mut right: u64 = self.len - 1;
+        while (left < right) {
+            mem::swap(&self.ptr[left], &self.ptr[right]);
+            left = left + 1;
+            right = right - 1;
+        }
+    }
+
+    /// Swaps two elements.
+    function swap(self: &mut Slice<T>, a: u64, b: u64) -> void {
+        if (a >= self.len || b >= self.len) {
+            panic("swap index out of bounds", FILE, LINE);
+        }
+        mem::swap(&self.ptr[a], &self.ptr[b]);
+    }
+
+    /// Returns true if the slice contains the value.
+    function contains(self, value: T) -> boolean {
+        mut i: u64 = 0;
+        while (i < self.len) {
+            if (self.ptr[i] == value) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Binary search for a value in a sorted slice.
+    /// Returns the index if found.
+    function binary_search(self, value: T) -> Option<u64> {
+        if (self.len == 0) {
+            return Option::None;
+        }
+
+        mut low: u64 = 0;
+        mut high: u64 = self.len;
+
+        while (low < high) {
+            const mid: u64 = low + (high - low) / 2;
+            if (self.ptr[mid] == value) {
+                return Option::Some(mid);
+            } else if (self.ptr[mid] < value) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        return Option::None;
+    }
+}
+
+/// Pair type for split operations.
+type struct Pair<T, U> {
+    first: T;
+    second: U;
+}

@@ -1,0 +1,612 @@
+///! FFI Module
+///!
+///! Foreign Function Interface for C interoperability.
+
+namespace std::ffi;
+
+import <core/intrinsics>;
+import <core/option>;
+import <collections/string>;
+import <collections/vec>;
+import <io/error>;
+import <alloc/global>;
+
+// ============================================================================
+// C Types
+// ============================================================================
+
+/// C char type.
+type c_char = i8;
+
+/// C signed char.
+type c_schar = i8;
+
+/// C unsigned char.
+type c_uchar = u8;
+
+/// C short.
+type c_short = i16;
+
+/// C unsigned short.
+type c_ushort = u16;
+
+/// C int.
+type c_int = i32;
+
+/// C unsigned int.
+type c_uint = u32;
+
+/// C long.
+type c_long = i64;
+
+/// C unsigned long.
+type c_ulong = u64;
+
+/// C long long.
+type c_longlong = i64;
+
+/// C unsigned long long.
+type c_ulonglong = u64;
+
+/// C float.
+type c_float = f32;
+
+/// C double.
+type c_double = f64;
+
+/// C size_t.
+type c_size_t = u64;
+
+/// C ssize_t.
+type c_ssize_t = i64;
+
+/// C ptrdiff_t.
+type c_ptrdiff_t = i64;
+
+/// C intptr_t.
+type c_intptr_t = i64;
+
+/// C uintptr_t.
+type c_uintptr_t = u64;
+
+/// C void (for pointers).
+type c_void = void;
+
+// ============================================================================
+// CString
+// ============================================================================
+
+/// An owned, C-compatible string.
+type struct CString {
+    ptr: c_char*;
+    len: u64;
+    cap: u64;
+}
+
+implement struct CString {
+    /// Creates a new CString from a string.
+    static function new(s: string) -> CString {
+        const len: u64 = strlen(s);
+        const ptr: c_char* = malloc(len + 1) as c_char*;
+        if (ptr == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        memcpy(ptr as void*, s as void*, len);
+        ptr[len] = 0;
+
+        return CString {
+            ptr: ptr,
+            len: len,
+            cap: len + 1
+        };
+    }
+
+    /// Creates a CString from a String.
+    static function from_string(s: String) -> CString {
+        return CString::new(s.as_cstr());
+    }
+
+    /// Creates a CString from raw bytes (must include null terminator).
+    static function from_raw(ptr: c_char*, len: u64) -> CString {
+        return CString {
+            ptr: ptr,
+            len: len,
+            cap: len + 1
+        };
+    }
+
+    /// Creates an empty CString.
+    static function empty() -> CString {
+        const ptr: c_char* = malloc(1) as c_char*;
+        if (ptr == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        ptr[0] = 0;
+
+        return CString {
+            ptr: ptr,
+            len: 0,
+            cap: 1
+        };
+    }
+
+    /// Returns the CString as a C string pointer.
+    function as_ptr(self) -> c_char* {
+        return self.ptr;
+    }
+
+    /// Returns the CString as a string.
+    function as_cstr(self) -> string {
+        return self.ptr as string;
+    }
+
+    /// Returns the length (not including null terminator).
+    function len(self) -> u64 {
+        return self.len;
+    }
+
+    /// Returns true if empty.
+    function is_empty(self) -> boolean {
+        return self.len == 0;
+    }
+
+    /// Converts to a String.
+    function to_string(self) -> String {
+        return String::from_cstr(self.ptr as string);
+    }
+
+    /// Converts to a CStr (borrowed).
+    function as_c_str(self) -> CStr {
+        return CStr::from_ptr(self.ptr);
+    }
+
+    /// Releases ownership and returns the raw pointer.
+    function into_raw(self: &mut CString) -> c_char* {
+        const ptr: c_char* = self.ptr;
+        self.ptr = null;
+        self.len = 0;
+        self.cap = 0;
+        return ptr;
+    }
+
+    /// Creates a CString from a raw pointer (takes ownership).
+    static function from_raw_ptr(ptr: c_char*) -> CString {
+        const len: u64 = strlen(ptr as string);
+        return CString {
+            ptr: ptr,
+            len: len,
+            cap: len + 1
+        };
+    }
+
+    /// Drops the CString.
+    function drop(self) -> void {
+        if (self.ptr != null) {
+            free(self.ptr as void*);
+        }
+    }
+}
+
+// ============================================================================
+// CStr (Borrowed C String)
+// ============================================================================
+
+/// A borrowed reference to a C string.
+type struct CStr {
+    ptr: c_char*;
+}
+
+implement struct CStr {
+    /// Creates a CStr from a raw pointer.
+    static function from_ptr(ptr: c_char*) -> CStr {
+        return CStr { ptr: ptr };
+    }
+
+    /// Creates a CStr from a string literal.
+    static function from_cstr(s: string) -> CStr {
+        return CStr { ptr: s as c_char* };
+    }
+
+    /// Returns the raw pointer.
+    function as_ptr(self) -> c_char* {
+        return self.ptr;
+    }
+
+    /// Returns as a string.
+    function as_cstr(self) -> string {
+        return self.ptr as string;
+    }
+
+    /// Returns the length (not including null terminator).
+    function len(self) -> u64 {
+        return strlen(self.ptr as string);
+    }
+
+    /// Returns true if empty.
+    function is_empty(self) -> boolean {
+        return self.ptr[0] == 0;
+    }
+
+    /// Converts to a String.
+    function to_string(self) -> String {
+        return String::from_cstr(self.ptr as string);
+    }
+
+    /// Converts to an owned CString.
+    function to_cstring(self) -> CString {
+        return CString::new(self.ptr as string);
+    }
+
+    /// Returns a byte slice.
+    function to_bytes(self) -> (u8*, u64) {
+        const len: u64 = self.len();
+        return (self.ptr as u8*, len);
+    }
+
+    /// Returns a byte slice with the null terminator.
+    function to_bytes_with_nul(self) -> (u8*, u64) {
+        const len: u64 = self.len() + 1;
+        return (self.ptr as u8*, len);
+    }
+}
+
+// ============================================================================
+// OsStr (OS String)
+// ============================================================================
+
+/// A borrowed reference to an OS-specific string.
+type struct OsStr {
+    ptr: u8*;
+    len: u64;
+}
+
+implement struct OsStr {
+    /// Creates an OsStr from a string.
+    static function from_str(s: string) -> OsStr {
+        return OsStr {
+            ptr: s as u8*,
+            len: strlen(s)
+        };
+    }
+
+    /// Creates an OsStr from bytes.
+    static function from_bytes(bytes: u8*, len: u64) -> OsStr {
+        return OsStr {
+            ptr: bytes,
+            len: len
+        };
+    }
+
+    /// Returns the raw pointer.
+    function as_ptr(self) -> u8* {
+        return self.ptr;
+    }
+
+    /// Returns the length.
+    function len(self) -> u64 {
+        return self.len;
+    }
+
+    /// Returns true if empty.
+    function is_empty(self) -> boolean {
+        return self.len == 0;
+    }
+
+    /// Converts to a String (lossy).
+    function to_string_lossy(self) -> String {
+        return String::from_utf8_lossy(self.ptr, self.len);
+    }
+
+    /// Converts to an OsString.
+    function to_os_string(self) -> OsString {
+        return OsString::from_bytes(self.ptr, self.len);
+    }
+}
+
+// ============================================================================
+// OsString (Owned OS String)
+// ============================================================================
+
+/// An owned OS-specific string.
+type struct OsString {
+    data: Vec<u8>;
+}
+
+implement struct OsString {
+    /// Creates a new empty OsString.
+    static function new() -> OsString {
+        return OsString { data: Vec::new() };
+    }
+
+    /// Creates an OsString from a string.
+    static function from_str(s: string) -> OsString {
+        mut data: Vec<u8> = Vec::new();
+        mut i: u64 = 0;
+        while (s[i] != 0) {
+            data.push(s[i]);
+            i = i + 1;
+        }
+        return OsString { data: data };
+    }
+
+    /// Creates an OsString from bytes.
+    static function from_bytes(bytes: u8*, len: u64) -> OsString {
+        mut data: Vec<u8> = Vec::with_capacity(len);
+        mut i: u64 = 0;
+        while (i < len) {
+            data.push(bytes[i]);
+            i = i + 1;
+        }
+        return OsString { data: data };
+    }
+
+    /// Creates an OsString from a String.
+    static function from_string(s: String) -> OsString {
+        return OsString::from_str(s.as_cstr());
+    }
+
+    /// Returns the length.
+    function len(self) -> u64 {
+        return self.data.len();
+    }
+
+    /// Returns true if empty.
+    function is_empty(self) -> boolean {
+        return self.data.is_empty();
+    }
+
+    /// Pushes a string.
+    function push_str(self: &mut OsString, s: string) -> void {
+        mut i: u64 = 0;
+        while (s[i] != 0) {
+            self.data.push(s[i]);
+            i = i + 1;
+        }
+    }
+
+    /// Clears the string.
+    function clear(self: &mut OsString) -> void {
+        self.data.clear();
+    }
+
+    /// Converts to an OsStr.
+    function as_os_str(self) -> OsStr {
+        return OsStr::from_bytes(self.data.as_ptr(), self.data.len());
+    }
+
+    /// Converts to a String (lossy).
+    function to_string_lossy(self) -> String {
+        return String::from_utf8_lossy(self.data.as_ptr(), self.data.len());
+    }
+
+    /// Drops the OsString.
+    function drop(self) -> void {
+        self.data.drop();
+    }
+}
+
+// ============================================================================
+// VaList (Variable Arguments)
+// ============================================================================
+
+/// Variable argument list (C va_list).
+type struct VaList {
+    ptr: void*;
+}
+
+implement struct VaList {
+    /// Starts accessing variable arguments.
+    static function start(args: void*) -> VaList {
+        return VaList { ptr: args };
+    }
+
+    /// Gets the next argument as a specific type.
+    function arg_i32(self: &mut VaList) -> i32 {
+        return va_arg_i32(&self.ptr);
+    }
+
+    function arg_i64(self: &mut VaList) -> i64 {
+        return va_arg_i64(&self.ptr);
+    }
+
+    function arg_u64(self: &mut VaList) -> u64 {
+        return va_arg_u64(&self.ptr);
+    }
+
+    function arg_f64(self: &mut VaList) -> f64 {
+        return va_arg_f64(&self.ptr);
+    }
+
+    function arg_ptr(self: &mut VaList) -> void* {
+        return va_arg_ptr(&self.ptr);
+    }
+
+    /// Copies the va_list.
+    function copy(self) -> VaList {
+        return VaList { ptr: self.ptr };
+    }
+
+    /// Ends accessing variable arguments.
+    function end(self) -> void {
+        // No-op in most implementations
+    }
+}
+
+// ============================================================================
+// Dynamic Library Loading
+// ============================================================================
+
+/// A handle to a dynamically loaded library.
+type struct Library {
+    handle: void*;
+}
+
+implement struct Library {
+    /// Opens a dynamic library.
+    static function open(path: string) -> IoResult<Library> {
+        const handle: void* = dlopen(path, RTLD_NOW);
+        if (handle == null) {
+            const error: string = dlerror();
+            return IoResult::Err(IoError::new(IoErrorKind::Other, error));
+        }
+        return IoResult::Ok(Library { handle: handle });
+    }
+
+    /// Opens the main program as a library.
+    static function main_program() -> IoResult<Library> {
+        const handle: void* = dlopen(null, RTLD_NOW);
+        if (handle == null) {
+            const error: string = dlerror();
+            return IoResult::Err(IoError::new(IoErrorKind::Other, error));
+        }
+        return IoResult::Ok(Library { handle: handle });
+    }
+
+    /// Gets a symbol from the library.
+    function get_symbol(self, name: string) -> Option<void*> {
+        const sym: void* = dlsym(self.handle, name);
+        if (sym == null) {
+            return Option::None;
+        }
+        return Option::Some(sym);
+    }
+
+    /// Gets a function pointer from the library.
+    function get_function<F>(self, name: string) -> Option<F> {
+        const sym: void* = dlsym(self.handle, name);
+        if (sym == null) {
+            return Option::None;
+        }
+        return Option::Some(sym as F);
+    }
+
+    /// Closes the library.
+    function close(self) -> IoResult<void> {
+        if (dlclose(self.handle) != 0) {
+            const error: string = dlerror();
+            return IoResult::Err(IoError::new(IoErrorKind::Other, error));
+        }
+        return IoResult::Ok(());
+    }
+}
+
+/// Dynamic library loading flags.
+const RTLD_NOW: i32 = 2;
+const RTLD_LAZY: i32 = 1;
+const RTLD_GLOBAL: i32 = 256;
+const RTLD_LOCAL: i32 = 0;
+
+// ============================================================================
+// Memory Layout
+// ============================================================================
+
+/// Memory layout for a type.
+type struct Layout {
+    size: u64;
+    align: u64;
+}
+
+implement struct Layout {
+    /// Creates a layout with the given size and alignment.
+    static function new(size: u64, align: u64) -> Layout {
+        return Layout { size: size, align: align };
+    }
+
+    /// Creates a layout for an array of items.
+    static function array(element_size: u64, element_align: u64, count: u64) -> Layout {
+        // Align element size to element alignment
+        const aligned_size: u64 = (element_size + element_align - 1) & ~(element_align - 1);
+        return Layout {
+            size: aligned_size * count,
+            align: element_align
+        };
+    }
+
+    /// Returns the size.
+    function size(self) -> u64 {
+        return self.size;
+    }
+
+    /// Returns the alignment.
+    function align(self) -> u64 {
+        return self.align;
+    }
+
+    /// Returns the padding needed after this layout.
+    function padding_needed_for(self, align: u64) -> u64 {
+        const len: u64 = self.size;
+        const aligned: u64 = (len + align - 1) & ~(align - 1);
+        return aligned - len;
+    }
+}
+
+// ============================================================================
+// Null-Terminated Arrays
+// ============================================================================
+
+/// A null-terminated array of pointers.
+type struct NullTerminatedArray<T> {
+    ptr: T**;
+}
+
+implement struct NullTerminatedArray<T> {
+    /// Creates from a raw pointer.
+    static function from_ptr(ptr: T**) -> NullTerminatedArray<T> {
+        return NullTerminatedArray { ptr: ptr };
+    }
+
+    /// Returns the raw pointer.
+    function as_ptr(self) -> T** {
+        return self.ptr;
+    }
+
+    /// Returns the length.
+    function len(self) -> u64 {
+        mut count: u64 = 0;
+        while (self.ptr[count] != null) {
+            count = count + 1;
+        }
+        return count;
+    }
+
+    /// Gets an element.
+    function get(self, index: u64) -> Option<T*> {
+        mut i: u64 = 0;
+        while (i <= index) {
+            if (self.ptr[i] == null) {
+                return Option::None;
+            }
+            i = i + 1;
+        }
+        return Option::Some(self.ptr[index]);
+    }
+
+    /// Converts to a Vec.
+    function to_vec(self) -> Vec<T*> {
+        mut result: Vec<T*> = Vec::new();
+        mut i: u64 = 0;
+        while (self.ptr[i] != null) {
+            result.push(self.ptr[i]);
+            i = i + 1;
+        }
+        return result;
+    }
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function strlen(s: string) -> u64;
+intrinsic function memcpy(dest: void*, src: void*, n: u64) -> void*;
+intrinsic function va_arg_i32(ap: void**) -> i32;
+intrinsic function va_arg_i64(ap: void**) -> i64;
+intrinsic function va_arg_u64(ap: void**) -> u64;
+intrinsic function va_arg_f64(ap: void**) -> f64;
+intrinsic function va_arg_ptr(ap: void**) -> void*;
+intrinsic function dlopen(filename: string, flags: i32) -> void*;
+intrinsic function dlsym(handle: void*, symbol: string) -> void*;
+intrinsic function dlclose(handle: void*) -> i32;
+intrinsic function dlerror() -> string;
+
