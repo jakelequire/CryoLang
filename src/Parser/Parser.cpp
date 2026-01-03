@@ -5167,7 +5167,7 @@ namespace Cryo
                       static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
 
             collected_tokens.push_back(_current_token);
-            type_string += std::string(_current_token.text()) + " ";
+            type_string += std::string(_current_token.text());
             advance();
 
             // Break on certain terminators, but only if we're not inside angle brackets
