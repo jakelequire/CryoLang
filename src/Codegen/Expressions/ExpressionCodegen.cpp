@@ -268,7 +268,57 @@ namespace Cryo::Codegen
         {
             if (value_str.length() >= 3 && value_str.front() == '\'' && value_str.back() == '\'')
             {
-                char char_value = value_str[1]; // Simple case, handle escapes later
+                char char_value;
+                // Check for escape sequences (e.g., '\n', '\0', '\t')
+                if (value_str[1] == '\\' && value_str.length() >= 4)
+                {
+                    char escape_char = value_str[2];
+                    switch (escape_char)
+                    {
+                    case 'n':
+                        char_value = '\n';
+                        break;
+                    case 't':
+                        char_value = '\t';
+                        break;
+                    case 'r':
+                        char_value = '\r';
+                        break;
+                    case '\\':
+                        char_value = '\\';
+                        break;
+                    case '\'':
+                        char_value = '\'';
+                        break;
+                    case '"':
+                        char_value = '"';
+                        break;
+                    case '0':
+                        char_value = '\0';
+                        break;
+                    case 'a':
+                        char_value = '\a';
+                        break;
+                    case 'b':
+                        char_value = '\b';
+                        break;
+                    case 'f':
+                        char_value = '\f';
+                        break;
+                    case 'v':
+                        char_value = '\v';
+                        break;
+                    default:
+                        // Unknown escape, use the character literally
+                        char_value = escape_char;
+                        break;
+                    }
+                }
+                else
+                {
+                    // Simple case - no escape sequence
+                    char_value = value_str[1];
+                }
                 return generate_char_literal(char_value);
             }
             else
