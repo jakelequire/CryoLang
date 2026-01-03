@@ -1,0 +1,215 @@
+///! Thread-Local Storage
+///!
+///! Thread-local storage for per-thread data.
+
+namespace std::thread::local;
+
+import <core/intrinsics>;
+import <core/option>;
+import <alloc/global>;
+
+// ============================================================================
+// Thread Local Key
+// ============================================================================
+
+/// A key for thread-local storage.
+type struct LocalKey<T> {
+    key: pthread_key_t;
+    init: fn() -> T;
+    initialized: boolean;
+}
+
+implement struct LocalKey<T> {
+    /// Creates a new thread-local key with an initializer.
+    static function new(init: fn() -> T) -> LocalKey<T> {
+        mut key: pthread_key_t;
+        pthread_key_create(&key, thread_local_destructor<T>);
+
+        return LocalKey {
+            key: key,
+            init: init,
+            initialized: true
+        };
+    }
+
+    /// Gets or initializes the thread-local value.
+    function with<R>(self: &mut LocalKey<T>, f: fn(T*) -> R) -> R {
+        mut ptr: T* = pthread_getspecific(self.key);
+
+        if (ptr == null) {
+            // Initialize for this thread
+            ptr = malloc(sizeof(T));
+            if (ptr == null) {
+                panic("allocation failed", FILE, LINE);
+            }
+            *ptr = self.init();
+            pthread_setspecific(self.key, ptr);
+        }
+
+        return f(ptr);
+    }
+
+    /// Gets the thread-local value if initialized.
+    function try_with<R>(self, f: fn(T*) -> R) -> Option<R> {
+        const ptr: T* = pthread_getspecific(self.key);
+        if (ptr == null) {
+            return Option::None;
+        }
+        return Option::Some(f(ptr));
+    }
+
+    /// Sets the value for the current thread.
+    function set(self: &mut LocalKey<T>, value: T) -> void {
+        mut ptr: T* = pthread_getspecific(self.key);
+
+        if (ptr == null) {
+            ptr = malloc(sizeof(T));
+            if (ptr == null) {
+                panic("allocation failed", FILE, LINE);
+            }
+            pthread_setspecific(self.key, ptr);
+        }
+
+        *ptr = value;
+    }
+
+    /// Takes the value from the current thread.
+    function take(self: &mut LocalKey<T>) -> Option<T> {
+        const ptr: T* = pthread_getspecific(self.key);
+        if (ptr == null) {
+            return Option::None;
+        }
+
+        const value: T = *ptr;
+        pthread_setspecific(self.key, null);
+        free(ptr);
+
+        return Option::Some(value);
+    }
+
+    /// Drops the key.
+    function drop(self) -> void {
+        if (self.initialized) {
+            pthread_key_delete(self.key);
+        }
+    }
+}
+
+/// Destructor for thread-local values.
+function thread_local_destructor<T>(ptr: void*) -> void {
+    if (ptr != null) {
+        free(ptr);
+    }
+}
+
+// ============================================================================
+// Thread Local Cell
+// ============================================================================
+
+/// A simpler thread-local cell.
+type struct ThreadLocal<T> {
+    key: LocalKey<T>;
+}
+
+implement struct ThreadLocal<T> {
+    /// Creates a new thread-local with the given initializer.
+    static function new(init: fn() -> T) -> ThreadLocal<T> {
+        return ThreadLocal {
+            key: LocalKey::new(init)
+        };
+    }
+
+    /// Gets a reference to the value.
+    function get(self: &mut ThreadLocal<T>) -> T* {
+        mut result: T* = null;
+        self.key.with(fn(ptr: T*) -> void {
+            result = ptr;
+        });
+        return result;
+    }
+
+    /// Sets the value.
+    function set(self: &mut ThreadLocal<T>, value: T) -> void {
+        self.key.set(value);
+    }
+
+    /// Drops the thread-local.
+    function drop(self) -> void {
+        self.key.drop();
+    }
+}
+
+// ============================================================================
+// Scoped Thread Local
+// ============================================================================
+
+/// A thread-local that can be set for a scope.
+type struct ScopedThreadLocal<T> {
+    key: pthread_key_t;
+}
+
+implement struct ScopedThreadLocal<T> {
+    /// Creates a new scoped thread-local.
+    static function new() -> ScopedThreadLocal<T> {
+        mut key: pthread_key_t;
+        pthread_key_create(&key, null);
+        return ScopedThreadLocal { key: key };
+    }
+
+    /// Sets the value for the duration of the closure.
+    function set<R>(self: &mut ScopedThreadLocal<T>, value: T*, f: fn() -> R) -> R {
+        const old: void* = pthread_getspecific(self.key);
+        pthread_setspecific(self.key, value);
+
+        const result: R = f();
+
+        pthread_setspecific(self.key, old);
+        return result;
+    }
+
+    /// Gets the current value.
+    function get(self) -> T* {
+        return pthread_getspecific(self.key);
+    }
+
+    /// Returns true if a value is set.
+    function is_set(self) -> boolean {
+        return pthread_getspecific(self.key) != null;
+    }
+
+    /// Calls a function with the current value.
+    function with<R>(self, f: fn(T*) -> R) -> R {
+        return f(self.get());
+    }
+
+    /// Drops the scoped thread-local.
+    function drop(self) -> void {
+        pthread_key_delete(self.key);
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a new thread-local.
+function thread_local<T>(init: fn() -> T) -> ThreadLocal<T> {
+    return ThreadLocal::new(init);
+}
+
+/// Creates a new scoped thread-local.
+function scoped_thread_local<T>() -> ScopedThreadLocal<T> {
+    return ScopedThreadLocal::new();
+}
+
+// ============================================================================
+// Types and Intrinsics
+// ============================================================================
+
+type pthread_key_t = u32;
+
+intrinsic function pthread_key_create(key: pthread_key_t*, destructor: fn(void*) -> void) -> i32;
+intrinsic function pthread_key_delete(key: pthread_key_t) -> i32;
+intrinsic function pthread_getspecific(key: pthread_key_t) -> void*;
+intrinsic function pthread_setspecific(key: pthread_key_t, value: void*) -> i32;
+

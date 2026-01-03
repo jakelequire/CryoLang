@@ -1,0 +1,620 @@
+///! Network Addresses
+///!
+///! IP addresses and socket addresses for network communication.
+
+namespace std::net::addr;
+
+import <core/intrinsics>;
+import <core/option>;
+import <collections/string>;
+import <io/error>;
+
+// ============================================================================
+// IPv4 Address
+// ============================================================================
+
+/// An IPv4 address.
+type struct Ipv4Addr {
+    octets: u8[4];
+}
+
+implement struct Ipv4Addr {
+    /// Creates a new IPv4 address.
+    static function new(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+        mut addr: Ipv4Addr;
+        addr.octets[0] = a;
+        addr.octets[1] = b;
+        addr.octets[2] = c;
+        addr.octets[3] = d;
+        return addr;
+    }
+
+    /// The unspecified address (0.0.0.0).
+    static function unspecified() -> Ipv4Addr {
+        return Ipv4Addr::new(0, 0, 0, 0);
+    }
+
+    /// The localhost address (127.0.0.1).
+    static function localhost() -> Ipv4Addr {
+        return Ipv4Addr::new(127, 0, 0, 1);
+    }
+
+    /// The broadcast address (255.255.255.255).
+    static function broadcast() -> Ipv4Addr {
+        return Ipv4Addr::new(255, 255, 255, 255);
+    }
+
+    /// Creates from octets array.
+    static function from_octets(octets: u8[4]) -> Ipv4Addr {
+        mut addr: Ipv4Addr;
+        addr.octets = octets;
+        return addr;
+    }
+
+    /// Creates from a 32-bit integer (network byte order).
+    static function from_u32(n: u32) -> Ipv4Addr {
+        return Ipv4Addr::new(
+            ((n >> 24) & 0xFF) as u8,
+            ((n >> 16) & 0xFF) as u8,
+            ((n >> 8) & 0xFF) as u8,
+            (n & 0xFF) as u8
+        );
+    }
+
+    /// Parses an IPv4 address from a string.
+    static function parse(s: string) -> Option<Ipv4Addr> {
+        mut octets: u8[4];
+        mut octet_idx: u64 = 0;
+        mut current: u32 = 0;
+        mut has_digit: boolean = false;
+
+        mut i: u64 = 0;
+        while (s[i] != 0) {
+            const c: u8 = s[i];
+
+            if (c >= '0' && c <= '9') {
+                current = current * 10 + ((c - '0') as u32);
+                if (current > 255) {
+                    return Option::None;
+                }
+                has_digit = true;
+            } else if (c == '.') {
+                if (!has_digit || octet_idx >= 3) {
+                    return Option::None;
+                }
+                octets[octet_idx] = current as u8;
+                octet_idx = octet_idx + 1;
+                current = 0;
+                has_digit = false;
+            } else {
+                return Option::None;
+            }
+
+            i = i + 1;
+        }
+
+        if (!has_digit || octet_idx != 3) {
+            return Option::None;
+        }
+        octets[3] = current as u8;
+
+        return Option::Some(Ipv4Addr::from_octets(octets));
+    }
+
+    /// Returns the octets.
+    function octets(self) -> u8[4] {
+        return self.octets;
+    }
+
+    /// Converts to a 32-bit integer (network byte order).
+    function to_u32(self) -> u32 {
+        return ((self.octets[0] as u32) << 24) |
+               ((self.octets[1] as u32) << 16) |
+               ((self.octets[2] as u32) << 8) |
+               (self.octets[3] as u32);
+    }
+
+    /// Returns true if this is the unspecified address.
+    function is_unspecified(self) -> boolean {
+        return self.octets[0] == 0 && self.octets[1] == 0 &&
+               self.octets[2] == 0 && self.octets[3] == 0;
+    }
+
+    /// Returns true if this is the localhost address.
+    function is_loopback(self) -> boolean {
+        return self.octets[0] == 127;
+    }
+
+    /// Returns true if this is a private address.
+    function is_private(self) -> boolean {
+        // 10.0.0.0/8
+        if (self.octets[0] == 10) {
+            return true;
+        }
+        // 172.16.0.0/12
+        if (self.octets[0] == 172 && (self.octets[1] >= 16 && self.octets[1] <= 31)) {
+            return true;
+        }
+        // 192.168.0.0/16
+        if (self.octets[0] == 192 && self.octets[1] == 168) {
+            return true;
+        }
+        return false;
+    }
+
+    /// Returns true if this is a link-local address.
+    function is_link_local(self) -> boolean {
+        return self.octets[0] == 169 && self.octets[1] == 254;
+    }
+
+    /// Returns true if this is a multicast address.
+    function is_multicast(self) -> boolean {
+        return self.octets[0] >= 224 && self.octets[0] <= 239;
+    }
+
+    /// Returns true if this is the broadcast address.
+    function is_broadcast(self) -> boolean {
+        return self.octets[0] == 255 && self.octets[1] == 255 &&
+               self.octets[2] == 255 && self.octets[3] == 255;
+    }
+
+    /// Returns true if this is a documentation address.
+    function is_documentation(self) -> boolean {
+        // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        if (self.octets[0] == 192 && self.octets[1] == 0 && self.octets[2] == 2) {
+            return true;
+        }
+        if (self.octets[0] == 198 && self.octets[1] == 51 && self.octets[2] == 100) {
+            return true;
+        }
+        if (self.octets[0] == 203 && self.octets[1] == 0 && self.octets[2] == 113) {
+            return true;
+        }
+        return false;
+    }
+
+    /// Returns true if addresses are equal.
+    function eq(self, other: Ipv4Addr) -> boolean {
+        return self.octets[0] == other.octets[0] &&
+               self.octets[1] == other.octets[1] &&
+               self.octets[2] == other.octets[2] &&
+               self.octets[3] == other.octets[3];
+    }
+
+    /// Converts to an IPv6 mapped address.
+    function to_ipv6_mapped(self) -> Ipv6Addr {
+        mut segments: u16[8];
+        segments[0] = 0;
+        segments[1] = 0;
+        segments[2] = 0;
+        segments[3] = 0;
+        segments[4] = 0;
+        segments[5] = 0xFFFF;
+        segments[6] = ((self.octets[0] as u16) << 8) | (self.octets[1] as u16);
+        segments[7] = ((self.octets[2] as u16) << 8) | (self.octets[3] as u16);
+        return Ipv6Addr::from_segments(segments);
+    }
+
+    /// Converts to an IPv6 compatible address.
+    function to_ipv6_compatible(self) -> Ipv6Addr {
+        mut segments: u16[8];
+        segments[0] = 0;
+        segments[1] = 0;
+        segments[2] = 0;
+        segments[3] = 0;
+        segments[4] = 0;
+        segments[5] = 0;
+        segments[6] = ((self.octets[0] as u16) << 8) | (self.octets[1] as u16);
+        segments[7] = ((self.octets[2] as u16) << 8) | (self.octets[3] as u16);
+        return Ipv6Addr::from_segments(segments);
+    }
+}
+
+// ============================================================================
+// IPv6 Address
+// ============================================================================
+
+/// An IPv6 address.
+type struct Ipv6Addr {
+    segments: u16[8];
+}
+
+implement struct Ipv6Addr {
+    /// Creates a new IPv6 address.
+    static function new(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16, g: u16, h: u16) -> Ipv6Addr {
+        mut addr: Ipv6Addr;
+        addr.segments[0] = a;
+        addr.segments[1] = b;
+        addr.segments[2] = c;
+        addr.segments[3] = d;
+        addr.segments[4] = e;
+        addr.segments[5] = f;
+        addr.segments[6] = g;
+        addr.segments[7] = h;
+        return addr;
+    }
+
+    /// The unspecified address (::).
+    static function unspecified() -> Ipv6Addr {
+        return Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0);
+    }
+
+    /// The localhost address (::1).
+    static function localhost() -> Ipv6Addr {
+        return Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
+    }
+
+    /// Creates from segments array.
+    static function from_segments(segments: u16[8]) -> Ipv6Addr {
+        mut addr: Ipv6Addr;
+        addr.segments = segments;
+        return addr;
+    }
+
+    /// Creates from octets array.
+    static function from_octets(octets: u8[16]) -> Ipv6Addr {
+        mut segments: u16[8];
+        mut i: u64 = 0;
+        while (i < 8) {
+            segments[i] = ((octets[i * 2] as u16) << 8) | (octets[i * 2 + 1] as u16);
+            i = i + 1;
+        }
+        return Ipv6Addr::from_segments(segments);
+    }
+
+    /// Returns the segments.
+    function segments(self) -> u16[8] {
+        return self.segments;
+    }
+
+    /// Returns the octets.
+    function octets(self) -> u8[16] {
+        mut octets: u8[16];
+        mut i: u64 = 0;
+        while (i < 8) {
+            octets[i * 2] = ((self.segments[i] >> 8) & 0xFF) as u8;
+            octets[i * 2 + 1] = (self.segments[i] & 0xFF) as u8;
+            i = i + 1;
+        }
+        return octets;
+    }
+
+    /// Returns true if this is the unspecified address.
+    function is_unspecified(self) -> boolean {
+        mut i: u64 = 0;
+        while (i < 8) {
+            if (self.segments[i] != 0) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// Returns true if this is the localhost address.
+    function is_loopback(self) -> boolean {
+        mut i: u64 = 0;
+        while (i < 7) {
+            if (self.segments[i] != 0) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return self.segments[7] == 1;
+    }
+
+    /// Returns true if this is a multicast address.
+    function is_multicast(self) -> boolean {
+        return (self.segments[0] & 0xFF00) == 0xFF00;
+    }
+
+    /// Returns true if this is a link-local address.
+    function is_unicast_link_local(self) -> boolean {
+        return (self.segments[0] & 0xFFC0) == 0xFE80;
+    }
+
+    /// Returns true if this is a unique local address.
+    function is_unique_local(self) -> boolean {
+        return (self.segments[0] & 0xFE00) == 0xFC00;
+    }
+
+    /// Returns true if this is an IPv4-mapped address.
+    function is_ipv4_mapped(self) -> boolean {
+        return self.segments[0] == 0 && self.segments[1] == 0 &&
+               self.segments[2] == 0 && self.segments[3] == 0 &&
+               self.segments[4] == 0 && self.segments[5] == 0xFFFF;
+    }
+
+    /// Returns true if this is an IPv4-compatible address.
+    function is_ipv4_compatible(self) -> boolean {
+        if (!self.is_unspecified() && !self.is_loopback()) {
+            return self.segments[0] == 0 && self.segments[1] == 0 &&
+                   self.segments[2] == 0 && self.segments[3] == 0 &&
+                   self.segments[4] == 0 && self.segments[5] == 0;
+        }
+        return false;
+    }
+
+    /// Converts to an IPv4 address if this is an IPv4-mapped or compatible address.
+    function to_ipv4(self) -> Option<Ipv4Addr> {
+        if (self.is_ipv4_mapped() || self.is_ipv4_compatible()) {
+            return Option::Some(Ipv4Addr::new(
+                ((self.segments[6] >> 8) & 0xFF) as u8,
+                (self.segments[6] & 0xFF) as u8,
+                ((self.segments[7] >> 8) & 0xFF) as u8,
+                (self.segments[7] & 0xFF) as u8
+            ));
+        }
+        return Option::None;
+    }
+
+    /// Returns true if addresses are equal.
+    function eq(self, other: Ipv6Addr) -> boolean {
+        mut i: u64 = 0;
+        while (i < 8) {
+            if (self.segments[i] != other.segments[i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+}
+
+// ============================================================================
+// IP Address (either v4 or v6)
+// ============================================================================
+
+/// An IP address, either IPv4 or IPv6.
+enum IpAddr {
+    V4(Ipv4Addr);
+    V6(Ipv6Addr);
+}
+
+implement enum IpAddr {
+    /// Returns true if this is an IPv4 address.
+    function is_ipv4(self) -> boolean {
+        match (self) {
+            IpAddr::V4(_) => { return true; }
+            IpAddr::V6(_) => { return false; }
+        }
+    }
+
+    /// Returns true if this is an IPv6 address.
+    function is_ipv6(self) -> boolean {
+        return !self.is_ipv4();
+    }
+
+    /// Returns true if this is the unspecified address.
+    function is_unspecified(self) -> boolean {
+        match (self) {
+            IpAddr::V4(addr) => { return addr.is_unspecified(); }
+            IpAddr::V6(addr) => { return addr.is_unspecified(); }
+        }
+    }
+
+    /// Returns true if this is the loopback address.
+    function is_loopback(self) -> boolean {
+        match (self) {
+            IpAddr::V4(addr) => { return addr.is_loopback(); }
+            IpAddr::V6(addr) => { return addr.is_loopback(); }
+        }
+    }
+
+    /// Returns true if this is a multicast address.
+    function is_multicast(self) -> boolean {
+        match (self) {
+            IpAddr::V4(addr) => { return addr.is_multicast(); }
+            IpAddr::V6(addr) => { return addr.is_multicast(); }
+        }
+    }
+
+    /// Returns true if addresses are equal.
+    function eq(self, other: IpAddr) -> boolean {
+        match (self) {
+            IpAddr::V4(a) => {
+                match (other) {
+                    IpAddr::V4(b) => { return a.eq(b); }
+                    IpAddr::V6(_) => { return false; }
+                }
+            }
+            IpAddr::V6(a) => {
+                match (other) {
+                    IpAddr::V4(_) => { return false; }
+                    IpAddr::V6(b) => { return a.eq(b); }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Socket Address IPv4
+// ============================================================================
+
+/// An IPv4 socket address.
+type struct SocketAddrV4 {
+    ip: Ipv4Addr;
+    port: u16;
+}
+
+implement struct SocketAddrV4 {
+    /// Creates a new socket address.
+    static function new(ip: Ipv4Addr, port: u16) -> SocketAddrV4 {
+        return SocketAddrV4 { ip: ip, port: port };
+    }
+
+    /// Returns the IP address.
+    function ip(self) -> Ipv4Addr {
+        return self.ip;
+    }
+
+    /// Returns the port.
+    function port(self) -> u16 {
+        return self.port;
+    }
+
+    /// Sets the IP address.
+    function set_ip(self: &mut SocketAddrV4, ip: Ipv4Addr) -> void {
+        self.ip = ip;
+    }
+
+    /// Sets the port.
+    function set_port(self: &mut SocketAddrV4, port: u16) -> void {
+        self.port = port;
+    }
+
+    /// Returns true if addresses are equal.
+    function eq(self, other: SocketAddrV4) -> boolean {
+        return self.ip.eq(other.ip) && self.port == other.port;
+    }
+}
+
+// ============================================================================
+// Socket Address IPv6
+// ============================================================================
+
+/// An IPv6 socket address.
+type struct SocketAddrV6 {
+    ip: Ipv6Addr;
+    port: u16;
+    flowinfo: u32;
+    scope_id: u32;
+}
+
+implement struct SocketAddrV6 {
+    /// Creates a new socket address.
+    static function new(ip: Ipv6Addr, port: u16, flowinfo: u32, scope_id: u32) -> SocketAddrV6 {
+        return SocketAddrV6 {
+            ip: ip,
+            port: port,
+            flowinfo: flowinfo,
+            scope_id: scope_id
+        };
+    }
+
+    /// Returns the IP address.
+    function ip(self) -> Ipv6Addr {
+        return self.ip;
+    }
+
+    /// Returns the port.
+    function port(self) -> u16 {
+        return self.port;
+    }
+
+    /// Returns the flow info.
+    function flowinfo(self) -> u32 {
+        return self.flowinfo;
+    }
+
+    /// Returns the scope ID.
+    function scope_id(self) -> u32 {
+        return self.scope_id;
+    }
+
+    /// Sets the IP address.
+    function set_ip(self: &mut SocketAddrV6, ip: Ipv6Addr) -> void {
+        self.ip = ip;
+    }
+
+    /// Sets the port.
+    function set_port(self: &mut SocketAddrV6, port: u16) -> void {
+        self.port = port;
+    }
+
+    /// Returns true if addresses are equal.
+    function eq(self, other: SocketAddrV6) -> boolean {
+        return self.ip.eq(other.ip) && self.port == other.port &&
+               self.flowinfo == other.flowinfo && self.scope_id == other.scope_id;
+    }
+}
+
+// ============================================================================
+// Socket Address (either v4 or v6)
+// ============================================================================
+
+/// A socket address, either IPv4 or IPv6.
+enum SocketAddr {
+    V4(SocketAddrV4);
+    V6(SocketAddrV6);
+}
+
+implement enum SocketAddr {
+    /// Creates a new IPv4 socket address.
+    static function new_v4(ip: Ipv4Addr, port: u16) -> SocketAddr {
+        return SocketAddr::V4(SocketAddrV4::new(ip, port));
+    }
+
+    /// Creates a new IPv6 socket address.
+    static function new_v6(ip: Ipv6Addr, port: u16) -> SocketAddr {
+        return SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0));
+    }
+
+    /// Returns the IP address.
+    function ip(self) -> IpAddr {
+        match (self) {
+            SocketAddr::V4(addr) => { return IpAddr::V4(addr.ip()); }
+            SocketAddr::V6(addr) => { return IpAddr::V6(addr.ip()); }
+        }
+    }
+
+    /// Returns the port.
+    function port(self) -> u16 {
+        match (self) {
+            SocketAddr::V4(addr) => { return addr.port(); }
+            SocketAddr::V6(addr) => { return addr.port(); }
+        }
+    }
+
+    /// Returns true if this is an IPv4 address.
+    function is_ipv4(self) -> boolean {
+        match (self) {
+            SocketAddr::V4(_) => { return true; }
+            SocketAddr::V6(_) => { return false; }
+        }
+    }
+
+    /// Returns true if this is an IPv6 address.
+    function is_ipv6(self) -> boolean {
+        return !self.is_ipv4();
+    }
+
+    /// Returns true if addresses are equal.
+    function eq(self, other: SocketAddr) -> boolean {
+        match (self) {
+            SocketAddr::V4(a) => {
+                match (other) {
+                    SocketAddr::V4(b) => { return a.eq(b); }
+                    SocketAddr::V6(_) => { return false; }
+                }
+            }
+            SocketAddr::V6(a) => {
+                match (other) {
+                    SocketAddr::V4(_) => { return false; }
+                    SocketAddr::V6(b) => { return a.eq(b); }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Parses an IPv4 address from a string.
+function parse_ipv4(s: string) -> Option<Ipv4Addr> {
+    return Ipv4Addr::parse(s);
+}
+
+/// Creates an IPv4 socket address.
+function socket_addr_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+    return SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port));
+}
+
+/// Creates a localhost socket address.
+function localhost(port: u16) -> SocketAddr {
+    return SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::localhost(), port));
+}
+

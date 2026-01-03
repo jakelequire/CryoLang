@@ -1,0 +1,409 @@
+///! Write Operations
+///!
+///! Core types and functions for writing data to I/O sinks.
+
+namespace std::io::writer;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+import <collections/string>;
+import <io/error>;
+
+// ============================================================================
+// Writer
+// ============================================================================
+
+/// A sink to which bytes can be written.
+type struct Writer {
+    /// Opaque handle to the underlying sink.
+    handle: void*;
+    /// Write function pointer.
+    write_fn: fn(void*, u8*, u64) -> IoResult<u64>;
+    /// Flush function pointer.
+    flush_fn: fn(void*) -> IoResult<void>;
+    /// Close function pointer (optional).
+    close_fn: fn(void*) -> IoResult<void>;
+}
+
+implement struct Writer {
+    /// Creates a writer from function pointers.
+    static function from_fns(
+        handle: void*,
+        write_fn: fn(void*, u8*, u64) -> IoResult<u64>,
+        flush_fn: fn(void*) -> IoResult<void>,
+        close_fn: fn(void*) -> IoResult<void>
+    ) -> Writer {
+        return Writer {
+            handle: handle,
+            write_fn: write_fn,
+            flush_fn: flush_fn,
+            close_fn: close_fn
+        };
+    }
+
+    /// Writes bytes from the buffer.
+    /// Returns the number of bytes written.
+    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+        return self.write_fn(self.handle, buf, len);
+    }
+
+    /// Writes all bytes from the buffer.
+    function write_all(self, buf: u8*, len: u64) -> IoResult<void> {
+        mut total_written: u64 = 0;
+
+        while (total_written < len) {
+            const result: IoResult<u64> = self.write(&buf[total_written], len - total_written);
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Err(IoError::new(IoErrorKind::WriteZero, "failed to write whole buffer"));
+                }
+                IoResult::Ok(n) => {
+                    total_written = total_written + n;
+                }
+            }
+        }
+
+        return IoResult::Ok(void);
+    }
+
+    /// Writes a string.
+    function write_str(self, s: string) -> IoResult<u64> {
+        const len: u64 = strlen(s);
+        return self.write(s, len);
+    }
+
+    /// Writes a String.
+    function write_string(self, s: String) -> IoResult<u64> {
+        return self.write(s.as_bytes(), s.len());
+    }
+
+    /// Writes a formatted string (simple version).
+    function write_fmt(self, s: string) -> IoResult<void> {
+        const len: u64 = strlen(s);
+        return self.write_all(s, len);
+    }
+
+    /// Writes a single byte.
+    function write_byte(self, b: u8) -> IoResult<void> {
+        return self.write_all(&b, 1);
+    }
+
+    /// Flushes the writer.
+    function flush(self) -> IoResult<void> {
+        if (self.flush_fn != null) {
+            return self.flush_fn(self.handle);
+        }
+        return IoResult::Ok(void);
+    }
+
+    /// Closes the writer.
+    function close(self) -> IoResult<void> {
+        const flush_result: IoResult<void> = self.flush();
+        match (flush_result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(_) => {}
+        }
+
+        if (self.close_fn != null) {
+            return self.close_fn(self.handle);
+        }
+        return IoResult::Ok(void);
+    }
+}
+
+// ============================================================================
+// Write Utilities
+// ============================================================================
+
+/// Writes a u8 to the writer.
+function write_u8(writer: Writer, value: u8) -> IoResult<void> {
+    return writer.write_all(&value, 1);
+}
+
+/// Writes a little-endian u16 to the writer.
+function write_u16_le(writer: Writer, value: u16) -> IoResult<void> {
+    mut buf: u8[2];
+    buf[0] = value & 0xFF;
+    buf[1] = (value >> 8) & 0xFF;
+    return writer.write_all(&buf[0], 2);
+}
+
+/// Writes a big-endian u16 to the writer.
+function write_u16_be(writer: Writer, value: u16) -> IoResult<void> {
+    mut buf: u8[2];
+    buf[0] = (value >> 8) & 0xFF;
+    buf[1] = value & 0xFF;
+    return writer.write_all(&buf[0], 2);
+}
+
+/// Writes a little-endian u32 to the writer.
+function write_u32_le(writer: Writer, value: u32) -> IoResult<void> {
+    mut buf: u8[4];
+    buf[0] = value & 0xFF;
+    buf[1] = (value >> 8) & 0xFF;
+    buf[2] = (value >> 16) & 0xFF;
+    buf[3] = (value >> 24) & 0xFF;
+    return writer.write_all(&buf[0], 4);
+}
+
+/// Writes a big-endian u32 to the writer.
+function write_u32_be(writer: Writer, value: u32) -> IoResult<void> {
+    mut buf: u8[4];
+    buf[0] = (value >> 24) & 0xFF;
+    buf[1] = (value >> 16) & 0xFF;
+    buf[2] = (value >> 8) & 0xFF;
+    buf[3] = value & 0xFF;
+    return writer.write_all(&buf[0], 4);
+}
+
+/// Writes a little-endian u64 to the writer.
+function write_u64_le(writer: Writer, value: u64) -> IoResult<void> {
+    mut buf: u8[8];
+    mut i: u64 = 0;
+    while (i < 8) {
+        buf[i] = (value >> (i * 8)) & 0xFF;
+        i = i + 1;
+    }
+    return writer.write_all(&buf[0], 8);
+}
+
+/// Writes a big-endian u64 to the writer.
+function write_u64_be(writer: Writer, value: u64) -> IoResult<void> {
+    mut buf: u8[8];
+    mut i: u64 = 0;
+    while (i < 8) {
+        buf[i] = (value >> ((7 - i) * 8)) & 0xFF;
+        i = i + 1;
+    }
+    return writer.write_all(&buf[0], 8);
+}
+
+// ============================================================================
+// Sink Writer
+// ============================================================================
+
+/// A writer that discards all data.
+type struct Sink {}
+
+implement struct Sink {
+    /// Creates a sink writer.
+    static function new() -> Sink {
+        return Sink {};
+    }
+
+    /// Writes (discards all data).
+    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+        return IoResult::Ok(len);
+    }
+
+    /// Flushes (no-op).
+    function flush(self) -> IoResult<void> {
+        return IoResult::Ok(void);
+    }
+}
+
+// ============================================================================
+// Broadcast Writer
+// ============================================================================
+
+/// A writer that writes to multiple writers.
+type struct Broadcast {
+    writers: Writer*;
+    count: u64;
+}
+
+implement struct Broadcast {
+    /// Creates a broadcast writer.
+    static function new(writers: Writer*, count: u64) -> Broadcast {
+        return Broadcast {
+            writers: writers,
+            count: count
+        };
+    }
+
+    /// Writes to all underlying writers.
+    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+        mut i: u64 = 0;
+        while (i < self.count) {
+            const result: IoResult<u64> = self.writers[i].write(buf, len);
+            match (result) {
+                IoResult::Err(e) => { return IoResult::Err(e); }
+                IoResult::Ok(_) => {}
+            }
+            i = i + 1;
+        }
+        return IoResult::Ok(len);
+    }
+
+    /// Flushes all underlying writers.
+    function flush(self) -> IoResult<void> {
+        mut i: u64 = 0;
+        while (i < self.count) {
+            const result: IoResult<void> = self.writers[i].flush();
+            match (result) {
+                IoResult::Err(e) => { return IoResult::Err(e); }
+                IoResult::Ok(_) => {}
+            }
+            i = i + 1;
+        }
+        return IoResult::Ok(void);
+    }
+}
+
+// ============================================================================
+// Line Writer
+// ============================================================================
+
+/// A writer that flushes after each newline.
+type struct LineWriter {
+    inner: Writer;
+    buf: u8*;
+    buf_len: u64;
+    buf_cap: u64;
+}
+
+implement struct LineWriter {
+    /// Creates a line writer.
+    static function new(inner: Writer) -> LineWriter {
+        const DEFAULT_CAP: u64 = 1024;
+        const buf: u8* = malloc(DEFAULT_CAP);
+        if (buf == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        return LineWriter {
+            inner: inner,
+            buf: buf,
+            buf_len: 0,
+            buf_cap: DEFAULT_CAP
+        };
+    }
+
+    /// Writes to the line writer.
+    function write(self: &mut LineWriter, buf: u8*, len: u64) -> IoResult<u64> {
+        // Find the last newline
+        mut last_newline: i64 = -1;
+        mut i: u64 = 0;
+        while (i < len) {
+            if (buf[i] == 10) { // '\n'
+                last_newline = i;
+            }
+            i = i + 1;
+        }
+
+        if (last_newline < 0) {
+            // No newline, buffer everything
+            return self.buffer_write(buf, len);
+        }
+
+        // Flush buffer and write up to and including newline
+        const result: IoResult<void> = self.flush_buf();
+        match (result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(_) => {}
+        }
+
+        const write_len: u64 = last_newline + 1;
+        const inner_result: IoResult<u64> = self.inner.write(buf, write_len);
+        match (inner_result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(n) => {
+                if (n < write_len) {
+                    return IoResult::Ok(n);
+                }
+            }
+        }
+
+        const flush_result: IoResult<void> = self.inner.flush();
+        match (flush_result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(_) => {}
+        }
+
+        // Buffer the rest
+        const remaining: u64 = len - write_len;
+        if (remaining > 0) {
+            self.buffer_write(&buf[write_len], remaining);
+        }
+
+        return IoResult::Ok(len);
+    }
+
+    /// Buffers data.
+    function buffer_write(self: &mut LineWriter, buf: u8*, len: u64) -> IoResult<u64> {
+        // Ensure capacity
+        if (self.buf_len + len > self.buf_cap) {
+            const result: IoResult<void> = self.flush_buf();
+            match (result) {
+                IoResult::Err(e) => { return IoResult::Err(e); }
+                IoResult::Ok(_) => {}
+            }
+
+            if (len > self.buf_cap) {
+                // Too large for buffer, write directly
+                return self.inner.write(buf, len);
+            }
+        }
+
+        memcpy(&self.buf[self.buf_len], buf, len);
+        self.buf_len = self.buf_len + len;
+        return IoResult::Ok(len);
+    }
+
+    /// Flushes the internal buffer.
+    function flush_buf(self: &mut LineWriter) -> IoResult<void> {
+        if (self.buf_len == 0) {
+            return IoResult::Ok(void);
+        }
+
+        const result: IoResult<void> = self.inner.write_all(self.buf, self.buf_len);
+        self.buf_len = 0;
+        return result;
+    }
+
+    /// Flushes completely.
+    function flush(self: &mut LineWriter) -> IoResult<void> {
+        const buf_result: IoResult<void> = self.flush_buf();
+        match (buf_result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(_) => {}
+        }
+        return self.inner.flush();
+    }
+
+    /// Drops the line writer.
+    function drop(self) -> void {
+        self.flush();
+        if (self.buf != null) {
+            free(self.buf);
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a sink writer.
+function sink() -> Sink {
+    return Sink::new();
+}
+
+/// Creates a broadcast writer.
+function broadcast(writers: Writer*, count: u64) -> Broadcast {
+    return Broadcast::new(writers, count);
+}
+
+/// Creates a line writer.
+function line_writer(inner: Writer) -> LineWriter {
+    return LineWriter::new(inner);
+}
+

@@ -1,0 +1,509 @@
+///! Stack Allocator Module
+///!
+///! A stack allocator allocates memory in a LIFO (last-in, first-out) manner.
+///! Memory can only be freed in the reverse order it was allocated.
+///!
+///! Stack allocators are excellent for:
+///! - Temporary allocations within a scope
+///! - Compiler/interpreter temporary data
+///! - Parsing intermediate structures
+///! - Per-frame game allocations with nested scopes
+
+namespace std::alloc::stack;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+
+// ============================================================================
+// Stack Configuration
+// ============================================================================
+
+/// Default stack size (1 MB).
+const DEFAULT_STACK_SIZE: u64 = 1048576;
+
+/// Marker alignment.
+const MARKER_ALIGN: u64 = 8;
+
+// ============================================================================
+// Stack Marker
+// ============================================================================
+
+/// A marker representing a position in the stack.
+/// Used for bulk deallocation back to a previous state.
+type struct StackMarker {
+    offset: u64;
+}
+
+implement struct StackMarker {
+    /// Creates a new marker at the given offset.
+    static function new(offset: u64) -> StackMarker {
+        return StackMarker { offset: offset };
+    }
+
+    /// Returns the offset.
+    function offset(self) -> u64 {
+        return self.offset;
+    }
+}
+
+// ============================================================================
+// Stack Allocator
+// ============================================================================
+
+/// A stack-based memory allocator.
+type struct StackAllocator {
+    /// Pointer to the stack memory.
+    data: u8*;
+    /// Total size of the stack.
+    size: u64;
+    /// Current offset (top of stack).
+    offset: u64;
+    /// Peak usage.
+    peak_usage: u64;
+    /// Number of allocations.
+    alloc_count: u64;
+    /// Whether we own the memory.
+    owns_memory: boolean;
+}
+
+implement struct StackAllocator {
+    /// Creates a new stack allocator with the default size.
+    static function new() -> StackAllocator {
+        return StackAllocator::with_size(DEFAULT_STACK_SIZE);
+    }
+
+    /// Creates a new stack allocator with the specified size.
+    static function with_size(size: u64) -> StackAllocator {
+        const data: u8* = malloc(size);
+        if (data == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        return StackAllocator {
+            data: data,
+            size: size,
+            offset: 0,
+            peak_usage: 0,
+            alloc_count: 0,
+            owns_memory: true
+        };
+    }
+
+    /// Creates a stack allocator from existing memory.
+    static function from_memory(data: u8*, size: u64) -> StackAllocator {
+        return StackAllocator {
+            data: data,
+            size: size,
+            offset: 0,
+            peak_usage: 0,
+            alloc_count: 0,
+            owns_memory: false
+        };
+    }
+
+    /// Returns a marker at the current position.
+    function marker(self) -> StackMarker {
+        return StackMarker::new(self.offset);
+    }
+
+    /// Allocates memory from the stack.
+    function alloc(self: &mut StackAllocator, size: u64) -> void* {
+        return self.alloc_aligned(size, MARKER_ALIGN);
+    }
+
+    /// Allocates aligned memory from the stack.
+    function alloc_aligned(self: &mut StackAllocator, size: u64, align: u64) -> void* {
+        if (size == 0) {
+            return align; // Return dangling pointer
+        }
+
+        // Calculate aligned offset
+        const current_addr: u64 = self.data + self.offset;
+        const aligned_addr: u64 = mem::align_up(current_addr, align);
+        const padding: u64 = aligned_addr - current_addr;
+        const total_size: u64 = padding + size;
+
+        if (self.offset + total_size > self.size) {
+            return null; // Out of memory
+        }
+
+        self.offset = self.offset + total_size;
+        self.alloc_count = self.alloc_count + 1;
+
+        if (self.offset > self.peak_usage) {
+            self.peak_usage = self.offset;
+        }
+
+        return aligned_addr;
+    }
+
+    /// Allocates zeroed memory from the stack.
+    function alloc_zeroed(self: &mut StackAllocator, size: u64) -> void* {
+        const ptr: void* = self.alloc(size);
+        if (ptr != null) {
+            memset(ptr, 0, size);
+        }
+        return ptr;
+    }
+
+    /// Allocates a single value of type T.
+    function alloc_one<T>(self: &mut StackAllocator) -> T* {
+        return self.alloc_aligned(sizeof(T), alignof(T));
+    }
+
+    /// Allocates and initializes a single value.
+    function alloc_init<T>(self: &mut StackAllocator, value: T) -> T* {
+        const ptr: T* = self.alloc_one<T>();
+        if (ptr != null) {
+            *ptr = value;
+        }
+        return ptr;
+    }
+
+    /// Allocates an array of n elements.
+    function alloc_array<T>(self: &mut StackAllocator, n: u64) -> T* {
+        return self.alloc_aligned(sizeof(T) * n, alignof(T));
+    }
+
+    /// Allocates a zeroed array.
+    function alloc_array_zeroed<T>(self: &mut StackAllocator, n: u64) -> T* {
+        const ptr: T* = self.alloc_array<T>(n);
+        if (ptr != null) {
+            memset(ptr, 0, sizeof(T) * n);
+        }
+        return ptr;
+    }
+
+    /// Frees memory back to the given marker.
+    function free_to_marker(self: &mut StackAllocator, marker: StackMarker) -> void {
+        if (marker.offset <= self.offset) {
+            self.offset = marker.offset;
+        }
+    }
+
+    /// Resets the stack, freeing all allocations.
+    function reset(self: &mut StackAllocator) -> void {
+        self.offset = 0;
+        self.alloc_count = 0;
+    }
+
+    /// Returns the current offset.
+    function current_offset(self) -> u64 {
+        return self.offset;
+    }
+
+    /// Returns the remaining capacity.
+    function remaining(self) -> u64 {
+        return self.size - self.offset;
+    }
+
+    /// Returns the total size.
+    function capacity(self) -> u64 {
+        return self.size;
+    }
+
+    /// Returns the peak usage.
+    function peak(self) -> u64 {
+        return self.peak_usage;
+    }
+
+    /// Returns the number of allocations.
+    function num_allocations(self) -> u64 {
+        return self.alloc_count;
+    }
+
+    /// Returns true if the stack is empty.
+    function is_empty(self) -> boolean {
+        return self.offset == 0;
+    }
+
+    /// Drops the stack allocator.
+    function drop(self) -> void {
+        if (self.owns_memory && self.data != null) {
+            free(self.data);
+        }
+    }
+}
+
+// ============================================================================
+// Scoped Stack Allocation
+// ============================================================================
+
+/// A scope guard for automatic deallocation when leaving a scope.
+type struct StackScope {
+    allocator: StackAllocator*;
+    marker: StackMarker;
+}
+
+implement struct StackScope {
+    /// Begins a new allocation scope.
+    static function begin(allocator: &mut StackAllocator) -> StackScope {
+        return StackScope {
+            allocator: allocator,
+            marker: allocator.marker()
+        };
+    }
+
+    /// Allocates from this scope.
+    function alloc(self, size: u64) -> void* {
+        return self.allocator.alloc(size);
+    }
+
+    /// Allocates aligned memory from this scope.
+    function alloc_aligned(self, size: u64, align: u64) -> void* {
+        return self.allocator.alloc_aligned(size, align);
+    }
+
+    /// Allocates a single value.
+    function alloc_one<T>(self) -> T* {
+        return self.allocator.alloc_one<T>();
+    }
+
+    /// Allocates and initializes a value.
+    function alloc_init<T>(self, value: T) -> T* {
+        return self.allocator.alloc_init(value);
+    }
+
+    /// Allocates an array.
+    function alloc_array<T>(self, n: u64) -> T* {
+        return self.allocator.alloc_array<T>(n);
+    }
+
+    /// Ends the scope and frees all allocations made within it.
+    function end(self) -> void {
+        self.allocator.free_to_marker(self.marker);
+    }
+}
+
+// ============================================================================
+// Double-Ended Stack Allocator
+// ============================================================================
+
+/// A stack allocator that can allocate from both ends.
+/// Useful for separating temporary and persistent allocations.
+type struct DoubleEndedStack {
+    /// Pointer to the stack memory.
+    data: u8*;
+    /// Total size.
+    size: u64;
+    /// Front offset (grows up).
+    front_offset: u64;
+    /// Back offset (grows down).
+    back_offset: u64;
+    /// Whether we own the memory.
+    owns_memory: boolean;
+}
+
+implement struct DoubleEndedStack {
+    /// Creates a new double-ended stack.
+    static function new(size: u64) -> DoubleEndedStack {
+        const data: u8* = malloc(size);
+        if (data == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        return DoubleEndedStack {
+            data: data,
+            size: size,
+            front_offset: 0,
+            back_offset: size,
+            owns_memory: true
+        };
+    }
+
+    /// Creates from existing memory.
+    static function from_memory(data: u8*, size: u64) -> DoubleEndedStack {
+        return DoubleEndedStack {
+            data: data,
+            size: size,
+            front_offset: 0,
+            back_offset: size,
+            owns_memory: false
+        };
+    }
+
+    /// Allocates from the front (low addresses).
+    function alloc_front(self: &mut DoubleEndedStack, size: u64, align: u64) -> void* {
+        const current_addr: u64 = self.data + self.front_offset;
+        const aligned_addr: u64 = mem::align_up(current_addr, align);
+        const padding: u64 = aligned_addr - current_addr;
+        const new_front: u64 = self.front_offset + padding + size;
+
+        if (new_front > self.back_offset) {
+            return null;
+        }
+
+        self.front_offset = new_front;
+        return aligned_addr;
+    }
+
+    /// Allocates from the back (high addresses).
+    function alloc_back(self: &mut DoubleEndedStack, size: u64, align: u64) -> void* {
+        const aligned_size: u64 = mem::align_up(size, align);
+
+        if (aligned_size > self.back_offset - self.front_offset) {
+            return null;
+        }
+
+        const new_back: u64 = self.back_offset - aligned_size;
+        const aligned_addr: u64 = mem::align_down(self.data + new_back, align);
+
+        if (aligned_addr < self.data + self.front_offset) {
+            return null;
+        }
+
+        self.back_offset = aligned_addr - self.data;
+        return aligned_addr;
+    }
+
+    /// Returns a marker for the front.
+    function front_marker(self) -> StackMarker {
+        return StackMarker::new(self.front_offset);
+    }
+
+    /// Returns a marker for the back.
+    function back_marker(self) -> StackMarker {
+        return StackMarker::new(self.back_offset);
+    }
+
+    /// Frees the front to the given marker.
+    function free_front_to(self: &mut DoubleEndedStack, marker: StackMarker) -> void {
+        if (marker.offset <= self.front_offset) {
+            self.front_offset = marker.offset;
+        }
+    }
+
+    /// Frees the back to the given marker.
+    function free_back_to(self: &mut DoubleEndedStack, marker: StackMarker) -> void {
+        if (marker.offset >= self.back_offset && marker.offset <= self.size) {
+            self.back_offset = marker.offset;
+        }
+    }
+
+    /// Returns the remaining space.
+    function remaining(self) -> u64 {
+        return self.back_offset - self.front_offset;
+    }
+
+    /// Returns the front usage.
+    function front_usage(self) -> u64 {
+        return self.front_offset;
+    }
+
+    /// Returns the back usage.
+    function back_usage(self) -> u64 {
+        return self.size - self.back_offset;
+    }
+
+    /// Resets both ends.
+    function reset(self: &mut DoubleEndedStack) -> void {
+        self.front_offset = 0;
+        self.back_offset = self.size;
+    }
+
+    /// Resets only the front.
+    function reset_front(self: &mut DoubleEndedStack) -> void {
+        self.front_offset = 0;
+    }
+
+    /// Resets only the back.
+    function reset_back(self: &mut DoubleEndedStack) -> void {
+        self.back_offset = self.size;
+    }
+
+    /// Drops the allocator.
+    function drop(self) -> void {
+        if (self.owns_memory && self.data != null) {
+            free(self.data);
+        }
+    }
+}
+
+// ============================================================================
+// Thread-Local Stack
+// ============================================================================
+
+/// Per-thread scratch memory size.
+const SCRATCH_STACK_SIZE: u64 = 262144; // 256 KB
+
+/// Thread-local scratch stack for temporary allocations.
+/// Note: In a real implementation, this would use thread-local storage.
+mut g_scratch_stack: StackAllocator* = null;
+
+/// Gets or creates the thread-local scratch stack.
+function get_scratch_stack() -> StackAllocator* {
+    if (g_scratch_stack == null) {
+        g_scratch_stack = malloc(sizeof(StackAllocator));
+        if (g_scratch_stack != null) {
+            *g_scratch_stack = StackAllocator::with_size(SCRATCH_STACK_SIZE);
+        }
+    }
+    return g_scratch_stack;
+}
+
+/// Begins a scratch allocation scope.
+function scratch_begin() -> StackScope {
+    const stack: StackAllocator* = get_scratch_stack();
+    if (stack == null) {
+        panic("failed to get scratch stack", FILE, LINE);
+    }
+    return StackScope::begin(stack);
+}
+
+/// Ends a scratch allocation scope.
+function scratch_end(scope: StackScope) -> void {
+    scope.end();
+}
+
+// ============================================================================
+// Temporary Allocation Macros (as functions)
+// ============================================================================
+
+/// Allocates temporary memory that will be freed at end of scope.
+function temp_alloc(size: u64) -> void* {
+    const stack: StackAllocator* = get_scratch_stack();
+    if (stack == null) {
+        return null;
+    }
+    return stack.alloc(size);
+}
+
+/// Allocates a temporary value of type T.
+function temp_alloc_one<T>() -> T* {
+    const stack: StackAllocator* = get_scratch_stack();
+    if (stack == null) {
+        return null;
+    }
+    return stack.alloc_one<T>();
+}
+
+/// Allocates a temporary array.
+function temp_alloc_array<T>(n: u64) -> T* {
+    const stack: StackAllocator* = get_scratch_stack();
+    if (stack == null) {
+        return null;
+    }
+    return stack.alloc_array<T>(n);
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a new stack allocator with the default size.
+function new_stack() -> StackAllocator {
+    return StackAllocator::new();
+}
+
+/// Creates a new stack allocator with the specified size.
+function stack_with_size(size: u64) -> StackAllocator {
+    return StackAllocator::with_size(size);
+}
+
+/// Creates a new double-ended stack.
+function double_ended_stack(size: u64) -> DoubleEndedStack {
+    return DoubleEndedStack::new(size);
+}
+

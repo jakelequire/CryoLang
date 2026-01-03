@@ -1,0 +1,390 @@
+///! Standard I/O
+///!
+///! Standard input, output, and error streams.
+
+namespace std::io::stdio;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+import <collections/string>;
+import <io/error>;
+import <io/reader>;
+import <io/writer>;
+import <io/buffer>;
+
+// ============================================================================
+// Standard Streams
+// ============================================================================
+
+/// Standard input file descriptor.
+const STDIN_FILENO: i32 = 0;
+
+/// Standard output file descriptor.
+const STDOUT_FILENO: i32 = 1;
+
+/// Standard error file descriptor.
+const STDERR_FILENO: i32 = 2;
+
+// ============================================================================
+// Stdin
+// ============================================================================
+
+/// A handle to the standard input stream.
+type struct Stdin {
+    fd: i32;
+}
+
+implement struct Stdin {
+    /// Creates a new Stdin handle.
+    static function new() -> Stdin {
+        return Stdin { fd: STDIN_FILENO };
+    }
+
+    /// Reads bytes from stdin.
+    function read(self, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = read_syscall(self.fd, buf, len);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(result);
+    }
+
+    /// Reads a line from stdin.
+    function read_line(self, s: &mut String) -> IoResult<u64> {
+        mut total: u64 = 0;
+        mut buf: u8;
+
+        loop {
+            const result: IoResult<u64> = self.read(&buf, 1);
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Ok(total);
+                }
+                IoResult::Ok(_) => {
+                    s.push_byte(buf);
+                    total = total + 1;
+
+                    if (buf == 10) { // '\n'
+                        return IoResult::Ok(total);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Locks stdin for exclusive access.
+    function lock(self) -> StdinLock {
+        return StdinLock { inner: self };
+    }
+}
+
+/// A locked reference to Stdin.
+type struct StdinLock {
+    inner: Stdin;
+}
+
+implement struct StdinLock {
+    function read(self, buf: u8*, len: u64) -> IoResult<u64> {
+        return self.inner.read(buf, len);
+    }
+
+    function read_line(self, s: &mut String) -> IoResult<u64> {
+        return self.inner.read_line(s);
+    }
+}
+
+// ============================================================================
+// Stdout
+// ============================================================================
+
+/// A handle to the standard output stream.
+type struct Stdout {
+    fd: i32;
+}
+
+implement struct Stdout {
+    /// Creates a new Stdout handle.
+    static function new() -> Stdout {
+        return Stdout { fd: STDOUT_FILENO };
+    }
+
+    /// Writes bytes to stdout.
+    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = write_syscall(self.fd, buf, len);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(result);
+    }
+
+    /// Writes all bytes to stdout.
+    function write_all(self, buf: u8*, len: u64) -> IoResult<void> {
+        mut total: u64 = 0;
+        while (total < len) {
+            const result: IoResult<u64> = self.write(&buf[total], len - total);
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Err(IoError::new(IoErrorKind::WriteZero, "write returned 0"));
+                }
+                IoResult::Ok(n) => {
+                    total = total + n;
+                }
+            }
+        }
+        return IoResult::Ok(void);
+    }
+
+    /// Flushes stdout.
+    function flush(self) -> IoResult<void> {
+        // fdatasync or fsync would be used here
+        return IoResult::Ok(void);
+    }
+
+    /// Locks stdout for exclusive access.
+    function lock(self) -> StdoutLock {
+        return StdoutLock { inner: self };
+    }
+}
+
+/// A locked reference to Stdout.
+type struct StdoutLock {
+    inner: Stdout;
+}
+
+implement struct StdoutLock {
+    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+        return self.inner.write(buf, len);
+    }
+
+    function write_all(self, buf: u8*, len: u64) -> IoResult<void> {
+        return self.inner.write_all(buf, len);
+    }
+
+    function flush(self) -> IoResult<void> {
+        return self.inner.flush();
+    }
+}
+
+// ============================================================================
+// Stderr
+// ============================================================================
+
+/// A handle to the standard error stream.
+type struct Stderr {
+    fd: i32;
+}
+
+implement struct Stderr {
+    /// Creates a new Stderr handle.
+    static function new() -> Stderr {
+        return Stderr { fd: STDERR_FILENO };
+    }
+
+    /// Writes bytes to stderr.
+    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = write_syscall(self.fd, buf, len);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(result);
+    }
+
+    /// Writes all bytes to stderr.
+    function write_all(self, buf: u8*, len: u64) -> IoResult<void> {
+        mut total: u64 = 0;
+        while (total < len) {
+            const result: IoResult<u64> = self.write(&buf[total], len - total);
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Err(IoError::new(IoErrorKind::WriteZero, "write returned 0"));
+                }
+                IoResult::Ok(n) => {
+                    total = total + n;
+                }
+            }
+        }
+        return IoResult::Ok(void);
+    }
+
+    /// Flushes stderr.
+    function flush(self) -> IoResult<void> {
+        return IoResult::Ok(void);
+    }
+
+    /// Locks stderr for exclusive access.
+    function lock(self) -> StderrLock {
+        return StderrLock { inner: self };
+    }
+}
+
+/// A locked reference to Stderr.
+type struct StderrLock {
+    inner: Stderr;
+}
+
+implement struct StderrLock {
+    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+        return self.inner.write(buf, len);
+    }
+
+    function write_all(self, buf: u8*, len: u64) -> IoResult<void> {
+        return self.inner.write_all(buf, len);
+    }
+
+    function flush(self) -> IoResult<void> {
+        return self.inner.flush();
+    }
+}
+
+// ============================================================================
+// Global Accessors
+// ============================================================================
+
+/// Returns a handle to the standard input.
+function stdin() -> Stdin {
+    return Stdin::new();
+}
+
+/// Returns a handle to the standard output.
+function stdout() -> Stdout {
+    return Stdout::new();
+}
+
+/// Returns a handle to the standard error.
+function stderr() -> Stderr {
+    return Stderr::new();
+}
+
+// ============================================================================
+// Print Functions
+// ============================================================================
+
+/// Prints a string to stdout.
+function print(s: string) -> IoResult<void> {
+    const out: Stdout = stdout();
+    return out.write_all(s, strlen(s));
+}
+
+/// Prints a string to stdout with a newline.
+function println(s: string) -> IoResult<void> {
+    const out: Stdout = stdout();
+    const result: IoResult<void> = out.write_all(s, strlen(s));
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            const newline: u8 = 10;
+            return out.write_all(&newline, 1);
+        }
+    }
+}
+
+/// Prints a String to stdout.
+function print_string(s: String) -> IoResult<void> {
+    const out: Stdout = stdout();
+    return out.write_all(s.as_bytes(), s.len());
+}
+
+/// Prints a String to stdout with a newline.
+function println_string(s: String) -> IoResult<void> {
+    const out: Stdout = stdout();
+    const result: IoResult<void> = out.write_all(s.as_bytes(), s.len());
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            const newline: u8 = 10;
+            return out.write_all(&newline, 1);
+        }
+    }
+}
+
+/// Prints to stderr.
+function eprint(s: string) -> IoResult<void> {
+    const err: Stderr = stderr();
+    return err.write_all(s, strlen(s));
+}
+
+/// Prints to stderr with a newline.
+function eprintln(s: string) -> IoResult<void> {
+    const err: Stderr = stderr();
+    const result: IoResult<void> = err.write_all(s, strlen(s));
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            const newline: u8 = 10;
+            return err.write_all(&newline, 1);
+        }
+    }
+}
+
+// ============================================================================
+// Input Functions
+// ============================================================================
+
+/// Reads a line from stdin into a new String.
+function input() -> IoResult<String> {
+    const s: String = String::new();
+    const result: IoResult<u64> = stdin().read_line(&s);
+    match (result) {
+        IoResult::Err(e) => {
+            s.drop();
+            return IoResult::Err(e);
+        }
+        IoResult::Ok(_) => {
+            // Remove trailing newline
+            if (s.len() > 0 && s.as_bytes()[s.len() - 1] == 10) {
+                s.truncate(s.len() - 1);
+                // Also remove \r if present
+                if (s.len() > 0 && s.as_bytes()[s.len() - 1] == 13) {
+                    s.truncate(s.len() - 1);
+                }
+            }
+            return IoResult::Ok(s);
+        }
+    }
+}
+
+/// Prompts for input and reads a line.
+function prompt(message: string) -> IoResult<String> {
+    const print_result: IoResult<void> = print(message);
+    match (print_result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            const flush_result: IoResult<void> = stdout().flush();
+            match (flush_result) {
+                IoResult::Err(e) => { return IoResult::Err(e); }
+                IoResult::Ok(_) => { return input(); }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Syscall Wrappers (these would be intrinsics)
+// ============================================================================
+
+/// Read syscall wrapper.
+intrinsic function read_syscall(fd: i32, buf: u8*, count: u64) -> i64;
+
+/// Write syscall wrapper.
+intrinsic function write_syscall(fd: i32, buf: u8*, count: u64) -> i64;
+

@@ -1,0 +1,628 @@
+///! HashSet - Hash Set Collection
+///!
+///! A hash set for storing unique values.
+///! Implemented as a HashMap with unit values.
+
+namespace std::collections::hashset;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+import <collections/hashmap>;
+
+// ============================================================================
+// HashSet
+// ============================================================================
+
+/// A hash set for storing unique values.
+type struct HashSet<T> {
+    /// Array of entries.
+    entries: HashSetEntry<T>*;
+    /// Number of entries.
+    len: u64;
+    /// Capacity.
+    cap: u64;
+    /// Number of deleted entries.
+    deleted: u64;
+}
+
+/// An entry in the hash set.
+type struct HashSetEntry<T> {
+    value: T;
+    hash: u64;
+    state: u8;
+}
+
+const BUCKET_EMPTY: u8 = 0;
+const BUCKET_OCCUPIED: u8 = 1;
+const BUCKET_DELETED: u8 = 2;
+
+const DEFAULT_CAPACITY: u64 = 16;
+const MIN_CAPACITY: u64 = 8;
+const MAX_LOAD_FACTOR_NUM: u64 = 3;
+const MAX_LOAD_FACTOR_DEN: u64 = 4;
+
+implement struct HashSet<T> {
+    /// Creates a new empty HashSet.
+    static function new() -> HashSet<T> {
+        return HashSet {
+            entries: null,
+            len: 0,
+            cap: 0,
+            deleted: 0
+        };
+    }
+
+    /// Creates a HashSet with the specified capacity.
+    static function with_capacity(capacity: u64) -> HashSet<T> {
+        mut actual_cap: u64 = MIN_CAPACITY;
+        while (actual_cap < capacity) {
+            actual_cap = actual_cap * 2;
+        }
+
+        const entries: HashSetEntry<T>* = calloc(actual_cap, sizeof(HashSetEntry<T>));
+        if (entries == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        return HashSet {
+            entries: entries,
+            len: 0,
+            cap: actual_cap,
+            deleted: 0
+        };
+    }
+
+    // ========================================================================
+    // Capacity
+    // ========================================================================
+
+    /// Returns the number of elements.
+    function len(self) -> u64 {
+        return self.len;
+    }
+
+    /// Returns the capacity.
+    function capacity(self) -> u64 {
+        return self.cap;
+    }
+
+    /// Returns true if the set is empty.
+    function is_empty(self) -> boolean {
+        return self.len == 0;
+    }
+
+    // ========================================================================
+    // Lookup
+    // ========================================================================
+
+    /// Returns true if the set contains the value.
+    function contains(self, value: T, value_hash: u64) -> boolean {
+        return self.find_entry(value, value_hash).is_some();
+    }
+
+    /// Gets a reference to the value in the set.
+    function get(self, value: T, value_hash: u64) -> Option<T> {
+        const index: Option<u64> = self.find_entry(value, value_hash);
+        match (index) {
+            Option::None => { return Option::None; }
+            Option::Some(i) => {
+                return Option::Some(self.entries[i].value);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Modification
+    // ========================================================================
+
+    /// Inserts a value into the set.
+    /// Returns true if the value was newly inserted.
+    function insert(self: &mut HashSet<T>, value: T, value_hash: u64) -> boolean {
+        self.maybe_grow();
+
+        const mask: u64 = self.cap - 1;
+        mut index: u64 = value_hash & mask;
+        mut first_deleted: i64 = -1;
+
+        mut i: u64 = 0;
+        while (i < self.cap) {
+            const entry: HashSetEntry<T>* = &self.entries[index];
+
+            if (entry.state == BUCKET_EMPTY) {
+                mut insert_index: u64 = index;
+                if (first_deleted >= 0) {
+                    insert_index = first_deleted;
+                    self.deleted = self.deleted - 1;
+                }
+
+                self.entries[insert_index].value = value;
+                self.entries[insert_index].hash = value_hash;
+                self.entries[insert_index].state = BUCKET_OCCUPIED;
+                self.len = self.len + 1;
+                return true;
+            }
+
+            if (entry.state == BUCKET_DELETED) {
+                if (first_deleted < 0) {
+                    first_deleted = index;
+                }
+            } else if (entry.hash == value_hash && entry.value == value) {
+                return false; // Already exists
+            }
+
+            i = i + 1;
+            index = (value_hash + i * i) & mask;
+        }
+
+        panic("hash set full", FILE, LINE);
+        return false;
+    }
+
+    /// Removes a value from the set.
+    /// Returns true if the value was present.
+    function remove(self: &mut HashSet<T>, value: T, value_hash: u64) -> boolean {
+        if (self.cap == 0) {
+            return false;
+        }
+
+        const index: Option<u64> = self.find_entry(value, value_hash);
+        match (index) {
+            Option::None => { return false; }
+            Option::Some(i) => {
+                self.entries[i].state = BUCKET_DELETED;
+                self.len = self.len - 1;
+                self.deleted = self.deleted + 1;
+                return true;
+            }
+        }
+    }
+
+    /// Takes a value from the set.
+    function take(self: &mut HashSet<T>, value: T, value_hash: u64) -> Option<T> {
+        if (self.cap == 0) {
+            return Option::None;
+        }
+
+        const index: Option<u64> = self.find_entry(value, value_hash);
+        match (index) {
+            Option::None => { return Option::None; }
+            Option::Some(i) => {
+                const result: T = self.entries[i].value;
+                self.entries[i].state = BUCKET_DELETED;
+                self.len = self.len - 1;
+                self.deleted = self.deleted + 1;
+                return Option::Some(result);
+            }
+        }
+    }
+
+    /// Clears the set.
+    function clear(self: &mut HashSet<T>) -> void {
+        if (self.cap > 0) {
+            memset(self.entries, 0, sizeof(HashSetEntry<T>) * self.cap);
+        }
+        self.len = 0;
+        self.deleted = 0;
+    }
+
+    // ========================================================================
+    // Set Operations
+    // ========================================================================
+
+    /// Returns true if self is a subset of other.
+    function is_subset(self, other: HashSet<T>) -> boolean {
+        if (self.len > other.len) {
+            return false;
+        }
+
+        mut i: u64 = 0;
+        while (i < self.cap) {
+            if (self.entries[i].state == BUCKET_OCCUPIED) {
+                if (!other.contains(self.entries[i].value, self.entries[i].hash)) {
+                    return false;
+                }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// Returns true if self is a superset of other.
+    function is_superset(self, other: HashSet<T>) -> boolean {
+        return other.is_subset(self);
+    }
+
+    /// Returns true if self and other have no elements in common.
+    function is_disjoint(self, other: HashSet<T>) -> boolean {
+        // Iterate over the smaller set
+        if (self.len <= other.len) {
+            mut i: u64 = 0;
+            while (i < self.cap) {
+                if (self.entries[i].state == BUCKET_OCCUPIED) {
+                    if (other.contains(self.entries[i].value, self.entries[i].hash)) {
+                        return false;
+                    }
+                }
+                i = i + 1;
+            }
+        } else {
+            mut i: u64 = 0;
+            while (i < other.cap) {
+                if (other.entries[i].state == BUCKET_OCCUPIED) {
+                    if (self.contains(other.entries[i].value, other.entries[i].hash)) {
+                        return false;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return true;
+    }
+
+    /// Returns the union of self and other.
+    function union(self, other: HashSet<T>) -> HashSet<T> {
+        const result: HashSet<T> = HashSet::with_capacity(self.len + other.len);
+
+        // Add all from self
+        mut i: u64 = 0;
+        while (i < self.cap) {
+            if (self.entries[i].state == BUCKET_OCCUPIED) {
+                result.insert(self.entries[i].value, self.entries[i].hash);
+            }
+            i = i + 1;
+        }
+
+        // Add all from other
+        i = 0;
+        while (i < other.cap) {
+            if (other.entries[i].state == BUCKET_OCCUPIED) {
+                result.insert(other.entries[i].value, other.entries[i].hash);
+            }
+            i = i + 1;
+        }
+
+        return result;
+    }
+
+    /// Returns the intersection of self and other.
+    function intersection(self, other: HashSet<T>) -> HashSet<T> {
+        const result: HashSet<T> = HashSet::new();
+
+        // Iterate over the smaller set
+        if (self.len <= other.len) {
+            mut i: u64 = 0;
+            while (i < self.cap) {
+                if (self.entries[i].state == BUCKET_OCCUPIED) {
+                    if (other.contains(self.entries[i].value, self.entries[i].hash)) {
+                        result.insert(self.entries[i].value, self.entries[i].hash);
+                    }
+                }
+                i = i + 1;
+            }
+        } else {
+            mut i: u64 = 0;
+            while (i < other.cap) {
+                if (other.entries[i].state == BUCKET_OCCUPIED) {
+                    if (self.contains(other.entries[i].value, other.entries[i].hash)) {
+                        result.insert(other.entries[i].value, other.entries[i].hash);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+
+        return result;
+    }
+
+    /// Returns the difference of self and other (elements in self but not in other).
+    function difference(self, other: HashSet<T>) -> HashSet<T> {
+        const result: HashSet<T> = HashSet::new();
+
+        mut i: u64 = 0;
+        while (i < self.cap) {
+            if (self.entries[i].state == BUCKET_OCCUPIED) {
+                if (!other.contains(self.entries[i].value, self.entries[i].hash)) {
+                    result.insert(self.entries[i].value, self.entries[i].hash);
+                }
+            }
+            i = i + 1;
+        }
+
+        return result;
+    }
+
+    /// Returns the symmetric difference (elements in either but not both).
+    function symmetric_difference(self, other: HashSet<T>) -> HashSet<T> {
+        const result: HashSet<T> = HashSet::new();
+
+        // Elements in self but not in other
+        mut i: u64 = 0;
+        while (i < self.cap) {
+            if (self.entries[i].state == BUCKET_OCCUPIED) {
+                if (!other.contains(self.entries[i].value, self.entries[i].hash)) {
+                    result.insert(self.entries[i].value, self.entries[i].hash);
+                }
+            }
+            i = i + 1;
+        }
+
+        // Elements in other but not in self
+        i = 0;
+        while (i < other.cap) {
+            if (other.entries[i].state == BUCKET_OCCUPIED) {
+                if (!self.contains(other.entries[i].value, other.entries[i].hash)) {
+                    result.insert(other.entries[i].value, other.entries[i].hash);
+                }
+            }
+            i = i + 1;
+        }
+
+        return result;
+    }
+
+    // ========================================================================
+    // Internal
+    // ========================================================================
+
+    function find_entry(self, value: T, value_hash: u64) -> Option<u64> {
+        if (self.cap == 0) {
+            return Option::None;
+        }
+
+        const mask: u64 = self.cap - 1;
+        mut index: u64 = value_hash & mask;
+
+        mut i: u64 = 0;
+        while (i < self.cap) {
+            const entry: HashSetEntry<T>* = &self.entries[index];
+
+            if (entry.state == BUCKET_EMPTY) {
+                return Option::None;
+            }
+
+            if (entry.state == BUCKET_OCCUPIED &&
+                entry.hash == value_hash &&
+                entry.value == value) {
+                return Option::Some(index);
+            }
+
+            i = i + 1;
+            index = (value_hash + i * i) & mask;
+        }
+
+        return Option::None;
+    }
+
+    function maybe_grow(self: &mut HashSet<T>) -> void {
+        if (self.cap == 0) {
+            self.resize(DEFAULT_CAPACITY);
+            return;
+        }
+
+        const threshold: u64 = (self.cap * MAX_LOAD_FACTOR_NUM) / MAX_LOAD_FACTOR_DEN;
+        if (self.len + self.deleted >= threshold) {
+            self.resize(self.cap * 2);
+        }
+    }
+
+    function resize(self: &mut HashSet<T>, new_cap: u64) -> void {
+        const old_entries: HashSetEntry<T>* = self.entries;
+        const old_cap: u64 = self.cap;
+
+        self.entries = calloc(new_cap, sizeof(HashSetEntry<T>));
+        if (self.entries == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        self.cap = new_cap;
+        self.len = 0;
+        self.deleted = 0;
+
+        mut i: u64 = 0;
+        while (i < old_cap) {
+            if (old_entries[i].state == BUCKET_OCCUPIED) {
+                self.insert(old_entries[i].value, old_entries[i].hash);
+            }
+            i = i + 1;
+        }
+
+        if (old_entries != null) {
+            free(old_entries);
+        }
+    }
+
+    // ========================================================================
+    // Iteration
+    // ========================================================================
+
+    function iter(self) -> HashSetIter<T> {
+        return HashSetIter {
+            entries: self.entries,
+            cap: self.cap,
+            current: 0
+        };
+    }
+
+    // ========================================================================
+    // Memory Management
+    // ========================================================================
+
+    function drop(self) -> void {
+        if (self.entries != null) {
+            free(self.entries);
+        }
+    }
+
+    function reserve(self: &mut HashSet<T>, additional: u64) -> void {
+        const required: u64 = self.len + additional;
+        const threshold: u64 = (required * MAX_LOAD_FACTOR_DEN) / MAX_LOAD_FACTOR_NUM;
+
+        if (threshold > self.cap) {
+            mut new_cap: u64 = self.cap;
+            if (new_cap == 0) {
+                new_cap = DEFAULT_CAPACITY;
+            }
+            while (new_cap < threshold) {
+                new_cap = new_cap * 2;
+            }
+            self.resize(new_cap);
+        }
+    }
+
+    function clone(self) -> HashSet<T> {
+        const result: HashSet<T> = HashSet::with_capacity(self.cap);
+
+        mut i: u64 = 0;
+        while (i < self.cap) {
+            if (self.entries[i].state == BUCKET_OCCUPIED) {
+                result.insert(self.entries[i].value, self.entries[i].hash);
+            }
+            i = i + 1;
+        }
+
+        return result;
+    }
+}
+
+// ============================================================================
+// Iterator
+// ============================================================================
+
+type struct HashSetIter<T> {
+    entries: HashSetEntry<T>*;
+    cap: u64;
+    current: u64;
+}
+
+implement struct HashSetIter<T> {
+    function has_next(self) -> boolean {
+        while (self.current < self.cap) {
+            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
+                return true;
+            }
+            self.current = self.current + 1;
+        }
+        return false;
+    }
+
+    function next(self: &mut HashSetIter<T>) -> Option<T> {
+        while (self.current < self.cap) {
+            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
+                const value: T = self.entries[self.current].value;
+                self.current = self.current + 1;
+                return Option::Some(value);
+            }
+            self.current = self.current + 1;
+        }
+        return Option::None;
+    }
+}
+
+// ============================================================================
+// Specialized HashSets
+// ============================================================================
+
+/// A HashSet with string values.
+type struct StringHashSet {
+    set: HashSet<string>;
+}
+
+implement struct StringHashSet {
+    static function new() -> StringHashSet {
+        return StringHashSet { set: HashSet::new() };
+    }
+
+    function len(self) -> u64 {
+        return self.set.len();
+    }
+
+    function is_empty(self) -> boolean {
+        return self.set.is_empty();
+    }
+
+    function contains(self, value: string) -> boolean {
+        return self.set.contains(value, hash_str(value));
+    }
+
+    function insert(self: &mut StringHashSet, value: string) -> boolean {
+        return self.set.insert(value, hash_str(value));
+    }
+
+    function remove(self: &mut StringHashSet, value: string) -> boolean {
+        return self.set.remove(value, hash_str(value));
+    }
+
+    function clear(self: &mut StringHashSet) -> void {
+        self.set.clear();
+    }
+
+    function drop(self) -> void {
+        self.set.drop();
+    }
+}
+
+/// A HashSet with integer values.
+type struct IntHashSet {
+    set: HashSet<u64>;
+}
+
+implement struct IntHashSet {
+    static function new() -> IntHashSet {
+        return IntHashSet { set: HashSet::new() };
+    }
+
+    function len(self) -> u64 {
+        return self.set.len();
+    }
+
+    function is_empty(self) -> boolean {
+        return self.set.is_empty();
+    }
+
+    function contains(self, value: u64) -> boolean {
+        return self.set.contains(value, hash_int(value));
+    }
+
+    function insert(self: &mut IntHashSet, value: u64) -> boolean {
+        return self.set.insert(value, hash_int(value));
+    }
+
+    function remove(self: &mut IntHashSet, value: u64) -> boolean {
+        return self.set.remove(value, hash_int(value));
+    }
+
+    function clear(self: &mut IntHashSet) -> void {
+        self.set.clear();
+    }
+
+    function drop(self) -> void {
+        self.set.drop();
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a new empty HashSet.
+function hashset<T>() -> HashSet<T> {
+    return HashSet::new();
+}
+
+/// Creates a HashSet with capacity.
+function hashset_with_capacity<T>(capacity: u64) -> HashSet<T> {
+    return HashSet::with_capacity(capacity);
+}
+
+/// Creates a string HashSet.
+function string_hashset() -> StringHashSet {
+    return StringHashSet::new();
+}
+
+/// Creates an integer HashSet.
+function int_hashset() -> IntHashSet {
+    return IntHashSet::new();
+}
+

@@ -1,0 +1,657 @@
+///! LinkedList - Doubly Linked List
+///!
+///! A doubly-linked list with owned nodes.
+///! Provides O(1) insertion and removal at both ends.
+
+namespace std::collections::linkedlist;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+
+// ============================================================================
+// LinkedList Node
+// ============================================================================
+
+/// A node in the linked list.
+type struct ListNode<T> {
+    value: T;
+    prev: ListNode<T>*;
+    next: ListNode<T>*;
+}
+
+implement struct ListNode<T> {
+    /// Creates a new node with the given value.
+    static function new(value: T) -> ListNode<T>* {
+        const node: ListNode<T>* = malloc(sizeof(ListNode<T>));
+        if (node == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        node.value = value;
+        node.prev = null;
+        node.next = null;
+        return node;
+    }
+}
+
+// ============================================================================
+// LinkedList
+// ============================================================================
+
+/// A doubly-linked list.
+type struct LinkedList<T> {
+    head: ListNode<T>*;
+    tail: ListNode<T>*;
+    len: u64;
+}
+
+implement struct LinkedList<T> {
+    /// Creates a new empty LinkedList.
+    static function new() -> LinkedList<T> {
+        return LinkedList {
+            head: null,
+            tail: null,
+            len: 0
+        };
+    }
+
+    // ========================================================================
+    // Capacity
+    // ========================================================================
+
+    /// Returns the number of elements.
+    function len(self) -> u64 {
+        return self.len;
+    }
+
+    /// Returns true if the list is empty.
+    function is_empty(self) -> boolean {
+        return self.len == 0;
+    }
+
+    // ========================================================================
+    // Access
+    // ========================================================================
+
+    /// Returns the first element.
+    function front(self) -> Option<T> {
+        if (self.head == null) {
+            return Option::None;
+        }
+        return Option::Some(self.head.value);
+    }
+
+    /// Returns a reference to the first element.
+    function front_ref(self) -> T* {
+        if (self.head == null) {
+            return null;
+        }
+        return &self.head.value;
+    }
+
+    /// Returns the last element.
+    function back(self) -> Option<T> {
+        if (self.tail == null) {
+            return Option::None;
+        }
+        return Option::Some(self.tail.value);
+    }
+
+    /// Returns a reference to the last element.
+    function back_ref(self) -> T* {
+        if (self.tail == null) {
+            return null;
+        }
+        return &self.tail.value;
+    }
+
+    /// Gets an element at the given index.
+    function get(self, index: u64) -> Option<T> {
+        const node: ListNode<T>* = self.node_at(index);
+        if (node == null) {
+            return Option::None;
+        }
+        return Option::Some(node.value);
+    }
+
+    /// Gets a reference to an element at the given index.
+    function get_ref(self, index: u64) -> T* {
+        const node: ListNode<T>* = self.node_at(index);
+        if (node == null) {
+            return null;
+        }
+        return &node.value;
+    }
+
+    // ========================================================================
+    // Modification - Front
+    // ========================================================================
+
+    /// Pushes a value to the front.
+    function push_front(self: &mut LinkedList<T>, value: T) -> void {
+        const node: ListNode<T>* = ListNode::new(value);
+
+        node.next = self.head;
+
+        if (self.head != null) {
+            self.head.prev = node;
+        }
+
+        self.head = node;
+
+        if (self.tail == null) {
+            self.tail = node;
+        }
+
+        self.len = self.len + 1;
+    }
+
+    /// Pops a value from the front.
+    function pop_front(self: &mut LinkedList<T>) -> Option<T> {
+        if (self.head == null) {
+            return Option::None;
+        }
+
+        const node: ListNode<T>* = self.head;
+        const value: T = node.value;
+
+        self.head = node.next;
+
+        if (self.head != null) {
+            self.head.prev = null;
+        } else {
+            self.tail = null;
+        }
+
+        free(node);
+        self.len = self.len - 1;
+
+        return Option::Some(value);
+    }
+
+    // ========================================================================
+    // Modification - Back
+    // ========================================================================
+
+    /// Pushes a value to the back.
+    function push_back(self: &mut LinkedList<T>, value: T) -> void {
+        const node: ListNode<T>* = ListNode::new(value);
+
+        node.prev = self.tail;
+
+        if (self.tail != null) {
+            self.tail.next = node;
+        }
+
+        self.tail = node;
+
+        if (self.head == null) {
+            self.head = node;
+        }
+
+        self.len = self.len + 1;
+    }
+
+    /// Pops a value from the back.
+    function pop_back(self: &mut LinkedList<T>) -> Option<T> {
+        if (self.tail == null) {
+            return Option::None;
+        }
+
+        const node: ListNode<T>* = self.tail;
+        const value: T = node.value;
+
+        self.tail = node.prev;
+
+        if (self.tail != null) {
+            self.tail.next = null;
+        } else {
+            self.head = null;
+        }
+
+        free(node);
+        self.len = self.len - 1;
+
+        return Option::Some(value);
+    }
+
+    // ========================================================================
+    // Modification - Indexed
+    // ========================================================================
+
+    /// Inserts a value at the given index.
+    function insert(self: &mut LinkedList<T>, index: u64, value: T) -> void {
+        if (index > self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        if (index == 0) {
+            self.push_front(value);
+            return;
+        }
+
+        if (index == self.len) {
+            self.push_back(value);
+            return;
+        }
+
+        const next_node: ListNode<T>* = self.node_at(index);
+        const prev_node: ListNode<T>* = next_node.prev;
+
+        const node: ListNode<T>* = ListNode::new(value);
+        node.prev = prev_node;
+        node.next = next_node;
+
+        prev_node.next = node;
+        next_node.prev = node;
+
+        self.len = self.len + 1;
+    }
+
+    /// Removes the element at the given index.
+    function remove(self: &mut LinkedList<T>, index: u64) -> T {
+        if (index >= self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        if (index == 0) {
+            return self.pop_front().unwrap();
+        }
+
+        if (index == self.len - 1) {
+            return self.pop_back().unwrap();
+        }
+
+        const node: ListNode<T>* = self.node_at(index);
+        const value: T = node.value;
+
+        node.prev.next = node.next;
+        node.next.prev = node.prev;
+
+        free(node);
+        self.len = self.len - 1;
+
+        return value;
+    }
+
+    // ========================================================================
+    // Bulk Operations
+    // ========================================================================
+
+    /// Clears the list.
+    function clear(self: &mut LinkedList<T>) -> void {
+        mut current: ListNode<T>* = self.head;
+        while (current != null) {
+            const next: ListNode<T>* = current.next;
+            free(current);
+            current = next;
+        }
+        self.head = null;
+        self.tail = null;
+        self.len = 0;
+    }
+
+    /// Appends another list to this one.
+    function append(self: &mut LinkedList<T>, other: &mut LinkedList<T>) -> void {
+        if (other.head == null) {
+            return;
+        }
+
+        if (self.tail != null) {
+            self.tail.next = other.head;
+            other.head.prev = self.tail;
+        } else {
+            self.head = other.head;
+        }
+
+        self.tail = other.tail;
+        self.len = self.len + other.len;
+
+        other.head = null;
+        other.tail = null;
+        other.len = 0;
+    }
+
+    /// Splits the list at the given index.
+    function split_off(self: &mut LinkedList<T>, at: u64) -> LinkedList<T> {
+        if (at > self.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        if (at == self.len) {
+            return LinkedList::new();
+        }
+
+        if (at == 0) {
+            const other: LinkedList<T> = LinkedList {
+                head: self.head,
+                tail: self.tail,
+                len: self.len
+            };
+            self.head = null;
+            self.tail = null;
+            self.len = 0;
+            return other;
+        }
+
+        const split_node: ListNode<T>* = self.node_at(at);
+
+        const other: LinkedList<T> = LinkedList {
+            head: split_node,
+            tail: self.tail,
+            len: self.len - at
+        };
+
+        self.tail = split_node.prev;
+        self.tail.next = null;
+        split_node.prev = null;
+        self.len = at;
+
+        return other;
+    }
+
+    // ========================================================================
+    // Searching
+    // ========================================================================
+
+    /// Returns true if the list contains the value.
+    function contains(self, value: T) -> boolean {
+        return self.find(value).is_some();
+    }
+
+    /// Finds the index of the first occurrence of the value.
+    function find(self, value: T) -> Option<u64> {
+        mut current: ListNode<T>* = self.head;
+        mut index: u64 = 0;
+
+        while (current != null) {
+            if (current.value == value) {
+                return Option::Some(index);
+            }
+            current = current.next;
+            index = index + 1;
+        }
+
+        return Option::None;
+    }
+
+    /// Counts occurrences of the value.
+    function count(self, value: T) -> u64 {
+        mut current: ListNode<T>* = self.head;
+        mut count: u64 = 0;
+
+        while (current != null) {
+            if (current.value == value) {
+                count = count + 1;
+            }
+            current = current.next;
+        }
+
+        return count;
+    }
+
+    // ========================================================================
+    // Reordering
+    // ========================================================================
+
+    /// Reverses the list in place.
+    function reverse(self: &mut LinkedList<T>) -> void {
+        if (self.len <= 1) {
+            return;
+        }
+
+        mut current: ListNode<T>* = self.head;
+        while (current != null) {
+            const temp: ListNode<T>* = current.next;
+            current.next = current.prev;
+            current.prev = temp;
+            current = temp;
+        }
+
+        const temp: ListNode<T>* = self.head;
+        self.head = self.tail;
+        self.tail = temp;
+    }
+
+    // ========================================================================
+    // Iteration
+    // ========================================================================
+
+    /// Creates an iterator over the list.
+    function iter(self) -> LinkedListIter<T> {
+        return LinkedListIter { current: self.head };
+    }
+
+    /// Creates a reverse iterator.
+    function iter_rev(self) -> LinkedListRevIter<T> {
+        return LinkedListRevIter { current: self.tail };
+    }
+
+    // ========================================================================
+    // Internal Helpers
+    // ========================================================================
+
+    /// Gets the node at the given index.
+    function node_at(self, index: u64) -> ListNode<T>* {
+        if (index >= self.len) {
+            return null;
+        }
+
+        // Optimize by starting from closer end
+        if (index < self.len / 2) {
+            mut current: ListNode<T>* = self.head;
+            mut i: u64 = 0;
+            while (i < index) {
+                current = current.next;
+                i = i + 1;
+            }
+            return current;
+        } else {
+            mut current: ListNode<T>* = self.tail;
+            mut i: u64 = self.len - 1;
+            while (i > index) {
+                current = current.prev;
+                i = i - 1;
+            }
+            return current;
+        }
+    }
+
+    // ========================================================================
+    // Memory Management
+    // ========================================================================
+
+    /// Drops the list and frees all nodes.
+    function drop(self) -> void {
+        self.clear();
+    }
+
+    /// Clones the list.
+    function clone(self) -> LinkedList<T> {
+        const result: LinkedList<T> = LinkedList::new();
+
+        mut current: ListNode<T>* = self.head;
+        while (current != null) {
+            result.push_back(current.value);
+            current = current.next;
+        }
+
+        return result;
+    }
+}
+
+// ============================================================================
+// Iterators
+// ============================================================================
+
+/// Forward iterator over a LinkedList.
+type struct LinkedListIter<T> {
+    current: ListNode<T>*;
+}
+
+implement struct LinkedListIter<T> {
+    function has_next(self) -> boolean {
+        return self.current != null;
+    }
+
+    function next(self: &mut LinkedListIter<T>) -> Option<T> {
+        if (self.current == null) {
+            return Option::None;
+        }
+
+        const value: T = self.current.value;
+        self.current = self.current.next;
+        return Option::Some(value);
+    }
+
+    function peek(self) -> Option<T> {
+        if (self.current == null) {
+            return Option::None;
+        }
+        return Option::Some(self.current.value);
+    }
+}
+
+/// Reverse iterator over a LinkedList.
+type struct LinkedListRevIter<T> {
+    current: ListNode<T>*;
+}
+
+implement struct LinkedListRevIter<T> {
+    function has_next(self) -> boolean {
+        return self.current != null;
+    }
+
+    function next(self: &mut LinkedListRevIter<T>) -> Option<T> {
+        if (self.current == null) {
+            return Option::None;
+        }
+
+        const value: T = self.current.value;
+        self.current = self.current.prev;
+        return Option::Some(value);
+    }
+}
+
+// ============================================================================
+// Cursor
+// ============================================================================
+
+/// A cursor for navigating and modifying a linked list.
+type struct ListCursor<T> {
+    list: LinkedList<T>*;
+    current: ListNode<T>*;
+    index: u64;
+}
+
+implement struct ListCursor<T> {
+    /// Creates a cursor at the front of the list.
+    static function front(list: &mut LinkedList<T>) -> ListCursor<T> {
+        return ListCursor {
+            list: list,
+            current: list.head,
+            index: 0
+        };
+    }
+
+    /// Creates a cursor at the back of the list.
+    static function back(list: &mut LinkedList<T>) -> ListCursor<T> {
+        mut index: u64 = 0;
+        if (list.len > 0) {
+            index = list.len - 1;
+        }
+        return ListCursor {
+            list: list,
+            current: list.tail,
+            index: index
+        };
+    }
+
+    /// Returns the current element.
+    function current(self) -> Option<T> {
+        if (self.current == null) {
+            return Option::None;
+        }
+        return Option::Some(self.current.value);
+    }
+
+    /// Returns a reference to the current element.
+    function current_ref(self) -> T* {
+        if (self.current == null) {
+            return null;
+        }
+        return &self.current.value;
+    }
+
+    /// Returns the current index.
+    function index(self) -> u64 {
+        return self.index;
+    }
+
+    /// Moves the cursor forward.
+    function move_next(self: &mut ListCursor<T>) -> boolean {
+        if (self.current == null || self.current.next == null) {
+            return false;
+        }
+        self.current = self.current.next;
+        self.index = self.index + 1;
+        return true;
+    }
+
+    /// Moves the cursor backward.
+    function move_prev(self: &mut ListCursor<T>) -> boolean {
+        if (self.current == null || self.current.prev == null) {
+            return false;
+        }
+        self.current = self.current.prev;
+        self.index = self.index - 1;
+        return true;
+    }
+
+    /// Inserts a value before the current position.
+    function insert_before(self: &mut ListCursor<T>, value: T) -> void {
+        if (self.current == null) {
+            self.list.push_back(value);
+            self.current = self.list.tail;
+            return;
+        }
+
+        self.list.insert(self.index, value);
+        self.index = self.index + 1;
+    }
+
+    /// Inserts a value after the current position.
+    function insert_after(self: &mut ListCursor<T>, value: T) -> void {
+        if (self.current == null) {
+            self.list.push_back(value);
+            self.current = self.list.tail;
+            return;
+        }
+
+        self.list.insert(self.index + 1, value);
+    }
+
+    /// Removes the current element and moves to the next.
+    function remove_current(self: &mut ListCursor<T>) -> Option<T> {
+        if (self.current == null) {
+            return Option::None;
+        }
+
+        const next: ListNode<T>* = self.current.next;
+        const value: T = self.list.remove(self.index);
+        self.current = next;
+
+        return Option::Some(value);
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a new empty LinkedList.
+function linked_list<T>() -> LinkedList<T> {
+    return LinkedList::new();
+}
+
