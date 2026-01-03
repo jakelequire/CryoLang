@@ -1,0 +1,446 @@
+///! Cursor - In-Memory I/O
+///!
+///! A Cursor wraps an in-memory buffer and provides Read/Write/Seek operations.
+
+namespace std::io::cursor;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+import <collections/vec>;
+import <io/error>;
+import <io/reader>;
+import <io/writer>;
+
+// ============================================================================
+// Cursor
+// ============================================================================
+
+/// A cursor wrapping an in-memory buffer.
+/// Implements Read, Write, and Seek.
+type struct Cursor<T> {
+    inner: T;
+    pos: u64;
+}
+
+implement struct Cursor<T> {
+    /// Creates a new cursor wrapping the given value.
+    static function new(inner: T) -> Cursor<T> {
+        return Cursor {
+            inner: inner,
+            pos: 0
+        };
+    }
+
+    /// Returns a reference to the underlying value.
+    function get_ref(self) -> T* {
+        return &self.inner;
+    }
+
+    /// Returns a mutable reference to the underlying value.
+    function get_mut(self: &mut Cursor<T>) -> T* {
+        return &self.inner;
+    }
+
+    /// Consumes the cursor and returns the underlying value.
+    function into_inner(self) -> T {
+        return self.inner;
+    }
+
+    /// Returns the current position.
+    function position(self) -> u64 {
+        return self.pos;
+    }
+
+    /// Sets the position.
+    function set_position(self: &mut Cursor<T>, pos: u64) -> void {
+        self.pos = pos;
+    }
+}
+
+// ============================================================================
+// ByteCursor - Cursor over byte slice
+// ============================================================================
+
+/// A cursor over a byte slice.
+type struct ByteCursor {
+    data: u8*;
+    len: u64;
+    pos: u64;
+}
+
+implement struct ByteCursor {
+    /// Creates a new cursor over a byte slice.
+    static function new(data: u8*, len: u64) -> ByteCursor {
+        return ByteCursor {
+            data: data,
+            len: len,
+            pos: 0
+        };
+    }
+
+    /// Returns the length of the underlying data.
+    function len(self) -> u64 {
+        return self.len;
+    }
+
+    /// Returns the remaining bytes.
+    function remaining(self) -> u64 {
+        if (self.pos >= self.len) {
+            return 0;
+        }
+        return self.len - self.pos;
+    }
+
+    /// Returns the current position.
+    function position(self) -> u64 {
+        return self.pos;
+    }
+
+    /// Sets the position.
+    function set_position(self: &mut ByteCursor, pos: u64) -> void {
+        self.pos = pos;
+    }
+
+    /// Returns a pointer to the remaining data.
+    function remaining_slice(self) -> u8* {
+        if (self.pos >= self.len) {
+            return null;
+        }
+        return &self.data[self.pos];
+    }
+
+    /// Reads bytes from the cursor.
+    function read(self: &mut ByteCursor, buf: u8*, len: u64) -> IoResult<u64> {
+        const remaining: u64 = self.remaining();
+        if (remaining == 0) {
+            return IoResult::Ok(0);
+        }
+
+        mut to_read: u64 = len;
+        if (to_read > remaining) {
+            to_read = remaining;
+        }
+
+        memcpy(buf, &self.data[self.pos], to_read);
+        self.pos = self.pos + to_read;
+
+        return IoResult::Ok(to_read);
+    }
+
+    /// Seeks to a position.
+    function seek(self: &mut ByteCursor, pos: SeekFrom) -> IoResult<u64> {
+        mut new_pos: i64;
+
+        match (pos) {
+            SeekFrom::Start(offset) => {
+                new_pos = offset;
+            }
+            SeekFrom::End(offset) => {
+                new_pos = self.len + offset;
+            }
+            SeekFrom::Current(offset) => {
+                new_pos = self.pos + offset;
+            }
+        }
+
+        if (new_pos < 0) {
+            return IoResult::Err(IoError::invalid_input("seek to negative position"));
+        }
+
+        self.pos = new_pos;
+        return IoResult::Ok(self.pos);
+    }
+}
+
+// ============================================================================
+// VecCursor - Cursor over Vec<u8>
+// ============================================================================
+
+/// A cursor over a Vec<u8> that supports both reading and writing.
+type struct VecCursor {
+    data: Vec<u8>;
+    pos: u64;
+}
+
+implement struct VecCursor {
+    /// Creates a new empty cursor.
+    static function new() -> VecCursor {
+        return VecCursor {
+            data: Vec::new(),
+            pos: 0
+        };
+    }
+
+    /// Creates a cursor from a Vec.
+    static function from_vec(v: Vec<u8>) -> VecCursor {
+        return VecCursor {
+            data: v,
+            pos: 0
+        };
+    }
+
+    /// Creates a cursor with initial data.
+    static function from_slice(data: u8*, len: u64) -> VecCursor {
+        return VecCursor {
+            data: Vec::from_slice(data, len),
+            pos: 0
+        };
+    }
+
+    /// Returns the length of the data.
+    function len(self) -> u64 {
+        return self.data.len();
+    }
+
+    /// Returns the remaining bytes.
+    function remaining(self) -> u64 {
+        if (self.pos >= self.data.len()) {
+            return 0;
+        }
+        return self.data.len() - self.pos;
+    }
+
+    /// Returns the current position.
+    function position(self) -> u64 {
+        return self.pos;
+    }
+
+    /// Sets the position.
+    function set_position(self: &mut VecCursor, pos: u64) -> void {
+        self.pos = pos;
+    }
+
+    /// Returns a reference to the underlying Vec.
+    function get_ref(self) -> Vec<u8>* {
+        return &self.data;
+    }
+
+    /// Consumes the cursor and returns the Vec.
+    function into_vec(self) -> Vec<u8> {
+        return self.data;
+    }
+
+    /// Reads bytes from the cursor.
+    function read(self: &mut VecCursor, buf: u8*, len: u64) -> IoResult<u64> {
+        const remaining: u64 = self.remaining();
+        if (remaining == 0) {
+            return IoResult::Ok(0);
+        }
+
+        mut to_read: u64 = len;
+        if (to_read > remaining) {
+            to_read = remaining;
+        }
+
+        memcpy(buf, &self.data.as_ptr()[self.pos], to_read);
+        self.pos = self.pos + to_read;
+
+        return IoResult::Ok(to_read);
+    }
+
+    /// Writes bytes to the cursor.
+    function write(self: &mut VecCursor, buf: u8*, len: u64) -> IoResult<u64> {
+        if (len == 0) {
+            return IoResult::Ok(0);
+        }
+
+        // Extend the vec if necessary
+        const end_pos: u64 = self.pos + len;
+        if (end_pos > self.data.len()) {
+            // Reserve space
+            self.data.reserve(end_pos - self.data.len());
+
+            // Fill with zeros up to pos
+            while (self.data.len() < self.pos) {
+                self.data.push(0);
+            }
+
+            // Add the new data
+            mut i: u64 = 0;
+            while (i < len) {
+                if (self.pos + i < self.data.len()) {
+                    self.data.set(self.pos + i, buf[i]);
+                } else {
+                    self.data.push(buf[i]);
+                }
+                i = i + 1;
+            }
+        } else {
+            // Overwrite existing data
+            mut i: u64 = 0;
+            while (i < len) {
+                self.data.set(self.pos + i, buf[i]);
+                i = i + 1;
+            }
+        }
+
+        self.pos = self.pos + len;
+        return IoResult::Ok(len);
+    }
+
+    /// Seeks to a position.
+    function seek(self: &mut VecCursor, pos: SeekFrom) -> IoResult<u64> {
+        mut new_pos: i64;
+
+        match (pos) {
+            SeekFrom::Start(offset) => {
+                new_pos = offset;
+            }
+            SeekFrom::End(offset) => {
+                new_pos = self.data.len() + offset;
+            }
+            SeekFrom::Current(offset) => {
+                new_pos = self.pos + offset;
+            }
+        }
+
+        if (new_pos < 0) {
+            return IoResult::Err(IoError::invalid_input("seek to negative position"));
+        }
+
+        self.pos = new_pos;
+        return IoResult::Ok(self.pos);
+    }
+
+    /// Flushes (no-op for VecCursor).
+    function flush(self) -> IoResult<void> {
+        return IoResult::Ok(void);
+    }
+
+    /// Drops the cursor.
+    function drop(self) -> void {
+        self.data.drop();
+    }
+}
+
+// ============================================================================
+// SliceMutCursor - Cursor over mutable slice
+// ============================================================================
+
+/// A cursor over a mutable byte slice.
+type struct SliceMutCursor {
+    data: u8*;
+    len: u64;
+    pos: u64;
+}
+
+implement struct SliceMutCursor {
+    /// Creates a cursor over a mutable slice.
+    static function new(data: u8*, len: u64) -> SliceMutCursor {
+        return SliceMutCursor {
+            data: data,
+            len: len,
+            pos: 0
+        };
+    }
+
+    /// Returns the length.
+    function len(self) -> u64 {
+        return self.len;
+    }
+
+    /// Returns the remaining capacity.
+    function remaining(self) -> u64 {
+        if (self.pos >= self.len) {
+            return 0;
+        }
+        return self.len - self.pos;
+    }
+
+    /// Returns the current position.
+    function position(self) -> u64 {
+        return self.pos;
+    }
+
+    /// Sets the position.
+    function set_position(self: &mut SliceMutCursor, pos: u64) -> void {
+        self.pos = pos;
+    }
+
+    /// Reads bytes.
+    function read(self: &mut SliceMutCursor, buf: u8*, len: u64) -> IoResult<u64> {
+        const remaining: u64 = self.remaining();
+        if (remaining == 0) {
+            return IoResult::Ok(0);
+        }
+
+        mut to_read: u64 = len;
+        if (to_read > remaining) {
+            to_read = remaining;
+        }
+
+        memcpy(buf, &self.data[self.pos], to_read);
+        self.pos = self.pos + to_read;
+
+        return IoResult::Ok(to_read);
+    }
+
+    /// Writes bytes.
+    function write(self: &mut SliceMutCursor, buf: u8*, len: u64) -> IoResult<u64> {
+        const remaining: u64 = self.remaining();
+        if (remaining == 0) {
+            return IoResult::Ok(0);
+        }
+
+        mut to_write: u64 = len;
+        if (to_write > remaining) {
+            to_write = remaining;
+        }
+
+        memcpy(&self.data[self.pos], buf, to_write);
+        self.pos = self.pos + to_write;
+
+        return IoResult::Ok(to_write);
+    }
+
+    /// Seeks to a position.
+    function seek(self: &mut SliceMutCursor, pos: SeekFrom) -> IoResult<u64> {
+        mut new_pos: i64;
+
+        match (pos) {
+            SeekFrom::Start(offset) => {
+                new_pos = offset;
+            }
+            SeekFrom::End(offset) => {
+                new_pos = self.len + offset;
+            }
+            SeekFrom::Current(offset) => {
+                new_pos = self.pos + offset;
+            }
+        }
+
+        if (new_pos < 0) {
+            return IoResult::Err(IoError::invalid_input("seek to negative position"));
+        }
+
+        self.pos = new_pos;
+        return IoResult::Ok(self.pos);
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a cursor over a byte slice.
+function byte_cursor(data: u8*, len: u64) -> ByteCursor {
+    return ByteCursor::new(data, len);
+}
+
+/// Creates an empty Vec cursor.
+function vec_cursor() -> VecCursor {
+    return VecCursor::new();
+}
+
+/// Creates a Vec cursor from initial data.
+function vec_cursor_from(data: u8*, len: u64) -> VecCursor {
+    return VecCursor::from_slice(data, len);
+}
+
+/// Creates a cursor over a mutable slice.
+function slice_mut_cursor(data: u8*, len: u64) -> SliceMutCursor {
+    return SliceMutCursor::new(data, len);
+}
+

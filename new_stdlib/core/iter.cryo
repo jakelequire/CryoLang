@@ -1,0 +1,678 @@
+///! Iterator Module
+///!
+///! This module provides iterator types and utilities for working with
+///! sequences of values. Iterators provide a uniform way to traverse
+///! collections without exposing their internal structure.
+
+namespace std::core::iter;
+
+import <core/option>;
+import <core/intrinsics>;
+
+// ============================================================================
+// Basic Iterator Types
+// ============================================================================
+
+/// A range iterator over integers.
+type struct RangeIter {
+    current: i64;
+    end: i64;
+    step: i64;
+}
+
+implement struct RangeIter {
+    /// Creates a new range iterator [start, end).
+    static function new(start: i64, end: i64) -> RangeIter {
+        return RangeIter { current: start, end: end, step: 1 };
+    }
+
+    /// Creates a new range iterator with a custom step.
+    static function with_step(start: i64, end: i64, step: i64) -> RangeIter {
+        return RangeIter { current: start, end: end, step: step };
+    }
+
+    /// Returns the next value in the range.
+    function next(self: &mut RangeIter) -> Option<i64> {
+        if (self.step > 0 && self.current >= self.end) {
+            return Option::None;
+        }
+        if (self.step < 0 && self.current <= self.end) {
+            return Option::None;
+        }
+        const value: i64 = self.current;
+        self.current = self.current + self.step;
+        return Option::Some(value);
+    }
+
+    /// Returns the number of remaining elements.
+    function size_hint(self) -> u64 {
+        if (self.step > 0) {
+            if (self.current >= self.end) {
+                return 0;
+            }
+            return (self.end - self.current) / self.step;
+        } else {
+            if (self.current <= self.end) {
+                return 0;
+            }
+            return (self.current - self.end) / (-self.step);
+        }
+    }
+
+    /// Collects all remaining values into an array.
+    function count(self: &mut RangeIter) -> u64 {
+        mut n: u64 = 0;
+        while (self.next().is_some()) {
+            n = n + 1;
+        }
+        return n;
+    }
+
+    /// Returns the last element.
+    function last(self: &mut RangeIter) -> Option<i64> {
+        mut result: Option<i64> = Option::None;
+        mut item: Option<i64> = self.next();
+        while (item.is_some()) {
+            result = item;
+            item = self.next();
+        }
+        return result;
+    }
+
+    /// Returns the nth element.
+    function nth(self: &mut RangeIter, n: u64) -> Option<i64> {
+        mut i: u64 = 0;
+        while (i < n) {
+            if (self.next().is_none()) {
+                return Option::None;
+            }
+            i = i + 1;
+        }
+        return self.next();
+    }
+
+    /// Skips n elements and returns the iterator.
+    function skip(self: &mut RangeIter, n: u64) -> void {
+        mut i: u64 = 0;
+        while (i < n && self.next().is_some()) {
+            i = i + 1;
+        }
+    }
+}
+
+/// An iterator over a slice of elements.
+type struct SliceIter<T> {
+    ptr: T*;
+    current: u64;
+    len: u64;
+}
+
+implement struct SliceIter<T> {
+    /// Creates a new slice iterator.
+    static function new(ptr: T*, len: u64) -> SliceIter<T> {
+        return SliceIter { ptr: ptr, current: 0, len: len };
+    }
+
+    /// Returns the next element.
+    function next(self: &mut SliceIter<T>) -> Option<T> {
+        if (self.current >= self.len) {
+            return Option::None;
+        }
+        const value: T = self.ptr[self.current];
+        self.current = self.current + 1;
+        return Option::Some(value);
+    }
+
+    /// Returns a pointer to the next element.
+    function next_ptr(self: &mut SliceIter<T>) -> Option<T*> {
+        if (self.current >= self.len) {
+            return Option::None;
+        }
+        const ptr: T* = &self.ptr[self.current];
+        self.current = self.current + 1;
+        return Option::Some(ptr);
+    }
+
+    /// Returns the size hint (remaining elements).
+    function size_hint(self) -> u64 {
+        return self.len - self.current;
+    }
+
+    /// Counts remaining elements.
+    function count(self: &mut SliceIter<T>) -> u64 {
+        const remaining: u64 = self.len - self.current;
+        self.current = self.len;
+        return remaining;
+    }
+
+    /// Returns the last element.
+    function last(self: &mut SliceIter<T>) -> Option<T> {
+        if (self.current >= self.len) {
+            return Option::None;
+        }
+        self.current = self.len;
+        return Option::Some(self.ptr[self.len - 1]);
+    }
+
+    /// Returns the nth element.
+    function nth(self: &mut SliceIter<T>, n: u64) -> Option<T> {
+        const target: u64 = self.current + n;
+        if (target >= self.len) {
+            self.current = self.len;
+            return Option::None;
+        }
+        self.current = target + 1;
+        return Option::Some(self.ptr[target]);
+    }
+}
+
+/// A reverse iterator over a slice.
+type struct ReverseSliceIter<T> {
+    ptr: T*;
+    current: i64;
+}
+
+implement struct ReverseSliceIter<T> {
+    /// Creates a new reverse slice iterator.
+    static function new(ptr: T*, len: u64) -> ReverseSliceIter<T> {
+        return ReverseSliceIter { ptr: ptr, current: len - 1 };
+    }
+
+    /// Returns the next element (from end to beginning).
+    function next(self: &mut ReverseSliceIter<T>) -> Option<T> {
+        if (self.current < 0) {
+            return Option::None;
+        }
+        const value: T = self.ptr[self.current];
+        self.current = self.current - 1;
+        return Option::Some(value);
+    }
+
+    /// Returns the size hint.
+    function size_hint(self) -> u64 {
+        if (self.current < 0) {
+            return 0;
+        }
+        return self.current + 1;
+    }
+}
+
+// ============================================================================
+// Enumerate Iterator
+// ============================================================================
+
+/// An iterator that yields (index, value) pairs.
+type struct EnumerateIter<T> {
+    ptr: T*;
+    current: u64;
+    len: u64;
+}
+
+implement struct EnumerateIter<T> {
+    /// Creates a new enumerate iterator.
+    static function new(ptr: T*, len: u64) -> EnumerateIter<T> {
+        return EnumerateIter { ptr: ptr, current: 0, len: len };
+    }
+
+    /// Returns the next (index, value) pair.
+    function next(self: &mut EnumerateIter<T>) -> Option<IndexedValue<T>> {
+        if (self.current >= self.len) {
+            return Option::None;
+        }
+        const result: IndexedValue<T> = IndexedValue {
+            index: self.current,
+            value: self.ptr[self.current]
+        };
+        self.current = self.current + 1;
+        return Option::Some(result);
+    }
+
+    /// Returns the size hint.
+    function size_hint(self) -> u64 {
+        return self.len - self.current;
+    }
+}
+
+/// A value with its index.
+type struct IndexedValue<T> {
+    index: u64;
+    value: T;
+}
+
+implement struct IndexedValue<T> {
+    /// Returns the index.
+    function get_index(self) -> u64 {
+        return self.index;
+    }
+
+    /// Returns the value.
+    function get_value(self) -> T {
+        return self.value;
+    }
+}
+
+// ============================================================================
+// Repeat Iterator
+// ============================================================================
+
+/// An iterator that repeats a value forever.
+type struct RepeatIter<T> {
+    value: T;
+}
+
+implement struct RepeatIter<T> {
+    /// Creates a new repeat iterator.
+    static function new(value: T) -> RepeatIter<T> {
+        return RepeatIter { value: value };
+    }
+
+    /// Returns the next value (always Some).
+    function next(self) -> Option<T> {
+        return Option::Some(self.value);
+    }
+
+    /// Takes n elements and returns them in an array.
+    function take(self, n: u64, out: T*) -> void {
+        mut i: u64 = 0;
+        while (i < n) {
+            out[i] = self.value;
+            i = i + 1;
+        }
+    }
+}
+
+/// An iterator that repeats a value n times.
+type struct RepeatNIter<T> {
+    value: T;
+    remaining: u64;
+}
+
+implement struct RepeatNIter<T> {
+    /// Creates a new repeat-n iterator.
+    static function new(value: T, n: u64) -> RepeatNIter<T> {
+        return RepeatNIter { value: value, remaining: n };
+    }
+
+    /// Returns the next value.
+    function next(self: &mut RepeatNIter<T>) -> Option<T> {
+        if (self.remaining == 0) {
+            return Option::None;
+        }
+        self.remaining = self.remaining - 1;
+        return Option::Some(self.value);
+    }
+
+    /// Returns the size hint.
+    function size_hint(self) -> u64 {
+        return self.remaining;
+    }
+}
+
+// ============================================================================
+// Empty and Once Iterators
+// ============================================================================
+
+/// An empty iterator that yields nothing.
+type struct EmptyIter<T> {}
+
+implement struct EmptyIter<T> {
+    /// Creates a new empty iterator.
+    static function new() -> EmptyIter<T> {
+        return EmptyIter {};
+    }
+
+    /// Returns None (always).
+    function next(self) -> Option<T> {
+        return Option::None;
+    }
+
+    /// Returns 0 (no elements).
+    function size_hint(self) -> u64 {
+        return 0;
+    }
+}
+
+/// An iterator that yields exactly one value.
+type struct OnceIter<T> {
+    value: Option<T>;
+}
+
+implement struct OnceIter<T> {
+    /// Creates a new once iterator.
+    static function new(value: T) -> OnceIter<T> {
+        return OnceIter { value: Option::Some(value) };
+    }
+
+    /// Returns the value (once).
+    function next(self: &mut OnceIter<T>) -> Option<T> {
+        return self.value.take();
+    }
+
+    /// Returns the size hint (0 or 1).
+    function size_hint(self) -> u64 {
+        if (self.value.is_some()) {
+            return 1;
+        }
+        return 0;
+    }
+}
+
+// ============================================================================
+// Chain Iterator
+// ============================================================================
+
+/// An iterator that chains two slices together.
+type struct ChainIter<T> {
+    first: T*;
+    first_len: u64;
+    second: T*;
+    second_len: u64;
+    current: u64;
+}
+
+implement struct ChainIter<T> {
+    /// Creates a new chain iterator.
+    static function new(first: T*, first_len: u64, second: T*, second_len: u64) -> ChainIter<T> {
+        return ChainIter {
+            first: first,
+            first_len: first_len,
+            second: second,
+            second_len: second_len,
+            current: 0
+        };
+    }
+
+    /// Returns the next element.
+    function next(self: &mut ChainIter<T>) -> Option<T> {
+        if (self.current < self.first_len) {
+            const value: T = self.first[self.current];
+            self.current = self.current + 1;
+            return Option::Some(value);
+        }
+        const second_idx: u64 = self.current - self.first_len;
+        if (second_idx < self.second_len) {
+            const value: T = self.second[second_idx];
+            self.current = self.current + 1;
+            return Option::Some(value);
+        }
+        return Option::None;
+    }
+
+    /// Returns the size hint.
+    function size_hint(self) -> u64 {
+        const total: u64 = self.first_len + self.second_len;
+        if (self.current >= total) {
+            return 0;
+        }
+        return total - self.current;
+    }
+}
+
+// ============================================================================
+// Zip Iterator
+// ============================================================================
+
+/// An iterator that zips two slices together.
+type struct ZipIter<T, U> {
+    first: T*;
+    second: U*;
+    current: u64;
+    len: u64;
+}
+
+implement struct ZipIter<T, U> {
+    /// Creates a new zip iterator.
+    static function new(first: T*, first_len: u64, second: U*, second_len: u64) -> ZipIter<T, U> {
+        mut len: u64 = first_len;
+        if (second_len < len) {
+            len = second_len;
+        }
+        return ZipIter { first: first, second: second, current: 0, len: len };
+    }
+
+    /// Returns the next pair.
+    function next(self: &mut ZipIter<T, U>) -> Option<Pair<T, U>> {
+        if (self.current >= self.len) {
+            return Option::None;
+        }
+        const pair: Pair<T, U> = Pair {
+            first: self.first[self.current],
+            second: self.second[self.current]
+        };
+        self.current = self.current + 1;
+        return Option::Some(pair);
+    }
+
+    /// Returns the size hint.
+    function size_hint(self) -> u64 {
+        return self.len - self.current;
+    }
+}
+
+/// A pair of two values.
+type struct Pair<T, U> {
+    first: T;
+    second: U;
+}
+
+// ============================================================================
+// Functional Iterator Operations
+// ============================================================================
+
+/// Iterates over a slice, applying a function to each element.
+function for_each<T>(ptr: T*, len: u64, f: fn(T) -> void) -> void {
+    mut i: u64 = 0;
+    while (i < len) {
+        f(ptr[i]);
+        i = i + 1;
+    }
+}
+
+/// Iterates over a slice with indices.
+function for_each_indexed<T>(ptr: T*, len: u64, f: fn(u64, T) -> void) -> void {
+    mut i: u64 = 0;
+    while (i < len) {
+        f(i, ptr[i]);
+        i = i + 1;
+    }
+}
+
+/// Maps a function over a slice, writing results to output.
+function map<T, U>(input: T*, input_len: u64, output: U*, f: fn(T) -> U) -> void {
+    mut i: u64 = 0;
+    while (i < input_len) {
+        output[i] = f(input[i]);
+        i = i + 1;
+    }
+}
+
+/// Filters elements into an output buffer, returning the count.
+function filter<T>(input: T*, input_len: u64, output: T*, predicate: fn(T) -> boolean) -> u64 {
+    mut count: u64 = 0;
+    mut i: u64 = 0;
+    while (i < input_len) {
+        if (predicate(input[i])) {
+            output[count] = input[i];
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Folds a slice into a single value.
+function fold<T, A>(ptr: T*, len: u64, init: A, f: fn(A, T) -> A) -> A {
+    mut acc: A = init;
+    mut i: u64 = 0;
+    while (i < len) {
+        acc = f(acc, ptr[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+/// Reduces a slice to a single value (using first element as initial).
+function reduce<T>(ptr: T*, len: u64, f: fn(T, T) -> T) -> Option<T> {
+    if (len == 0) {
+        return Option::None;
+    }
+    mut acc: T = ptr[0];
+    mut i: u64 = 1;
+    while (i < len) {
+        acc = f(acc, ptr[i]);
+        i = i + 1;
+    }
+    return Option::Some(acc);
+}
+
+/// Returns true if any element matches the predicate.
+function any<T>(ptr: T*, len: u64, predicate: fn(T) -> boolean) -> boolean {
+    mut i: u64 = 0;
+    while (i < len) {
+        if (predicate(ptr[i])) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Returns true if all elements match the predicate.
+function all<T>(ptr: T*, len: u64, predicate: fn(T) -> boolean) -> boolean {
+    mut i: u64 = 0;
+    while (i < len) {
+        if (!predicate(ptr[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Finds the first element matching the predicate.
+function find<T>(ptr: T*, len: u64, predicate: fn(T) -> boolean) -> Option<T> {
+    mut i: u64 = 0;
+    while (i < len) {
+        if (predicate(ptr[i])) {
+            return Option::Some(ptr[i]);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// Finds the index of the first element matching the predicate.
+function find_index<T>(ptr: T*, len: u64, predicate: fn(T) -> boolean) -> Option<u64> {
+    mut i: u64 = 0;
+    while (i < len) {
+        if (predicate(ptr[i])) {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// Counts elements matching the predicate.
+function count_if<T>(ptr: T*, len: u64, predicate: fn(T) -> boolean) -> u64 {
+    mut count: u64 = 0;
+    mut i: u64 = 0;
+    while (i < len) {
+        if (predicate(ptr[i])) {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Sums all elements (for numeric types).
+function sum<T>(ptr: T*, len: u64) -> T {
+    mut acc: T = 0;
+    mut i: u64 = 0;
+    while (i < len) {
+        acc = acc + ptr[i];
+        i = i + 1;
+    }
+    return acc;
+}
+
+/// Multiplies all elements (for numeric types).
+function product<T>(ptr: T*, len: u64) -> T {
+    if (len == 0) {
+        return 1;
+    }
+    mut acc: T = ptr[0];
+    mut i: u64 = 1;
+    while (i < len) {
+        acc = acc * ptr[i];
+        i = i + 1;
+    }
+    return acc;
+}
+
+/// Finds the minimum element.
+function min<T>(ptr: T*, len: u64) -> Option<T> {
+    if (len == 0) {
+        return Option::None;
+    }
+    mut result: T = ptr[0];
+    mut i: u64 = 1;
+    while (i < len) {
+        if (ptr[i] < result) {
+            result = ptr[i];
+        }
+        i = i + 1;
+    }
+    return Option::Some(result);
+}
+
+/// Finds the maximum element.
+function max<T>(ptr: T*, len: u64) -> Option<T> {
+    if (len == 0) {
+        return Option::None;
+    }
+    mut result: T = ptr[0];
+    mut i: u64 = 1;
+    while (i < len) {
+        if (ptr[i] > result) {
+            result = ptr[i];
+        }
+        i = i + 1;
+    }
+    return Option::Some(result);
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a range iterator.
+function range(start: i64, end: i64) -> RangeIter {
+    return RangeIter::new(start, end);
+}
+
+/// Creates a range iterator with step.
+function range_step(start: i64, end: i64, step: i64) -> RangeIter {
+    return RangeIter::with_step(start, end, step);
+}
+
+/// Creates an empty iterator.
+function empty<T>() -> EmptyIter<T> {
+    return EmptyIter::new();
+}
+
+/// Creates a once iterator.
+function once<T>(value: T) -> OnceIter<T> {
+    return OnceIter::new(value);
+}
+
+/// Creates a repeat iterator.
+function repeat<T>(value: T) -> RepeatIter<T> {
+    return RepeatIter::new(value);
+}
+
+/// Creates a repeat-n iterator.
+function repeat_n<T>(value: T, n: u64) -> RepeatNIter<T> {
+    return RepeatNIter::new(value, n);
+}

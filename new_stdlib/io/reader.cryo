@@ -1,0 +1,441 @@
+///! Read Operations
+///!
+///! Core types and functions for reading data from I/O sources.
+
+namespace std::io::reader;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+import <collections/vec>;
+import <collections/string>;
+import <io/error>;
+
+// ============================================================================
+// Reader
+// ============================================================================
+
+/// A source from which bytes can be read.
+type struct Reader {
+    /// Opaque handle to the underlying source.
+    handle: void*;
+    /// Read function pointer.
+    read_fn: fn(void*, u8*, u64) -> IoResult<u64>;
+    /// Close function pointer (optional).
+    close_fn: fn(void*) -> IoResult<void>;
+}
+
+implement struct Reader {
+    /// Creates a reader from function pointers.
+    static function from_fns(
+        handle: void*,
+        read_fn: fn(void*, u8*, u64) -> IoResult<u64>,
+        close_fn: fn(void*) -> IoResult<void>
+    ) -> Reader {
+        return Reader {
+            handle: handle,
+            read_fn: read_fn,
+            close_fn: close_fn
+        };
+    }
+
+    /// Reads bytes into the buffer.
+    /// Returns the number of bytes read.
+    function read(self, buf: u8*, len: u64) -> IoResult<u64> {
+        return self.read_fn(self.handle, buf, len);
+    }
+
+    /// Reads exactly `len` bytes.
+    function read_exact(self, buf: u8*, len: u64) -> IoResult<void> {
+        mut total_read: u64 = 0;
+
+        while (total_read < len) {
+            const result: IoResult<u64> = self.read(&buf[total_read], len - total_read);
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Err(IoError::unexpected_eof("failed to fill buffer"));
+                }
+                IoResult::Ok(n) => {
+                    total_read = total_read + n;
+                }
+            }
+        }
+
+        return IoResult::Ok(void);
+    }
+
+    /// Reads all bytes until EOF.
+    function read_to_end(self, buf: &mut Vec<u8>) -> IoResult<u64> {
+        const CHUNK_SIZE: u64 = 8192;
+        mut total_read: u64 = 0;
+
+        loop {
+            buf.reserve(CHUNK_SIZE);
+            const start_len: u64 = buf.len();
+
+            // Read into the reserved space
+            mut chunk: u8[8192];
+            const result: IoResult<u64> = self.read(&chunk[0], CHUNK_SIZE);
+
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Ok(total_read);
+                }
+                IoResult::Ok(n) => {
+                    mut i: u64 = 0;
+                    while (i < n) {
+                        buf.push(chunk[i]);
+                        i = i + 1;
+                    }
+                    total_read = total_read + n;
+                }
+            }
+        }
+    }
+
+    /// Reads all bytes into a String until EOF.
+    function read_to_string(self, s: &mut String) -> IoResult<u64> {
+        const buf: Vec<u8> = Vec::new();
+        const result: IoResult<u64> = self.read_to_end(&buf);
+
+        match (result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(n) => {
+                // Append bytes to string
+                mut i: u64 = 0;
+                while (i < buf.len()) {
+                    s.push_byte(buf.get_ref(i).*);
+                    i = i + 1;
+                }
+                buf.drop();
+                return IoResult::Ok(n);
+            }
+        }
+    }
+
+    /// Closes the reader.
+    function close(self) -> IoResult<void> {
+        if (self.close_fn != null) {
+            return self.close_fn(self.handle);
+        }
+        return IoResult::Ok(void);
+    }
+}
+
+// ============================================================================
+// Bytes Iterator
+// ============================================================================
+
+/// An iterator that yields bytes from a reader.
+type struct Bytes {
+    reader: Reader*;
+    buf: u8;
+    done: boolean;
+}
+
+implement struct Bytes {
+    /// Creates a bytes iterator.
+    static function new(reader: Reader) -> Bytes {
+        return Bytes {
+            reader: &reader,
+            buf: 0,
+            done: false
+        };
+    }
+
+    /// Returns true if there are more bytes.
+    function has_next(self) -> boolean {
+        return !self.done;
+    }
+
+    /// Returns the next byte.
+    function next(self: &mut Bytes) -> Option<IoResult<u8>> {
+        if (self.done) {
+            return Option::None;
+        }
+
+        const result: IoResult<u64> = self.reader.read(&self.buf, 1);
+
+        match (result) {
+            IoResult::Err(e) => {
+                self.done = true;
+                return Option::Some(IoResult::Err(e));
+            }
+            IoResult::Ok(0) => {
+                self.done = true;
+                return Option::None;
+            }
+            IoResult::Ok(_) => {
+                return Option::Some(IoResult::Ok(self.buf));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Read Utilities
+// ============================================================================
+
+/// Reads a u8 from the reader.
+function read_u8(reader: Reader) -> IoResult<u8> {
+    mut buf: u8;
+    const result: IoResult<void> = reader.read_exact(&buf, 1);
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => { return IoResult::Ok(buf); }
+    }
+}
+
+/// Reads a little-endian u16 from the reader.
+function read_u16_le(reader: Reader) -> IoResult<u16> {
+    mut buf: u8[2];
+    const result: IoResult<void> = reader.read_exact(&buf[0], 2);
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            const value: u16 = buf[0] | (buf[1] << 8);
+            return IoResult::Ok(value);
+        }
+    }
+}
+
+/// Reads a big-endian u16 from the reader.
+function read_u16_be(reader: Reader) -> IoResult<u16> {
+    mut buf: u8[2];
+    const result: IoResult<void> = reader.read_exact(&buf[0], 2);
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            const value: u16 = (buf[0] << 8) | buf[1];
+            return IoResult::Ok(value);
+        }
+    }
+}
+
+/// Reads a little-endian u32 from the reader.
+function read_u32_le(reader: Reader) -> IoResult<u32> {
+    mut buf: u8[4];
+    const result: IoResult<void> = reader.read_exact(&buf[0], 4);
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            const value: u32 = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
+            return IoResult::Ok(value);
+        }
+    }
+}
+
+/// Reads a big-endian u32 from the reader.
+function read_u32_be(reader: Reader) -> IoResult<u32> {
+    mut buf: u8[4];
+    const result: IoResult<void> = reader.read_exact(&buf[0], 4);
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            const value: u32 = (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
+            return IoResult::Ok(value);
+        }
+    }
+}
+
+/// Reads a little-endian u64 from the reader.
+function read_u64_le(reader: Reader) -> IoResult<u64> {
+    mut buf: u8[8];
+    const result: IoResult<void> = reader.read_exact(&buf[0], 8);
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            mut value: u64 = 0;
+            mut i: u64 = 0;
+            while (i < 8) {
+                value = value | (buf[i] << (i * 8));
+                i = i + 1;
+            }
+            return IoResult::Ok(value);
+        }
+    }
+}
+
+/// Reads a big-endian u64 from the reader.
+function read_u64_be(reader: Reader) -> IoResult<u64> {
+    mut buf: u8[8];
+    const result: IoResult<void> = reader.read_exact(&buf[0], 8);
+    match (result) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(_) => {
+            mut value: u64 = 0;
+            mut i: u64 = 0;
+            while (i < 8) {
+                value = value | (buf[i] << ((7 - i) * 8));
+                i = i + 1;
+            }
+            return IoResult::Ok(value);
+        }
+    }
+}
+
+// ============================================================================
+// Chain Reader
+// ============================================================================
+
+/// A reader that chains two readers together.
+type struct Chain {
+    first: Reader;
+    second: Reader;
+    first_done: boolean;
+}
+
+implement struct Chain {
+    /// Creates a chain of two readers.
+    static function new(first: Reader, second: Reader) -> Chain {
+        return Chain {
+            first: first,
+            second: second,
+            first_done: false
+        };
+    }
+
+    /// Reads from the chain.
+    function read(self: &mut Chain, buf: u8*, len: u64) -> IoResult<u64> {
+        if (!self.first_done) {
+            const result: IoResult<u64> = self.first.read(buf, len);
+            match (result) {
+                IoResult::Err(e) => { return IoResult::Err(e); }
+                IoResult::Ok(0) => { self.first_done = true; }
+                IoResult::Ok(n) => { return IoResult::Ok(n); }
+            }
+        }
+
+        return self.second.read(buf, len);
+    }
+}
+
+// ============================================================================
+// Take Reader
+// ============================================================================
+
+/// A reader that limits the number of bytes read.
+type struct Take {
+    reader: Reader;
+    limit: u64;
+}
+
+implement struct Take {
+    /// Creates a limited reader.
+    static function new(reader: Reader, limit: u64) -> Take {
+        return Take {
+            reader: reader,
+            limit: limit
+        };
+    }
+
+    /// Returns the remaining limit.
+    function limit(self) -> u64 {
+        return self.limit;
+    }
+
+    /// Sets the limit.
+    function set_limit(self: &mut Take, limit: u64) -> void {
+        self.limit = limit;
+    }
+
+    /// Reads from the limited reader.
+    function read(self: &mut Take, buf: u8*, len: u64) -> IoResult<u64> {
+        if (self.limit == 0) {
+            return IoResult::Ok(0);
+        }
+
+        mut to_read: u64 = len;
+        if (to_read > self.limit) {
+            to_read = self.limit;
+        }
+
+        const result: IoResult<u64> = self.reader.read(buf, to_read);
+        match (result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(n) => {
+                self.limit = self.limit - n;
+                return IoResult::Ok(n);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Empty Reader
+// ============================================================================
+
+/// A reader that always returns EOF.
+type struct Empty {}
+
+implement struct Empty {
+    /// Creates an empty reader.
+    static function new() -> Empty {
+        return Empty {};
+    }
+
+    /// Reads (always returns 0).
+    function read(self, buf: u8*, len: u64) -> IoResult<u64> {
+        return IoResult::Ok(0);
+    }
+}
+
+// ============================================================================
+// Repeat Reader
+// ============================================================================
+
+/// A reader that infinitely repeats a byte.
+type struct Repeat {
+    byte: u8;
+}
+
+implement struct Repeat {
+    /// Creates a repeat reader.
+    static function new(byte: u8) -> Repeat {
+        return Repeat { byte: byte };
+    }
+
+    /// Reads (fills buffer with repeated byte).
+    function read(self, buf: u8*, len: u64) -> IoResult<u64> {
+        memset(buf, self.byte, len);
+        return IoResult::Ok(len);
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates an empty reader.
+function empty() -> Empty {
+    return Empty::new();
+}
+
+/// Creates a repeat reader.
+function repeat(byte: u8) -> Repeat {
+    return Repeat::new(byte);
+}
+
+/// Chains two readers.
+function chain(first: Reader, second: Reader) -> Chain {
+    return Chain::new(first, second);
+}
+
+/// Limits a reader.
+function take(reader: Reader, limit: u64) -> Take {
+    return Take::new(reader, limit);
+}
+
