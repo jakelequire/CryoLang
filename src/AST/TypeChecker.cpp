@@ -851,6 +851,70 @@ namespace Cryo
             return _type_context.get_generic_type(type_string);
         }
 
+        // Check for module-qualified types (e.g., "Types::SocketAddr")
+        // This must happen early to resolve import aliases before other type lookups
+        size_t scope_pos = type_string.find("::");
+        if (scope_pos != std::string::npos && _srm_context)
+        {
+            // Parse the qualified name
+            auto parsed = Cryo::SRM::Utils::parse_qualified_name(type_string);
+            std::vector<std::string> ns_parts = parsed.first;
+            std::string simple_name = parsed.second;
+
+            // Resolve namespace aliases (e.g., "Types" -> "std::net::Types")
+            if (!ns_parts.empty())
+            {
+                std::string resolved_first = _srm_context->resolve_namespace_alias(ns_parts[0]);
+                if (resolved_first != ns_parts[0])
+                {
+                    // Replace the first part with the resolved namespace
+                    auto resolved_parts = Cryo::SRM::Utils::parse_qualified_name(resolved_first).first;
+                    resolved_parts.insert(resolved_parts.end(), ns_parts.begin() + 1, ns_parts.end());
+
+                    // Build the new qualified type name
+                    std::string resolved_type_name = Cryo::SRM::Utils::build_qualified_name(resolved_parts, simple_name);
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "resolve_type_with_generic_context: Resolved alias '{}' -> '{}' for type '{}'",
+                              ns_parts[0], resolved_first, resolved_type_name);
+
+                    // Try to find the resolved type
+                    // First check struct types
+                    Type *struct_type = _type_context.get_struct_type(resolved_type_name);
+                    if (struct_type && struct_type->kind() != TypeKind::Unknown)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found scoped struct type: {}", resolved_type_name);
+                        return struct_type;
+                    }
+
+                    // Try class types
+                    Type *class_type = _type_context.get_class_type(resolved_type_name);
+                    if (class_type && class_type->kind() != TypeKind::Unknown)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found scoped class type: {}", resolved_type_name);
+                        return class_type;
+                    }
+
+                    // Try enum types
+                    Type *enum_type = _type_context.lookup_enum_type(resolved_type_name);
+                    if (enum_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found scoped enum type: {}", resolved_type_name);
+                        return enum_type;
+                    }
+
+                    // Try symbol table lookup
+                    TypedSymbol *symbol = _symbol_table->lookup_symbol(resolved_type_name);
+                    if (symbol && symbol->type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found scoped type in symbol table: {}", resolved_type_name);
+                        return symbol->type;
+                    }
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Scoped type '{}' not found in type registries", resolved_type_name);
+                }
+            }
+        }
+
         // Check for tuple types first (before checking for generic syntax)
         if (type_string.front() == '(' && type_string.back() == ')')
         {
