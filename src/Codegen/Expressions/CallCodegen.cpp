@@ -132,6 +132,36 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Generated member address for nested receiver: {}",
                               nested_member->member());
+
+                    // CRITICAL FIX: For primitive type members (string, i32, etc.), the field contains
+                    // a pointer value that we need to LOAD before passing to the method.
+                    // For example: this.input_buffer.length() where input_buffer is a string (ptr)
+                    //   - GEP gives us the address of the input_buffer field
+                    //   - But string::length expects the actual string pointer, not the field address
+                    //   - So we need to load the pointer value from the field
+                    if (receiver)
+                    {
+                        Cryo::Type *nested_type = nested_member->get_resolved_type();
+                        if (nested_type)
+                        {
+                            std::string type_name = nested_type->to_string();
+                            // Check if it's a primitive type that stores a pointer value
+                            static const std::unordered_set<std::string> primitive_ptr_types = {
+                                "string", "i8*", "u8*", "char*"};
+                            bool is_string_type = (nested_type->kind() == Cryo::TypeKind::String ||
+                                                   primitive_ptr_types.find(type_name) != primitive_ptr_types.end());
+
+                            if (is_string_type)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Loading string pointer from member field for primitive method call: {}",
+                                          nested_member->member());
+                                receiver = builder().CreateLoad(
+                                    llvm::PointerType::get(llvm_ctx(), 0), receiver,
+                                    nested_member->member() + ".str.load");
+                            }
+                        }
+                    }
                 }
                 else
                 {
