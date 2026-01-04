@@ -25,14 +25,14 @@ type struct RecvError {}
 
 /// Error when trying to receive without blocking.
 enum TryRecvError {
-    Empty,
-    Disconnected
+    Empty;
+    Disconnected;
 }
 
 /// Error when trying to send without blocking.
 enum TrySendError<T> {
-    Full(T),
-    Disconnected(T)
+    Full(T);
+    Disconnected(T);
 }
 
 // ============================================================================
@@ -46,11 +46,13 @@ type struct Channel<T> {
     cond: pthread_cond_t;
     senders: u64;
     receiver_connected: boolean;
+
+    static new() -> ChannelPair<T>;
 }
 
 implement struct Channel<T> {
     /// Creates a new unbounded channel.
-    static function new() -> ChannelPair<T> {
+    static new() -> ChannelPair<T> {
         const channel: Channel<T>* = malloc(sizeof(Channel<T>));
         if (channel == null) {
             panic("allocation failed", FILE, LINE);
@@ -72,51 +74,55 @@ implement struct Channel<T> {
 /// A sender half of a channel.
 type struct Sender<T> {
     channel: Channel<T>*;
+
+    send(this, value: T) -> Result<void, SendError<T>>;
+    clone(this) -> Sender<T>;
+    drop(this) -> void;
 }
 
 implement struct Sender<T> {
     /// Sends a value on the channel.
-    function send(self, value: T) -> Result<void, SendError<T>> {
-        pthread_mutex_lock(&self.channel.mutex);
+    send(this, value: T) -> Result<void, SendError<T>> {
+        pthread_mutex_lock(&this.channel.mutex);
 
-        if (!self.channel.receiver_connected) {
-            pthread_mutex_unlock(&self.channel.mutex);
+        if (!this.channel.receiver_connected) {
+            pthread_mutex_unlock(&this.channel.mutex);
             return Result::Err(SendError { value: value });
         }
 
-        self.channel.queue.push_back(value);
-        pthread_cond_signal(&self.channel.cond);
-        pthread_mutex_unlock(&self.channel.mutex);
+        this.channel.queue.push_back(value);
+        pthread_cond_signal(&this.channel.cond);
+        pthread_mutex_unlock(&this.channel.mutex);
 
         return Result::Ok(void);
     }
 
     /// Clones the sender.
-    function clone(self) -> Sender<T> {
-        pthread_mutex_lock(&self.channel.mutex);
-        self.channel.senders = self.channel.senders + 1;
-        pthread_mutex_unlock(&self.channel.mutex);
+    clone(this) -> Sender<T> {
+        pthread_mutex_lock(&this.channel.mutex);
+        this.channel.senders = this.channel.senders + 1;
+        pthread_mutex_unlock(&this.channel.mutex);
 
-        return Sender { channel: self.channel };
+        return Sender { channel: this.channel };
     }
 
     /// Drops the sender.
-    function drop(self) -> void {
-        pthread_mutex_lock(&self.channel.mutex);
-        self.channel.senders = self.channel.senders - 1;
+    drop(this) -> void {
+        pthread_mutex_lock(&this.channel.mutex);
+        this.channel.senders = this.channel.senders - 1;
 
-        if (self.channel.senders == 0) {
-            pthread_cond_broadcast(&self.channel.cond);
+        if (this.channel.senders == 0) {
+            pthread_cond_broadcast(&this.channel.cond);
         }
 
-        const should_free: boolean = self.channel.senders == 0 && !self.channel.receiver_connected;
-        pthread_mutex_unlock(&self.channel.mutex);
+        const should_free: boolean = this.channel.senders == 0 && !this.channel.receiver_connected;
+        pthread_mutex_unlock(&this.channel.mutex);
 
         if (should_free) {
-            pthread_mutex_destroy(&self.channel.mutex);
-            pthread_cond_destroy(&self.channel.cond);
-            self.channel.queue.drop();
-            free(self.channel);
+            pthread_mutex_destroy(&this.channel.mutex);
+            pthread_cond_destroy(&this.channel.cond);
+            this.channel.queue.drop();
+            free(this.channel);
         }
     }
 }
@@ -124,64 +130,69 @@ implement struct Sender<T> {
 /// A receiver half of a channel.
 type struct Receiver<T> {
     channel: Channel<T>*;
+
+    recv(this) -> Result<T, RecvError>;
+    try_recv(this) -> Result<T, TryRecvError>;
+    iter(this) -> RecvIter<T>;
+    drop(this) -> void;
 }
 
 implement struct Receiver<T> {
     /// Receives a value, blocking until one is available.
-    function recv(self) -> Result<T, RecvError> {
-        pthread_mutex_lock(&self.channel.mutex);
+    recv(this) -> Result<T, RecvError> {
+        pthread_mutex_lock(&this.channel.mutex);
 
-        while (self.channel.queue.is_empty()) {
-            if (self.channel.senders == 0) {
-                pthread_mutex_unlock(&self.channel.mutex);
+        while (this.channel.queue.is_empty()) {
+            if (this.channel.senders == 0) {
+                pthread_mutex_unlock(&this.channel.mutex);
                 return Result::Err(RecvError {});
             }
-            pthread_cond_wait(&self.channel.cond, &self.channel.mutex);
+            pthread_cond_wait(&this.channel.cond, &this.channel.mutex);
         }
 
-        const value: T = self.channel.queue.pop_front().unwrap();
-        pthread_mutex_unlock(&self.channel.mutex);
+        const value: T = this.channel.queue.pop_front().unwrap();
+        pthread_mutex_unlock(&this.channel.mutex);
 
         return Result::Ok(value);
     }
 
     /// Tries to receive without blocking.
-    function try_recv(self) -> Result<T, TryRecvError> {
-        pthread_mutex_lock(&self.channel.mutex);
+    try_recv(this) -> Result<T, TryRecvError> {
+        pthread_mutex_lock(&this.channel.mutex);
 
-        if (self.channel.queue.is_empty()) {
-            if (self.channel.senders == 0) {
-                pthread_mutex_unlock(&self.channel.mutex);
+        if (this.channel.queue.is_empty()) {
+            if (this.channel.senders == 0) {
+                pthread_mutex_unlock(&this.channel.mutex);
                 return Result::Err(TryRecvError::Disconnected);
             }
-            pthread_mutex_unlock(&self.channel.mutex);
+            pthread_mutex_unlock(&this.channel.mutex);
             return Result::Err(TryRecvError::Empty);
         }
 
-        const value: T = self.channel.queue.pop_front().unwrap();
-        pthread_mutex_unlock(&self.channel.mutex);
+        const value: T = this.channel.queue.pop_front().unwrap();
+        pthread_mutex_unlock(&this.channel.mutex);
 
         return Result::Ok(value);
     }
 
     /// Returns an iterator over received values.
-    function iter(self) -> RecvIter<T> {
-        return RecvIter { receiver: self };
+    iter(this) -> RecvIter<T> {
+        return RecvIter { receiver: this };
     }
 
     /// Drops the receiver.
-    function drop(self) -> void {
-        pthread_mutex_lock(&self.channel.mutex);
-        self.channel.receiver_connected = false;
+    drop(this) -> void {
+        pthread_mutex_lock(&this.channel.mutex);
+        this.channel.receiver_connected = false;
 
-        const should_free: boolean = self.channel.senders == 0;
-        pthread_mutex_unlock(&self.channel.mutex);
+        const should_free: boolean = this.channel.senders == 0;
+        pthread_mutex_unlock(&this.channel.mutex);
 
         if (should_free) {
-            pthread_mutex_destroy(&self.channel.mutex);
-            pthread_cond_destroy(&self.channel.cond);
-            self.channel.queue.drop();
-            free(self.channel);
+            pthread_mutex_destroy(&this.channel.mutex);
+            pthread_cond_destroy(&this.channel.cond);
+            this.channel.queue.drop();
+            free(this.channel);
         }
     }
 }
@@ -195,11 +206,13 @@ type struct ChannelPair<T> {
 /// An iterator over channel values.
 type struct RecvIter<T> {
     receiver: Receiver<T>;
+
+    next(this) -> Option<T>;
 }
 
 implement struct RecvIter<T> {
-    function next(self) -> Option<T> {
-        const result: Result<T, RecvError> = self.receiver.recv();
+    next(this) -> Option<T> {
+        const result: Result<T, RecvError> = this.receiver.recv();
         match (result) {
             Result::Ok(value) => { return Option::Some(value); }
             Result::Err(_) => { return Option::None; }
@@ -245,133 +258,142 @@ function bounded<T>(capacity: u64) -> BoundedChannelPair<T> {
 
 type struct BoundedSender<T> {
     channel: BoundedChannel<T>*;
+
+    send(this, value: T) -> Result<void, SendError<T>>;
+    try_send(this, value: T) -> Result<void, TrySendError<T>>;
+    clone(this) -> BoundedSender<T>;
+    drop(this) -> void;
 }
 
 implement struct BoundedSender<T> {
-    function send(self, value: T) -> Result<void, SendError<T>> {
-        pthread_mutex_lock(&self.channel.mutex);
+    send(this, value: T) -> Result<void, SendError<T>> {
+        pthread_mutex_lock(&this.channel.mutex);
 
-        while (self.channel.queue.len() >= self.channel.capacity) {
-            if (!self.channel.receiver_connected) {
-                pthread_mutex_unlock(&self.channel.mutex);
+        while (this.channel.queue.len() >= this.channel.capacity) {
+            if (!this.channel.receiver_connected) {
+                pthread_mutex_unlock(&this.channel.mutex);
                 return Result::Err(SendError { value: value });
             }
-            pthread_cond_wait(&self.channel.not_full, &self.channel.mutex);
+            pthread_cond_wait(&this.channel.not_full, &this.channel.mutex);
         }
 
-        if (!self.channel.receiver_connected) {
-            pthread_mutex_unlock(&self.channel.mutex);
+        if (!this.channel.receiver_connected) {
+            pthread_mutex_unlock(&this.channel.mutex);
             return Result::Err(SendError { value: value });
         }
 
-        self.channel.queue.push_back(value);
-        pthread_cond_signal(&self.channel.not_empty);
-        pthread_mutex_unlock(&self.channel.mutex);
+        this.channel.queue.push_back(value);
+        pthread_cond_signal(&this.channel.not_empty);
+        pthread_mutex_unlock(&this.channel.mutex);
 
         return Result::Ok(void);
     }
 
-    function try_send(self, value: T) -> Result<void, TrySendError<T>> {
-        pthread_mutex_lock(&self.channel.mutex);
+    try_send(this, value: T) -> Result<void, TrySendError<T>> {
+        pthread_mutex_lock(&this.channel.mutex);
 
-        if (!self.channel.receiver_connected) {
-            pthread_mutex_unlock(&self.channel.mutex);
+        if (!this.channel.receiver_connected) {
+            pthread_mutex_unlock(&this.channel.mutex);
             return Result::Err(TrySendError::Disconnected(value));
         }
 
-        if (self.channel.queue.len() >= self.channel.capacity) {
-            pthread_mutex_unlock(&self.channel.mutex);
+        if (this.channel.queue.len() >= this.channel.capacity) {
+            pthread_mutex_unlock(&this.channel.mutex);
             return Result::Err(TrySendError::Full(value));
         }
 
-        self.channel.queue.push_back(value);
-        pthread_cond_signal(&self.channel.not_empty);
-        pthread_mutex_unlock(&self.channel.mutex);
+        this.channel.queue.push_back(value);
+        pthread_cond_signal(&this.channel.not_empty);
+        pthread_mutex_unlock(&this.channel.mutex);
 
         return Result::Ok(void);
     }
 
-    function clone(self) -> BoundedSender<T> {
-        pthread_mutex_lock(&self.channel.mutex);
-        self.channel.senders = self.channel.senders + 1;
-        pthread_mutex_unlock(&self.channel.mutex);
-        return BoundedSender { channel: self.channel };
+    clone(this) -> BoundedSender<T> {
+        pthread_mutex_lock(&this.channel.mutex);
+        this.channel.senders = this.channel.senders + 1;
+        pthread_mutex_unlock(&this.channel.mutex);
+        return BoundedSender { channel: this.channel };
     }
 
-    function drop(self) -> void {
-        pthread_mutex_lock(&self.channel.mutex);
-        self.channel.senders = self.channel.senders - 1;
-        if (self.channel.senders == 0) {
-            pthread_cond_broadcast(&self.channel.not_empty);
+    drop(this) -> void {
+        pthread_mutex_lock(&this.channel.mutex);
+        this.channel.senders = this.channel.senders - 1;
+        if (this.channel.senders == 0) {
+            pthread_cond_broadcast(&this.channel.not_empty);
         }
-        const should_free: boolean = self.channel.senders == 0 && !self.channel.receiver_connected;
-        pthread_mutex_unlock(&self.channel.mutex);
+        const should_free: boolean = this.channel.senders == 0 && !this.channel.receiver_connected;
+        pthread_mutex_unlock(&this.channel.mutex);
 
         if (should_free) {
-            pthread_mutex_destroy(&self.channel.mutex);
-            pthread_cond_destroy(&self.channel.not_empty);
-            pthread_cond_destroy(&self.channel.not_full);
-            self.channel.queue.drop();
-            free(self.channel);
+            pthread_mutex_destroy(&this.channel.mutex);
+            pthread_cond_destroy(&this.channel.not_empty);
+            pthread_cond_destroy(&this.channel.not_full);
+            this.channel.queue.drop();
+            free(this.channel);
         }
     }
 }
 
 type struct BoundedReceiver<T> {
     channel: BoundedChannel<T>*;
+
+    recv(this) -> Result<T, RecvError>;
+    try_recv(this) -> Result<T, TryRecvError>;
+    drop(this) -> void;
 }
 
 implement struct BoundedReceiver<T> {
-    function recv(self) -> Result<T, RecvError> {
-        pthread_mutex_lock(&self.channel.mutex);
+    recv(this) -> Result<T, RecvError> {
+        pthread_mutex_lock(&this.channel.mutex);
 
-        while (self.channel.queue.is_empty()) {
-            if (self.channel.senders == 0) {
-                pthread_mutex_unlock(&self.channel.mutex);
+        while (this.channel.queue.is_empty()) {
+            if (this.channel.senders == 0) {
+                pthread_mutex_unlock(&this.channel.mutex);
                 return Result::Err(RecvError {});
             }
-            pthread_cond_wait(&self.channel.not_empty, &self.channel.mutex);
+            pthread_cond_wait(&this.channel.not_empty, &this.channel.mutex);
         }
 
-        const value: T = self.channel.queue.pop_front().unwrap();
-        pthread_cond_signal(&self.channel.not_full);
-        pthread_mutex_unlock(&self.channel.mutex);
+        const value: T = this.channel.queue.pop_front().unwrap();
+        pthread_cond_signal(&this.channel.not_full);
+        pthread_mutex_unlock(&this.channel.mutex);
 
         return Result::Ok(value);
     }
 
-    function try_recv(self) -> Result<T, TryRecvError> {
-        pthread_mutex_lock(&self.channel.mutex);
+    try_recv(this) -> Result<T, TryRecvError> {
+        pthread_mutex_lock(&this.channel.mutex);
 
-        if (self.channel.queue.is_empty()) {
-            if (self.channel.senders == 0) {
-                pthread_mutex_unlock(&self.channel.mutex);
+        if (this.channel.queue.is_empty()) {
+            if (this.channel.senders == 0) {
+                pthread_mutex_unlock(&this.channel.mutex);
                 return Result::Err(TryRecvError::Disconnected);
             }
-            pthread_mutex_unlock(&self.channel.mutex);
+            pthread_mutex_unlock(&this.channel.mutex);
             return Result::Err(TryRecvError::Empty);
         }
 
-        const value: T = self.channel.queue.pop_front().unwrap();
-        pthread_cond_signal(&self.channel.not_full);
-        pthread_mutex_unlock(&self.channel.mutex);
+        const value: T = this.channel.queue.pop_front().unwrap();
+        pthread_cond_signal(&this.channel.not_full);
+        pthread_mutex_unlock(&this.channel.mutex);
 
         return Result::Ok(value);
     }
 
-    function drop(self) -> void {
-        pthread_mutex_lock(&self.channel.mutex);
-        self.channel.receiver_connected = false;
-        pthread_cond_broadcast(&self.channel.not_full);
-        const should_free: boolean = self.channel.senders == 0;
-        pthread_mutex_unlock(&self.channel.mutex);
+    drop(this) -> void {
+        pthread_mutex_lock(&this.channel.mutex);
+        this.channel.receiver_connected = false;
+        pthread_cond_broadcast(&this.channel.not_full);
+        const should_free: boolean = this.channel.senders == 0;
+        pthread_mutex_unlock(&this.channel.mutex);
 
         if (should_free) {
-            pthread_mutex_destroy(&self.channel.mutex);
-            pthread_cond_destroy(&self.channel.not_empty);
-            pthread_cond_destroy(&self.channel.not_full);
-            self.channel.queue.drop();
-            free(self.channel);
+            pthread_mutex_destroy(&this.channel.mutex);
+            pthread_cond_destroy(&this.channel.not_empty);
+            pthread_cond_destroy(&this.channel.not_full);
+            this.channel.queue.drop();
+            free(this.channel);
         }
     }
 }
@@ -406,4 +428,3 @@ intrinsic function pthread_cond_destroy(cond: pthread_cond_t*) -> i32;
 intrinsic function pthread_cond_wait(cond: pthread_cond_t*, mutex: pthread_mutex_t*) -> i32;
 intrinsic function pthread_cond_signal(cond: pthread_cond_t*) -> i32;
 intrinsic function pthread_cond_broadcast(cond: pthread_cond_t*) -> i32;
-

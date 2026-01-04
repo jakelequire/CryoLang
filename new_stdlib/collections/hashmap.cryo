@@ -91,21 +91,42 @@ type struct HashMap<K, V> {
     cap: u64;
     /// Number of deleted entries.
     deleted: u64;
+
+    HashMap();
+    HashMap(capacity: u64);
+
+    length(this) -> u64;
+    capacity(this) -> u64;
+    is_empty(this) -> boolean;
+    get(this, key: K, key_hash: u64) -> Option<V>;
+    get_ref(this, key: K, key_hash: u64) -> V*;
+    contains_key(this, key: K, key_hash: u64) -> boolean;
+    insert(mut &this, key: K, value: V, key_hash: u64) -> Option<V>;
+    remove(mut &this, key: K, key_hash: u64) -> Option<V>;
+    get_or_insert(mut &this, key: K, default_value: V, key_hash: u64) -> V*;
+    clear(mut &this) -> void;
+    find_entry(this, key: K, key_hash: u64) -> Option<u64>;
+    maybe_grow(mut &this) -> void;
+    resize(mut &this, new_cap: u64) -> void;
+    iter(this) -> HashMapIter<K, V>;
+    keys(this) -> HashMapKeyIter<K, V>;
+    values(this) -> HashMapValueIter<K, V>;
+    drop(this) -> void;
+    reserve(mut &this, additional: u64) -> void;
+    shrink_to_fit(mut &this) -> void;
 }
 
 implement struct HashMap<K, V> {
     /// Creates a new empty HashMap.
-    static function new() -> HashMap<K, V> {
-        return HashMap {
-            entries: null,
-            len: 0,
-            cap: 0,
-            deleted: 0
-        };
+    HashMap() {
+        this.entries = null;
+        this.len = 0;
+        this.cap = 0;
+        this.deleted = 0;
     }
 
     /// Creates a HashMap with the specified capacity.
-    static function with_capacity(capacity: u64) -> HashMap<K, V> {
+    HashMap(capacity: u64) {
         mut actual_cap: u64 = MIN_CAPACITY;
         while (actual_cap < capacity) {
             actual_cap = actual_cap * 2;
@@ -116,12 +137,10 @@ implement struct HashMap<K, V> {
             panic("allocation failed", FILE, LINE);
         }
 
-        return HashMap {
-            entries: entries,
-            len: 0,
-            cap: actual_cap,
-            deleted: 0
-        };
+        this.entries = entries;
+        this.len = 0;
+        this.cap = actual_cap;
+        this.deleted = 0;
     }
 
     // ========================================================================
@@ -129,18 +148,18 @@ implement struct HashMap<K, V> {
     // ========================================================================
 
     /// Returns the number of entries.
-    function len(self) -> u64 {
-        return self.len;
+    length(this) -> u64 {
+        return this.len;
     }
 
     /// Returns the capacity.
-    function capacity(self) -> u64 {
-        return self.cap;
+    capacity(this) -> u64 {
+        return this.cap;
     }
 
     /// Returns true if the map is empty.
-    function is_empty(self) -> boolean {
-        return self.len == 0;
+    is_empty(this) -> boolean {
+        return this.len == 0;
     }
 
     // ========================================================================
@@ -148,38 +167,38 @@ implement struct HashMap<K, V> {
     // ========================================================================
 
     /// Gets a value by key.
-    function get(self, key: K, key_hash: u64) -> Option<V> {
-        if (self.cap == 0) {
+    get(this, key: K, key_hash: u64) -> Option<V> {
+        if (this.cap == 0) {
             return Option::None;
         }
 
-        const index: Option<u64> = self.find_entry(key, key_hash);
+        const index: Option<u64> = this.find_entry(key, key_hash);
         match (index) {
             Option::None => { return Option::None; }
             Option::Some(i) => {
-                return Option::Some(self.entries[i].value);
+                return Option::Some(this.entries[i].value);
             }
         }
     }
 
     /// Gets a reference to a value by key.
-    function get_ref(self, key: K, key_hash: u64) -> V* {
-        if (self.cap == 0) {
+    get_ref(this, key: K, key_hash: u64) -> V* {
+        if (this.cap == 0) {
             return null;
         }
 
-        const index: Option<u64> = self.find_entry(key, key_hash);
+        const index: Option<u64> = this.find_entry(key, key_hash);
         match (index) {
             Option::None => { return null; }
             Option::Some(i) => {
-                return &self.entries[i].value;
+                return &this.entries[i].value;
             }
         }
     }
 
     /// Returns true if the map contains the key.
-    function contains_key(self, key: K, key_hash: u64) -> boolean {
-        return self.find_entry(key, key_hash).is_some();
+    contains_key(this, key: K, key_hash: u64) -> boolean {
+        return this.find_entry(key, key_hash).is_some();
     }
 
     // ========================================================================
@@ -188,30 +207,30 @@ implement struct HashMap<K, V> {
 
     /// Inserts a key-value pair.
     /// Returns the old value if the key existed.
-    function insert(self: &mut HashMap<K, V>, key: K, value: V, key_hash: u64) -> Option<V> {
-        self.maybe_grow();
+    insert(mut &this, key: K, value: V, key_hash: u64) -> Option<V> {
+        this.maybe_grow();
 
-        const mask: u64 = self.cap - 1;
+        const mask: u64 = this.cap - 1;
         mut index: u64 = key_hash & mask;
         mut first_deleted: i64 = -1;
 
         mut i: u64 = 0;
-        while (i < self.cap) {
-            const entry: HashMapEntry<K, V>* = &self.entries[index];
+        while (i < this.cap) {
+            const entry: HashMapEntry<K, V>* = &this.entries[index];
 
             if (entry.state == BUCKET_EMPTY) {
                 // Insert here
                 mut insert_index: u64 = index;
                 if (first_deleted >= 0) {
                     insert_index = first_deleted;
-                    self.deleted = self.deleted - 1;
+                    this.deleted = this.deleted - 1;
                 }
 
-                self.entries[insert_index].key = key;
-                self.entries[insert_index].value = value;
-                self.entries[insert_index].hash = key_hash;
-                self.entries[insert_index].state = BUCKET_OCCUPIED;
-                self.len = self.len + 1;
+                this.entries[insert_index].key = key;
+                this.entries[insert_index].value = value;
+                this.entries[insert_index].hash = key_hash;
+                this.entries[insert_index].state = BUCKET_OCCUPIED;
+                this.len = this.len + 1;
                 return Option::None;
             }
 
@@ -222,7 +241,7 @@ implement struct HashMap<K, V> {
             } else if (entry.hash == key_hash && entry.key == key) {
                 // Key exists, replace value
                 const old_value: V = entry.value;
-                self.entries[index].value = value;
+                this.entries[index].value = value;
                 return Option::Some(old_value);
             }
 
@@ -238,49 +257,49 @@ implement struct HashMap<K, V> {
 
     /// Removes a key-value pair.
     /// Returns the value if the key existed.
-    function remove(self: &mut HashMap<K, V>, key: K, key_hash: u64) -> Option<V> {
-        if (self.cap == 0) {
+    remove(mut &this, key: K, key_hash: u64) -> Option<V> {
+        if (this.cap == 0) {
             return Option::None;
         }
 
-        const index: Option<u64> = self.find_entry(key, key_hash);
+        const index: Option<u64> = this.find_entry(key, key_hash);
         match (index) {
             Option::None => { return Option::None; }
             Option::Some(i) => {
-                const value: V = self.entries[i].value;
-                self.entries[i].state = BUCKET_DELETED;
-                self.len = self.len - 1;
-                self.deleted = self.deleted + 1;
+                const value: V = this.entries[i].value;
+                this.entries[i].state = BUCKET_DELETED;
+                this.len = this.len - 1;
+                this.deleted = this.deleted + 1;
                 return Option::Some(value);
             }
         }
     }
 
     /// Gets or inserts a value.
-    function get_or_insert(self: &mut HashMap<K, V>, key: K, default_value: V, key_hash: u64) -> V* {
-        self.maybe_grow();
+    get_or_insert(mut &this, key: K, default_value: V, key_hash: u64) -> V* {
+        this.maybe_grow();
 
-        const mask: u64 = self.cap - 1;
+        const mask: u64 = this.cap - 1;
         mut index: u64 = key_hash & mask;
         mut first_deleted: i64 = -1;
 
         mut i: u64 = 0;
-        while (i < self.cap) {
-            const entry: HashMapEntry<K, V>* = &self.entries[index];
+        while (i < this.cap) {
+            const entry: HashMapEntry<K, V>* = &this.entries[index];
 
             if (entry.state == BUCKET_EMPTY) {
                 mut insert_index: u64 = index;
                 if (first_deleted >= 0) {
                     insert_index = first_deleted;
-                    self.deleted = self.deleted - 1;
+                    this.deleted = this.deleted - 1;
                 }
 
-                self.entries[insert_index].key = key;
-                self.entries[insert_index].value = default_value;
-                self.entries[insert_index].hash = key_hash;
-                self.entries[insert_index].state = BUCKET_OCCUPIED;
-                self.len = self.len + 1;
-                return &self.entries[insert_index].value;
+                this.entries[insert_index].key = key;
+                this.entries[insert_index].value = default_value;
+                this.entries[insert_index].hash = key_hash;
+                this.entries[insert_index].state = BUCKET_OCCUPIED;
+                this.len = this.len + 1;
+                return &this.entries[insert_index].value;
             }
 
             if (entry.state == BUCKET_DELETED) {
@@ -288,7 +307,7 @@ implement struct HashMap<K, V> {
                     first_deleted = index;
                 }
             } else if (entry.hash == key_hash && entry.key == key) {
-                return &self.entries[index].value;
+                return &this.entries[index].value;
             }
 
             i = i + 1;
@@ -300,12 +319,12 @@ implement struct HashMap<K, V> {
     }
 
     /// Clears the map.
-    function clear(self: &mut HashMap<K, V>) -> void {
-        if (self.cap > 0) {
-            memset(self.entries, 0, sizeof(HashMapEntry<K, V>) * self.cap);
+    clear(mut &this) -> void {
+        if (this.cap > 0) {
+            memset(this.entries, 0, sizeof(HashMapEntry<K, V>) * this.cap);
         }
-        self.len = 0;
-        self.deleted = 0;
+        this.len = 0;
+        this.deleted = 0;
     }
 
     // ========================================================================
@@ -313,17 +332,17 @@ implement struct HashMap<K, V> {
     // ========================================================================
 
     /// Finds an entry by key.
-    function find_entry(self, key: K, key_hash: u64) -> Option<u64> {
-        if (self.cap == 0) {
+    find_entry(this, key: K, key_hash: u64) -> Option<u64> {
+        if (this.cap == 0) {
             return Option::None;
         }
 
-        const mask: u64 = self.cap - 1;
+        const mask: u64 = this.cap - 1;
         mut index: u64 = key_hash & mask;
 
         mut i: u64 = 0;
-        while (i < self.cap) {
-            const entry: HashMapEntry<K, V>* = &self.entries[index];
+        while (i < this.cap) {
+            const entry: HashMapEntry<K, V>* = &this.entries[index];
 
             if (entry.state == BUCKET_EMPTY) {
                 return Option::None;
@@ -343,38 +362,38 @@ implement struct HashMap<K, V> {
     }
 
     /// Grows the map if needed.
-    function maybe_grow(self: &mut HashMap<K, V>) -> void {
-        if (self.cap == 0) {
-            self.resize(DEFAULT_CAPACITY);
+    maybe_grow(mut &this) -> void {
+        if (this.cap == 0) {
+            this.resize(DEFAULT_CAPACITY);
             return;
         }
 
         // Check if we need to resize
-        const threshold: u64 = (self.cap * MAX_LOAD_FACTOR_NUM) / MAX_LOAD_FACTOR_DEN;
-        if (self.len + self.deleted >= threshold) {
-            self.resize(self.cap * 2);
+        const threshold: u64 = (this.cap * MAX_LOAD_FACTOR_NUM) / MAX_LOAD_FACTOR_DEN;
+        if (this.len + this.deleted >= threshold) {
+            this.resize(this.cap * 2);
         }
     }
 
     /// Resizes the map.
-    function resize(self: &mut HashMap<K, V>, new_cap: u64) -> void {
-        const old_entries: HashMapEntry<K, V>* = self.entries;
-        const old_cap: u64 = self.cap;
+    resize(mut &this, new_cap: u64) -> void {
+        const old_entries: HashMapEntry<K, V>* = this.entries;
+        const old_cap: u64 = this.cap;
 
-        self.entries = calloc(new_cap, sizeof(HashMapEntry<K, V>));
-        if (self.entries == null) {
+        this.entries = calloc(new_cap, sizeof(HashMapEntry<K, V>));
+        if (this.entries == null) {
             panic("allocation failed", FILE, LINE);
         }
 
-        self.cap = new_cap;
-        self.len = 0;
-        self.deleted = 0;
+        this.cap = new_cap;
+        this.len = 0;
+        this.deleted = 0;
 
         // Reinsert all entries
         mut i: u64 = 0;
         while (i < old_cap) {
             if (old_entries[i].state == BUCKET_OCCUPIED) {
-                self.insert(old_entries[i].key, old_entries[i].value, old_entries[i].hash);
+                this.insert(old_entries[i].key, old_entries[i].value, old_entries[i].hash);
             }
             i = i + 1;
         }
@@ -389,28 +408,28 @@ implement struct HashMap<K, V> {
     // ========================================================================
 
     /// Creates an iterator over the entries.
-    function iter(self) -> HashMapIter<K, V> {
+    iter(this) -> HashMapIter<K, V> {
         return HashMapIter {
-            entries: self.entries,
-            cap: self.cap,
+            entries: this.entries,
+            cap: this.cap,
             current: 0
         };
     }
 
     /// Creates an iterator over the keys.
-    function keys(self) -> HashMapKeyIter<K, V> {
+    keys(this) -> HashMapKeyIter<K, V> {
         return HashMapKeyIter {
-            entries: self.entries,
-            cap: self.cap,
+            entries: this.entries,
+            cap: this.cap,
             current: 0
         };
     }
 
     /// Creates an iterator over the values.
-    function values(self) -> HashMapValueIter<K, V> {
+    values(this) -> HashMapValueIter<K, V> {
         return HashMapValueIter {
-            entries: self.entries,
-            cap: self.cap,
+            entries: this.entries,
+            cap: this.cap,
             current: 0
         };
     }
@@ -420,48 +439,48 @@ implement struct HashMap<K, V> {
     // ========================================================================
 
     /// Drops the map.
-    function drop(self) -> void {
-        if (self.entries != null) {
-            free(self.entries);
+    drop(this) -> void {
+        if (this.entries != null) {
+            free(this.entries);
         }
     }
 
     /// Reserves capacity for additional entries.
-    function reserve(self: &mut HashMap<K, V>, additional: u64) -> void {
-        const required: u64 = self.len + additional;
+    reserve(mut &this, additional: u64) -> void {
+        const required: u64 = this.len + additional;
         const threshold: u64 = (required * MAX_LOAD_FACTOR_DEN) / MAX_LOAD_FACTOR_NUM;
 
-        if (threshold > self.cap) {
-            mut new_cap: u64 = self.cap;
+        if (threshold > this.cap) {
+            mut new_cap: u64 = this.cap;
             if (new_cap == 0) {
                 new_cap = DEFAULT_CAPACITY;
             }
             while (new_cap < threshold) {
                 new_cap = new_cap * 2;
             }
-            self.resize(new_cap);
+            this.resize(new_cap);
         }
     }
 
     /// Shrinks the capacity to fit.
-    function shrink_to_fit(self: &mut HashMap<K, V>) -> void {
-        if (self.len == 0) {
-            if (self.entries != null) {
-                free(self.entries);
-                self.entries = null;
-                self.cap = 0;
+    shrink_to_fit(mut &this) -> void {
+        if (this.len == 0) {
+            if (this.entries != null) {
+                free(this.entries);
+                this.entries = null;
+                this.cap = 0;
             }
             return;
         }
 
-        const min_cap: u64 = (self.len * MAX_LOAD_FACTOR_DEN) / MAX_LOAD_FACTOR_NUM;
+        const min_cap: u64 = (this.len * MAX_LOAD_FACTOR_DEN) / MAX_LOAD_FACTOR_NUM;
         mut new_cap: u64 = MIN_CAPACITY;
         while (new_cap < min_cap) {
             new_cap = new_cap * 2;
         }
 
-        if (new_cap < self.cap) {
-            self.resize(new_cap);
+        if (new_cap < this.cap) {
+            this.resize(new_cap);
         }
     }
 }
@@ -475,32 +494,35 @@ type struct HashMapIter<K, V> {
     entries: HashMapEntry<K, V>*;
     cap: u64;
     current: u64;
+
+    has_next(this) -> boolean;
+    next(mut &this) -> Option<HashMapPair<K, V>>;
 }
 
 implement struct HashMapIter<K, V> {
     /// Returns true if there are more entries.
-    function has_next(self) -> boolean {
-        while (self.current < self.cap) {
-            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
+    has_next(this) -> boolean {
+        while (this.current < this.cap) {
+            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
                 return true;
             }
-            self.current = self.current + 1;
+            this.current = this.current + 1;
         }
         return false;
     }
 
     /// Returns the next key-value pair.
-    function next(self: &mut HashMapIter<K, V>) -> Option<HashMapPair<K, V>> {
-        while (self.current < self.cap) {
-            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
-                const entry: HashMapEntry<K, V>* = &self.entries[self.current];
-                self.current = self.current + 1;
+    next(mut &this) -> Option<HashMapPair<K, V>> {
+        while (this.current < this.cap) {
+            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
+                const entry: HashMapEntry<K, V>* = &this.entries[this.current];
+                this.current = this.current + 1;
                 return Option::Some(HashMapPair {
                     key: entry.key,
                     value: entry.value
                 });
             }
-            self.current = self.current + 1;
+            this.current = this.current + 1;
         }
         return Option::None;
     }
@@ -517,27 +539,30 @@ type struct HashMapKeyIter<K, V> {
     entries: HashMapEntry<K, V>*;
     cap: u64;
     current: u64;
+
+    has_next(this) -> boolean;
+    next(mut &this) -> Option<K>;
 }
 
 implement struct HashMapKeyIter<K, V> {
-    function has_next(self) -> boolean {
-        while (self.current < self.cap) {
-            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
+    has_next(this) -> boolean {
+        while (this.current < this.cap) {
+            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
                 return true;
             }
-            self.current = self.current + 1;
+            this.current = this.current + 1;
         }
         return false;
     }
 
-    function next(self: &mut HashMapKeyIter<K, V>) -> Option<K> {
-        while (self.current < self.cap) {
-            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
-                const key: K = self.entries[self.current].key;
-                self.current = self.current + 1;
+    next(mut &this) -> Option<K> {
+        while (this.current < this.cap) {
+            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
+                const key: K = this.entries[this.current].key;
+                this.current = this.current + 1;
                 return Option::Some(key);
             }
-            self.current = self.current + 1;
+            this.current = this.current + 1;
         }
         return Option::None;
     }
@@ -548,27 +573,30 @@ type struct HashMapValueIter<K, V> {
     entries: HashMapEntry<K, V>*;
     cap: u64;
     current: u64;
+
+    has_next(this) -> boolean;
+    next(mut &this) -> Option<V>;
 }
 
 implement struct HashMapValueIter<K, V> {
-    function has_next(self) -> boolean {
-        while (self.current < self.cap) {
-            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
+    has_next(this) -> boolean {
+        while (this.current < this.cap) {
+            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
                 return true;
             }
-            self.current = self.current + 1;
+            this.current = this.current + 1;
         }
         return false;
     }
 
-    function next(self: &mut HashMapValueIter<K, V>) -> Option<V> {
-        while (self.current < self.cap) {
-            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
-                const value: V = self.entries[self.current].value;
-                self.current = self.current + 1;
+    next(mut &this) -> Option<V> {
+        while (this.current < this.cap) {
+            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
+                const value: V = this.entries[this.current].value;
+                this.current = this.current + 1;
                 return Option::Some(value);
             }
-            self.current = self.current + 1;
+            this.current = this.current + 1;
         }
         return Option::None;
     }
@@ -581,102 +609,128 @@ implement struct HashMapValueIter<K, V> {
 /// A HashMap with string keys.
 type struct StringHashMap<V> {
     map: HashMap<string, V>;
+
+    StringHashMap();
+    StringHashMap(capacity: u64);
+
+    length(this) -> u64;
+    is_empty(this) -> boolean;
+    get(this, key: string) -> Option<V>;
+    get_ref(this, key: string) -> V*;
+    contains_key(this, key: string) -> boolean;
+    insert(mut &this, key: string, value: V) -> Option<V>;
+    remove(mut &this, key: string) -> Option<V>;
+    clear(mut &this) -> void;
+    drop(this) -> void;
 }
 
 implement struct StringHashMap<V> {
-    static function new() -> StringHashMap<V> {
-        return StringHashMap { map: HashMap::new() };
+    StringHashMap() {
+        this.map = new HashMap();
     }
 
-    static function with_capacity(capacity: u64) -> StringHashMap<V> {
-        return StringHashMap { map: HashMap::with_capacity(capacity) };
+    StringHashMap(capacity: u64) {
+        this.map = new HashMap(capacity);
     }
 
-    function len(self) -> u64 {
-        return self.map.len();
+    length(this) -> u64 {
+        return this.map.length();
     }
 
-    function is_empty(self) -> boolean {
-        return self.map.is_empty();
+    is_empty(this) -> boolean {
+        return this.map.is_empty();
     }
 
-    function get(self, key: string) -> Option<V> {
-        return self.map.get(key, hash_str(key));
+    get(this, key: string) -> Option<V> {
+        return this.map.get(key, hash_str(key));
     }
 
-    function get_ref(self, key: string) -> V* {
-        return self.map.get_ref(key, hash_str(key));
+    get_ref(this, key: string) -> V* {
+        return this.map.get_ref(key, hash_str(key));
     }
 
-    function contains_key(self, key: string) -> boolean {
-        return self.map.contains_key(key, hash_str(key));
+    contains_key(this, key: string) -> boolean {
+        return this.map.contains_key(key, hash_str(key));
     }
 
-    function insert(self: &mut StringHashMap<V>, key: string, value: V) -> Option<V> {
-        return self.map.insert(key, value, hash_str(key));
+    insert(mut &this, key: string, value: V) -> Option<V> {
+        return this.map.insert(key, value, hash_str(key));
     }
 
-    function remove(self: &mut StringHashMap<V>, key: string) -> Option<V> {
-        return self.map.remove(key, hash_str(key));
+    remove(mut &this, key: string) -> Option<V> {
+        return this.map.remove(key, hash_str(key));
     }
 
-    function clear(self: &mut StringHashMap<V>) -> void {
-        self.map.clear();
+    clear(mut &this) -> void {
+        this.map.clear();
     }
 
-    function drop(self) -> void {
-        self.map.drop();
+    drop(this) -> void {
+        this.map.drop();
     }
 }
 
 /// A HashMap with integer keys.
 type struct IntHashMap<V> {
     map: HashMap<u64, V>;
+
+    IntHashMap();
+    IntHashMap(capacity: u64);
+
+    length(this) -> u64;
+    is_empty(this) -> boolean;
+    get(this, key: u64) -> Option<V>;
+    get_ref(this, key: u64) -> V*;
+    contains_key(this, key: u64) -> boolean;
+    insert(mut &this, key: u64, value: V) -> Option<V>;
+    remove(mut &this, key: u64) -> Option<V>;
+    clear(mut &this) -> void;
+    drop(this) -> void;
 }
 
 implement struct IntHashMap<V> {
-    static function new() -> IntHashMap<V> {
-        return IntHashMap { map: HashMap::new() };
+    IntHashMap() {
+        this.map = new HashMap();
     }
 
-    static function with_capacity(capacity: u64) -> IntHashMap<V> {
-        return IntHashMap { map: HashMap::with_capacity(capacity) };
+    IntHashMap(capacity: u64) {
+        this.map = new HashMap(capacity);
     }
 
-    function len(self) -> u64 {
-        return self.map.len();
+    length(this) -> u64 {
+        return this.map.length();
     }
 
-    function is_empty(self) -> boolean {
-        return self.map.is_empty();
+    is_empty(this) -> boolean {
+        return this.map.is_empty();
     }
 
-    function get(self, key: u64) -> Option<V> {
-        return self.map.get(key, hash_int(key));
+    get(this, key: u64) -> Option<V> {
+        return this.map.get(key, hash_int(key));
     }
 
-    function get_ref(self, key: u64) -> V* {
-        return self.map.get_ref(key, hash_int(key));
+    get_ref(this, key: u64) -> V* {
+        return this.map.get_ref(key, hash_int(key));
     }
 
-    function contains_key(self, key: u64) -> boolean {
-        return self.map.contains_key(key, hash_int(key));
+    contains_key(this, key: u64) -> boolean {
+        return this.map.contains_key(key, hash_int(key));
     }
 
-    function insert(self: &mut IntHashMap<V>, key: u64, value: V) -> Option<V> {
-        return self.map.insert(key, value, hash_int(key));
+    insert(mut &this, key: u64, value: V) -> Option<V> {
+        return this.map.insert(key, value, hash_int(key));
     }
 
-    function remove(self: &mut IntHashMap<V>, key: u64) -> Option<V> {
-        return self.map.remove(key, hash_int(key));
+    remove(mut &this, key: u64) -> Option<V> {
+        return this.map.remove(key, hash_int(key));
     }
 
-    function clear(self: &mut IntHashMap<V>) -> void {
-        self.map.clear();
+    clear(mut &this) -> void {
+        this.map.clear();
     }
 
-    function drop(self) -> void {
-        self.map.drop();
+    drop(this) -> void {
+        this.map.drop();
     }
 }
 
@@ -686,21 +740,20 @@ implement struct IntHashMap<V> {
 
 /// Creates a new empty HashMap.
 function hashmap<K, V>() -> HashMap<K, V> {
-    return HashMap::new();
+    return new HashMap();
 }
 
 /// Creates a HashMap with capacity.
 function hashmap_with_capacity<K, V>(capacity: u64) -> HashMap<K, V> {
-    return HashMap::with_capacity(capacity);
+    return new HashMap(capacity);
 }
 
 /// Creates a string-keyed HashMap.
 function string_hashmap<V>() -> StringHashMap<V> {
-    return StringHashMap::new();
+    return new StringHashMap();
 }
 
 /// Creates an integer-keyed HashMap.
 function int_hashmap<V>() -> IntHashMap<V> {
-    return IntHashMap::new();
+    return new IntHashMap();
 }
-

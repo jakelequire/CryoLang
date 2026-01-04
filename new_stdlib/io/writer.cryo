@@ -20,20 +20,31 @@ type struct Writer {
     /// Opaque handle to the underlying sink.
     handle: void*;
     /// Write function pointer.
-    write_fn: fn(void*, u8*, u64) -> IoResult<u64>;
+    write_fn: (void*, u8*, u64) -> IoResult<u64>;
     /// Flush function pointer.
-    flush_fn: fn(void*) -> IoResult<void>;
+    flush_fn: (void*) -> IoResult<void>;
     /// Close function pointer (optional).
-    close_fn: fn(void*) -> IoResult<void>;
+    close_fn: (void*) -> IoResult<void>;
+
+    // Method signatures
+    static Writer(handle: void*, write_fn: (void*, u8*, u64) -> IoResult<u64>, flush_fn: (void*) -> IoResult<void>, close_fn: (void*) -> IoResult<void>) -> Writer;
+    write(this, buf: u8*, len: u64) -> IoResult<u64>;
+    write_all(this, buf: u8*, len: u64) -> IoResult<void>;
+    write_str(this, s: string) -> IoResult<u64>;
+    write_string(this, s: String) -> IoResult<u64>;
+    write_fmt(this, s: string) -> IoResult<void>;
+    write_byte(this, b: u8) -> IoResult<void>;
+    flush(this) -> IoResult<void>;
+    close(this) -> IoResult<void>;
 }
 
 implement struct Writer {
     /// Creates a writer from function pointers.
-    static function from_fns(
+    static Writer(
         handle: void*,
-        write_fn: fn(void*, u8*, u64) -> IoResult<u64>,
-        flush_fn: fn(void*) -> IoResult<void>,
-        close_fn: fn(void*) -> IoResult<void>
+        write_fn: (void*, u8*, u64) -> IoResult<u64>,
+        flush_fn: (void*) -> IoResult<void>,
+        close_fn: (void*) -> IoResult<void>
     ) -> Writer {
         return Writer {
             handle: handle,
@@ -45,16 +56,16 @@ implement struct Writer {
 
     /// Writes bytes from the buffer.
     /// Returns the number of bytes written.
-    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
-        return self.write_fn(self.handle, buf, len);
+    write(this, buf: u8*, len: u64) -> IoResult<u64> {
+        return this.write_fn(this.handle, buf, len);
     }
 
     /// Writes all bytes from the buffer.
-    function write_all(self, buf: u8*, len: u64) -> IoResult<void> {
+    write_all(this, buf: u8*, len: u64) -> IoResult<void> {
         mut total_written: u64 = 0;
 
         while (total_written < len) {
-            const result: IoResult<u64> = self.write(&buf[total_written], len - total_written);
+            const result: IoResult<u64> = this.write(&buf[total_written], len - total_written);
             match (result) {
                 IoResult::Err(e) => {
                     if (e.kind() == IoErrorKind::Interrupted) {
@@ -75,45 +86,45 @@ implement struct Writer {
     }
 
     /// Writes a string.
-    function write_str(self, s: string) -> IoResult<u64> {
+    write_str(this, s: string) -> IoResult<u64> {
         const len: u64 = strlen(s);
-        return self.write(s, len);
+        return this.write(s, len);
     }
 
     /// Writes a String.
-    function write_string(self, s: String) -> IoResult<u64> {
-        return self.write(s.as_bytes(), s.len());
+    write_string(this, s: String) -> IoResult<u64> {
+        return this.write(s.as_bytes(), s.len());
     }
 
     /// Writes a formatted string (simple version).
-    function write_fmt(self, s: string) -> IoResult<void> {
+    write_fmt(this, s: string) -> IoResult<void> {
         const len: u64 = strlen(s);
-        return self.write_all(s, len);
+        return this.write_all(s, len);
     }
 
     /// Writes a single byte.
-    function write_byte(self, b: u8) -> IoResult<void> {
-        return self.write_all(&b, 1);
+    write_byte(this, b: u8) -> IoResult<void> {
+        return this.write_all(&b, 1);
     }
 
     /// Flushes the writer.
-    function flush(self) -> IoResult<void> {
-        if (self.flush_fn != null) {
-            return self.flush_fn(self.handle);
+    flush(this) -> IoResult<void> {
+        if (this.flush_fn != null) {
+            return this.flush_fn(this.handle);
         }
         return IoResult::Ok(void);
     }
 
     /// Closes the writer.
-    function close(self) -> IoResult<void> {
-        const flush_result: IoResult<void> = self.flush();
+    close(this) -> IoResult<void> {
+        const flush_result: IoResult<void> = this.flush();
         match (flush_result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(_) => {}
         }
 
-        if (self.close_fn != null) {
-            return self.close_fn(self.handle);
+        if (this.close_fn != null) {
+            return this.close_fn(this.handle);
         }
         return IoResult::Ok(void);
     }
@@ -191,21 +202,26 @@ function write_u64_be(writer: Writer, value: u64) -> IoResult<void> {
 // ============================================================================
 
 /// A writer that discards all data.
-type struct Sink {}
+type struct Sink {
+    // Method signatures
+    static Sink() -> Sink;
+    write(this, buf: u8*, len: u64) -> IoResult<u64>;
+    flush(this) -> IoResult<void>;
+}
 
 implement struct Sink {
     /// Creates a sink writer.
-    static function new() -> Sink {
+    static Sink() -> Sink {
         return Sink {};
     }
 
     /// Writes (discards all data).
-    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+    write(this, buf: u8*, len: u64) -> IoResult<u64> {
         return IoResult::Ok(len);
     }
 
     /// Flushes (no-op).
-    function flush(self) -> IoResult<void> {
+    flush(this) -> IoResult<void> {
         return IoResult::Ok(void);
     }
 }
@@ -218,11 +234,16 @@ implement struct Sink {
 type struct Broadcast {
     writers: Writer*;
     count: u64;
+
+    // Method signatures
+    static Broadcast(writers: Writer*, count: u64) -> Broadcast;
+    write(this, buf: u8*, len: u64) -> IoResult<u64>;
+    flush(this) -> IoResult<void>;
 }
 
 implement struct Broadcast {
     /// Creates a broadcast writer.
-    static function new(writers: Writer*, count: u64) -> Broadcast {
+    static Broadcast(writers: Writer*, count: u64) -> Broadcast {
         return Broadcast {
             writers: writers,
             count: count
@@ -230,10 +251,10 @@ implement struct Broadcast {
     }
 
     /// Writes to all underlying writers.
-    function write(self, buf: u8*, len: u64) -> IoResult<u64> {
+    write(this, buf: u8*, len: u64) -> IoResult<u64> {
         mut i: u64 = 0;
-        while (i < self.count) {
-            const result: IoResult<u64> = self.writers[i].write(buf, len);
+        while (i < this.count) {
+            const result: IoResult<u64> = this.writers[i].write(buf, len);
             match (result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(_) => {}
@@ -244,10 +265,10 @@ implement struct Broadcast {
     }
 
     /// Flushes all underlying writers.
-    function flush(self) -> IoResult<void> {
+    flush(this) -> IoResult<void> {
         mut i: u64 = 0;
-        while (i < self.count) {
-            const result: IoResult<void> = self.writers[i].flush();
+        while (i < this.count) {
+            const result: IoResult<void> = this.writers[i].flush();
             match (result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(_) => {}
@@ -268,11 +289,19 @@ type struct LineWriter {
     buf: u8*;
     buf_len: u64;
     buf_cap: u64;
+
+    // Method signatures
+    static LineWriter(inner: Writer) -> LineWriter;
+    write(mut &this, buf: u8*, len: u64) -> IoResult<u64>;
+    buffer_write(mut &this, buf: u8*, len: u64) -> IoResult<u64>;
+    flush_buf(mut &this) -> IoResult<void>;
+    flush(mut &this) -> IoResult<void>;
+    drop(this) -> void;
 }
 
 implement struct LineWriter {
     /// Creates a line writer.
-    static function new(inner: Writer) -> LineWriter {
+    static LineWriter(inner: Writer) -> LineWriter {
         const DEFAULT_CAP: u64 = 1024;
         const buf: u8* = malloc(DEFAULT_CAP);
         if (buf == null) {
@@ -288,7 +317,7 @@ implement struct LineWriter {
     }
 
     /// Writes to the line writer.
-    function write(self: &mut LineWriter, buf: u8*, len: u64) -> IoResult<u64> {
+    write(mut &this, buf: u8*, len: u64) -> IoResult<u64> {
         // Find the last newline
         mut last_newline: i64 = -1;
         mut i: u64 = 0;
@@ -301,18 +330,18 @@ implement struct LineWriter {
 
         if (last_newline < 0) {
             // No newline, buffer everything
-            return self.buffer_write(buf, len);
+            return this.buffer_write(buf, len);
         }
 
         // Flush buffer and write up to and including newline
-        const result: IoResult<void> = self.flush_buf();
+        const result: IoResult<void> = this.flush_buf();
         match (result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(_) => {}
         }
 
         const write_len: u64 = last_newline + 1;
-        const inner_result: IoResult<u64> = self.inner.write(buf, write_len);
+        const inner_result: IoResult<u64> = this.inner.write(buf, write_len);
         match (inner_result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(n) => {
@@ -322,7 +351,7 @@ implement struct LineWriter {
             }
         }
 
-        const flush_result: IoResult<void> = self.inner.flush();
+        const flush_result: IoResult<void> = this.inner.flush();
         match (flush_result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(_) => {}
@@ -331,59 +360,59 @@ implement struct LineWriter {
         // Buffer the rest
         const remaining: u64 = len - write_len;
         if (remaining > 0) {
-            self.buffer_write(&buf[write_len], remaining);
+            this.buffer_write(&buf[write_len], remaining);
         }
 
         return IoResult::Ok(len);
     }
 
     /// Buffers data.
-    function buffer_write(self: &mut LineWriter, buf: u8*, len: u64) -> IoResult<u64> {
+    buffer_write(mut &this, buf: u8*, len: u64) -> IoResult<u64> {
         // Ensure capacity
-        if (self.buf_len + len > self.buf_cap) {
-            const result: IoResult<void> = self.flush_buf();
+        if (this.buf_len + len > this.buf_cap) {
+            const result: IoResult<void> = this.flush_buf();
             match (result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(_) => {}
             }
 
-            if (len > self.buf_cap) {
+            if (len > this.buf_cap) {
                 // Too large for buffer, write directly
-                return self.inner.write(buf, len);
+                return this.inner.write(buf, len);
             }
         }
 
-        memcpy(&self.buf[self.buf_len], buf, len);
-        self.buf_len = self.buf_len + len;
+        memcpy(&this.buf[this.buf_len], buf, len);
+        this.buf_len = this.buf_len + len;
         return IoResult::Ok(len);
     }
 
     /// Flushes the internal buffer.
-    function flush_buf(self: &mut LineWriter) -> IoResult<void> {
-        if (self.buf_len == 0) {
+    flush_buf(mut &this) -> IoResult<void> {
+        if (this.buf_len == 0) {
             return IoResult::Ok(void);
         }
 
-        const result: IoResult<void> = self.inner.write_all(self.buf, self.buf_len);
-        self.buf_len = 0;
+        const result: IoResult<void> = this.inner.write_all(this.buf, this.buf_len);
+        this.buf_len = 0;
         return result;
     }
 
     /// Flushes completely.
-    function flush(self: &mut LineWriter) -> IoResult<void> {
-        const buf_result: IoResult<void> = self.flush_buf();
+    flush(mut &this) -> IoResult<void> {
+        const buf_result: IoResult<void> = this.flush_buf();
         match (buf_result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(_) => {}
         }
-        return self.inner.flush();
+        return this.inner.flush();
     }
 
     /// Drops the line writer.
-    function drop(self) -> void {
-        self.flush();
-        if (self.buf != null) {
-            free(self.buf);
+    drop(this) -> void {
+        this.flush();
+        if (this.buf != null) {
+            free(this.buf);
         }
     }
 }
@@ -394,16 +423,15 @@ implement struct LineWriter {
 
 /// Creates a sink writer.
 function sink() -> Sink {
-    return Sink::new();
+    return Sink::Sink();
 }
 
 /// Creates a broadcast writer.
 function broadcast(writers: Writer*, count: u64) -> Broadcast {
-    return Broadcast::new(writers, count);
+    return Broadcast::Broadcast(writers, count);
 }
 
 /// Creates a line writer.
 function line_writer(inner: Writer) -> LineWriter {
-    return LineWriter::new(inner);
+    return LineWriter::LineWriter(inner);
 }
-
