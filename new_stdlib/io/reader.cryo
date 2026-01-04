@@ -21,17 +21,25 @@ type struct Reader {
     /// Opaque handle to the underlying source.
     handle: void*;
     /// Read function pointer.
-    read_fn: fn(void*, u8*, u64) -> IoResult<u64>;
+    read_fn: (void*, u8*, u64) -> IoResult<u64>;
     /// Close function pointer (optional).
-    close_fn: fn(void*) -> IoResult<void>;
+    close_fn: (void*) -> IoResult<void>;
+
+    // Method signatures
+    static from_fns(void*, (void*, u8*, u64) -> IoResult<u64>, (void*) -> IoResult<void>) -> Reader;
+    read(this, u8*, u64) -> IoResult<u64>;
+    read_exact(this, u8*, u64) -> IoResult<void>;
+    read_to_end(this, &mut Vec<u8>) -> IoResult<u64>;
+    read_to_string(this, &mut String) -> IoResult<u64>;
+    close(this) -> IoResult<void>;
 }
 
 implement struct Reader {
     /// Creates a reader from function pointers.
     static function from_fns(
         handle: void*,
-        read_fn: fn(void*, u8*, u64) -> IoResult<u64>,
-        close_fn: fn(void*) -> IoResult<void>
+        read_fn: (void*, u8*, u64) -> IoResult<u64>,
+        close_fn: (void*) -> IoResult<void>
     ) -> Reader {
         return Reader {
             handle: handle,
@@ -42,16 +50,16 @@ implement struct Reader {
 
     /// Reads bytes into the buffer.
     /// Returns the number of bytes read.
-    function read(self, buf: u8*, len: u64) -> IoResult<u64> {
-        return self.read_fn(self.handle, buf, len);
+    read(this, buf: u8*, len: u64) -> IoResult<u64> {
+        return this.read_fn(this.handle, buf, len);
     }
 
     /// Reads exactly `len` bytes.
-    function read_exact(self, buf: u8*, len: u64) -> IoResult<void> {
+    read_exact(this, buf: u8*, len: u64) -> IoResult<void> {
         mut total_read: u64 = 0;
 
         while (total_read < len) {
-            const result: IoResult<u64> = self.read(&buf[total_read], len - total_read);
+            const result: IoResult<u64> = this.read(&buf[total_read], len - total_read);
             match (result) {
                 IoResult::Err(e) => {
                     if (e.kind() == IoErrorKind::Interrupted) {
@@ -72,7 +80,7 @@ implement struct Reader {
     }
 
     /// Reads all bytes until EOF.
-    function read_to_end(self, buf: &mut Vec<u8>) -> IoResult<u64> {
+    read_to_end(this, buf: &mut Vec<u8>) -> IoResult<u64> {
         const CHUNK_SIZE: u64 = 8192;
         mut total_read: u64 = 0;
 
@@ -82,7 +90,7 @@ implement struct Reader {
 
             // Read into the reserved space
             mut chunk: u8[8192];
-            const result: IoResult<u64> = self.read(&chunk[0], CHUNK_SIZE);
+            const result: IoResult<u64> = this.read(&chunk[0], CHUNK_SIZE);
 
             match (result) {
                 IoResult::Err(e) => {
@@ -107,9 +115,9 @@ implement struct Reader {
     }
 
     /// Reads all bytes into a String until EOF.
-    function read_to_string(self, s: &mut String) -> IoResult<u64> {
+    read_to_string(this, s: &mut String) -> IoResult<u64> {
         const buf: Vec<u8> = Vec::new();
-        const result: IoResult<u64> = self.read_to_end(&buf);
+        const result: IoResult<u64> = this.read_to_end(&buf);
 
         match (result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
@@ -127,9 +135,9 @@ implement struct Reader {
     }
 
     /// Closes the reader.
-    function close(self) -> IoResult<void> {
-        if (self.close_fn != null) {
-            return self.close_fn(self.handle);
+    close(this) -> IoResult<void> {
+        if (this.close_fn != null) {
+            return this.close_fn(this.handle);
         }
         return IoResult::Ok(void);
     }
@@ -144,11 +152,16 @@ type struct Bytes {
     reader: Reader*;
     buf: u8;
     done: boolean;
+
+    // Method signatures
+    Bytes(Reader) -> Bytes;
+    has_next(this) -> boolean;
+    next(mut &this) -> Option<IoResult<u8>>;
 }
 
 implement struct Bytes {
     /// Creates a bytes iterator.
-    static function new(reader: Reader) -> Bytes {
+    Bytes(reader: Reader) -> Bytes {
         return Bytes {
             reader: &reader,
             buf: 0,
@@ -157,29 +170,29 @@ implement struct Bytes {
     }
 
     /// Returns true if there are more bytes.
-    function has_next(self) -> boolean {
-        return !self.done;
+    has_next(this) -> boolean {
+        return !this.done;
     }
 
     /// Returns the next byte.
-    function next(self: &mut Bytes) -> Option<IoResult<u8>> {
-        if (self.done) {
+    next(mut &this) -> Option<IoResult<u8>> {
+        if (this.done) {
             return Option::None;
         }
 
-        const result: IoResult<u64> = self.reader.read(&self.buf, 1);
+        const result: IoResult<u64> = this.reader.read(&this.buf, 1);
 
         match (result) {
             IoResult::Err(e) => {
-                self.done = true;
+                this.done = true;
                 return Option::Some(IoResult::Err(e));
             }
             IoResult::Ok(0) => {
-                self.done = true;
+                this.done = true;
                 return Option::None;
             }
             IoResult::Ok(_) => {
-                return Option::Some(IoResult::Ok(self.buf));
+                return Option::Some(IoResult::Ok(this.buf));
             }
         }
     }
@@ -296,11 +309,15 @@ type struct Chain {
     first: Reader;
     second: Reader;
     first_done: boolean;
+
+    // Method signatures
+    Chain(Reader, Reader) -> Chain;
+    read(mut &this, u8*, u64) -> IoResult<u64>;
 }
 
 implement struct Chain {
     /// Creates a chain of two readers.
-    static function new(first: Reader, second: Reader) -> Chain {
+    Chain(first: Reader, second: Reader) -> Chain {
         return Chain {
             first: first,
             second: second,
@@ -309,17 +326,17 @@ implement struct Chain {
     }
 
     /// Reads from the chain.
-    function read(self: &mut Chain, buf: u8*, len: u64) -> IoResult<u64> {
-        if (!self.first_done) {
-            const result: IoResult<u64> = self.first.read(buf, len);
+    read(mut &this, buf: u8*, len: u64) -> IoResult<u64> {
+        if (!this.first_done) {
+            const result: IoResult<u64> = this.first.read(buf, len);
             match (result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
-                IoResult::Ok(0) => { self.first_done = true; }
+                IoResult::Ok(0) => { this.first_done = true; }
                 IoResult::Ok(n) => { return IoResult::Ok(n); }
             }
         }
 
-        return self.second.read(buf, len);
+        return this.second.read(buf, len);
     }
 }
 
@@ -331,11 +348,17 @@ implement struct Chain {
 type struct Take {
     reader: Reader;
     limit: u64;
+
+    // Method signatures
+    Take(Reader, u64) -> Take;
+    limit(this) -> u64;
+    set_limit(mut &this, u64) -> void;
+    read(mut &this, u8*, u64) -> IoResult<u64>;
 }
 
 implement struct Take {
     /// Creates a limited reader.
-    static function new(reader: Reader, limit: u64) -> Take {
+    Take(reader: Reader, limit: u64) -> Take {
         return Take {
             reader: reader,
             limit: limit
@@ -343,31 +366,31 @@ implement struct Take {
     }
 
     /// Returns the remaining limit.
-    function limit(self) -> u64 {
-        return self.limit;
+    limit(this) -> u64 {
+        return this.limit;
     }
 
     /// Sets the limit.
-    function set_limit(self: &mut Take, limit: u64) -> void {
-        self.limit = limit;
+    set_limit(mut &this, limit: u64) -> void {
+        this.limit = limit;
     }
 
     /// Reads from the limited reader.
-    function read(self: &mut Take, buf: u8*, len: u64) -> IoResult<u64> {
-        if (self.limit == 0) {
+    read(mut &this, buf: u8*, len: u64) -> IoResult<u64> {
+        if (this.limit == 0) {
             return IoResult::Ok(0);
         }
 
         mut to_read: u64 = len;
-        if (to_read > self.limit) {
-            to_read = self.limit;
+        if (to_read > this.limit) {
+            to_read = this.limit;
         }
 
-        const result: IoResult<u64> = self.reader.read(buf, to_read);
+        const result: IoResult<u64> = this.reader.read(buf, to_read);
         match (result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(n) => {
-                self.limit = self.limit - n;
+                this.limit = this.limit - n;
                 return IoResult::Ok(n);
             }
         }
@@ -379,16 +402,20 @@ implement struct Take {
 // ============================================================================
 
 /// A reader that always returns EOF.
-type struct Empty {}
+type struct Empty {
+    // Method signatures
+    Empty() -> Empty;
+    read(this, u8*, u64) -> IoResult<u64>;
+}
 
 implement struct Empty {
     /// Creates an empty reader.
-    static function new() -> Empty {
+    Empty() -> Empty {
         return Empty {};
     }
 
     /// Reads (always returns 0).
-    function read(self, buf: u8*, len: u64) -> IoResult<u64> {
+    read(this, buf: u8*, len: u64) -> IoResult<u64> {
         return IoResult::Ok(0);
     }
 }
@@ -400,17 +427,21 @@ implement struct Empty {
 /// A reader that infinitely repeats a byte.
 type struct Repeat {
     byte: u8;
+
+    // Method signatures
+    Repeat(u8) -> Repeat;
+    read(this, u8*, u64) -> IoResult<u64>;
 }
 
 implement struct Repeat {
     /// Creates a repeat reader.
-    static function new(byte: u8) -> Repeat {
+    Repeat(byte: u8) -> Repeat {
         return Repeat { byte: byte };
     }
 
     /// Reads (fills buffer with repeated byte).
-    function read(self, buf: u8*, len: u64) -> IoResult<u64> {
-        memset(buf, self.byte, len);
+    read(this, buf: u8*, len: u64) -> IoResult<u64> {
+        memset(buf, this.byte, len);
         return IoResult::Ok(len);
     }
 }
@@ -421,21 +452,20 @@ implement struct Repeat {
 
 /// Creates an empty reader.
 function empty() -> Empty {
-    return Empty::new();
+    return Empty::Empty();
 }
 
 /// Creates a repeat reader.
 function repeat(byte: u8) -> Repeat {
-    return Repeat::new(byte);
+    return Repeat::Repeat(byte);
 }
 
 /// Chains two readers.
 function chain(first: Reader, second: Reader) -> Chain {
-    return Chain::new(first, second);
+    return Chain::Chain(first, second);
 }
 
 /// Limits a reader.
 function take(reader: Reader, limit: u64) -> Take {
-    return Take::new(reader, limit);
+    return Take::Take(reader, limit);
 }
-

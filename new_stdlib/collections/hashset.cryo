@@ -25,6 +25,33 @@ type struct HashSet<T> {
     cap: u64;
     /// Number of deleted entries.
     deleted: u64;
+
+    HashSet();
+    HashSet(capacity: u64);
+
+    len(this) -> u64;
+    capacity(this) -> u64;
+    is_empty(this) -> boolean;
+    contains(this, value: T, value_hash: u64) -> boolean;
+    get(this, value: T, value_hash: u64) -> Option<T>;
+    insert(mut &this, value: T, value_hash: u64) -> boolean;
+    remove(mut &this, value: T, value_hash: u64) -> boolean;
+    take(mut &this, value: T, value_hash: u64) -> Option<T>;
+    clear(mut &this) -> void;
+    is_subset(this, other: HashSet<T>) -> boolean;
+    is_superset(this, other: HashSet<T>) -> boolean;
+    is_disjoint(this, other: HashSet<T>) -> boolean;
+    union(this, other: HashSet<T>) -> HashSet<T>;
+    intersection(this, other: HashSet<T>) -> HashSet<T>;
+    difference(this, other: HashSet<T>) -> HashSet<T>;
+    symmetric_difference(this, other: HashSet<T>) -> HashSet<T>;
+    find_entry(this, value: T, value_hash: u64) -> Option<u64>;
+    maybe_grow(mut &this) -> void;
+    resize(mut &this, new_cap: u64) -> void;
+    iter(this) -> HashSetIter<T>;
+    drop(this) -> void;
+    reserve(mut &this, additional: u64) -> void;
+    clone(this) -> HashSet<T>;
 }
 
 /// An entry in the hash set.
@@ -45,17 +72,15 @@ const MAX_LOAD_FACTOR_DEN: u64 = 4;
 
 implement struct HashSet<T> {
     /// Creates a new empty HashSet.
-    static function new() -> HashSet<T> {
-        return HashSet {
-            entries: null,
-            len: 0,
-            cap: 0,
-            deleted: 0
-        };
+    HashSet() {
+        this.entries = null;
+        this.len = 0;
+        this.cap = 0;
+        this.deleted = 0;
     }
 
     /// Creates a HashSet with the specified capacity.
-    static function with_capacity(capacity: u64) -> HashSet<T> {
+    HashSet(capacity: u64) {
         mut actual_cap: u64 = MIN_CAPACITY;
         while (actual_cap < capacity) {
             actual_cap = actual_cap * 2;
@@ -66,12 +91,10 @@ implement struct HashSet<T> {
             panic("allocation failed", FILE, LINE);
         }
 
-        return HashSet {
-            entries: entries,
-            len: 0,
-            cap: actual_cap,
-            deleted: 0
-        };
+        this.entries = entries;
+        this.len = 0;
+        this.cap = actual_cap;
+        this.deleted = 0;
     }
 
     // ========================================================================
@@ -79,18 +102,18 @@ implement struct HashSet<T> {
     // ========================================================================
 
     /// Returns the number of elements.
-    function len(self) -> u64 {
-        return self.len;
+    len(this) -> u64 {
+        return this.len;
     }
 
     /// Returns the capacity.
-    function capacity(self) -> u64 {
-        return self.cap;
+    capacity(this) -> u64 {
+        return this.cap;
     }
 
     /// Returns true if the set is empty.
-    function is_empty(self) -> boolean {
-        return self.len == 0;
+    is_empty(this) -> boolean {
+        return this.len == 0;
     }
 
     // ========================================================================
@@ -98,17 +121,17 @@ implement struct HashSet<T> {
     // ========================================================================
 
     /// Returns true if the set contains the value.
-    function contains(self, value: T, value_hash: u64) -> boolean {
-        return self.find_entry(value, value_hash).is_some();
+    contains(this, value: T, value_hash: u64) -> boolean {
+        return this.find_entry(value, value_hash).is_some();
     }
 
     /// Gets a reference to the value in the set.
-    function get(self, value: T, value_hash: u64) -> Option<T> {
-        const index: Option<u64> = self.find_entry(value, value_hash);
+    get(this, value: T, value_hash: u64) -> Option<T> {
+        const index: Option<u64> = this.find_entry(value, value_hash);
         match (index) {
             Option::None => { return Option::None; }
             Option::Some(i) => {
-                return Option::Some(self.entries[i].value);
+                return Option::Some(this.entries[i].value);
             }
         }
     }
@@ -119,28 +142,28 @@ implement struct HashSet<T> {
 
     /// Inserts a value into the set.
     /// Returns true if the value was newly inserted.
-    function insert(self: &mut HashSet<T>, value: T, value_hash: u64) -> boolean {
-        self.maybe_grow();
+    insert(mut &this, value: T, value_hash: u64) -> boolean {
+        this.maybe_grow();
 
-        const mask: u64 = self.cap - 1;
+        const mask: u64 = this.cap - 1;
         mut index: u64 = value_hash & mask;
         mut first_deleted: i64 = -1;
 
         mut i: u64 = 0;
-        while (i < self.cap) {
-            const entry: HashSetEntry<T>* = &self.entries[index];
+        while (i < this.cap) {
+            const entry: HashSetEntry<T>* = &this.entries[index];
 
             if (entry.state == BUCKET_EMPTY) {
                 mut insert_index: u64 = index;
                 if (first_deleted >= 0) {
                     insert_index = first_deleted;
-                    self.deleted = self.deleted - 1;
+                    this.deleted = this.deleted - 1;
                 }
 
-                self.entries[insert_index].value = value;
-                self.entries[insert_index].hash = value_hash;
-                self.entries[insert_index].state = BUCKET_OCCUPIED;
-                self.len = self.len + 1;
+                this.entries[insert_index].value = value;
+                this.entries[insert_index].hash = value_hash;
+                this.entries[insert_index].state = BUCKET_OCCUPIED;
+                this.len = this.len + 1;
                 return true;
             }
 
@@ -162,49 +185,49 @@ implement struct HashSet<T> {
 
     /// Removes a value from the set.
     /// Returns true if the value was present.
-    function remove(self: &mut HashSet<T>, value: T, value_hash: u64) -> boolean {
-        if (self.cap == 0) {
+    remove(mut &this, value: T, value_hash: u64) -> boolean {
+        if (this.cap == 0) {
             return false;
         }
 
-        const index: Option<u64> = self.find_entry(value, value_hash);
+        const index: Option<u64> = this.find_entry(value, value_hash);
         match (index) {
             Option::None => { return false; }
             Option::Some(i) => {
-                self.entries[i].state = BUCKET_DELETED;
-                self.len = self.len - 1;
-                self.deleted = self.deleted + 1;
+                this.entries[i].state = BUCKET_DELETED;
+                this.len = this.len - 1;
+                this.deleted = this.deleted + 1;
                 return true;
             }
         }
     }
 
     /// Takes a value from the set.
-    function take(self: &mut HashSet<T>, value: T, value_hash: u64) -> Option<T> {
-        if (self.cap == 0) {
+    take(mut &this, value: T, value_hash: u64) -> Option<T> {
+        if (this.cap == 0) {
             return Option::None;
         }
 
-        const index: Option<u64> = self.find_entry(value, value_hash);
+        const index: Option<u64> = this.find_entry(value, value_hash);
         match (index) {
             Option::None => { return Option::None; }
             Option::Some(i) => {
-                const result: T = self.entries[i].value;
-                self.entries[i].state = BUCKET_DELETED;
-                self.len = self.len - 1;
-                self.deleted = self.deleted + 1;
+                const result: T = this.entries[i].value;
+                this.entries[i].state = BUCKET_DELETED;
+                this.len = this.len - 1;
+                this.deleted = this.deleted + 1;
                 return Option::Some(result);
             }
         }
     }
 
     /// Clears the set.
-    function clear(self: &mut HashSet<T>) -> void {
-        if (self.cap > 0) {
-            memset(self.entries, 0, sizeof(HashSetEntry<T>) * self.cap);
+    clear(mut &this) -> void {
+        if (this.cap > 0) {
+            memset(this.entries, 0, sizeof(HashSetEntry<T>) * this.cap);
         }
-        self.len = 0;
-        self.deleted = 0;
+        this.len = 0;
+        this.deleted = 0;
     }
 
     // ========================================================================
@@ -212,15 +235,15 @@ implement struct HashSet<T> {
     // ========================================================================
 
     /// Returns true if self is a subset of other.
-    function is_subset(self, other: HashSet<T>) -> boolean {
-        if (self.len > other.len) {
+    is_subset(this, other: HashSet<T>) -> boolean {
+        if (this.len > other.len) {
             return false;
         }
 
         mut i: u64 = 0;
-        while (i < self.cap) {
-            if (self.entries[i].state == BUCKET_OCCUPIED) {
-                if (!other.contains(self.entries[i].value, self.entries[i].hash)) {
+        while (i < this.cap) {
+            if (this.entries[i].state == BUCKET_OCCUPIED) {
+                if (!other.contains(this.entries[i].value, this.entries[i].hash)) {
                     return false;
                 }
             }
@@ -230,18 +253,18 @@ implement struct HashSet<T> {
     }
 
     /// Returns true if self is a superset of other.
-    function is_superset(self, other: HashSet<T>) -> boolean {
-        return other.is_subset(self);
+    is_superset(this, other: HashSet<T>) -> boolean {
+        return other.is_subset(this);
     }
 
     /// Returns true if self and other have no elements in common.
-    function is_disjoint(self, other: HashSet<T>) -> boolean {
+    is_disjoint(this, other: HashSet<T>) -> boolean {
         // Iterate over the smaller set
-        if (self.len <= other.len) {
+        if (this.len <= other.len) {
             mut i: u64 = 0;
-            while (i < self.cap) {
-                if (self.entries[i].state == BUCKET_OCCUPIED) {
-                    if (other.contains(self.entries[i].value, self.entries[i].hash)) {
+            while (i < this.cap) {
+                if (this.entries[i].state == BUCKET_OCCUPIED) {
+                    if (other.contains(this.entries[i].value, this.entries[i].hash)) {
                         return false;
                     }
                 }
@@ -251,7 +274,7 @@ implement struct HashSet<T> {
             mut i: u64 = 0;
             while (i < other.cap) {
                 if (other.entries[i].state == BUCKET_OCCUPIED) {
-                    if (self.contains(other.entries[i].value, other.entries[i].hash)) {
+                    if (this.contains(other.entries[i].value, other.entries[i].hash)) {
                         return false;
                     }
                 }
@@ -262,14 +285,14 @@ implement struct HashSet<T> {
     }
 
     /// Returns the union of self and other.
-    function union(self, other: HashSet<T>) -> HashSet<T> {
-        const result: HashSet<T> = HashSet::with_capacity(self.len + other.len);
+    union(this, other: HashSet<T>) -> HashSet<T> {
+        const result: HashSet<T> = new HashSet(this.len + other.len);
 
         // Add all from self
         mut i: u64 = 0;
-        while (i < self.cap) {
-            if (self.entries[i].state == BUCKET_OCCUPIED) {
-                result.insert(self.entries[i].value, self.entries[i].hash);
+        while (i < this.cap) {
+            if (this.entries[i].state == BUCKET_OCCUPIED) {
+                result.insert(this.entries[i].value, this.entries[i].hash);
             }
             i = i + 1;
         }
@@ -287,16 +310,16 @@ implement struct HashSet<T> {
     }
 
     /// Returns the intersection of self and other.
-    function intersection(self, other: HashSet<T>) -> HashSet<T> {
-        const result: HashSet<T> = HashSet::new();
+    intersection(this, other: HashSet<T>) -> HashSet<T> {
+        const result: HashSet<T> = new HashSet();
 
         // Iterate over the smaller set
-        if (self.len <= other.len) {
+        if (this.len <= other.len) {
             mut i: u64 = 0;
-            while (i < self.cap) {
-                if (self.entries[i].state == BUCKET_OCCUPIED) {
-                    if (other.contains(self.entries[i].value, self.entries[i].hash)) {
-                        result.insert(self.entries[i].value, self.entries[i].hash);
+            while (i < this.cap) {
+                if (this.entries[i].state == BUCKET_OCCUPIED) {
+                    if (other.contains(this.entries[i].value, this.entries[i].hash)) {
+                        result.insert(this.entries[i].value, this.entries[i].hash);
                     }
                 }
                 i = i + 1;
@@ -305,7 +328,7 @@ implement struct HashSet<T> {
             mut i: u64 = 0;
             while (i < other.cap) {
                 if (other.entries[i].state == BUCKET_OCCUPIED) {
-                    if (self.contains(other.entries[i].value, other.entries[i].hash)) {
+                    if (this.contains(other.entries[i].value, other.entries[i].hash)) {
                         result.insert(other.entries[i].value, other.entries[i].hash);
                     }
                 }
@@ -317,14 +340,14 @@ implement struct HashSet<T> {
     }
 
     /// Returns the difference of self and other (elements in self but not in other).
-    function difference(self, other: HashSet<T>) -> HashSet<T> {
-        const result: HashSet<T> = HashSet::new();
+    difference(this, other: HashSet<T>) -> HashSet<T> {
+        const result: HashSet<T> = new HashSet();
 
         mut i: u64 = 0;
-        while (i < self.cap) {
-            if (self.entries[i].state == BUCKET_OCCUPIED) {
-                if (!other.contains(self.entries[i].value, self.entries[i].hash)) {
-                    result.insert(self.entries[i].value, self.entries[i].hash);
+        while (i < this.cap) {
+            if (this.entries[i].state == BUCKET_OCCUPIED) {
+                if (!other.contains(this.entries[i].value, this.entries[i].hash)) {
+                    result.insert(this.entries[i].value, this.entries[i].hash);
                 }
             }
             i = i + 1;
@@ -334,15 +357,15 @@ implement struct HashSet<T> {
     }
 
     /// Returns the symmetric difference (elements in either but not both).
-    function symmetric_difference(self, other: HashSet<T>) -> HashSet<T> {
-        const result: HashSet<T> = HashSet::new();
+    symmetric_difference(this, other: HashSet<T>) -> HashSet<T> {
+        const result: HashSet<T> = new HashSet();
 
         // Elements in self but not in other
         mut i: u64 = 0;
-        while (i < self.cap) {
-            if (self.entries[i].state == BUCKET_OCCUPIED) {
-                if (!other.contains(self.entries[i].value, self.entries[i].hash)) {
-                    result.insert(self.entries[i].value, self.entries[i].hash);
+        while (i < this.cap) {
+            if (this.entries[i].state == BUCKET_OCCUPIED) {
+                if (!other.contains(this.entries[i].value, this.entries[i].hash)) {
+                    result.insert(this.entries[i].value, this.entries[i].hash);
                 }
             }
             i = i + 1;
@@ -352,7 +375,7 @@ implement struct HashSet<T> {
         i = 0;
         while (i < other.cap) {
             if (other.entries[i].state == BUCKET_OCCUPIED) {
-                if (!self.contains(other.entries[i].value, other.entries[i].hash)) {
+                if (!this.contains(other.entries[i].value, other.entries[i].hash)) {
                     result.insert(other.entries[i].value, other.entries[i].hash);
                 }
             }
@@ -366,17 +389,17 @@ implement struct HashSet<T> {
     // Internal
     // ========================================================================
 
-    function find_entry(self, value: T, value_hash: u64) -> Option<u64> {
-        if (self.cap == 0) {
+    find_entry(this, value: T, value_hash: u64) -> Option<u64> {
+        if (this.cap == 0) {
             return Option::None;
         }
 
-        const mask: u64 = self.cap - 1;
+        const mask: u64 = this.cap - 1;
         mut index: u64 = value_hash & mask;
 
         mut i: u64 = 0;
-        while (i < self.cap) {
-            const entry: HashSetEntry<T>* = &self.entries[index];
+        while (i < this.cap) {
+            const entry: HashSetEntry<T>* = &this.entries[index];
 
             if (entry.state == BUCKET_EMPTY) {
                 return Option::None;
@@ -395,35 +418,35 @@ implement struct HashSet<T> {
         return Option::None;
     }
 
-    function maybe_grow(self: &mut HashSet<T>) -> void {
-        if (self.cap == 0) {
-            self.resize(DEFAULT_CAPACITY);
+    maybe_grow(mut &this) -> void {
+        if (this.cap == 0) {
+            this.resize(DEFAULT_CAPACITY);
             return;
         }
 
-        const threshold: u64 = (self.cap * MAX_LOAD_FACTOR_NUM) / MAX_LOAD_FACTOR_DEN;
-        if (self.len + self.deleted >= threshold) {
-            self.resize(self.cap * 2);
+        const threshold: u64 = (this.cap * MAX_LOAD_FACTOR_NUM) / MAX_LOAD_FACTOR_DEN;
+        if (this.len + this.deleted >= threshold) {
+            this.resize(this.cap * 2);
         }
     }
 
-    function resize(self: &mut HashSet<T>, new_cap: u64) -> void {
-        const old_entries: HashSetEntry<T>* = self.entries;
-        const old_cap: u64 = self.cap;
+    resize(mut &this, new_cap: u64) -> void {
+        const old_entries: HashSetEntry<T>* = this.entries;
+        const old_cap: u64 = this.cap;
 
-        self.entries = calloc(new_cap, sizeof(HashSetEntry<T>));
-        if (self.entries == null) {
+        this.entries = calloc(new_cap, sizeof(HashSetEntry<T>));
+        if (this.entries == null) {
             panic("allocation failed", FILE, LINE);
         }
 
-        self.cap = new_cap;
-        self.len = 0;
-        self.deleted = 0;
+        this.cap = new_cap;
+        this.len = 0;
+        this.deleted = 0;
 
         mut i: u64 = 0;
         while (i < old_cap) {
             if (old_entries[i].state == BUCKET_OCCUPIED) {
-                self.insert(old_entries[i].value, old_entries[i].hash);
+                this.insert(old_entries[i].value, old_entries[i].hash);
             }
             i = i + 1;
         }
@@ -437,10 +460,10 @@ implement struct HashSet<T> {
     // Iteration
     // ========================================================================
 
-    function iter(self) -> HashSetIter<T> {
+    iter(this) -> HashSetIter<T> {
         return HashSetIter {
-            entries: self.entries,
-            cap: self.cap,
+            entries: this.entries,
+            cap: this.cap,
             current: 0
         };
     }
@@ -449,35 +472,35 @@ implement struct HashSet<T> {
     // Memory Management
     // ========================================================================
 
-    function drop(self) -> void {
-        if (self.entries != null) {
-            free(self.entries);
+    drop(this) -> void {
+        if (this.entries != null) {
+            free(this.entries);
         }
     }
 
-    function reserve(self: &mut HashSet<T>, additional: u64) -> void {
-        const required: u64 = self.len + additional;
+    reserve(mut &this, additional: u64) -> void {
+        const required: u64 = this.len + additional;
         const threshold: u64 = (required * MAX_LOAD_FACTOR_DEN) / MAX_LOAD_FACTOR_NUM;
 
-        if (threshold > self.cap) {
-            mut new_cap: u64 = self.cap;
+        if (threshold > this.cap) {
+            mut new_cap: u64 = this.cap;
             if (new_cap == 0) {
                 new_cap = DEFAULT_CAPACITY;
             }
             while (new_cap < threshold) {
                 new_cap = new_cap * 2;
             }
-            self.resize(new_cap);
+            this.resize(new_cap);
         }
     }
 
-    function clone(self) -> HashSet<T> {
-        const result: HashSet<T> = HashSet::with_capacity(self.cap);
+    clone(this) -> HashSet<T> {
+        const result: HashSet<T> = new HashSet(this.cap);
 
         mut i: u64 = 0;
-        while (i < self.cap) {
-            if (self.entries[i].state == BUCKET_OCCUPIED) {
-                result.insert(self.entries[i].value, self.entries[i].hash);
+        while (i < this.cap) {
+            if (this.entries[i].state == BUCKET_OCCUPIED) {
+                result.insert(this.entries[i].value, this.entries[i].hash);
             }
             i = i + 1;
         }
@@ -494,27 +517,30 @@ type struct HashSetIter<T> {
     entries: HashSetEntry<T>*;
     cap: u64;
     current: u64;
+
+    has_next(this) -> boolean;
+    next(mut &this) -> Option<T>;
 }
 
 implement struct HashSetIter<T> {
-    function has_next(self) -> boolean {
-        while (self.current < self.cap) {
-            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
+    has_next(this) -> boolean {
+        while (this.current < this.cap) {
+            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
                 return true;
             }
-            self.current = self.current + 1;
+            this.current = this.current + 1;
         }
         return false;
     }
 
-    function next(self: &mut HashSetIter<T>) -> Option<T> {
-        while (self.current < self.cap) {
-            if (self.entries[self.current].state == BUCKET_OCCUPIED) {
-                const value: T = self.entries[self.current].value;
-                self.current = self.current + 1;
+    next(mut &this) -> Option<T> {
+        while (this.current < this.cap) {
+            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
+                const value: T = this.entries[this.current].value;
+                this.current = this.current + 1;
                 return Option::Some(value);
             }
-            self.current = self.current + 1;
+            this.current = this.current + 1;
         }
         return Option::None;
     }
@@ -527,78 +553,98 @@ implement struct HashSetIter<T> {
 /// A HashSet with string values.
 type struct StringHashSet {
     set: HashSet<string>;
+
+    StringHashSet();
+
+    len(this) -> u64;
+    is_empty(this) -> boolean;
+    contains(this, value: string) -> boolean;
+    insert(mut &this, value: string) -> boolean;
+    remove(mut &this, value: string) -> boolean;
+    clear(mut &this) -> void;
+    drop(this) -> void;
 }
 
 implement struct StringHashSet {
-    static function new() -> StringHashSet {
-        return StringHashSet { set: HashSet::new() };
+    StringHashSet() {
+        this.set = new HashSet();
     }
 
-    function len(self) -> u64 {
-        return self.set.len();
+    len(this) -> u64 {
+        return this.set.len();
     }
 
-    function is_empty(self) -> boolean {
-        return self.set.is_empty();
+    is_empty(this) -> boolean {
+        return this.set.is_empty();
     }
 
-    function contains(self, value: string) -> boolean {
-        return self.set.contains(value, hash_str(value));
+    contains(this, value: string) -> boolean {
+        return this.set.contains(value, hash_str(value));
     }
 
-    function insert(self: &mut StringHashSet, value: string) -> boolean {
-        return self.set.insert(value, hash_str(value));
+    insert(mut &this, value: string) -> boolean {
+        return this.set.insert(value, hash_str(value));
     }
 
-    function remove(self: &mut StringHashSet, value: string) -> boolean {
-        return self.set.remove(value, hash_str(value));
+    remove(mut &this, value: string) -> boolean {
+        return this.set.remove(value, hash_str(value));
     }
 
-    function clear(self: &mut StringHashSet) -> void {
-        self.set.clear();
+    clear(mut &this) -> void {
+        this.set.clear();
     }
 
-    function drop(self) -> void {
-        self.set.drop();
+    drop(this) -> void {
+        this.set.drop();
     }
 }
 
 /// A HashSet with integer values.
 type struct IntHashSet {
     set: HashSet<u64>;
+
+    IntHashSet();
+
+    len(this) -> u64;
+    is_empty(this) -> boolean;
+    contains(this, value: u64) -> boolean;
+    insert(mut &this, value: u64) -> boolean;
+    remove(mut &this, value: u64) -> boolean;
+    clear(mut &this) -> void;
+    drop(this) -> void;
 }
 
 implement struct IntHashSet {
-    static function new() -> IntHashSet {
-        return IntHashSet { set: HashSet::new() };
+    IntHashSet() {
+        this.set = new HashSet();
     }
 
-    function len(self) -> u64 {
-        return self.set.len();
+    len(this) -> u64 {
+        return this.set.len();
     }
 
-    function is_empty(self) -> boolean {
-        return self.set.is_empty();
+    is_empty(this) -> boolean {
+        return this.set.is_empty();
     }
 
-    function contains(self, value: u64) -> boolean {
-        return self.set.contains(value, hash_int(value));
+    contains(this, value: u64) -> boolean {
+        return this.set.contains(value, hash_int(value));
     }
 
-    function insert(self: &mut IntHashSet, value: u64) -> boolean {
-        return self.set.insert(value, hash_int(value));
+    insert(mut &this, value: u64) -> boolean {
+        return this.set.insert(value, hash_int(value));
     }
 
-    function remove(self: &mut IntHashSet, value: u64) -> boolean {
-        return self.set.remove(value, hash_int(value));
+    remove(mut &this, value: u64) -> boolean {
+        return this.set.remove(value, hash_int(value));
     }
 
-    function clear(self: &mut IntHashSet) -> void {
-        self.set.clear();
+    clear(mut &this) -> void {
+        this.set.clear();
     }
 
-    function drop(self) -> void {
-        self.set.drop();
+    drop(this) -> void {
+        this.set.drop();
     }
 }
 
@@ -608,21 +654,20 @@ implement struct IntHashSet {
 
 /// Creates a new empty HashSet.
 function hashset<T>() -> HashSet<T> {
-    return HashSet::new();
+    return new HashSet();
 }
 
 /// Creates a HashSet with capacity.
 function hashset_with_capacity<T>(capacity: u64) -> HashSet<T> {
-    return HashSet::with_capacity(capacity);
+    return new HashSet(capacity);
 }
 
 /// Creates a string HashSet.
 function string_hashset() -> StringHashSet {
-    return StringHashSet::new();
+    return new StringHashSet();
 }
 
 /// Creates an integer HashSet.
 function int_hashset() -> IntHashSet {
-    return IntHashSet::new();
+    return new IntHashSet();
 }
-

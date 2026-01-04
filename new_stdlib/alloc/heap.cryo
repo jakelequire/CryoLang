@@ -17,11 +17,25 @@ import <alloc/global>;
 /// A uniquely-owned heap-allocated value.
 type struct Box<T> {
     ptr: T*;
+
+    Box(value: T) -> Box<T>;
+    Box() -> Box<T>;
+    from_raw(ptr: T*) -> Box<T>;
+
+    into_raw(this) -> T*;
+    get(this) -> T*;
+    get_mut(mut &this) -> T*;
+    deref(this) -> T;
+    take(mut &this) -> T;
+    replace(mut &this, value: T) -> T;
+    swap(mut &this, other: &mut Box<T>) -> void;
+    drop(this) -> void;
+    leak(this) -> T*;
 }
 
 implement struct Box<T> {
     /// Allocates a new Box containing the given value.
-    static function new(value: T) -> Box<T> {
+    Box(value: T) {
         const ptr: T* = malloc(sizeof(T));
         if (ptr == null) {
             panic("allocation failed", FILE, LINE);
@@ -31,7 +45,7 @@ implement struct Box<T> {
     }
 
     /// Allocates a new zeroed Box.
-    static function new_zeroed() -> Box<T> {
+    Box() {
         const ptr: T* = calloc(1, sizeof(T));
         if (ptr == null) {
             panic("allocation failed", FILE, LINE);
@@ -41,59 +55,59 @@ implement struct Box<T> {
 
     /// Creates a Box from a raw pointer.
     /// Safety: The pointer must have been allocated by this allocator.
-    static function from_raw(ptr: T*) -> Box<T> {
+    from_raw(ptr: T*) -> Box<T> {
         return Box { ptr: ptr };
     }
 
     /// Returns the raw pointer without deallocating.
-    function into_raw(self) -> T* {
-        return self.ptr;
+    into_raw(this) -> T* {
+        return this.ptr;
     }
 
     /// Returns a reference to the contained value.
-    function get(self) -> T* {
-        return self.ptr;
+    get(this) -> T* {
+        return this.ptr;
     }
 
     /// Returns a mutable reference to the contained value.
-    function get_mut(self) -> T* {
-        return self.ptr;
+    get_mut(mut &this) -> T* {
+        return this.ptr;
     }
 
     /// Dereferences the box.
-    function deref(self) -> T {
-        return *self.ptr;
+    deref(this) -> T {
+        return *this.ptr;
     }
 
     /// Takes the value out of the box and deallocates.
-    function take(self) -> T {
-        const value: T = *self.ptr;
-        free(self.ptr);
+    take(mut &this) -> T {
+        const value: T = *this.ptr;
+        free(this.ptr);
         return value;
     }
 
     /// Replaces the value in the box.
-    function replace(self, value: T) -> T {
-        const old: T = *self.ptr;
-        *self.ptr = value;
+    replace(mut &this, value: T) -> T {
+        const old: T = *this.ptr;
+        *this.ptr = value;
         return old;
     }
 
     /// Swaps the contents of two boxes.
-    function swap(self, other: &mut Box<T>) -> void {
-        const temp: T* = self.ptr;
-        self.ptr = other.ptr;
+    swap(mut &this, other: &mut Box<T>) -> void {
+        const temp: T* = this.ptr;
+        this.ptr = other.ptr;
         other.ptr = temp;
     }
 
     /// Deallocates the box.
-    function drop(self) -> void {
-        free(self.ptr);
+    drop(this) -> void {
+        free(this.ptr);
     }
 
     /// Leaks the box, returning a reference that lives forever.
-    function leak(self) -> T* {
-        return self.ptr;
+    leak(this) -> T* {
+        return this.ptr;
     }
 }
 
@@ -105,18 +119,33 @@ implement struct Box<T> {
 type struct RawVec<T> {
     ptr: T*;
     cap: u64;
+
+    RawVec() -> RawVec<T>;
+    RawVec(capacity: u64) -> RawVec<T>;
+    RawVec_zeroed(capacity: u64) -> RawVec<T>;
+    from_raw_parts(ptr: T*, capacity: u64) -> RawVec<T>;
+
+    as_ptr(this) -> T*;
+    capacity(this) -> u64;
+    is_empty(this) -> boolean;
+    reserve(mut &this, len: u64, additional: u64) -> void;
+    reserve_exact(mut &this, len: u64, additional: u64) -> void;
+    grow(mut &this, new_cap: u64) -> void;
+    shrink_to(mut &this, new_cap: u64) -> void;
+    drop(this) -> void;
+    into_raw_parts(this) -> RawVecParts<T>;
 }
 
 implement struct RawVec<T> {
     /// Creates a new empty RawVec with zero capacity.
-    static function new() -> RawVec<T> {
+    RawVec() {
         return RawVec { ptr: null, cap: 0 };
     }
 
     /// Creates a new RawVec with the specified capacity.
-    static function with_capacity(capacity: u64) -> RawVec<T> {
+    RawVec(capacity: u64) {
         if (capacity == 0) {
-            return RawVec::new();
+            return RawVec::RawVec();
         }
         const ptr: T* = malloc(sizeof(T) * capacity);
         if (ptr == null) {
@@ -126,9 +155,9 @@ implement struct RawVec<T> {
     }
 
     /// Creates a new zeroed RawVec with the specified capacity.
-    static function with_capacity_zeroed(capacity: u64) -> RawVec<T> {
+    RawVec_zeroed(capacity: u64) {
         if (capacity == 0) {
-            return RawVec::new();
+            return RawVec::RawVec();
         }
         const ptr: T* = calloc(capacity, sizeof(T));
         if (ptr == null) {
@@ -138,34 +167,34 @@ implement struct RawVec<T> {
     }
 
     /// Creates a RawVec from raw parts.
-    static function from_raw_parts(ptr: T*, capacity: u64) -> RawVec<T> {
+    from_raw_parts(ptr: T*, capacity: u64) -> RawVec<T> {
         return RawVec { ptr: ptr, cap: capacity };
     }
 
     /// Returns the pointer to the buffer.
-    function as_ptr(self) -> T* {
-        return self.ptr;
+    as_ptr(this) -> T* {
+        return this.ptr;
     }
 
     /// Returns the capacity.
-    function capacity(self) -> u64 {
-        return self.cap;
+    capacity(this) -> u64 {
+        return this.cap;
     }
 
     /// Returns true if the capacity is zero.
-    function is_empty(self) -> boolean {
-        return self.cap == 0;
+    is_empty(this) -> boolean {
+        return this.cap == 0;
     }
 
     /// Reserves capacity for at least `additional` more elements.
-    function reserve(self: &mut RawVec<T>, len: u64, additional: u64) -> void {
+    reserve(mut &this, len: u64, additional: u64) -> void {
         const required: u64 = len + additional;
-        if (required <= self.cap) {
+        if (required <= this.cap) {
             return;
         }
 
         // Grow by at least doubling
-        mut new_cap: u64 = self.cap;
+        mut new_cap: u64 = this.cap;
         if (new_cap == 0) {
             new_cap = 4;
         }
@@ -173,62 +202,62 @@ implement struct RawVec<T> {
             new_cap = new_cap * 2;
         }
 
-        self.grow(new_cap);
+        this.grow(new_cap);
     }
 
     /// Reserves exactly the specified capacity.
-    function reserve_exact(self: &mut RawVec<T>, len: u64, additional: u64) -> void {
+    reserve_exact(mut &this, len: u64, additional: u64) -> void {
         const required: u64 = len + additional;
-        if (required <= self.cap) {
+        if (required <= this.cap) {
             return;
         }
-        self.grow(required);
+        this.grow(required);
     }
 
     /// Grows the buffer to the new capacity.
-    function grow(self: &mut RawVec<T>, new_cap: u64) -> void {
-        if (new_cap <= self.cap) {
+    grow(mut &this, new_cap: u64) -> void {
+        if (new_cap <= this.cap) {
             return;
         }
 
-        const new_ptr: T* = realloc(self.ptr, sizeof(T) * new_cap);
+        const new_ptr: T* = realloc(this.ptr, sizeof(T) * new_cap);
         if (new_ptr == null) {
             panic("allocation failed", FILE, LINE);
         }
-        self.ptr = new_ptr;
-        self.cap = new_cap;
+        this.ptr = new_ptr;
+        this.cap = new_cap;
     }
 
     /// Shrinks the buffer to the specified capacity.
-    function shrink_to(self: &mut RawVec<T>, new_cap: u64) -> void {
-        if (new_cap >= self.cap) {
+    shrink_to(mut &this, new_cap: u64) -> void {
+        if (new_cap >= this.cap) {
             return;
         }
 
         if (new_cap == 0) {
-            free(self.ptr);
-            self.ptr = null;
-            self.cap = 0;
+            free(this.ptr);
+            this.ptr = null;
+            this.cap = 0;
             return;
         }
 
-        const new_ptr: T* = realloc(self.ptr, sizeof(T) * new_cap);
+        const new_ptr: T* = realloc(this.ptr, sizeof(T) * new_cap);
         if (new_ptr != null) {
-            self.ptr = new_ptr;
-            self.cap = new_cap;
+            this.ptr = new_ptr;
+            this.cap = new_cap;
         }
     }
 
     /// Deallocates the buffer.
-    function drop(self) -> void {
-        if (self.ptr != null) {
-            free(self.ptr);
+    drop(this) -> void {
+        if (this.ptr != null) {
+            free(this.ptr);
         }
     }
 
     /// Decomposes the RawVec into raw parts.
-    function into_raw_parts(self) -> RawVecParts<T> {
-        return RawVecParts { ptr: self.ptr, capacity: self.cap };
+    into_raw_parts(this) -> RawVecParts<T> {
+        return RawVecParts { ptr: this.ptr, capacity: this.cap };
     }
 }
 
@@ -246,11 +275,31 @@ type struct RawVecParts<T> {
 type struct HeapArray<T> {
     ptr: T*;
     len: u64;
+
+    HeapArray(len: u64) -> HeapArray<T>;
+    HeapArray_zeroed(len: u64) -> HeapArray<T>;
+    filled(len: u64, value: T) -> HeapArray<T>;
+    from_slice(ptr: T*, len: u64) -> HeapArray<T>;
+
+    len(this) -> u64;
+    is_empty(this) -> boolean;
+    as_ptr(this) -> T*;
+    get(this, index: u64) -> Option<T>;
+    get_ref(this, index: u64) -> T*;
+    set(mut &this, index: u64, value: T) -> void;
+    fill(mut &this, value: T) -> void;
+    copy_from_slice(mut &this, src: T*, src_len: u64) -> void;
+    first(this) -> Option<T>;
+    last(this) -> Option<T>;
+    swap(mut &this, a: u64, b: u64) -> void;
+    reverse(mut &this) -> void;
+    drop(this) -> void;
+    clone(this) -> HeapArray<T>;
 }
 
 implement struct HeapArray<T> {
     /// Creates a new HeapArray with the given size.
-    static function new(len: u64) -> HeapArray<T> {
+    HeapArray(len: u64) {
         if (len == 0) {
             return HeapArray { ptr: null, len: 0 };
         }
@@ -262,7 +311,7 @@ implement struct HeapArray<T> {
     }
 
     /// Creates a new zeroed HeapArray.
-    static function new_zeroed(len: u64) -> HeapArray<T> {
+    HeapArray_zeroed(len: u64) {
         if (len == 0) {
             return HeapArray { ptr: null, len: 0 };
         }
@@ -274,8 +323,8 @@ implement struct HeapArray<T> {
     }
 
     /// Creates a HeapArray filled with a value.
-    static function filled(len: u64, value: T) -> HeapArray<T> {
-        const arr: HeapArray<T> = HeapArray::new(len);
+    filled(len: u64, value: T) -> HeapArray<T> {
+        const arr: HeapArray<T> = HeapArray::HeapArray(len);
         mut i: u64 = 0;
         while (i < len) {
             arr.ptr[i] = value;
@@ -285,116 +334,116 @@ implement struct HeapArray<T> {
     }
 
     /// Creates a HeapArray from a slice.
-    static function from_slice(ptr: T*, len: u64) -> HeapArray<T> {
-        const arr: HeapArray<T> = HeapArray::new(len);
+    from_slice(ptr: T*, len: u64) -> HeapArray<T> {
+        const arr: HeapArray<T> = HeapArray::HeapArray(len);
         memcpy(arr.ptr, ptr, sizeof(T) * len);
         return arr;
     }
 
     /// Returns the length.
-    function len(self) -> u64 {
-        return self.len;
+    len(this) -> u64 {
+        return this.len;
     }
 
     /// Returns true if empty.
-    function is_empty(self) -> boolean {
-        return self.len == 0;
+    is_empty(this) -> boolean {
+        return this.len == 0;
     }
 
     /// Returns a pointer to the data.
-    function as_ptr(self) -> T* {
-        return self.ptr;
+    as_ptr(this) -> T* {
+        return this.ptr;
     }
 
     /// Gets an element at index.
-    function get(self, index: u64) -> Option<T> {
-        if (index >= self.len) {
+    get(this, index: u64) -> Option<T> {
+        if (index >= this.len) {
             return Option::None;
         }
-        return Option::Some(self.ptr[index]);
+        return Option::Some(this.ptr[index]);
     }
 
     /// Gets a reference to element at index.
-    function get_ref(self, index: u64) -> T* {
-        if (index >= self.len) {
+    get_ref(this, index: u64) -> T* {
+        if (index >= this.len) {
             panic("index out of bounds", FILE, LINE);
         }
-        return &self.ptr[index];
+        return &this.ptr[index];
     }
 
     /// Sets an element at index.
-    function set(self, index: u64, value: T) -> void {
-        if (index >= self.len) {
+    set(mut &this, index: u64, value: T) -> void {
+        if (index >= this.len) {
             panic("index out of bounds", FILE, LINE);
         }
-        self.ptr[index] = value;
+        this.ptr[index] = value;
     }
 
     /// Fills the array with a value.
-    function fill(self, value: T) -> void {
+    fill(mut &this, value: T) -> void {
         mut i: u64 = 0;
-        while (i < self.len) {
-            self.ptr[i] = value;
+        while (i < this.len) {
+            this.ptr[i] = value;
             i = i + 1;
         }
     }
 
     /// Copies from another slice.
-    function copy_from_slice(self, src: T*, src_len: u64) -> void {
+    copy_from_slice(mut &this, src: T*, src_len: u64) -> void {
         mut copy_len: u64 = src_len;
-        if (copy_len > self.len) {
-            copy_len = self.len;
+        if (copy_len > this.len) {
+            copy_len = this.len;
         }
-        memcpy(self.ptr, src, sizeof(T) * copy_len);
+        memcpy(this.ptr, src, sizeof(T) * copy_len);
     }
 
     /// Returns the first element.
-    function first(self) -> Option<T> {
-        return self.get(0);
+    first(this) -> Option<T> {
+        return this.get(0);
     }
 
     /// Returns the last element.
-    function last(self) -> Option<T> {
-        if (self.len == 0) {
+    last(this) -> Option<T> {
+        if (this.len == 0) {
             return Option::None;
         }
-        return self.get(self.len - 1);
+        return this.get(this.len - 1);
     }
 
     /// Swaps two elements.
-    function swap(self, a: u64, b: u64) -> void {
-        if (a >= self.len || b >= self.len) {
+    swap(mut &this, a: u64, b: u64) -> void {
+        if (a >= this.len || b >= this.len) {
             panic("index out of bounds", FILE, LINE);
         }
-        const temp: T = self.ptr[a];
-        self.ptr[a] = self.ptr[b];
-        self.ptr[b] = temp;
+        const temp: T = this.ptr[a];
+        this.ptr[a] = this.ptr[b];
+        this.ptr[b] = temp;
     }
 
     /// Reverses the array in place.
-    function reverse(self) -> void {
-        if (self.len <= 1) {
+    reverse(mut &this) -> void {
+        if (this.len <= 1) {
             return;
         }
         mut left: u64 = 0;
-        mut right: u64 = self.len - 1;
+        mut right: u64 = this.len - 1;
         while (left < right) {
-            self.swap(left, right);
+            this.swap(left, right);
             left = left + 1;
             right = right - 1;
         }
     }
 
     /// Deallocates the array.
-    function drop(self) -> void {
-        if (self.ptr != null) {
-            free(self.ptr);
+    drop(this) -> void {
+        if (this.ptr != null) {
+            free(this.ptr);
         }
     }
 
     /// Clones the array.
-    function clone(self) -> HeapArray<T> {
-        return HeapArray::from_slice(self.ptr, self.len);
+    clone(this) -> HeapArray<T> {
+        return HeapArray::from_slice(this.ptr, this.len);
     }
 }
 
@@ -404,15 +453,15 @@ implement struct HeapArray<T> {
 
 /// Creates a boxed value.
 function boxed<T>(value: T) -> Box<T> {
-    return Box::new(value);
+    return new Box(value);
 }
 
 /// Creates a heap array.
 function heap_array<T>(len: u64) -> HeapArray<T> {
-    return HeapArray::new(len);
+    return new HeapArray(len);
 }
 
 /// Creates a zeroed heap array.
 function heap_array_zeroed<T>(len: u64) -> HeapArray<T> {
-    return HeapArray::new_zeroed(len);
+    return HeapArray::HeapArray_zeroed(len);
 }

@@ -22,30 +22,35 @@ const ONCE_COMPLETE: u32 = 2;
 /// A synchronization primitive for running something exactly once.
 type struct Once {
     state: AtomicU32;
+
+    Once() -> Once;
+    call_once(mut &this, f: () -> void) -> void;
+    call_once_slow(mut &this, f: () -> void) -> void;
+    is_completed(this) -> boolean;
 }
 
 implement struct Once {
     /// Creates a new Once.
-    static function new() -> Once {
+    Once() -> Once {
         return Once {
             state: AtomicU32::new(ONCE_INCOMPLETE)
         };
     }
 
     /// Calls the function if this is the first call.
-    function call_once(self: &mut Once, f: fn() -> void) -> void {
+    call_once(mut &this, f: () -> void) -> void {
         // Fast path: already complete
-        if (self.state.load(Ordering::Acquire) == ONCE_COMPLETE) {
+        if (this.state.load(Ordering::Acquire) == ONCE_COMPLETE) {
             return;
         }
 
-        self.call_once_slow(f);
+        this.call_once_slow(f);
     }
 
     /// Slow path for call_once.
-    function call_once_slow(self: &mut Once, f: fn() -> void) -> void {
+    call_once_slow(mut &this, f: () -> void) -> void {
         // Try to start running
-        const result: CompareExchangeResult<u32> = self.state.compare_exchange(
+        const result: CompareExchangeResult<u32> = this.state.compare_exchange(
             ONCE_INCOMPLETE,
             ONCE_RUNNING,
             Ordering::Acquire,
@@ -55,20 +60,20 @@ implement struct Once {
         if (result.success) {
             // We won the race, run the function
             f();
-            self.state.store(ONCE_COMPLETE, Ordering::Release);
+            this.state.store(ONCE_COMPLETE, Ordering::Release);
             return;
         }
 
         // Someone else is running or complete
-        while (self.state.load(Ordering::Acquire) == ONCE_RUNNING) {
+        while (this.state.load(Ordering::Acquire) == ONCE_RUNNING) {
             // Spin wait
             cpu_pause();
         }
     }
 
     /// Returns true if the initialization has completed.
-    function is_completed(self) -> boolean {
-        return self.state.load(Ordering::Acquire) == ONCE_COMPLETE;
+    is_completed(this) -> boolean {
+        return this.state.load(Ordering::Acquire) == ONCE_COMPLETE;
     }
 }
 
@@ -80,11 +85,19 @@ implement struct Once {
 type struct OnceCell<T> {
     once: Once;
     value: T*;
+
+    OnceCell() -> OnceCell<T>;
+    static with_value(value: T) -> OnceCell<T>;
+    get(this) -> Option<T*>;
+    set(mut &this, value: T) -> boolean;
+    get_or_init(mut &this, f: () -> T) -> T*;
+    get_or_try_init<E>(mut &this, f: () -> Result<T, E>) -> Result<T*, E>;
+    drop(this) -> void;
 }
 
 implement struct OnceCell<T> {
     /// Creates a new empty OnceCell.
-    static function new() -> OnceCell<T> {
+    OnceCell() -> OnceCell<T> {
         return OnceCell {
             once: Once::new(),
             value: null
@@ -92,7 +105,7 @@ implement struct OnceCell<T> {
     }
 
     /// Creates a OnceCell with a value.
-    static function with_value(value: T) -> OnceCell<T> {
+    static with_value(value: T) -> OnceCell<T> {
         const cell: OnceCell<T> = OnceCell::new();
         const ptr: T* = malloc(sizeof(T));
         if (ptr != null) {
@@ -104,25 +117,25 @@ implement struct OnceCell<T> {
     }
 
     /// Gets the value, or None if not yet set.
-    function get(self) -> Option<T*> {
-        if (self.once.is_completed() && self.value != null) {
-            return Option::Some(self.value);
+    get(this) -> Option<T*> {
+        if (this.once.is_completed() && this.value != null) {
+            return Option::Some(this.value);
         }
         return Option::None;
     }
 
     /// Sets the value if not already set.
-    function set(self: &mut OnceCell<T>, value: T) -> boolean {
-        if (self.once.is_completed()) {
+    set(mut &this, value: T) -> boolean {
+        if (this.once.is_completed()) {
             return false;
         }
 
         mut set_value: boolean = false;
-        self.once.call_once(fn() -> void {
+        this.once.call_once(() -> void {
             const ptr: T* = malloc(sizeof(T));
             if (ptr != null) {
                 *ptr = value;
-                self.value = ptr;
+                this.value = ptr;
                 set_value = true;
             }
         });
@@ -131,30 +144,30 @@ implement struct OnceCell<T> {
     }
 
     /// Gets the value or initializes it with the function.
-    function get_or_init(self: &mut OnceCell<T>, f: fn() -> T) -> T* {
-        if (!self.once.is_completed()) {
-            self.once.call_once(fn() -> void {
+    get_or_init(mut &this, f: () -> T) -> T* {
+        if (!this.once.is_completed()) {
+            this.once.call_once(() -> void {
                 const ptr: T* = malloc(sizeof(T));
                 if (ptr != null) {
                     *ptr = f();
-                    self.value = ptr;
+                    this.value = ptr;
                 }
             });
         }
-        return self.value;
+        return this.value;
     }
 
     /// Gets the value or tries to initialize it.
-    function get_or_try_init<E>(self: &mut OnceCell<T>, f: fn() -> Result<T, E>) -> Result<T*, E> {
-        if (self.once.is_completed()) {
-            return Result::Ok(self.value);
+    get_or_try_init<E>(mut &this, f: () -> Result<T, E>) -> Result<T*, E> {
+        if (this.once.is_completed()) {
+            return Result::Ok(this.value);
         }
 
         const result: Result<T, E> = f();
         match (result) {
             Result::Ok(v) => {
-                self.set(v);
-                return Result::Ok(self.value);
+                this.set(v);
+                return Result::Ok(this.value);
             }
             Result::Err(e) => {
                 return Result::Err(e);
@@ -163,9 +176,9 @@ implement struct OnceCell<T> {
     }
 
     /// Drops the cell.
-    function drop(self) -> void {
-        if (self.value != null) {
-            free(self.value);
+    drop(this) -> void {
+        if (this.value != null) {
+            free(this.value);
         }
     }
 }
@@ -177,12 +190,17 @@ implement struct OnceCell<T> {
 /// A value that is initialized on first access.
 type struct Lazy<T> {
     cell: OnceCell<T>;
-    init: fn() -> T;
+    init: () -> T;
+
+    Lazy(init: () -> T) -> Lazy<T>;
+    force(mut &this) -> T*;
+    get(this) -> Option<T*>;
+    drop(this) -> void;
 }
 
 implement struct Lazy<T> {
     /// Creates a new Lazy with the given initializer.
-    static function new(init: fn() -> T) -> Lazy<T> {
+    Lazy(init: () -> T) -> Lazy<T> {
         return Lazy {
             cell: OnceCell::new(),
             init: init
@@ -190,18 +208,18 @@ implement struct Lazy<T> {
     }
 
     /// Forces initialization and returns a reference.
-    function force(self: &mut Lazy<T>) -> T* {
-        return self.cell.get_or_init(self.init);
+    force(mut &this) -> T* {
+        return this.cell.get_or_init(this.init);
     }
 
     /// Gets the value if initialized.
-    function get(self) -> Option<T*> {
-        return self.cell.get();
+    get(this) -> Option<T*> {
+        return this.cell.get();
     }
 
     /// Drops the lazy value.
-    function drop(self) -> void {
-        self.cell.drop();
+    drop(this) -> void {
+        this.cell.drop();
     }
 }
 
@@ -210,4 +228,3 @@ implement struct Lazy<T> {
 // ============================================================================
 
 intrinsic function cpu_pause() -> void;
-
