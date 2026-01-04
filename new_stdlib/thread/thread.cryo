@@ -17,12 +17,14 @@ import <io/error>;
 /// A unique identifier for a thread.
 type struct ThreadId {
     id: u64;
+
+    as_u64(this) -> u64;
 }
 
 implement struct ThreadId {
     /// Returns the raw id value.
-    function as_u64(self) -> u64 {
-        return self.id;
+    as_u64(this) -> u64 {
+        return this.id;
     }
 }
 
@@ -35,24 +37,28 @@ type struct Thread {
     handle: pthread_t;
     id: ThreadId;
     name: Option<String>;
+
+    id(this) -> ThreadId;
+    name(this) -> Option<string>;
+    unpark(this) -> void;
 }
 
 implement struct Thread {
     /// Returns the thread's unique ID.
-    function id(self) -> ThreadId {
-        return self.id;
+    id(this) -> ThreadId {
+        return this.id;
     }
 
     /// Returns the thread's name.
-    function name(self) -> Option<string> {
-        match (self.name) {
+    name(this) -> Option<string> {
+        match (this.name) {
             Option::None => { return Option::None; }
             Option::Some(s) => { return Option::Some(s.as_cstr()); }
         }
     }
 
     /// Unparks the thread (wakes it up).
-    function unpark(self) -> void {
+    unpark(this) -> void {
         // Platform-specific implementation
     }
 }
@@ -66,23 +72,27 @@ type struct JoinHandle<T> {
     handle: pthread_t;
     result: T*;
     joined: boolean;
+
+    join(mut &this) -> Result<T, JoinError>;
+    is_finished(this) -> boolean;
+    thread(this) -> Thread;
 }
 
 implement struct JoinHandle<T> {
     /// Waits for the thread to finish and returns the result.
-    function join(self: &mut JoinHandle<T>) -> Result<T, JoinError> {
-        if (self.joined) {
+    join(mut &this) -> Result<T, JoinError> {
+        if (this.joined) {
             return Result::Err(JoinError::new("thread already joined"));
         }
 
         mut result_ptr: void*;
-        const status: i32 = pthread_join(self.handle, &result_ptr);
+        const status: i32 = pthread_join(this.handle, &result_ptr);
 
         if (status != 0) {
             return Result::Err(JoinError::new("failed to join thread"));
         }
 
-        self.joined = true;
+        this.joined = true;
 
         if (result_ptr == null) {
             return Result::Err(JoinError::new("thread panicked"));
@@ -94,15 +104,15 @@ implement struct JoinHandle<T> {
     }
 
     /// Returns true if the thread has finished.
-    function is_finished(self) -> boolean {
-        return self.joined;
+    is_finished(this) -> boolean {
+        return this.joined;
     }
 
     /// Returns a reference to the thread.
-    function thread(self) -> Thread {
+    thread(this) -> Thread {
         return Thread {
-            handle: self.handle,
-            id: ThreadId { id: self.handle as u64 },
+            handle: this.handle,
+            id: ThreadId { id: this.handle as u64 },
             name: Option::None
         };
     }
@@ -111,10 +121,12 @@ implement struct JoinHandle<T> {
 /// Error when joining a thread.
 type struct JoinError {
     message: string;
+
+    static JoinError(message: string) -> JoinError;
 }
 
 implement struct JoinError {
-    static function new(message: string) -> JoinError {
+    static JoinError(message: string) -> JoinError {
         return JoinError { message: message };
     }
 }
@@ -127,11 +139,16 @@ implement struct JoinError {
 type struct Builder {
     name: Option<String>;
     stack_size: Option<u64>;
+
+    static Builder() -> Builder;
+    name(this, name: string) -> Builder;
+    stack_size(this, size: u64) -> Builder;
+    spawn<T>(this, f: () -> T) -> IoResult<JoinHandle<T>>;
 }
 
 implement struct Builder {
     /// Creates a new thread builder with default settings.
-    static function new() -> Builder {
+    static Builder() -> Builder {
         return Builder {
             name: Option::None,
             stack_size: Option::None
@@ -139,23 +156,23 @@ implement struct Builder {
     }
 
     /// Sets the name of the thread.
-    function name(self, name: string) -> Builder {
-        self.name = Option::Some(String::from_cstr(name));
-        return self;
+    name(this, name: string) -> Builder {
+        this.name = Option::Some(String::from_cstr(name));
+        return this;
     }
 
     /// Sets the stack size for the thread.
-    function stack_size(self, size: u64) -> Builder {
-        self.stack_size = Option::Some(size);
-        return self;
+    stack_size(this, size: u64) -> Builder {
+        this.stack_size = Option::Some(size);
+        return this;
     }
 
     /// Spawns a new thread running the given function.
-    function spawn<T>(self, f: fn() -> T) -> IoResult<JoinHandle<T>> {
+    spawn<T>(this, f: () -> T) -> IoResult<JoinHandle<T>> {
         mut attr: pthread_attr_t;
         pthread_attr_init(&attr);
 
-        match (self.stack_size) {
+        match (this.stack_size) {
             Option::Some(size) => {
                 pthread_attr_setstacksize(&attr, size);
             }
@@ -191,7 +208,7 @@ implement struct Builder {
 
 /// Internal thread data.
 type struct ThreadData<T> {
-    func: fn() -> T;
+    func: () -> T;
     result: T*;
 }
 
@@ -214,7 +231,7 @@ function thread_entry<T>(arg: void*) -> void* {
 // ============================================================================
 
 /// Spawns a new thread.
-function spawn<T>(f: fn() -> T) -> JoinHandle<T> {
+function spawn<T>(f: () -> T) -> JoinHandle<T> {
     const result: IoResult<JoinHandle<T>> = Builder::new().spawn(f);
     match (result) {
         IoResult::Ok(handle) => { return handle; }
@@ -280,16 +297,16 @@ function available_parallelism() -> u64 {
 // ============================================================================
 
 /// Registers a panic hook for threads.
-mut g_panic_hook: fn(string) -> void = null;
+mut g_panic_hook: (string) -> void = null;
 
 /// Sets the panic hook.
-function set_panic_hook(hook: fn(string) -> void) -> void {
+function set_panic_hook(hook: (string) -> void) -> void {
     g_panic_hook = hook;
 }
 
 /// Gets the current panic hook.
-function take_panic_hook() -> fn(string) -> void {
-    const hook: fn(string) -> void = g_panic_hook;
+function take_panic_hook() -> (string) -> void {
+    const hook: (string) -> void = g_panic_hook;
     g_panic_hook = null;
     return hook;
 }
@@ -303,7 +320,7 @@ type pthread_attr_t = void[56];
 
 const _SC_NPROCESSORS_ONLN: i32 = 84;
 
-intrinsic function pthread_create(thread: pthread_t*, attr: pthread_attr_t*, start: fn(void*) -> void*, arg: void*) -> i32;
+intrinsic function pthread_create(thread: pthread_t*, attr: pthread_attr_t*, start: (void*) -> void*, arg: void*) -> i32;
 intrinsic function pthread_join(thread: pthread_t, retval: void**) -> i32;
 intrinsic function pthread_self() -> pthread_t;
 intrinsic function pthread_attr_init(attr: pthread_attr_t*) -> i32;
@@ -312,4 +329,3 @@ intrinsic function pthread_attr_setstacksize(attr: pthread_attr_t*, size: u64) -
 intrinsic function sched_yield() -> i32;
 intrinsic function nanosleep(secs: u64, nsecs: u64) -> i32;
 intrinsic function sysconf(name: i32) -> i64;
-

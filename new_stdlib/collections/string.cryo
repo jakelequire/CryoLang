@@ -23,18 +23,94 @@ type struct String {
     len: u64;
     /// Allocated capacity.
     cap: u64;
+
+    String();
+    String(capacity: u64);
+    from_cstr(s: string) -> String;
+    from_bytes(bytes: u8*, len: u64) -> String;
+    from_char(c: char) -> String;
+    from_char_repeated(c: char, n: u64) -> String;
+
+    len(this) -> u64;
+    capacity(this) -> u64;
+    is_empty(this) -> boolean;
+    as_cstr(this) -> string;
+    as_bytes(this) -> u8*;
+    char_count(this) -> u64;
+
+    reserve(mut &this, additional: u64) -> void;
+    shrink_to_fit(mut &this) -> void;
+
+    byte_at(this, index: u64) -> Option<u8>;
+    first_byte(this) -> Option<u8>;
+    last_byte(this) -> Option<u8>;
+    char_at(this, byte_index: u64) -> Option<char>;
+    nth_char(this, n: u64) -> Option<char>;
+
+    push_char(mut &this, c: char) -> void;
+    push_byte(mut &this, b: u8) -> void;
+    push_str(mut &this, s: string) -> void;
+    push_string(mut &this, other: String) -> void;
+    pop(mut &this) -> Option<char>;
+    insert_char(mut &this, index: u64, c: char) -> void;
+    insert_str(mut &this, index: u64, s: string) -> void;
+    remove(mut &this, index: u64) -> char;
+    clear(mut &this) -> void;
+    truncate(mut &this, new_len: u64) -> void;
+
+    starts_with(this, prefix: string) -> boolean;
+    ends_with(this, suffix: string) -> boolean;
+    contains(this, needle: string) -> boolean;
+    find(this, needle: string) -> Option<u64>;
+    rfind(this, needle: string) -> Option<u64>;
+    find_char(this, c: char) -> Option<u64>;
+    count(this, needle: string) -> u64;
+
+    substr(this, start: u64, len: u64) -> String;
+    trim(this) -> String;
+    trim_start(this) -> String;
+    trim_end(this) -> String;
+    to_lowercase(this) -> String;
+    to_uppercase(this) -> String;
+    replace(this, from: string, to: string) -> String;
+    replace_first(this, from: string, to: string) -> String;
+    repeat(this, n: u64) -> String;
+    reverse_bytes(this) -> String;
+
+    split(this, delimiter: string) -> Vec<String>;
+    split_whitespace(this) -> Vec<String>;
+    lines(this) -> Vec<String>;
+
+    compare(this, other: String) -> i32;
+    compare_cstr(this, s: string) -> i32;
+    compare_ignore_case(this, other: String) -> i32;
+
+    clone(this) -> String;
+
+    grow(mut &this, new_cap: u64) -> void;
+    drop(this) -> void;
+
+    utf8_char_len(this, first_byte: u8) -> u64;
+    decode_utf8(this, index: u64) -> char;
+    encode_utf8(this, c: char, buf: u8*) -> u64;
+    is_whitespace(this, b: u8) -> boolean;
 }
 
 implement struct String {
     /// Creates a new empty String.
-    static function new() -> String {
-        return String { data: null, len: 0, cap: 0 };
+    String() {
+        this.data = null;
+        this.len = 0;
+        this.cap = 0;
     }
 
     /// Creates a String with the specified capacity.
-    static function with_capacity(capacity: u64) -> String {
+    String(capacity: u64) {
         if (capacity == 0) {
-            return String::new();
+            this.data = null;
+            this.len = 0;
+            this.cap = 0;
+            return;
         }
 
         const data: u8* = malloc(capacity + 1); // +1 for null terminator
@@ -43,29 +119,31 @@ implement struct String {
         }
         data[0] = 0;
 
-        return String { data: data, len: 0, cap: capacity };
+        this.data = data;
+        this.len = 0;
+        this.cap = capacity;
     }
 
     /// Creates a String from a C string.
-    static function from_cstr(s: string) -> String {
+    from_cstr(s: string) -> String {
         if (s == null) {
-            return String::new();
+            return new String();
         }
 
         const len: u64 = strlen(s);
-        const str: String = String::with_capacity(len);
+        const str: String = new String(len);
         memcpy(str.data, s, len + 1);
         str.len = len;
         return str;
     }
 
     /// Creates a String from bytes.
-    static function from_bytes(bytes: u8*, len: u64) -> String {
+    from_bytes(bytes: u8*, len: u64) -> String {
         if (len == 0) {
-            return String::new();
+            return new String();
         }
 
-        const str: String = String::with_capacity(len);
+        const str: String = new String(len);
         memcpy(str.data, bytes, len);
         str.data[len] = 0;
         str.len = len;
@@ -73,8 +151,8 @@ implement struct String {
     }
 
     /// Creates a String from a single character.
-    static function from_char(c: char) -> String {
-        const str: String = String::with_capacity(4);
+    from_char(c: char) -> String {
+        const str: String = new String(4);
         const len: u64 = str.encode_utf8(c, str.data);
         str.data[len] = 0;
         str.len = len;
@@ -82,9 +160,9 @@ implement struct String {
     }
 
     /// Creates a String with n copies of a character.
-    static function from_char_repeated(c: char, n: u64) -> String {
+    from_char_repeated(c: char, n: u64) -> String {
         // Estimate max bytes needed
-        const str: String = String::with_capacity(n * 4);
+        const str: String = new String(n * 4);
         mut i: u64 = 0;
         while (i < n) {
             str.push_char(c);
@@ -98,39 +176,39 @@ implement struct String {
     // ========================================================================
 
     /// Returns the length in bytes.
-    function len(self) -> u64 {
-        return self.len;
+    len(this) -> u64 {
+        return this.len;
     }
 
     /// Returns the capacity.
-    function capacity(self) -> u64 {
-        return self.cap;
+    capacity(this) -> u64 {
+        return this.cap;
     }
 
     /// Returns true if the string is empty.
-    function is_empty(self) -> boolean {
-        return self.len == 0;
+    is_empty(this) -> boolean {
+        return this.len == 0;
     }
 
     /// Returns the string as a C string (null-terminated).
-    function as_cstr(self) -> string {
-        if (self.data == null) {
+    as_cstr(this) -> string {
+        if (this.data == null) {
             return "";
         }
-        return self.data;
+        return this.data;
     }
 
     /// Returns a pointer to the bytes.
-    function as_bytes(self) -> u8* {
-        return self.data;
+    as_bytes(this) -> u8* {
+        return this.data;
     }
 
     /// Returns the number of UTF-8 characters (not bytes).
-    function char_count(self) -> u64 {
+    char_count(this) -> u64 {
         mut count: u64 = 0;
         mut i: u64 = 0;
-        while (i < self.len) {
-            const b: u8 = self.data[i];
+        while (i < this.len) {
+            const b: u8 = this.data[i];
             // Count bytes that are not continuation bytes
             if ((b & 0xC0) != 0x80) {
                 count = count + 1;
@@ -145,13 +223,13 @@ implement struct String {
     // ========================================================================
 
     /// Reserves capacity for at least `additional` more bytes.
-    function reserve(self: &mut String, additional: u64) -> void {
-        const required: u64 = self.len + additional;
-        if (required <= self.cap) {
+    reserve(mut &this, additional: u64) -> void {
+        const required: u64 = this.len + additional;
+        if (required <= this.cap) {
             return;
         }
 
-        mut new_cap: u64 = self.cap;
+        mut new_cap: u64 = this.cap;
         if (new_cap == 0) {
             new_cap = 8;
         }
@@ -159,26 +237,26 @@ implement struct String {
             new_cap = new_cap * 2;
         }
 
-        self.grow(new_cap);
+        this.grow(new_cap);
     }
 
     /// Shrinks the capacity to match the length.
-    function shrink_to_fit(self: &mut String) -> void {
-        if (self.len == self.cap) {
+    shrink_to_fit(mut &this) -> void {
+        if (this.len == this.cap) {
             return;
         }
 
-        if (self.len == 0) {
-            free(self.data);
-            self.data = null;
-            self.cap = 0;
+        if (this.len == 0) {
+            free(this.data);
+            this.data = null;
+            this.cap = 0;
             return;
         }
 
-        const new_data: u8* = realloc(self.data, self.len + 1);
+        const new_data: u8* = realloc(this.data, this.len + 1);
         if (new_data != null) {
-            self.data = new_data;
-            self.cap = self.len;
+            this.data = new_data;
+            this.cap = this.len;
         }
     }
 
@@ -187,43 +265,43 @@ implement struct String {
     // ========================================================================
 
     /// Gets a byte at the given index.
-    function byte_at(self, index: u64) -> Option<u8> {
-        if (index >= self.len) {
+    byte_at(this, index: u64) -> Option<u8> {
+        if (index >= this.len) {
             return Option::None;
         }
-        return Option::Some(self.data[index]);
+        return Option::Some(this.data[index]);
     }
 
     /// Gets the first byte.
-    function first_byte(self) -> Option<u8> {
-        return self.byte_at(0);
+    first_byte(this) -> Option<u8> {
+        return this.byte_at(0);
     }
 
     /// Gets the last byte.
-    function last_byte(self) -> Option<u8> {
-        if (self.len == 0) {
+    last_byte(this) -> Option<u8> {
+        if (this.len == 0) {
             return Option::None;
         }
-        return self.byte_at(self.len - 1);
+        return this.byte_at(this.len - 1);
     }
 
     /// Gets the character at the given byte index.
-    function char_at(self, byte_index: u64) -> Option<char> {
-        if (byte_index >= self.len) {
+    char_at(this, byte_index: u64) -> Option<char> {
+        if (byte_index >= this.len) {
             return Option::None;
         }
-        return Option::Some(self.decode_utf8(byte_index));
+        return Option::Some(this.decode_utf8(byte_index));
     }
 
     /// Gets the nth character (0-indexed).
-    function nth_char(self, n: u64) -> Option<char> {
+    nth_char(this, n: u64) -> Option<char> {
         mut count: u64 = 0;
         mut i: u64 = 0;
-        while (i < self.len) {
-            const b: u8 = self.data[i];
+        while (i < this.len) {
+            const b: u8 = this.data[i];
             if ((b & 0xC0) != 0x80) {
                 if (count == n) {
-                    return Option::Some(self.decode_utf8(i));
+                    return Option::Some(this.decode_utf8(i));
                 }
                 count = count + 1;
             }
@@ -237,136 +315,136 @@ implement struct String {
     // ========================================================================
 
     /// Pushes a character onto the end.
-    function push_char(self: &mut String, c: char) -> void {
-        self.reserve(4);
-        const len: u64 = self.encode_utf8(c, &self.data[self.len]);
-        self.len = self.len + len;
-        self.data[self.len] = 0;
+    push_char(mut &this, c: char) -> void {
+        this.reserve(4);
+        const len: u64 = this.encode_utf8(c, &this.data[this.len]);
+        this.len = this.len + len;
+        this.data[this.len] = 0;
     }
 
     /// Pushes a byte onto the end.
-    function push_byte(self: &mut String, b: u8) -> void {
-        self.reserve(1);
-        self.data[self.len] = b;
-        self.len = self.len + 1;
-        self.data[self.len] = 0;
+    push_byte(mut &this, b: u8) -> void {
+        this.reserve(1);
+        this.data[this.len] = b;
+        this.len = this.len + 1;
+        this.data[this.len] = 0;
     }
 
     /// Pushes a string onto the end.
-    function push_str(self: &mut String, s: string) -> void {
+    push_str(mut &this, s: string) -> void {
         const len: u64 = strlen(s);
-        self.reserve(len);
-        memcpy(&self.data[self.len], s, len);
-        self.len = self.len + len;
-        self.data[self.len] = 0;
+        this.reserve(len);
+        memcpy(&this.data[this.len], s, len);
+        this.len = this.len + len;
+        this.data[this.len] = 0;
     }
 
     /// Pushes another String onto the end.
-    function push_string(self: &mut String, other: String) -> void {
-        self.reserve(other.len);
-        memcpy(&self.data[self.len], other.data, other.len);
-        self.len = self.len + other.len;
-        self.data[self.len] = 0;
+    push_string(mut &this, other: String) -> void {
+        this.reserve(other.len);
+        memcpy(&this.data[this.len], other.data, other.len);
+        this.len = this.len + other.len;
+        this.data[this.len] = 0;
     }
 
     /// Pops the last character.
-    function pop(self: &mut String) -> Option<char> {
-        if (self.len == 0) {
+    pop(mut &this) -> Option<char> {
+        if (this.len == 0) {
             return Option::None;
         }
 
         // Find the start of the last character
-        mut i: u64 = self.len - 1;
-        while (i > 0 && (self.data[i] & 0xC0) == 0x80) {
+        mut i: u64 = this.len - 1;
+        while (i > 0 && (this.data[i] & 0xC0) == 0x80) {
             i = i - 1;
         }
 
-        const c: char = self.decode_utf8(i);
-        self.len = i;
-        self.data[self.len] = 0;
+        const c: char = this.decode_utf8(i);
+        this.len = i;
+        this.data[this.len] = 0;
         return Option::Some(c);
     }
 
     /// Inserts a character at the given byte index.
-    function insert_char(self: &mut String, index: u64, c: char) -> void {
-        if (index > self.len) {
+    insert_char(mut &this, index: u64, c: char) -> void {
+        if (index > this.len) {
             panic("index out of bounds", FILE, LINE);
         }
 
         mut buf: u8[4];
-        const char_len: u64 = self.encode_utf8(c, &buf[0]);
+        const char_len: u64 = this.encode_utf8(c, &buf[0]);
 
-        self.reserve(char_len);
+        this.reserve(char_len);
 
         // Shift bytes to the right
-        mut i: u64 = self.len;
+        mut i: u64 = this.len;
         while (i > index) {
-            self.data[i + char_len - 1] = self.data[i - 1];
+            this.data[i + char_len - 1] = this.data[i - 1];
             i = i - 1;
         }
 
         // Copy the character bytes
-        memcpy(&self.data[index], &buf[0], char_len);
-        self.len = self.len + char_len;
-        self.data[self.len] = 0;
+        memcpy(&this.data[index], &buf[0], char_len);
+        this.len = this.len + char_len;
+        this.data[this.len] = 0;
     }
 
     /// Inserts a string at the given byte index.
-    function insert_str(self: &mut String, index: u64, s: string) -> void {
-        if (index > self.len) {
+    insert_str(mut &this, index: u64, s: string) -> void {
+        if (index > this.len) {
             panic("index out of bounds", FILE, LINE);
         }
 
         const s_len: u64 = strlen(s);
-        self.reserve(s_len);
+        this.reserve(s_len);
 
         // Shift bytes to the right
-        mut i: u64 = self.len;
+        mut i: u64 = this.len;
         while (i > index) {
-            self.data[i + s_len - 1] = self.data[i - 1];
+            this.data[i + s_len - 1] = this.data[i - 1];
             i = i - 1;
         }
 
         // Copy the string bytes
-        memcpy(&self.data[index], s, s_len);
-        self.len = self.len + s_len;
-        self.data[self.len] = 0;
+        memcpy(&this.data[index], s, s_len);
+        this.len = this.len + s_len;
+        this.data[this.len] = 0;
     }
 
     /// Removes a character at the given byte index.
-    function remove(self: &mut String, index: u64) -> char {
-        if (index >= self.len) {
+    remove(mut &this, index: u64) -> char {
+        if (index >= this.len) {
             panic("index out of bounds", FILE, LINE);
         }
 
-        const c: char = self.decode_utf8(index);
-        const char_len: u64 = self.utf8_char_len(self.data[index]);
+        const c: char = this.decode_utf8(index);
+        const char_len: u64 = this.utf8_char_len(this.data[index]);
 
         // Shift bytes to the left
         mut i: u64 = index;
-        while (i + char_len < self.len) {
-            self.data[i] = self.data[i + char_len];
+        while (i + char_len < this.len) {
+            this.data[i] = this.data[i + char_len];
             i = i + 1;
         }
 
-        self.len = self.len - char_len;
-        self.data[self.len] = 0;
+        this.len = this.len - char_len;
+        this.data[this.len] = 0;
         return c;
     }
 
     /// Clears the string.
-    function clear(self: &mut String) -> void {
-        self.len = 0;
-        if (self.data != null) {
-            self.data[0] = 0;
+    clear(mut &this) -> void {
+        this.len = 0;
+        if (this.data != null) {
+            this.data[0] = 0;
         }
     }
 
     /// Truncates the string to the given byte length.
-    function truncate(self: &mut String, new_len: u64) -> void {
-        if (new_len < self.len) {
-            self.len = new_len;
-            self.data[self.len] = 0;
+    truncate(mut &this, new_len: u64) -> void {
+        if (new_len < this.len) {
+            this.len = new_len;
+            this.data[this.len] = 0;
         }
     }
 
@@ -375,42 +453,42 @@ implement struct String {
     // ========================================================================
 
     /// Returns true if the string starts with the given prefix.
-    function starts_with(self, prefix: string) -> boolean {
+    starts_with(this, prefix: string) -> boolean {
         const prefix_len: u64 = strlen(prefix);
-        if (prefix_len > self.len) {
+        if (prefix_len > this.len) {
             return false;
         }
-        return memcmp(self.data, prefix, prefix_len) == 0;
+        return memcmp(this.data, prefix, prefix_len) == 0;
     }
 
     /// Returns true if the string ends with the given suffix.
-    function ends_with(self, suffix: string) -> boolean {
+    ends_with(this, suffix: string) -> boolean {
         const suffix_len: u64 = strlen(suffix);
-        if (suffix_len > self.len) {
+        if (suffix_len > this.len) {
             return false;
         }
-        return memcmp(&self.data[self.len - suffix_len], suffix, suffix_len) == 0;
+        return memcmp(&this.data[this.len - suffix_len], suffix, suffix_len) == 0;
     }
 
     /// Returns true if the string contains the given substring.
-    function contains(self, needle: string) -> boolean {
-        return self.find(needle).is_some();
+    contains(this, needle: string) -> boolean {
+        return this.find(needle).is_some();
     }
 
     /// Finds the first occurrence of a substring.
-    function find(self, needle: string) -> Option<u64> {
+    find(this, needle: string) -> Option<u64> {
         const needle_len: u64 = strlen(needle);
         if (needle_len == 0) {
             return Option::Some(0);
         }
-        if (needle_len > self.len) {
+        if (needle_len > this.len) {
             return Option::None;
         }
 
-        const end: u64 = self.len - needle_len + 1;
+        const end: u64 = this.len - needle_len + 1;
         mut i: u64 = 0;
         while (i < end) {
-            if (memcmp(&self.data[i], needle, needle_len) == 0) {
+            if (memcmp(&this.data[i], needle, needle_len) == 0) {
                 return Option::Some(i);
             }
             i = i + 1;
@@ -419,19 +497,19 @@ implement struct String {
     }
 
     /// Finds the last occurrence of a substring.
-    function rfind(self, needle: string) -> Option<u64> {
+    rfind(this, needle: string) -> Option<u64> {
         const needle_len: u64 = strlen(needle);
         if (needle_len == 0) {
-            return Option::Some(self.len);
+            return Option::Some(this.len);
         }
-        if (needle_len > self.len) {
+        if (needle_len > this.len) {
             return Option::None;
         }
 
-        mut i: u64 = self.len - needle_len + 1;
+        mut i: u64 = this.len - needle_len + 1;
         while (i > 0) {
             i = i - 1;
-            if (memcmp(&self.data[i], needle, needle_len) == 0) {
+            if (memcmp(&this.data[i], needle, needle_len) == 0) {
                 return Option::Some(i);
             }
         }
@@ -439,13 +517,13 @@ implement struct String {
     }
 
     /// Finds the first occurrence of a character.
-    function find_char(self, c: char) -> Option<u64> {
+    find_char(this, c: char) -> Option<u64> {
         mut buf: u8[4];
-        const char_len: u64 = self.encode_utf8(c, &buf[0]);
+        const char_len: u64 = this.encode_utf8(c, &buf[0]);
 
         mut i: u64 = 0;
-        while (i + char_len <= self.len) {
-            if (memcmp(&self.data[i], &buf[0], char_len) == 0) {
+        while (i + char_len <= this.len) {
+            if (memcmp(&this.data[i], &buf[0], char_len) == 0) {
                 return Option::Some(i);
             }
             i = i + 1;
@@ -454,16 +532,16 @@ implement struct String {
     }
 
     /// Counts occurrences of a substring.
-    function count(self, needle: string) -> u64 {
+    count(this, needle: string) -> u64 {
         const needle_len: u64 = strlen(needle);
-        if (needle_len == 0 || needle_len > self.len) {
+        if (needle_len == 0 || needle_len > this.len) {
             return 0;
         }
 
         mut count: u64 = 0;
         mut i: u64 = 0;
-        while (i + needle_len <= self.len) {
-            if (memcmp(&self.data[i], needle, needle_len) == 0) {
+        while (i + needle_len <= this.len) {
+            if (memcmp(&this.data[i], needle, needle_len) == 0) {
                 count = count + 1;
                 i = i + needle_len;
             } else {
@@ -478,69 +556,69 @@ implement struct String {
     // ========================================================================
 
     /// Returns a substring.
-    function substr(self, start: u64, len: u64) -> String {
-        if (start >= self.len) {
-            return String::new();
+    substr(this, start: u64, len: u64) -> String {
+        if (start >= this.len) {
+            return new String();
         }
 
         mut actual_len: u64 = len;
-        if (start + actual_len > self.len) {
-            actual_len = self.len - start;
+        if (start + actual_len > this.len) {
+            actual_len = this.len - start;
         }
 
-        return String::from_bytes(&self.data[start], actual_len);
+        return String::from_bytes(&this.data[start], actual_len);
     }
 
     /// Trims whitespace from both ends.
-    function trim(self) -> String {
-        if (self.len == 0) {
-            return String::new();
+    trim(this) -> String {
+        if (this.len == 0) {
+            return new String();
         }
 
         mut start: u64 = 0;
-        while (start < self.len && self.is_whitespace(self.data[start])) {
+        while (start < this.len && this.is_whitespace(this.data[start])) {
             start = start + 1;
         }
 
-        mut end: u64 = self.len;
-        while (end > start && self.is_whitespace(self.data[end - 1])) {
+        mut end: u64 = this.len;
+        while (end > start && this.is_whitespace(this.data[end - 1])) {
             end = end - 1;
         }
 
-        return String::from_bytes(&self.data[start], end - start);
+        return String::from_bytes(&this.data[start], end - start);
     }
 
     /// Trims whitespace from the start.
-    function trim_start(self) -> String {
-        if (self.len == 0) {
-            return String::new();
+    trim_start(this) -> String {
+        if (this.len == 0) {
+            return new String();
         }
 
         mut start: u64 = 0;
-        while (start < self.len && self.is_whitespace(self.data[start])) {
+        while (start < this.len && this.is_whitespace(this.data[start])) {
             start = start + 1;
         }
 
-        return String::from_bytes(&self.data[start], self.len - start);
+        return String::from_bytes(&this.data[start], this.len - start);
     }
 
     /// Trims whitespace from the end.
-    function trim_end(self) -> String {
-        if (self.len == 0) {
-            return String::new();
+    trim_end(this) -> String {
+        if (this.len == 0) {
+            return new String();
         }
 
-        mut end: u64 = self.len;
-        while (end > 0 && self.is_whitespace(self.data[end - 1])) {
+        mut end: u64 = this.len;
+        while (end > 0 && this.is_whitespace(this.data[end - 1])) {
             end = end - 1;
         }
 
-        return String::from_bytes(self.data, end);
+        return String::from_bytes(this.data, end);
     }
 
     /// Converts to lowercase (ASCII only).
-    function to_lowercase(self) -> String {
-        const result: String = self.clone();
+    to_lowercase(this) -> String {
+        const result: String = this.clone();
         mut i: u64 = 0;
         while (i < result.len) {
             const c: u8 = result.data[i];
@@ -553,8 +631,8 @@ implement struct String {
     }
 
     /// Converts to uppercase (ASCII only).
-    function to_uppercase(self) -> String {
-        const result: String = self.clone();
+    to_uppercase(this) -> String {
+        const result: String = this.clone();
         mut i: u64 = 0;
         while (i < result.len) {
             const c: u8 = result.data[i];
@@ -567,23 +645,23 @@ implement struct String {
     }
 
     /// Replaces all occurrences of a pattern.
-    function replace(self, from: string, to: string) -> String {
+    replace(this, from: string, to: string) -> String {
         const from_len: u64 = strlen(from);
         const to_len: u64 = strlen(to);
 
         if (from_len == 0) {
-            return self.clone();
+            return this.clone();
         }
 
-        const result: String = String::with_capacity(self.len);
+        const result: String = new String(this.len);
 
         mut i: u64 = 0;
-        while (i < self.len) {
-            if (i + from_len <= self.len && memcmp(&self.data[i], from, from_len) == 0) {
+        while (i < this.len) {
+            if (i + from_len <= this.len && memcmp(&this.data[i], from, from_len) == 0) {
                 result.push_str(to);
                 i = i + from_len;
             } else {
-                result.push_byte(self.data[i]);
+                result.push_byte(this.data[i]);
                 i = i + 1;
             }
         }
@@ -592,32 +670,32 @@ implement struct String {
     }
 
     /// Replaces the first occurrence of a pattern.
-    function replace_first(self, from: string, to: string) -> String {
-        const pos: Option<u64> = self.find(from);
+    replace_first(this, from: string, to: string) -> String {
+        const pos: Option<u64> = this.find(from);
         match (pos) {
-            Option::None => { return self.clone(); }
+            Option::None => { return this.clone(); }
             Option::Some(index) => {
                 const from_len: u64 = strlen(from);
-                const result: String = String::with_capacity(self.len);
-                result.push_str(self.substr(0, index).as_cstr());
+                const result: String = new String(this.len);
+                result.push_str(this.substr(0, index).as_cstr());
                 result.push_str(to);
-                result.push_str(self.substr(index + from_len, self.len).as_cstr());
+                result.push_str(this.substr(index + from_len, this.len).as_cstr());
                 return result;
             }
         }
     }
 
     /// Repeats the string n times.
-    function repeat(self, n: u64) -> String {
-        if (n == 0 || self.len == 0) {
-            return String::new();
+    repeat(this, n: u64) -> String {
+        if (n == 0 || this.len == 0) {
+            return new String();
         }
 
-        const result: String = String::with_capacity(self.len * n);
+        const result: String = new String(this.len * n);
         mut i: u64 = 0;
         while (i < n) {
-            memcpy(&result.data[result.len], self.data, self.len);
-            result.len = result.len + self.len;
+            memcpy(&result.data[result.len], this.data, this.len);
+            result.len = result.len + this.len;
             i = i + 1;
         }
         result.data[result.len] = 0;
@@ -625,8 +703,8 @@ implement struct String {
     }
 
     /// Reverses the string (byte-wise, not UTF-8 aware).
-    function reverse_bytes(self) -> String {
-        const result: String = self.clone();
+    reverse_bytes(this) -> String {
+        const result: String = this.clone();
         mut left: u64 = 0;
         mut right: u64 = result.len;
 
@@ -646,21 +724,21 @@ implement struct String {
     // ========================================================================
 
     /// Splits the string by a delimiter and returns a Vec of Strings.
-    function split(self, delimiter: string) -> Vec<String> {
-        const result: Vec<String> = Vec::new();
+    split(this, delimiter: string) -> Vec<String> {
+        const result: Vec<String> = new Vec();
         const delim_len: u64 = strlen(delimiter);
 
         if (delim_len == 0) {
-            result.push(self.clone());
+            result.push(this.clone());
             return result;
         }
 
         mut start: u64 = 0;
         mut i: u64 = 0;
 
-        while (i + delim_len <= self.len) {
-            if (memcmp(&self.data[i], delimiter, delim_len) == 0) {
-                result.push(String::from_bytes(&self.data[start], i - start));
+        while (i + delim_len <= this.len) {
+            if (memcmp(&this.data[i], delimiter, delim_len) == 0) {
+                result.push(String::from_bytes(&this.data[start], i - start));
                 start = i + delim_len;
                 i = start;
             } else {
@@ -668,26 +746,26 @@ implement struct String {
             }
         }
 
-        result.push(String::from_bytes(&self.data[start], self.len - start));
+        result.push(String::from_bytes(&this.data[start], this.len - start));
         return result;
     }
 
     /// Splits by whitespace.
-    function split_whitespace(self) -> Vec<String> {
-        const result: Vec<String> = Vec::new();
+    split_whitespace(this) -> Vec<String> {
+        const result: Vec<String> = new Vec();
 
         mut start: u64 = 0;
         mut in_word: boolean = false;
 
         mut i: u64 = 0;
-        while (i < self.len) {
-            const is_ws: boolean = self.is_whitespace(self.data[i]);
+        while (i < this.len) {
+            const is_ws: boolean = this.is_whitespace(this.data[i]);
 
             if (!in_word && !is_ws) {
                 start = i;
                 in_word = true;
             } else if (in_word && is_ws) {
-                result.push(String::from_bytes(&self.data[start], i - start));
+                result.push(String::from_bytes(&this.data[start], i - start));
                 in_word = false;
             }
 
@@ -695,34 +773,34 @@ implement struct String {
         }
 
         if (in_word) {
-            result.push(String::from_bytes(&self.data[start], self.len - start));
+            result.push(String::from_bytes(&this.data[start], this.len - start));
         }
 
         return result;
     }
 
     /// Splits into lines.
-    function lines(self) -> Vec<String> {
-        const result: Vec<String> = Vec::new();
+    lines(this) -> Vec<String> {
+        const result: Vec<String> = new Vec();
 
         mut start: u64 = 0;
         mut i: u64 = 0;
 
-        while (i < self.len) {
-            if (self.data[i] == 10) { // \n
+        while (i < this.len) {
+            if (this.data[i] == 10) { // \n
                 mut end: u64 = i;
                 // Handle \r\n
-                if (i > start && self.data[i - 1] == 13) {
+                if (i > start && this.data[i - 1] == 13) {
                     end = i - 1;
                 }
-                result.push(String::from_bytes(&self.data[start], end - start));
+                result.push(String::from_bytes(&this.data[start], end - start));
                 start = i + 1;
             }
             i = i + 1;
         }
 
-        if (start < self.len) {
-            result.push(String::from_bytes(&self.data[start], self.len - start));
+        if (start < this.len) {
+            result.push(String::from_bytes(&this.data[start], this.len - start));
         }
 
         return result;
@@ -733,31 +811,31 @@ implement struct String {
     // ========================================================================
 
     /// Compares two strings.
-    function compare(self, other: String) -> i32 {
-        const min_len: u64 = self.len < other.len ? self.len : other.len;
-        const cmp: i32 = memcmp(self.data, other.data, min_len);
+    compare(this, other: String) -> i32 {
+        const min_len: u64 = this.len < other.len ? this.len : other.len;
+        const cmp: i32 = memcmp(this.data, other.data, min_len);
 
         if (cmp != 0) {
             return cmp;
         }
 
-        if (self.len < other.len) {
+        if (this.len < other.len) {
             return -1;
         }
-        if (self.len > other.len) {
+        if (this.len > other.len) {
             return 1;
         }
         return 0;
     }
 
     /// Compares with a C string.
-    function compare_cstr(self, s: string) -> i32 {
-        return strcmp(self.as_cstr(), s);
+    compare_cstr(this, s: string) -> i32 {
+        return strcmp(this.as_cstr(), s);
     }
 
     /// Case-insensitive comparison (ASCII only).
-    function compare_ignore_case(self, other: String) -> i32 {
-        const a: String = self.to_lowercase();
+    compare_ignore_case(this, other: String) -> i32 {
+        const a: String = this.to_lowercase();
         const b: String = other.to_lowercase();
         return a.compare(b);
     }
@@ -767,11 +845,11 @@ implement struct String {
     // ========================================================================
 
     /// Creates a clone of the string.
-    function clone(self) -> String {
-        if (self.len == 0) {
-            return String::new();
+    clone(this) -> String {
+        if (this.len == 0) {
+            return new String();
         }
-        return String::from_bytes(self.data, self.len);
+        return String::from_bytes(this.data, this.len);
     }
 
     // ========================================================================
@@ -779,19 +857,19 @@ implement struct String {
     // ========================================================================
 
     /// Grows the string capacity.
-    function grow(self: &mut String, new_cap: u64) -> void {
-        const new_data: u8* = realloc(self.data, new_cap + 1);
+    grow(mut &this, new_cap: u64) -> void {
+        const new_data: u8* = realloc(this.data, new_cap + 1);
         if (new_data == null) {
             panic("allocation failed", FILE, LINE);
         }
-        self.data = new_data;
-        self.cap = new_cap;
+        this.data = new_data;
+        this.cap = new_cap;
     }
 
     /// Drops the string and frees memory.
-    function drop(self) -> void {
-        if (self.data != null) {
-            free(self.data);
+    drop(this) -> void {
+        if (this.data != null) {
+            free(this.data);
         }
     }
 
@@ -800,7 +878,7 @@ implement struct String {
     // ========================================================================
 
     /// Returns the byte length of a UTF-8 character.
-    function utf8_char_len(self, first_byte: u8) -> u64 {
+    utf8_char_len(this, first_byte: u8) -> u64 {
         if ((first_byte & 0x80) == 0) {
             return 1;
         }
@@ -817,28 +895,28 @@ implement struct String {
     }
 
     /// Decodes a UTF-8 character at the given byte index.
-    function decode_utf8(self, index: u64) -> char {
-        const b0: u8 = self.data[index];
+    decode_utf8(this, index: u64) -> char {
+        const b0: u8 = this.data[index];
 
         if ((b0 & 0x80) == 0) {
             return b0;
         }
 
-        if ((b0 & 0xE0) == 0xC0 && index + 1 < self.len) {
-            const b1: u8 = self.data[index + 1];
+        if ((b0 & 0xE0) == 0xC0 && index + 1 < this.len) {
+            const b1: u8 = this.data[index + 1];
             return ((b0 & 0x1F) << 6) | (b1 & 0x3F);
         }
 
-        if ((b0 & 0xF0) == 0xE0 && index + 2 < self.len) {
-            const b1: u8 = self.data[index + 1];
-            const b2: u8 = self.data[index + 2];
+        if ((b0 & 0xF0) == 0xE0 && index + 2 < this.len) {
+            const b1: u8 = this.data[index + 1];
+            const b2: u8 = this.data[index + 2];
             return ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
         }
 
-        if ((b0 & 0xF8) == 0xF0 && index + 3 < self.len) {
-            const b1: u8 = self.data[index + 1];
-            const b2: u8 = self.data[index + 2];
-            const b3: u8 = self.data[index + 3];
+        if ((b0 & 0xF8) == 0xF0 && index + 3 < this.len) {
+            const b1: u8 = this.data[index + 1];
+            const b2: u8 = this.data[index + 2];
+            const b3: u8 = this.data[index + 3];
             return ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
         }
 
@@ -846,7 +924,7 @@ implement struct String {
     }
 
     /// Encodes a character as UTF-8 into the buffer.
-    function encode_utf8(self, c: char, buf: u8*) -> u64 {
+    encode_utf8(this, c: char, buf: u8*) -> u64 {
         const code: u32 = c;
 
         if (code < 0x80) {
@@ -875,7 +953,7 @@ implement struct String {
     }
 
     /// Returns true if the byte is ASCII whitespace.
-    function is_whitespace(self, b: u8) -> boolean {
+    is_whitespace(this, b: u8) -> boolean {
         return b == 32 || b == 9 || b == 10 || b == 13;
     }
 }
@@ -888,28 +966,34 @@ implement struct String {
 type struct StringChars {
     str: String*;
     byte_index: u64;
+
+    StringChars(str: String);
+
+    has_next(this) -> boolean;
+    next(mut &this) -> Option<char>;
 }
 
 implement struct StringChars {
     /// Creates a character iterator.
-    static function new(str: String) -> StringChars {
-        return StringChars { str: &str, byte_index: 0 };
+    StringChars(str: String) {
+        this.str = &str;
+        this.byte_index = 0;
     }
 
     /// Returns true if there are more characters.
-    function has_next(self) -> boolean {
-        return self.byte_index < self.str.len;
+    has_next(this) -> boolean {
+        return this.byte_index < this.str.len;
     }
 
     /// Returns the next character.
-    function next(self: &mut StringChars) -> Option<char> {
-        if (self.byte_index >= self.str.len) {
+    next(mut &this) -> Option<char> {
+        if (this.byte_index >= this.str.len) {
             return Option::None;
         }
 
-        const c: char = self.str.decode_utf8(self.byte_index);
-        const char_len: u64 = self.str.utf8_char_len(self.str.data[self.byte_index]);
-        self.byte_index = self.byte_index + char_len;
+        const c: char = this.str.decode_utf8(this.byte_index);
+        const char_len: u64 = this.str.utf8_char_len(this.str.data[this.byte_index]);
+        this.byte_index = this.byte_index + char_len;
 
         return Option::Some(c);
     }
@@ -919,27 +1003,33 @@ implement struct StringChars {
 type struct StringBytes {
     str: String*;
     index: u64;
+
+    StringBytes(str: String);
+
+    has_next(this) -> boolean;
+    next(mut &this) -> Option<u8>;
 }
 
 implement struct StringBytes {
     /// Creates a byte iterator.
-    static function new(str: String) -> StringBytes {
-        return StringBytes { str: &str, index: 0 };
+    StringBytes(str: String) {
+        this.str = &str;
+        this.index = 0;
     }
 
     /// Returns true if there are more bytes.
-    function has_next(self) -> boolean {
-        return self.index < self.str.len;
+    has_next(this) -> boolean {
+        return this.index < this.str.len;
     }
 
     /// Returns the next byte.
-    function next(self: &mut StringBytes) -> Option<u8> {
-        if (self.index >= self.str.len) {
+    next(mut &this) -> Option<u8> {
+        if (this.index >= this.str.len) {
             return Option::None;
         }
 
-        const b: u8 = self.str.data[self.index];
-        self.index = self.index + 1;
+        const b: u8 = this.str.data[this.index];
+        this.index = this.index + 1;
         return Option::Some(b);
     }
 }
@@ -951,74 +1041,88 @@ implement struct StringBytes {
 /// A mutable string builder for efficient concatenation.
 type struct StringBuilder {
     buffer: String;
+
+    StringBuilder();
+    StringBuilder(capacity: u64);
+
+    append(mut &this, s: string) -> StringBuilder*;
+    append_string(mut &this, s: String) -> StringBuilder*;
+    append_char(mut &this, c: char) -> StringBuilder*;
+    append_line(mut &this, s: string) -> StringBuilder*;
+    len(this) -> u64;
+    capacity(this) -> u64;
+    clear(mut &this) -> void;
+    build(this) -> String;
+    into_string(this) -> String;
+    drop(this) -> void;
 }
 
 implement struct StringBuilder {
     /// Creates a new StringBuilder.
-    static function new() -> StringBuilder {
-        return StringBuilder { buffer: String::new() };
+    StringBuilder() {
+        this.buffer = new String();
     }
 
     /// Creates a StringBuilder with capacity.
-    static function with_capacity(capacity: u64) -> StringBuilder {
-        return StringBuilder { buffer: String::with_capacity(capacity) };
+    StringBuilder(capacity: u64) {
+        this.buffer = new String(capacity);
     }
 
     /// Appends a string.
-    function append(self: &mut StringBuilder, s: string) -> StringBuilder* {
-        self.buffer.push_str(s);
-        return self;
+    append(mut &this, s: string) -> StringBuilder* {
+        this.buffer.push_str(s);
+        return this;
     }
 
     /// Appends a String.
-    function append_string(self: &mut StringBuilder, s: String) -> StringBuilder* {
-        self.buffer.push_string(s);
-        return self;
+    append_string(mut &this, s: String) -> StringBuilder* {
+        this.buffer.push_string(s);
+        return this;
     }
 
     /// Appends a character.
-    function append_char(self: &mut StringBuilder, c: char) -> StringBuilder* {
-        self.buffer.push_char(c);
-        return self;
+    append_char(mut &this, c: char) -> StringBuilder* {
+        this.buffer.push_char(c);
+        return this;
     }
 
     /// Appends a newline.
-    function append_line(self: &mut StringBuilder, s: string) -> StringBuilder* {
-        self.buffer.push_str(s);
-        self.buffer.push_char('\n');
-        return self;
+    append_line(mut &this, s: string) -> StringBuilder* {
+        this.buffer.push_str(s);
+        this.buffer.push_char('\n');
+        return this;
     }
 
     /// Returns the current length.
-    function len(self) -> u64 {
-        return self.buffer.len;
+    len(this) -> u64 {
+        return this.buffer.len;
     }
 
     /// Returns the capacity.
-    function capacity(self) -> u64 {
-        return self.buffer.cap;
+    capacity(this) -> u64 {
+        return this.buffer.cap;
     }
 
     /// Clears the builder.
-    function clear(self: &mut StringBuilder) -> void {
-        self.buffer.clear();
+    clear(mut &this) -> void {
+        this.buffer.clear();
     }
 
     /// Builds and returns the final String.
-    function build(self) -> String {
-        return self.buffer.clone();
+    build(this) -> String {
+        return this.buffer.clone();
     }
 
     /// Builds and consumes the builder.
-    function into_string(self) -> String {
-        const result: String = self.buffer;
-        self.buffer = String::new();
+    into_string(this) -> String {
+        const result: String = this.buffer;
+        this.buffer = new String();
         return result;
     }
 
     /// Drops the builder.
-    function drop(self) -> void {
-        self.buffer.drop();
+    drop(this) -> void {
+        this.buffer.drop();
     }
 }
 
@@ -1028,7 +1132,7 @@ implement struct StringBuilder {
 
 /// Creates a new empty String.
 function string_new() -> String {
-    return String::new();
+    return new String();
 }
 
 /// Creates a String from a C string.
@@ -1038,12 +1142,12 @@ function string_from(s: string) -> String {
 
 /// Creates a StringBuilder.
 function string_builder() -> StringBuilder {
-    return StringBuilder::new();
+    return new StringBuilder();
 }
 
 /// Concatenates two strings.
 function concat(a: string, b: string) -> String {
-    const result: String = String::with_capacity(strlen(a) + strlen(b));
+    const result: String = new String(strlen(a) + strlen(b));
     result.push_str(a);
     result.push_str(b);
     return result;
@@ -1052,7 +1156,7 @@ function concat(a: string, b: string) -> String {
 /// Joins strings with a separator.
 function join(parts: Vec<String>, separator: string) -> String {
     if (parts.len() == 0) {
-        return String::new();
+        return new String();
     }
 
     const sep_len: u64 = strlen(separator);
@@ -1065,7 +1169,7 @@ function join(parts: Vec<String>, separator: string) -> String {
     }
     total_len = total_len + sep_len * (parts.len() - 1);
 
-    const result: String = String::with_capacity(total_len);
+    const result: String = new String(total_len);
 
     i = 0;
     while (i < parts.len()) {
@@ -1078,4 +1182,3 @@ function join(parts: Vec<String>, separator: string) -> String {
 
     return result;
 }
-

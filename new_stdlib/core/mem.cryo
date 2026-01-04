@@ -329,6 +329,19 @@ type struct MaybeUninit<T> {
     value: T;
     /// Whether the value has been initialized.
     initialized: boolean;
+
+    // Static constructors
+    static function uninit() -> MaybeUninit<T>;
+    static function zeroed() -> MaybeUninit<T>;
+    static function new(value: T) -> MaybeUninit<T>;
+
+    // Instance methods
+    as_ptr(this) -> T*;
+    as_mut_ptr(mut &this) -> T*;
+    write(mut &this, value: T) -> void;
+    assume_init(this) -> T;
+    is_initialized(this) -> boolean;
+    get_or_default(this, default_value: T) -> T;
 }
 
 implement struct MaybeUninit<T> {
@@ -353,38 +366,38 @@ implement struct MaybeUninit<T> {
     }
 
     /// Returns a pointer to the underlying storage.
-    function as_ptr(self) -> T* {
-        return &self.value;
+    as_ptr(this) -> T* {
+        return &this.value;
     }
 
     /// Returns a mutable pointer to the underlying storage.
-    function as_mut_ptr(self: &mut MaybeUninit<T>) -> T* {
-        return &self.value;
+    as_mut_ptr(mut &this) -> T* {
+        return &this.value;
     }
 
     /// Writes a value to the storage and marks it as initialized.
-    function write(self: &mut MaybeUninit<T>, value: T) -> void {
-        self.value = value;
-        self.initialized = true;
+    write(mut &this, value: T) -> void {
+        this.value = value;
+        this.initialized = true;
     }
 
     /// Assumes the value is initialized and returns it.
     ///
     /// # Safety
     /// The caller must ensure the value has been initialized.
-    function assume_init(self) -> T {
-        return self.value;
+    assume_init(this) -> T {
+        return this.value;
     }
 
     /// Returns true if the value has been initialized.
-    function is_initialized(self) -> boolean {
-        return self.initialized;
+    is_initialized(this) -> boolean {
+        return this.initialized;
     }
 
     /// Reads the value if initialized, otherwise returns the default.
-    function get_or_default(self, default_value: T) -> T {
-        if (self.initialized) {
-            return self.value;
+    get_or_default(this, default_value: T) -> T {
+        if (this.initialized) {
+            return this.value;
         }
         return default_value;
     }
@@ -402,6 +415,19 @@ type struct MemoryRegion {
     size: u64;
     /// Current offset into the region.
     offset: u64;
+
+    // Static constructor
+    static function from_ptr(ptr: void*, size: u64) -> MemoryRegion;
+
+    // Instance methods
+    alloc(mut &this, size: u64) -> void*;
+    alloc_aligned(mut &this, size: u64, alignment: u64) -> void*;
+    alloc_array<T>(mut &this, count: u64) -> T*;
+    reset(mut &this) -> void;
+    used(this) -> u64;
+    remaining(this) -> u64;
+    is_empty(this) -> boolean;
+    is_full(this) -> boolean;
 }
 
 implement struct MemoryRegion {
@@ -412,59 +438,59 @@ implement struct MemoryRegion {
 
     /// Allocates `size` bytes from the region.
     /// Returns null if there's not enough space.
-    function alloc(self: &mut MemoryRegion, size: u64) -> void* {
-        if (self.offset + size > self.size) {
+    alloc(mut &this, size: u64) -> void* {
+        if (this.offset + size > this.size) {
             return null;
         }
-        const ptr: void* = ptr_add(self.base, self.offset);
-        self.offset = self.offset + size;
+        const ptr: void* = ptr_add(this.base, this.offset);
+        this.offset = this.offset + size;
         return ptr;
     }
 
     /// Allocates `size` bytes with the specified alignment.
-    function alloc_aligned(self: &mut MemoryRegion, size: u64, alignment: u64) -> void* {
-        const current: void* = ptr_add(self.base, self.offset);
+    alloc_aligned(mut &this, size: u64, alignment: u64) -> void* {
+        const current: void* = ptr_add(this.base, this.offset);
         const aligned: void* = align_up(current, alignment);
         const padding: u64 = byte_distance(current, aligned);
 
-        if (self.offset + padding + size > self.size) {
+        if (this.offset + padding + size > this.size) {
             return null;
         }
 
-        self.offset = self.offset + padding + size;
+        this.offset = this.offset + padding + size;
         return aligned;
     }
 
     /// Allocates space for `count` elements of type T.
-    function alloc_array<T>(self: &mut MemoryRegion, count: u64) -> T* {
+    alloc_array<T>(mut &this, count: u64) -> T* {
         const size: u64 = count * sizeof(T);
         const alignment: u64 = alignof(T);
-        return self.alloc_aligned(size, alignment);
+        return this.alloc_aligned(size, alignment);
     }
 
     /// Resets the region, allowing all memory to be reused.
-    function reset(self: &mut MemoryRegion) -> void {
-        self.offset = 0;
+    reset(mut &this) -> void {
+        this.offset = 0;
     }
 
     /// Returns the amount of used memory.
-    function used(self) -> u64 {
-        return self.offset;
+    used(this) -> u64 {
+        return this.offset;
     }
 
     /// Returns the amount of remaining memory.
-    function remaining(self) -> u64 {
-        return self.size - self.offset;
+    remaining(this) -> u64 {
+        return this.size - this.offset;
     }
 
     /// Returns true if the region is empty.
-    function is_empty(self) -> boolean {
-        return self.offset == 0;
+    is_empty(this) -> boolean {
+        return this.offset == 0;
     }
 
     /// Returns true if the region is full.
-    function is_full(self) -> boolean {
-        return self.offset >= self.size;
+    is_full(this) -> boolean {
+        return this.offset >= this.size;
     }
 }
 
@@ -475,15 +501,15 @@ implement struct MemoryRegion {
 /// Memory ordering for atomic and fence operations.
 enum MemoryOrder {
     /// No ordering constraints.
-    Relaxed,
+    Relaxed;
     /// Acquire ordering (reads cannot be reordered before this).
-    Acquire,
+    Acquire;
     /// Release ordering (writes cannot be reordered after this).
-    Release,
+    Release;
     /// Acquire-Release ordering.
-    AcqRel,
+    AcqRel;
     /// Sequential consistency (strongest ordering).
-    SeqCst
+    SeqCst;
 }
 
 /// Compiler memory fence - prevents reordering across this point.

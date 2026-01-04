@@ -32,16 +32,32 @@ type struct BufReader {
     buf_cap: u64;
     buf_pos: u64;
     buf_len: u64;
+
+    // Constructor
+    BufReader(inner: Reader) -> BufReader;
+    static with_capacity(capacity: u64, inner: Reader) -> BufReader;
+
+    // Methods
+    buffer_len(this) -> u64;
+    buffer_empty(this) -> boolean;
+    buffer(this) -> u8*;
+    fill_buf(mut &this) -> IoResult<u64>;
+    consume(mut &this, n: u64) -> void;
+    read(mut &this, buf: u8*, len: u64) -> IoResult<u64>;
+    read_line(mut &this, line: &mut String) -> IoResult<u64>;
+    read_until(mut &this, delim: u8, buf: &mut Vec<u8>) -> IoResult<u64>;
+    lines(mut &this) -> Lines;
+    drop(this) -> void;
 }
 
 implement struct BufReader {
     /// Creates a new BufReader with the default buffer size.
-    static function new(inner: Reader) -> BufReader {
+    BufReader(inner: Reader) -> BufReader {
         return BufReader::with_capacity(DEFAULT_BUF_SIZE, inner);
     }
 
     /// Creates a new BufReader with the specified capacity.
-    static function with_capacity(capacity: u64, inner: Reader) -> BufReader {
+    static with_capacity(capacity: u64, inner: Reader) -> BufReader {
         const buf: u8* = malloc(capacity);
         if (buf == null) {
             panic("allocation failed", FILE, LINE);
@@ -57,55 +73,55 @@ implement struct BufReader {
     }
 
     /// Returns the number of bytes in the buffer.
-    function buffer_len(self) -> u64 {
-        return self.buf_len - self.buf_pos;
+    buffer_len(this) -> u64 {
+        return this.buf_len - this.buf_pos;
     }
 
     /// Returns true if the buffer is empty.
-    function buffer_empty(self) -> boolean {
-        return self.buf_pos >= self.buf_len;
+    buffer_empty(this) -> boolean {
+        return this.buf_pos >= this.buf_len;
     }
 
     /// Returns a reference to the internal buffer.
-    function buffer(self) -> u8* {
-        return &self.buf[self.buf_pos];
+    buffer(this) -> u8* {
+        return &this.buf[this.buf_pos];
     }
 
     /// Fills the internal buffer.
-    function fill_buf(self: &mut BufReader) -> IoResult<u64> {
-        if (self.buf_pos >= self.buf_len) {
+    fill_buf(mut &this) -> IoResult<u64> {
+        if (this.buf_pos >= this.buf_len) {
             // Buffer is empty, refill it
-            const result: IoResult<u64> = self.inner.read(self.buf, self.buf_cap);
+            const result: IoResult<u64> = this.inner.read(this.buf, this.buf_cap);
             match (result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(n) => {
-                    self.buf_pos = 0;
-                    self.buf_len = n;
+                    this.buf_pos = 0;
+                    this.buf_len = n;
                     return IoResult::Ok(n);
                 }
             }
         }
-        return IoResult::Ok(self.buf_len - self.buf_pos);
+        return IoResult::Ok(this.buf_len - this.buf_pos);
     }
 
     /// Consumes n bytes from the buffer.
-    function consume(self: &mut BufReader, n: u64) -> void {
-        self.buf_pos = self.buf_pos + n;
-        if (self.buf_pos > self.buf_len) {
-            self.buf_pos = self.buf_len;
+    consume(mut &this, n: u64) -> void {
+        this.buf_pos = this.buf_pos + n;
+        if (this.buf_pos > this.buf_len) {
+            this.buf_pos = this.buf_len;
         }
     }
 
     /// Reads bytes into the buffer.
-    function read(self: &mut BufReader, buf: u8*, len: u64) -> IoResult<u64> {
+    read(mut &this, buf: u8*, len: u64) -> IoResult<u64> {
         // If requesting more than buffer size, bypass buffer
-        if (len >= self.buf_cap && self.buffer_empty()) {
-            return self.inner.read(buf, len);
+        if (len >= this.buf_cap && this.buffer_empty()) {
+            return this.inner.read(buf, len);
         }
 
         // Fill buffer if empty
-        if (self.buffer_empty()) {
-            const fill_result: IoResult<u64> = self.fill_buf();
+        if (this.buffer_empty()) {
+            const fill_result: IoResult<u64> = this.fill_buf();
             match (fill_result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(0) => { return IoResult::Ok(0); }
@@ -114,24 +130,24 @@ implement struct BufReader {
         }
 
         // Copy from buffer
-        const available: u64 = self.buf_len - self.buf_pos;
+        const available: u64 = this.buf_len - this.buf_pos;
         mut to_copy: u64 = len;
         if (to_copy > available) {
             to_copy = available;
         }
 
-        memcpy(buf, &self.buf[self.buf_pos], to_copy);
-        self.buf_pos = self.buf_pos + to_copy;
+        memcpy(buf, &this.buf[this.buf_pos], to_copy);
+        this.buf_pos = this.buf_pos + to_copy;
 
         return IoResult::Ok(to_copy);
     }
 
     /// Reads a line into the provided string.
-    function read_line(self: &mut BufReader, line: &mut String) -> IoResult<u64> {
+    read_line(mut &this, line: &mut String) -> IoResult<u64> {
         mut total_read: u64 = 0;
 
         loop {
-            const fill_result: IoResult<u64> = self.fill_buf();
+            const fill_result: IoResult<u64> = this.fill_buf();
             match (fill_result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(0) => { return IoResult::Ok(total_read); }
@@ -140,27 +156,27 @@ implement struct BufReader {
 
             // Search for newline in buffer
             mut found_newline: boolean = false;
-            mut newline_pos: u64 = self.buf_pos;
+            mut newline_pos: u64 = this.buf_pos;
 
-            while (newline_pos < self.buf_len) {
-                if (self.buf[newline_pos] == 10) { // '\n'
+            while (newline_pos < this.buf_len) {
+                if (this.buf[newline_pos] == 10) { // '\n'
                     found_newline = true;
                     break;
                 }
                 newline_pos = newline_pos + 1;
             }
 
-            const copy_len: u64 = newline_pos - self.buf_pos + (found_newline ? 1 : 0);
+            const copy_len: u64 = newline_pos - this.buf_pos + (found_newline ? 1 : 0);
 
             // Append to line
             mut i: u64 = 0;
             while (i < copy_len) {
-                line.push_byte(self.buf[self.buf_pos + i]);
+                line.push_byte(this.buf[this.buf_pos + i]);
                 i = i + 1;
             }
 
             total_read = total_read + copy_len;
-            self.buf_pos = self.buf_pos + copy_len;
+            this.buf_pos = this.buf_pos + copy_len;
 
             if (found_newline) {
                 return IoResult::Ok(total_read);
@@ -169,11 +185,11 @@ implement struct BufReader {
     }
 
     /// Reads until a delimiter byte.
-    function read_until(self: &mut BufReader, delim: u8, buf: &mut Vec<u8>) -> IoResult<u64> {
+    read_until(mut &this, delim: u8, buf: &mut Vec<u8>) -> IoResult<u64> {
         mut total_read: u64 = 0;
 
         loop {
-            const fill_result: IoResult<u64> = self.fill_buf();
+            const fill_result: IoResult<u64> = this.fill_buf();
             match (fill_result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(0) => { return IoResult::Ok(total_read); }
@@ -182,27 +198,27 @@ implement struct BufReader {
 
             // Search for delimiter
             mut found: boolean = false;
-            mut pos: u64 = self.buf_pos;
+            mut pos: u64 = this.buf_pos;
 
-            while (pos < self.buf_len) {
-                if (self.buf[pos] == delim) {
+            while (pos < this.buf_len) {
+                if (this.buf[pos] == delim) {
                     found = true;
                     break;
                 }
                 pos = pos + 1;
             }
 
-            const copy_len: u64 = pos - self.buf_pos + (found ? 1 : 0);
+            const copy_len: u64 = pos - this.buf_pos + (found ? 1 : 0);
 
             // Append to buffer
             mut i: u64 = 0;
             while (i < copy_len) {
-                buf.push(self.buf[self.buf_pos + i]);
+                buf.push(this.buf[this.buf_pos + i]);
                 i = i + 1;
             }
 
             total_read = total_read + copy_len;
-            self.buf_pos = self.buf_pos + copy_len;
+            this.buf_pos = this.buf_pos + copy_len;
 
             if (found) {
                 return IoResult::Ok(total_read);
@@ -211,14 +227,14 @@ implement struct BufReader {
     }
 
     /// Returns an iterator over lines.
-    function lines(self: &mut BufReader) -> Lines {
-        return Lines { reader: self };
+    lines(mut &this) -> Lines {
+        return Lines { reader: this };
     }
 
     /// Drops the buffered reader.
-    function drop(self) -> void {
-        if (self.buf != null) {
-            free(self.buf);
+    drop(this) -> void {
+        if (this.buf != null) {
+            free(this.buf);
         }
     }
 }
@@ -230,13 +246,16 @@ implement struct BufReader {
 /// An iterator over lines of a buffered reader.
 type struct Lines {
     reader: BufReader*;
+
+    // Methods
+    next(mut &this) -> Option<IoResult<String>>;
 }
 
 implement struct Lines {
     /// Returns the next line.
-    function next(self: &mut Lines) -> Option<IoResult<String>> {
+    next(mut &this) -> Option<IoResult<String>> {
         const line: String = String::new();
-        const result: IoResult<u64> = self.reader.read_line(&line);
+        const result: IoResult<u64> = this.reader.read_line(&line);
 
         match (result) {
             IoResult::Err(e) => {
@@ -279,16 +298,29 @@ type struct BufWriter {
     buf_cap: u64;
     buf_len: u64;
     panicked: boolean;
+
+    // Constructor
+    BufWriter(inner: Writer) -> BufWriter;
+    static with_capacity(capacity: u64, inner: Writer) -> BufWriter;
+
+    // Methods
+    buffer_len(this) -> u64;
+    capacity(this) -> u64;
+    write(mut &this, buf: u8*, len: u64) -> IoResult<u64>;
+    flush_buf(mut &this) -> IoResult<void>;
+    flush(mut &this) -> IoResult<void>;
+    into_inner(mut &this) -> IoResult<Writer>;
+    drop(this) -> void;
 }
 
 implement struct BufWriter {
     /// Creates a new BufWriter with the default buffer size.
-    static function new(inner: Writer) -> BufWriter {
+    BufWriter(inner: Writer) -> BufWriter {
         return BufWriter::with_capacity(DEFAULT_BUF_SIZE, inner);
     }
 
     /// Creates a new BufWriter with the specified capacity.
-    static function with_capacity(capacity: u64, inner: Writer) -> BufWriter {
+    static with_capacity(capacity: u64, inner: Writer) -> BufWriter {
         const buf: u8* = malloc(capacity);
         if (buf == null) {
             panic("allocation failed", FILE, LINE);
@@ -304,30 +336,30 @@ implement struct BufWriter {
     }
 
     /// Returns the number of bytes in the buffer.
-    function buffer_len(self) -> u64 {
-        return self.buf_len;
+    buffer_len(this) -> u64 {
+        return this.buf_len;
     }
 
     /// Returns the buffer capacity.
-    function capacity(self) -> u64 {
-        return self.buf_cap;
+    capacity(this) -> u64 {
+        return this.buf_cap;
     }
 
     /// Writes bytes.
-    function write(self: &mut BufWriter, buf: u8*, len: u64) -> IoResult<u64> {
+    write(mut &this, buf: u8*, len: u64) -> IoResult<u64> {
         // If data is larger than buffer, flush and write directly
-        if (len >= self.buf_cap) {
-            const flush_result: IoResult<void> = self.flush_buf();
+        if (len >= this.buf_cap) {
+            const flush_result: IoResult<void> = this.flush_buf();
             match (flush_result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(_) => {}
             }
-            return self.inner.write(buf, len);
+            return this.inner.write(buf, len);
         }
 
         // If data doesn't fit in buffer, flush first
-        if (self.buf_len + len > self.buf_cap) {
-            const flush_result: IoResult<void> = self.flush_buf();
+        if (this.buf_len + len > this.buf_cap) {
+            const flush_result: IoResult<void> = this.flush_buf();
             match (flush_result) {
                 IoResult::Err(e) => { return IoResult::Err(e); }
                 IoResult::Ok(_) => {}
@@ -335,62 +367,62 @@ implement struct BufWriter {
         }
 
         // Copy to buffer
-        memcpy(&self.buf[self.buf_len], buf, len);
-        self.buf_len = self.buf_len + len;
+        memcpy(&this.buf[this.buf_len], buf, len);
+        this.buf_len = this.buf_len + len;
 
         return IoResult::Ok(len);
     }
 
     /// Flushes the internal buffer.
-    function flush_buf(self: &mut BufWriter) -> IoResult<void> {
-        if (self.buf_len == 0) {
+    flush_buf(mut &this) -> IoResult<void> {
+        if (this.buf_len == 0) {
             return IoResult::Ok(void);
         }
 
-        self.panicked = true;
-        const result: IoResult<void> = self.inner.write_all(self.buf, self.buf_len);
-        self.panicked = false;
+        this.panicked = true;
+        const result: IoResult<void> = this.inner.write_all(this.buf, this.buf_len);
+        this.panicked = false;
 
         match (result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(_) => {
-                self.buf_len = 0;
+                this.buf_len = 0;
                 return IoResult::Ok(void);
             }
         }
     }
 
     /// Flushes completely.
-    function flush(self: &mut BufWriter) -> IoResult<void> {
-        const buf_result: IoResult<void> = self.flush_buf();
+    flush(mut &this) -> IoResult<void> {
+        const buf_result: IoResult<void> = this.flush_buf();
         match (buf_result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(_) => {}
         }
-        return self.inner.flush();
+        return this.inner.flush();
     }
 
     /// Gets the inner writer, flushing first.
-    function into_inner(self: &mut BufWriter) -> IoResult<Writer> {
-        const result: IoResult<void> = self.flush_buf();
+    into_inner(mut &this) -> IoResult<Writer> {
+        const result: IoResult<void> = this.flush_buf();
         match (result) {
             IoResult::Err(e) => { return IoResult::Err(e); }
             IoResult::Ok(_) => {
-                const inner: Writer = self.inner;
-                free(self.buf);
-                self.buf = null;
+                const inner: Writer = this.inner;
+                free(this.buf);
+                this.buf = null;
                 return IoResult::Ok(inner);
             }
         }
     }
 
     /// Drops the buffered writer.
-    function drop(self) -> void {
-        if (!self.panicked && self.buf != null) {
-            self.flush_buf();
+    drop(this) -> void {
+        if (!this.panicked && this.buf != null) {
+            this.flush_buf();
         }
-        if (self.buf != null) {
-            free(self.buf);
+        if (this.buf != null) {
+            free(this.buf);
         }
     }
 }
@@ -447,4 +479,3 @@ function copy(reader: &mut Reader, writer: &mut Writer) -> IoResult<u64> {
         }
     }
 }
-

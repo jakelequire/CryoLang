@@ -23,43 +23,51 @@ type struct DirEntry {
     name: String;
     path: PathBuf;
     file_type: FileType;
+
+    file_name(this) -> string;
+    path(this) -> Path;
+    file_type(this) -> FileType;
+    is_dir(this) -> boolean;
+    is_file(this) -> boolean;
+    is_symlink(this) -> boolean;
+    drop(this) -> void;
 }
 
 implement struct DirEntry {
     /// Returns the file name.
-    function file_name(self) -> string {
-        return self.name.as_cstr();
+    file_name(this) -> string {
+        return this.name.as_cstr();
     }
 
     /// Returns the full path.
-    function path(self) -> Path {
-        return self.path.as_path();
+    path(this) -> Path {
+        return this.path.as_path();
     }
 
     /// Returns the file type.
-    function file_type(self) -> FileType {
-        return self.file_type;
+    file_type(this) -> FileType {
+        return this.file_type;
     }
 
     /// Returns true if this is a directory.
-    function is_dir(self) -> boolean {
-        return self.file_type == FileType::Directory;
+    is_dir(this) -> boolean {
+        return this.file_type == FileType::Directory;
     }
 
     /// Returns true if this is a file.
-    function is_file(self) -> boolean {
-        return self.file_type == FileType::File;
+    is_file(this) -> boolean {
+        return this.file_type == FileType::File;
     }
 
     /// Returns true if this is a symlink.
-    function is_symlink(self) -> boolean {
-        return self.file_type == FileType::Symlink;
+    is_symlink(this) -> boolean {
+        return this.file_type == FileType::Symlink;
     }
 
     /// Drops the entry.
-    function drop(self) -> void {
-        self.name.drop();
-        self.path.drop();
+    drop(this) -> void {
+        this.name.drop();
+        this.path.drop();
     }
 }
 
@@ -72,11 +80,17 @@ type struct ReadDir {
     dir_ptr: void*;
     base_path: PathBuf;
     closed: boolean;
+
+    static open(path: string) -> IoResult<ReadDir>;
+    has_next(this) -> boolean;
+    next(mut &this) -> Option<IoResult<DirEntry>>;
+    close(mut &this) -> IoResult<void>;
+    drop(this) -> void;
 }
 
 implement struct ReadDir {
     /// Opens a directory for reading.
-    static function open(path: string) -> IoResult<ReadDir> {
+    static open(path: string) -> IoResult<ReadDir> {
         const dir: void* = opendir_syscall(path);
         if (dir == null) {
             return IoResult::Err(IoError::from_raw_os_error(get_errno()));
@@ -90,20 +104,20 @@ implement struct ReadDir {
     }
 
     /// Returns true if there may be more entries.
-    function has_next(self) -> boolean {
-        return !self.closed;
+    has_next(this) -> boolean {
+        return !this.closed;
     }
 
     /// Returns the next directory entry.
-    function next(self: &mut ReadDir) -> Option<IoResult<DirEntry>> {
-        if (self.closed) {
+    next(mut &this) -> Option<IoResult<DirEntry>> {
+        if (this.closed) {
             return Option::None;
         }
 
         loop {
-            const entry: DirentPtr = readdir_syscall(self.dir_ptr);
+            const entry: DirentPtr = readdir_syscall(this.dir_ptr);
             if (entry == null) {
-                self.closed = true;
+                this.closed = true;
                 return Option::None;
             }
 
@@ -114,7 +128,7 @@ implement struct ReadDir {
                 continue;
             }
 
-            const entry_path: PathBuf = self.base_path.join(name);
+            const entry_path: PathBuf = this.base_path.join(name);
             const file_type: FileType = dirent_type(entry);
 
             return Option::Some(IoResult::Ok(DirEntry {
@@ -126,13 +140,13 @@ implement struct ReadDir {
     }
 
     /// Closes the directory.
-    function close(self: &mut ReadDir) -> IoResult<void> {
-        if (self.closed) {
+    close(mut &this) -> IoResult<void> {
+        if (this.closed) {
             return IoResult::Ok(void);
         }
 
-        const result: i32 = closedir_syscall(self.dir_ptr);
-        self.closed = true;
+        const result: i32 = closedir_syscall(this.dir_ptr);
+        this.closed = true;
 
         if (result < 0) {
             return IoResult::Err(IoError::from_raw_os_error(-result));
@@ -141,11 +155,11 @@ implement struct ReadDir {
     }
 
     /// Drops the directory reader.
-    function drop(self) -> void {
-        if (!self.closed) {
-            closedir_syscall(self.dir_ptr);
+    drop(this) -> void {
+        if (!this.closed) {
+            closedir_syscall(this.dir_ptr);
         }
-        self.base_path.drop();
+        this.base_path.drop();
     }
 }
 
@@ -450,4 +464,3 @@ intrinsic function chdir_syscall(path: string) -> i32;
 intrinsic function access_syscall(path: string, mode: i32) -> i32;
 intrinsic function stat_syscall(path: string, buf: StatBuf*) -> i32;
 intrinsic function get_errno() -> i32;
-
