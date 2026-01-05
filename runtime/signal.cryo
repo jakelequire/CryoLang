@@ -1,0 +1,368 @@
+///! Signal Handling
+///!
+///! This module provides signal handling for the Cryo runtime.
+///! It installs handlers for common signals and provides a way
+///! to register custom signal handlers.
+
+namespace cryo::runtime::signal;
+
+import <core/intrinsics>;
+import <runtime/panic>;
+
+// ============================================================================
+// Signal Constants
+// ============================================================================
+
+/// Hangup signal.
+const SIGHUP: i32 = 1;
+
+/// Interrupt signal (Ctrl+C).
+const SIGINT: i32 = 2;
+
+/// Quit signal.
+const SIGQUIT: i32 = 3;
+
+/// Illegal instruction signal.
+const SIGILL: i32 = 4;
+
+/// Trap signal.
+const SIGTRAP: i32 = 5;
+
+/// Abort signal.
+const SIGABRT: i32 = 6;
+
+/// Bus error signal.
+const SIGBUS: i32 = 7;
+
+/// Floating point exception signal.
+const SIGFPE: i32 = 8;
+
+/// Kill signal (cannot be caught).
+const SIGKILL: i32 = 9;
+
+/// User-defined signal 1.
+const SIGUSR1: i32 = 10;
+
+/// Segmentation fault signal.
+const SIGSEGV: i32 = 11;
+
+/// User-defined signal 2.
+const SIGUSR2: i32 = 12;
+
+/// Broken pipe signal.
+const SIGPIPE: i32 = 13;
+
+/// Alarm signal.
+const SIGALRM: i32 = 14;
+
+/// Termination signal.
+const SIGTERM: i32 = 15;
+
+/// Stack fault signal.
+const SIGSTKFLT: i32 = 16;
+
+/// Child status changed signal.
+const SIGCHLD: i32 = 17;
+
+/// Continue if stopped.
+const SIGCONT: i32 = 18;
+
+/// Stop signal (cannot be caught).
+const SIGSTOP: i32 = 19;
+
+/// Terminal stop signal.
+const SIGTSTP: i32 = 20;
+
+/// Background read from terminal.
+const SIGTTIN: i32 = 21;
+
+/// Background write to terminal.
+const SIGTTOU: i32 = 22;
+
+// ============================================================================
+// Signal Handler Type
+// ============================================================================
+
+/// Type for signal handler functions.
+type SignalHandler = function(signum: i32) -> void;
+
+/// Special value indicating default signal handling.
+const SIG_DFL: SignalHandler = 0;
+
+/// Special value indicating signal should be ignored.
+const SIG_IGN: SignalHandler = 1;
+
+// ============================================================================
+// Signal State
+// ============================================================================
+
+/// Whether signal handlers are installed.
+mut g_initialized: boolean = false;
+
+/// Custom handlers for each signal (0-31).
+mut g_custom_handlers: SignalHandler[32];
+
+/// Previous handlers (for restoration on shutdown).
+mut g_previous_handlers: SignalHandler[32];
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+/// Initializes signal handling.
+function init() -> boolean {
+    if (g_initialized) {
+        return true;
+    }
+
+    // Initialize handler arrays
+    mut i: i32 = 0;
+    while (i < 32) {
+        g_custom_handlers[i] = null;
+        g_previous_handlers[i] = null;
+        i = i + 1;
+    }
+
+    // Install handlers for fatal signals
+    install_fatal_handlers();
+
+    // Ignore SIGPIPE (common in networked programs)
+    ignore_signal(SIGPIPE);
+
+    g_initialized = true;
+    return true;
+}
+
+/// Shuts down signal handling.
+function shutdown() -> void {
+    if (!g_initialized) {
+        return;
+    }
+
+    // Restore previous handlers
+    restore_signal(SIGSEGV);
+    restore_signal(SIGBUS);
+    restore_signal(SIGFPE);
+    restore_signal(SIGILL);
+    restore_signal(SIGABRT);
+
+    g_initialized = false;
+}
+
+// ============================================================================
+// Fatal Signal Handlers
+// ============================================================================
+
+/// Installs handlers for fatal signals.
+function install_fatal_handlers() -> void {
+    // SIGSEGV - Segmentation fault
+    g_previous_handlers[SIGSEGV] = signal(SIGSEGV, handle_sigsegv);
+
+    // SIGBUS - Bus error
+    g_previous_handlers[SIGBUS] = signal(SIGBUS, handle_sigbus);
+
+    // SIGFPE - Floating point exception
+    g_previous_handlers[SIGFPE] = signal(SIGFPE, handle_sigfpe);
+
+    // SIGILL - Illegal instruction
+    g_previous_handlers[SIGILL] = signal(SIGILL, handle_sigill);
+
+    // SIGABRT - Abort
+    g_previous_handlers[SIGABRT] = signal(SIGABRT, handle_sigabrt);
+}
+
+/// Handler for SIGSEGV (segmentation fault).
+function handle_sigsegv(signum: i32) -> void {
+    // Check for custom handler
+    if (g_custom_handlers[SIGSEGV] != null) {
+        g_custom_handlers[SIGSEGV](signum);
+        return;
+    }
+
+    // Default: panic
+    write_fatal_message("SIGSEGV: Segmentation fault (invalid memory access)\n");
+    abort_with_signal(signum);
+}
+
+/// Handler for SIGBUS (bus error).
+function handle_sigbus(signum: i32) -> void {
+    if (g_custom_handlers[SIGBUS] != null) {
+        g_custom_handlers[SIGBUS](signum);
+        return;
+    }
+
+    write_fatal_message("SIGBUS: Bus error (misaligned memory access)\n");
+    abort_with_signal(signum);
+}
+
+/// Handler for SIGFPE (floating point exception).
+function handle_sigfpe(signum: i32) -> void {
+    if (g_custom_handlers[SIGFPE] != null) {
+        g_custom_handlers[SIGFPE](signum);
+        return;
+    }
+
+    write_fatal_message("SIGFPE: Floating point exception (division by zero or overflow)\n");
+    abort_with_signal(signum);
+}
+
+/// Handler for SIGILL (illegal instruction).
+function handle_sigill(signum: i32) -> void {
+    if (g_custom_handlers[SIGILL] != null) {
+        g_custom_handlers[SIGILL](signum);
+        return;
+    }
+
+    write_fatal_message("SIGILL: Illegal instruction\n");
+    abort_with_signal(signum);
+}
+
+/// Handler for SIGABRT (abort).
+function handle_sigabrt(signum: i32) -> void {
+    if (g_custom_handlers[SIGABRT] != null) {
+        g_custom_handlers[SIGABRT](signum);
+        return;
+    }
+
+    write_fatal_message("SIGABRT: Abort signal received\n");
+    // Don't call abort() again, just exit
+    _exit(128 + signum);
+}
+
+// ============================================================================
+// Signal Management
+// ============================================================================
+
+/// Sets a custom handler for a signal.
+function set_handler(signum: i32, handler: SignalHandler) -> SignalHandler {
+    if (signum < 0 || signum >= 32) {
+        return null;
+    }
+
+    const old_handler: SignalHandler = g_custom_handlers[signum];
+    g_custom_handlers[signum] = handler;
+
+    return old_handler;
+}
+
+/// Gets the current handler for a signal.
+function get_handler(signum: i32) -> SignalHandler {
+    if (signum < 0 || signum >= 32) {
+        return null;
+    }
+
+    return g_custom_handlers[signum];
+}
+
+/// Clears the custom handler for a signal.
+function clear_handler(signum: i32) -> void {
+    if (signum >= 0 && signum < 32) {
+        g_custom_handlers[signum] = null;
+    }
+}
+
+/// Ignores a signal.
+function ignore_signal(signum: i32) -> void {
+    signal(signum, SIG_IGN);
+}
+
+/// Restores a signal to its previous handler.
+function restore_signal(signum: i32) -> void {
+    if (signum >= 0 && signum < 32 && g_previous_handlers[signum] != null) {
+        signal(signum, g_previous_handlers[signum]);
+        g_previous_handlers[signum] = null;
+    }
+}
+
+/// Restores a signal to its default handler.
+function reset_signal(signum: i32) -> void {
+    signal(signum, SIG_DFL);
+}
+
+// ============================================================================
+// Signal Raising
+// ============================================================================
+
+/// Raises a signal in the current process.
+function raise_signal(signum: i32) -> i32 {
+    return raise(signum);
+}
+
+/// Sends a signal to a process.
+function kill_process(pid: i32, signum: i32) -> i32 {
+    return kill(pid, signum);
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Writes a fatal error message to stderr.
+function write_fatal_message(msg: string) -> void {
+    const stderr_fd: i32 = 2;
+    write(stderr_fd, msg, strlen(msg));
+}
+
+/// Aborts with a signal (re-raises after resetting to default).
+function abort_with_signal(signum: i32) -> void {
+    // Reset to default handler
+    signal(signum, SIG_DFL);
+
+    // Re-raise the signal
+    raise(signum);
+
+    // If we get here, fall back to _exit
+    _exit(128 + signum);
+}
+
+// ============================================================================
+// Signal Names
+// ============================================================================
+
+/// Returns the name of a signal.
+function signal_name(signum: i32) -> string {
+    match (signum) {
+        SIGHUP => { return "SIGHUP"; }
+        SIGINT => { return "SIGINT"; }
+        SIGQUIT => { return "SIGQUIT"; }
+        SIGILL => { return "SIGILL"; }
+        SIGTRAP => { return "SIGTRAP"; }
+        SIGABRT => { return "SIGABRT"; }
+        SIGBUS => { return "SIGBUS"; }
+        SIGFPE => { return "SIGFPE"; }
+        SIGKILL => { return "SIGKILL"; }
+        SIGUSR1 => { return "SIGUSR1"; }
+        SIGSEGV => { return "SIGSEGV"; }
+        SIGUSR2 => { return "SIGUSR2"; }
+        SIGPIPE => { return "SIGPIPE"; }
+        SIGALRM => { return "SIGALRM"; }
+        SIGTERM => { return "SIGTERM"; }
+        SIGCHLD => { return "SIGCHLD"; }
+        SIGCONT => { return "SIGCONT"; }
+        SIGSTOP => { return "SIGSTOP"; }
+        SIGTSTP => { return "SIGTSTP"; }
+        _ => { return "UNKNOWN"; }
+    }
+}
+
+/// Returns true if the signal is fatal by default.
+function is_fatal(signum: i32) -> boolean {
+    return signum == SIGSEGV ||
+           signum == SIGBUS ||
+           signum == SIGFPE ||
+           signum == SIGILL ||
+           signum == SIGABRT;
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function signal(signum: i32, handler: SignalHandler) -> SignalHandler;
+intrinsic function raise(signum: i32) -> i32;
+intrinsic function kill(pid: i32, signum: i32) -> i32;
+intrinsic function write(fd: i32, buf: void*, count: u64) -> i64;
+intrinsic function strlen(s: string) -> u64;
+intrinsic function abort() -> void;
+intrinsic function _exit(status: i32) -> void;
+

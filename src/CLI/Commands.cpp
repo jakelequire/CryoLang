@@ -855,18 +855,23 @@ namespace Cryo::CLI::Commands
             }
         }
 
-        // Set default main file if not specified
-        std::string main_file = "src/main.cryo";
-        std::string exe_name = config.project_name.empty() ? "app" : config.project_name;
+        // Use entry_point from config (or default)
+        std::string main_file = config.entry_point;
+        std::string project_name = config.project_name.empty() ? "app" : config.project_name;
+        bool is_library = (config.target_type == "static_library" || config.target_type == "shared_library");
 
         if (use_verbose)
         {
-            std::cout << "Project name: " << exe_name << std::endl;
-            std::cout << "Main file: " << main_file << std::endl;
+            std::cout << "Project name: " << project_name << std::endl;
+            std::cout << "Target type: " << config.target_type << std::endl;
+            std::cout << "Entry point: " << main_file << std::endl;
+            std::cout << "Source directory: " << config.source_dir << std::endl;
             std::cout << "Output directory: " << config.output_dir << std::endl;
             std::cout << "Debug mode: " << (use_debug ? "enabled" : "disabled") << std::endl;
             std::cout << "Config debug: " << (config.debug ? "enabled" : "disabled") << std::endl;
             std::cout << "Optimization: " << (config.optimize ? "enabled" : "disabled") << std::endl;
+            std::cout << "Stdlib mode: " << (config.stdlib_mode ? "enabled" : "disabled") << std::endl;
+            std::cout << "No-std: " << (config.no_std ? "enabled" : "disabled") << std::endl;
             if (!config.args.empty())
             {
                 std::cout << "Compiler args: ";
@@ -878,10 +883,10 @@ namespace Cryo::CLI::Commands
             }
         }
 
-        // Check if main file exists
+        // Check if entry point file exists
         if (!std::filesystem::exists(main_file))
         {
-            std::cerr << "Error: Main file '" << main_file << "' not found" << std::endl;
+            std::cerr << "Error: Entry point file '" << main_file << "' not found" << std::endl;
             return 1;
         }
 
@@ -919,21 +924,54 @@ namespace Cryo::CLI::Commands
         }
 
         // Build the project using the compiler
-        std::string exe_name_with_ext = os.make_executable_name(exe_name);
-        std::string output_path = os.join_path(config.output_dir, exe_name_with_ext);
+        std::string output_path;
+        if (is_library)
+        {
+            // Static library: lib<name>.a
+            output_path = os.join_path(config.output_dir, "lib" + project_name + ".a");
+        }
+        else
+        {
+            // Executable: <name> (with platform extension)
+            std::string exe_name_with_ext = os.make_executable_name(project_name);
+            output_path = os.join_path(config.output_dir, exe_name_with_ext);
+        }
 
         auto compiler = Cryo::create_compiler_instance();
 
         // Use config settings for debug mode (but allow CLI override)
         compiler->set_debug_mode(use_debug);
 
-        // Enable standard library linking by default
-        compiler->set_stdlib_linking(true);
-
-        // Use auto-detection to find stdlib location
-        if (!compiler->module_loader()->auto_detect_stdlib_root())
+        // Handle stdlib_mode: compile as stdlib component
+        if (config.stdlib_mode)
         {
-            std::cerr << "Warning: Could not auto-detect stdlib location, using fallback path" << std::endl;
+            compiler->set_stdlib_compilation_mode(true);
+            if (use_verbose)
+            {
+                std::cout << "Compiling in stdlib mode" << std::endl;
+            }
+        }
+
+        // Handle no_std: disable stdlib linking and auto-imports
+        if (config.no_std)
+        {
+            compiler->set_stdlib_linking(false);
+            compiler->set_auto_imports_enabled(false);
+            if (use_verbose)
+            {
+                std::cout << "Stdlib linking disabled (no-std mode)" << std::endl;
+            }
+        }
+        else
+        {
+            // Enable standard library linking by default
+            compiler->set_stdlib_linking(true);
+
+            // Use auto-detection to find stdlib location
+            if (!compiler->module_loader()->auto_detect_stdlib_root())
+            {
+                std::cerr << "Warning: Could not auto-detect stdlib location, using fallback path" << std::endl;
+            }
         }
 
         compiler->module_loader()->set_current_file(std::filesystem::absolute(main_file).string());
@@ -969,7 +1007,7 @@ namespace Cryo::CLI::Commands
 
         if (emit_llvm)
         {
-            std::string bc_path = os.join_path(config.output_dir, exe_name + ".bc");
+            std::string bc_path = os.join_path(config.output_dir, project_name + ".bc");
 
             if (use_verbose)
             {
@@ -981,7 +1019,7 @@ namespace Cryo::CLI::Commands
                 std::cout << "✓ LLVM bitcode emitted: " << bc_path << std::endl;
 
                 // The .ll file is automatically generated by emit_llvm_ir
-                std::string ll_path = os.join_path(config.output_dir, exe_name + ".ll");
+                std::string ll_path = os.join_path(config.output_dir, project_name + ".ll");
                 if (std::filesystem::exists(ll_path))
                 {
                     std::cout << "✓ LLVM IR text emitted: " << ll_path << std::endl;
@@ -997,12 +1035,31 @@ namespace Cryo::CLI::Commands
             }
         }
 
-        // Generate executable
-        auto target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
+        // Determine the link target based on target_type
+        Cryo::Linker::CryoLinker::LinkTarget target;
+        if (config.target_type == "static_library")
+        {
+            target = Cryo::Linker::CryoLinker::LinkTarget::StaticLibrary;
+        }
+        else if (config.target_type == "shared_library")
+        {
+            target = Cryo::Linker::CryoLinker::LinkTarget::SharedLibrary;
+        }
+        else
+        {
+            target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
+        }
 
         if (compiler->generate_output(output_path, target))
         {
-            std::cout << "✓ Build successful: " << output_path << std::endl;
+            if (is_library)
+            {
+                std::cout << "✓ Library built successfully: " << output_path << std::endl;
+            }
+            else
+            {
+                std::cout << "✓ Build successful: " << output_path << std::endl;
+            }
             return 0;
         }
         else
