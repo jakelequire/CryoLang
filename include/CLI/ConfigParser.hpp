@@ -15,7 +15,7 @@ namespace Cryo::CLI
         // [project] section
         std::string project_name;
         std::string output_dir = "build";
-        std::string target_type = "executable";  // "executable", "static_library", "shared_library"
+        std::string target_type = "executable";  // "executable", "static_library", "shared_library", "stdlib"
         std::string entry_point = "src/main.cryo";  // Configurable entry point
         std::string source_dir = "src";             // Source directory root
 

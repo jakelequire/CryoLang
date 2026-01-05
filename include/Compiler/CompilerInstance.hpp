@@ -92,6 +92,7 @@ namespace Cryo
 
         // Main compilation phases
         bool compile_file(const std::string &source_file);
+        bool compile_stdlib(const std::string &source_dir, const std::string &output_path);
         bool parse_source(const std::string &source_code);
 
         // LSP-specific frontend-only compilation (no codegen)
