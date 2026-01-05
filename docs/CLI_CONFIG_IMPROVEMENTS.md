@@ -25,9 +25,9 @@ args = []
 
 1. **target_type not implemented**: Always builds executable regardless of setting
 2. **No stdlib_mode support**: Can't build stdlib/runtime components
-3. **No source file specification**: Assumes `src/main.cryo`
+3. **No source directory specification**: Assumes `src/main.cryo`
 4. **No library linking control**: Can't disable stdlib linking
-5. **No LLVM output control**: Can't specify bitcode-only compilation
+5. **No entry point configuration**: Hardcoded to `src/main.cryo`
 
 ---
 
@@ -44,26 +44,15 @@ struct CryoConfig
     std::string project_name;
     std::string output_dir = "build";
     std::string target_type = "executable";  // "executable", "static_library", "shared_library"
-    std::string entry_point = "src/main.cryo";
-    std::string source_dir = "src";
+    std::string entry_point = "src/main.cryo";  // NEW: configurable entry point
+    std::string source_dir = "src";             // NEW: source directory root
 
     // [compiler] section
     bool debug = false;
     bool optimize = true;
-    bool stdlib_mode = false;      // NEW: --stdlib-mode flag
-    bool no_std = false;           // NEW: Don't link stdlib
-    bool emit_llvm = false;        // NEW: Emit LLVM bitcode
-    bool pic = true;               // NEW: Position-independent code
+    bool stdlib_mode = false;   // NEW: --stdlib-mode flag
+    bool no_std = false;        // NEW: Don't link stdlib
     std::vector<std::string> args;
-
-    // [sources] section - NEW
-    std::vector<std::string> source_files;  // Explicit file list
-    std::vector<std::string> include_patterns;  // Glob patterns
-
-    // [build] section - NEW
-    bool use_llvm_link = false;    // Use llvm-link for libraries
-    bool use_llvm_ar = false;      // Use llvm-ar for static libs
-    std::vector<std::string> link_libraries;
 
     // [dependencies] section
     std::unordered_map<std::string, std::string> dependencies;
@@ -73,13 +62,11 @@ struct CryoConfig
 ### 2. Extended `cryoconfig` Format
 
 ```ini
-# Full cryoconfig specification
-
 [project]
 project_name = "cryo-runtime"
 output_dir = "build"
 target_type = "static_library"    # executable | static_library | shared_library
-entry_point = "entry.cryo"        # Main file (for executables)
+entry_point = "lib.cryo"          # Main entry point file
 source_dir = "."                  # Root source directory
 
 [compiler]
@@ -87,71 +74,75 @@ debug = false
 optimize = true
 stdlib_mode = true                # Compile in stdlib mode
 no_std = true                     # Don't link standard library
-emit_llvm = true                  # Emit LLVM bitcode
-pic = true                        # Position-independent code
-args = ["--custom-flag"]          # Additional compiler args
-
-[sources]
-# Explicit source file list (in compilation order)
-files = [
-    "version.cryo",
-    "platform/linux.cryo",
-    "memory.cryo",
-    "panic.cryo",
-    "init.cryo",
-    "entry.cryo"
-]
-# Or use glob patterns
-include = ["*.cryo", "platform/*.cryo"]
-exclude = ["test_*.cryo"]
-
-[build]
-llvm_link = true                  # Use llvm-link to combine bitcode
-llvm_ar = true                    # Create static archive
-link_libraries = ["pthread", "m"] # System libraries to link
+args = []                         # Additional compiler args
 
 [dependencies]
 # Package dependencies (future)
-# some_package = "1.0.0"
 ```
 
-### 3. CLI Argument Additions
+### 3. Automatic Source Discovery
+
+When `cryo build` runs with a `cryoconfig`, the compiler should:
+
+1. **Discover all `.cryo` files** in `source_dir` recursively
+2. **Parse imports** to build a dependency graph
+3. **Topologically sort** files by dependencies
+4. **Compile in correct order** automatically
+
+This means the compiler handles file management - no need for explicit file lists.
+
+### 4. ConfigParser Updates
 
 ```cpp
-// src/CLI/CLI.cpp - Add these flags to CompileCommand
+// src/CLI/ConfigParser.cpp
 
-// Stdlib mode flag
-argument(CLIArgument("stdlib-mode", "Compile in stdlib mode", false).flag());
-
-// No-std flag
-argument(CLIArgument("no-std", "Don't link standard library", false).flag());
-
-// Library output flags
-argument(CLIArgument("static-lib", "Build as static library", false).flag());
-argument(CLIArgument("shared-lib", "Build as shared library", false).flag());
-
-// LLVM control
-argument(CLIArgument("pic", "Generate position-independent code", false).flag());
+// In parse_config(), add handling for new fields:
+if (current_section == "project")
+{
+    if (key == "project_name")
+        config.project_name = value;
+    else if (key == "output_dir")
+        config.output_dir = value;
+    else if (key == "target_type")
+        config.target_type = value;
+    else if (key == "entry_point")      // NEW
+        config.entry_point = value;
+    else if (key == "source_dir")        // NEW
+        config.source_dir = value;
+}
+else if (current_section == "compiler")
+{
+    if (key == "debug")
+        config.debug = parse_bool(value);
+    else if (key == "optimize")
+        config.optimize = parse_bool(value);
+    else if (key == "stdlib_mode")       // NEW
+        config.stdlib_mode = parse_bool(value);
+    else if (key == "no_std")            // NEW
+        config.no_std = parse_bool(value);
+    else if (key == "args")
+        config.args = parse_array(value);
+}
 ```
 
-### 4. BuildCommand Improvements
+### 5. BuildCommand Updates
 
 ```cpp
 // src/CLI/Commands.cpp - BuildCommand::build_project
 
 int BuildCommand::build_project(const ParsedArgs &args)
 {
-    // ... existing code ...
+    // ... parse cryoconfig ...
 
-    // Handle target type
-    Cryo::Linker::CryoLinker::LinkTarget target;
-    if (config.target_type == "static_library") {
-        target = Cryo::Linker::CryoLinker::LinkTarget::StaticLibrary;
-    } else if (config.target_type == "shared_library") {
-        target = Cryo::Linker::CryoLinker::LinkTarget::SharedLibrary;
-    } else {
-        target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
-    }
+    // Determine entry point (use config or default)
+    std::string entry_point = config.entry_point.empty()
+        ? "src/main.cryo"
+        : config.entry_point;
+
+    // Use source_dir if specified
+    std::string source_dir = config.source_dir.empty()
+        ? "src"
+        : config.source_dir;
 
     // Handle stdlib mode
     if (config.stdlib_mode) {
@@ -164,81 +155,69 @@ int BuildCommand::build_project(const ParsedArgs &args)
         compiler->set_auto_imports_enabled(false);
     }
 
-    // Handle source files
-    std::vector<std::string> source_files;
-    if (!config.source_files.empty()) {
-        // Use explicit file list
-        source_files = config.source_files;
-    } else {
-        // Auto-discover sources
-        source_files = discover_source_files(config.source_dir, config.include_patterns);
-    }
+    // Discover source files in source_dir
+    std::vector<std::string> source_files = discover_sources(source_dir);
 
-    // Compile each file
-    for (const auto& src : source_files) {
-        if (!compiler->compile_file(src)) {
-            // Handle error
-        }
-    }
+    // For libraries: compile all sources, link into library
+    // For executables: compile and link as before
 
-    // Generate output based on target type
-    if (target == LinkTarget::StaticLibrary) {
-        return build_static_library(compiler, output_path, config);
-    } else if (target == LinkTarget::SharedLibrary) {
-        return build_shared_library(compiler, output_path, config);
+    if (config.target_type == "static_library") {
+        return build_static_library(compiler, source_files, output_path);
+    } else if (config.target_type == "shared_library") {
+        return build_shared_library(compiler, source_files, output_path);
     } else {
-        return build_executable(compiler, output_path, config);
+        return build_executable(compiler, entry_point, output_path);
     }
 }
 
-int BuildCommand::build_static_library(/*...*/)
+std::vector<std::string> BuildCommand::discover_sources(const std::string& source_dir)
 {
-    // 1. Compile all sources to bitcode
-    // 2. Use llvm-link to combine
-    // 3. Use llc to create object file
-    // 4. Use llvm-ar to create archive
+    std::vector<std::string> sources;
+
+    // Recursively find all .cryo files
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(source_dir)) {
+        if (entry.path().extension() == ".cryo") {
+            sources.push_back(entry.path().string());
+        }
+    }
+
+    return sources;
 }
-```
 
-### 5. New ConfigParser Sections
-
-```cpp
-// src/CLI/ConfigParser.cpp
-
-bool ConfigParser::parse_config(const std::string &config_path, CryoConfig &config)
+int BuildCommand::build_static_library(
+    CompilerInstance* compiler,
+    const std::vector<std::string>& sources,
+    const std::string& output_path)
 {
-    // ... existing code ...
+    std::vector<std::string> object_files;
 
-    // Parse [sources] section
-    else if (current_section == "sources")
-    {
-        if (key == "files")
-        {
-            config.source_files = parse_array(value);
+    // 1. Compile each source to bitcode
+    for (const auto& src : sources) {
+        std::string bc_path = get_bitcode_path(src);
+        if (!compile_to_bitcode(compiler, src, bc_path)) {
+            return 1;
         }
-        else if (key == "include")
-        {
-            config.include_patterns = parse_array(value);
-        }
-    }
-    // Parse [build] section
-    else if (current_section == "build")
-    {
-        if (key == "llvm_link")
-        {
-            config.use_llvm_link = parse_bool(value);
-        }
-        else if (key == "llvm_ar")
-        {
-            config.use_llvm_ar = parse_bool(value);
-        }
-        else if (key == "link_libraries")
-        {
-            config.link_libraries = parse_array(value);
-        }
+        object_files.push_back(bc_path);
     }
 
-    // ... rest of parsing ...
+    // 2. Link bitcode files with llvm-link
+    std::string combined_bc = output_dir + "/combined.bc";
+    if (!llvm_link(object_files, combined_bc)) {
+        return 1;
+    }
+
+    // 3. Compile to object with llc
+    std::string obj_path = output_dir + "/" + project_name + ".o";
+    if (!llc_compile(combined_bc, obj_path)) {
+        return 1;
+    }
+
+    // 4. Create archive with llvm-ar
+    if (!llvm_ar_create(obj_path, output_path)) {
+        return 1;
+    }
+
+    return 0;
 }
 ```
 
@@ -251,7 +230,9 @@ bool ConfigParser::parse_config(const std::string &config_path, CryoConfig &conf
 ```ini
 [project]
 project_name = "cryo-runtime"
+output_dir = "build"
 target_type = "static_library"
+entry_point = "lib.cryo"
 source_dir = "."
 
 [compiler]
@@ -259,21 +240,7 @@ stdlib_mode = true
 no_std = true
 optimize = true
 
-[sources]
-files = [
-    "version.cryo",
-    "platform/linux.cryo",
-    "memory.cryo",
-    "signal.cryo",
-    "panic.cryo",
-    "init.cryo",
-    "entry.cryo",
-    "lib.cryo"
-]
-
-[build]
-llvm_link = true
-llvm_ar = true
+[dependencies]
 ```
 
 ### Standard Library
@@ -281,20 +248,16 @@ llvm_ar = true
 ```ini
 [project]
 project_name = "cryo-stdlib"
+output_dir = "build"
 target_type = "static_library"
+entry_point = "lib.cryo"
 source_dir = "."
 
 [compiler]
 stdlib_mode = true
 optimize = true
 
-[sources]
-include = ["**/*.cryo"]
-exclude = ["runtime/**"]
-
-[build]
-llvm_link = true
-llvm_ar = true
+[dependencies]
 ```
 
 ### User Application
@@ -302,32 +265,32 @@ llvm_ar = true
 ```ini
 [project]
 project_name = "myapp"
+output_dir = "build"
 target_type = "executable"
 
 [compiler]
 debug = true
 
 [dependencies]
-# Future: package dependencies
 ```
 
 ---
 
 ## Implementation Priority
 
-1. **High**: `target_type` implementation (static_library, shared_library)
-2. **High**: `stdlib_mode` and `no_std` flags
-3. **Medium**: `[sources]` section with file lists
-4. **Medium**: `[build]` section with LLVM tool control
-5. **Low**: Glob pattern support for source discovery
-6. **Low**: Package dependency resolution
+1. **High**: Add `entry_point` and `source_dir` to CryoConfig
+2. **High**: Add `stdlib_mode` and `no_std` flags to CryoConfig
+3. **High**: Implement `target_type = "static_library"` in BuildCommand
+4. **Medium**: Automatic source file discovery in source_dir
+5. **Medium**: Dependency graph building and topological sort
+6. **Low**: `target_type = "shared_library"` support
 
 ---
 
-## Migration Path
+## Key Design Principles
 
-1. Keep backward compatibility - existing configs continue to work
-2. Add new sections/fields as optional
-3. Gradually deprecate hardcoded assumptions (e.g., `src/main.cryo`)
-4. Document new features in CLI help and docs
+1. **Compiler manages files**: No explicit file lists needed - the compiler discovers and orders files automatically
+2. **Simple configuration**: Minimal required fields, sensible defaults
+3. **Backward compatible**: Existing configs continue to work
+4. **Convention over configuration**: `src/main.cryo` default, standard directory structure
 
