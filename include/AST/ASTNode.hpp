@@ -41,6 +41,9 @@ namespace Cryo
     class SwitchStatementNode;
     class CaseStatementNode;
 
+    // Forward declaration for module declarations
+    class ModuleDeclarationNode;
+
     enum class NodeKind
     {
         // Base categories
@@ -86,6 +89,7 @@ namespace Cryo
         IntrinsicDeclaration,
         IntrinsicConstDeclaration,
         ImportDeclaration,
+        ModuleDeclaration,
         StructDeclaration,
         ClassDeclaration,
         EnumDeclaration,
@@ -184,6 +188,8 @@ namespace Cryo
             return "IntrinsicConstDeclaration";
         case NodeKind::ImportDeclaration:
             return "ImportDeclaration";
+        case NodeKind::ModuleDeclaration:
+            return "ModuleDeclaration";
         case NodeKind::StructDeclaration:
             return "StructDeclaration";
         case NodeKind::ClassDeclaration:
@@ -780,44 +786,37 @@ namespace Cryo
     class ImportDeclarationNode : public DeclarationNode
     {
     public:
-        enum class ImportType
-        {
-            Relative, // "./path" or "../path" for relative files
-            Absolute  // <path> for standard library (stdlib/ prefix assumed)
-        };
-
         enum class ImportStyle
         {
-            WildcardImport, // import <core/types>; or import * from <core/types>;
-            SpecificImport  // import IO from <io/stdio>;
+            WildcardImport, // import core::option;
+            SpecificImport  // import IO from core::stdio;
         };
 
     private:
-        std::string _path;                          // The import path (file path or module name)
+        std::string _module_path;                   // The module path (e.g., "core::option")
         std::string _alias;                         // Optional alias (for "as" keyword)
         std::vector<std::string> _specific_imports; // Specific symbols to import (for "import X from")
-        ImportType _import_type;                    // Type of import
         ImportStyle _import_style;                  // Style of import (wildcard vs specific)
         bool _has_alias;                            // Whether an alias was specified
 
     public:
-        ImportDeclarationNode(SourceLocation loc, std::string path, ImportType type)
+        ImportDeclarationNode(SourceLocation loc, std::string module_path)
             : DeclarationNode(NodeKind::ImportDeclaration, loc),
-              _path(std::move(path)), _import_type(type), _import_style(ImportStyle::WildcardImport), _has_alias(false) {}
+              _module_path(std::move(module_path)), _import_style(ImportStyle::WildcardImport), _has_alias(false) {}
 
-        ImportDeclarationNode(SourceLocation loc, std::string path, std::string alias, ImportType type)
+        ImportDeclarationNode(SourceLocation loc, std::string module_path, std::string alias)
             : DeclarationNode(NodeKind::ImportDeclaration, loc),
-              _path(std::move(path)), _alias(std::move(alias)), _import_type(type), _import_style(ImportStyle::WildcardImport), _has_alias(true) {}
+              _module_path(std::move(module_path)), _alias(std::move(alias)), _import_style(ImportStyle::WildcardImport), _has_alias(true) {}
 
-        // Constructor for specific imports (import X from <path>)
-        ImportDeclarationNode(SourceLocation loc, std::vector<std::string> specific_imports, std::string path, ImportType type)
+        // Constructor for specific imports (import X from module::path)
+        ImportDeclarationNode(SourceLocation loc, std::vector<std::string> specific_imports, std::string module_path)
             : DeclarationNode(NodeKind::ImportDeclaration, loc),
-              _path(std::move(path)), _specific_imports(std::move(specific_imports)), _import_type(type), _import_style(ImportStyle::SpecificImport), _has_alias(false) {}
+              _module_path(std::move(module_path)), _specific_imports(std::move(specific_imports)), _import_style(ImportStyle::SpecificImport), _has_alias(false) {}
 
-        const std::string &path() const { return _path; }
+        const std::string &path() const { return _module_path; }  // Keep for compatibility
+        const std::string &module_path() const { return _module_path; }
         const std::string &alias() const { return _alias; }
         const std::vector<std::string> &specific_imports() const { return _specific_imports; }
-        ImportType import_type() const { return _import_type; }
         ImportStyle import_style() const { return _import_style; }
         bool has_alias() const { return _has_alias; }
         bool is_specific_import() const { return _import_style == ImportStyle::SpecificImport; }
@@ -838,14 +837,39 @@ namespace Cryo
                 os << " from ";
             }
 
-            if (_import_type == ImportType::Relative)
-                os << "\"" << _path << "\"";
-            else if (_import_type == ImportType::Absolute)
-                os << "<" << _path << ">";
+            os << _module_path;
 
             if (_has_alias)
                 os << " as " << _alias;
             os << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    /**
+     * @brief Module declaration node for public module syntax in _module.cryo files
+     */
+    class ModuleDeclarationNode : public DeclarationNode
+    {
+    private:
+        std::string _module_path;  // The module path (e.g., "alloc::global")
+        bool _is_public;           // Whether the module is public
+
+    public:
+        ModuleDeclarationNode(SourceLocation loc, std::string module_path, bool is_public = true)
+            : DeclarationNode(NodeKind::ModuleDeclaration, loc),
+              _module_path(std::move(module_path)), _is_public(is_public) {}
+
+        const std::string &module_path() const { return _module_path; }
+        bool is_public() const { return _is_public; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ');
+            if (_is_public)
+                os << "public ";
+            os << "module " << _module_path << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;

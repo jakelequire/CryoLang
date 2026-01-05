@@ -1,0 +1,449 @@
+///! Global Allocator Module
+///!
+///! This module provides the global memory allocator interface and
+///! allocation/deallocation functions.
+
+namespace std::alloc::global;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::mem;
+
+// ============================================================================
+// Allocation Error
+// ============================================================================
+
+/// Error type for allocation failures.
+type struct AllocError {
+    requested_size: u64;
+    requested_align: u64;
+    reason: string;
+    
+    AllocError(size: u64, align: u64, reason: string);
+
+    out_of_memory(size: u64) -> AllocError;
+    invalid_layout(size: u64, align: u64) -> AllocError;
+    size(&this) -> u64;
+    alignment(&this) -> u64;
+    reason(&this) -> string;
+}
+
+implement struct AllocError {
+    /// Creates a new allocation error.
+    AllocError (size: u64, align: u64, reason: string) {
+        this.requested_size = size;
+        this.requested_align = align;
+        this.reason = reason;
+    }
+
+    /// Creates an out-of-memory error.
+    out_of_memory(&this, size: u64) -> AllocError {
+        return AllocError::new(size, 1, "out of memory");
+    }
+
+    /// Creates an invalid layout error.
+    invalid_layout(&this, size: u64, align: u64) -> AllocError {
+        return AllocError::new(size, align, "invalid layout");
+    }
+
+    /// Returns the requested size.
+    size(&this) -> u64 {
+        return this.requested_size;
+    }
+
+    /// Returns the requested alignment.
+    alignment(&this) -> u64 {
+        return this.requested_align;
+    }
+
+    /// Returns the error reason.
+    reason(&this) -> string {
+        return this.reason;
+    }
+}
+
+/// Result type for allocations.
+type AllocResult = Result<void*, AllocError>;
+
+// ============================================================================
+// Layout
+// ============================================================================
+
+/// Describes the memory layout of a type (size and alignment).
+type struct Layout {
+    size: u64;
+    align: u64;
+
+    Layout(size: u64, align: u64) -> Option<Layout>;
+
+    from_size_align(size: u64, align: u64) -> Layout;
+    for_type<T>() -> Layout;
+    for_array<T>(n: u64) -> Option<Layout>;
+    size(&this) -> u64;
+    align(&this) -> u64;
+    pad_to_align(&this) -> Layout;
+    extend(&this, other: Layout) -> Option<LayoutExtend>;
+    repeat(&this, n: u64) -> Option<LayoutRepeat>;
+    dangling(&this) -> void*;
+}
+
+implement struct Layout {
+    /// Creates a new layout with the given size and alignment.
+    /// Alignment must be a power of two.
+    Layout(size: u64, align: u64) -> Option<Layout> {
+        if (align == 0 || (align & (align - 1)) != 0) {
+            return Option::None;
+        }
+        return Option::Some(Layout { size: size, align: align });
+    }
+
+    /// Creates a layout from size and alignment, panicking if invalid.
+    from_size_align(size: u64, align: u64) -> Layout {
+        if (align == 0 || (align & (align - 1)) != 0) {
+            panic("alignment must be a power of two", FILE, LINE);
+        }
+        return Layout { size: size, align: align };
+    }
+
+    /// Creates a layout for a type T.
+    for_type<T>() -> Layout {
+        return Layout { size: sizeof(T), align: alignof(T) };
+    }
+
+    /// Creates a layout for an array of n elements of type T.
+    for_array<T>(n: u64) -> Option<Layout> {
+        const elem_size: u64 = sizeof(T);
+        const elem_align: u64 = alignof(T);
+
+        // Check for overflow
+        const total_size: u64 = elem_size * n;
+        if (n != 0 && total_size / n != elem_size) {
+            return Option::None;
+        }
+
+        return Option::Some(Layout { size: total_size, align: elem_align });
+    }
+
+    /// Returns the size.
+    size(&this) -> u64 {
+        return this.size;
+    }
+
+    /// Returns the alignment.
+    align(&this) -> u64 {
+        return this.align;
+    }
+
+    /// Pads the layout to the alignment.
+    pad_to_align(&this) -> Layout {
+        const new_size: u64 = mem::align_up(this.size, this.align);
+        return Layout { size: new_size, align: this.align };
+    }
+
+    /// Extends this layout with another layout.
+    extend(&this, other: Layout) -> Option<LayoutExtend> {
+        // Calculate padding needed to align the next field
+        const padding: u64 = mem::padding_needed(this.size, other.align);
+        const offset: u64 = this.size + padding;
+        const new_size: u64 = offset + other.size;
+
+        // New alignment is the maximum
+        mut new_align: u64 = this.align;
+        if (other.align > new_align) {
+            new_align = other.align;
+        }
+
+        return Option::Some(LayoutExtend {
+            layout: Layout { size: new_size, align: new_align },
+            offset: offset
+        });
+    }
+
+    /// Repeats this layout n times.
+    repeat(&this, n: u64) -> Option<LayoutRepeat> {
+        const padded: Layout = this.pad_to_align();
+        const total_size: u64 = padded.size * n;
+
+        // Check for overflow
+        if (n != 0 && total_size / n != padded.size) {
+            return Option::None;
+        }
+
+        return Option::Some(LayoutRepeat {
+            layout: Layout { size: total_size, align: this.align },
+            stride: padded.size
+        });
+    }
+
+    /// Returns the dangling pointer for this alignment.
+    dangling(&this) -> void* {
+        return this.align;
+    }
+}
+
+/// Result of extending a layout.
+type struct LayoutExtend {
+    layout: Layout;
+    offset: u64;
+}
+
+/// Result of repeating a layout.
+type struct LayoutRepeat {
+    layout: Layout;
+    stride: u64;
+}
+
+// ============================================================================
+// Global Allocation Functions
+// ============================================================================
+
+/// Allocates memory with the default alignment.
+function alloc(size: u64) -> void* {
+    return malloc(size);
+}
+
+/// Allocates zeroed memory.
+function alloc_zeroed(size: u64) -> void* {
+    return calloc(1, size);
+}
+
+/// Allocates memory with the specified layout.
+function alloc_layout(layout: Layout) -> AllocResult {
+    if (layout.size == 0) {
+        return Result::Ok(layout.dangling());
+    }
+
+    const ptr: void* = aligned_alloc(layout.align, layout.size);
+    if (ptr == null) {
+        return Result::Err(AllocError::out_of_memory(layout.size));
+    }
+    return Result::Ok(ptr);
+}
+
+/// Allocates zeroed memory with the specified layout.
+function alloc_zeroed_layout(layout: Layout) -> AllocResult {
+    const result: AllocResult = alloc_layout(layout);
+    match (result) {
+        Result::Ok(ptr) => {
+            if (layout.size > 0) {
+                memset(ptr, 0, layout.size);
+            }
+            return Result::Ok(ptr);
+        }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}
+
+/// Deallocates memory.
+function dealloc(ptr: void*) -> void {
+    free(ptr);
+}
+
+/// Deallocates memory with layout (for aligned allocations).
+function dealloc_layout(ptr: void*, layout: Layout) -> void {
+    if (layout.size != 0) {
+        free(ptr);
+    }
+}
+
+/// Reallocates memory.
+function realloc_mem(ptr: void*, new_size: u64) -> void* {
+    return realloc(ptr, new_size);
+}
+
+/// Reallocates memory with layout information.
+function realloc_layout(ptr: void*, old_layout: Layout, new_layout: Layout) -> AllocResult {
+    if (new_layout.size == 0) {
+        dealloc_layout(ptr, old_layout);
+        return Result::Ok(new_layout.dangling());
+    }
+
+    if (old_layout.size == 0) {
+        return alloc_layout(new_layout);
+    }
+
+    // If alignment is the same, we can use realloc
+    if (old_layout.align == new_layout.align) {
+        const new_ptr: void* = realloc(ptr, new_layout.size);
+        if (new_ptr == null) {
+            return Result::Err(AllocError::out_of_memory(new_layout.size));
+        }
+        return Result::Ok(new_ptr);
+    }
+
+    // Otherwise, allocate new and copy
+    const result: AllocResult = alloc_layout(new_layout);
+    match (result) {
+        Result::Ok(new_ptr) => {
+            mut copy_size: u64 = old_layout.size;
+            if (new_layout.size < copy_size) {
+                copy_size = new_layout.size;
+            }
+            memcpy(new_ptr, ptr, copy_size);
+            dealloc_layout(ptr, old_layout);
+            return Result::Ok(new_ptr);
+        }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}
+
+// ============================================================================
+// Typed Allocation Functions
+// ============================================================================
+
+/// Allocates memory for a single value of type T.
+function alloc_one<T>() -> T* {
+    return malloc(sizeof(T));
+}
+
+/// Allocates zeroed memory for a single value of type T.
+function alloc_one_zeroed<T>() -> T* {
+    return calloc(1, sizeof(T));
+}
+
+/// Allocates memory for an array of n values of type T.
+function alloc_array<T>(n: u64) -> T* {
+    return malloc(sizeof(T) * n);
+}
+
+/// Allocates zeroed memory for an array of n values of type T.
+function alloc_array_zeroed<T>(n: u64) -> T* {
+    return calloc(n, sizeof(T));
+}
+
+/// Deallocates a single value.
+function dealloc_one<T>(ptr: T*) -> void {
+    free(ptr);
+}
+
+/// Deallocates an array.
+function dealloc_array<T>(ptr: T*, n: u64) -> void {
+    free(ptr);
+}
+
+/// Reallocates an array.
+function realloc_array<T>(ptr: T*, old_n: u64, new_n: u64) -> T* {
+    return realloc(ptr, sizeof(T) * new_n);
+}
+
+// ============================================================================
+// Allocation with Initialization
+// ============================================================================
+
+/// Allocates and initializes a single value.
+function alloc_init<T>(value: T) -> T* {
+    const ptr: T* = alloc_one<T>();
+    if (ptr != null) {
+        *ptr = value;
+    }
+    return ptr;
+}
+
+/// Allocates and initializes an array with a default value.
+function alloc_array_init<T>(n: u64, value: T) -> T* {
+    const ptr: T* = alloc_array<T>(n);
+    if (ptr != null) {
+        mut i: u64 = 0;
+        while (i < n) {
+            ptr[i] = value;
+            i = i + 1;
+        }
+    }
+    return ptr;
+}
+
+// ============================================================================
+// Allocation Statistics
+// ============================================================================
+
+/// Allocation statistics (thread-local or global depending on configuration).
+type struct AllocStats {
+    total_allocated: u64;
+    total_deallocated: u64;
+    current_usage: u64;
+    peak_usage: u64;
+    allocation_count: u64;
+    deallocation_count: u64;
+
+    AllocStats();
+    record_alloc(mut &this, size: u64) -> void;
+    record_dealloc(mut &this, size: u64) -> void;
+    reset(mut &this) -> void;
+}
+
+implement struct AllocStats {
+    /// Creates zeroed stats.
+    AllocStats() {
+        this.total_allocated = 0;
+        this.total_deallocated = 0;
+        this.current_usage = 0;
+        this.peak_usage = 0;
+        this.allocation_count = 0;
+        this.deallocation_count = 0;
+    }
+
+    /// Records an allocation.
+    record_alloc(mut &this, size: u64) -> void {
+        this.total_allocated = this.total_allocated + size;
+        this.current_usage = this.current_usage + size;
+        this.allocation_count = this.allocation_count + 1;
+        if (this.current_usage > this.peak_usage) {
+            this.peak_usage = this.current_usage;
+        }
+    }
+
+    /// Records a deallocation.
+    record_dealloc(mut &this, size: u64) -> void {
+        this.total_deallocated = this.total_deallocated + size;
+        this.current_usage = this.current_usage - size;
+        this.deallocation_count = this.deallocation_count + 1;
+    }
+
+    /// Resets the statistics.
+    reset(mut &this) -> void {
+        this.total_allocated = 0;
+        this.total_deallocated = 0;
+        this.current_usage = 0;
+        this.peak_usage = 0;
+        this.allocation_count = 0;
+        this.deallocation_count = 0;
+    }
+}
+
+// Global allocation stats
+mut g_alloc_stats: AllocStats = new AllocStats();
+
+/// Returns the global allocation statistics.
+function get_stats() -> AllocStats* {
+    return &g_alloc_stats;
+}
+
+/// Resets the global allocation statistics.
+function reset_stats() -> void {
+    g_alloc_stats.reset();
+}
+
+// ============================================================================
+// Memory Pressure
+// ============================================================================
+
+/// Hints to the allocator about memory pressure.
+enum MemoryPressure {
+    /// No memory pressure.
+    None,
+    /// Low memory pressure - consider releasing caches.
+    Low,
+    /// Medium memory pressure - release non-essential memory.
+    Medium,
+    /// High memory pressure - release as much as possible.
+    High,
+    /// Critical - system is almost out of memory.
+    Critical
+}
+
+/// Notifies the allocator of memory pressure.
+function notify_memory_pressure(pressure: MemoryPressure) -> void {
+    // In a real implementation, this would notify the allocator
+    // to release cached memory, consolidate allocations, etc.
+}

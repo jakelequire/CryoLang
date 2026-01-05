@@ -1,263 +1,688 @@
-namespace std::net::TCP;
+///! TCP - Transmission Control Protocol
+///!
+///! TCP streams and listeners for reliable network communication.
 
-import IO from <io/stdio>;
-import Types from <net/types>;
+namespace std::net::tcp;
 
-//===================================================================
-// TCP SOCKET ABSTRACTIONS
-// Low-level TCP socket operations and connection management
-//===================================================================
+import core::intrinsics;
+import core::option;
+import io::error;
+import time::duration;
+import net::addr;
 
-//===================================================================
-// TCP SOCKET CLASS
-//===================================================================
+// ============================================================================
+// TCP Stream
+// ============================================================================
 
-// Represents a TCP socket connection
-type class TcpSocket {
-private:
-    socket_fd: i32;
-    local_addr: Types::SocketAddr;
-    peer_addr: Types::SocketAddr;
-    is_connected_flag: boolean;
-    is_bound_flag: boolean;
+/// A TCP stream between a local and remote socket.
+type struct TcpStream {
+    fd: i32;
+    peer_addr: SocketAddr;
+    local_addr: SocketAddr;
 
-public:
-    TcpSocket() {
-        this.socket_fd = i32(-1);
-        this.is_connected_flag = false;
-        this.is_bound_flag = false;
-        this.local_addr = Types::SocketAddr(Types::ANY_ADDR, u16(0));
-        this.peer_addr = Types::SocketAddr(Types::ANY_ADDR, u16(0));
-    }
+    // Method signatures
+    static connect(addr: SocketAddr) -> IoResult<TcpStream>;
+    static connect_timeout(addr: SocketAddr, timeout: Duration) -> IoResult<TcpStream>;
     
-    TcpSocket(fd: i32, local: Types::SocketAddr, peer: Types::SocketAddr) {
-        this.socket_fd = fd;
-        this.local_addr = local;
-        this.peer_addr = peer;
-        this.is_connected_flag = true;
-        this.is_bound_flag = true;
-    }
-    
-    // Create and bind socket to local address
-    bind(addr: Types::SocketAddr) -> Types::NetError {
-        // Socket creation and binding would be implemented here
-        // This is a placeholder for the actual system call implementation
-        this.local_addr = addr;
-        this.is_bound_flag = true;
-        return Types::NetError::SUCCESS;
-    }
-    
-    // Connect to remote address
-    connect(addr: Types::SocketAddr) -> Types::NetError {
-        this.peer_addr = addr;
-        this.is_connected_flag = true;
-        return Types::NetError::SUCCESS;
-    }
-    
-    // Close the socket connection
-    close() -> Types::NetError {
-        this.socket_fd = i32(-1);
-        this.is_connected_flag = false;
-        this.is_bound_flag = false;
-        return Types::NetError::SUCCESS;
-    }
-    
-    // Write data to the socket
-    write(data: string) -> i32 {
-        if (!this.is_connected_flag) {
-            return i32(-1);
+    peer_addr(&this) -> SocketAddr;
+    local_addr(&this) -> SocketAddr;
+    shutdown(&this, how: Shutdown) -> IoResult<void>;
+    try_clone(&this) -> IoResult<TcpStream>;
+    set_read_timeout(&this, timeout: Option<Duration>) -> IoResult<void>;
+    set_write_timeout(&this, timeout: Option<Duration>) -> IoResult<void>;
+    read_timeout(&this) -> IoResult<Option<Duration>>;
+    write_timeout(&this) -> IoResult<Option<Duration>>;
+    set_nodelay(&this, nodelay: boolean) -> IoResult<void>;
+    nodelay(&this) -> IoResult<boolean>;
+    set_keepalive(&this, keepalive: boolean) -> IoResult<void>;
+    keepalive(&this) -> IoResult<boolean>;
+    set_ttl(&this, ttl: u32) -> IoResult<void>;
+    ttl(&this) -> IoResult<u32>;
+    set_nonblocking(&this, nonblocking: boolean) -> IoResult<void>;
+    read(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    write(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    write_all(&this, buf: u8*, len: u64) -> IoResult<void>;
+    flush(&this) -> IoResult<void>;
+    peek(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    as_raw_fd(&this) -> i32;
+    close(&this) -> void;
+}
+
+implement struct TcpStream {
+    /// Opens a TCP connection to a remote host.
+    static connect(addr: SocketAddr) -> IoResult<TcpStream> {
+        const fd: i32 = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return IoResult::Err(IoError::last_os_error());
         }
-        // Actual write implementation would go here
-        return i32(0);
-    }
-    
-    // Read data from the socket 
-    read(buffer_size: u32) -> string {
-        if (!this.is_connected_flag) {
-            return "";
+
+        mut sockaddr: sockaddr_in;
+        match (addr) {
+            SocketAddr::V4(v4) => {
+                sockaddr.sin_family = AF_INET as u16;
+                sockaddr.sin_port = htons(v4.port());
+                sockaddr.sin_addr = v4.ip().to_u32();
+            }
+            SocketAddr::V6(_) => {
+                close(fd);
+                return IoResult::Err(IoError::new(IoErrorKind::Unsupported, "IPv6 not implemented"));
+            }
         }
-        // Actual read implementation would go here
-        return "";
+
+        const result: i32 = connect_socket(fd, &sockaddr as void*, sizeof(sockaddr_in));
+        if (result < 0) {
+            const err: IoError = IoError::last_os_error();
+            close(fd);
+            return IoResult::Err(err);
+        }
+
+        // Get local address
+        mut local_sockaddr: sockaddr_in;
+        mut local_len: u32 = sizeof(sockaddr_in);
+        getsockname(fd, &local_sockaddr as void*, &local_len);
+
+        const local_ip: Ipv4Addr = Ipv4Addr::from_u32(ntohl(local_sockaddr.sin_addr));
+        const local_port: u16 = ntohs(local_sockaddr.sin_port);
+        const local_addr: SocketAddr = SocketAddr::new_v4(local_ip, local_port);
+
+        return IoResult::Ok(TcpStream {
+            fd: fd,
+            peer_addr: addr,
+            local_addr: local_addr
+        });
     }
-    
-    // Check if socket is connected
-    is_connected() -> boolean {
-        return this.is_connected_flag;
+
+    /// Opens a TCP connection with a timeout.
+    static connect_timeout(addr: SocketAddr, timeout: Duration) -> IoResult<TcpStream> {
+        const fd: i32 = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        // Set non-blocking
+        const flags: i32 = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        mut sockaddr: sockaddr_in;
+        match (addr) {
+            SocketAddr::V4(v4) => {
+                sockaddr.sin_family = AF_INET as u16;
+                sockaddr.sin_port = htons(v4.port());
+                sockaddr.sin_addr = v4.ip().to_u32();
+            }
+            SocketAddr::V6(_) => {
+                close(fd);
+                return IoResult::Err(IoError::new(IoErrorKind::Unsupported, "IPv6 not implemented"));
+            }
+        }
+
+        const result: i32 = connect_socket(fd, &sockaddr as void*, sizeof(sockaddr_in));
+        if (result < 0 && get_errno() != EINPROGRESS) {
+            const err: IoError = IoError::last_os_error();
+            close(fd);
+            return IoResult::Err(err);
+        }
+
+        // Wait for connection with timeout
+        mut fds: pollfd;
+        fds.fd = fd;
+        fds.events = POLLOUT;
+        fds.revents = 0;
+
+        const timeout_ms: i32 = (timeout.as_millis() as u64) as i32;
+        const poll_result: i32 = poll(&fds, 1, timeout_ms);
+
+        if (poll_result == 0) {
+            close(fd);
+            return IoResult::Err(IoError::new(IoErrorKind::TimedOut, "connection timed out"));
+        }
+        if (poll_result < 0) {
+            const err: IoError = IoError::last_os_error();
+            close(fd);
+            return IoResult::Err(err);
+        }
+
+        // Check for connection error
+        mut error: i32 = 0;
+        mut error_len: u32 = sizeof(i32);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &error as void*, &error_len);
+        if (error != 0) {
+            close(fd);
+            return IoResult::Err(IoError::from_raw_os_error(error));
+        }
+
+        // Restore blocking mode
+        fcntl(fd, F_SETFL, flags);
+
+        // Get local address
+        mut local_sockaddr: sockaddr_in;
+        mut local_len: u32 = sizeof(sockaddr_in);
+        getsockname(fd, &local_sockaddr as void*, &local_len);
+
+        const local_ip: Ipv4Addr = Ipv4Addr::from_u32(ntohl(local_sockaddr.sin_addr));
+        const local_port: u16 = ntohs(local_sockaddr.sin_port);
+        const local_addr: SocketAddr = SocketAddr::new_v4(local_ip, local_port);
+
+        return IoResult::Ok(TcpStream {
+            fd: fd,
+            peer_addr: addr,
+            local_addr: local_addr
+        });
     }
-    
-    // Check if socket is bound to local address
-    is_bound() -> boolean {
-        return this.is_bound_flag;
-    }
-    
-    // Get local socket address
-    get_local_addr() -> Types::SocketAddr {
-        return this.local_addr;
-    }
-    
-    // Get peer socket address
-    get_peer_addr() -> Types::SocketAddr {
+
+    /// Returns the socket address of the remote peer.
+    peer_addr(&this) -> SocketAddr {
         return this.peer_addr;
     }
-    
-    // Get socket file descriptor
-    get_socket_fd() -> i32 {
-        return this.socket_fd;
-    }
-}
 
-//===================================================================
-// TCP LISTENER CLASS
-//===================================================================
-
-// Represents a TCP listener for accepting connections
-type class TcpListener {
-private:
-    socket_fd: i32;
-    local_addr: Types::SocketAddr;
-    is_listening_flag: boolean;
-    backlog: i32;
-
-public:
-    TcpListener() {
-        this.socket_fd = i32(-1);
-        this.is_listening_flag = false;
-        this.backlog = i32(128); // Default backlog
-        this.local_addr = Types::SocketAddr(Types::ANY_ADDR, u16(0));
-    }
-    
-    TcpListener(addr: Types::SocketAddr) {
-        this.socket_fd = i32(-1);
-        this.local_addr = addr;
-        this.is_listening_flag = false;
-        this.backlog = i32(128);
-    }
-    
-    // Bind listener to address and start listening
-    listen() -> Types::NetError {
-        // Socket creation, binding, and listen would be implemented here
-        this.is_listening_flag = true;
-        return Types::NetError::SUCCESS;
-    }
-    
-    // Accept incoming connection
-    // accept() -> TcpSocket {
-    //     if (!this.is_listening_flag) {
-    //         return TcpSocket();
-    //     }
-    //     
-    //     // Actual accept implementation would create new socket with peer address
-    //     // const peer_addr: Types::SocketAddr = Types::SocketAddr(Types::IpAddr(0, 0, 0, 0), u16(12345));
-    //     // return TcpSocket(i32(10), this.local_addr, peer_addr);
-    //     return TcpSocket();
-    // }
-    
-    // Set listen backlog size
-    set_backlog(size: i32) -> void {
-        this.backlog = size;
-        return;
-    }
-    
-    // Stop listening and close socket
-    shutdown() -> Types::NetError {
-        this.is_listening_flag = false;
-        this.socket_fd = i32(-1);
-        return Types::NetError::SUCCESS;
-    }
-    
-    // Check if currently listening
-    is_listening() -> boolean {
-        return this.is_listening_flag;
-    }
-    
-    // Get local address
-    get_local_addr() -> Types::SocketAddr {
+    /// Returns the socket address of the local half.
+    local_addr(&this) -> SocketAddr {
         return this.local_addr;
     }
-    
-    // Get socket file descriptor
-    get_socket_fd() -> i32 {
-        return this.socket_fd;
+
+    /// Shuts down the read, write, or both halves of this connection.
+    shutdown(&this, how: Shutdown) -> IoResult<void> {
+        const how_int: i32 = match (how) {
+            Shutdown::Read => { SHUT_RD }
+            Shutdown::Write => { SHUT_WR }
+            Shutdown::Both => { SHUT_RDWR }
+        };
+
+        if (shutdown_socket(this.fd, how_int) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
     }
-    
-    // Get backlog size
-    get_backlog() -> i32 {
-        return this.backlog;
+
+    /// Creates a new independently owned handle to the underlying socket.
+    try_clone(&this) -> IoResult<TcpStream> {
+        const new_fd: i32 = dup(this.fd);
+        if (new_fd < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        return IoResult::Ok(TcpStream {
+            fd: new_fd,
+            peer_addr: this.peer_addr,
+            local_addr: this.local_addr
+        });
+    }
+
+    /// Sets the read timeout.
+    set_read_timeout(&this, timeout: Option<Duration>) -> IoResult<void> {
+        mut tv: timeval;
+        match (timeout) {
+            Option::Some(d) => {
+                tv.tv_sec = d.as_secs() as i64;
+                tv.tv_usec = (d.subsec_micros()) as i64;
+            }
+            Option::None => {
+                tv.tv_sec = 0;
+                tv.tv_usec = 0;
+            }
+        }
+
+        if (setsockopt(this.fd, SOL_SOCKET, SO_RCVTIMEO, &tv as void*, sizeof(timeval)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Sets the write timeout.
+    set_write_timeout(&this, timeout: Option<Duration>) -> IoResult<void> {
+        mut tv: timeval;
+        match (timeout) {
+            Option::Some(d) => {
+                tv.tv_sec = d.as_secs() as i64;
+                tv.tv_usec = (d.subsec_micros()) as i64;
+            }
+            Option::None => {
+                tv.tv_sec = 0;
+                tv.tv_usec = 0;
+            }
+        }
+
+        if (setsockopt(this.fd, SOL_SOCKET, SO_SNDTIMEO, &tv as void*, sizeof(timeval)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the read timeout.
+    read_timeout(&this) -> IoResult<Option<Duration>> {
+        mut tv: timeval;
+        mut len: u32 = sizeof(timeval);
+        if (getsockopt(this.fd, SOL_SOCKET, SO_RCVTIMEO, &tv as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+            return IoResult::Ok(Option::None);
+        }
+        return IoResult::Ok(Option::Some(Duration::new(tv.tv_sec as u64, (tv.tv_usec * 1000) as u32)));
+    }
+
+    /// Gets the write timeout.
+    write_timeout(&this) -> IoResult<Option<Duration>> {
+        mut tv: timeval;
+        mut len: u32 = sizeof(timeval);
+        if (getsockopt(this.fd, SOL_SOCKET, SO_SNDTIMEO, &tv as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+            return IoResult::Ok(Option::None);
+        }
+        return IoResult::Ok(Option::Some(Duration::new(tv.tv_sec as u64, (tv.tv_usec * 1000) as u32)));
+    }
+
+    /// Sets the value of the TCP_NODELAY option.
+    set_nodelay(&this, nodelay: boolean) -> IoResult<void> {
+        const val: i32 = if (nodelay) { 1 } else { 0 };
+        if (setsockopt(this.fd, IPPROTO_TCP, TCP_NODELAY, &val as void*, sizeof(i32)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the value of the TCP_NODELAY option.
+    nodelay(&this) -> IoResult<boolean> {
+        mut val: i32 = 0;
+        mut len: u32 = sizeof(i32);
+        if (getsockopt(this.fd, IPPROTO_TCP, TCP_NODELAY, &val as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(val != 0);
+    }
+
+    /// Sets the value of the SO_KEEPALIVE option.
+    set_keepalive(&this, keepalive: boolean) -> IoResult<void> {
+        const val: i32 = if (keepalive) { 1 } else { 0 };
+        if (setsockopt(this.fd, SOL_SOCKET, SO_KEEPALIVE, &val as void*, sizeof(i32)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the value of the SO_KEEPALIVE option.
+    keepalive(&this) -> IoResult<boolean> {
+        mut val: i32 = 0;
+        mut len: u32 = sizeof(i32);
+        if (getsockopt(this.fd, SOL_SOCKET, SO_KEEPALIVE, &val as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(val != 0);
+    }
+
+    /// Sets the TTL of outgoing packets.
+    set_ttl(&this, ttl: u32) -> IoResult<void> {
+        const val: i32 = ttl as i32;
+        if (setsockopt(this.fd, IPPROTO_IP, IP_TTL, &val as void*, sizeof(i32)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the TTL of outgoing packets.
+    ttl(&this) -> IoResult<u32> {
+        mut val: i32 = 0;
+        mut len: u32 = sizeof(i32);
+        if (getsockopt(this.fd, IPPROTO_IP, IP_TTL, &val as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(val as u32);
+    }
+
+    /// Sets non-blocking mode.
+    set_nonblocking(&this, nonblocking: boolean) -> IoResult<void> {
+        const flags: i32 = fcntl(this.fd, F_GETFL, 0);
+        const new_flags: i32 = if (nonblocking) {
+            flags | O_NONBLOCK
+        } else {
+            flags & ~O_NONBLOCK
+        };
+        if (fcntl(this.fd, F_SETFL, new_flags) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Reads data from the stream.
+    read(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = recv(this.fd, buf as void*, len, 0);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Writes data to the stream.
+    write(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = send(this.fd, buf as void*, len, 0);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Writes all data to the stream.
+    write_all(&this, buf: u8*, len: u64) -> IoResult<void> {
+        mut written: u64 = 0;
+        while (written < len) {
+            const result: IoResult<u64> = this.write(buf + written, len - written);
+            match (result) {
+                IoResult::Ok(n) => {
+                    if (n == 0) {
+                        return IoResult::Err(IoError::new(IoErrorKind::WriteZero, "write returned 0"));
+                    }
+                    written = written + n;
+                }
+                IoResult::Err(e) => {
+                    return IoResult::Err(e);
+                }
+            }
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Flushes the stream (no-op for TCP).
+    flush(&this) -> IoResult<void> {
+        return IoResult::Ok(());
+    }
+
+    /// Reads data with MSG_PEEK flag.
+    peek(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = recv(this.fd, buf as void*, len, MSG_PEEK);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Returns the raw file descriptor.
+    as_raw_fd(&this) -> i32 {
+        return this.fd;
+    }
+
+    /// Closes the stream.
+    close(&this) -> void {
+        close(this.fd);
     }
 }
 
-//===================================================================
-// TCP STREAM CLASS
-//===================================================================
+// ============================================================================
+// TCP Listener
+// ============================================================================
 
-// High-level TCP stream for easier read/write operations
-type class TcpStream {
-private:
-    socket: TcpSocket;
-    read_buffer: string;
-    write_buffer: string;
-    buffer_size: u32;
+/// A TCP socket server, listening for connections.
+type struct TcpListener {
+    fd: i32;
+    local_addr: SocketAddr;
 
-public:
-    TcpStream(connected_socket: TcpSocket) {
-        this.socket = connected_socket;
-        this.read_buffer = "";
-        this.write_buffer = "";
-        this.buffer_size = u32(8192); // 8KB default buffer
+    // Method signatures
+    static bind(addr: SocketAddr) -> IoResult<TcpListener>;
+    local_addr(&this) -> SocketAddr;
+    accept(&this) -> IoResult<(TcpStream, SocketAddr)>;
+    incoming(&this) -> Incoming;
+    try_clone(&this) -> IoResult<TcpListener>;
+    set_nonblocking(&this, nonblocking: boolean) -> IoResult<void>;
+    set_ttl(&this, ttl: u32) -> IoResult<void>;
+    ttl(&this) -> IoResult<u32>;
+    as_raw_fd(&this) -> i32;
+    close(&this) -> void;
+}
+
+implement struct TcpListener {
+    /// Creates a new TcpListener bound to the specified address.
+    static bind(addr: SocketAddr) -> IoResult<TcpListener> {
+        const fd: i32 = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        // Set SO_REUSEADDR
+        const reuse: i32 = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse as void*, sizeof(i32));
+
+        mut sockaddr: sockaddr_in;
+        match (addr) {
+            SocketAddr::V4(v4) => {
+                sockaddr.sin_family = AF_INET as u16;
+                sockaddr.sin_port = htons(v4.port());
+                sockaddr.sin_addr = v4.ip().to_u32();
+            }
+            SocketAddr::V6(_) => {
+                close(fd);
+                return IoResult::Err(IoError::new(IoErrorKind::Unsupported, "IPv6 not implemented"));
+            }
+        }
+
+        if (bind_socket(fd, &sockaddr as void*, sizeof(sockaddr_in)) < 0) {
+            const err: IoError = IoError::last_os_error();
+            close(fd);
+            return IoResult::Err(err);
+        }
+
+        if (listen(fd, 128) < 0) {
+            const err: IoError = IoError::last_os_error();
+            close(fd);
+            return IoResult::Err(err);
+        }
+
+        // Get actual bound address
+        mut bound_addr: sockaddr_in;
+        mut addr_len: u32 = sizeof(sockaddr_in);
+        getsockname(fd, &bound_addr as void*, &addr_len);
+
+        const local_ip: Ipv4Addr = Ipv4Addr::from_u32(ntohl(bound_addr.sin_addr));
+        const local_port: u16 = ntohs(bound_addr.sin_port);
+        const local_addr: SocketAddr = SocketAddr::new_v4(local_ip, local_port);
+
+        return IoResult::Ok(TcpListener {
+            fd: fd,
+            local_addr: local_addr
+        });
     }
-    
-    // Read line from stream (until newline)
-    read_line() -> string {
-        // Implementation would buffer reads and return complete lines
-        return this.socket.read(this.buffer_size);
+
+    /// Returns the local socket address.
+    local_addr(&this) -> SocketAddr {
+        return this.local_addr;
     }
-    
-    // Read exact number of bytes
-    read_exact(count: u32) -> string {
-        return this.socket.read(count);
+
+    /// Accepts a new incoming connection.
+    accept(&this) -> IoResult<(TcpStream, SocketAddr)> {
+        mut peer_addr: sockaddr_in;
+        mut addr_len: u32 = sizeof(sockaddr_in);
+
+        const client_fd: i32 = accept_socket(this.fd, &peer_addr as void*, &addr_len);
+        if (client_fd < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        const peer_ip: Ipv4Addr = Ipv4Addr::from_u32(ntohl(peer_addr.sin_addr));
+        const peer_port: u16 = ntohs(peer_addr.sin_port);
+        const remote_addr: SocketAddr = SocketAddr::new_v4(peer_ip, peer_port);
+
+        const stream: TcpStream = TcpStream {
+            fd: client_fd,
+            peer_addr: remote_addr,
+            local_addr: this.local_addr
+        };
+
+        return IoResult::Ok((stream, remote_addr));
     }
-    
-    // Write string to stream
-    write_string(data: string) -> Types::NetError {
-        this.socket.write(data);
-        return Types::NetError::SUCCESS;
+
+    /// Creates an iterator over incoming connections.
+    incoming(&this) -> Incoming {
+        return Incoming { listener: this };
     }
-    
-    // Write line with newline
-    write_line(data: string) -> Types::NetError {
-        const line_data: string = data + "\n";
-        return this.write_string(line_data);
+
+    /// Creates a new independently owned handle.
+    try_clone(&this) -> IoResult<TcpListener> {
+        const new_fd: i32 = dup(this.fd);
+        if (new_fd < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        return IoResult::Ok(TcpListener {
+            fd: new_fd,
+            local_addr: this.local_addr
+        });
     }
-    
-    // Flush write buffer
-    flush() -> Types::NetError {
-        // Implementation would flush any buffered writes
-        return Types::NetError::SUCCESS;
+
+    /// Sets non-blocking mode.
+    set_nonblocking(&this, nonblocking: boolean) -> IoResult<void> {
+        const flags: i32 = fcntl(this.fd, F_GETFL, 0);
+        const new_flags: i32 = if (nonblocking) {
+            flags | O_NONBLOCK
+        } else {
+            flags & ~O_NONBLOCK
+        };
+        if (fcntl(this.fd, F_SETFL, new_flags) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
     }
-    
-    // Close stream
-    close() -> Types::NetError {
-        return this.socket.close();
+
+    /// Sets the TTL for accepted connections.
+    set_ttl(&this, ttl: u32) -> IoResult<void> {
+        const val: i32 = ttl as i32;
+        if (setsockopt(this.fd, IPPROTO_IP, IP_TTL, &val as void*, sizeof(i32)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
     }
-    
-    // Check if stream is connected
-    is_connected() -> boolean {
-        return this.socket.is_connected();
+
+    /// Gets the TTL.
+    ttl(&this) -> IoResult<u32> {
+        mut val: i32 = 0;
+        mut len: u32 = sizeof(i32);
+        if (getsockopt(this.fd, IPPROTO_IP, IP_TTL, &val as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(val as u32);
     }
-    
-    // Get underlying socket
-    get_socket() -> TcpSocket {
-        return this.socket;
+
+    /// Returns the raw file descriptor.
+    as_raw_fd(&this) -> i32 {
+        return this.fd;
     }
-    
-    // Set buffer size
-    set_buffer_size(size: u32) -> void {
-        this.buffer_size = size;
-        return;
-    }
-    
-    // Get buffer size
-    get_buffer_size() -> u32 {
-        return this.buffer_size;
+
+    /// Closes the listener.
+    close(&this) -> void {
+        close(this.fd);
     }
 }
+
+// ============================================================================
+// Incoming Iterator
+// ============================================================================
+
+/// An iterator over incoming TCP connections.
+type struct Incoming {
+    listener: TcpListener;
+
+    // Method signatures
+    next(&this) -> Option<IoResult<TcpStream>>;
+}
+
+implement struct Incoming {
+    /// Returns the next connection.
+    next(&this) -> Option<IoResult<TcpStream>> {
+        const result: IoResult<(TcpStream, SocketAddr)> = this.listener.accept();
+        match (result) {
+            IoResult::Ok(pair) => {
+                return Option::Some(IoResult::Ok(pair.0));
+            }
+            IoResult::Err(e) => {
+                return Option::Some(IoResult::Err(e));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+/// Possible values for shutting down a TCP connection.
+enum Shutdown {
+    Read;
+    Write;
+    Both;
+}
+
+// ============================================================================
+// Types and Constants
+// ============================================================================
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+const SOL_SOCKET: i32 = 1;
+const IPPROTO_IP: i32 = 0;
+const IPPROTO_TCP: i32 = 6;
+
+const SO_REUSEADDR: i32 = 2;
+const SO_KEEPALIVE: i32 = 9;
+const SO_RCVTIMEO: i32 = 20;
+const SO_SNDTIMEO: i32 = 21;
+const SO_ERROR: i32 = 4;
+
+const TCP_NODELAY: i32 = 1;
+const IP_TTL: i32 = 2;
+
+const SHUT_RD: i32 = 0;
+const SHUT_WR: i32 = 1;
+const SHUT_RDWR: i32 = 2;
+
+const O_NONBLOCK: i32 = 2048;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+
+const EINPROGRESS: i32 = 115;
+const POLLOUT: i16 = 4;
+const MSG_PEEK: i32 = 2;
+
+type struct sockaddr_in {
+    sin_family: u16;
+    sin_port: u16;
+    sin_addr: u32;
+    sin_zero: u8[8];
+}
+
+type struct timeval {
+    tv_sec: i64;
+    tv_usec: i64;
+}
+
+type struct pollfd {
+    fd: i32;
+    events: i16;
+    revents: i16;
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function socket(domain: i32, type: i32, protocol: i32) -> i32;
+intrinsic function connect_socket(fd: i32, addr: void*, addrlen: u64) -> i32;
+intrinsic function bind_socket(fd: i32, addr: void*, addrlen: u64) -> i32;
+intrinsic function listen(fd: i32, backlog: i32) -> i32;
+intrinsic function accept_socket(fd: i32, addr: void*, addrlen: u32*) -> i32;
+intrinsic function shutdown_socket(fd: i32, how: i32) -> i32;
+intrinsic function close(fd: i32) -> i32;
+intrinsic function dup(fd: i32) -> i32;
+intrinsic function recv(fd: i32, buf: void*, len: u64, flags: i32) -> i64;
+intrinsic function send(fd: i32, buf: void*, len: u64, flags: i32) -> i64;
+intrinsic function setsockopt(fd: i32, level: i32, optname: i32, optval: void*, optlen: u32) -> i32;
+intrinsic function getsockopt(fd: i32, level: i32, optname: i32, optval: void*, optlen: u32*) -> i32;
+intrinsic function getsockname(fd: i32, addr: void*, addrlen: u32*) -> i32;
+intrinsic function getpeername(fd: i32, addr: void*, addrlen: u32*) -> i32;
+intrinsic function fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+intrinsic function poll(fds: pollfd*, nfds: u64, timeout: i32) -> i32;
+intrinsic function htons(hostshort: u16) -> u16;
+intrinsic function ntohs(netshort: u16) -> u16;
+intrinsic function htonl(hostlong: u32) -> u32;
+intrinsic function ntohl(netlong: u32) -> u32;
+intrinsic function get_errno() -> i32;

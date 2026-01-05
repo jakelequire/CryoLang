@@ -20,6 +20,7 @@ namespace Cryo
     class IntrinsicDeclarationNode;
     class IntrinsicConstDeclarationNode;
     class ImportDeclarationNode;
+    class ModuleDeclarationNode;
     class CallExpressionNode;
     class NewExpressionNode;
     class SizeofExpressionNode;
@@ -78,6 +79,7 @@ namespace Cryo
         virtual void visit(IntrinsicDeclarationNode &node) = 0;
         virtual void visit(IntrinsicConstDeclarationNode &node) = 0;
         virtual void visit(ImportDeclarationNode &node) = 0;
+        virtual void visit(ModuleDeclarationNode &node) = 0;
         virtual void visit(CallExpressionNode &node) = 0;
         virtual void visit(NewExpressionNode &node) = 0;
         virtual void visit(SizeofExpressionNode &node) = 0;
@@ -135,6 +137,7 @@ namespace Cryo
         void visit(IntrinsicDeclarationNode &node) override {}
         void visit(IntrinsicConstDeclarationNode &node) override {}
         void visit(ImportDeclarationNode &node) override {}
+        void visit(ModuleDeclarationNode &node) override {}
         void visit(CallExpressionNode &node) override {}
         void visit(NewExpressionNode &node) override {}
         void visit(SizeofExpressionNode &node) override {}
