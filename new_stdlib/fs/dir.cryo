@@ -1,0 +1,466 @@
+///! Directory Operations
+///!
+///! Functions for creating, reading, and removing directories.
+
+namespace std::fs::dir;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+import <collections/array>;
+import <collections/string>;
+import <io/error>;
+import <fs/path>;
+import <fs/metadata>;
+
+// ============================================================================
+// Directory Entry
+// ============================================================================
+
+/// An entry inside a directory.
+type struct DirEntry {
+    name: String;
+    path: PathBuf;
+    file_type: FileType;
+
+    file_name(&this) -> string;
+    path(&this) -> Path;
+    file_type(&this) -> FileType;
+    is_dir(&this) -> boolean;
+    is_file(&this) -> boolean;
+    is_symlink(&this) -> boolean;
+    drop(&this) -> void;
+}
+
+implement struct DirEntry {
+    /// Returns the file name.
+    file_name(&this) -> string {
+        return this.name.as_cstr();
+    }
+
+    /// Returns the full path.
+    path(&this) -> Path {
+        return this.path.as_path();
+    }
+
+    /// Returns the file type.
+    file_type(&this) -> FileType {
+        return this.file_type;
+    }
+
+    /// Returns true if this is a directory.
+    is_dir(&this) -> boolean {
+        return this.file_type == FileType::Directory;
+    }
+
+    /// Returns true if this is a file.
+    is_file(&this) -> boolean {
+        return this.file_type == FileType::File;
+    }
+
+    /// Returns true if this is a symlink.
+    is_symlink(&this) -> boolean {
+        return this.file_type == FileType::Symlink;
+    }
+
+    /// Drops the entry.
+    drop(&this) -> void {
+        this.name.drop();
+        this.path.drop();
+    }
+}
+
+// ============================================================================
+// Read Dir
+// ============================================================================
+
+/// An iterator over entries in a directory.
+type struct ReadDir {
+    dir_ptr: void*;
+    base_path: PathBuf;
+    closed: boolean;
+
+    static open(path: string) -> IoResult<ReadDir>;
+    has_next(&this) -> boolean;
+    next(mut &this) -> Option<IoResult<DirEntry>>;
+    close(mut &this) -> IoResult<void>;
+    drop(&this) -> void;
+}
+
+implement struct ReadDir {
+    /// Opens a directory for reading.
+    static open(path: string) -> IoResult<ReadDir> {
+        const dir: void* = opendir_syscall(path);
+        if (dir == null) {
+            return IoResult::Err(IoError::from_raw_os_error(get_errno()));
+        }
+
+        return IoResult::Ok(ReadDir {
+            dir_ptr: dir,
+            base_path: PathBuf::from_str(path),
+            closed: false
+        });
+    }
+
+    /// Returns true if there may be more entries.
+    has_next(&this) -> boolean {
+        return !this.closed;
+    }
+
+    /// Returns the next directory entry.
+    next(mut &this) -> Option<IoResult<DirEntry>> {
+        if (this.closed) {
+            return Option::None;
+        }
+
+        loop {
+            const entry: DirentPtr = readdir_syscall(this.dir_ptr);
+            if (entry == null) {
+                this.closed = true;
+                return Option::None;
+            }
+
+            const name: string = dirent_name(entry);
+
+            // Skip . and ..
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+                continue;
+            }
+
+            const entry_path: PathBuf = this.base_path.join(name);
+            const file_type: FileType = dirent_type(entry);
+
+            return Option::Some(IoResult::Ok(DirEntry {
+                name: String::from_cstr(name),
+                path: entry_path,
+                file_type: file_type
+            }));
+        }
+    }
+
+    /// Closes the directory.
+    close(mut &this) -> IoResult<void> {
+        if (this.closed) {
+            return IoResult::Ok(void);
+        }
+
+        const result: i32 = closedir_syscall(this.dir_ptr);
+        this.closed = true;
+
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(void);
+    }
+
+    /// Drops the directory reader.
+    drop(&this) -> void {
+        if (!this.closed) {
+            closedir_syscall(this.dir_ptr);
+        }
+        this.base_path.drop();
+    }
+}
+
+// ============================================================================
+// Directory Functions
+// ============================================================================
+
+/// Reads a directory.
+function read_dir(path: string) -> IoResult<ReadDir> {
+    return ReadDir::open(path);
+}
+
+/// Creates a directory.
+function create_dir(path: string) -> IoResult<void> {
+    const result: i32 = mkdir_syscall(path, 0o755);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(void);
+}
+
+/// Creates a directory and all parent directories.
+function create_dir_all(path: string) -> IoResult<void> {
+    const components: PathComponents = PathComponents::new(path);
+    const current: PathBuf = PathBuf::new();
+
+    // Handle absolute paths
+    if (strlen(path) > 0 && path[0] == '/') {
+        current.data.push_char('/');
+    }
+
+    loop {
+        const comp: Option<string> = components.next();
+        match (comp) {
+            Option::None => { break; }
+            Option::Some(c) => {
+                current.push(c);
+
+                // Check if exists
+                if (!exists(current.as_str())) {
+                    const result: IoResult<void> = create_dir(current.as_str());
+                    match (result) {
+                        IoResult::Err(e) => {
+                            if (e.kind() != IoErrorKind::AlreadyExists) {
+                                current.drop();
+                                return IoResult::Err(e);
+                            }
+                        }
+                        IoResult::Ok(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    current.drop();
+    return IoResult::Ok(void);
+}
+
+/// Removes an empty directory.
+function remove_dir(path: string) -> IoResult<void> {
+    const result: i32 = rmdir_syscall(path);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(void);
+}
+
+/// Removes a directory and all its contents.
+function remove_dir_all(path: string) -> IoResult<void> {
+    const dir: IoResult<ReadDir> = read_dir(path);
+    match (dir) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(d) => {
+            loop {
+                const entry: Option<IoResult<DirEntry>> = d.next();
+                match (entry) {
+                    Option::None => { break; }
+                    Option::Some(result) => {
+                        match (result) {
+                            IoResult::Err(e) => {
+                                d.drop();
+                                return IoResult::Err(e);
+                            }
+                            IoResult::Ok(e) => {
+                                const entry_path: string = e.path().as_str();
+                                if (e.is_dir()) {
+                                    const sub_result: IoResult<void> = remove_dir_all(entry_path);
+                                    e.drop();
+                                    match (sub_result) {
+                                        IoResult::Err(err) => {
+                                            d.drop();
+                                            return IoResult::Err(err);
+                                        }
+                                        IoResult::Ok(_) => {}
+                                    }
+                                } else {
+                                    const remove_result: IoResult<void> = remove_file(entry_path);
+                                    e.drop();
+                                    match (remove_result) {
+                                        IoResult::Err(err) => {
+                                            d.drop();
+                                            return IoResult::Err(err);
+                                        }
+                                        IoResult::Ok(_) => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            d.drop();
+            return remove_dir(path);
+        }
+    }
+}
+
+/// Returns true if a path exists.
+function exists(path: string) -> boolean {
+    return access_syscall(path, F_OK) == 0;
+}
+
+/// Returns true if a path is a directory.
+function is_dir(path: string) -> boolean {
+    const stat: StatBuf = StatBuf::new();
+    const result: i32 = stat_syscall(path, &stat);
+    if (result < 0) {
+        return false;
+    }
+    return (stat.mode & S_IFMT) == S_IFDIR;
+}
+
+/// Returns true if a path is a file.
+function is_file(path: string) -> boolean {
+    const stat: StatBuf = StatBuf::new();
+    const result: i32 = stat_syscall(path, &stat);
+    if (result < 0) {
+        return false;
+    }
+    return (stat.mode & S_IFMT) == S_IFREG;
+}
+
+/// Removes a file.
+function remove_file(path: string) -> IoResult<void> {
+    const result: i32 = unlink_syscall(path);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(void);
+}
+
+/// Renames a file or directory.
+function rename(from: string, to: string) -> IoResult<void> {
+    const result: i32 = rename_syscall(from, to);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(void);
+}
+
+/// Copies a file.
+function copy(from: string, to: string) -> IoResult<u64> {
+    const src: IoResult<File> = File::open(from);
+    match (src) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(s) => {
+            const dst: IoResult<File> = File::create(to);
+            match (dst) {
+                IoResult::Err(e) => {
+                    s.drop();
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(d) => {
+                    const BUF_SIZE: u64 = 8192;
+                    mut buf: u8[8192];
+                    mut total: u64 = 0;
+
+                    loop {
+                        const read_result: IoResult<u64> = s.read(&buf[0], BUF_SIZE);
+                        match (read_result) {
+                            IoResult::Err(e) => {
+                                s.drop();
+                                d.drop();
+                                return IoResult::Err(e);
+                            }
+                            IoResult::Ok(0) => {
+                                s.drop();
+                                d.drop();
+                                return IoResult::Ok(total);
+                            }
+                            IoResult::Ok(n) => {
+                                const write_result: IoResult<void> = d.write_all(&buf[0], n);
+                                match (write_result) {
+                                    IoResult::Err(e) => {
+                                        s.drop();
+                                        d.drop();
+                                        return IoResult::Err(e);
+                                    }
+                                    IoResult::Ok(_) => {
+                                        total = total + n;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Creates a hard link.
+function hard_link(src: string, dst: string) -> IoResult<void> {
+    const result: i32 = link_syscall(src, dst);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(void);
+}
+
+/// Creates a symbolic link.
+function symlink(src: string, dst: string) -> IoResult<void> {
+    const result: i32 = symlink_syscall(src, dst);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(void);
+}
+
+/// Reads a symbolic link.
+function read_link(path: string) -> IoResult<PathBuf> {
+    mut buf: u8[4096];
+    const len: i64 = readlink_syscall(path, &buf[0], 4096);
+    if (len < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-len));
+    }
+    buf[len] = 0;
+    return IoResult::Ok(PathBuf::from_str(&buf[0]));
+}
+
+/// Returns the canonical path.
+function canonicalize(path: string) -> IoResult<PathBuf> {
+    mut buf: u8[4096];
+    const result: string = realpath_syscall(path, &buf[0]);
+    if (result == null) {
+        return IoResult::Err(IoError::from_raw_os_error(get_errno()));
+    }
+    return IoResult::Ok(PathBuf::from_str(result));
+}
+
+/// Returns the current working directory.
+function current_dir() -> IoResult<PathBuf> {
+    mut buf: u8[4096];
+    const result: string = getcwd_syscall(&buf[0], 4096);
+    if (result == null) {
+        return IoResult::Err(IoError::from_raw_os_error(get_errno()));
+    }
+    return IoResult::Ok(PathBuf::from_str(result));
+}
+
+/// Sets the current working directory.
+function set_current_dir(path: string) -> IoResult<void> {
+    const result: i32 = chdir_syscall(path);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(void);
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const F_OK: i32 = 0;
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+
+// ============================================================================
+// Syscall Wrappers
+// ============================================================================
+
+type DirentPtr = void*;
+type StatBuf = void*;
+
+intrinsic function opendir_syscall(path: string) -> void*;
+intrinsic function readdir_syscall(dir: void*) -> DirentPtr;
+intrinsic function closedir_syscall(dir: void*) -> i32;
+intrinsic function dirent_name(entry: DirentPtr) -> string;
+intrinsic function dirent_type(entry: DirentPtr) -> FileType;
+intrinsic function mkdir_syscall(path: string, mode: u32) -> i32;
+intrinsic function rmdir_syscall(path: string) -> i32;
+intrinsic function unlink_syscall(path: string) -> i32;
+intrinsic function rename_syscall(from: string, to: string) -> i32;
+intrinsic function link_syscall(src: string, dst: string) -> i32;
+intrinsic function symlink_syscall(src: string, dst: string) -> i32;
+intrinsic function readlink_syscall(path: string, buf: u8*, size: u64) -> i64;
+intrinsic function realpath_syscall(path: string, resolved: u8*) -> string;
+intrinsic function getcwd_syscall(buf: u8*, size: u64) -> string;
+intrinsic function chdir_syscall(path: string) -> i32;
+intrinsic function access_syscall(path: string, mode: i32) -> i32;
+intrinsic function stat_syscall(path: string, buf: StatBuf*) -> i32;
+intrinsic function get_errno() -> i32;

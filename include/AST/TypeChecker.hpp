@@ -274,6 +274,9 @@ namespace Cryo
         std::unique_ptr<Cryo::SRM::SymbolResolutionContext> _srm_context;
         std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _srm_manager;
 
+        // Contextual typing support - used for array literal type inference
+        Type *_current_expected_type = nullptr;
+
     public:
         TypeChecker(TypeContext &type_ctx);
         TypeChecker(TypeContext &type_ctx, DiagnosticManager *diagnostic_manager, const std::string &source_file = "");

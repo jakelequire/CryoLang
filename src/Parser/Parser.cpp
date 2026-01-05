@@ -1492,7 +1492,22 @@ namespace Cryo
         // Set variadic flag if detected
         func_decl->set_variadic(is_variadic);
 
-        // Add parameters to function
+        // For _user_main_, inject argc and argv parameters to match runtime's expected signature
+        // The runtime declares: declare i32 @_user_main_(i32, ptr)
+        if (func_name == "_user_main_")
+        {
+            // Create argc: i32 parameter
+            Type *i32_type = _context.types().get_i32_type();
+            auto argc_param = _builder.create_variable_declaration(start_loc, "argc", i32_type);
+            func_decl->add_parameter(std::move(argc_param));
+
+            // Create argv: ptr parameter (pointer to string array)
+            Type *ptr_type = _context.types().create_pointer_type(_context.types().get_i8_type());
+            auto argv_param = _builder.create_variable_declaration(start_loc, "argv", ptr_type);
+            func_decl->add_parameter(std::move(argv_param));
+        }
+
+        // Add user-defined parameters to function
         for (auto &param : params)
         {
             func_decl->add_parameter(std::move(param));
@@ -5127,6 +5142,7 @@ namespace Cryo
         while (is_type_token() ||
                _current_token.is(TokenKind::TK_L_ANGLE) ||
                _current_token.is(TokenKind::TK_R_ANGLE) ||
+               _current_token.is(TokenKind::TK_GREATERGREATER) || // Handle >> in nested generics
                _current_token.is(TokenKind::TK_L_SQUARE) ||
                _current_token.is(TokenKind::TK_R_SQUARE) ||
                _current_token.is(TokenKind::TK_NUMERIC_CONSTANT) ||
@@ -5147,12 +5163,17 @@ namespace Cryo
             {
                 angle_bracket_depth--;
             }
+            else if (_current_token.is(TokenKind::TK_GREATERGREATER))
+            {
+                // >> represents two closing angle brackets in generic types
+                angle_bracket_depth -= 2;
+            }
 
             LOG_DEBUG(LogComponent::PARSER, "Collecting token: {} ({})",
                       static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
 
             collected_tokens.push_back(_current_token);
-            type_string += std::string(_current_token.text()) + " ";
+            type_string += std::string(_current_token.text());
             advance();
 
             // Break on certain terminators, but only if we're not inside angle brackets
@@ -5292,15 +5313,15 @@ namespace Cryo
             return struct_type;
         }
 
-        // Try to resolve as a class type
-        Type *class_type = _context.types().get_class_type(type_str);
+        // Try to resolve as a class type (lookup only, don't create)
+        Type *class_type = _context.types().lookup_class_type(type_str);
         if (class_type && class_type->kind() != TypeKind::Unknown)
         {
             return class_type;
         }
 
-        // Try to resolve as an enum type
-        Type *enum_type = _context.types().get_enum_type(type_str, {}, false);
+        // Try to resolve as an enum type (lookup only, don't create)
+        Type *enum_type = _context.types().lookup_enum_type(type_str);
         if (enum_type && enum_type->kind() != TypeKind::Unknown)
         {
             return enum_type;

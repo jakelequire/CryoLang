@@ -1,0 +1,595 @@
+///! File Operations
+///!
+///! Types and functions for file I/O operations.
+
+namespace std::fs::file;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+import <collections/array>;
+import <collections/string>;
+import <io/error>;
+import <io/reader>;
+import <io/writer>;
+import <io/buffer>;
+
+// ============================================================================
+// Open Flags
+// ============================================================================
+
+/// File open options.
+type struct OpenOptions {
+    read: boolean;
+    write: boolean;
+    append: boolean;
+    truncate: boolean;
+    create: boolean;
+    create_new: boolean;
+    mode: u32;
+
+    // Method signatures
+    OpenOptions() -> OpenOptions;
+    read(&this, read: boolean) -> OpenOptions;
+    write(&this, write: boolean) -> OpenOptions;
+    append(&this, append: boolean) -> OpenOptions;
+    truncate(&this, truncate: boolean) -> OpenOptions;
+    create(&this, create: boolean) -> OpenOptions;
+    create_new(&this, create_new: boolean) -> OpenOptions;
+    mode(&this, mode: u32) -> OpenOptions;
+    open(&this, path: string) -> IoResult<File>;
+    to_flags(&this) -> i32;
+}
+
+implement struct OpenOptions {
+    /// Creates new open options.
+    OpenOptions() -> OpenOptions {
+        return OpenOptions {
+            read: false,
+            write: false,
+            append: false,
+            truncate: false,
+            create: false,
+            create_new: false,
+            mode: 0o644
+        };
+    }
+
+    /// Sets read mode.
+    read(&this, read: boolean) -> OpenOptions {
+        this.read = read;
+        return this;
+    }
+
+    /// Sets write mode.
+    write(&this, write: boolean) -> OpenOptions {
+        this.write = write;
+        return this;
+    }
+
+    /// Sets append mode.
+    append(&this, append: boolean) -> OpenOptions {
+        this.append = append;
+        return this;
+    }
+
+    /// Sets truncate mode.
+    truncate(&this, truncate: boolean) -> OpenOptions {
+        this.truncate = truncate;
+        return this;
+    }
+
+    /// Sets create mode.
+    create(&this, create: boolean) -> OpenOptions {
+        this.create = create;
+        return this;
+    }
+
+    /// Sets create_new mode.
+    create_new(&this, create_new: boolean) -> OpenOptions {
+        this.create_new = create_new;
+        return this;
+    }
+
+    /// Sets the file mode (permissions).
+    mode(&this, mode: u32) -> OpenOptions {
+        this.mode = mode;
+        return this;
+    }
+
+    /// Opens a file with these options.
+    open(&this, path: string) -> IoResult<File> {
+        return File::open_with_options(path, this);
+    }
+
+    /// Converts to POSIX flags.
+    to_flags(&this) -> i32 {
+        mut flags: i32 = 0;
+
+        if (this.read && this.write) {
+            flags = O_RDWR;
+        } else if (this.write) {
+            flags = O_WRONLY;
+        } else {
+            flags = O_RDONLY;
+        }
+
+        if (this.append) {
+            flags = flags | O_APPEND;
+        }
+        if (this.truncate) {
+            flags = flags | O_TRUNC;
+        }
+        if (this.create) {
+            flags = flags | O_CREAT;
+        }
+        if (this.create_new) {
+            flags = flags | O_CREAT | O_EXCL;
+        }
+
+        return flags;
+    }
+}
+
+// POSIX flag constants
+const O_RDONLY: i32 = 0;
+const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
+const O_CREAT: i32 = 64;
+const O_EXCL: i32 = 128;
+const O_TRUNC: i32 = 512;
+const O_APPEND: i32 = 1024;
+
+// ============================================================================
+// File
+// ============================================================================
+
+/// A reference to an open file on the filesystem.
+type struct File {
+    fd: i32;
+
+    // Method signatures
+    static open(path: string) -> IoResult<File>;
+    static create(path: string) -> IoResult<File>;
+    static open_with_options(path: string, options: OpenOptions) -> IoResult<File>;
+    static from_raw_fd(fd: i32) -> File;
+    as_raw_fd(&this) -> i32;
+    into_raw_fd(&this) -> i32;
+    read(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    read_at(&this, buf: u8*, len: u64, offset: u64) -> IoResult<u64>;
+    read_exact(&this, buf: u8*, len: u64) -> IoResult<void>;
+    read_to_end(&this, buf: &mut Vec<u8>) -> IoResult<u64>;
+    read_to_string(&this, s: &mut String) -> IoResult<u64>;
+    write(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    write_at(&this, buf: u8*, len: u64, offset: u64) -> IoResult<u64>;
+    write_all(&this, buf: u8*, len: u64) -> IoResult<void>;
+    flush(&this) -> IoResult<void>;
+    sync_data(&this) -> IoResult<void>;
+    seek(&this, pos: SeekFrom) -> IoResult<u64>;
+    rewind(&this) -> IoResult<void>;
+    stream_position(&this) -> IoResult<u64>;
+    len(&this) -> IoResult<u64>;
+    set_len(&this, size: u64) -> IoResult<void>;
+    try_clone(&this) -> IoResult<File>;
+    close(mut &this) -> IoResult<void>;
+    drop(&this) -> void;
+}
+
+implement struct File {
+    /// Opens a file in read-only mode.
+    static function open(path: string) -> IoResult<File> {
+        return File::open_with_options(path, OpenOptions::new().read(true));
+    }
+
+    /// Creates a new file (or truncates if exists).
+    static function create(path: string) -> IoResult<File> {
+        return File::open_with_options(path,
+            OpenOptions::new().write(true).create(true).truncate(true));
+    }
+
+    /// Opens a file with custom options.
+    static function open_with_options(path: string, options: OpenOptions) -> IoResult<File> {
+        const fd: i32 = open_syscall(path, options.to_flags(), options.mode);
+        if (fd < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-fd));
+        }
+        return IoResult::Ok(File { fd: fd });
+    }
+
+    /// Creates a File from a raw file descriptor.
+    static function from_raw_fd(fd: i32) -> File {
+        return File { fd: fd };
+    }
+
+    /// Returns the raw file descriptor.
+    as_raw_fd(&this) -> i32 {
+        return this.fd;
+    }
+
+    /// Consumes the File and returns the raw file descriptor.
+    into_raw_fd(&this) -> i32 {
+        const fd: i32 = this.fd;
+        this.fd = -1;
+        return fd;
+    }
+
+    // ========================================================================
+    // Read Operations
+    // ========================================================================
+
+    /// Reads bytes from the file.
+    read(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = read_syscall(this.fd, buf, len);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(result);
+    }
+
+    /// Reads bytes at a specific offset without changing the file position.
+    read_at(&this, buf: u8*, len: u64, offset: u64) -> IoResult<u64> {
+        const result: i64 = pread_syscall(this.fd, buf, len, offset);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(result);
+    }
+
+    /// Reads exactly `len` bytes.
+    read_exact(&this, buf: u8*, len: u64) -> IoResult<void> {
+        mut total: u64 = 0;
+        while (total < len) {
+            const result: IoResult<u64> = this.read(&buf[total], len - total);
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Err(IoError::unexpected_eof("failed to fill buffer"));
+                }
+                IoResult::Ok(n) => {
+                    total = total + n;
+                }
+            }
+        }
+        return IoResult::Ok(void);
+    }
+
+    /// Reads the entire file into a Vec.
+    read_to_end(&this, buf: &mut Vec<u8>) -> IoResult<u64> {
+        const CHUNK_SIZE: u64 = 8192;
+        mut total: u64 = 0;
+        mut chunk: u8[8192];
+
+        loop {
+            const result: IoResult<u64> = this.read(&chunk[0], CHUNK_SIZE);
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Ok(total);
+                }
+                IoResult::Ok(n) => {
+                    mut i: u64 = 0;
+                    while (i < n) {
+                        buf.push(chunk[i]);
+                        i = i + 1;
+                    }
+                    total = total + n;
+                }
+            }
+        }
+    }
+
+    /// Reads the entire file into a String.
+    read_to_string(&this, s: &mut String) -> IoResult<u64> {
+        const buf: Vec<u8> = Vec::new();
+        const result: IoResult<u64> = this.read_to_end(&buf);
+
+        match (result) {
+            IoResult::Err(e) => {
+                buf.drop();
+                return IoResult::Err(e);
+            }
+            IoResult::Ok(n) => {
+                mut i: u64 = 0;
+                while (i < buf.len()) {
+                    s.push_byte(*buf.get_ref(i));
+                    i = i + 1;
+                }
+                buf.drop();
+                return IoResult::Ok(n);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Write Operations
+    // ========================================================================
+
+    /// Writes bytes to the file.
+    write(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = write_syscall(this.fd, buf, len);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(result);
+    }
+
+    /// Writes bytes at a specific offset without changing the file position.
+    write_at(&this, buf: u8*, len: u64, offset: u64) -> IoResult<u64> {
+        const result: i64 = pwrite_syscall(this.fd, buf, len, offset);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(result);
+    }
+
+    /// Writes all bytes.
+    write_all(&this, buf: u8*, len: u64) -> IoResult<void> {
+        mut total: u64 = 0;
+        while (total < len) {
+            const result: IoResult<u64> = this.write(&buf[total], len - total);
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(0) => {
+                    return IoResult::Err(IoError::new(IoErrorKind::WriteZero, "write returned 0"));
+                }
+                IoResult::Ok(n) => {
+                    total = total + n;
+                }
+            }
+        }
+        return IoResult::Ok(void);
+    }
+
+    /// Flushes the file.
+    flush(&this) -> IoResult<void> {
+        const result: i32 = fsync_syscall(this.fd);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(void);
+    }
+
+    /// Syncs data only (not metadata).
+    sync_data(&this) -> IoResult<void> {
+        const result: i32 = fdatasync_syscall(this.fd);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(void);
+    }
+
+    // ========================================================================
+    // Seek Operations
+    // ========================================================================
+
+    /// Seeks to a position.
+    seek(&this, pos: SeekFrom) -> IoResult<u64> {
+        mut whence: i32;
+        mut offset: i64;
+
+        match (pos) {
+            SeekFrom::Start(off) => {
+                whence = SEEK_SET;
+                offset = off;
+            }
+            SeekFrom::End(off) => {
+                whence = SEEK_END;
+                offset = off;
+            }
+            SeekFrom::Current(off) => {
+                whence = SEEK_CUR;
+                offset = off;
+            }
+        }
+
+        const result: i64 = lseek_syscall(this.fd, offset, whence);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(result);
+    }
+
+    /// Rewinds to the beginning.
+    rewind(&this) -> IoResult<void> {
+        const result: IoResult<u64> = this.seek(SeekFrom::Start(0));
+        match (result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(_) => { return IoResult::Ok(void); }
+        }
+    }
+
+    /// Returns the current stream position.
+    stream_position(&this) -> IoResult<u64> {
+        return this.seek(SeekFrom::Current(0));
+    }
+
+    // ========================================================================
+    // Metadata Operations
+    // ========================================================================
+
+    /// Returns the length of the file.
+    len(&this) -> IoResult<u64> {
+        // Save current position
+        const pos: IoResult<u64> = this.stream_position();
+        match (pos) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(current_pos) => {
+                // Seek to end
+                const end: IoResult<u64> = this.seek(SeekFrom::End(0));
+                match (end) {
+                    IoResult::Err(e) => { return IoResult::Err(e); }
+                    IoResult::Ok(length) => {
+                        // Restore position
+                        this.seek(SeekFrom::Start(current_pos));
+                        return IoResult::Ok(length);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sets the length of the file.
+    set_len(&this, size: u64) -> IoResult<void> {
+        const result: i32 = ftruncate_syscall(this.fd, size);
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(void);
+    }
+
+    // ========================================================================
+    // Duplicating
+    // ========================================================================
+
+    /// Duplicates the file handle.
+    try_clone(&this) -> IoResult<File> {
+        const new_fd: i32 = dup_syscall(this.fd);
+        if (new_fd < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-new_fd));
+        }
+        return IoResult::Ok(File { fd: new_fd });
+    }
+
+    // ========================================================================
+    // Cleanup
+    // ========================================================================
+
+    /// Closes the file.
+    close(mut &this) -> IoResult<void> {
+        if (this.fd < 0) {
+            return IoResult::Ok(void);
+        }
+
+        const result: i32 = close_syscall(this.fd);
+        this.fd = -1;
+
+        if (result < 0) {
+            return IoResult::Err(IoError::from_raw_os_error(-result));
+        }
+        return IoResult::Ok(void);
+    }
+
+    /// Drops the file (closes it).
+    drop(&this) -> void {
+        if (this.fd >= 0) {
+            close_syscall(this.fd);
+        }
+    }
+}
+
+// Seek constants
+const SEEK_SET: i32 = 0;
+const SEEK_CUR: i32 = 1;
+const SEEK_END: i32 = 2;
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+/// Reads the entire contents of a file into a Vec.
+function read(path: string) -> IoResult<Vec<u8>> {
+    const file: IoResult<File> = File::open(path);
+    match (file) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(f) => {
+            const buf: Vec<u8> = Vec::new();
+            const result: IoResult<u64> = f.read_to_end(&buf);
+            f.drop();
+            match (result) {
+                IoResult::Err(e) => {
+                    buf.drop();
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(_) => {
+                    return IoResult::Ok(buf);
+                }
+            }
+        }
+    }
+}
+
+/// Reads the entire contents of a file into a String.
+function read_to_string(path: string) -> IoResult<String> {
+    const file: IoResult<File> = File::open(path);
+    match (file) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(f) => {
+            const s: String = String::new();
+            const result: IoResult<u64> = f.read_to_string(&s);
+            f.drop();
+            match (result) {
+                IoResult::Err(e) => {
+                    s.drop();
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(_) => {
+                    return IoResult::Ok(s);
+                }
+            }
+        }
+    }
+}
+
+/// Writes bytes to a file, creating or truncating it.
+function write(path: string, contents: u8*, len: u64) -> IoResult<void> {
+    const file: IoResult<File> = File::create(path);
+    match (file) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(f) => {
+            const result: IoResult<void> = f.write_all(contents, len);
+            f.drop();
+            return result;
+        }
+    }
+}
+
+/// Writes a string to a file.
+function write_string(path: string, contents: string) -> IoResult<void> {
+    return write(path, contents, strlen(contents));
+}
+
+/// Appends bytes to a file.
+function append(path: string, contents: u8*, len: u64) -> IoResult<void> {
+    const file: IoResult<File> = File::open_with_options(path,
+        OpenOptions::new().write(true).append(true).create(true));
+    match (file) {
+        IoResult::Err(e) => { return IoResult::Err(e); }
+        IoResult::Ok(f) => {
+            const result: IoResult<void> = f.write_all(contents, len);
+            f.drop();
+            return result;
+        }
+    }
+}
+
+// ============================================================================
+// Syscall Wrappers
+// ============================================================================
+
+intrinsic function open_syscall(path: string, flags: i32, mode: u32) -> i32;
+intrinsic function close_syscall(fd: i32) -> i32;
+intrinsic function read_syscall(fd: i32, buf: u8*, count: u64) -> i64;
+intrinsic function write_syscall(fd: i32, buf: u8*, count: u64) -> i64;
+intrinsic function pread_syscall(fd: i32, buf: u8*, count: u64, offset: u64) -> i64;
+intrinsic function pwrite_syscall(fd: i32, buf: u8*, count: u64, offset: u64) -> i64;
+intrinsic function lseek_syscall(fd: i32, offset: i64, whence: i32) -> i64;
+intrinsic function fsync_syscall(fd: i32) -> i32;
+intrinsic function fdatasync_syscall(fd: i32) -> i32;
+intrinsic function ftruncate_syscall(fd: i32, size: u64) -> i32;
+intrinsic function dup_syscall(fd: i32) -> i32;
