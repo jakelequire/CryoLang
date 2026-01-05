@@ -78,7 +78,8 @@ namespace Cryo
         void visit(FunctionDeclarationNode &node) override;
         void visit(IntrinsicDeclarationNode &node) override;
         void visit(IntrinsicConstDeclarationNode &node) override;
-        void visit(ImportDeclarationNode &node) override;\n        void visit(ModuleDeclarationNode &node) override;
+        void visit(ImportDeclarationNode &node) override;
+        void visit(ModuleDeclarationNode &node) override;
         void visit(CallExpressionNode &node) override;
         void visit(NewExpressionNode &node) override;
         void visit(SizeofExpressionNode &node) override;

@@ -429,6 +429,13 @@ namespace Cryo::Codegen
         // Imports are resolved during linking
     }
 
+    void CodegenVisitor::visit(Cryo::ModuleDeclarationNode &node)
+    {
+        NodeTracker tracker(*_ctx, &node);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ModuleDeclarationNode");
+        // Module declarations are processed during compilation but don't generate code
+    }
+
     void CodegenVisitor::visit(Cryo::VariableDeclarationNode &node)
     {
         NodeTracker tracker(*_ctx, &node);
