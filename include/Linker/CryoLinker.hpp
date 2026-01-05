@@ -358,6 +358,11 @@ namespace Cryo::Linker
         bool execute_linker_command(const std::vector<std::string> &args);
 
         /**
+         * @brief Execute ar command for creating static libraries
+         */
+        bool execute_ar_command(const std::vector<std::string> &args);
+
+        /**
          * @brief Build linker command arguments
          */
         std::vector<std::string> build_linker_args(

@@ -305,9 +305,96 @@ namespace Cryo::Linker
 
     bool CryoLinker::generate_static_library(llvm::Module *module, const std::string &output_path)
     {
-        // TODO: Implement static library generation
-        report_error("Static library generation not yet implemented");
-        return false;
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "CryoLinker::generate_static_library called with output_path: {}", output_path);
+
+        // Step 1: Generate object file from LLVM IR
+        std::string temp_obj = output_path + ".o";
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "Generating object file: {}", temp_obj);
+
+        if (!generate_object_file(module, temp_obj))
+        {
+            LOG_ERROR(Cryo::LogComponent::LINKER, "generate_object_file failed!");
+            return false;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "Object file generated successfully");
+
+        // Step 2: Use llvm-ar to create static library archive
+        std::vector<std::string> ar_args;
+        ar_args.push_back("rcs");  // r=insert, c=create, s=write index
+        ar_args.push_back(output_path);
+        ar_args.push_back(temp_obj);
+
+        bool success = execute_ar_command(ar_args);
+
+        // Clean up temp object file
+        if (std::filesystem::exists(temp_obj))
+        {
+            std::filesystem::remove(temp_obj);
+        }
+
+        if (success)
+        {
+            LOG_DEBUG(Cryo::LogComponent::LINKER, "Static library created successfully: {}", output_path);
+        }
+        else
+        {
+            LOG_ERROR(Cryo::LogComponent::LINKER, "Failed to create static library: {}", output_path);
+        }
+
+        return success;
+    }
+
+    bool CryoLinker::execute_ar_command(const std::vector<std::string> &args)
+    {
+        // Build the ar command
+        std::string cmd;
+
+#if defined(_WIN32) || defined(_WIN64)
+        cmd = "C:/msys64/mingw64/bin/llvm-ar";
+#else
+        cmd = "llvm-ar";
+#endif
+
+        for (const auto &arg : args)
+        {
+            cmd += " \"" + arg + "\"";
+        }
+
+        // Log the command for debugging
+        LOG_DEBUG(Cryo::LogComponent::LINKER, "Executing ar command: {}", cmd);
+
+        // Execute the command
+        std::string cmd_with_redirect = cmd + " 2>&1";
+        FILE *pipe = popen(cmd_with_redirect.c_str(), "r");
+        if (!pipe)
+        {
+            report_error("Failed to execute ar command: " + cmd);
+            return false;
+        }
+
+        std::string output;
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+        {
+            output += buffer;
+        }
+
+        int result = pclose(pipe);
+
+        if (result != 0)
+        {
+            std::string error_msg = "llvm-ar failed with exit code " + std::to_string(result);
+            error_msg += "\nCommand: " + cmd;
+            if (!output.empty())
+            {
+                error_msg += "\nOutput:\n" + output;
+            }
+            report_error(error_msg);
+            return false;
+        }
+
+        return true;
     }
 
     bool CryoLinker::generate_object_file(llvm::Module *module, const std::string &output_path)
