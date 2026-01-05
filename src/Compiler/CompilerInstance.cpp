@@ -2065,6 +2065,85 @@ namespace Cryo
         }
     }
 
+    bool CompilerInstance::compile_stdlib(const std::string &source_dir, const std::string &output_path)
+    {
+        LOG_INFO(LogComponent::GENERAL, "Starting stdlib compilation from directory: {}", source_dir);
+        
+        // Discover all .cryo files in the source directory recursively
+        std::vector<std::string> source_files;
+        
+        try {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(source_dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".cryo") {
+                    source_files.push_back(entry.path().string());
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR(LogComponent::GENERAL, "Error discovering source files: {}", e.what());
+            return false;
+        }
+        
+        if (source_files.empty()) {
+            LOG_ERROR(LogComponent::GENERAL, "No .cryo files found in source directory: {}", source_dir);
+            return false;
+        }
+        
+        LOG_INFO(LogComponent::GENERAL, "Found {} source files for stdlib compilation", source_files.size());
+        
+        // Sort files to ensure consistent compilation order
+        std::sort(source_files.begin(), source_files.end());
+        
+        // For stdlib compilation, we need to compile all files together into one module
+        // This is different from individual file compilation
+        bool success = true;
+        
+        // Initialize the compilation context for multi-file compilation
+        reset_state();
+        
+        // Set compilation mode to stdlib
+        set_stdlib_compilation_mode(true);
+        
+        // For now, compile each file individually and collect bitcode
+        // TODO: Implement proper multi-module compilation when needed
+        std::vector<std::string> compiled_modules;
+        
+        for (const auto& source_file : source_files) {
+            LOG_DEBUG(LogComponent::GENERAL, "Compiling stdlib module: {}", source_file);
+            
+            // Reset state for each file while maintaining stdlib mode
+            reset_state();
+            set_stdlib_compilation_mode(true);
+            
+            if (!compile_file(source_file)) {
+                LOG_ERROR(LogComponent::GENERAL, "Failed to compile stdlib module: {}", source_file);
+                // Continue with other files instead of failing completely
+                success = false;
+                continue;
+            }
+            
+            // Generate LLVM IR for this module
+            if (!generate_ir()) {
+                LOG_ERROR(LogComponent::GENERAL, "Failed to generate IR for stdlib module: {}", source_file);
+                success = false;
+                continue;
+            }
+            
+            compiled_modules.push_back(source_file);
+        }
+        
+        if (compiled_modules.empty()) {
+            LOG_ERROR(LogComponent::GENERAL, "No stdlib modules compiled successfully");
+            return false;
+        }
+        
+        LOG_INFO(LogComponent::GENERAL, "Successfully compiled {}/{} stdlib modules", 
+                 compiled_modules.size(), source_files.size());
+        
+        // For now, we'll rely on external linking to combine modules
+        // The output_path parameter can be used in the future for direct library generation
+        return success;
+    }
+
     std::unique_ptr<CompilerInstance> create_compiler_instance()
     {
         return std::make_unique<CompilerInstance>();

@@ -173,6 +173,8 @@ namespace Cryo
         // Parameter parsing for functions
         std::pair<std::vector<std::unique_ptr<VariableDeclarationNode>>, bool> parse_parameter_list();
         std::unique_ptr<VariableDeclarationNode> parse_parameter();
+        bool is_this_parameter();
+        std::unique_ptr<VariableDeclarationNode> parse_this_parameter();
         bool peek_variadic_parameter();
         std::unique_ptr<VariableDeclarationNode> parse_variadic_parameter();
 
@@ -254,6 +256,7 @@ namespace Cryo
         // Look ahead utilities
         Token peek() const { return _current_token; }
         Token peek_next();
+        Token peek_next_n(int n);
 
         // Type resolution helper
         Type *resolve_type_from_string(const std::string &type_str);
