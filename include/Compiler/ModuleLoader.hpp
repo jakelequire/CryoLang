@@ -100,7 +100,7 @@ namespace Cryo
          * @param import_type Type of import (relative or absolute)
          * @return Resolved file path
          */
-        std::string resolve_module_file_path(const std::string &module_path, ImportDeclarationNode::ImportType import_type);
+        std::string resolve_module_file_path(const std::string &module_path, ImportDeclarationNode::ImportStyle import_type);
 
         /**
          * @brief Check if a path represents a module directory (contains _module.cryo)

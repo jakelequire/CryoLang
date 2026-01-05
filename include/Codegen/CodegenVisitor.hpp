@@ -113,6 +113,7 @@ namespace Cryo::Codegen
         void visit(Cryo::IntrinsicDeclarationNode &node) override;
         void visit(Cryo::IntrinsicConstDeclarationNode &node) override;
         void visit(Cryo::ImportDeclarationNode &node) override;
+        void visit(Cryo::ModuleDeclarationNode &node) override;
         void visit(Cryo::VariableDeclarationNode &node) override;
         void visit(Cryo::StructDeclarationNode &node) override;
         void visit(Cryo::ClassDeclarationNode &node) override;
