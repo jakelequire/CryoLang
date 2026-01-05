@@ -1,0 +1,240 @@
+///! Exit Handler Registration
+///!
+///! This module provides atexit-style handler registration for cleanup
+///! code that should run before program termination.
+
+namespace cryo::runtime::atexit;
+
+import <core/intrinsics>;
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/// Maximum number of atexit handlers.
+const MAX_HANDLERS: u64 = 64;
+
+// ============================================================================
+// Handler Types
+// ============================================================================
+
+/// Type for atexit handler functions.
+type AtexitHandler = function() -> void;
+
+/// Handler entry with priority.
+type struct HandlerEntry {
+    handler: AtexitHandler;
+    priority: i32;
+    registered: boolean;
+}
+
+// ============================================================================
+// State
+// ============================================================================
+
+/// Array of registered handlers.
+mut g_handlers: HandlerEntry[64];
+
+/// Number of registered handlers.
+mut g_handler_count: u64 = 0;
+
+/// Whether we're currently running handlers.
+mut g_running: boolean = false;
+
+/// Whether initialization has occurred.
+mut g_initialized: boolean = false;
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+/// Initializes the atexit subsystem.
+function init() -> void {
+    if (g_initialized) {
+        return;
+    }
+
+    // Initialize all handler entries
+    mut i: u64 = 0;
+    while (i < MAX_HANDLERS) {
+        g_handlers[i].handler = null;
+        g_handlers[i].priority = 0;
+        g_handlers[i].registered = false;
+        i = i + 1;
+    }
+
+    g_handler_count = 0;
+    g_running = false;
+    g_initialized = true;
+}
+
+// ============================================================================
+// Handler Registration
+// ============================================================================
+
+/// Registers an atexit handler.
+///
+/// Returns true if registration succeeded, false if the table is full.
+function register(handler: AtexitHandler) -> boolean {
+    return register_with_priority(handler, 0);
+}
+
+/// Registers an atexit handler with a priority.
+///
+/// Higher priority handlers run first during shutdown.
+/// Returns true if registration succeeded, false if the table is full.
+function register_with_priority(handler: AtexitHandler, priority: i32) -> boolean {
+    if (handler == null) {
+        return false;
+    }
+
+    if (g_handler_count >= MAX_HANDLERS) {
+        return false;
+    }
+
+    // Don't allow registration while running handlers
+    if (g_running) {
+        return false;
+    }
+
+    // Find an empty slot
+    mut i: u64 = 0;
+    while (i < MAX_HANDLERS) {
+        if (!g_handlers[i].registered) {
+            g_handlers[i].handler = handler;
+            g_handlers[i].priority = priority;
+            g_handlers[i].registered = true;
+            g_handler_count = g_handler_count + 1;
+            return true;
+        }
+        i = i + 1;
+    }
+
+    return false;
+}
+
+/// Unregisters an atexit handler.
+///
+/// Returns true if the handler was found and removed.
+function unregister(handler: AtexitHandler) -> boolean {
+    if (handler == null) {
+        return false;
+    }
+
+    // Don't allow unregistration while running handlers
+    if (g_running) {
+        return false;
+    }
+
+    mut i: u64 = 0;
+    while (i < MAX_HANDLERS) {
+        if (g_handlers[i].registered && g_handlers[i].handler == handler) {
+            g_handlers[i].handler = null;
+            g_handlers[i].priority = 0;
+            g_handlers[i].registered = false;
+            g_handler_count = g_handler_count - 1;
+            return true;
+        }
+        i = i + 1;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Handler Execution
+// ============================================================================
+
+/// Runs all registered handlers in priority order (highest first).
+///
+/// Handlers are run in reverse registration order within the same priority.
+function run_handlers() -> void {
+    if (g_running) {
+        // Prevent recursive calls
+        return;
+    }
+
+    g_running = true;
+
+    // Find the maximum priority
+    mut max_priority: i32 = -2147483648; // i32 min
+    mut i: u64 = 0;
+    while (i < MAX_HANDLERS) {
+        if (g_handlers[i].registered && g_handlers[i].priority > max_priority) {
+            max_priority = g_handlers[i].priority;
+        }
+        i = i + 1;
+    }
+
+    // Run handlers in priority order (highest first)
+    // Within same priority, run in reverse registration order
+    mut current_priority: i32 = max_priority;
+    while (g_handler_count > 0) {
+        // Find handlers at current priority (scan backwards for reverse order)
+        mut found_at_priority: boolean = false;
+        mut j: u64 = MAX_HANDLERS;
+        while (j > 0) {
+            j = j - 1;
+            if (g_handlers[j].registered && g_handlers[j].priority == current_priority) {
+                found_at_priority = true;
+
+                // Run the handler
+                const handler: AtexitHandler = g_handlers[j].handler;
+
+                // Mark as unregistered before calling (in case of panic)
+                g_handlers[j].handler = null;
+                g_handlers[j].priority = 0;
+                g_handlers[j].registered = false;
+                g_handler_count = g_handler_count - 1;
+
+                // Call the handler
+                if (handler != null) {
+                    handler();
+                }
+            }
+        }
+
+        // Move to next lower priority
+        if (!found_at_priority) {
+            // Find next lower priority
+            mut next_priority: i32 = -2147483648;
+            mut k: u64 = 0;
+            while (k < MAX_HANDLERS) {
+                if (g_handlers[k].registered &&
+                    g_handlers[k].priority < current_priority &&
+                    g_handlers[k].priority > next_priority) {
+                    next_priority = g_handlers[k].priority;
+                }
+                k = k + 1;
+            }
+
+            if (next_priority == -2147483648) {
+                // No more handlers
+                break;
+            }
+            current_priority = next_priority;
+        }
+    }
+
+    g_running = false;
+}
+
+// ============================================================================
+// Query Functions
+// ============================================================================
+
+/// Returns the number of registered handlers.
+function count() -> u64 {
+    return g_handler_count;
+}
+
+/// Returns true if handlers are currently running.
+function is_running() -> boolean {
+    return g_running;
+}
+
+/// Returns true if the atexit subsystem is initialized.
+function is_initialized() -> boolean {
+    return g_initialized;
+}
+

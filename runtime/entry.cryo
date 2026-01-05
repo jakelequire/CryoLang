@@ -1,0 +1,182 @@
+///! Program Entry Point
+///!
+///! This module provides the true entry point for Cryo programs.
+///! The `main` function here is called by the operating system,
+///! initializes the runtime, calls the user's main function,
+///! and handles cleanup.
+///!
+///! # Entry Point Flow
+///!
+///! 1. OS calls `main(argc, argv)`
+///! 2. Runtime initializes (memory, signals, etc.)
+///! 3. User's `_user_main_(argc, argv)` is called
+///! 4. Runtime shutdown occurs
+///! 5. Exit with user's return code
+///!
+///! # User Main Function
+///!
+///! The Cryo compiler renames the user's `main` function to `_user_main_`
+///! and ensures it has the signature:
+///!
+///! ```cryo
+///! function _user_main_(argc: i32, argv: string*) -> i32
+///! ```
+
+namespace cryo::runtime::entry;
+
+import <core/intrinsics>;
+import <runtime/init>;
+import <runtime/panic>;
+
+// ============================================================================
+// User Main Declaration
+// ============================================================================
+
+/// The user's main function (renamed by the compiler).
+///
+/// This is an external declaration - the actual implementation
+/// comes from the user's code.
+extern function _user_main_(argc: i32, argv: string*) -> i32;
+
+// ============================================================================
+// Entry Point
+// ============================================================================
+
+/// The true entry point called by the operating system.
+///
+/// This function:
+/// 1. Initializes the Cryo runtime
+/// 2. Calls the user's main function
+/// 3. Performs runtime shutdown
+/// 4. Returns the user's exit code
+function main(argc: i32, argv: string*) -> i32 {
+    // Initialize the runtime
+    const init_result: init::InitResult = init::runtime_init(argc, argv);
+
+    // Check for initialization failure
+    match (init_result) {
+        init::InitResult::Ok => {
+            // Runtime initialized successfully
+        }
+        init::InitResult::MemoryError => {
+            write_error("fatal: failed to initialize memory subsystem\n");
+            return 101;
+        }
+        init::InitResult::SignalError => {
+            write_error("fatal: failed to install signal handlers\n");
+            return 102;
+        }
+        init::InitResult::PlatformError => {
+            write_error("fatal: platform initialization failed\n");
+            return 103;
+        }
+        init::InitResult::AlreadyInitialized => {
+            // This shouldn't happen, but continue anyway
+        }
+    }
+
+    // Call the user's main function
+    mut user_result: i32 = 0;
+    mut panicked: boolean = false;
+
+    // Note: In a full implementation, we'd have try/catch here
+    // For now, panics will call exit() directly
+    user_result = _user_main_(argc, argv);
+
+    // Shutdown the runtime
+    init::runtime_shutdown();
+
+    // Return the user's exit code
+    return user_result;
+}
+
+// ============================================================================
+// Alternative Entry Points
+// ============================================================================
+
+/// Entry point for programs that don't need argc/argv.
+///
+/// Some programs may use this simpler entry point.
+function _start_simple() -> i32 {
+    return main(0, null);
+}
+
+/// Entry point for library initialization.
+///
+/// Called when the runtime is loaded as a shared library.
+function _cryo_init() -> void {
+    // Minimal initialization for library mode
+    const result: init::InitResult = init::runtime_init(0, null);
+    if (result != init::InitResult::Ok && result != init::InitResult::AlreadyInitialized) {
+        abort();
+    }
+}
+
+/// Entry point for library finalization.
+///
+/// Called when the runtime shared library is unloaded.
+function _cryo_fini() -> void {
+    init::runtime_shutdown();
+}
+
+// ============================================================================
+// Quick Exit
+// ============================================================================
+
+/// Exits the program immediately without running atexit handlers.
+///
+/// Use this for abnormal termination where cleanup is not safe.
+function quick_exit(status: i32) -> void {
+    _exit(status);
+}
+
+/// Exits the program, running atexit handlers.
+///
+/// This is the normal way to exit a Cryo program.
+function exit_program(status: i32) -> void {
+    init::runtime_shutdown();
+    exit(status);
+}
+
+// ============================================================================
+// Exit Codes
+// ============================================================================
+
+/// Exit code for successful execution.
+const EXIT_SUCCESS: i32 = 0;
+
+/// Exit code for general failure.
+const EXIT_FAILURE: i32 = 1;
+
+/// Exit code for panic.
+const EXIT_PANIC: i32 = 101;
+
+/// Exit code for memory initialization failure.
+const EXIT_MEMORY_ERROR: i32 = 102;
+
+/// Exit code for signal handler installation failure.
+const EXIT_SIGNAL_ERROR: i32 = 103;
+
+/// Exit code for platform initialization failure.
+const EXIT_PLATFORM_ERROR: i32 = 104;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Writes an error message to stderr.
+function write_error(msg: string) -> void {
+    const stderr_fd: i32 = 2;
+    write(stderr_fd, msg, strlen(msg));
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function exit(status: i32) -> void;
+intrinsic function _exit(status: i32) -> void;
+intrinsic function abort() -> void;
+intrinsic function write(fd: i32, buf: void*, count: u64) -> i64;
+intrinsic function strlen(s: string) -> u64;
+
