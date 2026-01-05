@@ -15,11 +15,15 @@ namespace Cryo::CLI
         // [project] section
         std::string project_name;
         std::string output_dir = "build";
-        std::string target_type = "executable";
+        std::string target_type = "executable";  // "executable", "static_library", "shared_library"
+        std::string entry_point = "src/main.cryo";  // Configurable entry point
+        std::string source_dir = "src";             // Source directory root
 
         // [compiler] section
         bool debug = false;
         bool optimize = true;
+        bool stdlib_mode = false;  // Compile in stdlib mode (for runtime/stdlib)
+        bool no_std = false;       // Don't link standard library
         std::vector<std::string> args;
 
         // [dependencies] section (future feature)

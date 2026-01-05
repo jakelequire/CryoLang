@@ -61,6 +61,14 @@ namespace Cryo::CLI
                     {
                         config.target_type = value;
                     }
+                    else if (key == "entry_point")
+                    {
+                        config.entry_point = value;
+                    }
+                    else if (key == "source_dir")
+                    {
+                        config.source_dir = value;
+                    }
                 }
                 else if (current_section == "compiler")
                 {
@@ -71,6 +79,14 @@ namespace Cryo::CLI
                     else if (key == "optimize")
                     {
                         config.optimize = parse_bool(value);
+                    }
+                    else if (key == "stdlib_mode")
+                    {
+                        config.stdlib_mode = parse_bool(value);
+                    }
+                    else if (key == "no_std")
+                    {
+                        config.no_std = parse_bool(value);
                     }
                     else if (key == "args")
                     {
