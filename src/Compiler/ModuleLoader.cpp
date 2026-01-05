@@ -288,10 +288,10 @@ namespace Cryo
 
         auto &os = Cryo::Utils::OS::instance();
         std::string resolved = os.join_path(_stdlib_root, file_path);
-        return resolve_module_file_path(resolved);
+        return resolve_module_file_path(resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
     }
 
-    std::string ModuleLoader::resolve_module_file_path(const std::string &module_path)
+    std::string ModuleLoader::resolve_module_file_path(const std::string &module_path, ImportDeclarationNode::ImportStyle import_style)
     {
         auto &os = Cryo::Utils::OS::instance();
         std::string abs_path = os.absolute_path(module_path);
