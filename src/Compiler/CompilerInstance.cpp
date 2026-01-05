@@ -402,6 +402,10 @@ namespace Cryo
             std::string namespace_for_module = _current_namespace.empty() ? "cryo_program" : _current_namespace;
             _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module, _diagnostic_manager.get());
 
+            // Set source info immediately after creating CodeGenerator
+            // This ensures namespace context is available for analyze() which may initialize the visitor
+            _codegen->set_source_info(_source_file, _current_namespace);
+
             // Configure stdlib compilation mode if enabled
             if (_stdlib_compilation_mode)
             {
@@ -1286,6 +1290,34 @@ namespace Cryo
             current_scope->declare_symbol(enum_decl->name(), SymbolKind::Type,
                                           enum_decl->location(), enum_type, scope_name);
 
+            // IMMEDIATELY register enum variants in codegen context to prevent early reference issues
+            // This ensures variants are available when struct constructors reference them during pre-registration
+            if (_codegen && _codegen->ensure_visitor_initialized())
+            {
+                auto *visitor = _codegen->get_visitor();
+                auto &enum_variants_map = visitor->context().enum_variants_map();
+
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registering enum variants for {}", enum_decl->name());
+
+                // For simple enums, register integer constants for each variant
+                if (is_simple_enum)
+                {
+                    for (size_t i = 0; i < variant_names.size(); ++i)
+                    {
+                        std::string qualified_name = enum_decl->name() + "::" + variant_names[i];
+
+                        // Create integer constant for this variant
+                        llvm::Constant *variant_const = llvm::ConstantInt::get(
+                            llvm::Type::getInt32Ty(visitor->context().llvm_context()),
+                            static_cast<uint64_t>(i));
+
+                        // Register in enum_variants_map
+                        enum_variants_map[qualified_name] = variant_const;
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registered enum variant: {} = {}", qualified_name, i);
+                    }
+                }
+            }
+
             // Register generic enum templates if this enum has generic parameters
             if (!enum_decl->generic_parameters().empty())
             {
@@ -1420,12 +1452,39 @@ namespace Cryo
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to load import '{}': {}", import_decl->path(), result.error_message);
             }
         }
-        // Skip variable declarations in first pass - they don't need forward declaration
-        // and will be processed by TypeChecker in second pass
+        // Handle global constants in first pass to prevent early reference issues
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Skip variable declarations in collect_declarations_pass
-            // They will be properly handled by TypeChecker
+            // Only handle global constants - regular variables are processed by TypeChecker
+            if (var_decl->is_global() && !var_decl->is_mutable() && var_decl->has_initializer())
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registering global constant: {}", var_decl->name());
+
+                // IMMEDIATELY register global constant in codegen context to prevent early reference issues
+                if (_codegen && _codegen->ensure_visitor_initialized())
+                {
+                    auto *visitor = _codegen->get_visitor();
+
+                    // Pre-register global constant with a placeholder value
+                    // The actual value will be generated later during proper codegen
+                    llvm::GlobalVariable *global_var = new llvm::GlobalVariable(
+                        *visitor->context().module(),
+                        visitor->context().types().map(var_decl->get_resolved_type()),
+                        true, // is_constant
+                        llvm::GlobalValue::ExternalLinkage,
+                        nullptr, // initializer will be set later
+                        var_decl->name());
+
+                    // Store in globals map for later retrieval
+                    visitor->context().globals_map()[var_decl->name()] = global_var;
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registered global constant: {}", var_decl->name());
+                }
+
+                // Still register in symbol table for type checking
+                current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
+                                              var_decl->location(), var_decl->get_resolved_type(), scope_name);
+            }
+            // Skip other variable declarations - they will be properly handled by TypeChecker
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
@@ -1672,8 +1731,7 @@ namespace Cryo
             return; // Don't do other auto-imports in stdlib mode
         }
 
-        // Skip auto-import if we're in stdlib compilation mode to avoid circular dependencies
-        // Exception: runtime files need access to core/types for string methods
+        // Determine if this is a runtime file that needs special handling
         bool is_runtime_file = (_source_file.find("runtime/runtime.cryo") != std::string::npos ||
                                 _source_file.find("stdlib/runtime/runtime.cryo") != std::string::npos ||
                                 _source_file.find("runtime\\runtime.cryo") != std::string::npos ||
@@ -1682,6 +1740,8 @@ namespace Cryo
                                 _source_file == "runtime/runtime" ||
                                 _source_file == "std::Runtime.cryo");
 
+        // Skip auto-import if we're in stdlib compilation mode to avoid circular dependencies
+        // Exception: runtime files already handled above with intrinsics + core/types
         if (_stdlib_compilation_mode && !is_runtime_file)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports in stdlib compilation mode");
@@ -1942,13 +2002,15 @@ namespace Cryo
         if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering struct AST node: {}", struct_decl->name());
-            type_mapper->register_struct_ast_node(struct_decl);
+            // TODO: Implement proper struct registration with AST node
+            // type_mapper->register_struct_ast_node(struct_decl);
         }
         // Register class declarations
         else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(node))
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering class AST node: {}", class_decl->name());
-            type_mapper->register_class_ast_node(class_decl);
+            // TODO: Implement proper class registration with AST node
+            // type_mapper->register_class_ast_node(class_decl);
         }
         // Recurse into program nodes
         else if (auto program = dynamic_cast<ProgramNode *>(node))

@@ -98,12 +98,18 @@ namespace Cryo::Codegen
 
     bool ValueContext::is_lvalue(llvm::Value *value)
     {
+        // Guard against null values - isa asserts on null
+        if (!value)
+            return false;
         return llvm::isa<llvm::AllocaInst>(value) ||
                llvm::isa<llvm::GlobalVariable>(value);
     }
 
     llvm::AllocaInst *ValueContext::get_value_alloca(llvm::Value *value)
     {
+        // Guard against null values - dyn_cast asserts on null
+        if (!value)
+            return nullptr;
         return llvm::dyn_cast<llvm::AllocaInst>(value);
     }
 

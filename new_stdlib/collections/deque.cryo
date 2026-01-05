@@ -1,0 +1,679 @@
+///! Deque - Double-Ended Queue
+///!
+///! A double-ended queue implemented with a growable ring buffer.
+///! Provides O(1) push and pop at both ends.
+
+namespace std::collections::deque;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+
+// ============================================================================
+// Deque
+// ============================================================================
+
+/// A double-ended queue implemented as a ring buffer.
+type struct Deque<T> {
+    /// Pointer to the buffer.
+    buf: T*;
+    /// Index of the first element.
+    head: u64;
+    /// Number of elements.
+    len: u64;
+    /// Capacity of the buffer.
+    cap: u64;
+
+    Deque();
+    Deque(capacity: u64);
+
+    len(&this) -> u64;
+    capacity(&this) -> u64;
+    is_empty(&this) -> boolean;
+    is_full(&this) -> boolean;
+    reserve(mut &this, additional: u64) -> void;
+    shrink_to_fit(mut &this) -> void;
+
+    front(&this) -> Option<T>;
+    front_ref(&this) -> T*;
+    back(&this) -> Option<T>;
+    back_ref(&this) -> T*;
+    get(&this, index: u64) -> Option<T>;
+    get_ref(&this, index: u64) -> T*;
+    set(mut &this, index: u64, value: T) -> void;
+
+    push_front(mut &this, value: T) -> void;
+    pop_front(mut &this) -> Option<T>;
+    push_back(mut &this, value: T) -> void;
+    pop_back(mut &this) -> Option<T>;
+
+    insert(mut &this, index: u64, value: T) -> void;
+    remove(mut &this, index: u64) -> T;
+    swap_remove_front(mut &this, index: u64) -> T;
+    swap_remove_back(mut &this, index: u64) -> T;
+
+    clear(mut &this) -> void;
+    rotate_left(mut &this, n: u64) -> void;
+    rotate_right(mut &this, n: u64) -> void;
+    swap(mut &this, a: u64, b: u64) -> void;
+
+    contains(&this, value: T) -> boolean;
+    find(&this, value: T) -> Option<u64>;
+
+    iter(&this) -> DequeIter<T>;
+
+    wrap_index(&this, index: u64) -> u64;
+    grow(mut &this, new_cap: u64) -> void;
+
+    drop(&this) -> void;
+    clone(&this) -> Deque<T>;
+    make_contiguous(mut &this) -> T*;
+
+    push(mut &this, value: T) -> void;
+    pop(mut &this) -> Option<T>;
+    peek(&this) -> Option<T>;
+
+    enqueue(mut &this, value: T) -> void;
+    dequeue(mut &this) -> Option<T>;
+}
+
+implement struct Deque<T> {
+    /// Creates a new empty Deque.
+    Deque() {
+        this.buf = null;
+        this.head = 0;
+        this.len = 0;
+        this.cap = 0;
+    }
+
+    /// Creates a Deque with the specified capacity.
+    Deque(capacity: u64) {
+        if (capacity == 0) {
+            this.buf = null;
+            this.head = 0;
+            this.len = 0;
+            this.cap = 0;
+            return;
+        }
+
+        // Round up to power of 2 for efficient modulo
+        mut actual_cap: u64 = 1;
+        while (actual_cap < capacity) {
+            actual_cap = actual_cap * 2;
+        }
+
+        const buf: T* = malloc(sizeof(T) * actual_cap);
+        if (buf == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        this.buf = buf;
+        this.head = 0;
+        this.len = 0;
+        this.cap = actual_cap;
+    }
+
+    // ========================================================================
+    // Capacity
+    // ========================================================================
+
+    /// Returns the number of elements.
+    len(&this) -> u64 {
+        return this.len;
+    }
+
+    /// Returns the capacity.
+    capacity(&this) -> u64 {
+        return this.cap;
+    }
+
+    /// Returns true if the deque is empty.
+    is_empty(&this) -> boolean {
+        return this.len == 0;
+    }
+
+    /// Returns true if the deque is full.
+    is_full(&this) -> boolean {
+        return this.len == this.cap;
+    }
+
+    /// Reserves capacity for at least `additional` more elements.
+    reserve(mut &this, additional: u64) -> void {
+        const required: u64 = this.len + additional;
+        if (required <= this.cap) {
+            return;
+        }
+
+        mut new_cap: u64 = this.cap;
+        if (new_cap == 0) {
+            new_cap = 4;
+        }
+        while (new_cap < required) {
+            new_cap = new_cap * 2;
+        }
+
+        this.grow(new_cap);
+    }
+
+    /// Shrinks the capacity to fit.
+    shrink_to_fit(mut &this) -> void {
+        if (this.len == 0) {
+            if (this.buf != null) {
+                free(this.buf);
+                this.buf = null;
+                this.cap = 0;
+            }
+            return;
+        }
+
+        // Round up to power of 2
+        mut new_cap: u64 = 1;
+        while (new_cap < this.len) {
+            new_cap = new_cap * 2;
+        }
+
+        if (new_cap < this.cap) {
+            this.grow(new_cap);
+        }
+    }
+
+    // ========================================================================
+    // Access
+    // ========================================================================
+
+    /// Returns the front element.
+    front(&this) -> Option<T> {
+        if (this.len == 0) {
+            return Option::None;
+        }
+        return Option::Some(this.buf[this.head]);
+    }
+
+    /// Returns a reference to the front element.
+    front_ref(&this) -> T* {
+        if (this.len == 0) {
+            return null;
+        }
+        return &this.buf[this.head];
+    }
+
+    /// Returns the back element.
+    back(&this) -> Option<T> {
+        if (this.len == 0) {
+            return Option::None;
+        }
+        return Option::Some(this.buf[this.wrap_index(this.head + this.len - 1)]);
+    }
+
+    /// Returns a reference to the back element.
+    back_ref(&this) -> T* {
+        if (this.len == 0) {
+            return null;
+        }
+        return &this.buf[this.wrap_index(this.head + this.len - 1)];
+    }
+
+    /// Gets an element at the given index.
+    get(&this, index: u64) -> Option<T> {
+        if (index >= this.len) {
+            return Option::None;
+        }
+        return Option::Some(this.buf[this.wrap_index(this.head + index)]);
+    }
+
+    /// Gets a reference to an element at the given index.
+    get_ref(&this, index: u64) -> T* {
+        if (index >= this.len) {
+            return null;
+        }
+        return &this.buf[this.wrap_index(this.head + index)];
+    }
+
+    /// Sets an element at the given index.
+    set(mut &this, index: u64, value: T) -> void {
+        if (index >= this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+        this.buf[this.wrap_index(this.head + index)] = value;
+    }
+
+    // ========================================================================
+    // Modification - Front
+    // ========================================================================
+
+    /// Pushes a value to the front.
+    push_front(mut &this, value: T) -> void {
+        if (this.len == this.cap) {
+            this.reserve(1);
+        }
+
+        // Move head backwards
+        if (this.head == 0) {
+            this.head = this.cap - 1;
+        } else {
+            this.head = this.head - 1;
+        }
+
+        this.buf[this.head] = value;
+        this.len = this.len + 1;
+    }
+
+    /// Pops a value from the front.
+    pop_front(mut &this) -> Option<T> {
+        if (this.len == 0) {
+            return Option::None;
+        }
+
+        const value: T = this.buf[this.head];
+        this.head = this.wrap_index(this.head + 1);
+        this.len = this.len - 1;
+
+        return Option::Some(value);
+    }
+
+    // ========================================================================
+    // Modification - Back
+    // ========================================================================
+
+    /// Pushes a value to the back.
+    push_back(mut &this, value: T) -> void {
+        if (this.len == this.cap) {
+            this.reserve(1);
+        }
+
+        const tail: u64 = this.wrap_index(this.head + this.len);
+        this.buf[tail] = value;
+        this.len = this.len + 1;
+    }
+
+    /// Pops a value from the back.
+    pop_back(mut &this) -> Option<T> {
+        if (this.len == 0) {
+            return Option::None;
+        }
+
+        this.len = this.len - 1;
+        const tail: u64 = this.wrap_index(this.head + this.len);
+        return Option::Some(this.buf[tail]);
+    }
+
+    // ========================================================================
+    // Modification - Indexed
+    // ========================================================================
+
+    /// Inserts a value at the given index.
+    insert(mut &this, index: u64, value: T) -> void {
+        if (index > this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        if (this.len == this.cap) {
+            this.reserve(1);
+        }
+
+        if (index == 0) {
+            this.push_front(value);
+            return;
+        }
+
+        if (index == this.len) {
+            this.push_back(value);
+            return;
+        }
+
+        // Decide whether to shift front or back portion
+        if (index < this.len / 2) {
+            // Shift front portion left
+            if (this.head == 0) {
+                this.head = this.cap - 1;
+            } else {
+                this.head = this.head - 1;
+            }
+
+            // Shift elements
+            mut i: u64 = 0;
+            while (i < index) {
+                const _from: u64 = this.wrap_index(this.head + i + 1);
+                const _to: u64 = this.wrap_index(this.head + i);
+                this.buf[_to] = this.buf[_from];
+                i = i + 1;
+            }
+        } else {
+            // Shift back portion right
+            mut i: u64 = this.len;
+            while (i > index) {
+                const _from: u64 = this.wrap_index(this.head + i - 1);
+                const _to: u64 = this.wrap_index(this.head + i);
+                this.buf[_to] = this.buf[_from];
+                i = i - 1;
+            }
+        }
+
+        this.buf[this.wrap_index(this.head + index)] = value;
+        this.len = this.len + 1;
+    }
+
+    /// Removes the element at the given index.
+    remove(mut &this, index: u64) -> T {
+        if (index >= this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const value: T = this.buf[this.wrap_index(this.head + index)];
+
+        if (index == 0) {
+            this.head = this.wrap_index(this.head + 1);
+        } else if (index < this.len / 2) {
+            // Shift front portion right
+            mut i: u64 = index;
+            while (i > 0) {
+                const _from: u64 = this.wrap_index(this.head + i - 1);
+                const _to: u64 = this.wrap_index(this.head + i);
+                this.buf[_to] = this.buf[_from];
+                i = i - 1;
+            }
+            this.head = this.wrap_index(this.head + 1);
+        } else {
+            // Shift back portion left
+            mut i: u64 = index;
+            while (i < this.len - 1) {
+                const _from: u64 = this.wrap_index(this.head + i + 1);
+                const _to: u64 = this.wrap_index(this.head + i);
+                this.buf[_to] = this.buf[_from];
+                i = i + 1;
+            }
+        }
+
+        this.len = this.len - 1;
+        return value;
+    }
+
+    /// Swap-removes the element at the given index.
+    swap_remove_front(mut &this, index: u64) -> T {
+        if (index >= this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const value: T = this.buf[this.wrap_index(this.head + index)];
+
+        if (index != 0) {
+            this.swap(0, index);
+        }
+
+        this.head = this.wrap_index(this.head + 1);
+        this.len = this.len - 1;
+
+        return value;
+    }
+
+    /// Swap-removes the element at the given index (back variant).
+    swap_remove_back(mut &this, index: u64) -> T {
+        if (index >= this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const value: T = this.buf[this.wrap_index(this.head + index)];
+
+        if (index != this.len - 1) {
+            this.swap(index, this.len - 1);
+        }
+
+        this.len = this.len - 1;
+
+        return value;
+    }
+
+    // ========================================================================
+    // Bulk Operations
+    // ========================================================================
+
+    /// Clears the deque.
+    clear(mut &this) -> void {
+        this.head = 0;
+        this.len = 0;
+    }
+
+    /// Rotates the deque left by n positions.
+    rotate_left(mut &this, n: u64) -> void {
+        if (this.len <= 1 || n == 0) {
+            return;
+        }
+
+        const k: u64 = n % this.len;
+        this.head = this.wrap_index(this.head + k);
+    }
+
+    /// Rotates the deque right by n positions.
+    rotate_right(mut &this, n: u64) -> void {
+        if (this.len <= 1 || n == 0) {
+            return;
+        }
+
+        const k: u64 = n % this.len;
+        if (this.head >= k) {
+            this.head = this.head - k;
+        } else {
+            this.head = this.cap - (k - this.head);
+        }
+    }
+
+    /// Swaps two elements.
+    swap(mut &this, a: u64, b: u64) -> void {
+        if (a >= this.len || b >= this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const idx_a: u64 = this.wrap_index(this.head + a);
+        const idx_b: u64 = this.wrap_index(this.head + b);
+
+        const temp: T = this.buf[idx_a];
+        this.buf[idx_a] = this.buf[idx_b];
+        this.buf[idx_b] = temp;
+    }
+
+    // ========================================================================
+    // Searching
+    // ========================================================================
+
+    /// Returns true if the deque contains the value.
+    contains(&this, value: T) -> boolean {
+        return this.find(value).is_some();
+    }
+
+    /// Finds the index of the first occurrence.
+    find(&this, value: T) -> Option<u64> {
+        mut i: u64 = 0;
+        while (i < this.len) {
+            if (this.buf[this.wrap_index(this.head + i)] == value) {
+                return Option::Some(i);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    // ========================================================================
+    // Iteration
+    // ========================================================================
+
+    /// Creates an iterator over the deque.
+    iter(&this) -> DequeIter<T> {
+        return DequeIter {
+            deque: &this,
+            current: 0
+        };
+    }
+
+    // ========================================================================
+    // Internal Helpers
+    // ========================================================================
+
+    /// Wraps an index within the buffer bounds.
+    wrap_index(&this, index: u64) -> u64 {
+        if (this.cap == 0) {
+            return 0;
+        }
+        // Using bitwise AND since capacity is always power of 2
+        return index & (this.cap - 1);
+    }
+
+    /// Grows the buffer to the new capacity.
+    grow(mut &this, new_cap: u64) -> void {
+        const new_buf: T* = malloc(sizeof(T) * new_cap);
+        if (new_buf == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+
+        // Copy elements in order
+        if (this.len > 0) {
+            const tail: u64 = this.wrap_index(this.head + this.len);
+
+            if (this.head < tail) {
+                // Elements are contiguous
+                memcpy(new_buf, &this.buf[this.head], sizeof(T) * this.len);
+            } else {
+                // Elements wrap around
+                const first_part: u64 = this.cap - this.head;
+                memcpy(new_buf, &this.buf[this.head], sizeof(T) * first_part);
+                memcpy(&new_buf[first_part], this.buf, sizeof(T) * tail);
+            }
+        }
+
+        if (this.buf != null) {
+            free(this.buf);
+        }
+
+        this.buf = new_buf;
+        this.head = 0;
+        this.cap = new_cap;
+    }
+
+    // ========================================================================
+    // Memory Management
+    // ========================================================================
+
+    /// Drops the deque.
+    drop(&this) -> void {
+        if (this.buf != null) {
+            free(this.buf);
+        }
+    }
+
+    /// Clones the deque.
+    clone(&this) -> Deque<T> {
+        if (this.len == 0) {
+            return new Deque();
+        }
+
+        const result: Deque<T> = new Deque(this.len);
+
+        mut i: u64 = 0;
+        while (i < this.len) {
+            result.push_back(this.buf[this.wrap_index(this.head + i)]);
+            i = i + 1;
+        }
+
+        return result;
+    }
+
+    /// Converts to a contiguous Vec-like layout.
+    make_contiguous(mut &this) -> T* {
+        if (this.len == 0) {
+            return this.buf;
+        }
+
+        const tail: u64 = this.wrap_index(this.head + this.len);
+
+        if (this.head < tail || this.head == 0) {
+            // Already contiguous
+            return &this.buf[this.head];
+        }
+
+        // Need to make contiguous
+        this.grow(this.cap);
+        return this.buf;
+    }
+
+    // ========================================================================
+    // Stack Interface
+    // ========================================================================
+
+    /// Pushes to the stack (alias for push_back).
+    push(mut &this, value: T) -> void {
+        this.push_back(value);
+    }
+
+    /// Pops from the stack (alias for pop_back).
+    pop(mut &this) -> Option<T> {
+        return this.pop_back();
+    }
+
+    /// Peeks at the top of the stack.
+    peek(&this) -> Option<T> {
+        return this.back();
+    }
+
+    // ========================================================================
+    // Queue Interface
+    // ========================================================================
+
+    /// Enqueues a value (alias for push_back).
+    enqueue(mut &this, value: T) -> void {
+        this.push_back(value);
+    }
+
+    /// Dequeues a value (alias for pop_front).
+    dequeue(mut &this) -> Option<T> {
+        return this.pop_front();
+    }
+}
+
+// ============================================================================
+// Iterator
+// ============================================================================
+
+/// Iterator over a Deque.
+type struct DequeIter<T> {
+    deque: Deque<T>*;
+    current: u64;
+
+    has_next(&this) -> boolean;
+    next(mut &this) -> Option<T>;
+    remaining(&this) -> u64;
+}
+
+implement struct DequeIter<T> {
+    has_next(&this) -> boolean {
+        return this.current < this.deque.len;
+    }
+
+    next(mut &this) -> Option<T> {
+        if (this.current >= this.deque.len) {
+            return Option::None;
+        }
+
+        const index: u64 = this.deque.wrap_index(this.deque.head + this.current);
+        const value: T = this.deque.buf[index];
+        this.current = this.current + 1;
+        return Option::Some(value);
+    }
+
+    remaining(&this) -> u64 {
+        return this.deque.len - this.current;
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a new empty Deque.
+function deque<T>() -> Deque<T> {
+    return new Deque();
+}
+
+/// Creates a Deque with capacity.
+function deque_with_capacity<T>(capacity: u64) -> Deque<T> {
+    return new Deque(capacity);
+}

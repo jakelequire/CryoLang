@@ -1,0 +1,318 @@
+///! Mutex - Mutual Exclusion Lock
+///!
+///! A mutual exclusion primitive useful for protecting shared data.
+
+namespace std::sync::mutex;
+
+import <core/intrinsics>;
+import <core/option>;
+import <alloc/global>;
+
+// ============================================================================
+// Mutex
+// ============================================================================
+
+/// A mutual exclusion lock.
+type struct Mutex<T> {
+    /// The underlying pthread mutex.
+    inner: pthread_mutex_t;
+    /// The protected data.
+    data: T;
+    /// Whether the mutex has been poisoned.
+    poisoned: boolean;
+
+    // Method signatures
+    Mutex(data: T) -> Mutex<T>;
+    lock(mut &this) -> MutexGuard<T>;
+    try_lock(mut &this) -> Option<MutexGuard<T>>;
+    is_poisoned(&this) -> boolean;
+    get_mut(mut &this) -> T*;
+    into_inner(&this) -> T;
+    drop(&this) -> void;
+}
+
+implement struct Mutex<T> {
+    /// Creates a new mutex protecting the given data.
+    Mutex(data: T) -> Mutex<T> {
+        const mutex: Mutex<T> = Mutex {
+            inner: pthread_mutex_t::new(),
+            data: data,
+            poisoned: false
+        };
+        pthread_mutex_init(&mutex.inner, null);
+        return mutex;
+    }
+
+    /// Acquires the mutex, blocking until available.
+    lock(mut &this) -> MutexGuard<T> {
+        pthread_mutex_lock(&this.inner);
+
+        if (this.poisoned) {
+            // In a full implementation, would return Result with PoisonError
+        }
+
+        return MutexGuard {
+            mutex: this,
+            locked: true
+        };
+    }
+
+    /// Attempts to acquire the mutex without blocking.
+    try_lock(mut &this) -> Option<MutexGuard<T>> {
+        const result: i32 = pthread_mutex_trylock(&this.inner);
+        if (result == 0) {
+            return Option::Some(MutexGuard {
+                mutex: this,
+                locked: true
+            });
+        }
+        return Option::None;
+    }
+
+    /// Returns whether the mutex is poisoned.
+    is_poisoned(&this) -> boolean {
+        return this.poisoned;
+    }
+
+    /// Gets a mutable reference to the underlying data.
+    /// This is safe because we have exclusive access to the Mutex.
+    get_mut(mut &this) -> T* {
+        return &this.data;
+    }
+
+    /// Consumes the mutex and returns the underlying data.
+    into_inner(&this) -> T {
+        pthread_mutex_destroy(&this.inner);
+        return this.data;
+    }
+
+    /// Drops the mutex.
+    drop(&this) -> void {
+        pthread_mutex_destroy(&this.inner);
+    }
+}
+
+// ============================================================================
+// MutexGuard
+// ============================================================================
+
+/// A guard that releases the mutex when dropped.
+type struct MutexGuard<T> {
+    mutex: Mutex<T>*;
+    locked: boolean;
+
+    // Method signatures
+    get(&this) -> T*;
+    get_mut(&this) -> T*;
+    unlock(mut &this) -> void;
+    drop(&this) -> void;
+}
+
+implement struct MutexGuard<T> {
+    /// Returns a reference to the protected data.
+    get(&this) -> T* {
+        return &this.mutex.data;
+    }
+
+    /// Returns a mutable reference to the protected data.
+    get_mut(&this) -> T* {
+        return &this.mutex.data;
+    }
+
+    /// Unlocks the mutex.
+    unlock(mut &this) -> void {
+        if (this.locked) {
+            pthread_mutex_unlock(&this.mutex.inner);
+            this.locked = false;
+        }
+    }
+
+    /// Drops the guard, releasing the mutex.
+    drop(&this) -> void {
+        if (this.locked) {
+            pthread_mutex_unlock(&this.mutex.inner);
+        }
+    }
+}
+
+// ============================================================================
+// Spin Lock
+// ============================================================================
+
+/// A simple spin lock.
+type struct SpinLock {
+    locked: AtomicBool;
+
+    // Method signatures
+    SpinLock() -> SpinLock;
+    lock(mut &this) -> void;
+    try_lock(mut &this) -> boolean;
+    unlock(mut &this) -> void;
+}
+
+implement struct SpinLock {
+    /// Creates a new spin lock.
+    SpinLock() -> SpinLock {
+        return SpinLock { locked: AtomicBool::new(false) };
+    }
+
+    /// Acquires the spin lock.
+    lock(mut &this) -> void {
+        while (this.locked.swap(true, MemoryOrder::Acquire)) {
+            // Spin
+            while (this.locked.load(MemoryOrder::Relaxed)) {
+                // CPU pause hint
+                cpu_pause();
+            }
+        }
+    }
+
+    /// Attempts to acquire without spinning.
+    try_lock(mut &this) -> boolean {
+        return !this.locked.swap(true, MemoryOrder::Acquire);
+    }
+
+    /// Releases the spin lock.
+    unlock(mut &this) -> void {
+        this.locked.store(false, MemoryOrder::Release);
+    }
+}
+
+// ============================================================================
+// Reentrant Mutex
+// ============================================================================
+
+/// A mutex that can be locked multiple times by the same thread.
+type struct ReentrantMutex<T> {
+    inner: pthread_mutex_t;
+    data: T;
+
+    // Method signatures
+    ReentrantMutex(data: T) -> ReentrantMutex<T>;
+    lock(mut &this) -> ReentrantMutexGuard<T>;
+    try_lock(mut &this) -> Option<ReentrantMutexGuard<T>>;
+    drop(&this) -> void;
+}
+
+implement struct ReentrantMutex<T> {
+    /// Creates a new reentrant mutex.
+    ReentrantMutex(data: T) -> ReentrantMutex<T> {
+        const mutex: ReentrantMutex<T> = ReentrantMutex {
+            inner: pthread_mutex_t::new(),
+            data: data
+        };
+
+        // Set recursive attribute
+        mut attr: pthread_mutexattr_t;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&mutex.inner, &attr);
+        pthread_mutexattr_destroy(&attr);
+
+        return mutex;
+    }
+
+    /// Locks the mutex.
+    lock(mut &this) -> ReentrantMutexGuard<T> {
+        pthread_mutex_lock(&this.inner);
+        return ReentrantMutexGuard { mutex: this };
+    }
+
+    /// Tries to lock without blocking.
+    try_lock(mut &this) -> Option<ReentrantMutexGuard<T>> {
+        const result: i32 = pthread_mutex_trylock(&this.inner);
+        if (result == 0) {
+            return Option::Some(ReentrantMutexGuard { mutex: this });
+        }
+        return Option::None;
+    }
+
+    /// Drops the mutex.
+    drop(&this) -> void {
+        pthread_mutex_destroy(&this.inner);
+    }
+}
+
+/// Guard for reentrant mutex.
+type struct ReentrantMutexGuard<T> {
+    mutex: ReentrantMutex<T>*;
+
+    // Method signatures
+    get(&this) -> T*;
+    get_mut(&this) -> T*;
+    drop(&this) -> void;
+}
+
+implement struct ReentrantMutexGuard<T> {
+    get(&this) -> T* {
+        return &this.mutex.data;
+    }
+
+    get_mut(&this) -> T* {
+        return &this.mutex.data;
+    }
+
+    drop(&this) -> void {
+        pthread_mutex_unlock(&this.mutex.inner);
+    }
+}
+
+// ============================================================================
+// Types and Intrinsics
+// ============================================================================
+
+/// Memory ordering for atomic operations.
+enum MemoryOrder {
+    Relaxed;
+    Acquire;
+    Release;
+    AcqRel;
+    SeqCst;
+}
+
+/// Atomic boolean.
+type struct AtomicBool {
+    value: boolean;
+
+    // Method signatures
+    AtomicBool(value: boolean) -> AtomicBool;
+    load(&this, order: MemoryOrder) -> boolean;
+    store(mut &this, value: boolean, order: MemoryOrder) -> void;
+    swap(mut &this, value: boolean, order: MemoryOrder) -> boolean;
+}
+
+implement struct AtomicBool {
+    AtomicBool(value: boolean) -> AtomicBool {
+        return AtomicBool { value: value };
+    }
+
+    load(&this, order: MemoryOrder) -> boolean {
+        return atomic_load_bool(&this.value, order);
+    }
+
+    store(mut &this, value: boolean, order: MemoryOrder) -> void {
+        atomic_store_bool(&this.value, value, order);
+    }
+
+    swap(mut &this, value: boolean, order: MemoryOrder) -> boolean {
+        return atomic_swap_bool(&this.value, value, order);
+    }
+}
+
+type pthread_mutex_t = void[48]; // Platform-specific size
+type pthread_mutexattr_t = void[8];
+
+const PTHREAD_MUTEX_RECURSIVE: i32 = 1;
+
+intrinsic function pthread_mutex_init(mutex: pthread_mutex_t*, attr: pthread_mutexattr_t*) -> i32;
+intrinsic function pthread_mutex_destroy(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_mutex_lock(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_mutex_unlock(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_mutex_trylock(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_mutexattr_init(attr: pthread_mutexattr_t*) -> i32;
+intrinsic function pthread_mutexattr_destroy(attr: pthread_mutexattr_t*) -> i32;
+intrinsic function pthread_mutexattr_settype(attr: pthread_mutexattr_t*, type: i32) -> i32;
+intrinsic function atomic_load_bool(ptr: boolean*, order: MemoryOrder) -> boolean;
+intrinsic function atomic_store_bool(ptr: boolean*, value: boolean, order: MemoryOrder) -> void;
+intrinsic function atomic_swap_bool(ptr: boolean*, value: boolean, order: MemoryOrder) -> boolean;
+intrinsic function cpu_pause() -> void;

@@ -1,0 +1,106 @@
+///! Barrier - Thread Synchronization
+///!
+///! A barrier enables multiple threads to synchronize at a point.
+
+namespace std::sync::barrier;
+
+import <core/intrinsics>;
+import <alloc/global>;
+
+// ============================================================================
+// Barrier
+// ============================================================================
+
+/// A barrier that synchronizes multiple threads.
+type struct Barrier {
+    mutex: pthread_mutex_t;
+    cond: pthread_cond_t;
+    count: u64;
+    total: u64;
+    generation: u64;
+
+    // Method signatures
+    Barrier(count: u64) -> Barrier;
+    wait(mut &this) -> BarrierWaitResult;
+    drop(&this) -> void;
+}
+
+implement struct Barrier {
+    /// Creates a new barrier for the given number of threads.
+    Barrier(count: u64) -> Barrier {
+        const barrier: Barrier = Barrier {
+            mutex: pthread_mutex_t::new(),
+            cond: pthread_cond_t::new(),
+            count: count,
+            total: count,
+            generation: 0
+        };
+
+        pthread_mutex_init(&barrier.mutex, null);
+        pthread_cond_init(&barrier.cond, null);
+
+        return barrier;
+    }
+
+    /// Waits at the barrier until all threads arrive.
+    wait(mut &this) -> BarrierWaitResult {
+        pthread_mutex_lock(&this.mutex);
+
+        const local_gen: u64 = this.generation;
+        this.count = this.count - 1;
+
+        if (this.count == 0) {
+            // Last thread to arrive
+            this.generation = this.generation + 1;
+            this.count = this.total;
+            pthread_cond_broadcast(&this.cond);
+            pthread_mutex_unlock(&this.mutex);
+            return BarrierWaitResult { is_leader: true };
+        }
+
+        // Wait for the generation to change
+        while (local_gen == this.generation) {
+            pthread_cond_wait(&this.cond, &this.mutex);
+        }
+
+        pthread_mutex_unlock(&this.mutex);
+        return BarrierWaitResult { is_leader: false };
+    }
+
+    /// Drops the barrier.
+    drop(&this) -> void {
+        pthread_mutex_destroy(&this.mutex);
+        pthread_cond_destroy(&this.cond);
+    }
+}
+
+/// Result of waiting at a barrier.
+type struct BarrierWaitResult {
+    is_leader: boolean;
+
+    // Method signatures
+    is_leader(&this) -> boolean;
+}
+
+implement struct BarrierWaitResult {
+    /// Returns true if this thread is the "leader" (last to arrive).
+    is_leader(&this) -> boolean {
+        return this.is_leader;
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+type pthread_mutex_t = void[48];
+type pthread_cond_t = void[48];
+
+intrinsic function pthread_mutex_init(mutex: pthread_mutex_t*, attr: void*) -> i32;
+intrinsic function pthread_mutex_destroy(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_mutex_lock(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_mutex_unlock(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_cond_init(cond: pthread_cond_t*, attr: void*) -> i32;
+intrinsic function pthread_cond_destroy(cond: pthread_cond_t*) -> i32;
+intrinsic function pthread_cond_wait(cond: pthread_cond_t*, mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_cond_broadcast(cond: pthread_cond_t*) -> i32;

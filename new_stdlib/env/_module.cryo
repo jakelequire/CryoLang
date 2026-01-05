@@ -1,0 +1,453 @@
+///! Environment Module
+///!
+///! This module provides access to environment variables and program arguments.
+
+namespace std::env;
+
+import <core/intrinsics>;
+import <core/option>;
+import <collections/string>;
+import <collections/array>;
+import <collections/hashmap>;
+import <fs/path>;
+import <io/error>;
+import <alloc/global>;
+
+// ============================================================================
+// Environment Variables
+// ============================================================================
+
+/// Gets the value of an environment variable.
+function var(name: string) -> Option<String> {
+    const value: string = getenv(name);
+    if (value == null) {
+        return Option::None;
+    }
+    return Option::Some(String::from_cstr(value));
+}
+
+/// Gets the value of an environment variable or a default.
+function var_or(name: string, _default: string) -> String {
+    match (var(name)) {
+        Option::Some(v) => { return v; }
+        Option::None => { return String::from_cstr(_default); }
+    }
+}
+
+/// Sets an environment variable.
+function set_var(name: string, value: string) -> void {
+    setenv(name, value, 1);
+}
+
+/// Removes an environment variable.
+function remove_var(name: string) -> void {
+    unsetenv(name);
+}
+
+/// Returns an iterator over all environment variables.
+function vars() -> EnvVars {
+    return EnvVars { index: 0 };
+}
+
+/// Iterator over environment variables.
+type struct EnvVars {
+    index: u64;
+
+    // Method signatures
+    next(mut &this) -> Option<(String, String)>;
+}
+
+implement struct EnvVars {
+    /// Returns the next environment variable.
+    next(mut &this) -> Option<(String, String)> {
+        const env_ptr: string* = get_environ();
+        if (env_ptr == null) {
+            return Option::None;
+        }
+
+        // Count to current index
+        mut i: u64 = 0;
+        while (i < this.index) {
+            if (env_ptr[i] == null) {
+                return Option::None;
+            }
+            i = i + 1;
+        }
+
+        const entry: string = env_ptr[this.index];
+        if (entry == null) {
+            return Option::None;
+        }
+
+        this.index = this.index + 1;
+
+        // Parse "NAME=VALUE"
+        mut name: String = String::new();
+        mut value: String = String::new();
+        mut found_eq: boolean = false;
+
+        mut j: u64 = 0;
+        while (entry[j] != 0) {
+            if (!found_eq && entry[j] == '=') {
+                found_eq = true;
+            } else if (!found_eq) {
+                name.push(entry[j]);
+            } else {
+                value.push(entry[j]);
+            }
+            j = j + 1;
+        }
+
+        return Option::Some((name, value));
+    }
+}
+
+/// Returns all environment variables as a HashMap.
+function vars_map() -> StringHashMap<String> {
+    mut map: StringHashMap<String> = StringHashMap::new();
+    mut iter: EnvVars = vars();
+
+    loop {
+        match (iter.next()) {
+            Option::Some(pair) => {
+                map.insert(pair.0.as_cstr(), pair.1);
+            }
+            Option::None => {
+                break;
+            }
+        }
+    }
+
+    return map;
+}
+
+// ============================================================================
+// Program Arguments
+// ============================================================================
+
+// Global storage for argc/argv (set by runtime)
+mut g_argc: i32 = 0;
+mut g_argv: string* = null;
+
+/// Initializes the args (called by runtime).
+function init_args(argc: i32, argv: string*) -> void {
+    g_argc = argc;
+    g_argv = argv;
+}
+
+/// Returns an iterator over program arguments.
+function args() -> Args {
+    return Args { index: 0 };
+}
+
+/// Iterator over program arguments.
+type struct Args {
+    index: i32;
+
+    // Method signatures
+    next(mut &this) -> Option<String>;
+    len(&this) -> u64;
+    skip(mut &this, n: u64) -> void;
+}
+
+implement struct Args {
+    /// Returns the next argument.
+    next(mut &this) -> Option<String> {
+        if (this.index >= g_argc) {
+            return Option::None;
+        }
+
+        const arg: String = String::from_cstr(g_argv[this.index]);
+        this.index = this.index + 1;
+        return Option::Some(arg);
+    }
+
+    /// Returns the number of remaining arguments.
+    len(&this) -> u64 {
+        if (this.index >= g_argc) {
+            return 0;
+        }
+        return (g_argc - this.index) as u64;
+    }
+
+    /// Skips the first n arguments.
+    skip(mut &this, n: u64) -> void {
+        this.index = this.index + (n as i32);
+        if (this.index > g_argc) {
+            this.index = g_argc;
+        }
+    }
+}
+
+/// Returns program arguments as a Vec.
+function args_vec() -> Vec<String> {
+    mut result: Vec<String> = Vec::new();
+    mut iter: Args = args();
+
+    loop {
+        match (iter.next()) {
+            Option::Some(arg) => {
+                result.push(arg);
+            }
+            Option::None => {
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
+/// Returns the number of program arguments.
+function args_count() -> u64 {
+    return g_argc as u64;
+}
+
+/// Returns the program name (first argument).
+function program_name() -> Option<String> {
+    if (g_argc < 1 || g_argv == null) {
+        return Option::None;
+    }
+    return Option::Some(String::from_cstr(g_argv[0]));
+}
+
+// ============================================================================
+// Current Directory
+// ============================================================================
+
+/// Returns the current working directory.
+function current_dir() -> IoResult<PathBuf> {
+    mut buffer: u8[4096];
+    const result: string = getcwd(&buffer[0], 4096);
+    if (result == null) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(PathBuf::from_cstr(result));
+}
+
+/// Sets the current working directory.
+function set_current_dir(path: string) -> IoResult<void> {
+    if (chdir(path) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+// ============================================================================
+// Home and Temp Directories
+// ============================================================================
+
+/// Returns the user's home directory.
+function home_dir() -> Option<PathBuf> {
+    // Try HOME environment variable first
+    match (var("HOME")) {
+        Option::Some(home) => {
+            return Option::Some(PathBuf::from_string(home));
+        }
+        Option::None => {}
+    }
+
+    // Fall back to getpwuid
+    const uid: u32 = getuid();
+    const pwd: passwd* = getpwuid(uid);
+    if (pwd != null && pwd.pw_dir != null) {
+        return Option::Some(PathBuf::from_cstr(pwd.pw_dir));
+    }
+
+    return Option::None;
+}
+
+/// Returns a temporary directory.
+function temp_dir() -> PathBuf {
+    // Check TMPDIR, TMP, TEMP environment variables
+    match (var("TMPDIR")) {
+        Option::Some(dir) => { return PathBuf::from_string(dir); }
+        Option::None => {}
+    }
+    match (var("TMP")) {
+        Option::Some(dir) => { return PathBuf::from_string(dir); }
+        Option::None => {}
+    }
+    match (var("TEMP")) {
+        Option::Some(dir) => { return PathBuf::from_string(dir); }
+        Option::None => {}
+    }
+
+    // Default to /tmp
+    return PathBuf::from_cstr("/tmp");
+}
+
+// ============================================================================
+// Executable Path
+// ============================================================================
+
+/// Returns the path of the current executable.
+function current_exe() -> IoResult<PathBuf> {
+    mut buffer: u8[4096];
+    const len: i64 = readlink("/proc/self/exe", &buffer[0], 4095);
+    if (len < 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    buffer[len] = 0;
+    return IoResult::Ok(PathBuf::from_cstr(&buffer[0] as string));
+}
+
+// ============================================================================
+// Architecture and OS Info
+// ============================================================================
+
+/// Returns the target architecture.
+function arch() -> string {
+    // This would be determined at compile time
+    return "x86_64";
+}
+
+/// Returns the target OS.
+function os() -> string {
+    return "linux";
+}
+
+/// Returns the target family.
+function family() -> string {
+    return "unix";
+}
+
+// ============================================================================
+// Process Info
+// ============================================================================
+
+/// Returns the current process ID.
+function pid() -> u32 {
+    return getpid();
+}
+
+/// Returns the parent process ID.
+function ppid() -> u32 {
+    return getppid();
+}
+
+/// Returns the current user ID.
+function uid() -> u32 {
+    return getuid();
+}
+
+/// Returns the effective user ID.
+function euid() -> u32 {
+    return geteuid();
+}
+
+/// Returns the current group ID.
+function gid() -> u32 {
+    return getgid();
+}
+
+/// Returns the effective group ID.
+function egid() -> u32 {
+    return getegid();
+}
+
+// ============================================================================
+// Hostname
+// ============================================================================
+
+/// Returns the hostname.
+function hostname() -> Option<String> {
+    mut buffer: u8[256];
+    if (gethostname(&buffer[0], 256) != 0) {
+        return Option::None;
+    }
+    return Option::Some(String::from_cstr(&buffer[0] as string));
+}
+
+// ============================================================================
+// Path Separator
+// ============================================================================
+
+/// Returns the path separator for the current platform.
+function path_separator() -> u8 {
+    return '/';
+}
+
+/// Returns the path list separator for the current platform.
+function path_list_separator() -> u8 {
+    return ':';
+}
+
+// ============================================================================
+// Path Operations
+// ============================================================================
+
+/// Splits PATH environment variable into components.
+function split_paths(path: string) -> Vec<PathBuf> {
+    mut result: Vec<PathBuf> = Vec::new();
+    mut current: String = String::new();
+
+    mut i: u64 = 0;
+    while (path[i] != 0) {
+        if (path[i] == ':') {
+            if (!current.is_empty()) {
+                result.push(PathBuf::from_string(current));
+                current = String::new();
+            }
+        } else {
+            current.push(path[i]);
+        }
+        i = i + 1;
+    }
+
+    if (!current.is_empty()) {
+        result.push(PathBuf::from_string(current));
+    }
+
+    return result;
+}
+
+/// Joins paths into a PATH-style string.
+function join_paths(paths: Vec<PathBuf>) -> String {
+    mut result: String = String::new();
+
+    mut i: u64 = 0;
+    while (i < paths.len()) {
+        if (i > 0) {
+            result.push(':');
+        }
+        result.push_str(paths.get(i).as_cstr());
+        i = i + 1;
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+type struct passwd {
+    pw_name: string;
+    pw_passwd: string;
+    pw_uid: u32;
+    pw_gid: u32;
+    pw_gecos: string;
+    pw_dir: string;
+    pw_shell: string;
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function getenv(name: string) -> string;
+intrinsic function setenv(name: string, value: string, overwrite: i32) -> i32;
+intrinsic function unsetenv(name: string) -> i32;
+intrinsic function get_environ() -> string*;
+intrinsic function getcwd(buf: u8*, size: u64) -> string;
+intrinsic function chdir(path: string) -> i32;
+intrinsic function getuid() -> u32;
+intrinsic function geteuid() -> u32;
+intrinsic function getgid() -> u32;
+intrinsic function getegid() -> u32;
+intrinsic function getpid() -> u32;
+intrinsic function getppid() -> u32;
+intrinsic function getpwuid(uid: u32) -> passwd*;
+intrinsic function gethostname(name: u8*, len: u64) -> i32;
+intrinsic function readlink(path: string, buf: u8*, bufsiz: u64) -> i64;

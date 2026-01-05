@@ -70,6 +70,7 @@ namespace Cryo
         ReturnStatement,
         IfStatement,
         WhileStatement,
+        DoWhileStatement,
         ForStatement,
         MatchStatement,
         SwitchStatement,
@@ -155,6 +156,8 @@ namespace Cryo
             return "IfStatement";
         case NodeKind::WhileStatement:
             return "WhileStatement";
+        case NodeKind::DoWhileStatement:
+            return "DoWhileStatement";
         case NodeKind::ForStatement:
             return "ForStatement";
         case NodeKind::MatchStatement:
@@ -2108,6 +2111,39 @@ namespace Cryo
             }
         }
 
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // do-while statement
+    class DoWhileStatementNode : public StatementNode
+    {
+    private:
+        std::unique_ptr<StatementNode> _body;
+        std::unique_ptr<ExpressionNode> _condition;
+
+    public:
+        DoWhileStatementNode(SourceLocation loc, std::unique_ptr<StatementNode> body,
+                             std::unique_ptr<ExpressionNode> condition)
+            : StatementNode(NodeKind::DoWhileStatement, loc), _body(std::move(body)),
+              _condition(std::move(condition)) {}
+
+        StatementNode *body() const { return _body.get(); }
+        ExpressionNode *condition() const { return _condition.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "DoWhile:" << std::endl;
+            if (_body)
+            {
+                os << std::string(indent + 2, ' ') << "Body:" << std::endl;
+                _body->print(os, indent + 4);
+            }
+            if (_condition)
+            {
+                os << std::string(indent + 2, ' ') << "Condition:" << std::endl;
+                _condition->print(os, indent + 4);
+            }
+        }
         void accept(ASTVisitor &visitor) override;
     };
 

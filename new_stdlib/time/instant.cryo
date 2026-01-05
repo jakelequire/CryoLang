@@ -1,0 +1,444 @@
+///! Instant - Monotonic Time
+///!
+///! A monotonic clock for measuring elapsed time.
+
+namespace std::time::instant;
+
+import <core/intrinsics>;
+import <core/option>;
+import <time/duration>;
+
+// ============================================================================
+// Instant
+// ============================================================================
+
+/// A measurement of a monotonically nondecreasing clock.
+///
+/// Instants are opaque types that can only be compared to one another.
+/// They are useful for measuring elapsed time.
+type struct Instant {
+    secs: u64;
+    nanos: u32;
+
+    // Method signatures
+    static now() -> Instant;
+    duration_since(&this, earlier: Instant) -> Duration;
+    checked_duration_since(&this, earlier: Instant) -> Option<Duration>;
+    saturating_duration_since(&this, earlier: Instant) -> Duration;
+    elapsed(&this) -> Duration;
+    checked_add(&this, duration: Duration) -> Option<Instant>;
+    add(&this, duration: Duration) -> Instant;
+    checked_sub(&this, duration: Duration) -> Option<Instant>;
+    sub(&this, duration: Duration) -> Instant;
+    cmp(&this, other: Instant) -> i32;
+    lt(&this, other: Instant) -> boolean;
+    le(&this, other: Instant) -> boolean;
+    gt(&this, other: Instant) -> boolean;
+    ge(&this, other: Instant) -> boolean;
+    eq(&this, other: Instant) -> boolean;
+    min(&this, other: Instant) -> Instant;
+    max(&this, other: Instant) -> Instant;
+}
+
+implement struct Instant {
+    /// Returns an instant corresponding to "now".
+    static now() -> Instant {
+        mut ts: timespec;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return Instant {
+            secs: ts.tv_sec as u64,
+            nanos: ts.tv_nsec as u32
+        };
+    }
+
+    /// Returns the amount of time elapsed from another instant.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `earlier` is later than `this`.
+    duration_since(&this, earlier: Instant) -> Duration {
+        match (this.checked_duration_since(earlier)) {
+            Option::Some(d) => { return d; }
+            Option::None => {
+                panic("duration_since called with later instant", FILE, LINE);
+            }
+        }
+    }
+
+    /// Returns the amount of time elapsed from another instant, or None
+    /// if the other instant is later than this one.
+    checked_duration_since(&this, earlier: Instant) -> Option<Duration> {
+        if (earlier.secs > this.secs) {
+            return Option::None;
+        }
+        if (earlier.secs == this.secs && earlier.nanos > this.nanos) {
+            return Option::None;
+        }
+
+        mut secs: u64 = this.secs - earlier.secs;
+        mut nanos: i64 = (this.nanos as i64) - (earlier.nanos as i64);
+
+        if (nanos < 0) {
+            secs = secs - 1;
+            nanos = nanos + 1_000_000_000;
+        }
+
+        return Option::Some(Duration::new(secs, nanos as u32));
+    }
+
+    /// Returns the amount of time elapsed from another instant, saturating
+    /// at zero on negative durations.
+    saturating_duration_since(&this, earlier: Instant) -> Duration {
+        match (this.checked_duration_since(earlier)) {
+            Option::Some(d) => { return d; }
+            Option::None => { return Duration::zero(); }
+        }
+    }
+
+    /// Returns the amount of time elapsed since this instant.
+    elapsed(&this) -> Duration {
+        const now: Instant = Instant::now();
+        return now.duration_since(&this);
+    }
+
+    /// Returns `Some(instant)` if the instant is in the future, `None` otherwise.
+    checked_add(&this, duration: Duration) -> Option<Instant> {
+        mut total_nanos: u64 = (this.nanos as u64) + (duration.subsec_nanos() as u64);
+        const extra_secs: u64 = total_nanos / 1_000_000_000;
+        total_nanos = total_nanos % 1_000_000_000;
+
+        const max_u64: u64 = 18446744073709551615;
+        if (this.secs > max_u64 - duration.as_secs() - extra_secs) {
+            return Option::None;
+        }
+
+        return Option::Some(Instant {
+            secs: this.secs + duration.as_secs() + extra_secs,
+            nanos: total_nanos as u32
+        });
+    }
+
+    /// Adds a duration to this instant.
+    add(&this, duration: Duration) -> Instant {
+        match (this.checked_add(duration)) {
+            Option::Some(i) => { return i; }
+            Option::None => {
+                panic("overflow when adding duration to instant", FILE, LINE);
+            }
+        }
+    }
+
+    /// Returns `Some(instant)` if the result is representable, `None` otherwise.
+    checked_sub(&this, duration: Duration) -> Option<Instant> {
+        if (duration.as_secs() > this.secs) {
+            return Option::None;
+        }
+        if (duration.as_secs() == this.secs && duration.subsec_nanos() > this.nanos) {
+            return Option::None;
+        }
+
+        mut secs: u64 = this.secs - duration.as_secs();
+        mut nanos: i64 = (this.nanos as i64) - (duration.subsec_nanos() as i64);
+
+        if (nanos < 0) {
+            secs = secs - 1;
+            nanos = nanos + 1_000_000_000;
+        }
+
+        return Option::Some(Instant {
+            secs: secs,
+            nanos: nanos as u32
+        });
+    }
+
+    /// Subtracts a duration from this instant.
+    sub(&this, duration: Duration) -> Instant {
+        match (this.checked_sub(duration)) {
+            Option::Some(i) => { return i; }
+            Option::None => {
+                panic("overflow when subtracting duration from instant", FILE, LINE);
+            }
+        }
+    }
+
+    /// Compares two instants.
+    cmp(&this, other: Instant) -> i32 {
+        if (this.secs < other.secs) {
+            return -1;
+        }
+        if (this.secs > other.secs) {
+            return 1;
+        }
+        if (this.nanos < other.nanos) {
+            return -1;
+        }
+        if (this.nanos > other.nanos) {
+            return 1;
+        }
+        return 0;
+    }
+
+    /// Returns true if this is before other.
+    lt(&this, other: Instant) -> boolean {
+        return this.cmp(other) < 0;
+    }
+
+    /// Returns true if this is before or equal to other.
+    le(&this, other: Instant) -> boolean {
+        return this.cmp(other) <= 0;
+    }
+
+    /// Returns true if this is after other.
+    gt(&this, other: Instant) -> boolean {
+        return this.cmp(other) > 0;
+    }
+
+    /// Returns true if this is after or equal to other.
+    ge(&this, other: Instant) -> boolean {
+        return this.cmp(other) >= 0;
+    }
+
+    /// Returns true if instants are equal.
+    eq(&this, other: Instant) -> boolean {
+        return this.secs == other.secs && this.nanos == other.nanos;
+    }
+
+    /// Returns the minimum of two instants.
+    min(&this, other: Instant) -> Instant {
+        if (this.le(other)) {
+            return this;
+        }
+        return other;
+    }
+
+    /// Returns the maximum of two instants.
+    max(&this, other: Instant) -> Instant {
+        if (this.ge(other)) {
+            return this;
+        }
+        return other;
+    }
+}
+
+// ============================================================================
+// Stopwatch
+// ============================================================================
+
+/// A simple stopwatch for measuring elapsed time.
+type struct Stopwatch {
+    start: Instant;
+    elapsed: Duration;
+    running: boolean;
+
+    // Method signatures
+    Stopwatch() -> Stopwatch;
+    static start_new() -> Stopwatch;
+    start(mut &this) -> void;
+    stop(mut &this) -> void;
+    reset(mut &this) -> void;
+    restart(mut &this) -> Duration;
+    elapsed_time(&this) -> Duration;
+    is_running(&this) -> boolean;
+}
+
+implement struct Stopwatch {
+    /// Creates a new stopped stopwatch.
+    Stopwatch() -> Stopwatch {
+        return Stopwatch {
+            start: Instant::now(),
+            elapsed: Duration::zero(),
+            running: false
+        };
+    }
+
+    /// Creates and starts a new stopwatch.
+    static start_new() -> Stopwatch {
+        return Stopwatch {
+            start: Instant::now(),
+            elapsed: Duration::zero(),
+            running: true
+        };
+    }
+
+    /// Starts or resumes the stopwatch.
+    start(mut &this) -> void {
+        if (!this.running) {
+            this.start = Instant::now();
+            this.running = true;
+        }
+    }
+
+    /// Stops the stopwatch.
+    stop(mut &this) -> void {
+        if (this.running) {
+            this.elapsed = this.elapsed.add(this.start.elapsed());
+            this.running = false;
+        }
+    }
+
+    /// Resets the stopwatch.
+    reset(mut &this) -> void {
+        this.elapsed = Duration::zero();
+        this.start = Instant::now();
+    }
+
+    /// Restarts the stopwatch and returns the elapsed time.
+    restart(mut &this) -> Duration {
+        const elapsed: Duration = this.elapsed_time();
+        this.reset();
+        this.running = true;
+        return elapsed;
+    }
+
+    /// Returns the elapsed time.
+    elapsed_time(&this) -> Duration {
+        if (this.running) {
+            return this.elapsed.add(this.start.elapsed());
+        }
+        return this.elapsed;
+    }
+
+    /// Returns true if the stopwatch is running.
+    is_running(&this) -> boolean {
+        return this.running;
+    }
+}
+
+// ============================================================================
+// Timer
+// ============================================================================
+
+/// A countdown timer.
+type struct Timer {
+    deadline: Instant;
+
+    // Method signatures
+    static after(duration: Duration) -> Timer;
+    static at(deadline: Instant) -> Timer;
+    is_expired(&this) -> boolean;
+    remaining(&this) -> Duration;
+    reset(mut &this, duration: Duration) -> void;
+    deadline(&this) -> Instant;
+}
+
+implement struct Timer {
+    /// Creates a timer that expires after the given duration.
+    static after(duration: Duration) -> Timer {
+        return Timer {
+            deadline: Instant::now().add(duration)
+        };
+    }
+
+    /// Creates a timer that expires at the given instant.
+    static at(deadline: Instant) -> Timer {
+        return Timer { deadline: deadline };
+    }
+
+    /// Returns true if the timer has expired.
+    is_expired(&this) -> boolean {
+        return Instant::now().ge(this.deadline);
+    }
+
+    /// Returns the remaining time, or zero if expired.
+    remaining(&this) -> Duration {
+        const now: Instant = Instant::now();
+        return this.deadline.saturating_duration_since(now);
+    }
+
+    /// Resets the timer to expire after the given duration.
+    reset(mut &this, duration: Duration) -> void {
+        this.deadline = Instant::now().add(duration);
+    }
+
+    /// Returns the deadline instant.
+    deadline(&this) -> Instant {
+        return this.deadline;
+    }
+}
+
+// ============================================================================
+// Benchmark Helper
+// ============================================================================
+
+/// Result of a benchmark.
+type struct BenchmarkResult {
+    iterations: u64;
+    total_time: Duration;
+    min_time: Duration;
+    max_time: Duration;
+
+    // Method signatures
+    mean(&this) -> Duration;
+    throughput(&this) -> f64;
+}
+
+implement struct BenchmarkResult {
+    /// Returns the average time per iteration.
+    mean(&this) -> Duration {
+        if (this.iterations == 0) {
+            return Duration::zero();
+        }
+        return this.total_time.div(this.iterations as u32);
+    }
+
+    /// Returns the throughput in iterations per second.
+    throughput(&this) -> f64 {
+        const secs: f64 = this.total_time.as_secs_f64();
+        if (secs == 0.0) {
+            return 0.0;
+        }
+        return (this.iterations as f64) / secs;
+    }
+}
+
+/// Benchmarks a function.
+function benchmark(iterations: u64, f: () -> void) -> BenchmarkResult {
+    mut total: Duration = Duration::zero();
+    mut min_time: Duration = Duration::max();
+    mut max_time: Duration = Duration::zero();
+
+    mut i: u64 = 0;
+    while (i < iterations) {
+        const start: Instant = Instant::now();
+        f();
+        const elapsed: Duration = start.elapsed();
+
+        total = total.add(elapsed);
+        if (elapsed.lt(min_time)) {
+            min_time = elapsed;
+        }
+        if (elapsed.gt(max_time)) {
+            max_time = elapsed;
+        }
+
+        i = i + 1;
+    }
+
+    return BenchmarkResult {
+        iterations: iterations,
+        total_time: total,
+        min_time: min_time,
+        max_time: max_time
+    };
+}
+
+/// Times a single execution of a function.
+function time_it<T>(f: () -> T) -> (T, Duration) {
+    const start: Instant = Instant::now();
+    const result: T = f();
+    const elapsed: Duration = start.elapsed();
+    return (result, elapsed);
+}
+
+// ============================================================================
+// Types and Intrinsics
+// ============================================================================
+
+type struct timespec {
+    tv_sec: i64;
+    tv_nsec: i64;
+}
+
+const CLOCK_MONOTONIC: i32 = 1;
+
+intrinsic function clock_gettime(clk_id: i32, tp: timespec*) -> i32;

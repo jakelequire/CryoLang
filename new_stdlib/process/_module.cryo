@@ -1,0 +1,702 @@
+///! Process Module
+///!
+///! This module provides process spawning and management functionality.
+
+namespace std::process;
+
+import <core/intrinsics>;
+import <core/option>;
+import <collections/string>;
+import <collections/array>;
+import <collections/hashmap>;
+import <io/error>;
+import <alloc/global>;
+
+// ============================================================================
+// Exit Status
+// ============================================================================
+
+/// The exit status of a process.
+type struct ExitStatus {
+    code: i32;
+
+    // Method signatures
+    code(&this) -> Option<i32>;
+    success(&this) -> boolean;
+    signal(&this) -> Option<i32>;
+    stopped(&this) -> boolean;
+    continued(&this) -> boolean;
+}
+
+implement struct ExitStatus {
+    /// Returns the exit code.
+    code(&this) -> Option<i32> {
+        if (WIFEXITED(this.code)) {
+            return Option::Some(WEXITSTATUS(this.code));
+        }
+        return Option::None;
+    }
+
+    /// Returns true if the process exited successfully.
+    success(&this) -> boolean {
+        return WIFEXITED(this.code) && WEXITSTATUS(this.code) == 0;
+    }
+
+    /// Returns the signal that terminated the process, if any.
+    signal(&this) -> Option<i32> {
+        if (WIFSIGNALED(this.code)) {
+            return Option::Some(WTERMSIG(this.code));
+        }
+        return Option::None;
+    }
+
+    /// Returns true if the process was stopped by a signal.
+    stopped(&this) -> boolean {
+        return WIFSTOPPED(this.code);
+    }
+
+    /// Returns true if the process continued.
+    continued(&this) -> boolean {
+        return WIFCONTINUED(this.code);
+    }
+}
+
+// ============================================================================
+// Output
+// ============================================================================
+
+/// The output of a finished process.
+type struct Output {
+    status: ExitStatus;
+    stdout: Vec<u8>;
+    stderr: Vec<u8>;
+
+    // Method signatures
+    success(&this) -> boolean;
+    stdout_string(&this) -> String;
+    stderr_string(&this) -> String;
+}
+
+implement struct Output {
+    /// Returns true if the command was successful.
+    success(&this) -> boolean {
+        return this.status.success();
+    }
+
+    /// Returns stdout as a string.
+    stdout_string(&this) -> String {
+        return String::from_utf8_lossy(this.stdout.as_ptr(), this.stdout.len());
+    }
+
+    /// Returns stderr as a string.
+    stderr_string(&this) -> String {
+        return String::from_utf8_lossy(this.stderr.as_ptr(), this.stderr.len());
+    }
+}
+
+// ============================================================================
+// Stdio
+// ============================================================================
+
+/// Configuration for a process's standard I/O.
+enum Stdio {
+    Inherit;    // Inherit from parent
+    Piped;      // Create a pipe
+    Null;       // Redirect to /dev/null
+}
+
+// ============================================================================
+// Command
+// ============================================================================
+
+/// A builder for spawning processes.
+type struct Command {
+    program: String;
+    args: Vec<String>;
+    envs: StringHashMap<String>;
+    cwd: Option<String>;
+    stdin: Stdio;
+    stdout: Stdio;
+    stderr: Stdio;
+    clear_env: boolean;
+
+    // Method signatures
+    Command(program: string) -> Command;
+    arg(mut &this, arg: string) -> &mut Command;
+    args(mut &this, args: Vec<string>) -> &mut Command;
+    env(mut &this, key: string, value: string) -> &mut Command;
+    env_clear(mut &this) -> &mut Command;
+    env_remove(mut &this, key: string) -> &mut Command;
+    current_dir(mut &this, dir: string) -> &mut Command;
+    stdin(mut &this, stdin: Stdio) -> &mut Command;
+    stdout(mut &this, stdout: Stdio) -> &mut Command;
+    stderr(mut &this, stderr: Stdio) -> &mut Command;
+    spawn(&this) -> IoResult<Child>;
+    setup_child(&this, stdin_pipe: i32[2], stdout_pipe: i32[2], stderr_pipe: i32[2]) -> void;
+    output(mut &this) -> IoResult<Output>;
+    status(mut &this) -> IoResult<ExitStatus>;
+}
+
+implement struct Command {
+    /// Creates a new Command for the given program.
+    Command(program: string) -> Command {
+        return Command {
+            program: String::from_cstr(program),
+            args: Vec::new(),
+            envs: StringHashMap::new(),
+            cwd: Option::None,
+            stdin: Stdio::Inherit,
+            stdout: Stdio::Inherit,
+            stderr: Stdio::Inherit,
+            clear_env: false
+        };
+    }
+
+    /// Adds an argument.
+    arg(mut &this, arg: string) -> &mut Command {
+        this.args.push(String::from_cstr(arg));
+        return this;
+    }
+
+    /// Adds multiple arguments.
+    args(mut &this, args: Vec<string>) -> &mut Command {
+        mut i: u64 = 0;
+        while (i < args.len()) {
+            this.args.push(String::from_cstr(args.get(i)));
+            i = i + 1;
+        }
+        return this;
+    }
+
+    /// Sets an environment variable.
+    env(mut &this, key: string, value: string) -> &mut Command {
+        this.envs.insert(key, String::from_cstr(value));
+        return this;
+    }
+
+    /// Clears all environment variables.
+    env_clear(mut &this) -> &mut Command {
+        this.clear_env = true;
+        this.envs.clear();
+        return this;
+    }
+
+    /// Removes an environment variable.
+    env_remove(mut &this, key: string) -> &mut Command {
+        this.envs.remove(key);
+        return this;
+    }
+
+    /// Sets the working directory.
+    current_dir(mut &this, dir: string) -> &mut Command {
+        this.cwd = Option::Some(String::from_cstr(dir));
+        return this;
+    }
+
+    /// Sets the stdin configuration.
+    stdin(mut &this, stdin: Stdio) -> &mut Command {
+        this.stdin = stdin;
+        return this;
+    }
+
+    /// Sets the stdout configuration.
+    stdout(mut &this, stdout: Stdio) -> &mut Command {
+        this.stdout = stdout;
+        return this;
+    }
+
+    /// Sets the stderr configuration.
+    stderr(mut &this, stderr: Stdio) -> &mut Command {
+        this.stderr = stderr;
+        return this;
+    }
+
+    /// Spawns the process.
+    spawn(&this) -> IoResult<Child> {
+        // Create pipes if needed
+        mut stdin_pipe: i32[2];
+        mut stdout_pipe: i32[2];
+        mut stderr_pipe: i32[2];
+
+        match (this.stdin) {
+            Stdio::Piped => {
+                if (pipe(&stdin_pipe[0]) != 0) {
+                    return IoResult::Err(IoError::last_os_error());
+                }
+            }
+            _ => {}
+        }
+
+        match (this.stdout) {
+            Stdio::Piped => {
+                if (pipe(&stdout_pipe[0]) != 0) {
+                    return IoResult::Err(IoError::last_os_error());
+                }
+            }
+            _ => {}
+        }
+
+        match (this.stderr) {
+            Stdio::Piped => {
+                if (pipe(&stderr_pipe[0]) != 0) {
+                    return IoResult::Err(IoError::last_os_error());
+                }
+            }
+            _ => {}
+        }
+
+        const pid: i32 = fork();
+        if (pid < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        if (pid == 0) {
+            // Child process
+            this.setup_child(stdin_pipe, stdout_pipe, stderr_pipe);
+            // Should not return
+            _exit(127);
+        }
+
+        // Parent process
+        // Close unused ends of pipes
+        match (this.stdin) {
+            Stdio::Piped => { close(stdin_pipe[0]); }
+            _ => {}
+        }
+        match (this.stdout) {
+            Stdio::Piped => { close(stdout_pipe[1]); }
+            _ => {}
+        }
+        match (this.stderr) {
+            Stdio::Piped => { close(stderr_pipe[1]); }
+            _ => {}
+        }
+
+        return IoResult::Ok(Child {
+            pid: pid,
+            stdin: match (this.stdin) {
+                Stdio::Piped => { Option::Some(ChildStdin { fd: stdin_pipe[1] }) }
+                _ => { Option::None }
+            },
+            stdout: match (this.stdout) {
+                Stdio::Piped => { Option::Some(ChildStdout { fd: stdout_pipe[0] }) }
+                _ => { Option::None }
+            },
+            stderr: match (this.stderr) {
+                Stdio::Piped => { Option::Some(ChildStderr { fd: stderr_pipe[0] }) }
+                _ => { Option::None }
+            },
+            exited: false
+        });
+    }
+
+    /// Sets up the child process.
+    setup_child(&this, stdin_pipe: i32[2], stdout_pipe: i32[2], stderr_pipe: i32[2]) -> void {
+        // Set up stdin
+        match (this.stdin) {
+            Stdio::Piped => {
+                close(stdin_pipe[1]);
+                dup2(stdin_pipe[0], 0);
+                close(stdin_pipe[0]);
+            }
+            Stdio::Null => {
+                const fd: i32 = open_file("/dev/null", O_RDONLY, 0);
+                if (fd >= 0) {
+                    dup2(fd, 0);
+                    close(fd);
+                }
+            }
+            Stdio::Inherit => {}
+        }
+
+        // Set up stdout
+        match (this.stdout) {
+            Stdio::Piped => {
+                close(stdout_pipe[0]);
+                dup2(stdout_pipe[1], 1);
+                close(stdout_pipe[1]);
+            }
+            Stdio::Null => {
+                const fd: i32 = open_file("/dev/null", O_WRONLY, 0);
+                if (fd >= 0) {
+                    dup2(fd, 1);
+                    close(fd);
+                }
+            }
+            Stdio::Inherit => {}
+        }
+
+        // Set up stderr
+        match (this.stderr) {
+            Stdio::Piped => {
+                close(stderr_pipe[0]);
+                dup2(stderr_pipe[1], 2);
+                close(stderr_pipe[1]);
+            }
+            Stdio::Null => {
+                const fd: i32 = open_file("/dev/null", O_WRONLY, 0);
+                if (fd >= 0) {
+                    dup2(fd, 2);
+                    close(fd);
+                }
+            }
+            Stdio::Inherit => {}
+        }
+
+        // Change directory
+        match (this.cwd) {
+            Option::Some(dir) => {
+                chdir(dir.as_cstr());
+            }
+            Option::None => {}
+        }
+
+        // Set up environment
+        if (this.clear_env) {
+            clearenv();
+        }
+
+        // Apply environment changes
+        mut env_iter: StringHashMapIter<String> = this.envs.iter();
+        loop {
+            match (env_iter.next()) {
+                Option::Some(entry) => {
+                    setenv(entry.key, entry.value.as_cstr(), 1);
+                }
+                Option::None => { break; }
+            }
+        }
+
+        // Build argv
+        const argc: u64 = 1 + this.args.len();
+        const argv: string* = malloc((argc + 1) * sizeof(string)) as string*;
+        argv[0] = this.program.as_cstr();
+
+        mut i: u64 = 0;
+        while (i < this.args.len()) {
+            argv[1 + i] = this.args.get(i).as_cstr();
+            i = i + 1;
+        }
+        argv[argc] = null;
+
+        // Execute
+        execvp(this.program.as_cstr(), argv);
+
+        // If we get here, exec failed
+        free(argv as void*);
+    }
+
+    /// Executes the command and waits for it to complete.
+    output(mut &this) -> IoResult<Output> {
+        this.stdout = Stdio::Piped;
+        this.stderr = Stdio::Piped;
+
+        const spawn_result: IoResult<Child> = this.spawn();
+        match (spawn_result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(child) => {
+                return child.wait_with_output();
+            }
+        }
+    }
+
+    /// Executes the command and returns the exit status.
+    status(mut &this) -> IoResult<ExitStatus> {
+        const spawn_result: IoResult<Child> = this.spawn();
+        match (spawn_result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(child) => {
+                return child.wait();
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Child Process
+// ============================================================================
+
+/// A handle to a child process.
+type struct Child {
+    pid: i32;
+    stdin: Option<ChildStdin>;
+    stdout: Option<ChildStdout>;
+    stderr: Option<ChildStderr>;
+    exited: boolean;
+
+    // Method signatures
+    id(&this) -> u32;
+    wait(mut &this) -> IoResult<ExitStatus>;
+    wait_with_output(mut &this) -> IoResult<Output>;
+    kill(&this) -> IoResult<void>;
+    try_wait(mut &this) -> IoResult<Option<ExitStatus>>;
+}
+
+implement struct Child {
+    /// Returns the process ID.
+    id(&this) -> u32 {
+        return this.pid as u32;
+    }
+
+    /// Waits for the child to exit.
+    wait(mut &this) -> IoResult<ExitStatus> {
+        if (this.exited) {
+            return IoResult::Err(IoError::new(IoErrorKind::InvalidInput, "process already exited"));
+        }
+
+        mut status: i32 = 0;
+        const result: i32 = waitpid(this.pid, &status, 0);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        this.exited = true;
+        return IoResult::Ok(ExitStatus { code: status });
+    }
+
+    /// Waits for the child and captures its output.
+    wait_with_output(mut &this) -> IoResult<Output> {
+        // Read stdout
+        mut stdout_data: Vec<u8> = Vec::new();
+        match (this.stdout) {
+            Option::Some(out) => {
+                mut buffer: u8[4096];
+                loop {
+                    const n: i64 = read(out.fd, &buffer[0] as void*, 4096);
+                    if (n <= 0) {
+                        break;
+                    }
+                    mut i: u64 = 0;
+                    while (i < n as u64) {
+                        stdout_data.push(buffer[i]);
+                        i = i + 1;
+                    }
+                }
+                close(out.fd);
+            }
+            Option::None => {}
+        }
+
+        // Read stderr
+        mut stderr_data: Vec<u8> = Vec::new();
+        match (this.stderr) {
+            Option::Some(err) => {
+                mut buffer: u8[4096];
+                loop {
+                    const n: i64 = read(err.fd, &buffer[0] as void*, 4096);
+                    if (n <= 0) {
+                        break;
+                    }
+                    mut i: u64 = 0;
+                    while (i < n as u64) {
+                        stderr_data.push(buffer[i]);
+                        i = i + 1;
+                    }
+                }
+                close(err.fd);
+            }
+            Option::None => {}
+        }
+
+        // Wait for process
+        const status_result: IoResult<ExitStatus> = this.wait();
+        match (status_result) {
+            IoResult::Err(e) => { return IoResult::Err(e); }
+            IoResult::Ok(status) => {
+                return IoResult::Ok(Output {
+                    status: status,
+                    stdout: stdout_data,
+                    stderr: stderr_data
+                });
+            }
+        }
+    }
+
+    /// Sends a signal to the child process.
+    kill(&this) -> IoResult<void> {
+        if (this.exited) {
+            return IoResult::Err(IoError::new(IoErrorKind::InvalidInput, "process already exited"));
+        }
+
+        if (kill_process(this.pid, SIGKILL) != 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Tries to check if the child has exited without blocking.
+    try_wait(mut &this) -> IoResult<Option<ExitStatus>> {
+        if (this.exited) {
+            return IoResult::Err(IoError::new(IoErrorKind::InvalidInput, "process already exited"));
+        }
+
+        mut status: i32 = 0;
+        const result: i32 = waitpid(this.pid, &status, WNOHANG);
+
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        if (result == 0) {
+            return IoResult::Ok(Option::None);
+        }
+
+        this.exited = true;
+        return IoResult::Ok(Option::Some(ExitStatus { code: status }));
+    }
+}
+
+// ============================================================================
+// Child I/O Handles
+// ============================================================================
+
+/// Handle to a child's stdin.
+type struct ChildStdin {
+    fd: i32;
+
+    // Method signatures
+    write(&this, data: u8*, len: u64) -> IoResult<u64>;
+    close(&this) -> void;
+}
+
+implement struct ChildStdin {
+    /// Writes to the child's stdin.
+    write(&this, data: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = write_fd(this.fd, data as void*, len);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Closes the stdin handle.
+    close(&this) -> void {
+        close(this.fd);
+    }
+}
+
+/// Handle to a child's stdout.
+type struct ChildStdout {
+    fd: i32;
+
+    // Method signatures
+    read(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    close(&this) -> void;
+}
+
+implement struct ChildStdout {
+    /// Reads from the child's stdout.
+    read(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = read(this.fd, buf as void*, len);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Closes the stdout handle.
+    close(&this) -> void {
+        close(this.fd);
+    }
+}
+
+/// Handle to a child's stderr.
+type struct ChildStderr {
+    fd: i32;
+
+    // Method signatures
+    read(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    close(&this) -> void;
+}
+
+implement struct ChildStderr {
+    /// Reads from the child's stderr.
+    read(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = read(this.fd, buf as void*, len);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Closes the stderr handle.
+    close(&this) -> void {
+        close(this.fd);
+    }
+}
+
+// ============================================================================
+// Process Control Functions
+// ============================================================================
+
+/// Terminates the current process.
+function exit(code: i32) -> void {
+    _exit(code);
+}
+
+/// Aborts the current process.
+function abort() -> void {
+    abort_process();
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const O_RDONLY: i32 = 0;
+const O_WRONLY: i32 = 1;
+const WNOHANG: i32 = 1;
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+
+// ============================================================================
+// Wait Status Macros (as functions)
+// ============================================================================
+
+function WIFEXITED(status: i32) -> boolean {
+    return (status & 0x7F) == 0;
+}
+
+function WEXITSTATUS(status: i32) -> i32 {
+    return (status >> 8) & 0xFF;
+}
+
+function WIFSIGNALED(status: i32) -> boolean {
+    return (status & 0x7F) != 0 && (status & 0x7F) != 0x7F;
+}
+
+function WTERMSIG(status: i32) -> i32 {
+    return status & 0x7F;
+}
+
+function WIFSTOPPED(status: i32) -> boolean {
+    return (status & 0xFF) == 0x7F;
+}
+
+function WSTOPSIG(status: i32) -> i32 {
+    return (status >> 8) & 0xFF;
+}
+
+function WIFCONTINUED(status: i32) -> boolean {
+    return status == 0xFFFF;
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function fork() -> i32;
+intrinsic function execvp(file: string, argv: string*) -> i32;
+intrinsic function waitpid(pid: i32, status: i32*, options: i32) -> i32;
+intrinsic function kill_process(pid: i32, sig: i32) -> i32;
+intrinsic function _exit(status: i32) -> void;
+intrinsic function abort_process() -> void;
+intrinsic function pipe(pipefd: i32*) -> i32;
+intrinsic function dup2(oldfd: i32, newfd: i32) -> i32;
+intrinsic function close(fd: i32) -> i32;
+intrinsic function read(fd: i32, buf: void*, count: u64) -> i64;
+intrinsic function write_fd(fd: i32, buf: void*, count: u64) -> i64;
+intrinsic function open_file(path: string, flags: i32, mode: u32) -> i32;
+intrinsic function chdir(path: string) -> i32;
+intrinsic function setenv(name: string, value: string, overwrite: i32) -> i32;
+intrinsic function clearenv() -> i32;
