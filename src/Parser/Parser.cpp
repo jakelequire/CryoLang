@@ -3261,6 +3261,12 @@ namespace Cryo
 
     std::unique_ptr<VariableDeclarationNode> Parser::parse_parameter()
     {
+        // Check for explicit 'this' parameter (e.g., &this, mut &this, this)
+        if (is_this_parameter())
+        {
+            return parse_this_parameter();
+        }
+
         // Parse parameter name
         Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected parameter name");
         std::string param_name = std::string(name_token.text());
@@ -3271,6 +3277,85 @@ namespace Cryo
 
         // Create parameter as variable declaration (without initializer)
         return _builder.create_variable_declaration(name_token.location(), param_name, param_type);
+    }
+
+    bool Parser::is_this_parameter()
+    {
+        // Check for patterns: &this, mut &this, this
+        if (_current_token.is(TokenKind::TK_KW_THIS))
+        {
+            return true; // this (by value)
+        }
+        else if (_current_token.is(TokenKind::TK_AMP))
+        {
+            // Look ahead to see if it's &this
+            Token next = peek_next();
+            return next.is(TokenKind::TK_KW_THIS);
+        }
+        else if (_current_token.is(TokenKind::TK_KW_MUT))
+        {
+            // For 'mut &this', we'll handle this in parse_this_parameter
+            // For now, just return true if we see 'mut' as first token in parameter
+            return true;
+        }
+        return false;
+    }
+
+    std::unique_ptr<VariableDeclarationNode> Parser::parse_this_parameter()
+    {
+        SourceLocation start_loc = _current_token.location();
+        bool is_mutable = false;
+        bool is_reference = false;
+
+        // Parse mut keyword if present
+        if (_current_token.is(TokenKind::TK_KW_MUT))
+        {
+            is_mutable = true;
+            advance(); // consume 'mut'
+            
+            // After 'mut', we expect '&this'
+            if (!_current_token.is(TokenKind::TK_AMP))
+            {
+                error("Expected '&' after 'mut' in this parameter");
+                return nullptr;
+            }
+        }
+
+        // Parse & if present
+        if (_current_token.is(TokenKind::TK_AMP))
+        {
+            is_reference = true;
+            advance(); // consume '&'
+        }
+
+        // Parse 'this'
+        if (!_current_token.is(TokenKind::TK_KW_THIS))
+        {
+            error("Expected 'this' in this parameter");
+            return nullptr;
+        }
+        advance(); // consume 'this'
+
+        // For now, create a simple type - we'll enhance this later
+        Type *this_type = nullptr;
+        if (is_reference)
+        {
+            // Create a reference type to a placeholder type
+            Type *base_type = _context.types().get_auto_type(); // Use auto as placeholder
+            this_type = _context.types().create_reference_type(base_type);
+        }
+        else
+        {
+            // By value - use auto as placeholder for now
+            this_type = _context.types().get_auto_type();
+        }
+
+        // Create a special parameter for 'this'
+        auto param = _builder.create_variable_declaration(start_loc, "this", this_type);
+        
+        // TODO: Add metadata to indicate this is a 'this' parameter and whether it's mutable
+        
+        return param;
     }
 
     bool Parser::peek_variadic_parameter()
@@ -4879,6 +4964,21 @@ namespace Cryo
     {
         // Use the lexer's built-in peek functionality
         return _lexer->peek_token();
+    }
+
+    Token Parser::peek_next_n(int n)
+    {
+        // Simple implementation that only supports n=1 for now
+        // The complex lookahead for 'mut &this' is handled differently
+        if (n == 1)
+        {
+            return peek_next();
+        }
+        else
+        {
+            // Return EOF token for unsupported cases
+            return Token(TokenKind::TK_EOF, "", SourceLocation{});
+        }
     }
 
     // Function type parsing helpers

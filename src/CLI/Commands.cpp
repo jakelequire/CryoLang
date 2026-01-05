@@ -859,6 +859,7 @@ namespace Cryo::CLI::Commands
         std::string main_file = config.entry_point;
         std::string project_name = config.project_name.empty() ? "app" : config.project_name;
         bool is_library = (config.target_type == "static_library" || config.target_type == "shared_library");
+        bool is_stdlib = (config.target_type == "stdlib");
 
         if (use_verbose)
         {
@@ -883,8 +884,8 @@ namespace Cryo::CLI::Commands
             }
         }
 
-        // Check if entry point file exists
-        if (!std::filesystem::exists(main_file))
+        // Check if entry point file exists (skip for stdlib compilation)
+        if (!is_stdlib && !std::filesystem::exists(main_file))
         {
             std::cerr << "Error: Entry point file '" << main_file << "' not found" << std::endl;
             return 1;
@@ -925,7 +926,12 @@ namespace Cryo::CLI::Commands
 
         // Build the project using the compiler
         std::string output_path;
-        if (is_library)
+        if (is_stdlib)
+        {
+            // Standard library: lib<name>.a
+            output_path = os.join_path(config.output_dir, "lib" + project_name + ".a");
+        }
+        else if (is_library)
         {
             // Static library: lib<name>.a
             output_path = os.join_path(config.output_dir, "lib" + project_name + ".a");
@@ -974,13 +980,26 @@ namespace Cryo::CLI::Commands
             }
         }
 
-        compiler->module_loader()->set_current_file(std::filesystem::absolute(main_file).string());
-        if (use_verbose)
+        bool compilation_success;
+        if (is_stdlib)
         {
-            std::cout << "Compiling " << main_file << " -> " << output_path << std::endl;
+            // For stdlib compilation, use directory-based compilation
+            if (use_verbose)
+            {
+                std::cout << "Compiling stdlib from " << config.source_dir << " -> " << output_path << std::endl;
+            }
+            compilation_success = compiler->compile_stdlib(config.source_dir, output_path);
         }
-
-        bool compilation_success = compiler->compile_file(main_file);
+        else
+        {
+            // For regular files, use single-file compilation
+            compiler->module_loader()->set_current_file(std::filesystem::absolute(main_file).string());
+            if (use_verbose)
+            {
+                std::cout << "Compiling " << main_file << " -> " << output_path << std::endl;
+            }
+            compilation_success = compiler->compile_file(main_file);
+        }
 
         if (!compilation_success)
         {
