@@ -851,6 +851,70 @@ namespace Cryo
             return _type_context.get_generic_type(type_string);
         }
 
+        // Check for module-qualified types (e.g., "Types::SocketAddr")
+        // This must happen early to resolve import aliases before other type lookups
+        size_t scope_pos = type_string.find("::");
+        if (scope_pos != std::string::npos && _srm_context)
+        {
+            // Parse the qualified name
+            auto parsed = Cryo::SRM::Utils::parse_qualified_name(type_string);
+            std::vector<std::string> ns_parts = parsed.first;
+            std::string simple_name = parsed.second;
+
+            // Resolve namespace aliases (e.g., "Types" -> "std::net::Types")
+            if (!ns_parts.empty())
+            {
+                std::string resolved_first = _srm_context->resolve_namespace_alias(ns_parts[0]);
+                if (resolved_first != ns_parts[0])
+                {
+                    // Replace the first part with the resolved namespace
+                    auto resolved_parts = Cryo::SRM::Utils::parse_qualified_name(resolved_first).first;
+                    resolved_parts.insert(resolved_parts.end(), ns_parts.begin() + 1, ns_parts.end());
+
+                    // Build the new qualified type name
+                    std::string resolved_type_name = Cryo::SRM::Utils::build_qualified_name(resolved_parts, simple_name);
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "resolve_type_with_generic_context: Resolved alias '{}' -> '{}' for type '{}'",
+                              ns_parts[0], resolved_first, resolved_type_name);
+
+                    // Try to find the resolved type
+                    // First check struct types
+                    Type *struct_type = _type_context.get_struct_type(resolved_type_name);
+                    if (struct_type && struct_type->kind() != TypeKind::Unknown)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found scoped struct type: {}", resolved_type_name);
+                        return struct_type;
+                    }
+
+                    // Try class types
+                    Type *class_type = _type_context.get_class_type(resolved_type_name);
+                    if (class_type && class_type->kind() != TypeKind::Unknown)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found scoped class type: {}", resolved_type_name);
+                        return class_type;
+                    }
+
+                    // Try enum types
+                    Type *enum_type = _type_context.lookup_enum_type(resolved_type_name);
+                    if (enum_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found scoped enum type: {}", resolved_type_name);
+                        return enum_type;
+                    }
+
+                    // Try symbol table lookup
+                    TypedSymbol *symbol = _symbol_table->lookup_symbol(resolved_type_name);
+                    if (symbol && symbol->type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found scoped type in symbol table: {}", resolved_type_name);
+                        return symbol->type;
+                    }
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Scoped type '{}' not found in type registries", resolved_type_name);
+                }
+            }
+        }
+
         // Check for tuple types first (before checking for generic syntax)
         if (type_string.front() == '(' && type_string.back() == ')')
         {
@@ -1875,9 +1939,16 @@ namespace Cryo
 
         if (node.initializer())
         {
+            // Set expected type context for contextual typing (especially important for array literals)
+            Type *previous_expected_type = _current_expected_type;
+            _current_expected_type = declared_type;
+            
             // Visit the initializer to determine its type
             node.initializer()->accept(*this);
             inferred_type = node.initializer()->get_resolved_type();
+            
+            // Restore previous expected type context
+            _current_expected_type = previous_expected_type;
         }
 
         // Determine final type
@@ -3936,13 +4007,46 @@ namespace Cryo
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "Visiting ArrayLiteralNode with {} elements", node.size());
 
-        // Visit all elements first
+        // Check if we have an expected type context (e.g., from variable declaration)
+        Type *expected_element_type = nullptr;
+        if (_current_expected_type)
+        {
+            // If expected type is an Array<T>, extract the T
+            if (_current_expected_type->kind() == TypeKind::Array)
+            {
+                auto *array_type = static_cast<ArrayType *>(_current_expected_type);
+                expected_element_type = array_type->element_type().get();
+                LOG_DEBUG(Cryo::LogComponent::AST, "ArrayLiteral: Using expected element type '{}' from context", expected_element_type->name());
+            }
+            else if (_current_expected_type->kind() == TypeKind::Parameterized)
+            {
+                auto *param_type = static_cast<ParameterizedType *>(_current_expected_type);
+                if (param_type->base_name() == "Array" && param_type->parameter_count() > 0)
+                {
+                    expected_element_type = param_type->type_parameters()[0].get();
+                    LOG_DEBUG(Cryo::LogComponent::AST, "ArrayLiteral: Using expected element type '{}' from parameterized Array<T>", expected_element_type->name());
+                }
+            }
+        }
+
+        // Visit all elements and apply expected type context
         Type *common_element_type = nullptr;
         for (const auto &element : node.elements())
         {
             if (element)
             {
+                // Set expected type for element if we have one
+                Type *previous_expected = _current_expected_type;
+                if (expected_element_type)
+                {
+                    _current_expected_type = expected_element_type;
+                }
+                
                 element->accept(*this);
+                
+                // Restore previous expected type
+                _current_expected_type = previous_expected;
+                
                 if (element->has_resolved_type())
                 {
                     Type *element_type = element->get_resolved_type();
@@ -4656,6 +4760,40 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_fields map", lookup_type_name);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_fields ({} total):", _struct_fields.size());
+            for (const auto &entry : _struct_fields)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "  - '{}' with {} fields", entry.first, entry.second.size());
+            }
+
+            // Fallback for well-known stdlib generic types that might not be imported
+            // This handles cases where types like Pair are used without explicit imports
+            // Check this BEFORE trying to extract base type from lookup_type_name
+            if (effective_type && effective_type->kind() == TypeKind::Parameterized)
+            {
+                ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
+                auto &concrete_types = param_type->type_parameters();
+                std::string base_name = param_type->base_name();
+
+                // Fallback field resolution for Pair<T1, T2>
+                if ((base_name == "Pair" || lookup_type_name == "Pair") && concrete_types.size() == 2)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Using fallback field resolution for Pair type (base_name='{}', concrete_types={})",
+                              base_name, concrete_types.size());
+                    if (member_name == "first")
+                    {
+                        node.set_resolved_type(concrete_types[0].get());
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Pair.first to '{}'", concrete_types[0]->to_string());
+                        return;
+                    }
+                    else if (member_name == "second")
+                    {
+                        node.set_resolved_type(concrete_types[1].get());
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Pair.second to '{}'", concrete_types[1]->to_string());
+                        return;
+                    }
+                }
+            }
 
             // For generic types like "Array<int>", try looking up the base type "Array"
             size_t bracket_pos = lookup_type_name.find('<');
@@ -4683,6 +4821,7 @@ namespace Cryo
                 else
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Base struct '{}' NOT found in _struct_fields map", base_type_name);
+                    // Fallback was already checked above for parameterized types
                 }
             }
         }
@@ -4736,8 +4875,9 @@ namespace Cryo
                             LOG_DEBUG(Cryo::LogComponent::AST, "No stored template params for '{}', using fallback", lookup_type_name);
                             if (lookup_type_name == "Pair" && concrete_types.size() == 2)
                             {
-                                substitution_map["K"] = concrete_types[0];
-                                substitution_map["V"] = concrete_types[1];
+                                // Pair class uses T1, T2 as generic parameters
+                                substitution_map["T1"] = concrete_types[0];
+                                substitution_map["T2"] = concrete_types[1];
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Fallback Pair mapping: K -> {}, V -> {}",
                                           concrete_types[0]->name(), concrete_types[1]->name());
                             }
@@ -4915,8 +5055,9 @@ namespace Cryo
                                 }
                                 else if (lookup_type_name == "Pair" && concrete_types.size() == 2)
                                 {
-                                    substitution_map["K"] = concrete_types[0];
-                                    substitution_map["V"] = concrete_types[1];
+                                    // Pair class uses T1, T2 as generic parameters
+                                    substitution_map["T1"] = concrete_types[0];
+                                    substitution_map["T2"] = concrete_types[1];
                                 }
                             }
                             else
@@ -4943,8 +5084,9 @@ namespace Cryo
                                             Type *string_type = lookup_type_by_name("string");
                                             if (int_type && string_type)
                                             {
-                                                substitution_map["K"] = std::shared_ptr<Type>(int_type, [](Type *) {});
-                                                substitution_map["V"] = std::shared_ptr<Type>(string_type, [](Type *) {});
+                                                // Pair class uses T1, T2 as generic parameters
+                                                substitution_map["T1"] = std::shared_ptr<Type>(int_type, [](Type *) {});
+                                                substitution_map["T2"] = std::shared_ptr<Type>(string_type, [](Type *) {});
                                                 LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<i32, string> from variable name");
                                             }
                                         }
@@ -4955,8 +5097,9 @@ namespace Cryo
                                             Type *bool_type = lookup_type_by_name("boolean");
                                             if (float_type && bool_type)
                                             {
-                                                substitution_map["K"] = std::shared_ptr<Type>(float_type, [](Type *) {});
-                                                substitution_map["V"] = std::shared_ptr<Type>(bool_type, [](Type *) {});
+                                                // Pair class uses T1, T2 as generic parameters
+                                                substitution_map["T1"] = std::shared_ptr<Type>(float_type, [](Type *) {});
+                                                substitution_map["T2"] = std::shared_ptr<Type>(bool_type, [](Type *) {});
                                                 LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<f32, boolean> from variable name");
                                             }
                                         }
@@ -4967,8 +5110,9 @@ namespace Cryo
                                             Type *int_type = lookup_type_by_name("i32");
                                             if (string_type && int_type)
                                             {
-                                                substitution_map["K"] = std::shared_ptr<Type>(string_type, [](Type *) {});
-                                                substitution_map["V"] = std::shared_ptr<Type>(int_type, [](Type *) {});
+                                                // Pair class uses T1, T2 as generic parameters
+                                                substitution_map["T1"] = std::shared_ptr<Type>(string_type, [](Type *) {});
+                                                substitution_map["T2"] = std::shared_ptr<Type>(int_type, [](Type *) {});
                                                 LOG_DEBUG(Cryo::LogComponent::AST, "Inferred Pair<string, i32> from variable name");
                                             }
                                         }
@@ -5002,9 +5146,10 @@ namespace Cryo
 
                                             if (first_concrete && second_concrete)
                                             {
-                                                substitution_map["K"] = std::shared_ptr<Type>(first_concrete, [](Type *) {});
-                                                substitution_map["V"] = std::shared_ptr<Type>(second_concrete, [](Type *) {});
-                                                LOG_DEBUG(Cryo::LogComponent::AST, "Extracted types from name: K={}, V={}",
+                                                // Pair class uses T1, T2 as generic parameters
+                                                substitution_map["T1"] = std::shared_ptr<Type>(first_concrete, [](Type *) {});
+                                                substitution_map["T2"] = std::shared_ptr<Type>(second_concrete, [](Type *) {});
+                                                LOG_DEBUG(Cryo::LogComponent::AST, "Extracted types from name: T1={}, T2={}",
                                                           first_type, second_type);
                                             }
                                         }
@@ -5052,6 +5197,66 @@ namespace Cryo
                 for (const auto &[method_name, method_type] : methods)
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "    - Method '{}' -> {}", method_name, method_type->to_string());
+                }
+            }
+
+            // Fallback for well-known stdlib generic types that might not be imported
+            if (effective_type && effective_type->kind() == TypeKind::Parameterized)
+            {
+                ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
+                auto &concrete_types = param_type->type_parameters();
+                std::string base_name = param_type->base_name();
+
+                // Fallback method resolution for Array<T>
+                if ((base_name == "Array" || lookup_type_name == "Array") && concrete_types.size() >= 1)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Using fallback method resolution for Array type");
+                    Type *element_type = concrete_types[0].get();
+
+                    if (member_name == "push")
+                    {
+                        // push(element: T) -> void
+                        Type *void_type = _type_context.get_void_type();
+                        Type *method_type = _type_context.create_function_type(void_type, {element_type}, false);
+                        node.set_resolved_type(method_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Array.push to void function");
+                        return;
+                    }
+                    else if (member_name == "contains")
+                    {
+                        // contains(element: T) -> boolean
+                        Type *bool_type = _type_context.get_boolean_type();
+                        Type *method_type = _type_context.create_function_type(bool_type, {element_type}, false);
+                        node.set_resolved_type(method_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Array.contains to boolean function");
+                        return;
+                    }
+                    else if (member_name == "length" || member_name == "size")
+                    {
+                        // length() -> i32 / size() -> i32
+                        Type *int_type = _type_context.get_i32_type();
+                        Type *method_type = _type_context.create_function_type(int_type, {}, false);
+                        node.set_resolved_type(method_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Array.{} to i32 function", member_name);
+                        return;
+                    }
+                    else if (member_name == "pop")
+                    {
+                        // pop() -> T
+                        Type *method_type = _type_context.create_function_type(element_type, {}, false);
+                        node.set_resolved_type(method_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Array.pop to element type function");
+                        return;
+                    }
+                    else if (member_name == "get")
+                    {
+                        // get(index: i32) -> T
+                        Type *int_type = _type_context.get_i32_type();
+                        Type *method_type = _type_context.create_function_type(element_type, {int_type}, false);
+                        node.set_resolved_type(method_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Array.get to element type function");
+                        return;
+                    }
                 }
             }
 
@@ -7352,13 +7557,21 @@ namespace Cryo
                 return _type_context.get_i64_type();
             }
 
-            // No suffix - use heuristic based on content
+            // No suffix - use contextual typing if available, otherwise fall back to default heuristic
             if (value.find('.') != std::string::npos)
             {
                 return _type_context.get_default_float_type();
             }
             else
             {
+                // Check if we have an expected type context for integer literals
+                if (_current_expected_type && is_integer_type(_current_expected_type))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Using expected type '{}' for integer literal '{}'", 
+                              _current_expected_type->name(), value);
+                    return _current_expected_type;
+                }
+                
                 return _type_context.get_int_type();
             }
         }
@@ -9100,6 +9313,10 @@ namespace Cryo
         if (module_path == "io/stdio")
         {
             return "std::IO"; // Map io/stdio to std::IO
+        }
+        if (module_path == "strings/strings")
+        {
+            return "std::String"; // Map strings/strings to std::String
         }
 
         // Process path segments

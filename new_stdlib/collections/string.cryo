@@ -1,0 +1,1127 @@
+///! String - UTF-8 Encoded String Type
+///!
+///! A growable, heap-allocated UTF-8 encoded string type.
+///! This is the primary string type for most use cases.
+
+namespace std::collections::string;
+
+import <core/intrinsics>;
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+import <collections/array>;
+
+// ============================================================================
+// String
+// ============================================================================
+
+/// A growable, heap-allocated UTF-8 string.
+type struct String {
+    /// The underlying byte buffer.
+    data: u8*;
+    /// Number of bytes (not characters).
+    len: u64;
+    /// Allocated capacity.
+    cap: u64;
+
+    String();
+    String(capacity: u64);
+    from_cstr(s: string) -> String;
+    from_bytes(bytes: u8*, len: u64) -> String;
+    from_char(c: char) -> String;
+    from_char_repeated(c: char, n: u64) -> String;
+
+    len(&this) -> u64;
+    capacity(&this) -> u64;
+    is_empty(&this) -> boolean;
+    as_cstr(&this) -> string;
+    as_bytes(&this) -> u8*;
+    char_count(&this) -> u64;
+
+    reserve(mut &this, additional: u64) -> void;
+    shrink_to_fit(mut &this) -> void;
+
+    byte_at(&this, index: u64) -> Option<u8>;
+    first_byte(&this) -> Option<u8>;
+    last_byte(&this) -> Option<u8>;
+    char_at(&this, byte_index: u64) -> Option<char>;
+    nth_char(&this, n: u64) -> Option<char>;
+
+    push_char(mut &this, c: char) -> void;
+    push_byte(mut &this, b: u8) -> void;
+    push_str(mut &this, s: string) -> void;
+    push_string(mut &this, other: String) -> void;
+    pop(mut &this) -> Option<char>;
+    insert_char(mut &this, index: u64, c: char) -> void;
+    insert_str(mut &this, index: u64, s: string) -> void;
+    remove(mut &this, index: u64) -> char;
+    clear(mut &this) -> void;
+    truncate(mut &this, new_len: u64) -> void;
+
+    starts_with(&this, prefix: string) -> boolean;
+    ends_with(&this, suffix: string) -> boolean;
+    contains(&this, needle: string) -> boolean;
+    find(&this, needle: string) -> Option<u64>;
+    rfind(&this, needle: string) -> Option<u64>;
+    find_char(&this, c: char) -> Option<u64>;
+    count(&this, needle: string) -> u64;
+
+    substr(&this, start: u64, len: u64) -> String;
+    trim(&this) -> String;
+    trim_start(&this) -> String;
+    trim_end(&this) -> String;
+    to_lowercase(&this) -> String;
+    to_uppercase(&this) -> String;
+    replace(&this, from: string, to: string) -> String;
+    replace_first(&this, from: string, to: string) -> String;
+    repeat(&this, n: u64) -> String;
+    reverse_bytes(&this) -> String;
+
+    split(&this, delimiter: string) -> Vec<String>;
+    split_whitespace(&this) -> Vec<String>;
+    lines(&this) -> Vec<String>;
+
+    compare(&this, other: String) -> i32;
+    compare_cstr(&this, s: string) -> i32;
+    compare_ignore_case(&this, other: String) -> i32;
+
+    clone(&this) -> String;
+
+    grow(mut &this, new_cap: u64) -> void;
+    drop(&this) -> void;
+
+    utf8_char_len(&this, first_byte: u8) -> u64;
+    decode_utf8(&this, index: u64) -> char;
+    encode_utf8(&this, c: char, buf: u8*) -> u64;
+    is_whitespace(&this, b: u8) -> boolean;
+}
+
+implement struct String {
+    /// Creates a new empty String.
+    String() {
+        this.data = null;
+        this.len = 0;
+        this.cap = 0;
+    }
+
+    /// Creates a String with the specified capacity.
+    String(capacity: u64) {
+        if (capacity == 0) {
+            this.data = null;
+            this.len = 0;
+            this.cap = 0;
+            return;
+        }
+
+        const data: u8* = malloc(capacity + 1); // +1 for null terminator
+        if (data == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        data[0] = 0;
+
+        this.data = data;
+        this.len = 0;
+        this.cap = capacity;
+    }
+
+    /// Creates a String from a C string.
+    from_cstr(s: string) -> String {
+        if (s == null) {
+            return new String();
+        }
+
+        const len: u64 = strlen(s);
+        const str: String = new String(len);
+        memcpy(str.data, s, len + 1);
+        str.len = len;
+        return str;
+    }
+
+    /// Creates a String from bytes.
+    from_bytes(bytes: u8*, len: u64) -> String {
+        if (len == 0) {
+            return new String();
+        }
+
+        const str: String = new String(len);
+        memcpy(str.data, bytes, len);
+        str.data[len] = 0;
+        str.len = len;
+        return str;
+    }
+
+    /// Creates a String from a single character.
+    from_char(c: char) -> String {
+        const str: String = new String(4);
+        const len: u64 = str.encode_utf8(c, str.data);
+        str.data[len] = 0;
+        str.len = len;
+        return str;
+    }
+
+    /// Creates a String with n copies of a character.
+    from_char_repeated(c: char, n: u64) -> String {
+        // Estimate max bytes needed
+        const str: String = new String(n * 4);
+        mut i: u64 = 0;
+        while (i < n) {
+            str.push_char(c);
+            i = i + 1;
+        }
+        return str;
+    }
+
+    // ========================================================================
+    // Properties
+    // ========================================================================
+
+    /// Returns the length in bytes.
+    len(&this) -> u64 {
+        return this.len;
+    }
+
+    /// Returns the capacity.
+    capacity(&this) -> u64 {
+        return this.cap;
+    }
+
+    /// Returns true if the string is empty.
+    is_empty(&this) -> boolean {
+        return this.len == 0;
+    }
+
+    /// Returns the string as a C string (null-terminated).
+    as_cstr(&this) -> string {
+        if (this.data == null) {
+            return "";
+        }
+        return this.data;
+    }
+
+    /// Returns a pointer to the bytes.
+    as_bytes(&this) -> u8* {
+        return this.data;
+    }
+
+    /// Returns the number of UTF-8 characters (not bytes).
+    char_count(&this) -> u64 {
+        mut count: u64 = 0;
+        mut i: u64 = 0;
+        while (i < this.len) {
+            const b: u8 = this.data[i];
+            // Count bytes that are not continuation bytes
+            if ((b & 0xC0) != 0x80) {
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    // ========================================================================
+    // Capacity Management
+    // ========================================================================
+
+    /// Reserves capacity for at least `additional` more bytes.
+    reserve(mut &this, additional: u64) -> void {
+        const required: u64 = this.len + additional;
+        if (required <= this.cap) {
+            return;
+        }
+
+        mut new_cap: u64 = this.cap;
+        if (new_cap == 0) {
+            new_cap = 8;
+        }
+        while (new_cap < required) {
+            new_cap = new_cap * 2;
+        }
+
+        this.grow(new_cap);
+    }
+
+    /// Shrinks the capacity to match the length.
+    shrink_to_fit(mut &this) -> void {
+        if (this.len == this.cap) {
+            return;
+        }
+
+        if (this.len == 0) {
+            free(this.data);
+            this.data = null;
+            this.cap = 0;
+            return;
+        }
+
+        const new_data: u8* = realloc(this.data, this.len + 1);
+        if (new_data != null) {
+            this.data = new_data;
+            this.cap = this.len;
+        }
+    }
+
+    // ========================================================================
+    // Access
+    // ========================================================================
+
+    /// Gets a byte at the given index.
+    byte_at(&this, index: u64) -> Option<u8> {
+        if (index >= this.len) {
+            return Option::None;
+        }
+        return Option::Some(this.data[index]);
+    }
+
+    /// Gets the first byte.
+    first_byte(&this) -> Option<u8> {
+        return this.byte_at(0);
+    }
+
+    /// Gets the last byte.
+    last_byte(&this) -> Option<u8> {
+        if (this.len == 0) {
+            return Option::None;
+        }
+        return this.byte_at(this.len - 1);
+    }
+
+    /// Gets the character at the given byte index.
+    char_at(&this, byte_index: u64) -> Option<char> {
+        if (byte_index >= this.len) {
+            return Option::None;
+        }
+        return Option::Some(this.decode_utf8(byte_index));
+    }
+
+    /// Gets the nth character (0-indexed).
+    nth_char(&this, n: u64) -> Option<char> {
+        mut count: u64 = 0;
+        mut i: u64 = 0;
+        while (i < this.len) {
+            const b: u8 = this.data[i];
+            if ((b & 0xC0) != 0x80) {
+                if (count == n) {
+                    return Option::Some(this.decode_utf8(i));
+                }
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    // ========================================================================
+    // Modification
+    // ========================================================================
+
+    /// Pushes a character onto the end.
+    push_char(mut &this, c: char) -> void {
+        this.reserve(4);
+        const len: u64 = this.encode_utf8(c, &this.data[this.len]);
+        this.len = this.len + len;
+        this.data[this.len] = 0;
+    }
+
+    /// Pushes a byte onto the end.
+    push_byte(mut &this, b: u8) -> void {
+        this.reserve(1);
+        this.data[this.len] = b;
+        this.len = this.len + 1;
+        this.data[this.len] = 0;
+    }
+
+    /// Pushes a string onto the end.
+    push_str(mut &this, s: string) -> void {
+        const len: u64 = strlen(s);
+        this.reserve(len);
+        memcpy(&this.data[this.len], s, len);
+        this.len = this.len + len;
+        this.data[this.len] = 0;
+    }
+
+    /// Pushes another String onto the end.
+    push_string(mut &this, other: String) -> void {
+        this.reserve(other.len);
+        memcpy(&this.data[this.len], other.data, other.len);
+        this.len = this.len + other.len;
+        this.data[this.len] = 0;
+    }
+
+    /// Pops the last character.
+    pop(mut &this) -> Option<char> {
+        if (this.len == 0) {
+            return Option::None;
+        }
+
+        // Find the start of the last character
+        mut i: u64 = this.len - 1;
+        while (i > 0 && (this.data[i] & 0xC0) == 0x80) {
+            i = i - 1;
+        }
+
+        const c: char = this.decode_utf8(i);
+        this.len = i;
+        this.data[this.len] = 0;
+        return Option::Some(c);
+    }
+
+    /// Inserts a character at the given byte index.
+    insert_char(mut &this, index: u64, c: char) -> void {
+        if (index > this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        mut buf: u8[4];
+        const char_len: u64 = this.encode_utf8(c, &buf[0]);
+
+        this.reserve(char_len);
+
+        // Shift bytes to the right
+        mut i: u64 = this.len;
+        while (i > index) {
+            this.data[i + char_len - 1] = this.data[i - 1];
+            i = i - 1;
+        }
+
+        // Copy the character bytes
+        memcpy(&this.data[index], &buf[0], char_len);
+        this.len = this.len + char_len;
+        this.data[this.len] = 0;
+    }
+
+    /// Inserts a string at the given byte index.
+    insert_str(mut &this, index: u64, s: string) -> void {
+        if (index > this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const s_len: u64 = strlen(s);
+        this.reserve(s_len);
+
+        // Shift bytes to the right
+        mut i: u64 = this.len;
+        while (i > index) {
+            this.data[i + s_len - 1] = this.data[i - 1];
+            i = i - 1;
+        }
+
+        // Copy the string bytes
+        memcpy(&this.data[index], s, s_len);
+        this.len = this.len + s_len;
+        this.data[this.len] = 0;
+    }
+
+    /// Removes a character at the given byte index.
+    remove(mut &this, index: u64) -> char {
+        if (index >= this.len) {
+            panic("index out of bounds", FILE, LINE);
+        }
+
+        const c: char = this.decode_utf8(index);
+        const char_len: u64 = this.utf8_char_len(this.data[index]);
+
+        // Shift bytes to the left
+        mut i: u64 = index;
+        while (i + char_len < this.len) {
+            this.data[i] = this.data[i + char_len];
+            i = i + 1;
+        }
+
+        this.len = this.len - char_len;
+        this.data[this.len] = 0;
+        return c;
+    }
+
+    /// Clears the string.
+    clear(mut &this) -> void {
+        this.len = 0;
+        if (this.data != null) {
+            this.data[0] = 0;
+        }
+    }
+
+    /// Truncates the string to the given byte length.
+    truncate(mut &this, new_len: u64) -> void {
+        if (new_len < this.len) {
+            this.len = new_len;
+            this.data[this.len] = 0;
+        }
+    }
+
+    // ========================================================================
+    // Searching
+    // ========================================================================
+
+    /// Returns true if the string starts with the given prefix.
+    starts_with(&this, prefix: string) -> boolean {
+        const prefix_len: u64 = strlen(prefix);
+        if (prefix_len > this.len) {
+            return false;
+        }
+        return memcmp(this.data, prefix, prefix_len) == 0;
+    }
+
+    /// Returns true if the string ends with the given suffix.
+    ends_with(&this, suffix: string) -> boolean {
+        const suffix_len: u64 = strlen(suffix);
+        if (suffix_len > this.len) {
+            return false;
+        }
+        return memcmp(&this.data[this.len - suffix_len], suffix, suffix_len) == 0;
+    }
+
+    /// Returns true if the string contains the given substring.
+    contains(&this, needle: string) -> boolean {
+        return this.find(needle).is_some();
+    }
+
+    /// Finds the first occurrence of a substring.
+    find(&this, needle: string) -> Option<u64> {
+        const needle_len: u64 = strlen(needle);
+        if (needle_len == 0) {
+            return Option::Some(0);
+        }
+        if (needle_len > this.len) {
+            return Option::None;
+        }
+
+        const end: u64 = this.len - needle_len + 1;
+        mut i: u64 = 0;
+        while (i < end) {
+            if (memcmp(&this.data[i], needle, needle_len) == 0) {
+                return Option::Some(i);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// Finds the last occurrence of a substring.
+    rfind(&this, needle: string) -> Option<u64> {
+        const needle_len: u64 = strlen(needle);
+        if (needle_len == 0) {
+            return Option::Some(this.len);
+        }
+        if (needle_len > this.len) {
+            return Option::None;
+        }
+
+        mut i: u64 = this.len - needle_len + 1;
+        while (i > 0) {
+            i = i - 1;
+            if (memcmp(&this.data[i], needle, needle_len) == 0) {
+                return Option::Some(i);
+            }
+        }
+        return Option::None;
+    }
+
+    /// Finds the first occurrence of a character.
+    find_char(&this, c: char) -> Option<u64> {
+        mut buf: u8[4];
+        const char_len: u64 = this.encode_utf8(c, &buf[0]);
+
+        mut i: u64 = 0;
+        while (i + char_len <= this.len) {
+            if (memcmp(&this.data[i], &buf[0], char_len) == 0) {
+                return Option::Some(i);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// Counts occurrences of a substring.
+    count(&this, needle: string) -> u64 {
+        const needle_len: u64 = strlen(needle);
+        if (needle_len == 0 || needle_len > this.len) {
+            return 0;
+        }
+
+        mut count: u64 = 0;
+        mut i: u64 = 0;
+        while (i + needle_len <= this.len) {
+            if (memcmp(&this.data[i], needle, needle_len) == 0) {
+                count = count + 1;
+                i = i + needle_len;
+            } else {
+                i = i + 1;
+            }
+        }
+        return count;
+    }
+
+    // ========================================================================
+    // Transformations
+    // ========================================================================
+
+    /// Returns a substring.
+    substr(&this, start: u64, len: u64) -> String {
+        if (start >= this.len) {
+            return new String();
+        }
+
+        mut actual_len: u64 = len;
+        if (start + actual_len > this.len) {
+            actual_len = this.len - start;
+        }
+
+        return String::from_bytes(&this.data[start], actual_len);
+    }
+
+    /// Trims whitespace from both ends.
+    trim(&this) -> String {
+        if (this.len == 0) {
+            return new String();
+        }
+
+        mut start: u64 = 0;
+        while (start < this.len && this.is_whitespace(this.data[start])) {
+            start = start + 1;
+        }
+
+        mut end: u64 = this.len;
+        while (end > start && this.is_whitespace(this.data[end - 1])) {
+            end = end - 1;
+        }
+
+        return String::from_bytes(&this.data[start], end - start);
+    }
+
+    /// Trims whitespace from the start.
+    trim_start(&this) -> String {
+        if (this.len == 0) {
+            return new String();
+        }
+
+        mut start: u64 = 0;
+        while (start < this.len && this.is_whitespace(this.data[start])) {
+            start = start + 1;
+        }
+
+        return String::from_bytes(&this.data[start], this.len - start);
+    }
+
+    /// Trims whitespace from the end.
+    trim_end(&this) -> String {
+        if (this.len == 0) {
+            return new String();
+        }
+
+        mut end: u64 = this.len;
+        while (end > 0 && this.is_whitespace(this.data[end - 1])) {
+            end = end - 1;
+        }
+
+        return String::from_bytes(this.data, end);
+    }
+
+    /// Converts to lowercase (ASCII only).
+    to_lowercase(&this) -> String {
+        const result: String = this.clone();
+        mut i: u64 = 0;
+        while (i < result.len) {
+            const c: u8 = result.data[i];
+            if (c >= 65 && c <= 90) { // A-Z
+                result.data[i] = c + 32;
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    /// Converts to uppercase (ASCII only).
+    to_uppercase(&this) -> String {
+        const result: String = this.clone();
+        mut i: u64 = 0;
+        while (i < result.len) {
+            const c: u8 = result.data[i];
+            if (c >= 97 && c <= 122) { // a-z
+                result.data[i] = c - 32;
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    /// Replaces all occurrences of a pattern.
+    replace(&this, from: string, to: string) -> String {
+        const from_len: u64 = strlen(from);
+        const to_len: u64 = strlen(to);
+
+        if (from_len == 0) {
+            return this.clone();
+        }
+
+        const result: String = new String(this.len);
+
+        mut i: u64 = 0;
+        while (i < this.len) {
+            if (i + from_len <= this.len && memcmp(&this.data[i], from, from_len) == 0) {
+                result.push_str(to);
+                i = i + from_len;
+            } else {
+                result.push_byte(this.data[i]);
+                i = i + 1;
+            }
+        }
+
+        return result;
+    }
+
+    /// Replaces the first occurrence of a pattern.
+    replace_first(&this, from: string, to: string) -> String {
+        const pos: Option<u64> = this.find(from);
+        match (pos) {
+            Option::None => { return this.clone(); }
+            Option::Some(index) => {
+                const from_len: u64 = strlen(from);
+                const result: String = new String(this.len);
+                result.push_str(this.substr(0, index).as_cstr());
+                result.push_str(to);
+                result.push_str(this.substr(index + from_len, this.len).as_cstr());
+                return result;
+            }
+        }
+    }
+
+    /// Repeats the string n times.
+    repeat(&this, n: u64) -> String {
+        if (n == 0 || this.len == 0) {
+            return new String();
+        }
+
+        const result: String = new String(this.len * n);
+        mut i: u64 = 0;
+        while (i < n) {
+            memcpy(&result.data[result.len], this.data, this.len);
+            result.len = result.len + this.len;
+            i = i + 1;
+        }
+        result.data[result.len] = 0;
+        return result;
+    }
+
+    /// Reverses the string (byte-wise, not UTF-8 aware).
+    reverse_bytes(&this) -> String {
+        const result: String = this.clone();
+        mut left: u64 = 0;
+        mut right: u64 = result.len;
+
+        while (left < right) {
+            right = right - 1;
+            const temp: u8 = result.data[left];
+            result.data[left] = result.data[right];
+            result.data[right] = temp;
+            left = left + 1;
+        }
+
+        return result;
+    }
+
+    // ========================================================================
+    // Splitting
+    // ========================================================================
+
+    /// Splits the string by a delimiter and returns a Vec of Strings.
+    split(&this, delimiter: string) -> Vec<String> {
+        const result: Vec<String> = new Vec();
+        const delim_len: u64 = strlen(delimiter);
+
+        if (delim_len == 0) {
+            result.push(this.clone());
+            return result;
+        }
+
+        mut start: u64 = 0;
+        mut i: u64 = 0;
+
+        while (i + delim_len <= this.len) {
+            if (memcmp(&this.data[i], delimiter, delim_len) == 0) {
+                result.push(String::from_bytes(&this.data[start], i - start));
+                start = i + delim_len;
+                i = start;
+            } else {
+                i = i + 1;
+            }
+        }
+
+        result.push(String::from_bytes(&this.data[start], this.len - start));
+        return result;
+    }
+
+    /// Splits by whitespace.
+    split_whitespace(&this) -> Vec<String> {
+        const result: Vec<String> = new Vec();
+
+        mut start: u64 = 0;
+        mut in_word: boolean = false;
+
+        mut i: u64 = 0;
+        while (i < this.len) {
+            const is_ws: boolean = this.is_whitespace(this.data[i]);
+
+            if (!in_word && !is_ws) {
+                start = i;
+                in_word = true;
+            } else if (in_word && is_ws) {
+                result.push(String::from_bytes(&this.data[start], i - start));
+                in_word = false;
+            }
+
+            i = i + 1;
+        }
+
+        if (in_word) {
+            result.push(String::from_bytes(&this.data[start], this.len - start));
+        }
+
+        return result;
+    }
+
+    /// Splits into lines.
+    lines(&this) -> Vec<String> {
+        const result: Vec<String> = new Vec();
+
+        mut start: u64 = 0;
+        mut i: u64 = 0;
+
+        while (i < this.len) {
+            if (this.data[i] == 10) { // \n
+                mut end: u64 = i;
+                // Handle \r\n
+                if (i > start && this.data[i - 1] == 13) {
+                    end = i - 1;
+                }
+                result.push(String::from_bytes(&this.data[start], end - start));
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+
+        if (start < this.len) {
+            result.push(String::from_bytes(&this.data[start], this.len - start));
+        }
+
+        return result;
+    }
+
+    // ========================================================================
+    // Comparison
+    // ========================================================================
+
+    /// Compares two strings.
+    compare(&this, other: String) -> i32 {
+        const min_len: u64 = this.len < other.len ? this.len : other.len;
+        const cmp: i32 = memcmp(this.data, other.data, min_len);
+
+        if (cmp != 0) {
+            return cmp;
+        }
+
+        if (this.len < other.len) {
+            return -1;
+        }
+        if (this.len > other.len) {
+            return 1;
+        }
+        return 0;
+    }
+
+    /// Compares with a C string.
+    compare_cstr(&this, s: string) -> i32 {
+        return strcmp(this.as_cstr(), s);
+    }
+
+    /// Case-insensitive comparison (ASCII only).
+    compare_ignore_case(&this, other: String) -> i32 {
+        const a: String = this.to_lowercase();
+        const b: String = other.to_lowercase();
+        return a.compare(b);
+    }
+
+    // ========================================================================
+    // Cloning
+    // ========================================================================
+
+    /// Creates a clone of the string.
+    clone(&this) -> String {
+        if (this.len == 0) {
+            return new String();
+        }
+        return String::from_bytes(this.data, this.len);
+    }
+
+    // ========================================================================
+    // Memory Management
+    // ========================================================================
+
+    /// Grows the string capacity.
+    grow(mut &this, new_cap: u64) -> void {
+        const new_data: u8* = realloc(this.data, new_cap + 1);
+        if (new_data == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        this.data = new_data;
+        this.cap = new_cap;
+    }
+
+    /// Drops the string and frees memory.
+    drop(&this) -> void {
+        if (this.data != null) {
+            free(this.data);
+        }
+    }
+
+    // ========================================================================
+    // UTF-8 Helpers
+    // ========================================================================
+
+    /// Returns the byte length of a UTF-8 character.
+    utf8_char_len(&this, first_byte: u8) -> u64 {
+        if ((first_byte & 0x80) == 0) {
+            return 1;
+        }
+        if ((first_byte & 0xE0) == 0xC0) {
+            return 2;
+        }
+        if ((first_byte & 0xF0) == 0xE0) {
+            return 3;
+        }
+        if ((first_byte & 0xF8) == 0xF0) {
+            return 4;
+        }
+        return 1; // Invalid, treat as single byte
+    }
+
+    /// Decodes a UTF-8 character at the given byte index.
+    decode_utf8(&this, index: u64) -> char {
+        const b0: u8 = this.data[index];
+
+        if ((b0 & 0x80) == 0) {
+            return b0;
+        }
+
+        if ((b0 & 0xE0) == 0xC0 && index + 1 < this.len) {
+            const b1: u8 = this.data[index + 1];
+            return ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+        }
+
+        if ((b0 & 0xF0) == 0xE0 && index + 2 < this.len) {
+            const b1: u8 = this.data[index + 1];
+            const b2: u8 = this.data[index + 2];
+            return ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+        }
+
+        if ((b0 & 0xF8) == 0xF0 && index + 3 < this.len) {
+            const b1: u8 = this.data[index + 1];
+            const b2: u8 = this.data[index + 2];
+            const b3: u8 = this.data[index + 3];
+            return ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+        }
+
+        return 0xFFFD; // Replacement character
+    }
+
+    /// Encodes a character as UTF-8 into the buffer.
+    encode_utf8(&this, c: char, buf: u8*) -> u64 {
+        const code: u32 = c;
+
+        if (code < 0x80) {
+            buf[0] = code;
+            return 1;
+        }
+
+        if (code < 0x800) {
+            buf[0] = 0xC0 | (code >> 6);
+            buf[1] = 0x80 | (code & 0x3F);
+            return 2;
+        }
+
+        if (code < 0x10000) {
+            buf[0] = 0xE0 | (code >> 12);
+            buf[1] = 0x80 | ((code >> 6) & 0x3F);
+            buf[2] = 0x80 | (code & 0x3F);
+            return 3;
+        }
+
+        buf[0] = 0xF0 | (code >> 18);
+        buf[1] = 0x80 | ((code >> 12) & 0x3F);
+        buf[2] = 0x80 | ((code >> 6) & 0x3F);
+        buf[3] = 0x80 | (code & 0x3F);
+        return 4;
+    }
+
+    /// Returns true if the byte is ASCII whitespace.
+    is_whitespace(&this, b: u8) -> boolean {
+        return b == 32 || b == 9 || b == 10 || b == 13;
+    }
+}
+
+// ============================================================================
+// String Iterator
+// ============================================================================
+
+/// An iterator over the characters of a String.
+type struct StringChars {
+    str: String*;
+    byte_index: u64;
+
+    StringChars(str: String);
+
+    has_next(&this) -> boolean;
+    next(mut &this) -> Option<char>;
+}
+
+implement struct StringChars {
+    /// Creates a character iterator.
+    StringChars(str: String) {
+        this.str = &str;
+        this.byte_index = 0;
+    }
+
+    /// Returns true if there are more characters.
+    has_next(&this) -> boolean {
+        return this.byte_index < this.str.len;
+    }
+
+    /// Returns the next character.
+    next(mut &this) -> Option<char> {
+        if (this.byte_index >= this.str.len) {
+            return Option::None;
+        }
+
+        const c: char = this.str.decode_utf8(this.byte_index);
+        const char_len: u64 = this.str.utf8_char_len(this.str.data[this.byte_index]);
+        this.byte_index = this.byte_index + char_len;
+
+        return Option::Some(c);
+    }
+}
+
+/// An iterator over the bytes of a String.
+type struct StringBytes {
+    str: String*;
+    index: u64;
+
+    StringBytes(str: String);
+
+    has_next(&this) -> boolean;
+    next(mut &this) -> Option<u8>;
+}
+
+implement struct StringBytes {
+    /// Creates a byte iterator.
+    StringBytes(str: String) {
+        this.str = &str;
+        this.index = 0;
+    }
+
+    /// Returns true if there are more bytes.
+    has_next(&this) -> boolean {
+        return this.index < this.str.len;
+    }
+
+    /// Returns the next byte.
+    next(mut &this) -> Option<u8> {
+        if (this.index >= this.str.len) {
+            return Option::None;
+        }
+
+        const b: u8 = this.str.data[this.index];
+        this.index = this.index + 1;
+        return Option::Some(b);
+    }
+}
+
+// ============================================================================
+// StringBuilder
+// ============================================================================
+
+/// A mutable string builder for efficient concatenation.
+type struct StringBuilder {
+    buffer: String;
+
+    StringBuilder();
+    StringBuilder(capacity: u64);
+
+    append(mut &this, s: string) -> StringBuilder*;
+    append_string(mut &this, s: String) -> StringBuilder*;
+    append_char(mut &this, c: char) -> StringBuilder*;
+    append_line(mut &this, s: string) -> StringBuilder*;
+    len(&this) -> u64;
+    capacity(&this) -> u64;
+    clear(mut &this) -> void;
+    build(&this) -> String;
+    into_string(&this) -> String;
+    drop(&this) -> void;
+}
+
+implement struct StringBuilder {
+    /// Creates a new StringBuilder.
+    StringBuilder() {
+        this.buffer = new String();
+    }
+
+    /// Creates a StringBuilder with capacity.
+    StringBuilder(capacity: u64) {
+        this.buffer = new String(capacity);
+    }
+
+    /// Appends a string.
+    append(mut &this, s: string) -> StringBuilder* {
+        this.buffer.push_str(s);
+        return this;
+    }
+
+    /// Appends a String.
+    append_string(mut &this, s: String) -> StringBuilder* {
+        this.buffer.push_string(s);
+        return this;
+    }
+
+    /// Appends a character.
+    append_char(mut &this, c: char) -> StringBuilder* {
+        this.buffer.push_char(c);
+        return this;
+    }
+
+    /// Appends a newline.
+    append_line(mut &this, s: string) -> StringBuilder* {
+        this.buffer.push_str(s);
+        this.buffer.push_char('\n');
+        return this;
+    }
+
+    /// Returns the current length.
+    len(&this) -> u64 {
+        return this.buffer.len;
+    }
+
+    /// Returns the capacity.
+    capacity(&this) -> u64 {
+        return this.buffer.cap;
+    }
+
+    /// Clears the builder.
+    clear(mut &this) -> void {
+        this.buffer.clear();
+    }
+
+    /// Builds and returns the final String.
+    build(&this) -> String {
+        return this.buffer.clone();
+    }
+
+    /// Builds and consumes the builder.
+    into_string(&this) -> String {
+        const result: String = this.buffer;
+        this.buffer = new String();
+        return result;
+    }
+
+    /// Drops the builder.
+    drop(&this) -> void {
+        this.buffer.drop();
+    }
+}

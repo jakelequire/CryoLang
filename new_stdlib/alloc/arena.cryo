@@ -1,0 +1,478 @@
+///! Arena Allocator Module
+///!
+///! An arena allocator (also called bump allocator or region allocator)
+///! allocates memory by simply incrementing a pointer. Deallocation is
+///! performed all at once when the arena is dropped or reset.
+///!
+///! Arenas are excellent for:
+///! - Parsing (allocating AST nodes)
+///! - Per-frame game allocations
+///! - Request-scoped allocations in servers
+
+namespace std::alloc::arena;
+
+import <core/option>;
+import <core/mem>;
+import <alloc/global>;
+
+// ============================================================================
+// Arena Configuration
+// ============================================================================
+
+/// Default chunk size for arena allocations (64 KB).
+const DEFAULT_CHUNK_SIZE: u64 = 65536;
+
+/// Maximum alignment supported by the arena.
+const MAX_ALIGN: u64 = 16;
+
+// ============================================================================
+// Arena Chunk
+// ============================================================================
+
+/// A chunk of memory in the arena.
+type struct ArenaChunk {
+    /// Pointer to the chunk data.
+    data: u8*;
+    /// Total size of the chunk.
+    size: u64;
+    /// Current offset into the chunk.
+    offset: u64;
+    /// Pointer to the next chunk.
+    next: ArenaChunk*;
+
+    // Constructor
+    ArenaChunk(size: u64);
+
+    remaining(this) -> u64;
+    try_alloc(mut &this, size: u64, align: u64) -> void*;
+    reset(mut &this) -> void;
+    drop(this) -> void;
+}
+
+implement struct ArenaChunk {
+    /// Creates a new chunk with the specified size.
+    ArenaChunk(size: u64) {
+        const chunk: ArenaChunk* = malloc(sizeof(ArenaChunk));
+        if (chunk == null) {
+            return null;
+        }
+
+        chunk.data = malloc(size);
+        if (chunk.data == null) {
+            free(chunk);
+            return null;
+        }
+
+        chunk.size = size;
+        chunk.offset = 0;
+        chunk.next = null;
+        return chunk;
+    }
+
+    /// Returns the remaining capacity.
+    remaining(this) -> u64 {
+        return this.size - this.offset;
+    }
+
+    /// Attempts to allocate from this chunk.
+    try_alloc(mut &this, size: u64, align: u64) -> void* {
+        // Calculate aligned offset
+        const current_addr: u64 = this.data + this.offset;
+        const aligned_addr: u64 = (current_addr + align - 1) & ~(align - 1);
+        const padding: u64 = aligned_addr - current_addr;
+        const total_size: u64 = padding + size;
+
+        if (this.offset + total_size > this.size) {
+            return null;
+        }
+
+        this.offset = this.offset + total_size;
+        return aligned_addr;
+    }
+
+    /// Resets the chunk.
+   reset(mut &this) -> void {
+        this.offset = 0;
+    }
+
+    /// Deallocates the chunk.
+    drop(this) -> void {
+        free(this.data);
+        free(this);
+    }
+}
+
+// ============================================================================
+// Arena
+// ============================================================================
+
+/// A bump allocator that allocates memory linearly from chunks.
+type struct Arena {
+    /// The first chunk in the linked list.
+    first_chunk: ArenaChunk*;
+    /// The current chunk being allocated from.
+    current_chunk: ArenaChunk*;
+    /// The default chunk size.
+    chunk_size: u64;
+    /// Total bytes allocated.
+    total_allocated: u64;
+    /// Number of chunks.
+    chunk_count: u64;
+
+    Arena();
+    Arena(chunk_size: u64);
+    Arena(capacity: u64);
+
+    ensure_capacity(mut &this, capacity: u64) -> void;
+    alloc(mut &this, size: u64) -> void*;
+    alloc_aligned(mut &this, size: u64, align: u64) -> void*;
+    alloc_zeroed(mut &this, size: u64) -> void*;
+    alloc_one<T>(mut &this) -> T*;
+    alloc_init<T>(mut &this, value: T) -> T*;
+    alloc_array<T>(mut &this, n: u64) -> T*;
+    alloc_array_zeroed<T>(mut &this, n: u64) -> T*;
+    alloc_slice_copy<T>(mut &this, src: T*, len: u64) -> T*;
+    alloc_str(mut &this, s: string) -> string;
+    reset(mut &this) -> void;
+    bytes_allocated(this) -> u64;
+    num_chunks(this) -> u64;
+    capacity(this) -> u64;
+    drop(this) -> void;
+}
+
+implement struct Arena {
+    /// Creates a new arena with the default chunk size.
+    Arena() {
+        this.first_chunk = null;
+        this.current_chunk = null;
+        this.chunk_size = DEFAULT_CHUNK_SIZE;
+        this.total_allocated = 0;
+        this.chunk_count = 0;
+    }
+
+    /// Creates a new arena with the specified chunk size.
+    Arena(chunk_size: u64) {
+        this.first_chunk = null;
+        this.current_chunk = null;
+        this.chunk_size = chunk_size;
+        this.total_allocated = 0;
+        this.chunk_count = 0;
+    }
+
+    /// Creates a new arena with an initial capacity.
+    Arena(capacity: u64) {
+        this.first_chunk = null;
+        this.current_chunk = null;
+        this.chunk_size = DEFAULT_CHUNK_SIZE;
+        this.total_allocated = 0;
+        this.chunk_count = 0;
+        this.ensure_capacity(capacity);
+    }
+
+    /// Ensures the arena has at least the specified capacity.
+    ensure_capacity(mut &this, capacity: u64) -> void {
+        if (this.first_chunk == null) {
+            mut size: u64 = this.chunk_size;
+            if (capacity > size) {
+                size = capacity;
+            }
+            const chunk: ArenaChunk* = new ArenaChunk(size);
+            if (chunk != null) {
+                this.first_chunk = chunk;
+                this.current_chunk = chunk;
+                this.chunk_count = 1;
+            }
+        }
+    }
+
+    /// Allocates memory from the arena.
+    alloc(mut &this, size: u64) -> void* {
+        return this.alloc_aligned(size, 8);
+    }
+
+    /// Allocates aligned memory from the arena.
+    alloc_aligned(mut &this, size: u64, align: u64) -> void* {
+        if (size == 0) {
+            return align; // Return dangling pointer
+        }
+
+        // Try current chunk first
+        if (this.current_chunk != null) {
+            const ptr: void* = this.current_chunk.try_alloc(size, align);
+            if (ptr != null) {
+                this.total_allocated = this.total_allocated + size;
+                return ptr;
+            }
+        }
+
+        // Allocate new chunk
+        mut chunk_size: u64 = this.chunk_size;
+        const needed: u64 = size + align;
+        if (needed > chunk_size) {
+            chunk_size = needed;
+        }
+
+        const new_chunk: ArenaChunk* = new ArenaChunk(chunk_size);
+        if (new_chunk == null) {
+            return null;
+        }
+
+        // Link the new chunk
+        if (this.current_chunk != null) {
+            this.current_chunk.next = new_chunk;
+        } else {
+            this.first_chunk = new_chunk;
+        }
+        this.current_chunk = new_chunk;
+        this.chunk_count = this.chunk_count + 1;
+
+        // Allocate from new chunk
+        const ptr: void* = new_chunk.try_alloc(size, align);
+        if (ptr != null) {
+            this.total_allocated = this.total_allocated + size;
+        }
+        return ptr;
+    }
+
+    /// Allocates zeroed memory from the arena.
+    alloc_zeroed(mut &this, size: u64) -> void* {
+        const ptr: void* = this.alloc(size);
+        if (ptr != null) {
+            memset(ptr, 0, size);
+        }
+        return ptr;
+    }
+
+    /// Allocates a single value of type T.
+    alloc_one<T>(mut &this) -> T* {
+        return this.alloc_aligned(sizeof(T), alignof(T));
+    }
+
+    /// Allocates and initializes a single value.
+    alloc_init<T>(mut &this, value: T) -> T* {
+        const ptr: T* = this.alloc_one<T>();
+        if (ptr != null) {
+            *ptr = value;
+        }
+        return ptr;
+    }
+
+    /// Allocates an array of n elements.
+    alloc_array<T>(mut &this, n: u64) -> T* {
+        return this.alloc_aligned(sizeof(T) * n, alignof(T));
+    }
+
+    /// Allocates a zeroed array.
+    alloc_array_zeroed<T>(mut &this, n: u64) -> T* {
+        const ptr: T* = this.alloc_array<T>(n);
+        if (ptr != null) {
+            memset(ptr, 0, sizeof(T) * n);
+        }
+        return ptr;
+    }
+
+    /// Allocates a copy of a slice.
+    alloc_slice_copy<T>(mut &this, src: T*, len: u64) -> T* {
+        const ptr: T* = this.alloc_array<T>(len);
+        if (ptr != null) {
+            memcpy(ptr, src, sizeof(T) * len);
+        }
+        return ptr;
+    }
+
+    /// Allocates a copy of a string.
+    alloc_str(mut &this, s: string) -> string {
+        const len: u64 = strlen(s) + 1;
+        const ptr: i8* = this.alloc(len);
+        if (ptr != null) {
+            memcpy(ptr, s, len);
+        }
+        return ptr;
+    }
+
+    /// Resets the arena, allowing memory to be reused.
+    reset(mut &this, Arena) -> void {
+        mut chunk: ArenaChunk* = this.first_chunk;
+        while (chunk != null) {
+            chunk.reset();
+            chunk = chunk.next;
+        }
+        this.current_chunk = this.first_chunk;
+        this.total_allocated = 0;
+    }
+
+    /// Returns the total bytes allocated.
+    bytes_allocated(this) -> u64 {
+        return this.total_allocated;
+    }
+
+    /// Returns the number of chunks.
+    num_chunks(this) -> u64 {
+        return this.chunk_count;
+    }
+
+    /// Returns the total capacity of all chunks.
+    capacity(this) -> u64 {
+        mut total: u64 = 0;
+        mut chunk: ArenaChunk* = this.first_chunk;
+        while (chunk != null) {
+            total = total + chunk.size;
+            chunk = chunk.next;
+        }
+        return total;
+    }
+
+    /// Drops the arena and frees all memory.
+    drop(this) -> void {
+        mut chunk: ArenaChunk* = this.first_chunk;
+        while (chunk != null) {
+            const next: ArenaChunk* = chunk.next;
+            chunk.drop();
+            chunk = next;
+        }
+        this.first_chunk = null;
+        this.current_chunk = null;
+        this.chunk_count = 0;
+        this.total_allocated = 0;
+    }
+}
+
+// ============================================================================
+// Typed Arena
+// ============================================================================
+
+/// An arena specialized for allocating values of a single type.
+type struct TypedArena<T> {
+    arena: Arena;
+    count: u64;
+
+    TypedArena();
+    TypedArena(n: u64);
+
+    alloc(mut &this) -> T*;
+    alloc_init(mut &this, value: T) -> T*;
+    alloc_many(mut &this, n: u64) -> T*;
+    len(this) -> u64;
+    reset(mut &this) -> void;
+    drop(this) -> void;
+}
+
+implement struct TypedArena<T> {
+    /// Creates a new typed arena.
+    TypedArena() {
+        this.arena = new Arena();
+        this.count = 0;
+    }
+
+    /// Creates a typed arena with capacity for n elements.
+    TypedArena(n: u64) {
+        this.arena = new Arena(sizeof(T) * n);
+        this.count = 0;
+    }
+
+    /// Allocates an uninitialized value.
+    alloc(mut &this) -> T* {
+        const ptr: T* = this.arena.alloc_one<T>();
+        if (ptr != null) {
+            this.count = this.count + 1;
+        }
+        return ptr;
+    }
+
+    /// Allocates and initializes a value.
+    alloc_init(mut &this, value: T) -> T* {
+        const ptr: T* = this.alloc();
+        if (ptr != null) {
+            *ptr = value;
+        }
+        return ptr;
+    }
+
+    /// Allocates multiple values.
+    alloc_many(mut &this, n: u64) -> T* {
+        const ptr: T* = this.arena.alloc_array<T>(n);
+        if (ptr != null) {
+            this.count = this.count + n;
+        }
+        return ptr;
+    }
+
+    /// Returns the number of allocated values.
+    len(this) -> u64 {
+        return this.count;
+    }
+
+    /// Resets the arena.
+    reset(mut &this) -> void {
+        this.arena.reset();
+        this.count = 0;
+    }
+
+    /// Drops the arena.
+    drop(this) -> void {
+        this.arena.drop();
+    }
+}
+
+// ============================================================================
+// Scratch Arena
+// ============================================================================
+
+/// A scratch arena for temporary allocations that are freed together.
+/// Useful for per-frame or per-request allocations.
+type struct ScratchArena {
+    arena: Arena*;
+    saved_offset: u64;
+    saved_chunk: ArenaChunk*;
+
+    ScratchArena(arena: Arena*);
+    alloc<T>(this) -> T*;
+    alloc_init<T>(this, value: T) -> T*;
+    alloc_array<T>(this, n: u64) -> T*;
+    end(this) -> void;
+}
+
+implement struct ScratchArena {
+    /// Begins a scratch allocation scope.
+    ScratchArena(arena: Arena*) {
+        this.arena = arena;
+        this.saved_chunk = arena.current_chunk;
+        if (this.saved_chunk != null) {
+            this.saved_offset = this.saved_chunk.offset;
+        } else {
+            this.saved_offset = 0;
+        }
+    }
+
+    /// Allocates from the scratch arena.
+    alloc<T>(this) -> T* {
+        return this.arena.alloc_one<T>();
+    }
+
+    /// Allocates and initializes.
+    alloc_init<T>(this, value: T) -> T* {
+        return this.arena.alloc_init(value);
+    }
+
+    /// Allocates an array.
+    alloc_array<T>(this, n: u64) -> T* {
+        return this.arena.alloc_array<T>(n);
+    }
+
+    /// Ends the scratch scope, resetting to the saved state.
+    end(this) -> void {
+        // Reset all chunks after saved_chunk
+        if (this.saved_chunk != null) {
+            mut chunk: ArenaChunk* = this.saved_chunk.next;
+            while (chunk != null) {
+                chunk.reset();
+                chunk = chunk.next;
+            }
+            this.saved_chunk.offset = this.saved_offset;
+            this.arena.current_chunk = this.saved_chunk;
+        } else {
+            this.arena.reset();
+        }
+    }
+}
+

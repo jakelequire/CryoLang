@@ -1307,8 +1307,8 @@ namespace Cryo
             }
 
             // Simple user-defined type
-            // Try struct, class, enum, trait types
-            Type *user_type = get_struct_type(type_name);
+            // Try struct, class, enum, trait types (use lookup to avoid auto-creating)
+            Type *user_type = lookup_struct_type(type_name);
             if (user_type && user_type->kind() != TypeKind::Unknown)
             {
                 // Handle pointer and array modifiers for user-defined types
@@ -1349,7 +1349,7 @@ namespace Cryo
                 return result_type;
             }
 
-            user_type = get_class_type(type_name);
+            user_type = lookup_class_type(type_name);
             if (user_type && user_type->kind() != TypeKind::Unknown)
             {
                 // Handle pointer and array modifiers for user-defined types
@@ -1425,7 +1425,7 @@ namespace Cryo
                 return result_type;
             }
 
-            user_type = get_trait_type(type_name);
+            user_type = lookup_trait_type(type_name);
             if (user_type && user_type->kind() != TypeKind::Unknown)
             {
                 // Handle pointer and array modifiers for user-defined types
@@ -1999,6 +1999,18 @@ namespace Cryo
         return result;
     }
 
+    Type *TypeContext::lookup_class_type(const std::string &name)
+    {
+        auto it = _class_types.find(name);
+        if (it != _class_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Return null if not found - don't create
+        return nullptr;
+    }
+
     Type *TypeContext::get_trait_type(const std::string &name)
     {
         auto it = _trait_types.find(name);
@@ -2013,6 +2025,18 @@ namespace Cryo
         _trait_types[name] = std::move(trait_type);
 
         return result;
+    }
+
+    Type *TypeContext::lookup_trait_type(const std::string &name)
+    {
+        auto it = _trait_types.find(name);
+        if (it != _trait_types.end())
+        {
+            return it->second.get();
+        }
+
+        // Return null if not found - don't create
+        return nullptr;
     }
 
     Type *TypeContext::get_enum_type(const std::string &name, std::vector<std::string> variants, bool is_simple)

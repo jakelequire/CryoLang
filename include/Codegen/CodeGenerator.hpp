@@ -238,6 +238,10 @@ namespace Cryo::Codegen
         int _optimization_level;
         bool _has_errors;
 
+        // Stored source info (applied when visitor is created)
+        std::string _pending_source_file;
+        std::string _pending_namespace_context;
+
         // Statistics
         size_t _functions_generated;
         size_t _types_generated;

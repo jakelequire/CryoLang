@@ -392,7 +392,14 @@ namespace Cryo::SRM {
                 std::string resolved_first = resolve_namespace_alias(ns_parts[0]);
                 if (resolved_first != ns_parts[0]) {
                     // Replace the first part with the resolved namespace
-                    auto resolved_parts = Utils::parse_qualified_name(resolved_first).first;
+                    // Parse the resolved namespace and include ALL parts (not just the "namespace" parts)
+                    auto parsed_resolved = Utils::parse_qualified_name(resolved_first);
+                    std::vector<std::string> resolved_parts = parsed_resolved.first;
+                    // Include the last part from parsing (which is incorrectly treated as "symbol name")
+                    if (!parsed_resolved.second.empty()) {
+                        resolved_parts.push_back(parsed_resolved.second);
+                    }
+                    // Append any remaining parts from the original qualified name
                     resolved_parts.insert(resolved_parts.end(), ns_parts.begin() + 1, ns_parts.end());
                     candidates.push_back(std::make_unique<QualifiedIdentifier>(resolved_parts, simple_name, kind));
                 }
@@ -406,7 +413,16 @@ namespace Cryo::SRM {
             
             // Add imported namespaces
             for (const auto& imported_ns : imported_namespaces_) {
-                auto ns_parts = Utils::parse_qualified_name(imported_ns).first;
+                // Parse the imported namespace and use ALL parts as namespace components
+                // For example: "std::IO" should become ["std", "IO"] as namespace parts
+                // so that "println" becomes "std::IO::println"
+                auto parsed = Utils::parse_qualified_name(imported_ns);
+                std::vector<std::string> ns_parts = parsed.first;
+                // Include the last part (which parse_qualified_name returns as "symbol name")
+                // as part of the namespace path
+                if (!parsed.second.empty()) {
+                    ns_parts.push_back(parsed.second);
+                }
                 candidates.push_back(std::make_unique<QualifiedIdentifier>(ns_parts, symbol_name, kind));
             }
         }
@@ -443,12 +459,29 @@ namespace Cryo::SRM {
     }
 
     std::unique_ptr<TypeIdentifier> SymbolResolutionContext::create_type_identifier(
-        const std::string& type_name, 
-        Cryo::TypeKind kind, 
+        const std::string& type_name,
+        Cryo::TypeKind kind,
         const std::vector<Cryo::Type*>& template_params) const {
-        
+
         return std::make_unique<TypeIdentifier>(
             namespace_stack_, type_name, kind, template_params);
+    }
+
+    std::unique_ptr<QualifiedIdentifier> SymbolResolutionContext::create_qualified_identifier(
+        const std::string& name, Cryo::SymbolKind kind) const {
+
+        return std::make_unique<QualifiedIdentifier>(
+            namespace_stack_, name, kind);
+    }
+
+    std::unique_ptr<FunctionIdentifier> SymbolResolutionContext::create_function_identifier(
+        const std::string& name,
+        const std::vector<Cryo::Type*>& params,
+        Cryo::Type* return_type,
+        FunctionIdentifier::FunctionType func_type) const {
+
+        return std::make_unique<FunctionIdentifier>(
+            namespace_stack_, name, params, return_type, func_type);
     }
 
     void SymbolResolutionContext::dump_context(std::ostream& os) const {
