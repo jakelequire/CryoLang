@@ -1,0 +1,474 @@
+///! Runtime Memory Management
+///!
+///! This module provides the global allocator interface and heap management
+///! for the Cryo runtime. It wraps the system allocator and provides
+///! allocation tracking, memory statistics, and out-of-memory handling.
+
+namespace cryo::runtime::memory;
+
+import <core/intrinsics>;
+import <core/mem>;
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/// Default heap size hint (64 MB).
+const DEFAULT_HEAP_HINT: u64 = 67108864;
+
+/// Allocation alignment (16 bytes for SSE compatibility).
+const DEFAULT_ALIGNMENT: u64 = 16;
+
+/// Maximum single allocation size (1 GB).
+const MAX_ALLOCATION_SIZE: u64 = 1073741824;
+
+// ============================================================================
+// Allocator State
+// ============================================================================
+
+/// Allocation statistics.
+type struct AllocStats {
+    /// Total bytes allocated (lifetime).
+    total_allocated: u64;
+    /// Total bytes freed (lifetime).
+    total_freed: u64;
+    /// Current bytes in use.
+    current_usage: u64;
+    /// Peak memory usage.
+    peak_usage: u64;
+    /// Number of allocations (lifetime).
+    alloc_count: u64;
+    /// Number of frees (lifetime).
+    free_count: u64;
+    /// Number of reallocations (lifetime).
+    realloc_count: u64;
+    /// Number of failed allocations (lifetime).
+    failed_count: u64;
+}
+
+/// Global allocation statistics.
+mut g_alloc_stats: AllocStats = AllocStats {
+    total_allocated: 0,
+    total_freed: 0,
+    current_usage: 0,
+    peak_usage: 0,
+    alloc_count: 0,
+    free_count: 0,
+    realloc_count: 0,
+    failed_count: 0
+};
+
+/// Whether memory tracking is enabled.
+mut g_tracking_enabled: boolean = true;
+
+/// Whether the allocator is initialized.
+mut g_initialized: boolean = false;
+
+// ============================================================================
+// Out-of-Memory Handler
+// ============================================================================
+
+/// Type for OOM handler functions.
+type OomHandler = function(size: u64) -> void*;
+
+/// Default OOM handler - returns null (allocation fails).
+function default_oom_handler(size: u64) -> void* {
+    return null;
+}
+
+/// The current OOM handler.
+mut g_oom_handler: OomHandler = default_oom_handler;
+
+/// Sets a custom OOM handler, returning the previous handler.
+function set_oom_handler(handler: OomHandler) -> OomHandler {
+    const old_handler: OomHandler = g_oom_handler;
+    g_oom_handler = handler;
+    return old_handler;
+}
+
+/// Resets the OOM handler to the default.
+function reset_oom_handler() -> void {
+    g_oom_handler = default_oom_handler;
+}
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+/// Initializes the memory subsystem.
+function init() -> boolean {
+    if (g_initialized) {
+        return true;
+    }
+
+    // Reset statistics
+    g_alloc_stats.total_allocated = 0;
+    g_alloc_stats.total_freed = 0;
+    g_alloc_stats.current_usage = 0;
+    g_alloc_stats.peak_usage = 0;
+    g_alloc_stats.alloc_count = 0;
+    g_alloc_stats.free_count = 0;
+    g_alloc_stats.realloc_count = 0;
+    g_alloc_stats.failed_count = 0;
+
+    g_initialized = true;
+    return true;
+}
+
+/// Shuts down the memory subsystem.
+function shutdown() -> void {
+    if (!g_initialized) {
+        return;
+    }
+
+    // In a debug build, we could check for leaks here
+    if (g_alloc_stats.current_usage > 0) {
+        // Memory leak detected
+        // In debug mode, we'd log this
+    }
+
+    g_initialized = false;
+}
+
+// ============================================================================
+// Core Allocation Functions
+// ============================================================================
+
+/// Allocates `size` bytes of memory.
+///
+/// Returns null on failure.
+function alloc(size: u64) -> void* {
+    if (size == 0) {
+        return DEFAULT_ALIGNMENT as void*; // Dangling pointer for zero-size
+    }
+
+    if (size > MAX_ALLOCATION_SIZE) {
+        record_failed_alloc(size);
+        return null;
+    }
+
+    const ptr: void* = malloc(size);
+
+    if (ptr == null) {
+        record_failed_alloc(size);
+
+        // Try OOM handler
+        const retry_ptr: void* = g_oom_handler(size);
+        if (retry_ptr != null) {
+            record_alloc(size);
+            return retry_ptr;
+        }
+        return null;
+    }
+
+    record_alloc(size);
+    return ptr;
+}
+
+/// Allocates `size` bytes of zeroed memory.
+function alloc_zeroed(size: u64) -> void* {
+    if (size == 0) {
+        return DEFAULT_ALIGNMENT as void*;
+    }
+
+    if (size > MAX_ALLOCATION_SIZE) {
+        record_failed_alloc(size);
+        return null;
+    }
+
+    const ptr: void* = calloc(1, size);
+
+    if (ptr == null) {
+        record_failed_alloc(size);
+
+        const retry_ptr: void* = g_oom_handler(size);
+        if (retry_ptr != null) {
+            memset(retry_ptr, 0, size);
+            record_alloc(size);
+            return retry_ptr;
+        }
+        return null;
+    }
+
+    record_alloc(size);
+    return ptr;
+}
+
+/// Allocates `size` bytes with specified alignment.
+function alloc_aligned(size: u64, alignment: u64) -> void* {
+    if (size == 0) {
+        return alignment as void*;
+    }
+
+    if (size > MAX_ALLOCATION_SIZE) {
+        record_failed_alloc(size);
+        return null;
+    }
+
+    // Validate alignment is power of two
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        record_failed_alloc(size);
+        return null;
+    }
+
+    const ptr: void* = aligned_alloc(alignment, size);
+
+    if (ptr == null) {
+        record_failed_alloc(size);
+
+        const retry_ptr: void* = g_oom_handler(size);
+        if (retry_ptr != null) {
+            record_alloc(size);
+            return retry_ptr;
+        }
+        return null;
+    }
+
+    record_alloc(size);
+    return ptr;
+}
+
+/// Deallocates memory at `ptr`.
+function dealloc(ptr: void*, size: u64) -> void {
+    if (ptr == null) {
+        return;
+    }
+
+    // Check for dangling pointer (from zero-size allocation)
+    if (ptr as u64 <= DEFAULT_ALIGNMENT) {
+        return;
+    }
+
+    free(ptr);
+    record_dealloc(size);
+}
+
+/// Reallocates memory at `ptr` to `new_size` bytes.
+function realloc_mem(ptr: void*, old_size: u64, new_size: u64) -> void* {
+    if (ptr == null) {
+        return alloc(new_size);
+    }
+
+    if (new_size == 0) {
+        dealloc(ptr, old_size);
+        return DEFAULT_ALIGNMENT as void*;
+    }
+
+    if (new_size > MAX_ALLOCATION_SIZE) {
+        record_failed_alloc(new_size);
+        return null;
+    }
+
+    const new_ptr: void* = realloc(ptr, new_size);
+
+    if (new_ptr == null) {
+        record_failed_alloc(new_size);
+
+        const retry_ptr: void* = g_oom_handler(new_size);
+        if (retry_ptr != null) {
+            // Copy old data to new allocation
+            mut copy_size: u64 = old_size;
+            if (new_size < copy_size) {
+                copy_size = new_size;
+            }
+            memcpy(retry_ptr, ptr, copy_size);
+            dealloc(ptr, old_size);
+            record_alloc(new_size);
+            return retry_ptr;
+        }
+        return null;
+    }
+
+    record_realloc(old_size, new_size);
+    return new_ptr;
+}
+
+// ============================================================================
+// Typed Allocation Functions
+// ============================================================================
+
+/// Allocates memory for a single value of type T.
+function alloc_one<T>() -> T* {
+    return alloc(sizeof(T));
+}
+
+/// Allocates zeroed memory for a single value of type T.
+function alloc_one_zeroed<T>() -> T* {
+    return alloc_zeroed(sizeof(T));
+}
+
+/// Allocates memory for an array of `count` values of type T.
+function alloc_array<T>(count: u64) -> T* {
+    const size: u64 = sizeof(T) * count;
+
+    // Check for overflow
+    if (count != 0 && size / count != sizeof(T)) {
+        return null;
+    }
+
+    return alloc(size);
+}
+
+/// Allocates zeroed memory for an array of `count` values of type T.
+function alloc_array_zeroed<T>(count: u64) -> T* {
+    const size: u64 = sizeof(T) * count;
+
+    // Check for overflow
+    if (count != 0 && size / count != sizeof(T)) {
+        return null;
+    }
+
+    return alloc_zeroed(size);
+}
+
+/// Deallocates a single value.
+function dealloc_one<T>(ptr: T*) -> void {
+    dealloc(ptr, sizeof(T));
+}
+
+/// Deallocates an array.
+function dealloc_array<T>(ptr: T*, count: u64) -> void {
+    dealloc(ptr, sizeof(T) * count);
+}
+
+// ============================================================================
+// Statistics Tracking
+// ============================================================================
+
+/// Records an allocation.
+function record_alloc(size: u64) -> void {
+    if (!g_tracking_enabled) {
+        return;
+    }
+
+    g_alloc_stats.total_allocated = g_alloc_stats.total_allocated + size;
+    g_alloc_stats.current_usage = g_alloc_stats.current_usage + size;
+    g_alloc_stats.alloc_count = g_alloc_stats.alloc_count + 1;
+
+    if (g_alloc_stats.current_usage > g_alloc_stats.peak_usage) {
+        g_alloc_stats.peak_usage = g_alloc_stats.current_usage;
+    }
+}
+
+/// Records a deallocation.
+function record_dealloc(size: u64) -> void {
+    if (!g_tracking_enabled) {
+        return;
+    }
+
+    g_alloc_stats.total_freed = g_alloc_stats.total_freed + size;
+    g_alloc_stats.current_usage = g_alloc_stats.current_usage - size;
+    g_alloc_stats.free_count = g_alloc_stats.free_count + 1;
+}
+
+/// Records a reallocation.
+function record_realloc(old_size: u64, new_size: u64) -> void {
+    if (!g_tracking_enabled) {
+        return;
+    }
+
+    // Adjust current usage
+    if (new_size > old_size) {
+        const delta: u64 = new_size - old_size;
+        g_alloc_stats.total_allocated = g_alloc_stats.total_allocated + delta;
+        g_alloc_stats.current_usage = g_alloc_stats.current_usage + delta;
+    } else {
+        const delta: u64 = old_size - new_size;
+        g_alloc_stats.total_freed = g_alloc_stats.total_freed + delta;
+        g_alloc_stats.current_usage = g_alloc_stats.current_usage - delta;
+    }
+
+    g_alloc_stats.realloc_count = g_alloc_stats.realloc_count + 1;
+
+    if (g_alloc_stats.current_usage > g_alloc_stats.peak_usage) {
+        g_alloc_stats.peak_usage = g_alloc_stats.current_usage;
+    }
+}
+
+/// Records a failed allocation.
+function record_failed_alloc(size: u64) -> void {
+    if (!g_tracking_enabled) {
+        return;
+    }
+
+    g_alloc_stats.failed_count = g_alloc_stats.failed_count + 1;
+}
+
+// ============================================================================
+// Statistics Queries
+// ============================================================================
+
+/// Returns the current allocation statistics.
+function stats() -> AllocStats* {
+    return &g_alloc_stats;
+}
+
+/// Returns the current memory usage in bytes.
+function current_usage() -> u64 {
+    return g_alloc_stats.current_usage;
+}
+
+/// Returns the peak memory usage in bytes.
+function peak_usage() -> u64 {
+    return g_alloc_stats.peak_usage;
+}
+
+/// Returns the total bytes allocated (lifetime).
+function total_allocated() -> u64 {
+    return g_alloc_stats.total_allocated;
+}
+
+/// Returns the total bytes freed (lifetime).
+function total_freed() -> u64 {
+    return g_alloc_stats.total_freed;
+}
+
+/// Returns the number of allocations (lifetime).
+function alloc_count() -> u64 {
+    return g_alloc_stats.alloc_count;
+}
+
+/// Returns the number of frees (lifetime).
+function free_count() -> u64 {
+    return g_alloc_stats.free_count;
+}
+
+/// Returns the number of failed allocations (lifetime).
+function failed_count() -> u64 {
+    return g_alloc_stats.failed_count;
+}
+
+/// Resets the allocation statistics.
+function reset_stats() -> void {
+    g_alloc_stats.total_allocated = 0;
+    g_alloc_stats.total_freed = 0;
+    g_alloc_stats.current_usage = 0;
+    g_alloc_stats.peak_usage = 0;
+    g_alloc_stats.alloc_count = 0;
+    g_alloc_stats.free_count = 0;
+    g_alloc_stats.realloc_count = 0;
+    g_alloc_stats.failed_count = 0;
+}
+
+/// Enables or disables memory tracking.
+function set_tracking_enabled(enabled: boolean) -> void {
+    g_tracking_enabled = enabled;
+}
+
+/// Returns true if memory tracking is enabled.
+function is_tracking_enabled() -> boolean {
+    return g_tracking_enabled;
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function malloc(size: u64) -> void*;
+intrinsic function calloc(count: u64, size: u64) -> void*;
+intrinsic function realloc(ptr: void*, size: u64) -> void*;
+intrinsic function free(ptr: void*) -> void;
+intrinsic function aligned_alloc(alignment: u64, size: u64) -> void*;
+intrinsic function memset(dest: void*, value: i32, count: u64) -> void*;
+intrinsic function memcpy(dest: void*, src: void*, count: u64) -> void*;
+

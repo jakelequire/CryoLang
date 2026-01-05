@@ -1,0 +1,338 @@
+///! Linux Platform Implementation
+///!
+///! This module provides Linux-specific implementations for the runtime.
+
+namespace cryo::runtime::platform::linux;
+
+import <core/intrinsics>;
+
+// ============================================================================
+// Platform Constants
+// ============================================================================
+
+/// Platform name.
+const PLATFORM_NAME: string = "linux";
+
+/// Platform family.
+const PLATFORM_FAMILY: string = "unix";
+
+/// Newline sequence.
+const NEWLINE: string = "\n";
+
+/// Path separator.
+const PATH_SEPARATOR: u8 = '/';
+
+/// Path list separator (for PATH env var).
+const PATH_LIST_SEPARATOR: u8 = ':';
+
+// ============================================================================
+// System Constants
+// ============================================================================
+
+/// Page size (typically 4KB on x86_64).
+const PAGE_SIZE: u64 = 4096;
+
+/// Maximum path length.
+const PATH_MAX: u64 = 4096;
+
+/// Maximum hostname length.
+const HOST_NAME_MAX: u64 = 64;
+
+// ============================================================================
+// Clock IDs
+// ============================================================================
+
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+const CLOCK_MONOTONIC_RAW: i32 = 4;
+const CLOCK_REALTIME_COARSE: i32 = 5;
+const CLOCK_MONOTONIC_COARSE: i32 = 6;
+const CLOCK_BOOTTIME: i32 = 7;
+
+// ============================================================================
+// File Descriptor Constants
+// ============================================================================
+
+const STDIN_FILENO: i32 = 0;
+const STDOUT_FILENO: i32 = 1;
+const STDERR_FILENO: i32 = 2;
+
+// ============================================================================
+// Memory Protection Flags
+// ============================================================================
+
+const PROT_NONE: i32 = 0;
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const PROT_EXEC: i32 = 4;
+
+// ============================================================================
+// Memory Map Flags
+// ============================================================================
+
+const MAP_SHARED: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+const MAP_FIXED: i32 = 16;
+const MAP_ANONYMOUS: i32 = 32;
+const MAP_NORESERVE: i32 = 16384;
+
+/// Failed mmap return value.
+const MAP_FAILED: void* = -1;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// POSIX timespec structure.
+type struct Timespec {
+    tv_sec: i64;
+    tv_nsec: i64;
+}
+
+/// POSIX timeval structure.
+type struct Timeval {
+    tv_sec: i64;
+    tv_usec: i64;
+}
+
+/// Resource usage structure.
+type struct Rusage {
+    ru_utime: Timeval;
+    ru_stime: Timeval;
+    ru_maxrss: i64;
+    ru_ixrss: i64;
+    ru_idrss: i64;
+    ru_isrss: i64;
+    ru_minflt: i64;
+    ru_majflt: i64;
+    ru_nswap: i64;
+    ru_inblock: i64;
+    ru_oublock: i64;
+    ru_msgsnd: i64;
+    ru_msgrcv: i64;
+    ru_nsignals: i64;
+    ru_nvcsw: i64;
+    ru_nivcsw: i64;
+}
+
+/// System information structure.
+type struct Utsname {
+    sysname: u8[65];
+    nodename: u8[65];
+    release: u8[65];
+    version: u8[65];
+    machine: u8[65];
+    domainname: u8[65];
+}
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+/// Initializes Linux-specific features.
+function init() -> boolean {
+    // Nothing special needed for basic Linux initialization
+    return true;
+}
+
+/// Shuts down Linux-specific features.
+function shutdown() -> void {
+    // Nothing special needed
+}
+
+// ============================================================================
+// System Information
+// ============================================================================
+
+/// Returns the number of CPUs available.
+function cpu_count() -> u64 {
+    const count: i64 = sysconf(_SC_NPROCESSORS_ONLN);
+    if (count < 1) {
+        return 1;
+    }
+    return count as u64;
+}
+
+/// Returns the page size.
+function page_size() -> u64 {
+    const size: i64 = sysconf(_SC_PAGESIZE);
+    if (size < 1) {
+        return PAGE_SIZE;
+    }
+    return size as u64;
+}
+
+/// Returns the total physical memory in bytes.
+function total_memory() -> u64 {
+    const pages: i64 = sysconf(_SC_PHYS_PAGES);
+    const page_sz: i64 = sysconf(_SC_PAGESIZE);
+    if (pages < 0 || page_sz < 0) {
+        return 0;
+    }
+    return (pages as u64) * (page_sz as u64);
+}
+
+/// Returns the available physical memory in bytes.
+function available_memory() -> u64 {
+    const pages: i64 = sysconf(_SC_AVPHYS_PAGES);
+    const page_sz: i64 = sysconf(_SC_PAGESIZE);
+    if (pages < 0 || page_sz < 0) {
+        return 0;
+    }
+    return (pages as u64) * (page_sz as u64);
+}
+
+// ============================================================================
+// Time Functions
+// ============================================================================
+
+/// Gets the current time from a clock.
+function clock_gettime_impl(clock_id: i32, ts: Timespec*) -> i32 {
+    return clock_gettime(clock_id, ts);
+}
+
+/// Gets monotonic time in nanoseconds.
+function monotonic_nanos() -> i64 {
+    mut ts: Timespec;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ts.tv_sec * 1000000000) + ts.tv_nsec;
+}
+
+/// Gets realtime in nanoseconds since epoch.
+function realtime_nanos() -> i64 {
+    mut ts: Timespec;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (ts.tv_sec * 1000000000) + ts.tv_nsec;
+}
+
+/// Sleeps for the specified nanoseconds.
+function sleep_nanos(nanos: i64) -> void {
+    mut req: Timespec;
+    mut rem: Timespec;
+
+    req.tv_sec = nanos / 1000000000;
+    req.tv_nsec = nanos % 1000000000;
+
+    while (nanosleep(&req, &rem) == -1) {
+        // Interrupted by signal, continue sleeping
+        req = rem;
+    }
+}
+
+// ============================================================================
+// Memory Mapping
+// ============================================================================
+
+/// Maps memory pages.
+function mmap_impl(addr: void*, length: u64, prot: i32, flags: i32,
+                   fd: i32, offset: i64) -> void* {
+    return mmap(addr, length, prot, flags, fd, offset);
+}
+
+/// Unmaps memory pages.
+function munmap_impl(addr: void*, length: u64) -> i32 {
+    return munmap(addr, length);
+}
+
+/// Changes memory protection.
+function mprotect_impl(addr: void*, length: u64, prot: i32) -> i32 {
+    return mprotect(addr, length, prot);
+}
+
+/// Allocates anonymous memory.
+function alloc_pages(size: u64) -> void* {
+    const ptr: void* = mmap(null, size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        return null;
+    }
+    return ptr;
+}
+
+/// Frees pages allocated with alloc_pages.
+function free_pages(ptr: void*, size: u64) -> void {
+    munmap(ptr, size);
+}
+
+// ============================================================================
+// Process Information
+// ============================================================================
+
+/// Gets the current process ID.
+function getpid_impl() -> i32 {
+    return getpid();
+}
+
+/// Gets the parent process ID.
+function getppid_impl() -> i32 {
+    return getppid();
+}
+
+/// Gets the current thread ID.
+function gettid_impl() -> i64 {
+    return syscall(SYS_gettid);
+}
+
+// ============================================================================
+// Resource Usage
+// ============================================================================
+
+/// Resource usage target: self.
+const RUSAGE_SELF: i32 = 0;
+
+/// Resource usage target: children.
+const RUSAGE_CHILDREN: i32 = -1;
+
+/// Resource usage target: thread.
+const RUSAGE_THREAD: i32 = 1;
+
+/// Gets resource usage.
+function getrusage_impl(who: i32, usage: Rusage*) -> i32 {
+    return getrusage(who, usage);
+}
+
+/// Gets the current process's memory usage in bytes (resident set size).
+function current_rss() -> u64 {
+    mut usage: Rusage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        // ru_maxrss is in KB on Linux
+        return (usage.ru_maxrss as u64) * 1024;
+    }
+    return 0;
+}
+
+// ============================================================================
+// System Calls
+// ============================================================================
+
+/// SYS_gettid syscall number (x86_64).
+const SYS_gettid: i64 = 186;
+
+// ============================================================================
+// sysconf Constants
+// ============================================================================
+
+const _SC_PAGESIZE: i32 = 30;
+const _SC_NPROCESSORS_ONLN: i32 = 84;
+const _SC_PHYS_PAGES: i32 = 85;
+const _SC_AVPHYS_PAGES: i32 = 86;
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function clock_gettime(clk_id: i32, tp: Timespec*) -> i32;
+intrinsic function nanosleep(req: Timespec*, rem: Timespec*) -> i32;
+intrinsic function mmap(addr: void*, length: u64, prot: i32, flags: i32,
+                        fd: i32, offset: i64) -> void*;
+intrinsic function munmap(addr: void*, length: u64) -> i32;
+intrinsic function mprotect(addr: void*, length: u64, prot: i32) -> i32;
+intrinsic function getpid() -> i32;
+intrinsic function getppid() -> i32;
+intrinsic function getrusage(who: i32, usage: Rusage*) -> i32;
+intrinsic function sysconf(name: i32) -> i64;
+intrinsic function syscall(number: i64, args...) -> i64;
+intrinsic function uname(buf: Utsname*) -> i32;
+
