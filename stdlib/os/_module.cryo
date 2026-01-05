@@ -1,0 +1,603 @@
+///! OS Module
+///!
+///! Operating system specific functionality and low-level operations.
+
+namespace std::os;
+
+import core::intrinsics;
+import core::option;
+import collections::string;
+import collections::array;
+import io::error;
+import alloc::global;
+
+// ============================================================================
+// System Information
+// ============================================================================
+
+/// System name information.
+type struct SystemInfo {
+    sysname: String;     // Operating system name
+    nodename: String;    // Network node hostname
+    release: String;     // OS release
+    version: String;     // OS version
+    machine: String;     // Hardware identifier
+
+    // Method signatures
+    static get() -> IoResult<SystemInfo>;
+}
+
+implement struct SystemInfo {
+    /// Gets system information.
+    static get() -> IoResult<SystemInfo> {
+        mut uts: utsname;
+        if (uname(&uts) != 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        return IoResult::Ok(SystemInfo {
+            sysname: String::from_cstr(&uts.sysname[0] as string),
+            nodename: String::from_cstr(&uts.nodename[0] as string),
+            release: String::from_cstr(&uts.release[0] as string),
+            version: String::from_cstr(&uts.version[0] as string),
+            machine: String::from_cstr(&uts.machine[0] as string)
+        });
+    }
+}
+
+/// Returns the page size.
+function page_size() -> u64 {
+    return sysconf(_SC_PAGESIZE) as u64;
+}
+
+/// Returns the number of processors.
+function num_cpus() -> u64 {
+    const result: i64 = sysconf(_SC_NPROCESSORS_ONLN);
+    if (result < 1) {
+        return 1;
+    }
+    return result as u64;
+}
+
+/// Returns the total physical memory.
+function total_memory() -> u64 {
+    const pages: i64 = sysconf(_SC_PHYS_PAGES);
+    const page_size: i64 = sysconf(_SC_PAGESIZE);
+    if (pages < 0 || page_size < 0) {
+        return 0;
+    }
+    return (pages as u64) * (page_size as u64);
+}
+
+/// Returns the available physical memory.
+function available_memory() -> u64 {
+    const pages: i64 = sysconf(_SC_AVPHYS_PAGES);
+    const page_size: i64 = sysconf(_SC_PAGESIZE);
+    if (pages < 0 || page_size < 0) {
+        return 0;
+    }
+    return (pages as u64) * (page_size as u64);
+}
+
+// ============================================================================
+// Resource Limits
+// ============================================================================
+
+/// Resource limit values.
+type struct RLimit {
+    cur: u64;  // Soft limit
+    max: u64;  // Hard limit
+}
+
+/// Resource types.
+enum Resource {
+    CPU;            // CPU time
+    FileSize;       // File size
+    Data;           // Data segment size
+    Stack;          // Stack size
+    Core;           // Core file size
+    RSS;            // Resident set size
+    NumProcs;       // Number of processes
+    NumFiles;       // Number of open files
+    MemLock;        // Locked memory
+    AddressSpace;   // Address space
+}
+
+/// Gets the resource limit.
+function get_rlimit(resource: Resource) -> IoResult<RLimit> {
+    const res: i32 = resource_to_int(resource);
+    mut limit: rlimit;
+
+    if (getrlimit(res, &limit) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+
+    return IoResult::Ok(RLimit {
+        cur: limit.rlim_cur,
+        max: limit.rlim_max
+    });
+}
+
+/// Sets the resource limit.
+function set_rlimit(resource: Resource, limit: RLimit) -> IoResult<void> {
+    const res: i32 = resource_to_int(resource);
+    mut rl: rlimit;
+    rl.rlim_cur = limit.cur;
+    rl.rlim_max = limit.max;
+
+    if (setrlimit(res, &rl) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+
+    return IoResult::Ok(());
+}
+
+function resource_to_int(resource: Resource) -> i32 {
+    match (resource) {
+        Resource::CPU => { return RLIMIT_CPU; }
+        Resource::FileSize => { return RLIMIT_FSIZE; }
+        Resource::Data => { return RLIMIT_DATA; }
+        Resource::Stack => { return RLIMIT_STACK; }
+        Resource::Core => { return RLIMIT_CORE; }
+        Resource::RSS => { return RLIMIT_RSS; }
+        Resource::NumProcs => { return RLIMIT_NPROC; }
+        Resource::NumFiles => { return RLIMIT_NOFILE; }
+        Resource::MemLock => { return RLIMIT_MEMLOCK; }
+        Resource::AddressSpace => { return RLIMIT_AS; }
+    }
+}
+
+// ============================================================================
+// Signals
+// ============================================================================
+
+/// Signal numbers.
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGQUIT: i32 = 3;
+const SIGILL: i32 = 4;
+const SIGTRAP: i32 = 5;
+const SIGABRT: i32 = 6;
+const SIGBUS: i32 = 7;
+const SIGFPE: i32 = 8;
+const SIGKILL: i32 = 9;
+const SIGUSR1: i32 = 10;
+const SIGSEGV: i32 = 11;
+const SIGUSR2: i32 = 12;
+const SIGPIPE: i32 = 13;
+const SIGALRM: i32 = 14;
+const SIGTERM: i32 = 15;
+const SIGCHLD: i32 = 17;
+const SIGCONT: i32 = 18;
+const SIGSTOP: i32 = 19;
+const SIGTSTP: i32 = 20;
+const SIGTTIN: i32 = 21;
+const SIGTTOU: i32 = 22;
+const SIGURG: i32 = 23;
+const SIGXCPU: i32 = 24;
+const SIGXFSZ: i32 = 25;
+const SIGVTALRM: i32 = 26;
+const SIGPROF: i32 = 27;
+const SIGWINCH: i32 = 28;
+const SIGIO: i32 = 29;
+const SIGSYS: i32 = 31;
+
+/// Signal handler type.
+type SignalHandler = (i32) -> void;
+
+/// Registers a signal handler.
+function signal_handler(sig: i32, handler: SignalHandler) -> IoResult<void> {
+    const result: void* = signal(sig, handler as void*);
+    if (result == SIG_ERR) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Ignores a signal.
+function signal_ignore(sig: i32) -> IoResult<void> {
+    const result: void* = signal(sig, SIG_IGN);
+    if (result == SIG_ERR) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Restores default signal handler.
+function signal_default(sig: i32) -> IoResult<void> {
+    const result: void* = signal(sig, SIG_DFL);
+    if (result == SIG_ERR) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Sends a signal to a process.
+function kill_process(pid: i32, sig: i32) -> IoResult<void> {
+    if (kill(pid, sig) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Raises a signal in the current process.
+function raise_signal(sig: i32) -> IoResult<void> {
+    if (raise(sig) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+// ============================================================================
+// Memory Mapping
+// ============================================================================
+
+/// Memory protection flags.
+const PROT_NONE: i32 = 0;
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const PROT_EXEC: i32 = 4;
+
+/// Memory mapping flags.
+const MAP_SHARED: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+const MAP_ANONYMOUS: i32 = 32;
+const MAP_FIXED: i32 = 16;
+
+const MAP_FAILED: void* = -1 as void*;
+
+/// Maps memory.
+function mmap(addr: void*, length: u64, prot: i32, flags: i32, fd: i32, offset: i64) -> void* {
+    return mmap_sys(addr, length, prot, flags, fd, offset);
+}
+
+/// Unmaps memory.
+function munmap(addr: void*, length: u64) -> IoResult<void> {
+    if (munmap_sys(addr, length) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Changes memory protection.
+function mprotect(addr: void*, length: u64, prot: i32) -> IoResult<void> {
+    if (mprotect_sys(addr, length, prot) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Locks memory.
+function mlock(addr: void*, length: u64) -> IoResult<void> {
+    if (mlock_sys(addr, length) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Unlocks memory.
+function munlock(addr: void*, length: u64) -> IoResult<void> {
+    if (munlock_sys(addr, length) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Advises the kernel about memory usage.
+function madvise(addr: void*, length: u64, advice: i32) -> IoResult<void> {
+    if (madvise_sys(addr, length, advice) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+/// Memory advice constants.
+const MADV_NORMAL: i32 = 0;
+const MADV_RANDOM: i32 = 1;
+const MADV_SEQUENTIAL: i32 = 2;
+const MADV_WILLNEED: i32 = 3;
+const MADV_DONTNEED: i32 = 4;
+
+// ============================================================================
+// File Descriptors
+// ============================================================================
+
+/// Duplicates a file descriptor.
+function dup(fd: i32) -> IoResult<i32> {
+    const result: i32 = dup_sys(fd);
+    if (result < 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(result);
+}
+
+/// Duplicates a file descriptor to a specific number.
+function dup2(oldfd: i32, newfd: i32) -> IoResult<i32> {
+    const result: i32 = dup2_sys(oldfd, newfd);
+    if (result < 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(result);
+}
+
+/// Creates a pipe.
+function pipe() -> IoResult<(i32, i32)> {
+    mut fds: i32[2];
+    if (pipe_sys(&fds[0]) != 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok((fds[0], fds[1]));
+}
+
+/// Gets file descriptor flags.
+function fcntl_getfl(fd: i32) -> IoResult<i32> {
+    const result: i32 = fcntl(fd, F_GETFL, 0);
+    if (result < 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(result);
+}
+
+/// Sets file descriptor flags.
+function fcntl_setfl(fd: i32, flags: i32) -> IoResult<void> {
+    if (fcntl(fd, F_SETFL, flags) < 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+    return IoResult::Ok(());
+}
+
+// ============================================================================
+// User and Group
+// ============================================================================
+
+/// User information.
+type struct UserInfo {
+    name: String;
+    uid: u32;
+    gid: u32;
+    home: String;
+    shell: String;
+}
+
+/// Gets user information by UID.
+function get_user_by_uid(uid: u32) -> Option<UserInfo> {
+    const pwd: passwd* = getpwuid(uid);
+    if (pwd == null) {
+        return Option::None;
+    }
+
+    return Option::Some(UserInfo {
+        name: String::from_cstr(pwd.pw_name),
+        uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
+        home: String::from_cstr(pwd.pw_dir),
+        shell: String::from_cstr(pwd.pw_shell)
+    });
+}
+
+/// Gets user information by name.
+function get_user_by_name(name: string) -> Option<UserInfo> {
+    const pwd: passwd* = getpwnam(name);
+    if (pwd == null) {
+        return Option::None;
+    }
+
+    return Option::Some(UserInfo {
+        name: String::from_cstr(pwd.pw_name),
+        uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
+        home: String::from_cstr(pwd.pw_dir),
+        shell: String::from_cstr(pwd.pw_shell)
+    });
+}
+
+/// Group information.
+type struct GroupInfo {
+    name: String;
+    gid: u32;
+}
+
+/// Gets group information by GID.
+function get_group_by_gid(gid: u32) -> Option<GroupInfo> {
+    const grp: group* = getgrgid(gid);
+    if (grp == null) {
+        return Option::None;
+    }
+
+    return Option::Some(GroupInfo {
+        name: String::from_cstr(grp.gr_name),
+        gid: grp.gr_gid
+    });
+}
+
+/// Gets group information by name.
+function get_group_by_name(name: string) -> Option<GroupInfo> {
+    const grp: group* = getgrnam(name);
+    if (grp == null) {
+        return Option::None;
+    }
+
+    return Option::Some(GroupInfo {
+        name: String::from_cstr(grp.gr_name),
+        gid: grp.gr_gid
+    });
+}
+
+// ============================================================================
+// Random Numbers
+// ============================================================================
+
+/// Fills a buffer with random bytes from /dev/urandom.
+function get_random_bytes(buf: u8*, len: u64) -> IoResult<u64> {
+    const fd: i32 = open_file("/dev/urandom", O_RDONLY, 0);
+    if (fd < 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+
+    const result: i64 = read(fd, buf as void*, len);
+    close(fd);
+
+    if (result < 0) {
+        return IoResult::Err(IoError::last_os_error());
+    }
+
+    return IoResult::Ok(result as u64);
+}
+
+/// Gets a random u64.
+function random_u64() -> u64 {
+    mut value: u64 = 0;
+    get_random_bytes(&value as u8*, 8);
+    return value;
+}
+
+/// Gets a random u32.
+function random_u32() -> u32 {
+    mut value: u32 = 0;
+    get_random_bytes(&value as u8*, 4);
+    return value;
+}
+
+// ============================================================================
+// Error Codes
+// ============================================================================
+
+const EPERM: i32 = 1;
+const ENOENT: i32 = 2;
+const ESRCH: i32 = 3;
+const EINTR: i32 = 4;
+const EIO: i32 = 5;
+const ENXIO: i32 = 6;
+const E2BIG: i32 = 7;
+const ENOEXEC: i32 = 8;
+const EBADF: i32 = 9;
+const ECHILD: i32 = 10;
+const EAGAIN: i32 = 11;
+const ENOMEM: i32 = 12;
+const EACCES: i32 = 13;
+const EFAULT: i32 = 14;
+const EBUSY: i32 = 16;
+const EEXIST: i32 = 17;
+const EXDEV: i32 = 18;
+const ENODEV: i32 = 19;
+const ENOTDIR: i32 = 20;
+const EISDIR: i32 = 21;
+const EINVAL: i32 = 22;
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const ENOTTY: i32 = 25;
+const EFBIG: i32 = 27;
+const ENOSPC: i32 = 28;
+const ESPIPE: i32 = 29;
+const EROFS: i32 = 30;
+const EMLINK: i32 = 31;
+const EPIPE: i32 = 32;
+const EDOM: i32 = 33;
+const ERANGE: i32 = 34;
+const EDEADLK: i32 = 35;
+const ENAMETOOLONG: i32 = 36;
+const ENOLCK: i32 = 37;
+const ENOSYS: i32 = 38;
+const ENOTEMPTY: i32 = 39;
+const ELOOP: i32 = 40;
+const EWOULDBLOCK: i32 = 11;
+const ENOMSG: i32 = 42;
+
+/// Returns a description for an error code.
+function strerror(errnum: i32) -> string {
+    return strerror_sys(errnum);
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+type struct utsname {
+    sysname: u8[65];
+    nodename: u8[65];
+    release: u8[65];
+    version: u8[65];
+    machine: u8[65];
+    domainname: u8[65];
+}
+
+type struct rlimit {
+    rlim_cur: u64;
+    rlim_max: u64;
+}
+
+type struct passwd {
+    pw_name: string;
+    pw_passwd: string;
+    pw_uid: u32;
+    pw_gid: u32;
+    pw_gecos: string;
+    pw_dir: string;
+    pw_shell: string;
+}
+
+type struct group {
+    gr_name: string;
+    gr_passwd: string;
+    gr_gid: u32;
+    gr_mem: string*;
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const _SC_PAGESIZE: i32 = 30;
+const _SC_NPROCESSORS_ONLN: i32 = 84;
+const _SC_PHYS_PAGES: i32 = 85;
+const _SC_AVPHYS_PAGES: i32 = 86;
+
+const RLIMIT_CPU: i32 = 0;
+const RLIMIT_FSIZE: i32 = 1;
+const RLIMIT_DATA: i32 = 2;
+const RLIMIT_STACK: i32 = 3;
+const RLIMIT_CORE: i32 = 4;
+const RLIMIT_RSS: i32 = 5;
+const RLIMIT_NPROC: i32 = 6;
+const RLIMIT_NOFILE: i32 = 7;
+const RLIMIT_MEMLOCK: i32 = 8;
+const RLIMIT_AS: i32 = 9;
+
+const SIG_DFL: void* = 0 as void*;
+const SIG_IGN: void* = 1 as void*;
+const SIG_ERR: void* = -1 as void*;
+
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const O_NONBLOCK: i32 = 2048;
+const O_RDONLY: i32 = 0;
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function uname(buf: utsname*) -> i32;
+intrinsic function sysconf(name: i32) -> i64;
+intrinsic function getrlimit(resource: i32, rlim: rlimit*) -> i32;
+intrinsic function setrlimit(resource: i32, rlim: rlimit*) -> i32;
+intrinsic function signal(signum: i32, handler: void*) -> void*;
+intrinsic function kill(pid: i32, sig: i32) -> i32;
+intrinsic function raise(sig: i32) -> i32;
+intrinsic function mmap_sys(addr: void*, length: u64, prot: i32, flags: i32, fd: i32, offset: i64) -> void*;
+intrinsic function munmap_sys(addr: void*, length: u64) -> i32;
+intrinsic function mprotect_sys(addr: void*, length: u64, prot: i32) -> i32;
+intrinsic function mlock_sys(addr: void*, length: u64) -> i32;
+intrinsic function munlock_sys(addr: void*, length: u64) -> i32;
+intrinsic function madvise_sys(addr: void*, length: u64, advice: i32) -> i32;
+intrinsic function dup_sys(fd: i32) -> i32;
+intrinsic function dup2_sys(oldfd: i32, newfd: i32) -> i32;
+intrinsic function pipe_sys(pipefd: i32*) -> i32;
+intrinsic function fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+intrinsic function getpwuid(uid: u32) -> passwd*;
+intrinsic function getpwnam(name: string) -> passwd*;
+intrinsic function getgrgid(gid: u32) -> group*;
+intrinsic function getgrnam(name: string) -> group*;
+intrinsic function open_file(path: string, flags: i32, mode: u32) -> i32;
+intrinsic function read(fd: i32, buf: void*, count: u64) -> i64;
+intrinsic function close(fd: i32) -> i32;
+intrinsic function strerror_sys(errnum: i32) -> string;

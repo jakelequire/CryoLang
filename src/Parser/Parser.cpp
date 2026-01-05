@@ -1210,6 +1210,15 @@ namespace Cryo
         {
             statement = parse_import_declaration();
         }
+        // Module declarations (public module syntax)
+        else if (_current_token.is(TokenKind::TK_KW_PUBLIC) && peek_next().is(TokenKind::TK_KW_MODULE))
+        {
+            statement = parse_module_declaration();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_MODULE))
+        {
+            statement = parse_module_declaration();
+        }
 
         // Type declarations - struct, class, type alias, enum
         else if (_current_token.is(TokenKind::TK_KW_TYPE))
@@ -1714,23 +1723,22 @@ namespace Cryo
         consume(TokenKind::TK_KW_IMPORT, "Expected 'import'");
 
         // Check for different import patterns:
-        // 1. import * from <path>;            (wildcard with explicit from)
-        // 2. import IO from <path>;           (specific import with from)
-        // 3. import IO, Function from <path>; (multiple specific imports)
-        // 4. import <path>;                   (traditional wildcard)
-        // 5. import <path> as alias;          (traditional with alias)
+        // 1. import * from core::stdio;            (wildcard with explicit from)
+        // 2. import IO from core::stdio;           (specific import with from)
+        // 3. import IO, Function from core::stdio; (multiple specific imports)
+        // 4. import core::option;                  (wildcard module import)
+        // 5. import core::option as Option;        (wildcard with alias)
 
         std::vector<std::string> specific_imports;
         std::string module_path;
         std::string alias;
-        ImportDeclarationNode::ImportType import_type;
         bool has_alias = false;
         bool using_from_syntax = false;
 
         // Check if we have a wildcard (*) or specific imports before 'from'
         if (_current_token.is(TokenKind::TK_STAR))
         {
-            // import * from <path>;
+            // import * from core::option;
             advance(); // consume '*'
 
             if (!_current_token.is(TokenKind::TK_KW_FROM))
@@ -1740,21 +1748,17 @@ namespace Cryo
 
             advance(); // consume 'from'
             using_from_syntax = true;
-            // This is still a wildcard import, just with explicit 'from' syntax
         }
         else if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
-            // Could be: import IO from <path>; or import IO, Function from <path>; or import <path>;
-            // We need to look ahead to see if there's a 'from' keyword
-
-            // Parse the first identifier
+            // Could be: import IO from core::stdio; or import IO, Function from core::stdio; or import core::option;
             std::string first_identifier = std::string(_current_token.text());
             advance(); // consume identifier
 
-            // Check if we have a comma (multiple imports) or 'from' (specific import) or something else (traditional import path)
+            // Check if we have a comma (multiple imports) or 'from' (specific import) or '::' (module path)
             if (_current_token.is(TokenKind::TK_COMMA) || _current_token.is(TokenKind::TK_KW_FROM))
             {
-                // This is specific import syntax: import IO from <path>; or import IO, Function from <path>;
+                // This is specific import syntax: import IO from core::stdio;
                 specific_imports.push_back(first_identifier);
 
                 // Parse additional imports if comma-separated
@@ -1769,61 +1773,44 @@ namespace Cryo
                 consume(TokenKind::TK_KW_FROM, "Expected 'from' after import list");
                 using_from_syntax = true;
             }
+            else if (_current_token.is(TokenKind::TK_COLONCOLON))
+            {
+                // This is module path syntax: import core::option;
+                module_path = first_identifier;
+                // Continue parsing the module path
+            }
             else
             {
-                // This might be traditional import syntax where the identifier is part of the path
-                // We need to backtrack and parse this as a traditional import path
-                // For now, let's handle this as an error since identifiers without <> or "" are ambiguous
-                throw ParseError("Ambiguous import syntax. Use 'import <path>' for stdlib or 'import \"path\"' for relative imports, or 'import Symbol from <path>' for specific imports", _current_token.location());
+                throw ParseError("Expected '::' for module path, 'from' for specific imports, or ',' for multiple imports", _current_token.location());
             }
         }
-
-        // Now parse the module path (required for all import types)
-        if (_current_token.is(TokenKind::TK_STRING_LITERAL))
+        else
         {
-            // String literal import for relative files (e.g., import "./relative/path.cryo")
-            module_path = std::string(_current_token.text());
-            // Remove quotes
-            if (module_path.size() >= 2 && module_path.front() == '"' && module_path.back() == '"')
-            {
-                module_path = module_path.substr(1, module_path.size() - 2);
-            }
-
-            import_type = ImportDeclarationNode::ImportType::Relative;
-            advance(); // consume string literal
+            throw ParseError("Expected module path or symbol name after 'import'", _current_token.location());
         }
-        else if (_current_token.is(TokenKind::TK_L_ANGLE))
-        {
-            // Angle bracket import for standard library (e.g., import <core/intrinsics>)
-            advance(); // consume '<'
 
-            // Build the path from identifiers and forward slashes
+        // Parse module path (required for all imports)
+        if (module_path.empty())
+        {
+            // We need to parse a module path starting with identifier
             if (!_current_token.is(TokenKind::TK_IDENTIFIER))
             {
-                throw ParseError("Expected module path after '<' in import statement", _current_token.location());
+                throw ParseError("Expected module path after 'from' or 'import'", _current_token.location());
             }
 
             module_path = std::string(_current_token.text());
             advance(); // consume first identifier
-
-            // Handle path segments separated by '/'
-            while (_current_token.is(TokenKind::TK_SLASH))
-            {
-                advance(); // consume '/'
-                Token ident = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '/' in import path");
-                module_path += "/" + std::string(ident.text());
-            }
-
-            consume(TokenKind::TK_R_ANGLE, "Expected '>' to close standard library import");
-
-            import_type = ImportDeclarationNode::ImportType::Absolute;
         }
-        else
+
+        // Parse remaining module path segments (identifier::identifier::...)
+        while (_current_token.is(TokenKind::TK_COLONCOLON))
         {
-            throw ParseError("Expected import path: use \"./relative/path.cryo\" for relative imports or <core/module> for standard library", _current_token.location());
+            advance(); // consume '::'
+            Token ident = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '::' in module path");
+            module_path += "::" + std::string(ident.text());
         }
 
-        // Parse optional 'as' alias (only for traditional wildcard imports)
+        // Parse optional 'as' alias (only for wildcard imports)
         if (_current_token.is(TokenKind::TK_KW_AS) && !using_from_syntax)
         {
             advance(); // consume 'as'
@@ -1832,28 +1819,69 @@ namespace Cryo
             has_alias = true;
         }
 
-        // Parse optional ';' or newline
+        // Parse optional ';'
         if (_current_token.is(TokenKind::TK_SEMICOLON))
         {
             advance(); // consume ';'
         }
 
-        // Create the appropriate import node based on the syntax used
+        // Create the appropriate import node
         if (!specific_imports.empty())
         {
-            // Specific import: import IO from <path>;
-            return std::make_unique<ImportDeclarationNode>(start_loc, std::move(specific_imports), module_path, import_type);
+            // Specific import: import IO from core::stdio;
+            return std::make_unique<ImportDeclarationNode>(start_loc, std::move(specific_imports), module_path);
         }
         else if (has_alias)
         {
-            // Traditional import with alias: import <path> as alias;
-            return std::make_unique<ImportDeclarationNode>(start_loc, module_path, alias, import_type);
+            // Import with alias: import core::option as Option;
+            return std::make_unique<ImportDeclarationNode>(start_loc, module_path, alias);
         }
         else
         {
-            // Wildcard import: import <path>; or import * from <path>;
-            return std::make_unique<ImportDeclarationNode>(start_loc, module_path, import_type);
+            // Wildcard import: import core::option;
+            return std::make_unique<ImportDeclarationNode>(start_loc, module_path);
         }
+    }
+
+    std::unique_ptr<ModuleDeclarationNode> Parser::parse_module_declaration()
+    {
+        SourceLocation start_loc = _current_token.location();
+        bool is_public = false;
+
+        // Check for 'public' keyword
+        if (_current_token.is(TokenKind::TK_KW_PUBLIC))
+        {
+            is_public = true;
+            advance(); // consume 'public'
+        }
+
+        // Parse 'module' keyword
+        consume(TokenKind::TK_KW_MODULE, "Expected 'module'");
+
+        // Parse module path (e.g., alloc::global)
+        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            throw ParseError("Expected module path after 'module'", _current_token.location());
+        }
+
+        std::string module_path = std::string(_current_token.text());
+        advance(); // consume first identifier
+
+        // Parse remaining module path segments (identifier::identifier::...)
+        while (_current_token.is(TokenKind::TK_COLONCOLON))
+        {
+            advance(); // consume '::'
+            Token ident = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '::' in module path");
+            module_path += "::" + std::string(ident.text());
+        }
+
+        // Parse optional ';'
+        if (_current_token.is(TokenKind::TK_SEMICOLON))
+        {
+            advance(); // consume ';'
+        }
+
+        return std::make_unique<ModuleDeclarationNode>(start_loc, module_path, is_public);
     }
 
     std::unique_ptr<ReturnStatementNode> Parser::parse_return_statement()

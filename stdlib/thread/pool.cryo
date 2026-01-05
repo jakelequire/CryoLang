@@ -1,0 +1,308 @@
+///! Thread Pool
+///!
+///! A pool of worker threads for executing tasks.
+
+namespace std::thread::pool;
+
+import core::intrinsics;
+import core::option;
+import alloc::global;
+import collections::array;
+import collections::deque;
+import sync::mutex;
+import sync::condvar;
+import sync::atomic;
+import thread::thread;
+
+// ============================================================================
+// Task
+// ============================================================================
+
+/// A task to be executed by the thread pool.
+type struct Task {
+    func: (void*) -> void;
+    data: void*;
+}
+
+// ============================================================================
+// ThreadPool
+// ============================================================================
+
+/// A pool of worker threads.
+type struct ThreadPool {
+    workers: Vec<Worker>;
+    queue: Deque<Task>;
+    queue_mutex: pthread_mutex_t;
+    queue_cond: pthread_cond_t;
+    shutdown: AtomicBool;
+    active_count: AtomicU64;
+
+    // Method signatures
+    ThreadPool() -> ThreadPool;
+    ThreadPool(num_threads: u64) -> ThreadPool;
+    execute(mut &this, func: (void*) -> void, data: void*) -> void;
+    worker_count(&this) -> u64;
+    active_count(&this) -> u64;
+    queued_count(&this) -> u64;
+    join(&this) -> void;
+    shutdown(mut &this) -> void;
+    drop(&this) -> void;
+}
+
+implement struct ThreadPool {
+    /// Creates a new thread pool with the default number of threads.
+    ThreadPool() -> ThreadPool {
+        const num_threads: u64 = available_parallelism();
+        return ThreadPool::ThreadPool(num_threads);
+    }
+
+    /// Creates a thread pool with the specified number of threads.
+    ThreadPool(num_threads: u64) -> ThreadPool {
+        mut pool: ThreadPool = ThreadPool {
+            workers: Vec::with_capacity(num_threads),
+            queue: Deque::new(),
+            queue_mutex: pthread_mutex_t::new(),
+            queue_cond: pthread_cond_t::new(),
+            shutdown: AtomicBool::new(false),
+            active_count: AtomicU64::new(0)
+        };
+
+        pthread_mutex_init(&pool.queue_mutex, null);
+        pthread_cond_init(&pool.queue_cond, null);
+
+        // Spawn worker threads
+        mut i: u64 = 0;
+        while (i < num_threads) {
+            const worker: Worker = Worker::Worker(&pool);
+            pool.workers.push(worker);
+            i = i + 1;
+        }
+
+        return pool;
+    }
+
+    /// Submits a task to the pool.
+    execute(mut &this, func: (void*) -> void, data: void*) -> void {
+        pthread_mutex_lock(&this.queue_mutex);
+
+        this.queue.push_back(Task {
+            func: func,
+            data: data
+        });
+
+        pthread_cond_signal(&this.queue_cond);
+        pthread_mutex_unlock(&this.queue_mutex);
+    }
+
+    /// Returns the number of worker threads.
+    worker_count(&this) -> u64 {
+        return this.workers.len();
+    }
+
+    /// Returns the number of active tasks.
+    active_count(&this) -> u64 {
+        return this.active_count.load(Ordering::SeqCst);
+    }
+
+    /// Returns the number of queued tasks.
+    queued_count(&this) -> u64 {
+        pthread_mutex_lock(&this.queue_mutex);
+        const count: u64 = this.queue.len();
+        pthread_mutex_unlock(&this.queue_mutex);
+        return count;
+    }
+
+    /// Waits for all tasks to complete.
+    join(&this) -> void {
+        // Wait for queue to empty and all workers to be idle
+        loop {
+            pthread_mutex_lock(&this.queue_mutex);
+            const queue_empty: boolean = this.queue.is_empty();
+            pthread_mutex_unlock(&this.queue_mutex);
+
+            if (queue_empty && this.active_count.load(Ordering::SeqCst) == 0) {
+                break;
+            }
+
+            sleep_ms(1);
+        }
+    }
+
+    /// Shuts down the pool, waiting for all tasks to complete.
+    shutdown(mut &this) -> void {
+        this.shutdown.store(true, Ordering::SeqCst);
+
+        // Wake all workers
+        pthread_mutex_lock(&this.queue_mutex);
+        pthread_cond_broadcast(&this.queue_cond);
+        pthread_mutex_unlock(&this.queue_mutex);
+
+        // Join all workers
+        mut i: u64 = 0;
+        while (i < this.workers.len()) {
+            this.workers.get_ref(i).join();
+            i = i + 1;
+        }
+    }
+
+    /// Drops the pool.
+    drop(&this) -> void {
+        if (!this.shutdown.load(Ordering::SeqCst)) {
+            this.shutdown();
+        }
+
+        pthread_mutex_destroy(&this.queue_mutex);
+        pthread_cond_destroy(&this.queue_cond);
+        this.workers.drop();
+        this.queue.drop();
+    }
+}
+
+// ============================================================================
+// Worker
+// ============================================================================
+
+/// A worker thread in the pool.
+type struct Worker {
+    handle: pthread_t;
+
+    // Method signatures
+    Worker(pool: ThreadPool*) -> Worker;
+    join(mut &this) -> void;
+}
+
+implement struct Worker {
+    /// Creates a new worker.
+    Worker(pool: ThreadPool*) -> Worker {
+        mut handle: pthread_t;
+
+        const data: WorkerData* = malloc(sizeof(WorkerData));
+        if (data == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        data.pool = pool;
+
+        pthread_create(&handle, null, worker_thread, data);
+
+        return Worker { handle: handle };
+    }
+
+    /// Joins the worker thread.
+    join(mut &this) -> void {
+        pthread_join(this.handle, null);
+    }
+}
+
+/// Worker thread data.
+type struct WorkerData {
+    pool: ThreadPool*;
+}
+
+/// Worker thread function.
+function worker_thread(arg: void*) -> void* {
+    const data: WorkerData* = arg as WorkerData*;
+    const pool: ThreadPool* = data.pool;
+    free(data);
+
+    loop {
+        pthread_mutex_lock(&pool.queue_mutex);
+
+        // Wait for task or shutdown
+        while (pool.queue.is_empty() && !pool.shutdown.load(Ordering::SeqCst)) {
+            pthread_cond_wait(&pool.queue_cond, &pool.queue_mutex);
+        }
+
+        if (pool.shutdown.load(Ordering::SeqCst) && pool.queue.is_empty()) {
+            pthread_mutex_unlock(&pool.queue_mutex);
+            break;
+        }
+
+        const task_opt: Option<Task> = pool.queue.pop_front();
+        pthread_mutex_unlock(&pool.queue_mutex);
+
+        match (task_opt) {
+            Option::Some(task) => {
+                pool.active_count.fetch_add(1, Ordering::SeqCst);
+                task.func(task.data);
+                pool.active_count.fetch_sub(1, Ordering::SeqCst);
+            }
+            Option::None => {}
+        }
+    }
+
+    return null;
+}
+
+// ============================================================================
+// Scoped Thread Pool
+// ============================================================================
+
+/// A thread pool that ensures all tasks complete before returning.
+type struct ScopedThreadPool {
+    pool: ThreadPool;
+
+    // Method signatures
+    ScopedThreadPool(num_threads: u64) -> ScopedThreadPool;
+    scope(mut &this, f: (&mut ScopedThreadPool) -> void) -> void;
+    execute(mut &this, func: (void*) -> void, data: void*) -> void;
+    drop(&this) -> void;
+}
+
+implement struct ScopedThreadPool {
+    /// Creates a new scoped pool.
+    ScopedThreadPool(num_threads: u64) -> ScopedThreadPool {
+        return ScopedThreadPool {
+            pool: ThreadPool::ThreadPool(num_threads)
+        };
+    }
+
+    /// Executes tasks in scope, waiting for all to complete.
+    scope(mut &this, f: (&mut ScopedThreadPool) -> void) -> void {
+        f(&this);
+        this.pool.join();
+    }
+
+    /// Submits a task.
+    execute(mut &this, func: (void*) -> void, data: void*) -> void {
+        this.pool.execute(func, data);
+    }
+
+    /// Drops the scoped pool.
+    drop(&this) -> void {
+        this.pool.drop();
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Creates a new thread pool with the default number of threads.
+function thread_pool() -> ThreadPool {
+    return ThreadPool::ThreadPool();
+}
+
+/// Creates a thread pool with the specified number of threads.
+function thread_pool_with(num_threads: u64) -> ThreadPool {
+    return ThreadPool::ThreadPool(num_threads);
+}
+
+// ============================================================================
+// Types and Intrinsics
+// ============================================================================
+
+type pthread_t = u64;
+type pthread_mutex_t = void[48];
+type pthread_cond_t = void[48];
+
+intrinsic function pthread_create(thread: pthread_t*, attr: void*, start: (void*) -> void*, arg: void*) -> i32;
+intrinsic function pthread_join(thread: pthread_t, retval: void**) -> i32;
+intrinsic function pthread_mutex_init(mutex: pthread_mutex_t*, attr: void*) -> i32;
+intrinsic function pthread_mutex_destroy(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_mutex_lock(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_mutex_unlock(mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_cond_init(cond: pthread_cond_t*, attr: void*) -> i32;
+intrinsic function pthread_cond_destroy(cond: pthread_cond_t*) -> i32;
+intrinsic function pthread_cond_wait(cond: pthread_cond_t*, mutex: pthread_mutex_t*) -> i32;
+intrinsic function pthread_cond_signal(cond: pthread_cond_t*) -> i32;
+intrinsic function pthread_cond_broadcast(cond: pthread_cond_t*) -> i32;

@@ -62,7 +62,7 @@ namespace Cryo
             
             // Import core/types for string methods
             auto core_types_import = std::make_unique<ImportDeclarationNode>(
-                SourceLocation(0, 0), "core/types", ImportDeclarationNode::ImportType::Absolute);
+                SourceLocation(0, 0), "core::types");
             auto core_types_result = _module_loader->load_import(*core_types_import);
             if (core_types_result.success && !core_types_result.symbol_map.empty()) {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime auto-import: loaded core/types with {} symbols", core_types_result.symbol_map.size());
@@ -70,7 +70,7 @@ namespace Cryo
             
             // Import intrinsics for __malloc__, __free__, etc.
             auto intrinsics_import = std::make_unique<ImportDeclarationNode>(
-                SourceLocation(0, 0), "core/intrinsics", ImportDeclarationNode::ImportType::Absolute);
+                SourceLocation(0, 0), "core::intrinsics");
             auto intrinsics_result = _module_loader->load_import(*intrinsics_import);
             if (intrinsics_result.success && !intrinsics_result.symbol_map.empty()) {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime auto-import: loaded intrinsics with {} symbols", intrinsics_result.symbol_map.size());
@@ -1677,8 +1677,7 @@ namespace Cryo
                 // Create a synthetic ImportDeclarationNode for core/intrinsics
                 auto intrinsics_import = std::make_unique<ImportDeclarationNode>(
                     SourceLocation(0, 0),                       // synthetic location
-                    "core/intrinsics",                          // path
-                    ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
+                    "core::intrinsics"                          // module path
                 );
 
                 // Temporarily disable stdlib mode for this import to allow loading
@@ -1702,8 +1701,7 @@ namespace Cryo
                 // Also load core/types for runtime files to access string.length() and other primitive methods
                 auto core_types_import = std::make_unique<ImportDeclarationNode>(
                     SourceLocation(0, 0),                       // synthetic location
-                    "core/types",                               // path
-                    ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
+                    "core::types"                               // module path
                 );
 
                 // Load the core/types import
@@ -1754,14 +1752,19 @@ namespace Cryo
             return;
         }
 
-        // Skip auto-import if we're compiling the core/types module itself to avoid circular dependencies
-        if (_source_file.find("core/types.cryo") != std::string::npos ||
+        // Skip auto-import if we're compiling the prelude itself or core modules to avoid circular dependencies
+        if (_source_file.find("prelude.cryo") != std::string::npos ||
+            _source_file.find("stdlib/prelude.cryo") != std::string::npos ||
+            _source_file.find("new_stdlib/prelude.cryo") != std::string::npos ||
+            _source_file.find("prelude\\prelude.cryo") != std::string::npos ||
+            _source_file.find("core/types.cryo") != std::string::npos ||
             _source_file.find("stdlib/core/types.cryo") != std::string::npos ||
             _source_file.find("core\\types.cryo") != std::string::npos ||
             _source_file.find("stdlib\\core\\types.cryo") != std::string::npos ||
-            _source_file.find("std::Core") != std::string::npos)
+            _source_file.find("std::Core") != std::string::npos ||
+            _source_file.find("std::prelude") != std::string::npos)
         {
-            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports when compiling core/types module itself");
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping auto-imports when compiling prelude or core modules to avoid circular dependencies");
             return;
         }
 
@@ -1774,27 +1777,33 @@ namespace Cryo
                       _source_file, _stdlib_compilation_mode, stdlib_mode_runtime_exception);
         }
 
-        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: core/types");
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: prelude");
 
         // Use the member ModuleLoader instance
         // Auto-detect stdlib root instead of using hardcoded path
         if (!_module_loader->auto_detect_stdlib_root())
         {
-            // Fallback to relative path if auto-detection fails
-            _module_loader->set_stdlib_root("./stdlib");
+            // Fallback to relative paths - try new_stdlib first, then stdlib for compatibility
+            if (std::filesystem::exists("./new_stdlib"))
+            {
+                _module_loader->set_stdlib_root("./new_stdlib");
+            }
+            else
+            {
+                _module_loader->set_stdlib_root("./stdlib");
+            }
         }
         _module_loader->set_current_file(_source_file);
 
-        // Create a synthetic ImportDeclarationNode for core/types
-        // This simulates: import <core/types>;
-        auto core_types_import = std::make_unique<ImportDeclarationNode>(
+        // Create a synthetic ImportDeclarationNode for prelude
+        // This simulates: import <prelude>;
+        auto prelude_import = std::make_unique<ImportDeclarationNode>(
             SourceLocation(0, 0),                       // synthetic location
-            "core/types",                               // path
-            ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
+            "prelude"                                   // module path
         );
 
-        // Load the import
-        auto result = _module_loader->load_import(*core_types_import);
+        // Load the prelude import
+        auto result = _module_loader->load_import(*prelude_import);
 
         if (result.success)
         {
@@ -1802,148 +1811,50 @@ namespace Cryo
             if (!result.symbol_map.empty())
             {
                 current_scope->register_namespace(result.module_name, result.symbol_map);
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported core/types: registered namespace '{}' with {} symbols",
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported prelude: registered namespace '{}' with {} symbols",
                           result.module_name, result.symbol_map.size());
                 if (is_runtime_file)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file successfully auto-imported core/types - implementation blocks should be processed later");
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file successfully auto-imported prelude");
                 }
             }
             else
             {
-                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in core/types");
+                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in prelude");
             }
         }
         else
         {
-            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import core/types: {}", result.error_message);
-            if (is_runtime_file)
+            // If prelude import fails, try fallback to core/types for compatibility
+            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import prelude: {}, trying core/types fallback", result.error_message);
+            
+            auto core_types_import = std::make_unique<ImportDeclarationNode>(
+                SourceLocation(0, 0),                       // synthetic location
+                "core::types"                               // module path
+            );
+            
+            auto fallback_result = _module_loader->load_import(*core_types_import);
+            if (fallback_result.success && !fallback_result.symbol_map.empty())
             {
-                LOG_ERROR(Cryo::LogComponent::GENERAL, "CRITICAL: Runtime file failed to auto-import core/types - string methods will be unavailable!");
+                current_scope->register_namespace(fallback_result.module_name, fallback_result.symbol_map);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Fallback auto-imported core/types: registered namespace '{}' with {} symbols",
+                          fallback_result.module_name, fallback_result.symbol_map.size());
+            }
+            else if (is_runtime_file)
+            {
+                LOG_ERROR(Cryo::LogComponent::GENERAL, "CRITICAL: Runtime file failed to auto-import both prelude and core/types!");
             }
         }
 
-        // Skip remaining auto-imports if we're in stdlib mode (except for runtime files which only get core/types)
+        // Skip remaining auto-imports if we're in stdlib mode (except for runtime files which only get prelude)
         if (stdlib_mode_runtime_exception)
         {
-            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file in stdlib mode: only auto-imported core/types, skipping other imports");
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime file in stdlib mode: only auto-imported prelude, skipping other imports");
             return;
         }
 
-        // Auto-import intrinsic functions for user projects
-        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: core/intrinsics");
-
-        // Create a synthetic ImportDeclarationNode for core/intrinsics
-        // This simulates: import <core/intrinsics>;
-        auto intrinsics_import = std::make_unique<ImportDeclarationNode>(
-            SourceLocation(0, 0),                       // synthetic location
-            "core/intrinsics",                          // path
-            ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
-        );
-
-        // Load the intrinsics import
-        auto intrinsics_result = _module_loader->load_import(*intrinsics_import);
-
-        if (intrinsics_result.success)
-        {
-            // Register the namespace and symbols (wildcard import behavior)
-            if (!intrinsics_result.symbol_map.empty())
-            {
-                current_scope->register_namespace(intrinsics_result.module_name, intrinsics_result.symbol_map);
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported intrinsics: registered namespace '{}' with {} symbols",
-                          intrinsics_result.module_name, intrinsics_result.symbol_map.size());
-
-                // Also register under the short name "Intrinsics" for convenience
-                // This allows both Intrinsics::__printf__ and std::Intrinsics::__printf__ to work
-                current_scope->register_namespace("Intrinsics", intrinsics_result.symbol_map);
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported intrinsics: also registered under short name 'Intrinsics' with {} symbols",
-                          intrinsics_result.symbol_map.size());
-            }
-            else
-            {
-                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in intrinsics");
-            }
-        }
-        else
-        {
-            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import intrinsics: {}", intrinsics_result.error_message);
-        }
-
-        // Auto-import runtime functions
-        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: runtime/runtime");
-
-        // Create a synthetic ImportDeclarationNode for runtime/runtime
-        // This simulates: import <runtime/runtime>;
-        auto runtime_import = std::make_unique<ImportDeclarationNode>(
-            SourceLocation(0, 0),                       // synthetic location
-            "runtime/runtime",                          // path
-            ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
-        );
-
-        // Load the runtime import
-        auto runtime_result = _module_loader->load_import(*runtime_import);
-
-        if (runtime_result.success)
-        {
-            // Register the namespace and symbols (wildcard import behavior)
-            if (!runtime_result.symbol_map.empty())
-            {
-                // Force runtime symbols to be registered under std::Runtime for TypeChecker fallback compatibility
-                std::string runtime_namespace = "std::Runtime";
-                current_scope->register_namespace(runtime_namespace, runtime_result.symbol_map);
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported runtime: registered namespace '{}' with {} symbols (original module: '{}')",
-                          runtime_namespace, runtime_result.symbol_map.size(), runtime_result.module_name);
-
-                // Only use fully qualified std::Runtime namespace - no short names for consistency
-            }
-            else
-            {
-                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in runtime");
-            }
-        }
-        else
-        {
-            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import runtime: {}", runtime_result.error_message);
-        }
-
-        // Auto-import IO functions (printf, etc.)
-        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Injecting auto-import: io/stdio");
-
-        // Create a synthetic ImportDeclarationNode for io/stdio
-        // This simulates: import <io/stdio>;
-        auto io_import = std::make_unique<ImportDeclarationNode>(
-            SourceLocation(0, 0),                       // synthetic location
-            "io/stdio",                                 // path
-            ImportDeclarationNode::ImportType::Absolute // absolute import (stdlib)
-        );
-
-        // Load the io/stdio import
-        auto io_result = _module_loader->load_import(*io_import);
-
-        if (io_result.success)
-        {
-            // Register the namespace and symbols (wildcard import behavior)
-            if (!io_result.symbol_map.empty())
-            {
-                current_scope->register_namespace(io_result.module_name, io_result.symbol_map);
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported IO: registered namespace '{}' with {} symbols",
-                          io_result.module_name, io_result.symbol_map.size());
-
-                // Also register under the short name "IO" for convenience
-                // This allows both IO::printf and std::IO::printf to work
-                current_scope->register_namespace("IO", io_result.symbol_map);
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Auto-imported IO: also registered under short name 'IO' with {} symbols",
-                          io_result.symbol_map.size());
-            }
-            else
-            {
-                LOG_WARN(Cryo::LogComponent::GENERAL, "Auto-import succeeded but no symbols found in io/stdio");
-            }
-        }
-        else
-        {
-            LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to auto-import io/stdio: {}", io_result.error_message);
-        }
+        // The prelude should have already imported all necessary modules (intrinsics, runtime, io, etc.)
+        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Prelude auto-injection complete. All required symbols should be available through prelude re-exports.");
     }
 
     void CompilerInstance::process_struct_declarations_for_preregistration(ASTNode *node)
