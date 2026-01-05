@@ -1,0 +1,223 @@
+///! Runtime Initialization and Shutdown
+///!
+///! This module handles the initialization and shutdown of the Cryo runtime.
+///! It is responsible for setting up global state, initializing subsystems,
+///! and performing cleanup on program exit.
+
+namespace cryo::runtime::init;
+
+import <core/intrinsics>;
+import <runtime/memory>;
+import <runtime/signal>;
+import <runtime/atexit>;
+import <runtime/platform>;
+import <env>;
+
+// ============================================================================
+// Runtime State
+// ============================================================================
+
+/// The current state of the runtime.
+enum RuntimeState {
+    /// Runtime has not been initialized.
+    Uninitialized;
+    /// Runtime is currently initializing.
+    Initializing;
+    /// Runtime is fully initialized and running.
+    Running;
+    /// Runtime is shutting down.
+    ShuttingDown;
+    /// Runtime has been shut down.
+    Shutdown;
+    /// Runtime encountered a fatal error.
+    Error;
+}
+
+/// Result of runtime initialization.
+enum InitResult {
+    /// Initialization succeeded.
+    Ok;
+    /// Memory initialization failed.
+    MemoryError;
+    /// Signal handler installation failed.
+    SignalError;
+    /// Platform initialization failed.
+    PlatformError;
+    /// Runtime was already initialized.
+    AlreadyInitialized;
+}
+
+// ============================================================================
+// Global Runtime State
+// ============================================================================
+
+/// Current runtime state.
+mut g_runtime_state: RuntimeState = RuntimeState::Uninitialized;
+
+/// Indicates if the runtime has been initialized.
+mut g_initialized: boolean = false;
+
+/// Main thread ID (set during initialization).
+mut g_main_thread_id: u64 = 0;
+
+/// Program start time (nanoseconds since epoch).
+mut g_start_time: i64 = 0;
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+/// Initializes the Cryo runtime.
+///
+/// This function must be called before any Cryo code executes. It:
+/// 1. Sets up the global allocator
+/// 2. Installs signal handlers
+/// 3. Initializes platform-specific features
+/// 4. Records the program start time
+///
+/// Returns Ok on success, or an error code on failure.
+function runtime_init(argc: i32, argv: string*) -> InitResult {
+    // Check if already initialized
+    if (g_initialized) {
+        return InitResult::AlreadyInitialized;
+    }
+
+    // Mark as initializing
+    g_runtime_state = RuntimeState::Initializing;
+
+    // Initialize platform-specific features first
+    if (!platform::init()) {
+        g_runtime_state = RuntimeState::Error;
+        return InitResult::PlatformError;
+    }
+
+    // Initialize memory subsystem
+    if (!memory::init()) {
+        g_runtime_state = RuntimeState::Error;
+        return InitResult::MemoryError;
+    }
+
+    // Install signal handlers
+    if (!signal::init()) {
+        g_runtime_state = RuntimeState::Error;
+        return InitResult::SignalError;
+    }
+
+    // Initialize atexit handlers
+    atexit::init();
+
+    // Store program arguments in env module
+    env::init_args(argc, argv);
+
+    // Record main thread ID
+    g_main_thread_id = pthread_self();
+
+    // Record start time
+    g_start_time = get_monotonic_time();
+
+    // Mark as running
+    g_initialized = true;
+    g_runtime_state = RuntimeState::Running;
+
+    return InitResult::Ok;
+}
+
+/// Shuts down the Cryo runtime.
+///
+/// This function should be called before program exit. It:
+/// 1. Runs registered atexit handlers
+/// 2. Flushes I/O buffers
+/// 3. Releases runtime resources
+function runtime_shutdown() -> void {
+    if (!g_initialized) {
+        return;
+    }
+
+    // Mark as shutting down
+    g_runtime_state = RuntimeState::ShuttingDown;
+
+    // Run atexit handlers in reverse order
+    atexit::run_handlers();
+
+    // Flush standard streams
+    fflush(null);
+
+    // Shutdown subsystems
+    signal::shutdown();
+    memory::shutdown();
+    platform::shutdown();
+
+    // Mark as shutdown
+    g_initialized = false;
+    g_runtime_state = RuntimeState::Shutdown;
+}
+
+// ============================================================================
+// Runtime Queries
+// ============================================================================
+
+/// Returns true if the runtime is initialized.
+function is_initialized() -> boolean {
+    return g_initialized;
+}
+
+/// Returns the current runtime state.
+function state() -> RuntimeState {
+    return g_runtime_state;
+}
+
+/// Returns true if the current thread is the main thread.
+function is_main_thread() -> boolean {
+    return pthread_self() == g_main_thread_id;
+}
+
+/// Returns the program uptime in nanoseconds.
+function uptime_nanos() -> i64 {
+    if (!g_initialized) {
+        return 0;
+    }
+    return get_monotonic_time() - g_start_time;
+}
+
+/// Returns the program uptime in milliseconds.
+function uptime_millis() -> i64 {
+    return uptime_nanos() / 1000000;
+}
+
+/// Returns the program uptime in seconds.
+function uptime_secs() -> i64 {
+    return uptime_nanos() / 1000000000;
+}
+
+// ============================================================================
+// Internal Helpers
+// ============================================================================
+
+/// Gets monotonic time in nanoseconds.
+function get_monotonic_time() -> i64 {
+    mut ts: timespec;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ts.tv_sec * 1000000000) + ts.tv_nsec;
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// POSIX timespec structure.
+type struct timespec {
+    tv_sec: i64;
+    tv_nsec: i64;
+}
+
+/// Clock ID for CLOCK_MONOTONIC.
+const CLOCK_MONOTONIC: i32 = 1;
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function pthread_self() -> u64;
+intrinsic function clock_gettime(clk_id: i32, tp: timespec*) -> i32;
+intrinsic function fflush(stream: void*) -> i32;
+

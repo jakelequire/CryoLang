@@ -1,0 +1,275 @@
+///! Panic Handling
+///!
+///! This module provides panic handling for the Cryo runtime.
+///! A panic represents an unrecoverable error that will terminate the program.
+///!
+///! # Panic Hooks
+///!
+///! Users can register custom panic hooks to customize panic behavior,
+///! such as logging to a file or sending crash reports.
+
+namespace cryo::runtime::panic;
+
+import <core/intrinsics>;
+import <runtime/init>;
+
+// ============================================================================
+// Panic Information
+// ============================================================================
+
+/// Information about a panic.
+type struct PanicInfo {
+    /// The panic message.
+    message: string;
+    /// The file where the panic occurred.
+    file: string;
+    /// The line number where the panic occurred.
+    line: u32;
+    /// The column number where the panic occurred.
+    column: u32;
+
+    // Methods
+    static new(msg: string, file: string, line: u32, col: u32) -> PanicInfo;
+    message(&this) -> string;
+    location(&this) -> (string, u32, u32);
+}
+
+implement struct PanicInfo {
+    /// Creates new panic info.
+    static new(msg: string, file: string, line: u32, col: u32) -> PanicInfo {
+        return PanicInfo {
+            message: msg,
+            file: file,
+            line: line,
+            column: col
+        };
+    }
+
+    /// Returns the panic message.
+    message(&this) -> string {
+        return this.message;
+    }
+
+    /// Returns the panic location as (file, line, column).
+    location(&this) -> (string, u32, u32) {
+        return (this.file, this.line, this.column);
+    }
+}
+
+// ============================================================================
+// Panic Hook
+// ============================================================================
+
+/// Type for panic hook functions.
+type PanicHook = function(info: PanicInfo*) -> void;
+
+/// The default panic hook.
+function default_panic_hook(info: PanicInfo*) -> void {
+    // Print panic message to stderr
+    const stderr_fd: i32 = 2;
+
+    // Format: "panic: <message>\n  at <file>:<line>:<column>\n"
+    write_str(stderr_fd, "panic: ");
+    write_str(stderr_fd, info.message);
+    write_str(stderr_fd, "\n  at ");
+    write_str(stderr_fd, info.file);
+    write_str(stderr_fd, ":");
+    write_u32(stderr_fd, info.line);
+    write_str(stderr_fd, ":");
+    write_u32(stderr_fd, info.column);
+    write_str(stderr_fd, "\n");
+}
+
+/// The current panic hook.
+mut g_panic_hook: PanicHook = default_panic_hook;
+
+/// Sets a custom panic hook, returning the previous hook.
+function set_hook(hook: PanicHook) -> PanicHook {
+    const old_hook: PanicHook = g_panic_hook;
+    g_panic_hook = hook;
+    return old_hook;
+}
+
+/// Resets the panic hook to the default.
+function reset_hook() -> void {
+    g_panic_hook = default_panic_hook;
+}
+
+/// Returns the current panic hook.
+function get_hook() -> PanicHook {
+    return g_panic_hook;
+}
+
+// ============================================================================
+// Panic State
+// ============================================================================
+
+/// Indicates if we're currently in a panic.
+mut g_panicking: boolean = false;
+
+/// Panic count (for detecting double panics).
+mut g_panic_count: u32 = 0;
+
+/// Maximum allowed nested panics before hard abort.
+const MAX_PANIC_COUNT: u32 = 2;
+
+// ============================================================================
+// Panic Functions
+// ============================================================================
+
+/// Triggers a panic with the given message and location.
+///
+/// This function does not return. It will:
+/// 1. Call the registered panic hook
+/// 2. Attempt to run cleanup (if first panic)
+/// 3. Terminate the program
+function panic_impl(message: string, file: string, line: u32, column: u32) -> void {
+    // Increment panic count
+    g_panic_count = g_panic_count + 1;
+
+    // Check for nested panic
+    if (g_panic_count > MAX_PANIC_COUNT) {
+        // Hard abort - we're in too deep
+        const msg: string = "fatal: nested panic limit exceeded, aborting\n";
+        write(2, msg, strlen(msg));
+        abort();
+    }
+
+    // Mark as panicking
+    const was_panicking: boolean = g_panicking;
+    g_panicking = true;
+
+    // Create panic info
+    const info: PanicInfo = PanicInfo::new(message, file, line, column);
+
+    // Call the panic hook
+    if (g_panic_hook != null) {
+        g_panic_hook(&info);
+    }
+
+    // If this is the first panic and runtime is initialized, try to clean up
+    if (!was_panicking && init::is_initialized()) {
+        // Attempt graceful shutdown
+        init::runtime_shutdown();
+    }
+
+    // Exit with failure status
+    exit(101); // 101 is the standard Cryo panic exit code
+}
+
+/// Panics with a message.
+///
+/// This is the primary panic function called by user code.
+function panic(message: string) -> void {
+    panic_impl(message, "<unknown>", 0, 0);
+}
+
+/// Panics with a message and location.
+///
+/// This version is used by the compiler for source-level panics.
+function panic_at(message: string, file: string, line: u32, column: u32) -> void {
+    panic_impl(message, file, line, column);
+}
+
+/// Panics with a formatted assertion failure message.
+function assert_failed(expr: string, file: string, line: u32) -> void {
+    // Format: "assertion failed: <expr>"
+    panic_impl(expr, file, line, 0);
+}
+
+/// Called when unreachable code is executed.
+function unreachable_impl(file: string, line: u32) -> void {
+    panic_impl("internal error: entered unreachable code", file, line, 0);
+}
+
+/// Called when unimplemented code is executed.
+function unimplemented_impl(file: string, line: u32) -> void {
+    panic_impl("not yet implemented", file, line, 0);
+}
+
+/// Called when todo!() is executed.
+function todo_impl(file: string, line: u32) -> void {
+    panic_impl("not yet implemented", file, line, 0);
+}
+
+/// Called on index out of bounds.
+function index_out_of_bounds(index: u64, len: u64, file: string, line: u32) -> void {
+    // In a full implementation, we'd format this properly
+    panic_impl("index out of bounds", file, line, 0);
+}
+
+/// Called on unwrap of None.
+function unwrap_none(file: string, line: u32) -> void {
+    panic_impl("called `Option::unwrap()` on a `None` value", file, line, 0);
+}
+
+/// Called on unwrap of Err.
+function unwrap_err(file: string, line: u32) -> void {
+    panic_impl("called `Result::unwrap()` on an `Err` value", file, line, 0);
+}
+
+// ============================================================================
+// Query Functions
+// ============================================================================
+
+/// Returns true if the current thread is panicking.
+function panicking() -> boolean {
+    return g_panicking;
+}
+
+/// Returns the current panic count.
+function panic_count() -> u32 {
+    return g_panic_count;
+}
+
+// ============================================================================
+// Abort
+// ============================================================================
+
+/// Immediately aborts the program without cleanup.
+///
+/// Use this only in cases where cleanup cannot safely run.
+function abort_program() -> void {
+    abort();
+}
+
+// ============================================================================
+// Internal Helpers
+// ============================================================================
+
+/// Writes a string to a file descriptor.
+function write_str(fd: i32, s: string) -> void {
+    write(fd, s, strlen(s));
+}
+
+/// Writes an unsigned 32-bit integer to a file descriptor.
+function write_u32(fd: i32, value: u32) -> void {
+    if (value == 0) {
+        const zero: string = "0";
+        write(fd, zero, 1);
+        return;
+    }
+
+    // Convert to decimal string (max 10 digits for u32)
+    mut buffer: u8[11];
+    mut pos: u32 = 10;
+    mut v: u32 = value;
+
+    while (v > 0) {
+        pos = pos - 1;
+        buffer[pos] = ('0' as u8) + (v % 10) as u8;
+        v = v / 10;
+    }
+
+    write(fd, &buffer[pos], 10 - pos);
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function write(fd: i32, buf: void*, count: u64) -> i64;
+intrinsic function strlen(s: string) -> u64;
+intrinsic function abort() -> void;
+intrinsic function exit(status: i32) -> void;
+
