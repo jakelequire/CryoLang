@@ -1,0 +1,477 @@
+///! UDP - User Datagram Protocol
+///!
+///! UDP sockets for connectionless network communication.
+
+namespace std::net::udp;
+
+import core::intrinsics;
+import core::option;
+import io::error;
+import time::duration;
+import net::addr;
+
+// ============================================================================
+// UDP Socket
+// ============================================================================
+
+/// A UDP socket.
+type struct UdpSocket {
+    fd: i32;
+    local_addr: SocketAddr;
+
+    // Method signatures
+    static bind(addr: SocketAddr) -> IoResult<UdpSocket>;
+    local_addr(&this) -> SocketAddr;
+    connect(&this, addr: SocketAddr) -> IoResult<void>;
+    send(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    recv(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    send_to(&this, buf: u8*, len: u64, addr: SocketAddr) -> IoResult<u64>;
+    recv_from(&this, buf: u8*, len: u64) -> IoResult<(u64, SocketAddr)>;
+    peek(&this, buf: u8*, len: u64) -> IoResult<u64>;
+    peek_from(&this, buf: u8*, len: u64) -> IoResult<(u64, SocketAddr)>;
+    try_clone(&this) -> IoResult<UdpSocket>;
+    set_read_timeout(&this, timeout: Option<Duration>) -> IoResult<void>;
+    set_write_timeout(&this, timeout: Option<Duration>) -> IoResult<void>;
+    read_timeout(&this) -> IoResult<Option<Duration>>;
+    write_timeout(&this) -> IoResult<Option<Duration>>;
+    set_broadcast(&this, broadcast: boolean) -> IoResult<void>;
+    broadcast(&this) -> IoResult<boolean>;
+    set_ttl(&this, ttl: u32) -> IoResult<void>;
+    ttl(&this) -> IoResult<u32>;
+    set_multicast_ttl_v4(&this, ttl: u32) -> IoResult<void>;
+    multicast_ttl_v4(&this) -> IoResult<u32>;
+    set_multicast_loop_v4(&this, loop: boolean) -> IoResult<void>;
+    multicast_loop_v4(&this) -> IoResult<boolean>;
+    join_multicast_v4(&this, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> IoResult<void>;
+    leave_multicast_v4(&this, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> IoResult<void>;
+    set_nonblocking(&this, nonblocking: boolean) -> IoResult<void>;
+    as_raw_fd(&this) -> i32;
+    close(&this) -> void;
+}
+
+implement struct UdpSocket {
+    /// Creates a UDP socket bound to the specified address.
+    static bind(addr: SocketAddr) -> IoResult<UdpSocket> {
+        const fd: i32 = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        // Set SO_REUSEADDR
+        const reuse: i32 = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse as void*, sizeof(i32));
+
+        mut sockaddr: sockaddr_in;
+        match (addr) {
+            SocketAddr::V4(v4) => {
+                sockaddr.sin_family = AF_INET as u16;
+                sockaddr.sin_port = htons(v4.port());
+                sockaddr.sin_addr = v4.ip().to_u32();
+            }
+            SocketAddr::V6(_) => {
+                close(fd);
+                return IoResult::Err(IoError::new(IoErrorKind::Unsupported, "IPv6 not implemented"));
+            }
+        }
+
+        if (bind_socket(fd, &sockaddr as void*, sizeof(sockaddr_in)) < 0) {
+            const err: IoError = IoError::last_os_error();
+            close(fd);
+            return IoResult::Err(err);
+        }
+
+        // Get actual bound address
+        mut bound_addr: sockaddr_in;
+        mut addr_len: u32 = sizeof(sockaddr_in);
+        getsockname(fd, &bound_addr as void*, &addr_len);
+
+        const local_ip: Ipv4Addr = Ipv4Addr::from_u32(ntohl(bound_addr.sin_addr));
+        const local_port: u16 = ntohs(bound_addr.sin_port);
+        const local_addr: SocketAddr = SocketAddr::new_v4(local_ip, local_port);
+
+        return IoResult::Ok(UdpSocket {
+            fd: fd,
+            local_addr: local_addr
+        });
+    }
+
+    /// Returns the local socket address.
+    local_addr(&this) -> SocketAddr {
+        return this.local_addr;
+    }
+
+    /// Connects the socket to a remote address.
+    ///
+    /// After connecting, only packets from the specified address
+    /// will be received, and send() can be used instead of send_to().
+    connect(&this, addr: SocketAddr) -> IoResult<void> {
+        mut sockaddr: sockaddr_in;
+        match (addr) {
+            SocketAddr::V4(v4) => {
+                sockaddr.sin_family = AF_INET as u16;
+                sockaddr.sin_port = htons(v4.port());
+                sockaddr.sin_addr = v4.ip().to_u32();
+            }
+            SocketAddr::V6(_) => {
+                return IoResult::Err(IoError::new(IoErrorKind::Unsupported, "IPv6 not implemented"));
+            }
+        }
+
+        if (connect_socket(this.fd, &sockaddr as void*, sizeof(sockaddr_in)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Sends data on the socket to the connected address.
+    send(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = send_data(this.fd, buf as void*, len, 0);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Receives data from the connected address.
+    recv(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = recv_data(this.fd, buf as void*, len, 0);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Sends data to the specified address.
+    send_to(&this, buf: u8*, len: u64, addr: SocketAddr) -> IoResult<u64> {
+        mut sockaddr: sockaddr_in;
+        match (addr) {
+            SocketAddr::V4(v4) => {
+                sockaddr.sin_family = AF_INET as u16;
+                sockaddr.sin_port = htons(v4.port());
+                sockaddr.sin_addr = v4.ip().to_u32();
+            }
+            SocketAddr::V6(_) => {
+                return IoResult::Err(IoError::new(IoErrorKind::Unsupported, "IPv6 not implemented"));
+            }
+        }
+
+        const result: i64 = sendto(this.fd, buf as void*, len, 0, &sockaddr as void*, sizeof(sockaddr_in));
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Receives data and returns the source address.
+    recv_from(&this, buf: u8*, len: u64) -> IoResult<(u64, SocketAddr)> {
+        mut from_addr: sockaddr_in;
+        mut addr_len: u32 = sizeof(sockaddr_in);
+
+        const result: i64 = recvfrom(this.fd, buf as void*, len, 0, &from_addr as void*, &addr_len);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        const from_ip: Ipv4Addr = Ipv4Addr::from_u32(ntohl(from_addr.sin_addr));
+        const from_port: u16 = ntohs(from_addr.sin_port);
+        const source_addr: SocketAddr = SocketAddr::new_v4(from_ip, from_port);
+
+        return IoResult::Ok((result as u64, source_addr));
+    }
+
+    /// Receives data with MSG_PEEK flag.
+    peek(&this, buf: u8*, len: u64) -> IoResult<u64> {
+        const result: i64 = recv_data(this.fd, buf as void*, len, MSG_PEEK);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(result as u64);
+    }
+
+    /// Receives data with MSG_PEEK and returns the source address.
+    peek_from(&this, buf: u8*, len: u64) -> IoResult<(u64, SocketAddr)> {
+        mut from_addr: sockaddr_in;
+        mut addr_len: u32 = sizeof(sockaddr_in);
+
+        const result: i64 = recvfrom(this.fd, buf as void*, len, MSG_PEEK, &from_addr as void*, &addr_len);
+        if (result < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        const from_ip: Ipv4Addr = Ipv4Addr::from_u32(ntohl(from_addr.sin_addr));
+        const from_port: u16 = ntohs(from_addr.sin_port);
+        const source_addr: SocketAddr = SocketAddr::new_v4(from_ip, from_port);
+
+        return IoResult::Ok((result as u64, source_addr));
+    }
+
+    /// Creates a new independently owned handle.
+    try_clone(&this) -> IoResult<UdpSocket> {
+        const new_fd: i32 = dup(this.fd);
+        if (new_fd < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        return IoResult::Ok(UdpSocket {
+            fd: new_fd,
+            local_addr: this.local_addr
+        });
+    }
+
+    /// Sets the read timeout.
+    set_read_timeout(&this, timeout: Option<Duration>) -> IoResult<void> {
+        mut tv: timeval;
+        match (timeout) {
+            Option::Some(d) => {
+                tv.tv_sec = d.as_secs() as i64;
+                tv.tv_usec = (d.subsec_micros()) as i64;
+            }
+            Option::None => {
+                tv.tv_sec = 0;
+                tv.tv_usec = 0;
+            }
+        }
+
+        if (setsockopt(this.fd, SOL_SOCKET, SO_RCVTIMEO, &tv as void*, sizeof(timeval)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Sets the write timeout.
+    set_write_timeout(&this, timeout: Option<Duration>) -> IoResult<void> {
+        mut tv: timeval;
+        match (timeout) {
+            Option::Some(d) => {
+                tv.tv_sec = d.as_secs() as i64;
+                tv.tv_usec = (d.subsec_micros()) as i64;
+            }
+            Option::None => {
+                tv.tv_sec = 0;
+                tv.tv_usec = 0;
+            }
+        }
+
+        if (setsockopt(this.fd, SOL_SOCKET, SO_SNDTIMEO, &tv as void*, sizeof(timeval)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the read timeout.
+    read_timeout(&this) -> IoResult<Option<Duration>> {
+        mut tv: timeval;
+        mut len: u32 = sizeof(timeval);
+        if (getsockopt(this.fd, SOL_SOCKET, SO_RCVTIMEO, &tv as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+            return IoResult::Ok(Option::None);
+        }
+        return IoResult::Ok(Option::Some(Duration::new(tv.tv_sec as u64, (tv.tv_usec * 1000) as u32)));
+    }
+
+    /// Gets the write timeout.
+    write_timeout(&this) -> IoResult<Option<Duration>> {
+        mut tv: timeval;
+        mut len: u32 = sizeof(timeval);
+        if (getsockopt(this.fd, SOL_SOCKET, SO_SNDTIMEO, &tv as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+
+        if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+            return IoResult::Ok(Option::None);
+        }
+        return IoResult::Ok(Option::Some(Duration::new(tv.tv_sec as u64, (tv.tv_usec * 1000) as u32)));
+    }
+
+    /// Sets the broadcast flag.
+    set_broadcast(&this, broadcast: boolean) -> IoResult<void> {
+        const val: i32 = if (broadcast) { 1 } else { 0 };
+        if (setsockopt(this.fd, SOL_SOCKET, SO_BROADCAST, &val as void*, sizeof(i32)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the broadcast flag.
+    broadcast(&this) -> IoResult<boolean> {
+        mut val: i32 = 0;
+        mut len: u32 = sizeof(i32);
+        if (getsockopt(this.fd, SOL_SOCKET, SO_BROADCAST, &val as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(val != 0);
+    }
+
+    /// Sets the TTL.
+    set_ttl(&this, ttl: u32) -> IoResult<void> {
+        const val: i32 = ttl as i32;
+        if (setsockopt(this.fd, IPPROTO_IP, IP_TTL, &val as void*, sizeof(i32)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the TTL.
+    ttl(&this) -> IoResult<u32> {
+        mut val: i32 = 0;
+        mut len: u32 = sizeof(i32);
+        if (getsockopt(this.fd, IPPROTO_IP, IP_TTL, &val as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(val as u32);
+    }
+
+    /// Sets the multicast TTL.
+    set_multicast_ttl_v4(&this, ttl: u32) -> IoResult<void> {
+        const val: i32 = ttl as i32;
+        if (setsockopt(this.fd, IPPROTO_IP, IP_MULTICAST_TTL, &val as void*, sizeof(i32)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the multicast TTL.
+    multicast_ttl_v4(&this) -> IoResult<u32> {
+        mut val: i32 = 0;
+        mut len: u32 = sizeof(i32);
+        if (getsockopt(this.fd, IPPROTO_IP, IP_MULTICAST_TTL, &val as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(val as u32);
+    }
+
+    /// Sets the multicast loopback flag.
+    set_multicast_loop_v4(&this, loop: boolean) -> IoResult<void> {
+        const val: i32 = if (loop) { 1 } else { 0 };
+        if (setsockopt(this.fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val as void*, sizeof(i32)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Gets the multicast loopback flag.
+    multicast_loop_v4(&this) -> IoResult<boolean> {
+        mut val: i32 = 0;
+        mut len: u32 = sizeof(i32);
+        if (getsockopt(this.fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val as void*, &len) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(val != 0);
+    }
+
+    /// Joins a multicast group.
+    join_multicast_v4(&this, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> IoResult<void> {
+        mut mreq: ip_mreq;
+        mreq.imr_multiaddr = multiaddr.to_u32();
+        mreq.imr_interface = interface.to_u32();
+
+        if (setsockopt(this.fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq as void*, sizeof(ip_mreq)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Leaves a multicast group.
+    leave_multicast_v4(&this, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> IoResult<void> {
+        mut mreq: ip_mreq;
+        mreq.imr_multiaddr = multiaddr.to_u32();
+        mreq.imr_interface = interface.to_u32();
+
+        if (setsockopt(this.fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq as void*, sizeof(ip_mreq)) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Sets non-blocking mode.
+    set_nonblocking(&this, nonblocking: boolean) -> IoResult<void> {
+        const flags: i32 = fcntl(this.fd, F_GETFL, 0);
+        const new_flags: i32 = if (nonblocking) {
+            flags | O_NONBLOCK
+        } else {
+            flags & ~O_NONBLOCK
+        };
+        if (fcntl(this.fd, F_SETFL, new_flags) < 0) {
+            return IoResult::Err(IoError::last_os_error());
+        }
+        return IoResult::Ok(());
+    }
+
+    /// Returns the raw file descriptor.
+    as_raw_fd(&this) -> i32 {
+        return this.fd;
+    }
+
+    /// Closes the socket.
+    close(&this) -> void {
+        close(this.fd);
+    }
+}
+
+// ============================================================================
+// Types and Constants
+// ============================================================================
+
+const AF_INET: i32 = 2;
+const SOCK_DGRAM: i32 = 2;
+const SOL_SOCKET: i32 = 1;
+const IPPROTO_IP: i32 = 0;
+
+const SO_REUSEADDR: i32 = 2;
+const SO_BROADCAST: i32 = 6;
+const SO_RCVTIMEO: i32 = 20;
+const SO_SNDTIMEO: i32 = 21;
+
+const IP_TTL: i32 = 2;
+const IP_MULTICAST_TTL: i32 = 33;
+const IP_MULTICAST_LOOP: i32 = 34;
+const IP_ADD_MEMBERSHIP: i32 = 35;
+const IP_DROP_MEMBERSHIP: i32 = 36;
+
+const O_NONBLOCK: i32 = 2048;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+
+const MSG_PEEK: i32 = 2;
+
+type struct sockaddr_in {
+    sin_family: u16;
+    sin_port: u16;
+    sin_addr: u32;
+    sin_zero: u8[8];
+}
+
+type struct timeval {
+    tv_sec: i64;
+    tv_usec: i64;
+}
+
+type struct ip_mreq {
+    imr_multiaddr: u32;
+    imr_interface: u32;
+}
+
+// ============================================================================
+// Intrinsics
+// ============================================================================
+
+intrinsic function socket(domain: i32, type: i32, protocol: i32) -> i32;
+intrinsic function connect_socket(fd: i32, addr: void*, addrlen: u64) -> i32;
+intrinsic function bind_socket(fd: i32, addr: void*, addrlen: u64) -> i32;
+intrinsic function close(fd: i32) -> i32;
+intrinsic function dup(fd: i32) -> i32;
+intrinsic function recv_data(fd: i32, buf: void*, len: u64, flags: i32) -> i64;
+intrinsic function send_data(fd: i32, buf: void*, len: u64, flags: i32) -> i64;
+intrinsic function recvfrom(fd: i32, buf: void*, len: u64, flags: i32, src_addr: void*, addrlen: u32*) -> i64;
+intrinsic function sendto(fd: i32, buf: void*, len: u64, flags: i32, dest_addr: void*, addrlen: u64) -> i64;
+intrinsic function setsockopt(fd: i32, level: i32, optname: i32, optval: void*, optlen: u32) -> i32;
+intrinsic function getsockopt(fd: i32, level: i32, optname: i32, optval: void*, optlen: u32*) -> i32;
+intrinsic function getsockname(fd: i32, addr: void*, addrlen: u32*) -> i32;
+intrinsic function fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+intrinsic function htons(hostshort: u16) -> u16;
+intrinsic function ntohs(netshort: u16) -> u16;
+intrinsic function htonl(hostlong: u32) -> u32;
+intrinsic function ntohl(netlong: u32) -> u32;

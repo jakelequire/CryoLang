@@ -1,0 +1,737 @@
+///! B-Tree Collections
+///!
+///! Ordered map and set implementations based on B-trees.
+///! Provides O(log n) operations with good cache locality.
+
+namespace std::collections::btree;
+
+import core::intrinsics;
+import core::option;
+import core::mem;
+import alloc::global;
+
+// ============================================================================
+// B-Tree Configuration
+// ============================================================================
+
+/// B-tree order (maximum number of children per node).
+const BTREE_ORDER: u64 = 16;
+
+/// Minimum number of keys in a non-root node.
+const BTREE_MIN_KEYS: u64 = (BTREE_ORDER - 1) / 2;
+
+/// Maximum number of keys in a node.
+const BTREE_MAX_KEYS: u64 = BTREE_ORDER - 1;
+
+// ============================================================================
+// B-Tree Node
+// ============================================================================
+
+/// A node in the B-tree.
+type struct BTreeNode<K, V> {
+    /// Keys in this node.
+    keys: K[BTREE_MAX_KEYS];
+    /// Values in this node.
+    values: V[BTREE_MAX_KEYS];
+    /// Child pointers (null for leaf nodes).
+    children: BTreeNode<K, V>*[BTREE_ORDER];
+    /// Number of keys in this node.
+    num_keys: u64;
+    /// True if this is a leaf node.
+    is_leaf: boolean;
+
+    find_key_index(&this, key: K) -> u64;
+    is_full(&this) -> boolean;
+    has_min_keys(&this) -> boolean;
+    drop_recursive(&this) -> void;
+}
+
+implement struct BTreeNode<K, V> {
+    /// Creates a new leaf node.
+    static function new_leaf() -> BTreeNode<K, V>* {
+        const node: BTreeNode<K, V>* = calloc(1, sizeof(BTreeNode<K, V>));
+        if (node == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        node.num_keys = 0;
+        node.is_leaf = true;
+        return node;
+    }
+
+    /// Creates a new internal node.
+    static function new_internal() -> BTreeNode<K, V>* {
+        const node: BTreeNode<K, V>* = calloc(1, sizeof(BTreeNode<K, V>));
+        if (node == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        node.num_keys = 0;
+        node.is_leaf = false;
+        return node;
+    }
+
+    /// Finds the index where a key should be.
+    find_key_index(&this, key: K) -> u64 {
+        mut i: u64 = 0;
+        while (i < this.num_keys && this.keys[i] < key) {
+            i = i + 1;
+        }
+        return i;
+    }
+
+    /// Returns true if the node is full.
+    is_full(&this) -> boolean {
+        return this.num_keys == BTREE_MAX_KEYS;
+    }
+
+    /// Returns true if the node has minimum keys.
+    has_min_keys(&this) -> boolean {
+        return this.num_keys <= BTREE_MIN_KEYS;
+    }
+
+    /// Frees this node and all its children.
+    drop_recursive(&this) -> void {
+        if (!this.is_leaf) {
+            mut i: u64 = 0;
+            while (i <= this.num_keys) {
+                if (this.children[i] != null) {
+                    this.children[i].drop_recursive();
+                }
+                i = i + 1;
+            }
+        }
+        free(&this);
+    }
+}
+
+// ============================================================================
+// BTreeMap
+// ============================================================================
+
+/// An ordered map based on a B-tree.
+type struct BTreeMap<K, V> {
+    root: BTreeNode<K, V>*;
+    len: u64;
+
+    len(&this) -> u64;
+    is_empty(&this) -> boolean;
+    get(&this, key: K) -> Option<V>;
+    get_ref(&this, key: K) -> V*;
+    contains_key(&this, key: K) -> boolean;
+    first(&this) -> Option<BTreePair<K, V>>;
+    last(&this) -> Option<BTreePair<K, V>>;
+    insert(mut &this, key: K, value: V) -> Option<V>;
+    remove(mut &this, key: K) -> Option<V>;
+    clear(mut &this) -> void;
+    search_node(&this, node: BTreeNode<K, V>*, key: K) -> Option<V>;
+    search_node_ref(&this, node: BTreeNode<K, V>*, key: K) -> V*;
+    insert_non_full(mut &this, node: BTreeNode<K, V>*, key: K, value: V) -> void;
+    split_child(mut &this, parent: BTreeNode<K, V>*, child_index: u64) -> void;
+    remove_from_node(mut &this, node: BTreeNode<K, V>*, key: K) -> Option<V>;
+    remove_from_leaf(mut &this, node: BTreeNode<K, V>*, idx: u64) -> Option<V>;
+    remove_from_internal(mut &this, node: BTreeNode<K, V>*, idx: u64) -> Option<V>;
+    fill_child(mut &this, node: BTreeNode<K, V>*, idx: u64) -> void;
+    borrow_from_prev(mut &this, node: BTreeNode<K, V>*, idx: u64) -> void;
+    borrow_from_next(mut &this, node: BTreeNode<K, V>*, idx: u64) -> void;
+    merge_children(mut &this, node: BTreeNode<K, V>*, idx: u64) -> void;
+    drop(&this) -> void;
+}
+
+implement struct BTreeMap<K, V> {
+    /// Creates a new empty BTreeMap.
+    static function new() -> BTreeMap<K, V> {
+        return BTreeMap {
+            root: null,
+            len: 0
+        };
+    }
+
+    // ========================================================================
+    // Capacity
+    // ========================================================================
+
+    /// Returns the number of elements.
+    len(&this) -> u64 {
+        return this.len;
+    }
+
+    /// Returns true if the map is empty.
+    is_empty(&this) -> boolean {
+        return this.len == 0;
+    }
+
+    // ========================================================================
+    // Lookup
+    // ========================================================================
+
+    /// Gets a value by key.
+    get(&this, key: K) -> Option<V> {
+        if (this.root == null) {
+            return Option::None;
+        }
+        return this.search_node(this.root, key);
+    }
+
+    /// Gets a reference to a value by key.
+    get_ref(&this, key: K) -> V* {
+        if (this.root == null) {
+            return null;
+        }
+        return this.search_node_ref(this.root, key);
+    }
+
+    /// Returns true if the map contains the key.
+    contains_key(&this, key: K) -> boolean {
+        return this.get(key).is_some();
+    }
+
+    /// Returns the minimum key-value pair.
+    first(&this) -> Option<BTreePair<K, V>> {
+        if (this.root == null) {
+            return Option::None;
+        }
+
+        mut node: BTreeNode<K, V>* = this.root;
+        while (!node.is_leaf) {
+            node = node.children[0];
+        }
+
+        if (node.num_keys > 0) {
+            return Option::Some(BTreePair {
+                key: node.keys[0],
+                value: node.values[0]
+            });
+        }
+        return Option::None;
+    }
+
+    /// Returns the maximum key-value pair.
+    last(&this) -> Option<BTreePair<K, V>> {
+        if (this.root == null) {
+            return Option::None;
+        }
+
+        mut node: BTreeNode<K, V>* = this.root;
+        while (!node.is_leaf) {
+            node = node.children[node.num_keys];
+        }
+
+        if (node.num_keys > 0) {
+            return Option::Some(BTreePair {
+                key: node.keys[node.num_keys - 1],
+                value: node.values[node.num_keys - 1]
+            });
+        }
+        return Option::None;
+    }
+
+    // ========================================================================
+    // Modification
+    // ========================================================================
+
+    /// Inserts a key-value pair.
+    insert(mut &this, key: K, value: V) -> Option<V> {
+        if (this.root == null) {
+            this.root = BTreeNode::new_leaf();
+            this.root.keys[0] = key;
+            this.root.values[0] = value;
+            this.root.num_keys = 1;
+            this.len = 1;
+            return Option::None;
+        }
+
+        // Check if key already exists
+        const existing: V* = this.get_ref(key);
+        if (existing != null) {
+            const old: V = *existing;
+            *existing = value;
+            return Option::Some(old);
+        }
+
+        // If root is full, split it
+        if (this.root.is_full()) {
+            const new_root: BTreeNode<K, V>* = BTreeNode::new_internal();
+            new_root.children[0] = this.root;
+            this.split_child(new_root, 0);
+            this.root = new_root;
+        }
+
+        this.insert_non_full(this.root, key, value);
+        this.len = this.len + 1;
+        return Option::None;
+    }
+
+    /// Removes a key-value pair.
+    remove(mut &this, key: K) -> Option<V> {
+        if (this.root == null) {
+            return Option::None;
+        }
+
+        const result: Option<V> = this.remove_from_node(this.root, key);
+
+        // If root is empty and has a child, make that child the new root
+        if (this.root.num_keys == 0 && !this.root.is_leaf) {
+            const old_root: BTreeNode<K, V>* = this.root;
+            this.root = this.root.children[0];
+            free(old_root);
+        }
+
+        match (result) {
+            Option::Some(_) => { this.len = this.len - 1; }
+            Option::None => {}
+        }
+
+        return result;
+    }
+
+    /// Clears the map.
+    clear(mut &this) -> void {
+        if (this.root != null) {
+            this.root.drop_recursive();
+            this.root = null;
+        }
+        this.len = 0;
+    }
+
+    // ========================================================================
+    // Internal Search
+    // ========================================================================
+
+    search_node(&this, node: BTreeNode<K, V>*, key: K) -> Option<V> {
+        mut i: u64 = 0;
+        while (i < node.num_keys && key > node.keys[i]) {
+            i = i + 1;
+        }
+
+        if (i < node.num_keys && node.keys[i] == key) {
+            return Option::Some(node.values[i]);
+        }
+
+        if (node.is_leaf) {
+            return Option::None;
+        }
+
+        return this.search_node(node.children[i], key);
+    }
+
+    search_node_ref(&this, node: BTreeNode<K, V>*, key: K) -> V* {
+        mut i: u64 = 0;
+        while (i < node.num_keys && key > node.keys[i]) {
+            i = i + 1;
+        }
+
+        if (i < node.num_keys && node.keys[i] == key) {
+            return &node.values[i];
+        }
+
+        if (node.is_leaf) {
+            return null;
+        }
+
+        return this.search_node_ref(node.children[i], key);
+    }
+
+    // ========================================================================
+    // Internal Insertion
+    // ========================================================================
+
+    insert_non_full(mut &this, node: BTreeNode<K, V>*, key: K, value: V) -> void {
+        mut i: i64 = node.num_keys - 1;
+
+        if (node.is_leaf) {
+            // Shift keys and values to make room
+            while (i >= 0 && key < node.keys[i]) {
+                node.keys[i + 1] = node.keys[i];
+                node.values[i + 1] = node.values[i];
+                i = i - 1;
+            }
+            node.keys[i + 1] = key;
+            node.values[i + 1] = value;
+            node.num_keys = node.num_keys + 1;
+        } else {
+            // Find child to descend into
+            while (i >= 0 && key < node.keys[i]) {
+                i = i - 1;
+            }
+            i = i + 1;
+
+            if (node.children[i].is_full()) {
+                this.split_child(node, i);
+                if (key > node.keys[i]) {
+                    i = i + 1;
+                }
+            }
+            this.insert_non_full(node.children[i], key, value);
+        }
+    }
+
+    split_child(mut &this, parent: BTreeNode<K, V>*, child_index: u64) -> void {
+        const full_child: BTreeNode<K, V>* = parent.children[child_index];
+        const mid: u64 = BTREE_MAX_KEYS / 2;
+
+        // Create new node with half the keys
+        mut new_node: BTreeNode<K, V>*;
+        if (full_child.is_leaf) {
+            new_node = BTreeNode::new_leaf();
+        } else {
+            new_node = BTreeNode::new_internal();
+        }
+
+        // Copy second half of keys and values
+        mut j: u64 = 0;
+        while (j < mid) {
+            new_node.keys[j] = full_child.keys[mid + 1 + j];
+            new_node.values[j] = full_child.values[mid + 1 + j];
+            j = j + 1;
+        }
+        new_node.num_keys = mid;
+
+        // Copy children if not a leaf
+        if (!full_child.is_leaf) {
+            j = 0;
+            while (j <= mid) {
+                new_node.children[j] = full_child.children[mid + 1 + j];
+                j = j + 1;
+            }
+        }
+
+        full_child.num_keys = mid;
+
+        // Shift parent's children to make room
+        mut i: i64 = parent.num_keys;
+        while (i > child_index) {
+            parent.children[i + 1] = parent.children[i];
+            i = i - 1;
+        }
+        parent.children[child_index + 1] = new_node;
+
+        // Shift parent's keys to make room and insert median
+        i = parent.num_keys - 1;
+        while (i >= child_index) {
+            parent.keys[i + 1] = parent.keys[i];
+            parent.values[i + 1] = parent.values[i];
+            i = i - 1;
+        }
+        parent.keys[child_index] = full_child.keys[mid];
+        parent.values[child_index] = full_child.values[mid];
+        parent.num_keys = parent.num_keys + 1;
+    }
+
+    // ========================================================================
+    // Internal Deletion
+    // ========================================================================
+
+    remove_from_node(mut &this, node: BTreeNode<K, V>*, key: K) -> Option<V> {
+        const idx: u64 = node.find_key_index(key);
+
+        // Key found in this node
+        if (idx < node.num_keys && node.keys[idx] == key) {
+            if (node.is_leaf) {
+                return this.remove_from_leaf(node, idx);
+            } else {
+                return this.remove_from_internal(node, idx);
+            }
+        }
+
+        // Key not in tree
+        if (node.is_leaf) {
+            return Option::None;
+        }
+
+        // Ensure child has enough keys
+        const child: BTreeNode<K, V>* = node.children[idx];
+        if (child.num_keys <= BTREE_MIN_KEYS) {
+            this.fill_child(node, idx);
+        }
+
+        // Recalculate idx after potential merge
+        mut new_idx: u64 = idx;
+        if (idx > node.num_keys) {
+            new_idx = node.num_keys;
+        }
+
+        return this.remove_from_node(node.children[new_idx], key);
+    }
+
+    remove_from_leaf(mut &this, node: BTreeNode<K, V>*, idx: u64) -> Option<V> {
+        const value: V = node.values[idx];
+
+        // Shift keys and values left
+        mut i: u64 = idx;
+        while (i < node.num_keys - 1) {
+            node.keys[i] = node.keys[i + 1];
+            node.values[i] = node.values[i + 1];
+            i = i + 1;
+        }
+        node.num_keys = node.num_keys - 1;
+
+        return Option::Some(value);
+    }
+
+    remove_from_internal(mut &this, node: BTreeNode<K, V>*, idx: u64) -> Option<V> {
+        const key: K = node.keys[idx];
+        const value: V = node.values[idx];
+
+        const left_child: BTreeNode<K, V>* = node.children[idx];
+        const right_child: BTreeNode<K, V>* = node.children[idx + 1];
+
+        if (left_child.num_keys > BTREE_MIN_KEYS) {
+            // Replace with predecessor
+            mut pred: BTreeNode<K, V>* = left_child;
+            while (!pred.is_leaf) {
+                pred = pred.children[pred.num_keys];
+            }
+            const pred_key: K = pred.keys[pred.num_keys - 1];
+            const pred_value: V = pred.values[pred.num_keys - 1];
+
+            node.keys[idx] = pred_key;
+            node.values[idx] = pred_value;
+
+            this.remove_from_node(left_child, pred_key);
+        } else if (right_child.num_keys > BTREE_MIN_KEYS) {
+            // Replace with successor
+            mut succ: BTreeNode<K, V>* = right_child;
+            while (!succ.is_leaf) {
+                succ = succ.children[0];
+            }
+            const succ_key: K = succ.keys[0];
+            const succ_value: V = succ.values[0];
+
+            node.keys[idx] = succ_key;
+            node.values[idx] = succ_value;
+
+            this.remove_from_node(right_child, succ_key);
+        } else {
+            // Merge children
+            this.merge_children(node, idx);
+            this.remove_from_node(left_child, key);
+        }
+
+        return Option::Some(value);
+    }
+
+    fill_child(mut &this, node: BTreeNode<K, V>*, idx: u64) -> void {
+        // Try borrowing from left sibling
+        if (idx > 0 && node.children[idx - 1].num_keys > BTREE_MIN_KEYS) {
+            this.borrow_from_prev(node, idx);
+        }
+        // Try borrowing from right sibling
+        else if (idx < node.num_keys && node.children[idx + 1].num_keys > BTREE_MIN_KEYS) {
+            this.borrow_from_next(node, idx);
+        }
+        // Merge with a sibling
+        else {
+            if (idx < node.num_keys) {
+                this.merge_children(node, idx);
+            } else {
+                this.merge_children(node, idx - 1);
+            }
+        }
+    }
+
+    borrow_from_prev(mut &this, node: BTreeNode<K, V>*, idx: u64) -> void {
+        const child: BTreeNode<K, V>* = node.children[idx];
+        const sibling: BTreeNode<K, V>* = node.children[idx - 1];
+
+        // Shift child's keys right
+        mut i: i64 = child.num_keys - 1;
+        while (i >= 0) {
+            child.keys[i + 1] = child.keys[i];
+            child.values[i + 1] = child.values[i];
+            i = i - 1;
+        }
+
+        if (!child.is_leaf) {
+            i = child.num_keys;
+            while (i >= 0) {
+                child.children[i + 1] = child.children[i];
+                i = i - 1;
+            }
+            child.children[0] = sibling.children[sibling.num_keys];
+        }
+
+        child.keys[0] = node.keys[idx - 1];
+        child.values[0] = node.values[idx - 1];
+
+        node.keys[idx - 1] = sibling.keys[sibling.num_keys - 1];
+        node.values[idx - 1] = sibling.values[sibling.num_keys - 1];
+
+        child.num_keys = child.num_keys + 1;
+        sibling.num_keys = sibling.num_keys - 1;
+    }
+
+    borrow_from_next(mut &this, node: BTreeNode<K, V>*, idx: u64) -> void {
+        const child: BTreeNode<K, V>* = node.children[idx];
+        const sibling: BTreeNode<K, V>* = node.children[idx + 1];
+
+        child.keys[child.num_keys] = node.keys[idx];
+        child.values[child.num_keys] = node.values[idx];
+
+        if (!child.is_leaf) {
+            child.children[child.num_keys + 1] = sibling.children[0];
+        }
+
+        node.keys[idx] = sibling.keys[0];
+        node.values[idx] = sibling.values[0];
+
+        // Shift sibling's keys left
+        mut i: u64 = 0;
+        while (i < sibling.num_keys - 1) {
+            sibling.keys[i] = sibling.keys[i + 1];
+            sibling.values[i] = sibling.values[i + 1];
+            i = i + 1;
+        }
+
+        if (!sibling.is_leaf) {
+            i = 0;
+            while (i < sibling.num_keys) {
+                sibling.children[i] = sibling.children[i + 1];
+                i = i + 1;
+            }
+        }
+
+        child.num_keys = child.num_keys + 1;
+        sibling.num_keys = sibling.num_keys - 1;
+    }
+
+    merge_children(mut &this, node: BTreeNode<K, V>*, idx: u64) -> void {
+        const left: BTreeNode<K, V>* = node.children[idx];
+        const right: BTreeNode<K, V>* = node.children[idx + 1];
+
+        // Add separator key from parent
+        left.keys[left.num_keys] = node.keys[idx];
+        left.values[left.num_keys] = node.values[idx];
+        left.num_keys = left.num_keys + 1;
+
+        // Copy keys from right to left
+        mut i: u64 = 0;
+        while (i < right.num_keys) {
+            left.keys[left.num_keys + i] = right.keys[i];
+            left.values[left.num_keys + i] = right.values[i];
+            i = i + 1;
+        }
+
+        // Copy children if not leaf
+        if (!left.is_leaf) {
+            i = 0;
+            while (i <= right.num_keys) {
+                left.children[left.num_keys + i] = right.children[i];
+                i = i + 1;
+            }
+        }
+
+        left.num_keys = left.num_keys + right.num_keys;
+
+        // Shift parent's keys and children left
+        i = idx;
+        while (i < node.num_keys - 1) {
+            node.keys[i] = node.keys[i + 1];
+            node.values[i] = node.values[i + 1];
+            node.children[i + 1] = node.children[i + 2];
+            i = i + 1;
+        }
+        node.num_keys = node.num_keys - 1;
+
+        free(right);
+    }
+
+    // ========================================================================
+    // Memory Management
+    // ========================================================================
+
+    drop(&this) -> void {
+        if (this.root != null) {
+            this.root.drop_recursive();
+        }
+    }
+}
+
+// ============================================================================
+// Supporting Types
+// ============================================================================
+
+type struct BTreePair<K, V> {
+    key: K;
+    value: V;
+}
+
+// ============================================================================
+// BTreeSet
+// ============================================================================
+
+/// An ordered set based on a B-tree.
+type struct BTreeSet<T> {
+    map: BTreeMap<T, u8>;
+
+    len(&this) -> u64;
+    is_empty(&this) -> boolean;
+    contains(&this, value: T) -> boolean;
+    insert(mut &this, value: T) -> boolean;
+    remove(mut &this, value: T) -> boolean;
+    first(&this) -> Option<T>;
+    last(&this) -> Option<T>;
+    clear(mut &this) -> void;
+    drop(&this) -> void;
+}
+
+implement struct BTreeSet<T> {
+    static function new() -> BTreeSet<T> {
+        return BTreeSet { map: BTreeMap::new() };
+    }
+
+    len(&this) -> u64 {
+        return this.map.len();
+    }
+
+    is_empty(&this) -> boolean {
+        return this.map.is_empty();
+    }
+
+    contains(&this, value: T) -> boolean {
+        return this.map.contains_key(value);
+    }
+
+    insert(mut &this, value: T) -> boolean {
+        const result: Option<u8> = this.map.insert(value, 0);
+        return result.is_none();
+    }
+
+    remove(mut &this, value: T) -> boolean {
+        return this.map.remove(value).is_some();
+    }
+
+    first(&this) -> Option<T> {
+        const pair: Option<BTreePair<T, u8>> = this.map.first();
+        match (pair) {
+            Option::None => { return Option::None; }
+            Option::Some(p) => { return Option::Some(p.key); }
+        }
+    }
+
+    last(&this) -> Option<T> {
+        const pair: Option<BTreePair<T, u8>> = this.map.last();
+        match (pair) {
+            Option::None => { return Option::None; }
+            Option::Some(p) => { return Option::Some(p.key); }
+        }
+    }
+
+    clear(mut &this) -> void {
+        this.map.clear();
+    }
+
+    drop(&this) -> void {
+        this.map.drop();
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+function btree_map<K, V>() -> BTreeMap<K, V> {
+    return BTreeMap::new();
+}
+
+function btree_set<T>() -> BTreeSet<T> {
+    return BTreeSet::new();
+}

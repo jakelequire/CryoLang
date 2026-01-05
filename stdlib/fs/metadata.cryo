@@ -1,0 +1,333 @@
+///! File Metadata
+///!
+///! Types for representing file metadata.
+
+namespace std::fs::metadata;
+
+import core::intrinsics;
+import core::option;
+import alloc::global;
+import io::error;
+
+// ============================================================================
+// File Type
+// ============================================================================
+
+/// The type of a file.
+enum FileType {
+    /// Regular file.
+    File;
+    /// Directory.
+    Directory;
+    /// Symbolic link.
+    Symlink;
+    /// Block device.
+    BlockDevice;
+    /// Character device.
+    CharDevice;
+    /// FIFO/pipe.
+    Fifo;
+    /// Socket.
+    Socket;
+    /// Unknown type.
+    Unknown;
+}
+
+implement enum FileType {
+    /// Returns true if this is a file.
+    is_file(&this) -> boolean {
+        return this == FileType::File;
+    }
+
+    /// Returns true if this is a directory.
+    is_dir(&this) -> boolean {
+        return this == FileType::Directory;
+    }
+
+    /// Returns true if this is a symlink.
+    is_symlink(&this) -> boolean {
+        return this == FileType::Symlink;
+    }
+
+    /// Creates from a mode value.
+    static function from_mode(mode: u32) -> FileType {
+        const file_type: u32 = mode & S_IFMT;
+        match (file_type) {
+            S_IFREG => { return FileType::File; }
+            S_IFDIR => { return FileType::Directory; }
+            S_IFLNK => { return FileType::Symlink; }
+            S_IFBLK => { return FileType::BlockDevice; }
+            S_IFCHR => { return FileType::CharDevice; }
+            S_IFIFO => { return FileType::Fifo; }
+            S_IFSOCK => { return FileType::Socket; }
+            _ => { return FileType::Unknown; }
+        }
+    }
+}
+
+// Mode constants
+const S_IFMT: u32 = 0o170000;
+const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFLNK: u32 = 0o120000;
+const S_IFBLK: u32 = 0o060000;
+const S_IFCHR: u32 = 0o020000;
+const S_IFIFO: u32 = 0o010000;
+const S_IFSOCK: u32 = 0o140000;
+
+// ============================================================================
+// Permissions
+// ============================================================================
+
+/// File permissions.
+type struct Permissions {
+    mode: u32;
+}
+
+implement struct Permissions {
+    /// Creates permissions from a mode value.
+    static function from_mode(mode: u32) -> Permissions {
+        return Permissions { mode: mode & 0o777 };
+    }
+
+    /// Returns the raw mode bits.
+    mode(&this) -> u32 {
+        return this.mode;
+    }
+
+    /// Returns true if the file is readonly.
+    readonly(&this) -> boolean {
+        // Check if no write bits are set
+        return (this.mode & 0o222) == 0;
+    }
+
+    /// Sets the readonly flag.
+    set_readonly(mut &this, readonly: boolean) -> void {
+        if (readonly) {
+            this.mode = this.mode & ~0o222;
+        } else {
+            this.mode = this.mode | 0o200;
+        }
+    }
+
+    /// Returns true if owner can read.
+    owner_read(&this) -> boolean {
+        return (this.mode & 0o400) != 0;
+    }
+
+    /// Returns true if owner can write.
+    owner_write(&this) -> boolean {
+        return (this.mode & 0o200) != 0;
+    }
+
+    /// Returns true if owner can execute.
+    owner_execute(&this) -> boolean {
+        return (this.mode & 0o100) != 0;
+    }
+
+    /// Returns true if group can read.
+    group_read(&this) -> boolean {
+        return (this.mode & 0o040) != 0;
+    }
+
+    /// Returns true if group can write.
+    group_write(&this) -> boolean {
+        return (this.mode & 0o020) != 0;
+    }
+
+    /// Returns true if group can execute.
+    group_execute(&this) -> boolean {
+        return (this.mode & 0o010) != 0;
+    }
+
+    /// Returns true if others can read.
+    other_read(&this) -> boolean {
+        return (this.mode & 0o004) != 0;
+    }
+
+    /// Returns true if others can write.
+    other_write(&this) -> boolean {
+        return (this.mode & 0o002) != 0;
+    }
+
+    /// Returns true if others can execute.
+    other_execute(&this) -> boolean {
+        return (this.mode & 0o001) != 0;
+    }
+}
+
+// ============================================================================
+// File Time
+// ============================================================================
+
+/// A timestamp associated with a file.
+type struct FileTime {
+    seconds: i64;
+    nanoseconds: i64;
+}
+
+implement struct FileTime {
+    /// Creates a new FileTime.
+    static function new(seconds: i64, nanoseconds: i64) -> FileTime {
+        return FileTime {
+            seconds: seconds,
+            nanoseconds: nanoseconds
+        };
+    }
+
+    /// Returns the seconds component.
+    seconds(&this) -> i64 {
+        return this.seconds;
+    }
+
+    /// Returns the nanoseconds component.
+    nanoseconds(&this) -> i64 {
+        return this.nanoseconds;
+    }
+
+    /// Returns the total time as nanoseconds since epoch.
+    as_nanos(&this) -> i64 {
+        return this.seconds * 1000000000 + this.nanoseconds;
+    }
+
+    /// Returns the total time as seconds since epoch.
+    as_secs(&this) -> i64 {
+        return this.seconds;
+    }
+}
+
+// ============================================================================
+// Metadata
+// ============================================================================
+
+/// Metadata about a file.
+type struct Metadata {
+    /// File type and mode.
+    mode: u32;
+    /// File size in bytes.
+    size: u64;
+    /// Number of hard links.
+    nlink: u64;
+    /// User ID of owner.
+    uid: u32;
+    /// Group ID of owner.
+    gid: u32;
+    /// Device ID (if special file).
+    rdev: u64;
+    /// Block size for I/O.
+    blksize: u64;
+    /// Number of 512B blocks allocated.
+    blocks: u64;
+    /// Last access time.
+    atime: FileTime;
+    /// Last modification time.
+    mtime: FileTime;
+    /// Last status change time.
+    ctime: FileTime;
+}
+
+implement struct Metadata {
+    /// Creates empty metadata.
+    static function new() -> Metadata {
+        return Metadata {
+            mode: 0,
+            size: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 0,
+            blocks: 0,
+            atime: FileTime::new(0, 0),
+            mtime: FileTime::new(0, 0),
+            ctime: FileTime::new(0, 0)
+        };
+    }
+
+    /// Returns the file type.
+    file_type(&this) -> FileType {
+        return FileType::from_mode(this.mode);
+    }
+
+    /// Returns true if this is a file.
+    is_file(&this) -> boolean {
+        return this.file_type().is_file();
+    }
+
+    /// Returns true if this is a directory.
+    is_dir(&this) -> boolean {
+        return this.file_type().is_dir();
+    }
+
+    /// Returns true if this is a symlink.
+    is_symlink(&this) -> boolean {
+        return this.file_type().is_symlink();
+    }
+
+    /// Returns the file size.
+    len(&this) -> u64 {
+        return this.size;
+    }
+
+    /// Returns the permissions.
+    permissions(&this) -> Permissions {
+        return Permissions::from_mode(this.mode);
+    }
+
+    /// Returns the last modification time.
+    modified(&this) -> FileTime {
+        return this.mtime;
+    }
+
+    /// Returns the last access time.
+    accessed(&this) -> FileTime {
+        return this.atime;
+    }
+
+    /// Returns the creation/status change time.
+    created(&this) -> FileTime {
+        return this.ctime;
+    }
+}
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+/// Gets metadata for a path.
+function metadata(path: string) -> IoResult<Metadata> {
+    const meta: Metadata = Metadata::new();
+    const result: i32 = stat_syscall(path, &meta);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(meta);
+}
+
+/// Gets metadata for a symlink (doesn't follow links).
+function symlink_metadata(path: string) -> IoResult<Metadata> {
+    const meta: Metadata = Metadata::new();
+    const result: i32 = lstat_syscall(path, &meta);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(meta);
+}
+
+/// Sets permissions for a file.
+function set_permissions(path: string, perm: Permissions) -> IoResult<void> {
+    const result: i32 = chmod_syscall(path, perm.mode);
+    if (result < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-result));
+    }
+    return IoResult::Ok(void);
+}
+
+// ============================================================================
+// Syscall Wrappers
+// ============================================================================
+
+intrinsic function stat_syscall(path: string, buf: Metadata*) -> i32;
+intrinsic function lstat_syscall(path: string, buf: Metadata*) -> i32;
+intrinsic function fstat_syscall(fd: i32, buf: Metadata*) -> i32;
+intrinsic function chmod_syscall(path: string, mode: u32) -> i32;

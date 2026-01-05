@@ -561,16 +561,8 @@ namespace Cryo
         if (_use_colors)
             _output << Colors::VALUE;
 
-        // Show import type
-        _output << "'";
-        if (node.import_type() == ImportDeclarationNode::ImportType::Relative)
-        {
-            _output << "\"" << node.path() << "\"";
-        }
-        else if (node.import_type() == ImportDeclarationNode::ImportType::Absolute)
-        {
-            _output << "<" << node.path() << ">";
-        }
+        // Show module path in new syntax
+        _output << "'" << node.module_path();
 
         if (node.has_alias())
         {
@@ -578,6 +570,35 @@ namespace Cryo
         }
 
         _output << "'";
+
+        if (_use_colors)
+            _output << Colors::RESET;
+
+        _output << std::endl;
+    }
+
+    void ASTDumper::visit(ModuleDeclarationNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "ModuleDecl";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " ";
+
+        if (_use_colors)
+            _output << Colors::VALUE;
+
+        if (node.is_public())
+        {
+            _output << "'public ";
+        }
+        else
+        {
+            _output << "'";
+        }
+
+        _output << "module " << node.module_path() << "'";
 
         if (_use_colors)
             _output << Colors::RESET;

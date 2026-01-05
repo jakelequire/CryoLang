@@ -2684,13 +2684,13 @@ namespace Cryo
     void TypeChecker::visit(ImportDeclarationNode &node)
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "Processing import: {} (type: {})",
-                  node.path(), node.has_alias() ? "with alias" : "standard");
+                  node.module_path(), node.has_alias() ? "with alias" : "standard");
 
         if (node.has_alias())
         {
-            // Traditional import with alias: import <path> as alias;
+            // Import with alias: import core::option as Option;
             std::string alias_name = node.alias();
-            std::string full_path = node.path();
+            std::string full_path = node.module_path();
 
             LOG_DEBUG(Cryo::LogComponent::AST, "Import with alias: {} as {}", full_path, alias_name);
 
@@ -2703,9 +2703,9 @@ namespace Cryo
         }
         else if (node.is_specific_import())
         {
-            // Specific import: import IO from <path>; or import IO, Function from <path>;
+            // Specific import: import IO from core::stdio; or import IO, Function from core::stdlib;
             auto specific_imports = node.specific_imports();
-            std::string module_path = node.path();
+            std::string module_path = node.module_path();
 
             LOG_DEBUG(Cryo::LogComponent::AST, "Specific imports from {}", module_path);
 
@@ -2727,8 +2727,8 @@ namespace Cryo
         }
         else
         {
-            // Wildcard import: import <path>;
-            std::string module_path = node.path();
+            // Wildcard import: import core::option;
+            std::string module_path = node.module_path();
             LOG_DEBUG(Cryo::LogComponent::AST, "Wildcard import from {}", module_path);
 
             // Add the namespace to imported namespaces for wildcard resolution
@@ -2738,6 +2738,15 @@ namespace Cryo
                 _srm_context->add_imported_namespace(namespace_path);
             }
         }
+    }
+
+    void TypeChecker::visit(ModuleDeclarationNode &node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing module declaration: {} (public: {})", 
+                  node.module_path(), node.is_public() ? "yes" : "no");
+        
+        // Module declarations are processed during module loading, 
+        // so we just log them here for type checking purposes
     }
 
     //===----------------------------------------------------------------------===//

@@ -95,6 +95,21 @@ namespace Cryo
         void set_auto_import_callback(std::function<void(SymbolTable *, const std::string &, const std::string &)> callback);
 
         /**
+         * @brief Resolve module file path, checking for _module.cryo files
+         * @param module_path The module path to resolve
+         * @param import_type Type of import (relative or absolute)
+         * @return Resolved file path
+         */
+        std::string resolve_module_file_path(const std::string &module_path, ImportDeclarationNode::ImportType import_type);
+
+        /**
+         * @brief Check if a path represents a module directory (contains _module.cryo)
+         * @param path The path to check
+         * @return True if the path is a module directory
+         */
+        bool is_module_directory(const std::string &path);
+
+        /**
          * @brief Load and process an import declaration
          * @param import_node The import declaration node from the AST
          * @return ImportResult containing success status and any symbols to add
@@ -103,11 +118,10 @@ namespace Cryo
 
         /**
          * @brief Resolve import path to absolute filesystem path
-         * @param import_path The import path from the declaration
-         * @param import_type Whether it's relative or absolute (stdlib)
+         * @param import_path The module path from the declaration (e.g., \"core::option\")
          * @return Resolved absolute filesystem path
          */
-        std::string resolve_import_path(const std::string &import_path, ImportDeclarationNode::ImportType import_type);
+        std::string resolve_import_path(const std::string &import_path);
 
         /**
          * @brief Clear the module cache (useful for testing)

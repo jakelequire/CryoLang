@@ -86,15 +86,20 @@ namespace Cryo
             auto &os = Cryo::Utils::OS::instance();
             std::string cwd = os.get_working_directory();
 
-            // Common development and project patterns:
-            search_paths.push_back(os.join_path(cwd, "stdlib"));       // ./stdlib
-            search_paths.push_back(os.join_path(cwd, "../stdlib"));    // ../stdlib (for project dirs)
-            search_paths.push_back(os.join_path(cwd, "../../stdlib")); // ../../stdlib (for nested dirs)
+            // Common development and project patterns - try new_stdlib first, then stdlib:
+            search_paths.push_back(os.join_path(cwd, "new_stdlib"));    // ./new_stdlib (new structure)
+            search_paths.push_back(os.join_path(cwd, "stdlib"));        // ./stdlib (legacy)
+            search_paths.push_back(os.join_path(cwd, "../new_stdlib")); // ../new_stdlib (for project dirs)
+            search_paths.push_back(os.join_path(cwd, "../stdlib"));     // ../stdlib (legacy)
+            search_paths.push_back(os.join_path(cwd, "../../new_stdlib")); // ../../new_stdlib (for nested dirs)
+            search_paths.push_back(os.join_path(cwd, "../../stdlib")); // ../../stdlib (legacy)
         }
         catch (const std::exception &)
         {
             // If current_path fails, add basic fallbacks
+            search_paths.push_back("./new_stdlib");
             search_paths.push_back("./stdlib");
+            search_paths.push_back("../new_stdlib");
             search_paths.push_back("../stdlib");
         }
 
@@ -131,13 +136,23 @@ namespace Cryo
             {
                 std::filesystem::path stdlib_path = std::filesystem::absolute(path);
 
-                // Check if this looks like a valid stdlib directory
-                // by looking for key files that should exist
+                // Check for new stdlib structure first (prelude.cryo + core/_module.cryo)
+                std::filesystem::path prelude_file = stdlib_path / "prelude.cryo";
+                std::filesystem::path core_module = stdlib_path / "core" / "_module.cryo";
+                
+                if (std::filesystem::exists(prelude_file) && std::filesystem::exists(core_module))
+                {
+                    LOG_DEBUG(LogComponent::GENERAL, "Found new stdlib structure at: {}", stdlib_path.string());
+                    return stdlib_path.string();
+                }
+                
+                // Fallback to old stdlib structure (core/types.cryo + io/stdio.cryo)
                 std::filesystem::path core_types = stdlib_path / "core" / "types.cryo";
                 std::filesystem::path io_stdio = stdlib_path / "io" / "stdio.cryo";
 
                 if (std::filesystem::exists(core_types) && std::filesystem::exists(io_stdio))
                 {
+                    LOG_DEBUG(LogComponent::GENERAL, "Found legacy stdlib structure at: {}", stdlib_path.string());
                     return stdlib_path.string();
                 }
             }
@@ -160,7 +175,7 @@ namespace Cryo
     ModuleLoader::ImportResult ModuleLoader::load_import(const ImportDeclarationNode &import_node)
     {
         std::string import_path = import_node.path();
-        std::string resolved_path = resolve_import_path(import_path, import_node.import_type());
+        std::string resolved_path = resolve_import_path(import_path);
 
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Loading import '{}' -> '{}'", import_path, resolved_path);
 
@@ -259,23 +274,51 @@ namespace Cryo
         return result;
     }
 
-    std::string ModuleLoader::resolve_import_path(const std::string &import_path, ImportDeclarationNode::ImportType import_type)
+    std::string ModuleLoader::resolve_import_path(const std::string &import_path)
+    {
+        // Convert module path (core::option) to file path (core/option)
+        std::string file_path = import_path;
+        // Replace :: with /
+        size_t pos = 0;
+        while ((pos = file_path.find("::", pos)) != std::string::npos)
+        {
+            file_path.replace(pos, 2, "/");
+            pos += 1; // Move past the inserted '/'
+        }
+
+        auto &os = Cryo::Utils::OS::instance();
+        std::string resolved = os.join_path(_stdlib_root, file_path);
+        return resolve_module_file_path(resolved);
+    }
+
+    std::string ModuleLoader::resolve_module_file_path(const std::string &module_path)
     {
         auto &os = Cryo::Utils::OS::instance();
+        std::string abs_path = os.absolute_path(module_path);
+        
+        // First, check if the path points to a direct .cryo file
+        std::string direct_file = abs_path + ".cryo";
+        if (std::filesystem::exists(direct_file))
+        {
+            return direct_file;
+        }
+        
+        // Next, check if it's a module directory with _module.cryo
+        std::string module_file = os.join_path(abs_path, "_module.cryo");
+        if (std::filesystem::exists(module_file))
+        {
+            return module_file;
+        }
+        
+        // For backwards compatibility, try the old direct .cryo approach
+        return direct_file;
+    }
 
-        if (import_type == ImportDeclarationNode::ImportType::Relative)
-        {
-            // Relative import: resolve relative to current file's directory
-            std::string resolved = os.join_path(_current_file_dir, import_path);
-            return os.absolute_path(resolved);
-        }
-        else // Absolute (stdlib)
-        {
-            // Absolute import: resolve relative to stdlib root with .cryo extension
-            std::string import_file = import_path + ".cryo";
-            std::string resolved = os.join_path(_stdlib_root, import_file);
-            return os.absolute_path(resolved);
-        }
+    bool ModuleLoader::is_module_directory(const std::string &path)
+    {
+        auto &os = Cryo::Utils::OS::instance();
+        std::string module_file = os.join_path(path, "_module.cryo");
+        return std::filesystem::exists(module_file);
     }
 
     void ModuleLoader::clear_cache()
