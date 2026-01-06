@@ -16,6 +16,9 @@ namespace Cryo
             return SourceSpan(SourceLocation(1, 1), SourceLocation(1, 1), _source_file, true);
         }
 
+        // Use the node's source file if available, otherwise fall back to builder's source file
+        const std::string &source_file = node->source_file().empty() ? _source_file : node->source_file();
+
         SourceLocation start = node->location();
         // Try to estimate a reasonable end location based on node type
         size_t estimated_width = 1;
@@ -38,7 +41,7 @@ namespace Cryo
         }
 
         SourceLocation end(start.line(), start.column() + estimated_width);
-        return SourceSpan(start, end, _source_file, true);
+        return SourceSpan(start, end, source_file, true);
     }
 
     SourceSpan BaseDiagnosticBuilder::create_token_span(const Token &token) const
