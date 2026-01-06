@@ -345,9 +345,14 @@ namespace Cryo::SRM {
         // For imports like "import Types from <net/types>", "Types" should resolve to "std::net::Types"
         for (const auto& imported_ns : imported_namespaces_) {
             // Extract the last part of the imported namespace
-            size_t last_colon = imported_ns.find_last_of("::");
-            std::string ns_suffix = (last_colon != std::string::npos) ? 
-                imported_ns.substr(last_colon + 2) : imported_ns;
+            // Use rfind to find the actual "::" substring, not find_last_of which finds any ':' character
+            size_t last_colon = imported_ns.rfind("::");
+            std::string ns_suffix;
+            if (last_colon != std::string::npos && last_colon + 2 <= imported_ns.length()) {
+                ns_suffix = imported_ns.substr(last_colon + 2);
+            } else {
+                ns_suffix = imported_ns;
+            }
             
             if (ns_suffix == alias) {
                 return imported_ns;
