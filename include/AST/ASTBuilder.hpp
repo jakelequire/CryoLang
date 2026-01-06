@@ -10,9 +10,14 @@ namespace Cryo
     {
     private:
         ASTContext &_context;
+        std::string _source_file;  // Current source file for tagging nodes
 
     public:
         ASTBuilder(ASTContext &ctx) : _context(ctx) {}
+
+        // Set the current source file - nodes created after this will have this file
+        void set_source_file(const std::string &file) { _source_file = file; }
+        const std::string &source_file() const { return _source_file; }
 
         // Factory methods for creating various AST nodes
         std::unique_ptr<BinaryExpressionNode> create_binary_expression(Token op, std::unique_ptr<ExpressionNode> lhs, std::unique_ptr<ExpressionNode> rhs);
