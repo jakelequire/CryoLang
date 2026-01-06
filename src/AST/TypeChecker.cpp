@@ -3255,6 +3255,23 @@ namespace Cryo
                             is_null_comparison = true;
                         }
 
+                        // Allow null comparisons with parameterized/generic types (e.g., ListNode<T> == null)
+                        // These types are typically heap-allocated and can be null
+                        if (!is_null_comparison)
+                        {
+                            if ((left_type->kind() == TypeKind::Null && right_type->kind() == TypeKind::Parameterized) ||
+                                (right_type->kind() == TypeKind::Null && left_type->kind() == TypeKind::Parameterized))
+                            {
+                                is_null_comparison = true;
+                            }
+                            // Also check for generic struct types (types containing <T> or similar)
+                            if ((left_str == "null" && right_str.find("<") != std::string::npos) ||
+                                (right_str == "null" && left_str.find("<") != std::string::npos))
+                            {
+                                is_null_comparison = true;
+                            }
+                        }
+
                         // Special handling for mixed integer type comparisons
                         bool is_mixed_integer_comparison = false;
                         if (left_type->is_integral() && right_type->is_integral())
@@ -7927,6 +7944,35 @@ namespace Cryo
                         return true;
                     }
                 }
+            }
+        }
+
+        // SPECIAL CASE: Generic type compatibility
+        // Handle cases like ArraySplit<T> vs ArraySplit, ListNode<T> vs ListNode*, etc.
+        // where the base type name is the same but one has generic params and one doesn't
+        {
+            auto extract_base_name = [](const std::string &type_str) -> std::string {
+                // Remove pointer suffix
+                std::string result = type_str;
+                while (!result.empty() && result.back() == '*') {
+                    result.pop_back();
+                }
+                // Remove generic parameters
+                size_t angle_pos = result.find('<');
+                if (angle_pos != std::string::npos) {
+                    result = result.substr(0, angle_pos);
+                }
+                return result;
+            };
+
+            std::string lhs_base = extract_base_name(lhs_str);
+            std::string rhs_base = extract_base_name(rhs_str);
+
+            if (!lhs_base.empty() && lhs_base == rhs_base)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing generic type compatibility: {} = {} (same base name '{}')",
+                          lhs_str, rhs_str, lhs_base);
+                return true;
             }
         }
 
