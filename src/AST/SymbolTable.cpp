@@ -207,7 +207,8 @@ namespace Cryo
                     if (imported_namespace.substr(suffix_pos) == namespace_part)
                     {
                         // Check that it's preceded by "::" or is at the start
-                        if (suffix_pos == 0 || imported_namespace.substr(suffix_pos - 2, 2) == "::")
+                        // Guard against underflow: suffix_pos must be >= 2 to check for "::" prefix
+                        if (suffix_pos == 0 || (suffix_pos >= 2 && imported_namespace.substr(suffix_pos - 2, 2) == "::"))
                         {
                             result = lookup_namespaced_symbol(imported_namespace, symbol_part);
                             if (result)
