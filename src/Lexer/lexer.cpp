@@ -80,7 +80,6 @@ namespace Cryo
         {"struct", TokenKind::TK_KW_STRUCT},
         {"union", TokenKind::TK_KW_UNION},
         {"enum", TokenKind::TK_KW_ENUM},
-        {"interface", TokenKind::TK_KW_INTERFACE},
         {"trait", TokenKind::TK_KW_TRAIT},
         {"type", TokenKind::TK_KW_TYPE},
         {"namespace", TokenKind::TK_KW_NAMESPACE},
@@ -685,10 +684,10 @@ namespace Cryo
 
         // Extract the string content without quotes
         std::string_view raw_text(start + 1, _current - start - 2);
-        
+
         // Process escape sequences during lexical analysis
         std::string processed_content = process_escape_sequences(std::string(raw_text));
-        
+
         // Store the processed string in the string pool and get a string_view to it
         std::string_view processed_text = store_processed_string(std::move(processed_content));
 
@@ -1346,15 +1345,15 @@ namespace Cryo
                     // Handle octal escape sequences (\000 to \377)
                     {
                         std::string octal_str;
-                        octal_str += next; // Include the first digit we already found
+                        octal_str += next;        // Include the first digit we already found
                         size_t octal_pos = i + 2; // Start from the next position after the first digit
-                        
+
                         // Collect up to 2 more octal digits (we already have 1)
                         for (int digit_count = 1; digit_count < 3 && octal_pos < str.length() && str[octal_pos] >= '0' && str[octal_pos] <= '7'; ++digit_count, ++octal_pos)
                         {
                             octal_str += str[octal_pos];
                         }
-                        
+
                         // Special case: if we only have \0 and no following octal digits, treat as null terminator
                         if (octal_str == "0" && (i + 2 >= str.length() || str[i + 2] < '0' || str[i + 2] > '7'))
                         {
