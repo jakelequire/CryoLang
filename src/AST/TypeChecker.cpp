@@ -3069,8 +3069,8 @@ namespace Cryo
                     // For other operations, types should be compatible
                     Type *result_type = nullptr;
 
-                    // Arithmetic operations
-                    if (op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS || op == TokenKind::TK_STAR || op == TokenKind::TK_SLASH)
+                    // Arithmetic operations (including modulo)
+                    if (op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS || op == TokenKind::TK_STAR || op == TokenKind::TK_SLASH || op == TokenKind::TK_PERCENT)
                     {
                         // Handle string concatenation for + operator
                         if (op == TokenKind::TK_PLUS && left_type->name() == "string" && right_type->name() == "string")
@@ -3167,6 +3167,29 @@ namespace Cryo
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}",
                                           left_type->to_string(), right_type->to_string());
                                 result_type = right_type; // int literal promotes to specific integer type
+                            }
+                            // Allow arithmetic between any two integer types (e.g., u32 / u8, i64 + u32)
+                            // Use the wider type as the result type
+                            else if (left_type->is_integral() && right_type->is_integral())
+                            {
+                                // Determine which type is "wider" based on bit width
+                                auto get_int_width = [](const std::string &name) -> int {
+                                    if (name == "i8" || name == "u8") return 8;
+                                    if (name == "i16" || name == "u16") return 16;
+                                    if (name == "i32" || name == "u32" || name == "int") return 32;
+                                    if (name == "i64" || name == "u64") return 64;
+                                    if (name == "char") return 8;
+                                    return 32; // default
+                                };
+                                int left_width = get_int_width(left_type->name());
+                                int right_width = get_int_width(right_type->name());
+                                result_type = (left_width >= right_width) ? left_type : right_type;
+                                const char* op_str = (op == TokenKind::TK_PLUS ? "+" :
+                                                     (op == TokenKind::TK_MINUS ? "-" :
+                                                     (op == TokenKind::TK_STAR ? "*" :
+                                                     (op == TokenKind::TK_SLASH ? "/" : "%"))));
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing mixed integer arithmetic: {} {} {} = {}",
+                                          left_type->to_string(), op_str, right_type->to_string(), result_type->to_string());
                             }
                             else
                             {
