@@ -4539,6 +4539,12 @@ namespace Cryo
                     field->set_default_value(std::move(value));
                     impl_block->add_field_implementation(std::move(field));
                 }
+                else if (_current_token.is(TokenKind::TK_KW_STATIC))
+                {
+                    // Static method implementation: static method_name() -> T { ... }
+                    auto method = parse_struct_method(target_type);
+                    impl_block->add_method_implementation(std::move(method));
+                }
                 else if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
                          (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
                 {
