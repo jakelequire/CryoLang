@@ -1712,13 +1712,31 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Processing imported module: {}", module_name);
             LOG_DEBUG(Cryo::LogComponent::AST, "Module has {} statements", ast->statements().size());
 
-            // Set the source file context to this imported module for proper error attribution
-            // This is particularly important for stdlib modules to avoid attributing errors to user code
-            std::string module_file = module_name + ".cryo"; // Simple mapping for now
-            if (module_name.find("/") != std::string::npos)
+            // Try to get the actual source file from the AST node itself
+            // The Parser should have set this from the lexer's file path
+            std::string module_file = ast->source_file();
+
+            // If the AST doesn't have source_file set, try to get it from child nodes
+            if (module_file.empty() && !ast->statements().empty())
             {
-                // For stdlib paths like "core/types", construct the stdlib path
-                module_file = "stdlib/" + module_name + ".cryo";
+                for (const auto &stmt : ast->statements())
+                {
+                    if (stmt && !stmt->source_file().empty())
+                    {
+                        module_file = stmt->source_file();
+                        break;
+                    }
+                }
+            }
+
+            // Fallback to constructing path from module name if no source file found
+            if (module_file.empty())
+            {
+                module_file = module_name + ".cryo";
+                if (module_name.find("/") != std::string::npos)
+                {
+                    module_file = "stdlib/" + module_name + ".cryo";
+                }
             }
 
             // Use set_source_file to properly update both _source_file and _diagnostic_builder
