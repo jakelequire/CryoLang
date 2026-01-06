@@ -2523,7 +2523,7 @@ namespace Cryo
     {
         if (!_in_function)
         {
-            _diagnostic_builder->create_invalid_operation_error("return", nullptr, nullptr, node.location());
+            _diagnostic_builder->create_invalid_operation_error("return", nullptr, nullptr, &node);
             return;
         }
 
@@ -3203,7 +3203,7 @@ namespace Cryo
                             if (_diagnostic_builder)
                             {
                                 LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Using diagnostic builder for arithmetic error");
-                                _diagnostic_builder->create_invalid_operation_error("arithmetic", left_type, right_type, node.location());
+                                _diagnostic_builder->create_invalid_operation_error("arithmetic", left_type, right_type, &node);
                             }
                             else
                             {
@@ -3229,7 +3229,7 @@ namespace Cryo
                         else
                         {
                             std::string op_str = (op == TokenKind::TK_LESSLESS) ? "<<" : ">>";
-                            _diagnostic_builder->create_invalid_operation_error(op_str, left_type, right_type, node.location());
+                            _diagnostic_builder->create_invalid_operation_error(op_str, left_type, right_type, &node);
                             node.set_resolved_type(_type_context.get_unknown_type());
                         }
                     }
@@ -3289,7 +3289,7 @@ namespace Cryo
                         }
                         else
                         {
-                            _diagnostic_builder->create_invalid_operation_error("comparison", left_type, right_type, node.location());
+                            _diagnostic_builder->create_invalid_operation_error("comparison", left_type, right_type, &node);
                         }
                     }
 
@@ -3373,7 +3373,7 @@ namespace Cryo
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: Cannot dereference non-pointer type '{}' (kind={})",
                                   operand_type->to_string(), TypeKindToString(operand_type->kind()));
-                        _diagnostic_builder->create_invalid_operation_error("dereference", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("dereference", operand_type, nullptr, &node);
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -3385,7 +3385,7 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("unary minus", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("unary minus", operand_type, nullptr, &node);
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -3397,7 +3397,7 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("logical NOT", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("logical NOT", operand_type, nullptr, &node);
                     }
                 }
                 else if (op == TokenKind::TK_PLUSPLUS) // Increment operator (++ prefix or postfix)
@@ -3409,7 +3409,7 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("increment", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("increment", operand_type, nullptr, &node);
                     }
                 }
                 else if (op == TokenKind::TK_MINUSMINUS) // Decrement operator (-- prefix or postfix)
@@ -3421,7 +3421,7 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("decrement", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("decrement", operand_type, nullptr, &node);
                     }
                 }
                 else if (op == TokenKind::TK_TILDE) // Bitwise NOT (~)
@@ -3433,13 +3433,13 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("bitwise NOT", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("bitwise NOT", operand_type, nullptr, &node);
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
                 else
                 {
-                    _diagnostic_builder->create_invalid_operation_error(node.operator_token().to_string(), operand_type, nullptr, node.location());
+                    _diagnostic_builder->create_invalid_operation_error(node.operator_token().to_string(), operand_type, nullptr, &node);
                 }
             }
         }
@@ -6089,7 +6089,7 @@ namespace Cryo
         // Verify it's an enum type for enum variant access
         if (scope_type->kind() != TypeKind::Enum)
         {
-            _diagnostic_builder->create_invalid_operation_error("scope resolution", scope_type, nullptr, node.location());
+            _diagnostic_builder->create_invalid_operation_error("scope resolution", scope_type, nullptr, &node);
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
@@ -7022,7 +7022,7 @@ namespace Cryo
                     target_type->kind() != TypeKind::Enum &&
                     target_type->kind() != TypeKind::Trait)
                 {
-                    _diagnostic_builder->create_invalid_operation_error("implementation block", target_type, nullptr, node.location());
+                    _diagnostic_builder->create_invalid_operation_error("implementation block", target_type, nullptr, &node);
                     return;
                 }
             }
