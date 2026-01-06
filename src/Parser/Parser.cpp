@@ -4274,8 +4274,8 @@ namespace Cryo
                 enum_decl->add_variant(std::move(variant));
             }
 
-            // Optional comma between variants
-            if (_current_token.is(TokenKind::TK_COMMA))
+            // Optional comma or semicolon between variants
+            if (_current_token.is(TokenKind::TK_COMMA) || _current_token.is(TokenKind::TK_SEMICOLON))
             {
                 advance();
             }
@@ -5282,8 +5282,11 @@ namespace Cryo
         LOG_DEBUG(LogComponent::PARSER, "parse_type_annotation_with_tokens() starting, current token: {} ({})",
                   static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
 
+        // Track parenthesis depth for function types like () -> T or (T, U) -> V
+        int paren_depth = 0;
+
         // Collect tokens that form the complete type expression
-        // This handles complex types like: const int**, Option<Result<T, E>>, u64[5], etc.
+        // This handles complex types like: const int**, Option<Result<T, E>>, u64[5], () -> T, etc.
         while (is_type_token() ||
                _current_token.is(TokenKind::TK_L_ANGLE) ||
                _current_token.is(TokenKind::TK_R_ANGLE) ||
@@ -5297,7 +5300,10 @@ namespace Cryo
                _current_token.is(TokenKind::TK_COLONCOLON) ||
                _current_token.is(TokenKind::TK_KW_CONST) ||
                _current_token.is(TokenKind::TK_KW_MUT) ||
-               _current_token.is(TokenKind::TK_IDENTIFIER))
+               _current_token.is(TokenKind::TK_IDENTIFIER) ||
+               _current_token.is(TokenKind::TK_L_PAREN) ||  // Function types: () -> T
+               _current_token.is(TokenKind::TK_R_PAREN) ||  // Function types: (T) -> U
+               _current_token.is(TokenKind::TK_ARROW))      // Function types: T -> U
         {
             // Track angle bracket depth
             if (_current_token.is(TokenKind::TK_L_ANGLE))
@@ -5314,6 +5320,21 @@ namespace Cryo
                 angle_bracket_depth -= 2;
             }
 
+            // Track parenthesis depth for function types
+            if (_current_token.is(TokenKind::TK_L_PAREN))
+            {
+                paren_depth++;
+            }
+            else if (_current_token.is(TokenKind::TK_R_PAREN))
+            {
+                paren_depth--;
+                // If we close more parens than we opened, this ) belongs to outer context
+                if (paren_depth < 0)
+                {
+                    break;
+                }
+            }
+
             LOG_DEBUG(LogComponent::PARSER, "Collecting token: {} ({})",
                       static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
 
@@ -5321,8 +5342,8 @@ namespace Cryo
             type_string += std::string(_current_token.text());
             advance();
 
-            // Break on certain terminators, but only if we're not inside angle brackets
-            if (angle_bracket_depth == 0 &&
+            // Break on certain terminators, but only if we're not inside angle brackets or parentheses
+            if (angle_bracket_depth == 0 && paren_depth == 0 &&
                 (_current_token.is(TokenKind::TK_SEMICOLON) ||
                  _current_token.is(TokenKind::TK_COMMA) ||
                  _current_token.is(TokenKind::TK_R_PAREN) ||
