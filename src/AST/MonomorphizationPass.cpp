@@ -50,7 +50,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing class template: {}", instantiation.base_name);
 
                 // Prefer metadata path to avoid potentially corrupted pointers
-                if (!template_info->metadata.generic_params.empty())
+                if (!template_info->metadata.generic_parameter_names.empty())
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Using metadata for class template (safer path)");
                     specialized_node = specialize_class_template_from_metadata(template_info->metadata, instantiation);
@@ -82,7 +82,7 @@ namespace Cryo
 
                 // Prefer metadata path to avoid potentially corrupted pointers
                 // The struct_template pointer may be dangling after AST modifications
-                if (!template_info->metadata.generic_params.empty())
+                if (!template_info->metadata.generic_parameter_names.empty())
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Using metadata for struct template (safer path)");
                     specialized_node = specialize_struct_template_from_metadata(template_info->metadata, instantiation);
@@ -113,7 +113,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing enum template: {}", instantiation.base_name);
 
                 // Prefer metadata path to avoid potentially corrupted pointers
-                if (!template_info->metadata.generic_params.empty())
+                if (!template_info->metadata.generic_parameter_names.empty())
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Using metadata for enum template (safer path)");
                     specialized_node = specialize_enum_template_from_metadata(template_info->metadata, instantiation);
