@@ -1942,11 +1942,11 @@ namespace Cryo
             // Set expected type context for contextual typing (especially important for array literals)
             Type *previous_expected_type = _current_expected_type;
             _current_expected_type = declared_type;
-            
+
             // Visit the initializer to determine its type
             node.initializer()->accept(*this);
             inferred_type = node.initializer()->get_resolved_type();
-            
+
             // Restore previous expected type context
             _current_expected_type = previous_expected_type;
         }
@@ -2742,10 +2742,10 @@ namespace Cryo
 
     void TypeChecker::visit(ModuleDeclarationNode &node)
     {
-        LOG_DEBUG(Cryo::LogComponent::AST, "Processing module declaration: {} (public: {})", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing module declaration: {} (public: {})",
                   node.module_path(), node.is_public() ? "yes" : "no");
-        
-        // Module declarations are processed during module loading, 
+
+        // Module declarations are processed during module loading,
         // so we just log them here for type checking purposes
     }
 
@@ -4050,12 +4050,12 @@ namespace Cryo
                 {
                     _current_expected_type = expected_element_type;
                 }
-                
+
                 element->accept(*this);
-                
+
                 // Restore previous expected type
                 _current_expected_type = previous_expected;
-                
+
                 if (element->has_resolved_type())
                 {
                     Type *element_type = element->get_resolved_type();
@@ -5199,15 +5199,6 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_methods map", lookup_type_name);
-            LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_methods:");
-            for (const auto &[type_name, methods] : _struct_methods)
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "  - Type '{}' has {} methods", type_name, methods.size());
-                for (const auto &[method_name, method_type] : methods)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "    - Method '{}' -> {}", method_name, method_type->to_string());
-                }
-            }
 
             // Fallback for well-known stdlib generic types that might not be imported
             if (effective_type && effective_type->kind() == TypeKind::Parameterized)
@@ -5625,17 +5616,6 @@ namespace Cryo
                   effective_type ? effective_type->name() : "null",
                   effective_type ? TypeKindToString(effective_type->kind()) : "null",
                   lookup_type_name);
-
-        // Log all available methods in _struct_methods for debugging
-        LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_methods:");
-        for (const auto &type_methods : _struct_methods)
-        {
-            LOG_DEBUG(Cryo::LogComponent::AST, "  Type '{}' has {} methods", type_methods.first, type_methods.second.size());
-            for (const auto &method : type_methods.second)
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "    Method: '{}'", method.first);
-            }
-        }
 
         // Before failing, check base class methods for classes
         if (effective_type && effective_type->kind() == TypeKind::Class)
@@ -7576,11 +7556,11 @@ namespace Cryo
                 // Check if we have an expected type context for integer literals
                 if (_current_expected_type && is_integer_type(_current_expected_type))
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Using expected type '{}' for integer literal '{}'", 
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Using expected type '{}' for integer literal '{}'",
                               _current_expected_type->name(), value);
                     return _current_expected_type;
                 }
-                
+
                 return _type_context.get_int_type();
             }
         }
