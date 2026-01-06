@@ -938,8 +938,15 @@ namespace Cryo::Codegen
                       "Bound pattern variable '{}' (type: {}) from enum variant {}",
                       var_name, type_name, variant_name);
 
-            // Advance offset by the size of this field
-            offset += module()->getDataLayout().getTypeAllocSize(field_type);
+            // Advance offset by the size of this field (with safety check for unsized types)
+            if (field_type->isSized())
+            {
+                offset += module()->getDataLayout().getTypeAllocSize(field_type);
+            }
+            else
+            {
+                offset += 8; // Default to pointer size for unsized types
+            }
         }
     }
 
