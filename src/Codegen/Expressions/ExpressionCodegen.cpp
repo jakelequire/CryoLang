@@ -1585,6 +1585,83 @@ namespace Cryo::Codegen
     }
 
     //===================================================================
+    // If Expression
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_if_expression(Cryo::IfExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null if-expression node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating if-expression");
+
+        // Generate condition
+        llvm::Value *condition = generate(node->condition());
+        if (!condition)
+        {
+            return nullptr;
+        }
+
+        // Convert to i1 if needed
+        if (!condition->getType()->isIntegerTy(1))
+        {
+            if (condition->getType()->isIntegerTy())
+            {
+                condition = builder().CreateICmpNE(
+                    condition,
+                    llvm::ConstantInt::get(condition->getType(), 0),
+                    "tobool");
+            }
+            else
+            {
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
+                             "If-expression condition must be boolean");
+                return nullptr;
+            }
+        }
+
+        // Create basic blocks
+        llvm::Function *fn = builder().GetInsertBlock()->getParent();
+        llvm::BasicBlock *then_block = create_block("ifexpr.then", fn);
+        llvm::BasicBlock *else_block = create_block("ifexpr.else", fn);
+        llvm::BasicBlock *merge_block = create_block("ifexpr.merge", fn);
+
+        // Branch on condition
+        builder().CreateCondBr(condition, then_block, else_block);
+
+        // Generate then value
+        builder().SetInsertPoint(then_block);
+        llvm::Value *then_val = generate(node->then_expression());
+        if (!then_val)
+        {
+            return nullptr;
+        }
+        llvm::BasicBlock *then_end = builder().GetInsertBlock();
+        builder().CreateBr(merge_block);
+
+        // Generate else value
+        builder().SetInsertPoint(else_block);
+        llvm::Value *else_val = generate(node->else_expression());
+        if (!else_val)
+        {
+            return nullptr;
+        }
+        llvm::BasicBlock *else_end = builder().GetInsertBlock();
+        builder().CreateBr(merge_block);
+
+        // Create phi node
+        builder().SetInsertPoint(merge_block);
+        llvm::PHINode *phi = builder().CreatePHI(then_val->getType(), 2, "ifexpr.result");
+        phi->addIncoming(then_val, then_end);
+        phi->addIncoming(cast_if_needed(else_val, then_val->getType()), else_end);
+
+        return phi;
+    }
+
+    //===================================================================
     // Helpers
     //===================================================================
 
