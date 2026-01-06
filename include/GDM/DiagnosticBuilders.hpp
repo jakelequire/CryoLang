@@ -288,8 +288,12 @@ namespace Cryo
                                                     SourceLocation location);
 
         // Generic type error with custom message
-        Diagnostic &create_type_error(ErrorCode error_code, SourceLocation location, 
+        Diagnostic &create_type_error(ErrorCode error_code, SourceLocation location,
                                      const std::string &custom_message);
+
+        // Generic type error with node context - this provides full source code context
+        Diagnostic &create_error_with_node(ErrorCode error_code, ASTNode *node,
+                                          const std::string &message, const std::string &label = "");
     };
 
     /**
