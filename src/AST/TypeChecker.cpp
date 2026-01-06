@@ -6154,8 +6154,22 @@ namespace Cryo
         }
 
         // Check for redefinition
-        if (_symbol_table->lookup_symbol(struct_name))
+        if (auto *existing_symbol = _symbol_table->lookup_symbol(struct_name))
         {
+            // Allow compatible redefinitions - this handles extern FFI structs
+            // (like timespec) that may be defined in multiple modules
+            Type *existing_type = existing_symbol->type;
+            if (existing_type && existing_type->kind() == TypeKind::Struct)
+            {
+                // For structs without methods (FFI structs), allow compatible redefinition
+                if (node.methods().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing compatible redefinition of FFI struct '{}'", struct_name);
+                    // Just skip processing this duplicate definition
+                    return;
+                }
+            }
+
             _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
             return;
         }
@@ -6278,8 +6292,22 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "STRUCT_SIGNATURES: Registering struct '{}' types and method signatures", struct_name);
 
         // Check for redefinition
-        if (_symbol_table->lookup_symbol(struct_name))
+        if (auto *existing_symbol = _symbol_table->lookup_symbol(struct_name))
         {
+            // Allow compatible redefinitions - this handles extern FFI structs
+            // (like timespec) that may be defined in multiple modules
+            Type *existing_type = existing_symbol->type;
+            if (existing_type && existing_type->kind() == TypeKind::Struct)
+            {
+                // For structs without methods (FFI structs), allow compatible redefinition
+                if (node.methods().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing compatible redefinition of FFI struct '{}' in signatures phase", struct_name);
+                    // Just skip processing this duplicate definition
+                    return;
+                }
+            }
+
             _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
             return;
         }
@@ -7339,8 +7367,19 @@ namespace Cryo
 
             const std::string &func_name = node.name();
 
-            // Parse return type from node annotation (constructors have void return typically)
-            Type *return_type = node.get_resolved_return_type();
+            // For constructors, the return type is the struct type itself
+            // This allows constructors to return struct literals with `return StructName { ... }`
+            Type *return_type = _current_struct_type;
+            if (!return_type)
+            {
+                // Fallback: try to get the struct type by name
+                return_type = _type_context.get_struct_type(_current_struct_name);
+            }
+            if (!return_type)
+            {
+                // Final fallback to node's return type
+                return_type = node.get_resolved_return_type();
+            }
             const std::string &return_type_str = return_type ? return_type->to_string() : "void";
 
             if (!return_type)
@@ -8080,6 +8119,14 @@ namespace Cryo
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing reference-to-pointer conversion: &{} = {}*",
                           referenced_type->to_string(), pointer_pointee->to_string());
+                return true;
+            }
+            // Special case: void* accepts any reference type (common in extern C functions)
+            // This allows passing &struct_var where void* is expected
+            else if (pointer_pointee && pointer_pointee->kind() == TypeKind::Void)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing reference-to-void* conversion: &{} = void*",
+                          referenced_type ? referenced_type->to_string() : "unknown");
                 return true;
             }
         }
