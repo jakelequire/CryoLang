@@ -49,72 +49,94 @@ namespace Cryo
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing class template: {}", instantiation.base_name);
 
-                // Try to use the corrupted pointer first, fallback to metadata if it fails
-                try
+                // Prefer metadata path to avoid potentially corrupted pointers
+                if (!template_info->metadata.generic_params.empty())
                 {
-                    if (template_info->class_template->generic_parameters().empty() ||
-                        !template_info->class_template->generic_parameters()[0])
-                    {
-                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, using metadata");
-                        specialized_node = specialize_class_template_from_metadata(template_info->metadata, instantiation);
-                    }
-                    else
-                    {
-                        specialized_node = specialize_class_template(*template_info->class_template, instantiation);
-                    }
-                }
-                catch (...)
-                {
-                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed, using metadata");
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Using metadata for class template (safer path)");
                     specialized_node = specialize_class_template_from_metadata(template_info->metadata, instantiation);
+                }
+                else
+                {
+                    // Fallback to direct pointer access only if metadata is not available
+                    try
+                    {
+                        if (template_info->class_template->generic_parameters().empty() ||
+                            !template_info->class_template->generic_parameters()[0])
+                        {
+                            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, cannot specialize");
+                        }
+                        else
+                        {
+                            specialized_node = specialize_class_template(*template_info->class_template, instantiation);
+                        }
+                    }
+                    catch (...)
+                    {
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed");
+                    }
                 }
             }
             else if (template_info->struct_template)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing struct template: {}", instantiation.base_name);
 
-                // Try to use the corrupted pointer first, fallback to metadata if it fails
-                try
+                // Prefer metadata path to avoid potentially corrupted pointers
+                // The struct_template pointer may be dangling after AST modifications
+                if (!template_info->metadata.generic_params.empty())
                 {
-                    if (template_info->struct_template->generic_parameters().empty() ||
-                        !template_info->struct_template->generic_parameters()[0])
-                    {
-                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, using metadata");
-                        specialized_node = specialize_struct_template_from_metadata(template_info->metadata, instantiation);
-                    }
-                    else
-                    {
-                        specialized_node = specialize_struct_template(*template_info->struct_template, instantiation);
-                    }
-                }
-                catch (...)
-                {
-                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed, using metadata");
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Using metadata for struct template (safer path)");
                     specialized_node = specialize_struct_template_from_metadata(template_info->metadata, instantiation);
+                }
+                else
+                {
+                    // Fallback to direct pointer access only if metadata is not available
+                    try
+                    {
+                        if (template_info->struct_template->generic_parameters().empty() ||
+                            !template_info->struct_template->generic_parameters()[0])
+                        {
+                            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, cannot specialize");
+                        }
+                        else
+                        {
+                            specialized_node = specialize_struct_template(*template_info->struct_template, instantiation);
+                        }
+                    }
+                    catch (...)
+                    {
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed");
+                    }
                 }
             }
             else if (template_info->enum_template)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specializing enum template: {}", instantiation.base_name);
 
-                // Try to use the corrupted pointer first, fallback to metadata if it fails
-                try
+                // Prefer metadata path to avoid potentially corrupted pointers
+                if (!template_info->metadata.generic_params.empty())
                 {
-                    if (template_info->enum_template->generic_parameters().empty() ||
-                        !template_info->enum_template->generic_parameters()[0])
-                    {
-                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, using metadata");
-                        specialized_node = specialize_enum_template_from_metadata(template_info->metadata, instantiation);
-                    }
-                    else
-                    {
-                        specialized_node = specialize_enum_template(*template_info->enum_template, instantiation);
-                    }
-                }
-                catch (...)
-                {
-                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed, using metadata");
+                    LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Using metadata for enum template (safer path)");
                     specialized_node = specialize_enum_template_from_metadata(template_info->metadata, instantiation);
+                }
+                else
+                {
+                    // Fallback to direct pointer access only if metadata is not available
+                    try
+                    {
+                        if (template_info->enum_template->generic_parameters().empty() ||
+                            !template_info->enum_template->generic_parameters()[0])
+                        {
+                            LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node corrupted, cannot specialize");
+                        }
+                        else
+                        {
+                            specialized_node = specialize_enum_template(*template_info->enum_template, instantiation);
+                        }
+                    }
+                    catch (...)
+                    {
+                        LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Template node access failed");
+                    }
                 }
             }
             else if (template_info->function_template)
