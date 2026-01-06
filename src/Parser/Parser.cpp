@@ -595,6 +595,17 @@ namespace Cryo
                     current_kind == TokenKind::TK_KW_CONST || current_kind == TokenKind::TK_KW_MUT ||
                     current_kind == TokenKind::TK_KW_BREAK || current_kind == TokenKind::TK_KW_CONTINUE)
                 {
+                    // IMPORTANT: If we hit a statement keyword immediately without skipping any tokens,
+                    // the caller likely can't parse this statement. Skip past it to make progress.
+                    if (tokens_skipped == 0)
+                    {
+                        LOG_DEBUG(LogComponent::PARSER,
+                                  "[SYNC METHOD] Found statement keyword '{}' immediately - skipping to prevent infinite loop",
+                                  std::string(_current_token.text()));
+                        advance();
+                        tokens_skipped++;
+                        continue;
+                    }
                     LOG_DEBUG(LogComponent::PARSER, "Method body synchronized on statement keyword after skipping {} tokens", tokens_skipped);
                     return;
                 }
@@ -764,6 +775,20 @@ namespace Cryo
                             tokens_skipped++;
                             continue;
                         }
+                    }
+
+                    // IMPORTANT: If we hit a statement start immediately without skipping any tokens,
+                    // the caller likely can't parse this statement. Consuming and retrying will cause
+                    // an infinite loop. Instead, skip past this statement start to make progress.
+                    if (tokens_skipped == 0)
+                    {
+                        LOG_DEBUG(LogComponent::PARSER,
+                                  "Synchronization found statement start '{}' immediately - skipping to prevent infinite loop",
+                                  std::string(_current_token.text()));
+                        advance();
+                        tokens_skipped++;
+                        // Continue looking for a better recovery point (like a semicolon)
+                        continue;
                     }
 
                     LOG_DEBUG(LogComponent::PARSER, "Synchronized on statement start '{}' after skipping {} tokens",
