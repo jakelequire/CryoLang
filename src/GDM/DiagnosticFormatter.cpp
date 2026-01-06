@@ -1020,25 +1020,33 @@ namespace Cryo
         }
 
         // If we have a source manager, validate against actual file content
+        // But if the file can't be opened, still consider the range valid
+        // (we just won't be able to show the code snippet)
         if (_source_manager && !filename.empty())
         {
             size_t file_line_count = get_file_line_count(filename);
 
-            // Check if the range is within the bounds of the actual file
-            if (range.start.line() > file_line_count || range.end.line() > file_line_count)
+            // Only validate bounds if we could actually read the file
+            if (file_line_count > 0)
             {
-                return false;
-            }
-
-            // Additional validation: check if columns are reasonable
-            if (range.start.line() <= file_line_count)
-            {
-                std::string line = read_line_from_file(filename, range.start.line());
-                if (!line.empty() && range.start.column() > line.length() + 1)
+                // Check if the range is within the bounds of the actual file
+                if (range.start.line() > file_line_count || range.end.line() > file_line_count)
                 {
                     return false;
                 }
+
+                // Additional validation: check if columns are reasonable
+                if (range.start.line() <= file_line_count)
+                {
+                    std::string line = read_line_from_file(filename, range.start.line());
+                    if (!line.empty() && range.start.column() > line.length() + 1)
+                    {
+                        return false;
+                    }
+                }
             }
+            // If file_line_count is 0, the file couldn't be opened
+            // Still return true - we have valid line/column, just can't verify against file
         }
 
         return true;
