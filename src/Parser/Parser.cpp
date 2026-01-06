@@ -3962,16 +3962,18 @@ namespace Cryo
 
                 bool is_method = false;
 
-                // Case 1: regular method - identifier followed by ( or < (for generic methods)
-                if (_current_token.is(TokenKind::TK_IDENTIFIER) &&
+                // Case 1: regular method - identifier or keyword followed by ( or < (for generic methods)
+                // This allows method names like 'new', 'default', etc.
+                if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
                     (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE)))
                 {
                     is_method = true;
                 }
-                // Case 2: static method - static followed by identifier
-                else if (_current_token.is(TokenKind::TK_KW_STATIC) && next.is(TokenKind::TK_IDENTIFIER))
+                // Case 2: static method - static followed by identifier or keyword (like 'new')
+                else if (_current_token.is(TokenKind::TK_KW_STATIC) &&
+                         (next.is(TokenKind::TK_IDENTIFIER) || next.is_keyword()))
                 {
-                    // For static methods, we assume it's a method if static is followed by identifier
+                    // For static methods, we assume it's a method if static is followed by identifier or keyword
                     // The method parsing will handle the rest
                     is_method = true;
                 }
@@ -4074,14 +4076,15 @@ namespace Cryo
 
                 bool is_method = false;
 
-                // Case 1: regular method - identifier followed by ( or < (for generic methods)
-                if (_current_token.is(TokenKind::TK_IDENTIFIER) &&
+                // Case 1: regular method - identifier or keyword followed by ( or < (for generic methods)
+                // This allows method names like 'new', 'default', etc.
+                if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
                     (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE)))
                 {
                     // Additional validation: identifiers starting with __ are likely function calls, not methods
                     // Also exclude primitive type names that are likely type casts
                     std::string identifier_text = std::string(_current_token.text());
-                    if (identifier_text.substr(0, 2) == "__" ||
+                    if (identifier_text.length() >= 2 && identifier_text.substr(0, 2) == "__" ||
                         identifier_text == "u8" || identifier_text == "u16" || identifier_text == "u32" || identifier_text == "u64" ||
                         identifier_text == "i8" || identifier_text == "i16" || identifier_text == "i32" || identifier_text == "i64" ||
                         identifier_text == "f32" || identifier_text == "f64" || identifier_text == "bool" || identifier_text == "char")
@@ -4095,10 +4098,11 @@ namespace Cryo
                         is_method = true;
                     }
                 }
-                // Case 2: static method - static followed by identifier
-                else if (_current_token.is(TokenKind::TK_KW_STATIC) && next.is(TokenKind::TK_IDENTIFIER))
+                // Case 2: static method - static followed by identifier or keyword (like 'new')
+                else if (_current_token.is(TokenKind::TK_KW_STATIC) &&
+                         (next.is(TokenKind::TK_IDENTIFIER) || next.is_keyword()))
                 {
-                    // For static methods, we assume it's a method if static is followed by identifier
+                    // For static methods, we assume it's a method if static is followed by identifier or keyword
                     // The method parsing will handle the rest
                     is_method = true;
                 }
