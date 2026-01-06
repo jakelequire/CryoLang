@@ -2055,7 +2055,7 @@ namespace Cryo
             if (should_report_error)
             {
                 LOG_ERROR(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Failed to declare variable '{}' - already exists! stdlib_compilation_mode={}", var_name, _stdlib_compilation_mode);
-                _diagnostic_builder->create_redefined_symbol_error(var_name, NodeKind::VariableDeclaration, node.location());
+                _diagnostic_builder->create_redefined_symbol_error(var_name, NodeKind::VariableDeclaration, &node);
             }
         }
         else
@@ -2309,13 +2309,13 @@ namespace Cryo
                         }
                         else
                         {
-                            _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                            _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, &node);
                         }
                     }
                     else
                     {
                         // If we can't determine the existing symbol type, report the error as usual
-                        _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                        _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, &node);
                     }
                 }
             }
@@ -2434,7 +2434,7 @@ namespace Cryo
             // Intrinsic not loaded yet - declare it now
             if (!_symbol_table->declare_symbol(func_name, func_type, node.location()))
             {
-                _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, &node);
             }
         }
 
@@ -2474,7 +2474,7 @@ namespace Cryo
             // Register the intrinsic constant in symbol table
             if (!_symbol_table->declare_symbol(const_name, const_type, node.location()))
             {
-                _diagnostic_builder->create_redefined_symbol_error(const_name, NodeKind::IntrinsicConstDeclaration, node.location());
+                _diagnostic_builder->create_redefined_symbol_error(const_name, NodeKind::IntrinsicConstDeclaration, &node);
                 return;
             }
         }
@@ -2997,8 +2997,8 @@ namespace Cryo
             else
             {
                 // Only report the error if none of the fallback mechanisms worked
-                _diagnostic_builder->create_undefined_symbol_error(name, NodeKind::VariableDeclaration, node.location());
-                report_undefined_symbol(node.location(), name);
+                // Use node-based reporting for proper source context
+                report_undefined_symbol(&node, name);
                 node.set_resolved_type(_type_context.get_unknown_type());
             }
         }
@@ -6138,7 +6138,7 @@ namespace Cryo
         // Check for redefinition
         if (_symbol_table->lookup_symbol(struct_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
             return;
         }
 
@@ -6262,7 +6262,7 @@ namespace Cryo
         // Check for redefinition
         if (_symbol_table->lookup_symbol(struct_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
             return;
         }
 
@@ -6429,7 +6429,7 @@ namespace Cryo
         // Check for redefinition
         if (_symbol_table->lookup_symbol(class_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(class_name, NodeKind::ClassDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(class_name, NodeKind::ClassDeclaration, &node);
             return;
         }
 
@@ -6571,7 +6571,7 @@ namespace Cryo
         // Check for redefinition
         if (_symbol_table->lookup_symbol(trait_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(trait_name, NodeKind::TraitDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(trait_name, NodeKind::TraitDeclaration, &node);
             return;
         }
 
@@ -6660,7 +6660,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "Type alias '{}' already exists in stdlib compilation mode, skipping redeclaration", alias_name);
                 return;
             }
-            _diagnostic_builder->create_redefined_symbol_error(alias_name, NodeKind::TypeAliasDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(alias_name, NodeKind::TypeAliasDeclaration, &node);
             return;
         }
 
@@ -6783,7 +6783,7 @@ namespace Cryo
                             if (!_stdlib_compilation_mode)
                             {
                                 // Use VariableDeclaration as NodeKind since enum variants are essentially constant variables
-                                _diagnostic_builder->create_redefined_symbol_error(variant_name, NodeKind::VariableDeclaration, variant->location());
+                                _diagnostic_builder->create_redefined_symbol_error(variant_name, NodeKind::VariableDeclaration, variant);
                             }
                             // In stdlib mode, silently skip all redefinition errors for enum variants
                         }
@@ -6809,7 +6809,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "Enum '{}' already exists in stdlib compilation mode, skipping redeclaration", enum_name);
                 return;
             }
-            _diagnostic_builder->create_redefined_symbol_error(enum_name, NodeKind::EnumDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(enum_name, NodeKind::EnumDeclaration, &node);
             return;
         }
 
@@ -7143,7 +7143,7 @@ namespace Cryo
         // Check for redefinition within the same generic parameter list
         if (_symbol_table->lookup_symbol(param_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(param_name, NodeKind::Declaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(param_name, NodeKind::Declaration, &node);
             return;
         }
 
@@ -7169,7 +7169,7 @@ namespace Cryo
                 auto field_it = struct_it->second.find(field_name);
                 if (field_it != struct_it->second.end())
                 {
-                    _diagnostic_builder->create_redefined_symbol_error(field_name, NodeKind::VariableDeclaration, node.location());
+                    _diagnostic_builder->create_redefined_symbol_error(field_name, NodeKind::VariableDeclaration, &node);
                     return;
                 }
             }
@@ -7307,7 +7307,7 @@ namespace Cryo
 
                 if (!is_method_already_registered)
                 {
-                    _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, node.location());
+                    _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, &node);
                     return;
                 }
             }
@@ -8531,14 +8531,33 @@ namespace Cryo
     void TypeChecker::report_undefined_symbol(SourceLocation loc, const std::string &symbol_name)
     {
         std::string message = "Undefined symbol '" + symbol_name + "'";
-        _errors.emplace_back(TypeError::ErrorKind::UndefinedVariable, loc, message);
+        // Use the unified error reporting which goes through the diagnostic manager
+        report_error(TypeError::ErrorKind::UndefinedVariable, loc, message);
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::report_undefined_symbol - Added error for '{}', total errors: {}", symbol_name, _errors.size());
     }
 
     void TypeChecker::report_redefined_symbol(SourceLocation loc, const std::string &symbol_name)
     {
         std::string message = "Symbol '" + symbol_name + "' is already defined";
-        _errors.emplace_back(TypeError::ErrorKind::RedefinedSymbol, loc, message);
+        // Use the unified error reporting which goes through the diagnostic manager
+        report_error(TypeError::ErrorKind::RedefinedSymbol, loc, message);
+    }
+
+    void TypeChecker::report_undefined_symbol(ASTNode *node, const std::string &symbol_name)
+    {
+        std::string message = "Undefined symbol '" + symbol_name + "'";
+        SourceLocation loc = node ? node->location() : SourceLocation();
+        // Use the unified error reporting with node for proper source context
+        report_error(TypeError::ErrorKind::UndefinedVariable, loc, message, node);
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::report_undefined_symbol - Added error for '{}', total errors: {}", symbol_name, _errors.size());
+    }
+
+    void TypeChecker::report_redefined_symbol(ASTNode *node, const std::string &symbol_name)
+    {
+        std::string message = "Symbol '" + symbol_name + "' is already defined";
+        SourceLocation loc = node ? node->location() : SourceLocation();
+        // Use the unified error reporting with node for proper source context
+        report_error(TypeError::ErrorKind::RedefinedSymbol, loc, message, node);
     }
 
     //===----------------------------------------------------------------------===//

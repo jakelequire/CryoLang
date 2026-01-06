@@ -1340,6 +1340,66 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_redefined_symbol_error(const std::string &symbol_name,
+                                                                            NodeKind symbol_kind,
+                                                                            ASTNode *node)
+    {
+        // Use create_node_span which properly extracts source file from the node
+        SourceSpan span = create_node_span(node);
+
+        // Convert NodeKind to symbol type string
+        std::string symbol_type;
+        switch (symbol_kind)
+        {
+        case NodeKind::FunctionDeclaration:
+            symbol_type = "function";
+            break;
+        case NodeKind::StructDeclaration:
+            symbol_type = "struct";
+            break;
+        case NodeKind::ClassDeclaration:
+            symbol_type = "class";
+            break;
+        case NodeKind::TraitDeclaration:
+            symbol_type = "trait";
+            break;
+        case NodeKind::EnumDeclaration:
+            symbol_type = "enum";
+            break;
+        case NodeKind::TypeAliasDeclaration:
+            symbol_type = "type alias";
+            break;
+        case NodeKind::VariableDeclaration:
+            symbol_type = "variable";
+            break;
+        case NodeKind::Declaration: // Generic parameter
+            symbol_type = "generic parameter";
+            break;
+        default:
+            symbol_type = "symbol";
+            break;
+        }
+
+        span.set_label("redefined " + symbol_type);
+        std::string message = symbol_type + " `" + symbol_name + "` is already defined";
+
+        // Get the source file - prefer node's file, fall back to builder's file
+        const std::string &source_file = (node && !node->source_file().empty()) ? node->source_file() : _source_file;
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0205_REDEFINED_SYMBOL, span.to_source_range(), source_file);
+        diagnostic.with_primary_span(span);
+
+        add_common_help(diagnostic, ErrorCode::E0205_REDEFINED_SYMBOL);
+
+        // Mark node as having error to prevent duplicates
+        if (node)
+        {
+            node->mark_error();
+        }
+
+        return diagnostic;
+    }
+
     Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_dereference_error(Type *type,
                                                                                SourceLocation location)
     {
