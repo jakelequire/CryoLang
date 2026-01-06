@@ -3794,8 +3794,9 @@ namespace Cryo
 
                 bool is_method = false;
 
-                // Case 1: regular method - identifier followed by (
-                if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
+                // Case 1: regular method - identifier followed by ( or < (for generic methods)
+                if (_current_token.is(TokenKind::TK_IDENTIFIER) &&
+                    (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE)))
                 {
                     is_method = true;
                 }
@@ -3905,8 +3906,9 @@ namespace Cryo
 
                 bool is_method = false;
 
-                // Case 1: regular method - identifier followed by (
-                if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
+                // Case 1: regular method - identifier followed by ( or < (for generic methods)
+                if (_current_token.is(TokenKind::TK_IDENTIFIER) &&
+                    (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE)))
                 {
                     // Additional validation: identifiers starting with __ are likely function calls, not methods
                     // Also exclude primitive type names that are likely type casts
@@ -4478,9 +4480,9 @@ namespace Cryo
                     impl_block->add_field_implementation(std::move(field));
                 }
                 else if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
-                         (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
+                         (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
                 {
-                    // Method implementation
+                    // Method implementation (including generic methods with <T> syntax)
                     auto method = parse_struct_method(target_type);
                     impl_block->add_method_implementation(std::move(method));
                 }
@@ -4712,6 +4714,15 @@ namespace Cryo
             is_constructor = true;
         }
 
+        // Parse optional generic parameters (e.g., <T> or <T, U>)
+        std::vector<std::unique_ptr<GenericParameterNode>> method_generics;
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            method_generics = parse_generic_parameters();
+            LOG_DEBUG(LogComponent::PARSER, "[METHOD] Parsed {} generic parameters for method '{}'",
+                      method_generics.size(), method_name);
+        }
+
         consume(TokenKind::TK_L_PAREN, "Expected '(' after method name");
 
         // Parse parameters
@@ -4776,6 +4787,12 @@ namespace Cryo
 
         // Set variadic flag if detected
         method->set_variadic(is_variadic);
+
+        // Add generic parameters
+        for (auto &generic : method_generics)
+        {
+            method->add_generic_parameter(std::move(generic));
+        }
 
         // Add parameters
         for (auto &param : params)
