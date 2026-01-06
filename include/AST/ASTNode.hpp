@@ -225,6 +225,7 @@ namespace Cryo
     protected:
         NodeKind _kind;
         SourceLocation _location;
+        std::string _source_file;                // Track which file this node came from
         mutable bool _has_error = false; // Track if this node already has errors reported
 
     private:
@@ -232,7 +233,7 @@ namespace Cryo
         std::unique_ptr<DirectiveStorage> _directive_storage;
 
     public:
-        ASTNode(NodeKind kind, SourceLocation location);
+        ASTNode(NodeKind kind, SourceLocation location, const std::string &source_file = "");
         virtual ~ASTNode();
 
         // Copy constructor and assignment operator
@@ -245,6 +246,8 @@ namespace Cryo
 
         NodeKind kind() const { return _kind; }
         const SourceLocation &location() const { return _location; }
+        const std::string &source_file() const { return _source_file; }
+        void set_source_file(const std::string &file) { _source_file = file; }
 
         // Error tracking to prevent duplicate error reports
         bool has_error() const { return _has_error; }

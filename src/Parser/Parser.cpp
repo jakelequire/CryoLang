@@ -35,6 +35,9 @@ namespace Cryo
     Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file)
         : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
+        // Set source file on the builder so created nodes know their origin
+        _builder.set_source_file(source_file);
+
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
         try
         {
