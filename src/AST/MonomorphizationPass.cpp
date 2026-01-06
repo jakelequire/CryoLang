@@ -710,6 +710,11 @@ namespace Cryo
 
             // Apply type substitution to return type
             std::shared_ptr<Type> substituted_return_type = substitute_type(original_func_type->return_type().get(), type_substitutions_map);
+            if (!substituted_return_type)
+            {
+                LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Failed to substitute return type for method {}, skipping", method_name);
+                continue;
+            }
             LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialized return type for {}: {} -> {}",
                       method_name,
                       original_func_type->return_type()->to_string(),
@@ -717,6 +722,7 @@ namespace Cryo
 
             // Apply type substitution to parameter types and add 'this' parameter
             std::vector<Type *> substituted_param_types;
+            bool param_substitution_failed = false;
 
             // Add the specialized enum type as the first parameter ('this' parameter)
             auto &type_context = _type_checker->get_type_context();
@@ -735,11 +741,22 @@ namespace Cryo
             {
                 const auto &param_type = original_func_type->parameter_types()[i];
                 std::shared_ptr<Type> substituted_param = substitute_type(param_type.get(), type_substitutions_map);
+                if (!substituted_param)
+                {
+                    LOG_WARN(Cryo::LogComponent::AST, "MonomorphizationPass: Failed to substitute param {} for method {}, skipping method", i, method_name);
+                    param_substitution_failed = true;
+                    break;
+                }
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Specialized param {} for {}: {} -> {}",
                           i, method_name,
                           param_type->to_string(),
                           substituted_param->to_string());
                 substituted_param_types.push_back(substituted_param.get());
+            }
+
+            if (param_substitution_failed)
+            {
+                continue;
             }
 
             // Create new function type with substituted types
@@ -1400,6 +1417,51 @@ namespace Cryo
             {
                 resolved_type = type_context.get_integer_type(IntegerKind::I32, true);
                 LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> IntegerType", type_string);
+            }
+            else if (type_string == "i8")
+            {
+                resolved_type = type_context.get_integer_type(IntegerKind::I8, true);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> I8", type_string);
+            }
+            else if (type_string == "i16")
+            {
+                resolved_type = type_context.get_integer_type(IntegerKind::I16, true);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> I16", type_string);
+            }
+            else if (type_string == "i64")
+            {
+                resolved_type = type_context.get_integer_type(IntegerKind::I64, true);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> I64", type_string);
+            }
+            else if (type_string == "u8")
+            {
+                resolved_type = type_context.get_integer_type(IntegerKind::I8, false);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> U8", type_string);
+            }
+            else if (type_string == "u16")
+            {
+                resolved_type = type_context.get_integer_type(IntegerKind::I16, false);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> U16", type_string);
+            }
+            else if (type_string == "u32")
+            {
+                resolved_type = type_context.get_integer_type(IntegerKind::I32, false);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> U32", type_string);
+            }
+            else if (type_string == "u64")
+            {
+                resolved_type = type_context.get_integer_type(IntegerKind::I64, false);
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> U64", type_string);
+            }
+            else if (type_string == "char")
+            {
+                resolved_type = type_context.get_char_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> CharType", type_string);
+            }
+            else if (type_string == "void")
+            {
+                resolved_type = type_context.get_void_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Resolved primitive type '{}' -> VoidType", type_string);
             }
             else if (type_string == "string")
             {
