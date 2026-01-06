@@ -3178,6 +3178,7 @@ namespace Cryo
                                     if (name == "i16" || name == "u16") return 16;
                                     if (name == "i32" || name == "u32" || name == "int") return 32;
                                     if (name == "i64" || name == "u64") return 64;
+                                    if (name == "i128" || name == "u128") return 128;
                                     if (name == "char") return 8;
                                     return 32; // default
                                 };
@@ -8022,6 +8023,14 @@ namespace Cryo
             return true;
         }
 
+        // Special case: null can be assigned/returned to parameterized/generic types (e.g., ListNode<T>)
+        // These types are typically heap-allocated and can be null
+        if (rhs_str == "null" && (lhs_type->kind() == TypeKind::Parameterized || lhs_str.find("<") != std::string::npos))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing null assignment to generic/parameterized type {}", lhs_str);
+            return true;
+        }
+
         // Special case: &T[] (reference to array) can be assigned to T* (pointer to element type)
         if (lhs_type->kind() == TypeKind::Pointer && rhs_type->kind() == TypeKind::Reference)
         {
@@ -8869,8 +8878,9 @@ namespace Cryo
             type_name == "u16" || type_name == "i16" ||
             type_name == "u32" || type_name == "i32" || type_name == "int" ||
             type_name == "u64" || type_name == "i64" ||
+            type_name == "u128" || type_name == "i128" ||
             type_name == "f32" || type_name == "f64" || type_name == "float" ||
-            type_name == "boolean" || type_name == "string")
+            type_name == "boolean" || type_name == "string" || type_name == "bool")
         {
             return true;
         }
@@ -8903,7 +8913,7 @@ namespace Cryo
         // Numeric conversions
         std::vector<std::string> numeric_types = {
             "u8", "i8", "u16", "i16", "u32", "i32", "int", "u64", "i64",
-            "f32", "f64", "float"};
+            "u128", "i128", "f32", "f64", "float"};
 
         bool from_numeric = std::find(numeric_types.begin(), numeric_types.end(), from_type) != numeric_types.end();
         bool to_numeric = std::find(numeric_types.begin(), numeric_types.end(), to_type) != numeric_types.end();
