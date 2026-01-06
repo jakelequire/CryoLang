@@ -29,6 +29,66 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Skip generic functions - they should only be instantiated with concrete types
+        // Check 1: Function has generic type parameters defined (e.g., fn foo<T>(...))
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping generic function declaration '{}' - has {} generic type parameters",
+                      node->name(), node->generic_parameters().size());
+            return nullptr;
+        }
+
+        // Check 2: Detect uninstantiated type parameters in function signature
+        for (const auto &param : node->parameters())
+        {
+            if (param && param->get_resolved_type())
+            {
+                Cryo::Type *ptype = param->get_resolved_type();
+                if (ptype->kind() == TypeKind::Generic)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function declaration '{}' - param '{}' has generic type '{}'",
+                              node->name(), param->name(), ptype->to_string());
+                    return nullptr;
+                }
+                if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
+                {
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    if (!existing)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Skipping function declaration '{}' - param '{}' has undefined type '{}'",
+                                  node->name(), param->name(), ptype->to_string());
+                        return nullptr;
+                    }
+                }
+            }
+        }
+
+        // Check 3: Detect uninstantiated return type
+        if (Cryo::Type *ret_type = node->get_resolved_return_type())
+        {
+            if (ret_type->kind() == TypeKind::Generic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping function declaration '{}' - has generic return type '{}'",
+                          node->name(), ret_type->to_string());
+                return nullptr;
+            }
+            if (ret_type->kind() == TypeKind::Struct || ret_type->kind() == TypeKind::Class)
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type->to_string());
+                if (!existing)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function declaration '{}' - has undefined return type '{}'",
+                              node->name(), ret_type->to_string());
+                    return nullptr;
+                }
+            }
+        }
+
         // Generate properly qualified function name using namespace context
         std::string name;
         std::string ns_context = ctx().namespace_context();
@@ -96,6 +156,68 @@ namespace Cryo::Codegen
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, "Null function declaration node");
             return nullptr;
+        }
+
+        // Skip generic functions - they should only be instantiated with concrete types
+        // Check 1: Function has generic type parameters defined (e.g., fn foo<T>(...))
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping generic function '{}' - has {} generic type parameters",
+                      node->name(), node->generic_parameters().size());
+            return nullptr;
+        }
+
+        // Check 2: Detect uninstantiated type parameters in function signature
+        for (const auto &param : node->parameters())
+        {
+            if (param && param->get_resolved_type())
+            {
+                Cryo::Type *ptype = param->get_resolved_type();
+                // Check for Generic type kind
+                if (ptype->kind() == TypeKind::Generic)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function '{}' - param '{}' has generic type '{}'",
+                              node->name(), param->name(), ptype->to_string());
+                    return nullptr;
+                }
+                // Check if struct/class parameter type exists in LLVM context
+                if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
+                {
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    if (!existing)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Skipping function '{}' - param '{}' has undefined type '{}'",
+                                  node->name(), param->name(), ptype->to_string());
+                        return nullptr;
+                    }
+                }
+            }
+        }
+
+        // Check 3: Detect uninstantiated return type
+        if (Cryo::Type *ret_type = node->get_resolved_return_type())
+        {
+            if (ret_type->kind() == TypeKind::Generic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping function '{}' - has generic return type '{}'",
+                          node->name(), ret_type->to_string());
+                return nullptr;
+            }
+            if (ret_type->kind() == TypeKind::Struct || ret_type->kind() == TypeKind::Class)
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type->to_string());
+                if (!existing)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function '{}' - has undefined return type '{}'",
+                              node->name(), ret_type->to_string());
+                    return nullptr;
+                }
+            }
         }
 
         // Generate properly qualified function name using namespace context
