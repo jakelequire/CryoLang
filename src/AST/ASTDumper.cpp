@@ -332,6 +332,22 @@ namespace Cryo
         dump_child(node.false_expression(), true);
     }
 
+    void ASTDumper::visit(IfExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "IfExpression";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " 'if-else'";
+        _output << std::endl;
+
+        // Dump condition, then expression, and else expression
+        dump_child(node.condition(), false);
+        dump_child(node.then_expression(), false);
+        dump_child(node.else_expression(), true);
+    }
+
     void ASTDumper::visit(ProgramNode &node)
     {
         print_prefix();

@@ -47,6 +47,7 @@ namespace Cryo
         std::unique_ptr<MemberAccessNode> create_member_access(SourceLocation loc, std::unique_ptr<ExpressionNode> object, std::string member);
         std::unique_ptr<ScopeResolutionNode> create_scope_resolution(SourceLocation loc, std::string scope_name, std::string member_name);
         std::unique_ptr<IfStatementNode> create_if_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> then_stmt, std::unique_ptr<StatementNode> else_stmt = nullptr);
+        std::unique_ptr<IfExpressionNode> create_if_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> then_expr, std::unique_ptr<ExpressionNode> else_expr);
         std::unique_ptr<WhileStatementNode> create_while_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> body);
         std::unique_ptr<ForStatementNode> create_for_statement(SourceLocation loc, std::unique_ptr<VariableDeclarationNode> init, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> update, std::unique_ptr<StatementNode> body);
         std::unique_ptr<BreakStatementNode> create_break_statement(SourceLocation loc);

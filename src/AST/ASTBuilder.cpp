@@ -160,6 +160,11 @@ namespace Cryo
         return std::make_unique<IfStatementNode>(loc, std::move(condition), std::move(then_stmt), std::move(else_stmt));
     }
 
+    std::unique_ptr<IfExpressionNode> ASTBuilder::create_if_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> then_expr, std::unique_ptr<ExpressionNode> else_expr)
+    {
+        return std::make_unique<IfExpressionNode>(loc, std::move(condition), std::move(then_expr), std::move(else_expr));
+    }
+
     std::unique_ptr<WhileStatementNode> ASTBuilder::create_while_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> body)
     {
         return std::make_unique<WhileStatementNode>(loc, std::move(condition), std::move(body));

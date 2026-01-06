@@ -2360,6 +2360,12 @@ namespace Cryo
             return parse_boolean_literal();
         }
 
+        // If-expression: if (condition) { expr } else { expr }
+        if (_current_token.is(TokenKind::TK_KW_IF))
+        {
+            return parse_if_expression();
+        }
+
         if (_current_token.is(TokenKind::TK_KW_NULL))
         {
             return parse_null_literal();
@@ -2984,6 +2990,32 @@ namespace Cryo
 
         error("Invalid then statement in if");
         return nullptr;
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_if_expression()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_IF, "Expected 'if'");
+
+        // Parse condition in parentheses
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after 'if' in if-expression");
+        auto condition = parse_expression();
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after condition in if-expression");
+
+        // Parse then branch: { expression }
+        consume(TokenKind::TK_L_BRACE, "Expected '{' for then branch in if-expression");
+        auto then_expr = parse_expression();
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after then expression");
+
+        // Require else branch for if-expressions
+        consume(TokenKind::TK_KW_ELSE, "Expected 'else' in if-expression (both branches required)");
+
+        // Parse else branch: { expression }
+        consume(TokenKind::TK_L_BRACE, "Expected '{' for else branch in if-expression");
+        auto else_expr = parse_expression();
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after else expression");
+
+        return _builder.create_if_expression(start_loc, std::move(condition), std::move(then_expr), std::move(else_expr));
     }
 
     std::unique_ptr<ASTNode> Parser::parse_while_statement()

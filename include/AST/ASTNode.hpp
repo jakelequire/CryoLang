@@ -57,6 +57,7 @@ namespace Cryo
         BinaryExpression,
         UnaryExpression,
         TernaryExpression,
+        IfExpression,
         CallExpression,
         NewExpression,
         SizeofExpression,
@@ -1712,6 +1713,49 @@ namespace Cryo
                     if (func)
                         func->print(os, indent + 4);
                 }
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // If expression (if used as a value: if (cond) { expr } else { expr })
+    class IfExpressionNode : public ExpressionNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _condition;
+        std::unique_ptr<ExpressionNode> _then_expr;
+        std::unique_ptr<ExpressionNode> _else_expr;
+
+    public:
+        IfExpressionNode(SourceLocation loc,
+                         std::unique_ptr<ExpressionNode> condition,
+                         std::unique_ptr<ExpressionNode> then_expr,
+                         std::unique_ptr<ExpressionNode> else_expr)
+            : ExpressionNode(NodeKind::IfExpression, loc), _condition(std::move(condition)),
+              _then_expr(std::move(then_expr)), _else_expr(std::move(else_expr)) {}
+
+        ExpressionNode *condition() const { return _condition.get(); }
+        ExpressionNode *then_expression() const { return _then_expr.get(); }
+        ExpressionNode *else_expression() const { return _else_expr.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "IfExpression:" << std::endl;
+            if (_condition)
+            {
+                os << std::string(indent + 2, ' ') << "Condition:" << std::endl;
+                _condition->print(os, indent + 4);
+            }
+            if (_then_expr)
+            {
+                os << std::string(indent + 2, ' ') << "ThenExpr:" << std::endl;
+                _then_expr->print(os, indent + 4);
+            }
+            if (_else_expr)
+            {
+                os << std::string(indent + 2, ' ') << "ElseExpr:" << std::endl;
+                _else_expr->print(os, indent + 4);
             }
         }
 
