@@ -955,7 +955,6 @@ namespace Cryo
                kind == TokenKind::TK_KW_STRUCT ||
                kind == TokenKind::TK_KW_ENUM ||
                kind == TokenKind::TK_KW_TRAIT ||
-               kind == TokenKind::TK_KW_INTERFACE ||
                kind == TokenKind::TK_KW_IMPLEMENT ||
                kind == TokenKind::TK_KW_EXTERN ||
                kind == TokenKind::TK_KW_INTRINSIC ||
@@ -3423,7 +3422,7 @@ namespace Cryo
         {
             is_mutable = true;
             advance(); // consume 'mut'
-            
+
             // After 'mut', we expect '&this'
             if (!_current_token.is(TokenKind::TK_AMP))
             {
@@ -3463,9 +3462,9 @@ namespace Cryo
 
         // Create a special parameter for 'this'
         auto param = _builder.create_variable_declaration(start_loc, "this", this_type);
-        
+
         // TODO: Add metadata to indicate this is a 'this' parameter and whether it's mutable
-        
+
         return param;
     }
 
@@ -5418,9 +5417,9 @@ namespace Cryo
                _current_token.is(TokenKind::TK_KW_CONST) ||
                _current_token.is(TokenKind::TK_KW_MUT) ||
                _current_token.is(TokenKind::TK_IDENTIFIER) ||
-               _current_token.is(TokenKind::TK_L_PAREN) ||  // Function types: () -> T
-               _current_token.is(TokenKind::TK_R_PAREN) ||  // Function types: (T) -> U
-               _current_token.is(TokenKind::TK_ARROW))      // Function types: T -> U
+               _current_token.is(TokenKind::TK_L_PAREN) || // Function types: () -> T
+               _current_token.is(TokenKind::TK_R_PAREN) || // Function types: (T) -> U
+               _current_token.is(TokenKind::TK_ARROW))     // Function types: T -> U
         {
             // Track angle bracket depth
             if (_current_token.is(TokenKind::TK_L_ANGLE))
