@@ -466,6 +466,35 @@ namespace Cryo
                 {
                     exported_symbols.push_back(intrinsic_decl->name());
                 }
+                else if (auto module_decl = dynamic_cast<ModuleDeclarationNode *>(decl))
+                {
+                    // Handle public module declarations - add re-exported symbol names
+                    if (module_decl->is_public())
+                    {
+                        const std::string &submodule_path = module_decl->module_path();
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Extracting symbols from public module: {}", submodule_path);
+
+                        // Create a synthetic ImportDeclarationNode for the submodule
+                        auto submodule_import = std::make_unique<ImportDeclarationNode>(
+                            module_decl->location(),
+                            submodule_path
+                        );
+
+                        // Load the submodule (will use cache if already loaded)
+                        ImportResult submodule_result = load_import(*submodule_import);
+
+                        if (submodule_result.success)
+                        {
+                            // Add all exported symbols from the submodule
+                            for (const auto &sym_name : submodule_result.exported_symbols)
+                            {
+                                exported_symbols.push_back(sym_name);
+                            }
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added {} exported symbols from submodule '{}'",
+                                      submodule_result.exported_symbols.size(), submodule_path);
+                        }
+                    }
+                }
             }
         }
 
@@ -547,6 +576,47 @@ namespace Cryo
                     Type *intrinsic_type = create_function_type_from_declaration(intrinsic_decl, type_context);
                     Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_decl->location(), intrinsic_type, module_name);
                     symbol_map[intrinsic_decl->name()] = symbol;
+                }
+                else if (auto module_decl = dynamic_cast<ModuleDeclarationNode *>(decl))
+                {
+                    // Handle public module declarations (e.g., "public module core::option;")
+                    // These re-export symbols from submodules
+                    if (module_decl->is_public())
+                    {
+                        const std::string &submodule_path = module_decl->module_path();
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing public module declaration: {}", submodule_path);
+
+                        // Create a synthetic ImportDeclarationNode for the submodule
+                        auto submodule_import = std::make_unique<ImportDeclarationNode>(
+                            module_decl->location(),
+                            submodule_path
+                        );
+
+                        // Recursively load the submodule
+                        ImportResult submodule_result = load_import(*submodule_import);
+
+                        if (submodule_result.success)
+                        {
+                            // Merge submodule symbols into our symbol map
+                            for (const auto &[sym_name, sym] : submodule_result.symbol_map)
+                            {
+                                // Don't overwrite existing symbols
+                                if (symbol_map.find(sym_name) == symbol_map.end())
+                                {
+                                    symbol_map[sym_name] = sym;
+                                    LOG_TRACE(LogComponent::GENERAL, "ModuleLoader: Re-exported symbol '{}' from submodule '{}'",
+                                              sym_name, submodule_path);
+                                }
+                            }
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Merged {} symbols from submodule '{}'",
+                                      submodule_result.symbol_map.size(), submodule_path);
+                        }
+                        else
+                        {
+                            LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Failed to load submodule '{}': {}",
+                                     submodule_path, submodule_result.error_message);
+                        }
+                    }
                 }
             }
         }
