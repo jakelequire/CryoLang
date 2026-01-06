@@ -1510,6 +1510,39 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_error_with_node(ErrorCode error_code, ASTNode *node,
+                                                                     const std::string &message,
+                                                                     const std::string &label)
+    {
+        // Use create_node_span which properly extracts source file from the node
+        SourceSpan span = create_node_span(node);
+
+        // Set a meaningful label
+        if (!label.empty())
+        {
+            span.set_label(label);
+        }
+        else
+        {
+            // Generate label from error code category
+            span.set_label(message.substr(0, std::min(message.size(), size_t(50))));
+        }
+
+        // Get the source file - prefer node's file, fall back to builder's file
+        const std::string &source_file = (node && !node->source_file().empty()) ? node->source_file() : _source_file;
+
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), source_file, message);
+        diagnostic.with_primary_span(span);
+
+        // Mark node as having error to prevent duplicates
+        if (node)
+        {
+            node->mark_error();
+        }
+
+        return diagnostic;
+    }
+
     Diagnostic &TypeCheckerDiagnosticBuilder::create_undefined_variable_error(const std::string &symbol_name,
                                                                               NodeKind symbol_kind,
                                                                               SourceLocation location)
