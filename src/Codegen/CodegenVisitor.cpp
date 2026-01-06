@@ -1011,6 +1011,19 @@ namespace Cryo::Codegen
         }
     }
 
+    void CodegenVisitor::visit(Cryo::IfExpressionNode &node)
+    {
+        NodeTracker tracker(*_ctx, &node);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting IfExpressionNode");
+
+        llvm::Value *result = _expressions->generate_if_expression(&node);
+        if (result)
+        {
+            _ctx->set_result(result);
+            _ctx->register_value(&node, result);
+        }
+    }
+
     void CodegenVisitor::visit(Cryo::CallExpressionNode &node)
     {
         NodeTracker tracker(*_ctx, &node);

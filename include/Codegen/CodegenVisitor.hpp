@@ -160,6 +160,7 @@ namespace Cryo::Codegen
         void visit(Cryo::BinaryExpressionNode &node) override;
         void visit(Cryo::UnaryExpressionNode &node) override;
         void visit(Cryo::TernaryExpressionNode &node) override;
+        void visit(Cryo::IfExpressionNode &node) override;
         void visit(Cryo::CallExpressionNode &node) override;
         void visit(Cryo::NewExpressionNode &node) override;
         void visit(Cryo::SizeofExpressionNode &node) override;
