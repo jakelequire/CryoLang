@@ -5994,7 +5994,7 @@ namespace Cryo
                     if (method_type && method_type->kind() == TypeKind::Function)
                     {
                         FunctionType *func_type = static_cast<FunctionType *>(method_type);
-                        Type *return_type = func_type->return_type();
+                        Type *return_type = func_type->return_type().get();
                         node.set_resolved_type(return_type ? return_type : scope_type);
                         LOG_DEBUG(Cryo::LogComponent::AST, "Resolved static method {}::{} -> {}",
                                   base_scope_name, member_name, return_type ? return_type->name() : scope_type->name());
@@ -6014,7 +6014,7 @@ namespace Cryo
                     if (method_type && method_type->kind() == TypeKind::Function)
                     {
                         FunctionType *func_type = static_cast<FunctionType *>(method_type);
-                        Type *return_type = func_type->return_type();
+                        Type *return_type = func_type->return_type().get();
                         node.set_resolved_type(return_type ? return_type : scope_type);
                         LOG_DEBUG(Cryo::LogComponent::AST, "Resolved private static method {}::{} -> {}",
                                   base_scope_name, member_name, return_type ? return_type->name() : scope_type->name());
