@@ -1429,6 +1429,43 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_operation_error(const std::string &operation,
+                                                                             Type *left_type, Type *right_type,
+                                                                             ASTNode *node)
+    {
+        // Use create_node_span which properly extracts source file from the node
+        SourceSpan span = create_node_span(node);
+
+        std::string left_name = left_type ? left_type->to_string() : "unknown";
+        std::string right_name = right_type ? right_type->to_string() : "unknown";
+
+        if (right_type)
+        {
+            span.set_label("incompatible types for " + operation + " operation");
+        }
+        else
+        {
+            span.set_label("invalid " + operation + " operation on type '" + left_name + "'");
+        }
+
+        std::string message = right_type ? ("Cannot apply '" + operation + "' to types '" + left_name + "' and '" + right_name + "'") : ("Cannot apply '" + operation + "' to type '" + left_name + "'");
+
+        // Get the source file - prefer node's file, fall back to builder's file
+        const std::string &source_file = (node && !node->source_file().empty()) ? node->source_file() : _source_file;
+
+        ErrorCode error_code = right_type ? ErrorCode::E0229_INVALID_BINARY_OP : ErrorCode::E0230_INVALID_UNARY_OP;
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), source_file, message);
+        diagnostic.with_primary_span(span);
+
+        // Mark node as having error to prevent duplicates
+        if (node)
+        {
+            node->mark_error();
+        }
+
+        return diagnostic;
+    }
+
     Diagnostic &TypeCheckerDiagnosticBuilder::create_non_callable_error(Type *type, SourceLocation location, ASTNode *node)
     {
         // Check for duplicate error reporting

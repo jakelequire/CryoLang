@@ -274,6 +274,11 @@ namespace Cryo
                                                    Type *left_type, Type *right_type,
                                                    SourceLocation location);
 
+        // Overload with node for proper source context
+        Diagnostic &create_invalid_operation_error(const std::string &operation,
+                                                   Type *left_type, Type *right_type,
+                                                   ASTNode *node);
+
         Diagnostic &create_non_callable_error(Type *type, SourceLocation location, ASTNode *node = nullptr);
 
         Diagnostic &create_too_many_args_error(const std::string &function_name,
