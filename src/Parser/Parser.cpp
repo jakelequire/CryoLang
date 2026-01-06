@@ -2576,7 +2576,8 @@ namespace Cryo
             {
                 advance(); // consume '::'
 
-                if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                // Allow both identifiers and keywords after :: (for things like T::default())
+                if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
                 {
                     error("Expected identifier after '::'");
                     return nullptr;
@@ -2821,14 +2822,15 @@ namespace Cryo
         {
             advance(); // consume '::'
 
-            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+            // Allow both identifiers and keywords after :: (for things like T::default())
+            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
             {
                 error("Expected identifier after '::'");
                 return _builder.create_identifier_node(token);
             }
 
-            Token member_token = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '::'");
-            std::string member_name = std::string(member_token.text());
+            std::string member_name = std::string(_current_token.text());
+            advance(); // consume the identifier/keyword
 
             return _builder.create_scope_resolution(base_loc, base_name, member_name);
         }
@@ -3327,9 +3329,27 @@ namespace Cryo
             return parse_this_parameter();
         }
 
-        // Parse parameter name
-        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected parameter name");
-        std::string param_name = std::string(name_token.text());
+        // Parse parameter name - allow both identifiers and 'this' keyword (for this: Type syntax)
+        Token name_token;
+        std::string param_name;
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            name_token = _current_token;
+            param_name = std::string(name_token.text());
+            advance();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_THIS))
+        {
+            // Allow 'this' as a parameter name when followed by ':'
+            name_token = _current_token;
+            param_name = "this";
+            advance();
+        }
+        else
+        {
+            error("Expected parameter name");
+            return nullptr;
+        }
 
         // Parse type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
@@ -3341,10 +3361,16 @@ namespace Cryo
 
     bool Parser::is_this_parameter()
     {
-        // Check for patterns: &this, mut &this, this
+        // Check for patterns: &this, mut &this, this (but NOT this: Type)
         if (_current_token.is(TokenKind::TK_KW_THIS))
         {
-            return true; // this (by value)
+            // Check if followed by ':' - if so, it's a regular named parameter like "this: T"
+            Token next = peek_next();
+            if (next.is(TokenKind::TK_COLON))
+            {
+                return false; // this: Type is a regular named parameter, not special 'this' syntax
+            }
+            return true; // this (by value) without explicit type
         }
         else if (_current_token.is(TokenKind::TK_AMP))
         {
