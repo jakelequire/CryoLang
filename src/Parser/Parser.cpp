@@ -3013,8 +3013,9 @@ namespace Cryo
         consume(TokenKind::TK_KW_LOOP, "Expected 'loop'");
 
         // loop { body } is equivalent to while(true) { body }
-        // Create a boolean true literal as the condition
-        auto condition = _builder.create_boolean_literal(start_loc, true);
+        // Create a synthetic "true" token for the condition
+        Token true_token(TokenKind::TK_KW_TRUE, "true", start_loc);
+        auto condition = _builder.create_literal_node(true_token);
 
         auto body = parse_statement();
         if (auto stmt = dynamic_cast<StatementNode *>(body.get()))
