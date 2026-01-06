@@ -2638,6 +2638,66 @@ namespace Cryo
                     advance();
                     expr = _builder.create_unary_expression(op, std::move(expr));
                 }
+                else if (_current_token.is(TokenKind::TK_L_BRACE))
+                {
+                    // Struct literal initialization: TypeName { field: value, ... }
+                    // Only valid if expr is an identifier or scope resolution
+                    std::string struct_name;
+                    SourceLocation literal_location;
+
+                    if (auto identifier = dynamic_cast<IdentifierNode *>(expr.get()))
+                    {
+                        struct_name = identifier->name();
+                        literal_location = identifier->location();
+                    }
+                    else if (auto scope_res = dynamic_cast<ScopeResolutionNode *>(expr.get()))
+                    {
+                        // For generic types like MaybeUninit<T>
+                        struct_name = scope_res->scope_name() + "::" + scope_res->member_name();
+                        literal_location = scope_res->location();
+                    }
+                    else
+                    {
+                        // Not a valid struct literal context
+                        break;
+                    }
+
+                    advance(); // consume '{'
+
+                    auto struct_literal = _builder.create_struct_literal(literal_location, struct_name);
+
+                    // Parse field initializers
+                    if (!_current_token.is(TokenKind::TK_R_BRACE))
+                    {
+                        do
+                        {
+                            // Parse field name
+                            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                            {
+                                error("Expected field name in struct literal");
+                                return nullptr;
+                            }
+
+                            std::string field_name = std::string(_current_token.text());
+                            advance();
+
+                            // Expect ':'
+                            consume(TokenKind::TK_COLON, "Expected ':' after field name");
+
+                            // Parse field value
+                            auto field_value = parse_expression();
+
+                            // Create field initializer
+                            auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                            struct_literal->add_field_initializer(std::move(field_init));
+
+                        } while (match(TokenKind::TK_COMMA));
+                    }
+
+                    consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
+
+                    expr = std::move(struct_literal);
+                }
                 else
                 {
                     // No more postfix operations
