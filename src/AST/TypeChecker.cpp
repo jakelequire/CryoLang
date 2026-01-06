@@ -3212,7 +3212,7 @@ namespace Cryo
                                 std::string left_name = left_type ? left_type->to_string() : "unknown";
                                 std::string right_name = right_type ? right_type->to_string() : "unknown";
                                 report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                             "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'");
+                                             "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'", &node);
                             }
                             node.set_resolved_type(_type_context.get_unknown_type());
                         }
@@ -8420,13 +8420,70 @@ namespace Cryo
             return; // Skip duplicate error reporting
         }
 
+        // If we have a diagnostic builder and a node, use the enhanced error reporting with code context
+        if (_diagnostic_builder && node)
+        {
+            ErrorCode error_code = ErrorCode::E0805_INTERNAL_ERROR;
+
+            // Map TypeError::ErrorKind to ErrorCode
+            switch (kind)
+            {
+            case TypeError::ErrorKind::TypeMismatch:
+                error_code = ErrorCode::E0200_TYPE_MISMATCH;
+                break;
+            case TypeError::ErrorKind::UndefinedVariable:
+                error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
+                break;
+            case TypeError::ErrorKind::UndefinedFunction:
+                error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
+                break;
+            case TypeError::ErrorKind::RedefinedSymbol:
+                error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
+                break;
+            case TypeError::ErrorKind::InvalidOperation:
+                error_code = ErrorCode::E0209_INVALID_OPERATION;
+                break;
+            case TypeError::ErrorKind::InvalidAssignment:
+                error_code = ErrorCode::E0210_INVALID_ASSIGNMENT;
+                break;
+            case TypeError::ErrorKind::InvalidCast:
+                error_code = ErrorCode::E0208_INVALID_CAST;
+                break;
+            case TypeError::ErrorKind::IncompatibleTypes:
+                error_code = ErrorCode::E0211_INCOMPATIBLE_TYPES;
+                break;
+            case TypeError::ErrorKind::TooManyArguments:
+                error_code = ErrorCode::E0215_TOO_MANY_ARGS;
+                break;
+            case TypeError::ErrorKind::TooFewArguments:
+                error_code = ErrorCode::E0216_TOO_FEW_ARGS;
+                break;
+            case TypeError::ErrorKind::NonCallableType:
+                error_code = ErrorCode::E0213_NON_CALLABLE;
+                break;
+            case TypeError::ErrorKind::VoidValueUsage:
+                error_code = ErrorCode::E0212_VOID_VALUE_USED;
+                break;
+            default:
+                error_code = ErrorCode::E0805_INTERNAL_ERROR;
+                break;
+            }
+
+            // Use the new method that provides full source code context
+            _diagnostic_builder->create_error_with_node(error_code, node, message);
+
+            // Also add to internal errors for has_errors() check
+            _errors.emplace_back(kind, loc, message);
+            return;
+        }
+
         // Mark this node as having an error
         if (node)
         {
             node->mark_error();
         }
 
-        // Delegate to the original report_error method
+        // Delegate to the original report_error method (no node context)
         report_error(kind, loc, message);
     }
 
