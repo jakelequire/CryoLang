@@ -2158,13 +2158,13 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_bitwise_and()
     {
-        auto expr = parse_cast();
+        auto expr = parse_relational();
 
         while (_current_token.is(TokenKind::TK_AMP))
         {
             Token op = _current_token;
             advance();
-            auto right = parse_cast();
+            auto right = parse_relational();
             expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
         }
 
@@ -2173,7 +2173,7 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_cast()
     {
-        auto expr = parse_relational();
+        auto expr = parse_unary();
 
         // Handle type casts: expression as TargetType
         while (_current_token.is(TokenKind::TK_KW_AS))
@@ -2272,13 +2272,13 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_multiplicative()
     {
-        auto expr = parse_unary();
+        auto expr = parse_cast();
 
         while (_current_token.is(TokenKind::TK_STAR) || _current_token.is(TokenKind::TK_SLASH) || _current_token.is(TokenKind::TK_PERCENT))
         {
             Token op = _current_token;
             advance();
-            auto right = parse_unary();
+            auto right = parse_cast();
             expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
         }
 
