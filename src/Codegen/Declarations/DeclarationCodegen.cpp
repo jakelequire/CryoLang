@@ -409,20 +409,33 @@ namespace Cryo::Codegen
                 if (is_struct_value_type && var_type->isStructTy() && init_val->getType()->isPointerTy())
                 {
                     // The init_val is a pointer to the struct data, memcpy to our alloca
-                    auto &data_layout = module()->getDataLayout();
-                    uint64_t size = data_layout.getTypeAllocSize(var_type);
+                    // Check if the struct type is sized before computing size
+                    if (!var_type->isSized())
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "DeclarationCodegen: Struct type for '{}' is opaque, using store instead of memcpy",
+                                 name);
+                        // Fall back to store for unsized types
+                        llvm::Value *cast_val = cast_if_needed(init_val, var_type);
+                        create_store(cast_val, alloca);
+                    }
+                    else
+                    {
+                        auto &data_layout = module()->getDataLayout();
+                        uint64_t size = data_layout.getTypeAllocSize(var_type);
 
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "DeclarationCodegen: Struct initialization via memcpy for '{}', size {} bytes",
-                              name, size);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Struct initialization via memcpy for '{}', size {} bytes",
+                                  name, size);
 
-                    builder().CreateMemCpy(
-                        alloca,                                                    // dest
-                        llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // dest align
-                        init_val,                                                  // src
-                        llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // src align
-                        size                                                       // size
-                    );
+                        builder().CreateMemCpy(
+                            alloca,                                                    // dest
+                            llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // dest align
+                            init_val,                                                  // src
+                            llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // src align
+                            size                                                       // size
+                        );
+                    }
                 }
                 else
                 {
@@ -807,13 +820,13 @@ namespace Cryo::Codegen
                 for (const auto &type_name : variant->associated_types())
                 {
                     llvm::Type *field_type = types().get_type(type_name);
-                    if (field_type)
+                    if (field_type && field_type->isSized())
                     {
                         variant_payload += module()->getDataLayout().getTypeAllocSize(field_type);
                     }
                     else
                     {
-                        // Default to 8 bytes for unknown types
+                        // Default to 8 bytes for unknown or unsized types
                         variant_payload += 8;
                     }
                 }
@@ -954,7 +967,15 @@ namespace Cryo::Codegen
             field_ptr = ctor_builder.CreateBitCast(field_ptr, llvm::PointerType::get(arg_type, 0));
             ctor_builder.CreateStore(&arg, field_ptr);
 
-            offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+            // Calculate size of argument type, with safety check for unsized types
+            if (arg_type->isSized())
+            {
+                offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+            }
+            else
+            {
+                offset += 8; // Default to pointer size for unsized types
+            }
             arg_idx++;
         }
 

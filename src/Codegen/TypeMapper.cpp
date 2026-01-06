@@ -382,6 +382,15 @@ namespace Cryo::Codegen
         if (!type || !module())
             return 0;
 
+        // Check if the type is sized before computing size
+        // Opaque structs (structs without a body) are unsized and would cause LLVM to assert
+        if (!type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "TypeMapper::size_of called on unsized type, returning 0");
+            return 0;
+        }
+
         const llvm::DataLayout &layout = module()->getDataLayout();
         return layout.getTypeAllocSize(type);
     }
@@ -390,6 +399,15 @@ namespace Cryo::Codegen
     {
         if (!type || !module())
             return 1;
+
+        // Check if the type is sized before computing alignment
+        // Opaque structs (structs without a body) are unsized
+        if (!type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "TypeMapper::align_of called on unsized type, returning default alignment");
+            return 8; // Default to 8-byte alignment for unsized types
+        }
 
         const llvm::DataLayout &layout = module()->getDataLayout();
         return layout.getABITypeAlign(type).value();

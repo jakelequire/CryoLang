@@ -938,7 +938,7 @@ namespace Cryo::Codegen
             {
                 // Get the struct type to determine size
                 llvm::Type *struct_type = resolve_type_by_name(value_resolved_type->to_string());
-                if (struct_type && struct_type->isStructTy())
+                if (struct_type && struct_type->isStructTy() && struct_type->isSized())
                 {
                     auto &data_layout = ctx().module()->getDataLayout();
                     uint64_t size = data_layout.getTypeAllocSize(struct_type);
@@ -956,6 +956,7 @@ namespace Cryo::Codegen
                     );
                     return ptr;
                 }
+                // If struct is opaque/unsized, fall through to standard store path
             }
         }
 
