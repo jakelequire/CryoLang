@@ -403,6 +403,15 @@ namespace Cryo::Codegen
         if (!type)
             return 0;
 
+        // Check if the type is sized before computing size
+        // Opaque structs (structs without a body) are unsized and would cause LLVM to assert
+        if (!type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "TypeCodegen::get_type_size called on unsized type, returning 0");
+            return 0;
+        }
+
         const llvm::DataLayout &dl = module()->getDataLayout();
         return dl.getTypeAllocSize(type);
     }
@@ -412,6 +421,15 @@ namespace Cryo::Codegen
         if (!type)
             return 0;
 
+        // Check if the type is sized before computing alignment
+        // Opaque structs (structs without a body) are unsized
+        if (!type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "TypeCodegen::get_type_alignment called on unsized type, returning default alignment");
+            return 8; // Default to 8-byte alignment
+        }
+
         const llvm::DataLayout &dl = module()->getDataLayout();
         return dl.getABITypeAlign(type).value();
     }
@@ -420,6 +438,14 @@ namespace Cryo::Codegen
     {
         if (!struct_type || field_index >= struct_type->getNumElements())
             return 0;
+
+        // Check if the struct is opaque (unsized) before computing layout
+        if (struct_type->isOpaque())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "TypeCodegen::get_field_offset called on opaque struct, returning 0");
+            return 0;
+        }
 
         const llvm::DataLayout &dl = module()->getDataLayout();
         const llvm::StructLayout *layout = dl.getStructLayout(struct_type);

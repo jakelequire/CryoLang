@@ -1374,6 +1374,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Check if type is sized before computing size
+        if (!llvm_type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: sizeof called on unsized type '{}', returning 0",
+                     node->type_name());
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
+        }
+
         // Generate sizeof using LLVM type
         auto &context = llvm_ctx();
         auto &data_layout = module()->getDataLayout();
@@ -1394,6 +1403,15 @@ namespace Cryo::Codegen
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
         }
 
+        // Check if type is sized before computing size
+        if (!llvm_type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: sizeof called on unsized type '{}', returning 0",
+                     type->to_string());
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
+        }
+
         const llvm::DataLayout &dl = module()->getDataLayout();
         uint64_t size = dl.getTypeAllocSize(llvm_type);
 
@@ -1411,6 +1429,15 @@ namespace Cryo::Codegen
         if (!llvm_type)
         {
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1);
+        }
+
+        // Check if type is sized before computing alignment
+        if (!llvm_type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: alignof called on unsized type '{}', returning default alignment",
+                     type->to_string());
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 8);
         }
 
         const llvm::DataLayout &dl = module()->getDataLayout();
@@ -2122,9 +2149,20 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Calculate size
+        // Calculate size (with safety check for unsized types)
         const llvm::DataLayout &dl = module()->getDataLayout();
-        uint64_t size = dl.getTypeAllocSize(alloc_type);
+        uint64_t size;
+        if (alloc_type->isSized())
+        {
+            size = dl.getTypeAllocSize(alloc_type);
+        }
+        else
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: new expression for unsized type '{}', using default size",
+                     node->type_name());
+            size = 8; // Default to pointer size for unsized types
+        }
 
         // Call cryo_alloc (runtime heap allocator)
         llvm::Function *cryo_alloc_fn = module()->getFunction("std::Runtime::cryo_alloc");
