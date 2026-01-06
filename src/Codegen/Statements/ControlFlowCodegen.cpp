@@ -1008,11 +1008,23 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating return");
 
+        // Safety check: ensure we have a valid insert point
+        llvm::BasicBlock *current_block = builder().GetInsertBlock();
+        if (!current_block)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "generate_return: No valid insert block, skipping return generation");
+            return;
+        }
+
         // Get the current function's return type
-        llvm::Function *current_fn = builder().GetInsertBlock()
-                                         ? builder().GetInsertBlock()->getParent()
-                                         : nullptr;
-        llvm::Type *expected_ret_type = current_fn ? current_fn->getReturnType() : nullptr;
+        llvm::Function *current_fn = current_block->getParent();
+        if (!current_fn)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "generate_return: Insert block has no parent function, skipping return generation");
+            return;
+        }
+
+        llvm::Type *expected_ret_type = current_fn->getReturnType();
 
         if (node && node->expression())
         {

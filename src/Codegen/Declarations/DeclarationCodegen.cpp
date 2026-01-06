@@ -275,6 +275,9 @@ namespace Cryo::Codegen
         if (llvm::verifyFunction(*fn, &llvm::errs()))
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function verification failed: {}", name);
+            // Clear the builder's insert point before erasing the function
+            // to prevent dangling pointers to the deleted basic blocks
+            builder().ClearInsertionPoint();
             fn->eraseFromParent();
             return nullptr;
         }
