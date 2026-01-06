@@ -470,6 +470,9 @@ namespace Cryo
         void report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context);
         void report_undefined_symbol(SourceLocation loc, const std::string &symbol_name);
         void report_redefined_symbol(SourceLocation loc, const std::string &symbol_name);
+        // Overloads with node for proper source context
+        void report_undefined_symbol(ASTNode *node, const std::string &symbol_name);
+        void report_redefined_symbol(ASTNode *node, const std::string &symbol_name);
 
         // Symbol table helpers
         void enter_scope();

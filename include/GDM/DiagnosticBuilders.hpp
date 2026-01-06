@@ -245,6 +245,10 @@ namespace Cryo
         Diagnostic &create_redefined_symbol_error(const std::string &symbol_name,
                                                   NodeKind symbol_kind,
                                                   SourceLocation location);
+        // Overload with node for proper source context
+        Diagnostic &create_redefined_symbol_error(const std::string &symbol_name,
+                                                  NodeKind symbol_kind,
+                                                  ASTNode *node);
 
         // Access and dereference errors
         Diagnostic &create_invalid_member_access_error(const std::string &member_name,
