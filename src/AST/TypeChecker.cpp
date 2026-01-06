@@ -6783,7 +6783,7 @@ namespace Cryo
                             if (!_stdlib_compilation_mode)
                             {
                                 // Use VariableDeclaration as NodeKind since enum variants are essentially constant variables
-                                _diagnostic_builder->create_redefined_symbol_error(variant_name, NodeKind::VariableDeclaration, variant);
+                                _diagnostic_builder->create_redefined_symbol_error(variant_name, NodeKind::VariableDeclaration, variant.get());
                             }
                             // In stdlib mode, silently skip all redefinition errors for enum variants
                         }
