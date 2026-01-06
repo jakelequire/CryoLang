@@ -55,6 +55,7 @@ namespace Cryo
         {"default", TokenKind::TK_KW_DEFAULT},
         {"while", TokenKind::TK_KW_WHILE},
         {"for", TokenKind::TK_KW_FOR},
+        {"loop", TokenKind::TK_KW_LOOP},
         {"do", TokenKind::TK_KW_DO},
         {"break", TokenKind::TK_KW_BREAK},
         {"continue", TokenKind::TK_KW_CONTINUE},
@@ -504,8 +505,14 @@ namespace Cryo
                 advance(); // consume 'x' or 'X'
                 const char *hex_start = _current;
 
-                while (!at_end() && is_hex_digit(peek()))
+                while (!at_end() && (is_hex_digit(peek()) || peek() == '_'))
                 {
+                    // Skip underscores but don't count them as digits
+                    if (peek() == '_')
+                    {
+                        advance();
+                        continue;
+                    }
                     advance();
                 }
 
@@ -530,8 +537,14 @@ namespace Cryo
                 advance(); // consume 'b' or 'B'
                 const char *bin_start = _current;
 
-                while (!at_end() && (peek() == '0' || peek() == '1'))
+                while (!at_end() && (peek() == '0' || peek() == '1' || peek() == '_'))
                 {
+                    // Skip underscores but don't count them as digits
+                    if (peek() == '_')
+                    {
+                        advance();
+                        continue;
+                    }
                     advance();
                 }
 
@@ -556,8 +569,14 @@ namespace Cryo
                 advance(); // consume 'o' or 'O'
                 const char *oct_start = _current;
 
-                while (!at_end() && peek() >= '0' && peek() <= '7')
+                while (!at_end() && ((peek() >= '0' && peek() <= '7') || peek() == '_'))
                 {
+                    // Skip underscores but don't count them as digits
+                    if (peek() == '_')
+                    {
+                        advance();
+                        continue;
+                    }
                     advance();
                 }
 
@@ -579,8 +598,15 @@ namespace Cryo
         }
 
         // Regular decimal number - consume remaining digits (for all numbers, including those starting with 0)
-        while (!at_end() && is_digit(peek()))
+        // Also allow underscores as visual separators (e.g., 1_000_000)
+        while (!at_end() && (is_digit(peek()) || peek() == '_'))
         {
+            // Skip underscores but don't count them as digits
+            if (peek() == '_')
+            {
+                advance();
+                continue;
+            }
             advance();
         }
 
@@ -594,8 +620,13 @@ namespace Cryo
                 if (is_digit(next_char))
                 {
                     advance(); // consume '.'
-                    while (!at_end() && is_digit(peek()))
+                    while (!at_end() && (is_digit(peek()) || peek() == '_'))
                     {
+                        if (peek() == '_')
+                        {
+                            advance();
+                            continue;
+                        }
                         advance();
                     }
                 }
@@ -610,8 +641,13 @@ namespace Cryo
             {
                 advance();
             }
-            while (!at_end() && is_digit(peek()))
+            while (!at_end() && (is_digit(peek()) || peek() == '_'))
             {
+                if (peek() == '_')
+                {
+                    advance();
+                    continue;
+                }
                 advance();
             }
         }

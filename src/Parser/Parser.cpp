@@ -1326,6 +1326,10 @@ namespace Cryo
         {
             statement = parse_for_statement();
         }
+        else if (_current_token.is(TokenKind::TK_KW_LOOP))
+        {
+            statement = parse_loop_statement();
+        }
         else if (_current_token.is(TokenKind::TK_KW_MATCH))
         {
             statement = parse_match_statement();
@@ -3000,6 +3004,27 @@ namespace Cryo
         }
 
         error("Invalid body statement in while");
+        return nullptr;
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_loop_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_LOOP, "Expected 'loop'");
+
+        // loop { body } is equivalent to while(true) { body }
+        // Create a boolean true literal as the condition
+        auto condition = _builder.create_boolean_literal(start_loc, true);
+
+        auto body = parse_statement();
+        if (auto stmt = dynamic_cast<StatementNode *>(body.get()))
+        {
+            body.release();
+            auto body_stmt = std::unique_ptr<StatementNode>(stmt);
+            return _builder.create_while_statement(start_loc, std::move(condition), std::move(body_stmt));
+        }
+
+        error("Invalid body statement in loop");
         return nullptr;
     }
 
