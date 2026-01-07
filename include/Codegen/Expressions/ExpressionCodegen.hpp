@@ -318,6 +318,13 @@ namespace Cryo::Codegen
          */
         llvm::Value *generate_ternary(Cryo::TernaryExpressionNode *node);
 
+        /**
+         * @brief Generate if-expression (if as a value)
+         * @param node If expression node
+         * @return Result value
+         */
+        llvm::Value *generate_if_expression(Cryo::IfExpressionNode *node);
+
         //===================================================================
         // Helpers
         //===================================================================

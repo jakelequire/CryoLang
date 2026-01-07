@@ -1712,13 +1712,31 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "Processing imported module: {}", module_name);
             LOG_DEBUG(Cryo::LogComponent::AST, "Module has {} statements", ast->statements().size());
 
-            // Set the source file context to this imported module for proper error attribution
-            // This is particularly important for stdlib modules to avoid attributing errors to user code
-            std::string module_file = module_name + ".cryo"; // Simple mapping for now
-            if (module_name.find("/") != std::string::npos)
+            // Try to get the actual source file from the AST node itself
+            // The Parser should have set this from the lexer's file path
+            std::string module_file = ast->source_file();
+
+            // If the AST doesn't have source_file set, try to get it from child nodes
+            if (module_file.empty() && !ast->statements().empty())
             {
-                // For stdlib paths like "core/types", construct the stdlib path
-                module_file = "stdlib/" + module_name + ".cryo";
+                for (const auto &stmt : ast->statements())
+                {
+                    if (stmt && !stmt->source_file().empty())
+                    {
+                        module_file = stmt->source_file();
+                        break;
+                    }
+                }
+            }
+
+            // Fallback to constructing path from module name if no source file found
+            if (module_file.empty())
+            {
+                module_file = module_name + ".cryo";
+                if (module_name.find("/") != std::string::npos)
+                {
+                    module_file = "stdlib/" + module_name + ".cryo";
+                }
             }
 
             // Use set_source_file to properly update both _source_file and _diagnostic_builder
@@ -1942,11 +1960,11 @@ namespace Cryo
             // Set expected type context for contextual typing (especially important for array literals)
             Type *previous_expected_type = _current_expected_type;
             _current_expected_type = declared_type;
-            
+
             // Visit the initializer to determine its type
             node.initializer()->accept(*this);
             inferred_type = node.initializer()->get_resolved_type();
-            
+
             // Restore previous expected type context
             _current_expected_type = previous_expected_type;
         }
@@ -2055,7 +2073,7 @@ namespace Cryo
             if (should_report_error)
             {
                 LOG_ERROR(Cryo::LogComponent::AST, "TypeChecker::visit(VariableDeclarationNode): Failed to declare variable '{}' - already exists! stdlib_compilation_mode={}", var_name, _stdlib_compilation_mode);
-                _diagnostic_builder->create_redefined_symbol_error(var_name, NodeKind::VariableDeclaration, node.location());
+                _diagnostic_builder->create_redefined_symbol_error(var_name, NodeKind::VariableDeclaration, &node);
             }
         }
         else
@@ -2309,13 +2327,13 @@ namespace Cryo
                         }
                         else
                         {
-                            _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                            _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, &node);
                         }
                     }
                     else
                     {
                         // If we can't determine the existing symbol type, report the error as usual
-                        _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                        _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, &node);
                     }
                 }
             }
@@ -2434,7 +2452,7 @@ namespace Cryo
             // Intrinsic not loaded yet - declare it now
             if (!_symbol_table->declare_symbol(func_name, func_type, node.location()))
             {
-                _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, node.location());
+                _diagnostic_builder->create_redefined_symbol_error(func_name, NodeKind::FunctionDeclaration, &node);
             }
         }
 
@@ -2474,7 +2492,7 @@ namespace Cryo
             // Register the intrinsic constant in symbol table
             if (!_symbol_table->declare_symbol(const_name, const_type, node.location()))
             {
-                _diagnostic_builder->create_redefined_symbol_error(const_name, NodeKind::IntrinsicConstDeclaration, node.location());
+                _diagnostic_builder->create_redefined_symbol_error(const_name, NodeKind::IntrinsicConstDeclaration, &node);
                 return;
             }
         }
@@ -2523,7 +2541,7 @@ namespace Cryo
     {
         if (!_in_function)
         {
-            _diagnostic_builder->create_invalid_operation_error("return", nullptr, nullptr, node.location());
+            _diagnostic_builder->create_invalid_operation_error("return", nullptr, nullptr, &node);
             return;
         }
 
@@ -2742,10 +2760,10 @@ namespace Cryo
 
     void TypeChecker::visit(ModuleDeclarationNode &node)
     {
-        LOG_DEBUG(Cryo::LogComponent::AST, "Processing module declaration: {} (public: {})", 
+        LOG_DEBUG(Cryo::LogComponent::AST, "Processing module declaration: {} (public: {})",
                   node.module_path(), node.is_public() ? "yes" : "no");
-        
-        // Module declarations are processed during module loading, 
+
+        // Module declarations are processed during module loading,
         // so we just log them here for type checking purposes
     }
 
@@ -2997,8 +3015,8 @@ namespace Cryo
             else
             {
                 // Only report the error if none of the fallback mechanisms worked
-                _diagnostic_builder->create_undefined_symbol_error(name, NodeKind::VariableDeclaration, node.location());
-                report_undefined_symbol(node.location(), name);
+                // Use node-based reporting for proper source context
+                report_undefined_symbol(&node, name);
                 node.set_resolved_type(_type_context.get_unknown_type());
             }
         }
@@ -3069,8 +3087,8 @@ namespace Cryo
                     // For other operations, types should be compatible
                     Type *result_type = nullptr;
 
-                    // Arithmetic operations
-                    if (op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS || op == TokenKind::TK_STAR || op == TokenKind::TK_SLASH)
+                    // Arithmetic operations (including modulo)
+                    if (op == TokenKind::TK_PLUS || op == TokenKind::TK_MINUS || op == TokenKind::TK_STAR || op == TokenKind::TK_SLASH || op == TokenKind::TK_PERCENT)
                     {
                         // Handle string concatenation for + operator
                         if (op == TokenKind::TK_PLUS && left_type->name() == "string" && right_type->name() == "string")
@@ -3168,6 +3186,30 @@ namespace Cryo
                                           left_type->to_string(), right_type->to_string());
                                 result_type = right_type; // int literal promotes to specific integer type
                             }
+                            // Allow arithmetic between any two integer types (e.g., u32 / u8, i64 + u32)
+                            // Use the wider type as the result type
+                            else if (left_type->is_integral() && right_type->is_integral())
+                            {
+                                // Determine which type is "wider" based on bit width
+                                auto get_int_width = [](const std::string &name) -> int {
+                                    if (name == "i8" || name == "u8") return 8;
+                                    if (name == "i16" || name == "u16") return 16;
+                                    if (name == "i32" || name == "u32" || name == "int") return 32;
+                                    if (name == "i64" || name == "u64") return 64;
+                                    if (name == "i128" || name == "u128") return 128;
+                                    if (name == "char") return 8;
+                                    return 32; // default
+                                };
+                                int left_width = get_int_width(left_type->name());
+                                int right_width = get_int_width(right_type->name());
+                                result_type = (left_width >= right_width) ? left_type : right_type;
+                                const char* op_str = (op == TokenKind::TK_PLUS ? "+" :
+                                                     (op == TokenKind::TK_MINUS ? "-" :
+                                                     (op == TokenKind::TK_STAR ? "*" :
+                                                     (op == TokenKind::TK_SLASH ? "/" : "%"))));
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing mixed integer arithmetic: {} {} {} = {}",
+                                          left_type->to_string(), op_str, right_type->to_string(), result_type->to_string());
+                            }
                             else
                             {
                                 report_type_mismatch(node.location(), left_type, right_type,
@@ -3179,7 +3221,7 @@ namespace Cryo
                             if (_diagnostic_builder)
                             {
                                 LOG_ERROR(Cryo::LogComponent::GENERAL, "TYPECHECKER DEBUG: Using diagnostic builder for arithmetic error");
-                                _diagnostic_builder->create_invalid_operation_error("arithmetic", left_type, right_type, node.location());
+                                _diagnostic_builder->create_invalid_operation_error("arithmetic", left_type, right_type, &node);
                             }
                             else
                             {
@@ -3188,7 +3230,7 @@ namespace Cryo
                                 std::string left_name = left_type ? left_type->to_string() : "unknown";
                                 std::string right_name = right_type ? right_type->to_string() : "unknown";
                                 report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
-                                             "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'");
+                                             "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'", &node);
                             }
                             node.set_resolved_type(_type_context.get_unknown_type());
                         }
@@ -3205,7 +3247,7 @@ namespace Cryo
                         else
                         {
                             std::string op_str = (op == TokenKind::TK_LESSLESS) ? "<<" : ">>";
-                            _diagnostic_builder->create_invalid_operation_error(op_str, left_type, right_type, node.location());
+                            _diagnostic_builder->create_invalid_operation_error(op_str, left_type, right_type, &node);
                             node.set_resolved_type(_type_context.get_unknown_type());
                         }
                     }
@@ -3232,6 +3274,23 @@ namespace Cryo
                             is_null_comparison = true;
                         }
 
+                        // Allow null comparisons with parameterized/generic types (e.g., ListNode<T> == null)
+                        // These types are typically heap-allocated and can be null
+                        if (!is_null_comparison)
+                        {
+                            if ((left_type->kind() == TypeKind::Null && right_type->kind() == TypeKind::Parameterized) ||
+                                (right_type->kind() == TypeKind::Null && left_type->kind() == TypeKind::Parameterized))
+                            {
+                                is_null_comparison = true;
+                            }
+                            // Also check for generic struct types (types containing <T> or similar)
+                            if ((left_str == "null" && right_str.find("<") != std::string::npos) ||
+                                (right_str == "null" && left_str.find("<") != std::string::npos))
+                            {
+                                is_null_comparison = true;
+                            }
+                        }
+
                         // Special handling for mixed integer type comparisons
                         bool is_mixed_integer_comparison = false;
                         if (left_type->is_integral() && right_type->is_integral())
@@ -3248,7 +3307,7 @@ namespace Cryo
                         }
                         else
                         {
-                            _diagnostic_builder->create_invalid_operation_error("comparison", left_type, right_type, node.location());
+                            _diagnostic_builder->create_invalid_operation_error("comparison", left_type, right_type, &node);
                         }
                     }
 
@@ -3332,7 +3391,7 @@ namespace Cryo
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: Cannot dereference non-pointer type '{}' (kind={})",
                                   operand_type->to_string(), TypeKindToString(operand_type->kind()));
-                        _diagnostic_builder->create_invalid_operation_error("dereference", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("dereference", operand_type, nullptr, &node);
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -3344,7 +3403,7 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("unary minus", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("unary minus", operand_type, nullptr, &node);
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
@@ -3356,7 +3415,7 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("logical NOT", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("logical NOT", operand_type, nullptr, &node);
                     }
                 }
                 else if (op == TokenKind::TK_PLUSPLUS) // Increment operator (++ prefix or postfix)
@@ -3368,7 +3427,7 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("increment", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("increment", operand_type, nullptr, &node);
                     }
                 }
                 else if (op == TokenKind::TK_MINUSMINUS) // Decrement operator (-- prefix or postfix)
@@ -3380,7 +3439,7 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("decrement", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("decrement", operand_type, nullptr, &node);
                     }
                 }
                 else if (op == TokenKind::TK_TILDE) // Bitwise NOT (~)
@@ -3392,13 +3451,13 @@ namespace Cryo
                     }
                     else
                     {
-                        _diagnostic_builder->create_invalid_operation_error("bitwise NOT", operand_type, nullptr, node.location());
+                        _diagnostic_builder->create_invalid_operation_error("bitwise NOT", operand_type, nullptr, &node);
                         node.set_resolved_type(_type_context.get_unknown_type());
                     }
                 }
                 else
                 {
-                    _diagnostic_builder->create_invalid_operation_error(node.operator_token().to_string(), operand_type, nullptr, node.location());
+                    _diagnostic_builder->create_invalid_operation_error(node.operator_token().to_string(), operand_type, nullptr, &node);
                 }
             }
         }
@@ -4050,12 +4109,12 @@ namespace Cryo
                 {
                     _current_expected_type = expected_element_type;
                 }
-                
+
                 element->accept(*this);
-                
+
                 // Restore previous expected type
                 _current_expected_type = previous_expected;
-                
+
                 if (element->has_resolved_type())
                 {
                     Type *element_type = element->get_resolved_type();
@@ -5199,15 +5258,6 @@ namespace Cryo
         else
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_methods map", lookup_type_name);
-            LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_methods:");
-            for (const auto &[type_name, methods] : _struct_methods)
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "  - Type '{}' has {} methods", type_name, methods.size());
-                for (const auto &[method_name, method_type] : methods)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "    - Method '{}' -> {}", method_name, method_type->to_string());
-                }
-            }
 
             // Fallback for well-known stdlib generic types that might not be imported
             if (effective_type && effective_type->kind() == TypeKind::Parameterized)
@@ -5626,17 +5676,6 @@ namespace Cryo
                   effective_type ? TypeKindToString(effective_type->kind()) : "null",
                   lookup_type_name);
 
-        // Log all available methods in _struct_methods for debugging
-        LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_methods:");
-        for (const auto &type_methods : _struct_methods)
-        {
-            LOG_DEBUG(Cryo::LogComponent::AST, "  Type '{}' has {} methods", type_methods.first, type_methods.second.size());
-            for (const auto &method : type_methods.second)
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "    Method: '{}'", method.first);
-            }
-        }
-
         // Before failing, check base class methods for classes
         if (effective_type && effective_type->kind() == TypeKind::Class)
         {
@@ -5998,10 +6037,77 @@ namespace Cryo
             return;
         }
 
-        // Verify it's an enum type
+        // Handle struct/class types for static method calls (e.g., Duration::new(), SystemTime::now())
+        if (scope_type->kind() == TypeKind::Struct || scope_type->kind() == TypeKind::Class)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Scope resolution on struct/class type: {}::{}", base_scope_name, member_name);
+
+            // Look up the static method in _struct_methods
+            auto struct_methods_it = _struct_methods.find(base_scope_name);
+            if (struct_methods_it != _struct_methods.end())
+            {
+                auto method_it = struct_methods_it->second.find(member_name);
+                if (method_it != struct_methods_it->second.end())
+                {
+                    Type *method_type = method_it->second;
+                    if (method_type && method_type->kind() == TypeKind::Function)
+                    {
+                        FunctionType *func_type = static_cast<FunctionType *>(method_type);
+                        Type *return_type = func_type->return_type().get();
+                        node.set_resolved_type(return_type ? return_type : scope_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved static method {}::{} -> {}",
+                                  base_scope_name, member_name, return_type ? return_type->name() : scope_type->name());
+                        return;
+                    }
+                }
+            }
+
+            // Also check private methods
+            auto private_methods_it = _private_struct_methods.find(base_scope_name);
+            if (private_methods_it != _private_struct_methods.end())
+            {
+                auto method_it = private_methods_it->second.find(member_name);
+                if (method_it != private_methods_it->second.end())
+                {
+                    Type *method_type = method_it->second;
+                    if (method_type && method_type->kind() == TypeKind::Function)
+                    {
+                        FunctionType *func_type = static_cast<FunctionType *>(method_type);
+                        Type *return_type = func_type->return_type().get();
+                        node.set_resolved_type(return_type ? return_type : scope_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved private static method {}::{} -> {}",
+                                  base_scope_name, member_name, return_type ? return_type->name() : scope_type->name());
+                        return;
+                    }
+                }
+            }
+
+            // Method not found yet - it might be defined later or in another module
+            // For common patterns like constructors (new), allow them to proceed with the struct type as return
+            if (member_name == "new" || member_name == "default" || member_name == "from_secs" ||
+                member_name == "from_millis" || member_name == "from_nanos" || member_name == "zero" ||
+                member_name == "now" || member_name == "from_unix" || member_name == "from_system_time" ||
+                member_name == "today" || member_name == "midnight" || member_name == "noon" ||
+                member_name == "from_secs_since_midnight")
+            {
+                // These are likely factory/constructor methods that return the struct type
+                node.set_resolved_type(scope_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing constructor-like static method {}::{} -> {}",
+                          base_scope_name, member_name, scope_type->name());
+                return;
+            }
+
+            // For other methods, allow them to proceed with unknown type (might be resolved later)
+            LOG_DEBUG(Cryo::LogComponent::AST, "Static method {}::{} not found in struct_methods, allowing with scope type",
+                      base_scope_name, member_name);
+            node.set_resolved_type(scope_type);
+            return;
+        }
+
+        // Verify it's an enum type for enum variant access
         if (scope_type->kind() != TypeKind::Enum)
         {
-            _diagnostic_builder->create_invalid_operation_error("scope resolution", scope_type, nullptr, node.location());
+            _diagnostic_builder->create_invalid_operation_error("scope resolution", scope_type, nullptr, &node);
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
@@ -6048,9 +6154,23 @@ namespace Cryo
         }
 
         // Check for redefinition
-        if (_symbol_table->lookup_symbol(struct_name))
+        if (auto *existing_symbol = _symbol_table->lookup_symbol(struct_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, node.location());
+            // Allow compatible redefinitions - this handles extern FFI structs
+            // (like timespec) that may be defined in multiple modules
+            Type *existing_type = existing_symbol->type;
+            if (existing_type && existing_type->kind() == TypeKind::Struct)
+            {
+                // For structs without methods (FFI structs), allow compatible redefinition
+                if (node.methods().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing compatible redefinition of FFI struct '{}'", struct_name);
+                    // Just skip processing this duplicate definition
+                    return;
+                }
+            }
+
+            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
             return;
         }
 
@@ -6172,9 +6292,23 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "STRUCT_SIGNATURES: Registering struct '{}' types and method signatures", struct_name);
 
         // Check for redefinition
-        if (_symbol_table->lookup_symbol(struct_name))
+        if (auto *existing_symbol = _symbol_table->lookup_symbol(struct_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, node.location());
+            // Allow compatible redefinitions - this handles extern FFI structs
+            // (like timespec) that may be defined in multiple modules
+            Type *existing_type = existing_symbol->type;
+            if (existing_type && existing_type->kind() == TypeKind::Struct)
+            {
+                // For structs without methods (FFI structs), allow compatible redefinition
+                if (node.methods().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing compatible redefinition of FFI struct '{}' in signatures phase", struct_name);
+                    // Just skip processing this duplicate definition
+                    return;
+                }
+            }
+
+            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
             return;
         }
 
@@ -6341,7 +6475,7 @@ namespace Cryo
         // Check for redefinition
         if (_symbol_table->lookup_symbol(class_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(class_name, NodeKind::ClassDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(class_name, NodeKind::ClassDeclaration, &node);
             return;
         }
 
@@ -6483,7 +6617,7 @@ namespace Cryo
         // Check for redefinition
         if (_symbol_table->lookup_symbol(trait_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(trait_name, NodeKind::TraitDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(trait_name, NodeKind::TraitDeclaration, &node);
             return;
         }
 
@@ -6572,7 +6706,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "Type alias '{}' already exists in stdlib compilation mode, skipping redeclaration", alias_name);
                 return;
             }
-            _diagnostic_builder->create_redefined_symbol_error(alias_name, NodeKind::TypeAliasDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(alias_name, NodeKind::TypeAliasDeclaration, &node);
             return;
         }
 
@@ -6695,7 +6829,7 @@ namespace Cryo
                             if (!_stdlib_compilation_mode)
                             {
                                 // Use VariableDeclaration as NodeKind since enum variants are essentially constant variables
-                                _diagnostic_builder->create_redefined_symbol_error(variant_name, NodeKind::VariableDeclaration, variant->location());
+                                _diagnostic_builder->create_redefined_symbol_error(variant_name, NodeKind::VariableDeclaration, variant.get());
                             }
                             // In stdlib mode, silently skip all redefinition errors for enum variants
                         }
@@ -6721,7 +6855,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::AST, "Enum '{}' already exists in stdlib compilation mode, skipping redeclaration", enum_name);
                 return;
             }
-            _diagnostic_builder->create_redefined_symbol_error(enum_name, NodeKind::EnumDeclaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(enum_name, NodeKind::EnumDeclaration, &node);
             return;
         }
 
@@ -6934,7 +7068,7 @@ namespace Cryo
                     target_type->kind() != TypeKind::Enum &&
                     target_type->kind() != TypeKind::Trait)
                 {
-                    _diagnostic_builder->create_invalid_operation_error("implementation block", target_type, nullptr, node.location());
+                    _diagnostic_builder->create_invalid_operation_error("implementation block", target_type, nullptr, &node);
                     return;
                 }
             }
@@ -7055,7 +7189,7 @@ namespace Cryo
         // Check for redefinition within the same generic parameter list
         if (_symbol_table->lookup_symbol(param_name))
         {
-            _diagnostic_builder->create_redefined_symbol_error(param_name, NodeKind::Declaration, node.location());
+            _diagnostic_builder->create_redefined_symbol_error(param_name, NodeKind::Declaration, &node);
             return;
         }
 
@@ -7081,7 +7215,7 @@ namespace Cryo
                 auto field_it = struct_it->second.find(field_name);
                 if (field_it != struct_it->second.end())
                 {
-                    _diagnostic_builder->create_redefined_symbol_error(field_name, NodeKind::VariableDeclaration, node.location());
+                    _diagnostic_builder->create_redefined_symbol_error(field_name, NodeKind::VariableDeclaration, &node);
                     return;
                 }
             }
@@ -7219,7 +7353,7 @@ namespace Cryo
 
                 if (!is_method_already_registered)
                 {
-                    _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, node.location());
+                    _diagnostic_builder->create_redefined_symbol_error(method_name, NodeKind::FunctionDeclaration, &node);
                     return;
                 }
             }
@@ -7233,8 +7367,19 @@ namespace Cryo
 
             const std::string &func_name = node.name();
 
-            // Parse return type from node annotation (constructors have void return typically)
-            Type *return_type = node.get_resolved_return_type();
+            // For constructors, the return type is the struct type itself
+            // This allows constructors to return struct literals with `return StructName { ... }`
+            Type *return_type = _current_struct_type;
+            if (!return_type)
+            {
+                // Fallback: try to get the struct type by name
+                return_type = _type_context.get_struct_type(_current_struct_name);
+            }
+            if (!return_type)
+            {
+                // Final fallback to node's return type
+                return_type = node.get_resolved_return_type();
+            }
             const std::string &return_type_str = return_type ? return_type->to_string() : "void";
 
             if (!return_type)
@@ -7576,11 +7721,11 @@ namespace Cryo
                 // Check if we have an expected type context for integer literals
                 if (_current_expected_type && is_integer_type(_current_expected_type))
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Using expected type '{}' for integer literal '{}'", 
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Using expected type '{}' for integer literal '{}'",
                               _current_expected_type->name(), value);
                     return _current_expected_type;
                 }
-                
+
                 return _type_context.get_int_type();
             }
         }
@@ -7860,6 +8005,35 @@ namespace Cryo
             }
         }
 
+        // SPECIAL CASE: Generic type compatibility
+        // Handle cases like ArraySplit<T> vs ArraySplit, ListNode<T> vs ListNode*, etc.
+        // where the base type name is the same but one has generic params and one doesn't
+        {
+            auto extract_base_name = [](const std::string &type_str) -> std::string {
+                // Remove pointer suffix
+                std::string result = type_str;
+                while (!result.empty() && result.back() == '*') {
+                    result.pop_back();
+                }
+                // Remove generic parameters
+                size_t angle_pos = result.find('<');
+                if (angle_pos != std::string::npos) {
+                    result = result.substr(0, angle_pos);
+                }
+                return result;
+            };
+
+            std::string lhs_base = extract_base_name(lhs_str);
+            std::string rhs_base = extract_base_name(rhs_str);
+
+            if (!lhs_base.empty() && lhs_base == rhs_base)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing generic type compatibility: {} = {} (same base name '{}')",
+                          lhs_str, rhs_str, lhs_base);
+                return true;
+            }
+        }
+
         // Check if both are pointer types of the same base type (HeapBlock* = HeapBlock*)
         if (lhs_str.find("*") != std::string::npos && rhs_str.find("*") != std::string::npos)
         {
@@ -7906,6 +8080,14 @@ namespace Cryo
             return true;
         }
 
+        // Special case: null can be assigned/returned to parameterized/generic types (e.g., ListNode<T>)
+        // These types are typically heap-allocated and can be null
+        if (rhs_str == "null" && (lhs_type->kind() == TypeKind::Parameterized || lhs_str.find("<") != std::string::npos))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing null assignment to generic/parameterized type {}", lhs_str);
+            return true;
+        }
+
         // Special case: &T[] (reference to array) can be assigned to T* (pointer to element type)
         if (lhs_type->kind() == TypeKind::Pointer && rhs_type->kind() == TypeKind::Reference)
         {
@@ -7937,6 +8119,14 @@ namespace Cryo
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing reference-to-pointer conversion: &{} = {}*",
                           referenced_type->to_string(), pointer_pointee->to_string());
+                return true;
+            }
+            // Special case: void* accepts any reference type (common in extern C functions)
+            // This allows passing &struct_var where void* is expected
+            else if (pointer_pointee && pointer_pointee->kind() == TypeKind::Void)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing reference-to-void* conversion: &{} = void*",
+                          referenced_type ? referenced_type->to_string() : "unknown");
                 return true;
             }
         }
@@ -8295,13 +8485,70 @@ namespace Cryo
             return; // Skip duplicate error reporting
         }
 
+        // If we have a diagnostic builder and a node, use the enhanced error reporting with code context
+        if (_diagnostic_builder && node)
+        {
+            ErrorCode error_code = ErrorCode::E0805_INTERNAL_ERROR;
+
+            // Map TypeError::ErrorKind to ErrorCode
+            switch (kind)
+            {
+            case TypeError::ErrorKind::TypeMismatch:
+                error_code = ErrorCode::E0200_TYPE_MISMATCH;
+                break;
+            case TypeError::ErrorKind::UndefinedVariable:
+                error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
+                break;
+            case TypeError::ErrorKind::UndefinedFunction:
+                error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
+                break;
+            case TypeError::ErrorKind::RedefinedSymbol:
+                error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
+                break;
+            case TypeError::ErrorKind::InvalidOperation:
+                error_code = ErrorCode::E0209_INVALID_OPERATION;
+                break;
+            case TypeError::ErrorKind::InvalidAssignment:
+                error_code = ErrorCode::E0210_INVALID_ASSIGNMENT;
+                break;
+            case TypeError::ErrorKind::InvalidCast:
+                error_code = ErrorCode::E0208_INVALID_CAST;
+                break;
+            case TypeError::ErrorKind::IncompatibleTypes:
+                error_code = ErrorCode::E0211_INCOMPATIBLE_TYPES;
+                break;
+            case TypeError::ErrorKind::TooManyArguments:
+                error_code = ErrorCode::E0215_TOO_MANY_ARGS;
+                break;
+            case TypeError::ErrorKind::TooFewArguments:
+                error_code = ErrorCode::E0216_TOO_FEW_ARGS;
+                break;
+            case TypeError::ErrorKind::NonCallableType:
+                error_code = ErrorCode::E0213_NON_CALLABLE;
+                break;
+            case TypeError::ErrorKind::VoidValueUsage:
+                error_code = ErrorCode::E0212_VOID_VALUE_USED;
+                break;
+            default:
+                error_code = ErrorCode::E0805_INTERNAL_ERROR;
+                break;
+            }
+
+            // Use the new method that provides full source code context
+            _diagnostic_builder->create_error_with_node(error_code, node, message);
+
+            // Also add to internal errors for has_errors() check
+            _errors.emplace_back(kind, loc, message);
+            return;
+        }
+
         // Mark this node as having an error
         if (node)
         {
             node->mark_error();
         }
 
-        // Delegate to the original report_error method
+        // Delegate to the original report_error method (no node context)
         report_error(kind, loc, message);
     }
 
@@ -8349,14 +8596,33 @@ namespace Cryo
     void TypeChecker::report_undefined_symbol(SourceLocation loc, const std::string &symbol_name)
     {
         std::string message = "Undefined symbol '" + symbol_name + "'";
-        _errors.emplace_back(TypeError::ErrorKind::UndefinedVariable, loc, message);
+        // Use the unified error reporting which goes through the diagnostic manager
+        report_error(TypeError::ErrorKind::UndefinedVariable, loc, message);
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::report_undefined_symbol - Added error for '{}', total errors: {}", symbol_name, _errors.size());
     }
 
     void TypeChecker::report_redefined_symbol(SourceLocation loc, const std::string &symbol_name)
     {
         std::string message = "Symbol '" + symbol_name + "' is already defined";
-        _errors.emplace_back(TypeError::ErrorKind::RedefinedSymbol, loc, message);
+        // Use the unified error reporting which goes through the diagnostic manager
+        report_error(TypeError::ErrorKind::RedefinedSymbol, loc, message);
+    }
+
+    void TypeChecker::report_undefined_symbol(ASTNode *node, const std::string &symbol_name)
+    {
+        std::string message = "Undefined symbol '" + symbol_name + "'";
+        SourceLocation loc = node ? node->location() : SourceLocation();
+        // Use the unified error reporting with node for proper source context
+        report_error(TypeError::ErrorKind::UndefinedVariable, loc, message, node);
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker::report_undefined_symbol - Added error for '{}', total errors: {}", symbol_name, _errors.size());
+    }
+
+    void TypeChecker::report_redefined_symbol(ASTNode *node, const std::string &symbol_name)
+    {
+        std::string message = "Symbol '" + symbol_name + "' is already defined";
+        SourceLocation loc = node ? node->location() : SourceLocation();
+        // Use the unified error reporting with node for proper source context
+        report_error(TypeError::ErrorKind::RedefinedSymbol, loc, message, node);
     }
 
     //===----------------------------------------------------------------------===//
@@ -8753,8 +9019,9 @@ namespace Cryo
             type_name == "u16" || type_name == "i16" ||
             type_name == "u32" || type_name == "i32" || type_name == "int" ||
             type_name == "u64" || type_name == "i64" ||
+            type_name == "u128" || type_name == "i128" ||
             type_name == "f32" || type_name == "f64" || type_name == "float" ||
-            type_name == "boolean" || type_name == "string")
+            type_name == "boolean" || type_name == "string" || type_name == "bool")
         {
             return true;
         }
@@ -8787,7 +9054,7 @@ namespace Cryo
         // Numeric conversions
         std::vector<std::string> numeric_types = {
             "u8", "i8", "u16", "i16", "u32", "i32", "int", "u64", "i64",
-            "f32", "f64", "float"};
+            "u128", "i128", "f32", "f64", "float"};
 
         bool from_numeric = std::find(numeric_types.begin(), numeric_types.end(), from_type) != numeric_types.end();
         bool to_numeric = std::find(numeric_types.begin(), numeric_types.end(), to_type) != numeric_types.end();
@@ -8855,10 +9122,16 @@ namespace Cryo
 
     void TypeChecker::visit(MatchStatementNode &node)
     {
-        // Visit the expression to match on
+        // Save previous match expression type (for nested matches)
+        Type *previous_match_expr_type = _current_match_expr_type;
+
+        // Visit the expression to match on and get its type
         if (node.expr())
         {
             node.expr()->accept(*this);
+            _current_match_expr_type = node.expr()->get_resolved_type();
+            LOG_DEBUG(Cryo::LogComponent::AST, "Match expression type: {}",
+                      _current_match_expr_type ? _current_match_expr_type->to_string() : "null");
         }
 
         // Visit all match arms
@@ -8869,6 +9142,9 @@ namespace Cryo
                 arm->accept(*this);
             }
         }
+
+        // Restore previous match expression type
+        _current_match_expr_type = previous_match_expr_type;
     }
 
     void TypeChecker::visit(MatchArmNode &node)
@@ -8908,6 +9184,8 @@ namespace Cryo
         const std::string &enum_name = node.enum_name();
         const std::string &variant_name = node.variant_name();
 
+        LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Visiting pattern {}::{}", enum_name, variant_name);
+
         // Look up the enum type
         TypedSymbol *enum_symbol = _symbol_table->lookup_symbol(enum_name);
         if (!enum_symbol)
@@ -8923,25 +9201,82 @@ namespace Cryo
             return;
         }
 
-        // TODO: In a more complete implementation, we would:
-        // - Verify that variant_name is a valid variant of the enum
-        // - Get the parameter types for this specific variant
-
-        // For now, bind pattern variables with inferred types based on common enum patterns
+        // Get bound variables from the pattern
         const auto &bound_vars = node.bound_variables();
 
-        for (const auto &var_name : bound_vars)
+        for (size_t i = 0; i < bound_vars.size(); ++i)
         {
-            if (!var_name.empty())
-            {
-                // For enum patterns, we need to infer the type based on the enum variant
-                // For now, we'll use float for most numeric patterns (Circle(radius), Rectangle(width, height), etc.)
-                // TODO: Get actual parameter types from enum variant definition
-                Type *var_type = _type_context.get_default_float_type();
+            const std::string &var_name = bound_vars[i];
+            if (var_name.empty())
+                continue;
 
-                // Bind the variable in the current scope
-                _symbol_table->declare_symbol(var_name, var_type, node.location(), false);
+            // Try to infer type from the match expression type
+            Type *var_type = nullptr;
+
+            if (_current_match_expr_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Match expr type is {} (kind={})",
+                          _current_match_expr_type->to_string(),
+                          TypeKindToString(_current_match_expr_type->kind()));
+
+                // Handle parameterized types like Result<T, E> and Option<T>
+                if (_current_match_expr_type->kind() == TypeKind::Parameterized)
+                {
+                    auto *param_type = static_cast<ParameterizedType *>(_current_match_expr_type);
+                    const std::string &base_name = param_type->base_name();
+                    const auto &type_params = param_type->type_parameters();
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Parameterized type {} with {} params",
+                              base_name, type_params.size());
+
+                    // For Result<T, E>: Ok holds T (index 0), Err holds E (index 1)
+                    if (base_name == "Result" && type_params.size() >= 2)
+                    {
+                        if (variant_name == "Ok" && type_params[0])
+                        {
+                            var_type = type_params[0].get();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Result::Ok binds to type {}",
+                                      var_type->to_string());
+                        }
+                        else if (variant_name == "Err" && type_params[1])
+                        {
+                            var_type = type_params[1].get();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Result::Err binds to type {}",
+                                      var_type->to_string());
+                        }
+                    }
+                    // For Option<T>: Some holds T (index 0)
+                    else if (base_name == "Option" && type_params.size() >= 1)
+                    {
+                        if (variant_name == "Some" && type_params[0])
+                        {
+                            var_type = type_params[0].get();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Option::Some binds to type {}",
+                                      var_type->to_string());
+                        }
+                    }
+                    // Generic handling: use first type parameter for first bound variable
+                    else if (!type_params.empty() && i < type_params.size() && type_params[i])
+                    {
+                        var_type = type_params[i].get();
+                        LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Generic enum binding to type {}",
+                                  var_type->to_string());
+                    }
+                }
             }
+
+            // Fallback to unknown type if we couldn't infer
+            if (!var_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Could not infer type for '{}', using unknown",
+                          var_name);
+                var_type = _type_context.get_unknown_type();
+            }
+
+            // Bind the variable in the current scope
+            _symbol_table->declare_symbol(var_name, var_type, node.location(), false);
+            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Bound '{}' with type {}", var_name,
+                      var_type ? var_type->to_string() : "null");
         }
     }
 

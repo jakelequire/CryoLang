@@ -132,6 +132,9 @@ namespace Cryo
         void set_stdlib_compilation_mode(bool enable) { _stdlib_compilation_mode = enable; }
         bool stdlib_compilation_mode() const { return _stdlib_compilation_mode; }
 
+        // Show stdlib diagnostics (for building stdlib itself)
+        void set_show_stdlib_diagnostics(bool enable);
+
         void set_auto_imports_enabled(bool enable) { _auto_imports_enabled = enable; }
         bool auto_imports_enabled() const { return _auto_imports_enabled; }
 

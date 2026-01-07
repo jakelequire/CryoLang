@@ -938,7 +938,7 @@ namespace Cryo::Codegen
             {
                 // Get the struct type to determine size
                 llvm::Type *struct_type = resolve_type_by_name(value_resolved_type->to_string());
-                if (struct_type && struct_type->isStructTy())
+                if (struct_type && struct_type->isStructTy() && struct_type->isSized())
                 {
                     auto &data_layout = ctx().module()->getDataLayout();
                     uint64_t size = data_layout.getTypeAllocSize(struct_type);
@@ -956,6 +956,7 @@ namespace Cryo::Codegen
                     );
                     return ptr;
                 }
+                // If struct is opaque/unsized, fall through to standard store path
             }
         }
 
@@ -1496,6 +1497,27 @@ namespace Cryo::Codegen
             return nullptr;
 
         llvm::IRBuilder<> &b = builder();
+
+        // For bitwise operations, ensure both operands have the same type
+        // This is especially important for shifts where LLVM requires matching types
+        llvm::Type *lhs_type = lhs->getType();
+        llvm::Type *rhs_type = rhs->getType();
+
+        if (lhs_type != rhs_type && lhs_type->isIntegerTy() && rhs_type->isIntegerTy())
+        {
+            unsigned lhs_bits = lhs_type->getIntegerBitWidth();
+            unsigned rhs_bits = rhs_type->getIntegerBitWidth();
+
+            // Extend the smaller type to match the larger one
+            if (lhs_bits > rhs_bits)
+            {
+                rhs = b.CreateZExt(rhs, lhs_type, "rhs.zext");
+            }
+            else if (rhs_bits > lhs_bits)
+            {
+                lhs = b.CreateZExt(lhs, rhs_type, "lhs.zext");
+            }
+        }
 
         switch (op)
         {

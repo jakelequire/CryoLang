@@ -234,7 +234,8 @@ namespace Cryo::Codegen
          * @return Function type
          */
         llvm::FunctionType *get_function_type(Cryo::FunctionDeclarationNode *node,
-                                               bool has_this_param = false);
+                                               bool has_this_param = false,
+                                               const std::string &parent_type_name = "");
 
         /**
          * @brief Generate mangled name for a function

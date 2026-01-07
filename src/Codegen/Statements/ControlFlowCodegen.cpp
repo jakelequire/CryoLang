@@ -938,8 +938,15 @@ namespace Cryo::Codegen
                       "Bound pattern variable '{}' (type: {}) from enum variant {}",
                       var_name, type_name, variant_name);
 
-            // Advance offset by the size of this field
-            offset += module()->getDataLayout().getTypeAllocSize(field_type);
+            // Advance offset by the size of this field (with safety check for unsized types)
+            if (field_type->isSized())
+            {
+                offset += module()->getDataLayout().getTypeAllocSize(field_type);
+            }
+            else
+            {
+                offset += 8; // Default to pointer size for unsized types
+            }
         }
     }
 
@@ -1001,11 +1008,23 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating return");
 
+        // Safety check: ensure we have a valid insert point
+        llvm::BasicBlock *current_block = builder().GetInsertBlock();
+        if (!current_block)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "generate_return: No valid insert block, skipping return generation");
+            return;
+        }
+
         // Get the current function's return type
-        llvm::Function *current_fn = builder().GetInsertBlock()
-                                         ? builder().GetInsertBlock()->getParent()
-                                         : nullptr;
-        llvm::Type *expected_ret_type = current_fn ? current_fn->getReturnType() : nullptr;
+        llvm::Function *current_fn = current_block->getParent();
+        if (!current_fn)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "generate_return: Insert block has no parent function, skipping return generation");
+            return;
+        }
+
+        llvm::Type *expected_ret_type = current_fn->getReturnType();
 
         if (node && node->expression())
         {
@@ -1015,7 +1034,32 @@ namespace Cryo::Codegen
                 // Cast return value to match function return type if needed
                 if (expected_ret_type && ret_val->getType() != expected_ret_type)
                 {
-                    ret_val = cast_if_needed(ret_val, expected_ret_type);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_return: Type mismatch - ret_val type ID={}, expected type ID={}, isPtr={}, isStruct={}",
+                              ret_val->getType()->getTypeID(), expected_ret_type->getTypeID(),
+                              ret_val->getType()->isPointerTy(), expected_ret_type->isStructTy());
+
+                    // Special case: returning struct literal returns pointer to alloca,
+                    // but function expects struct value - need to load instead of cast
+                    if (ret_val->getType()->isPointerTy() && expected_ret_type->isStructTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_return: Loading struct value from pointer for return");
+                        ret_val = builder().CreateLoad(expected_ret_type, ret_val, "ret.load");
+                    }
+                    // Special case: constructor pattern - function has void return but trying to return value
+                    // This happens with constructor-style methods that return struct literals
+                    else if (expected_ret_type->isVoidTy())
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "generate_return: Function has void return type but has return value - treating as void return (constructor pattern)");
+                        builder().CreateRetVoid();
+                        return;
+                    }
+                    else
+                    {
+                        ret_val = cast_if_needed(ret_val, expected_ret_type);
+                    }
                 }
                 if (ret_val)
                 {

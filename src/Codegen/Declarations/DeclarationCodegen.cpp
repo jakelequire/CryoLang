@@ -29,6 +29,66 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Skip generic functions - they should only be instantiated with concrete types
+        // Check 1: Function has generic type parameters defined (e.g., fn foo<T>(...))
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping generic function declaration '{}' - has {} generic type parameters",
+                      node->name(), node->generic_parameters().size());
+            return nullptr;
+        }
+
+        // Check 2: Detect uninstantiated type parameters in function signature
+        for (const auto &param : node->parameters())
+        {
+            if (param && param->get_resolved_type())
+            {
+                Cryo::Type *ptype = param->get_resolved_type();
+                if (ptype->kind() == TypeKind::Generic)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function declaration '{}' - param '{}' has generic type '{}'",
+                              node->name(), param->name(), ptype->to_string());
+                    return nullptr;
+                }
+                if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
+                {
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    if (!existing)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Skipping function declaration '{}' - param '{}' has undefined type '{}'",
+                                  node->name(), param->name(), ptype->to_string());
+                        return nullptr;
+                    }
+                }
+            }
+        }
+
+        // Check 3: Detect uninstantiated return type
+        if (Cryo::Type *ret_type = node->get_resolved_return_type())
+        {
+            if (ret_type->kind() == TypeKind::Generic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping function declaration '{}' - has generic return type '{}'",
+                          node->name(), ret_type->to_string());
+                return nullptr;
+            }
+            if (ret_type->kind() == TypeKind::Struct || ret_type->kind() == TypeKind::Class)
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type->to_string());
+                if (!existing)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function declaration '{}' - has undefined return type '{}'",
+                              node->name(), ret_type->to_string());
+                    return nullptr;
+                }
+            }
+        }
+
         // Generate properly qualified function name using namespace context
         std::string name;
         std::string ns_context = ctx().namespace_context();
@@ -98,6 +158,68 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Skip generic functions - they should only be instantiated with concrete types
+        // Check 1: Function has generic type parameters defined (e.g., fn foo<T>(...))
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping generic function '{}' - has {} generic type parameters",
+                      node->name(), node->generic_parameters().size());
+            return nullptr;
+        }
+
+        // Check 2: Detect uninstantiated type parameters in function signature
+        for (const auto &param : node->parameters())
+        {
+            if (param && param->get_resolved_type())
+            {
+                Cryo::Type *ptype = param->get_resolved_type();
+                // Check for Generic type kind
+                if (ptype->kind() == TypeKind::Generic)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function '{}' - param '{}' has generic type '{}'",
+                              node->name(), param->name(), ptype->to_string());
+                    return nullptr;
+                }
+                // Check if struct/class parameter type exists in LLVM context
+                if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
+                {
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    if (!existing)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Skipping function '{}' - param '{}' has undefined type '{}'",
+                                  node->name(), param->name(), ptype->to_string());
+                        return nullptr;
+                    }
+                }
+            }
+        }
+
+        // Check 3: Detect uninstantiated return type
+        if (Cryo::Type *ret_type = node->get_resolved_return_type())
+        {
+            if (ret_type->kind() == TypeKind::Generic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping function '{}' - has generic return type '{}'",
+                          node->name(), ret_type->to_string());
+                return nullptr;
+            }
+            if (ret_type->kind() == TypeKind::Struct || ret_type->kind() == TypeKind::Class)
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type->to_string());
+                if (!existing)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function '{}' - has undefined return type '{}'",
+                              node->name(), ret_type->to_string());
+                    return nullptr;
+                }
+            }
+        }
+
         // Generate properly qualified function name using namespace context
         std::string name;
         std::string ns_context = ctx().namespace_context();
@@ -153,6 +275,9 @@ namespace Cryo::Codegen
         if (llvm::verifyFunction(*fn, &llvm::errs()))
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function verification failed: {}", name);
+            // Clear the builder's insert point before erasing the function
+            // to prevent dangling pointers to the deleted basic blocks
+            builder().ClearInsertionPoint();
             fn->eraseFromParent();
             return nullptr;
         }
@@ -208,6 +333,15 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating method: {}::{}",
                   parent_type, node->name());
 
+        // Check if this is a static method (no 'this' parameter)
+        bool is_static = false;
+        if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(node))
+        {
+            is_static = struct_method->is_static();
+        }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Method '{}::{}' is_static={}",
+                  parent_type, node->name(), is_static);
+
         // Generate base method name (Type::method)
         std::string base_method_name = generate_method_name(parent_type, node->name());
 
@@ -230,8 +364,8 @@ namespace Cryo::Codegen
             return existing;
         }
 
-        // Get function type with implicit 'this' parameter
-        llvm::FunctionType *fn_type = get_function_type(node, true);
+        // Get function type - only add 'this' parameter for non-static methods
+        llvm::FunctionType *fn_type = get_function_type(node, !is_static, parent_type);
         if (!fn_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
@@ -243,10 +377,15 @@ namespace Cryo::Codegen
         llvm::Function *fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
                                                     llvm_fn_name, module());
 
-        // Name parameters (first is 'this')
+        // Name parameters
         auto arg_it = fn->arg_begin();
-        arg_it->setName("this");
-        ++arg_it;
+
+        // For non-static methods, first parameter is 'this'
+        if (!is_static)
+        {
+            arg_it->setName("this");
+            ++arg_it;
+        }
 
         // Name remaining parameters
         if (node->parameters().size() > 0)
@@ -409,20 +548,33 @@ namespace Cryo::Codegen
                 if (is_struct_value_type && var_type->isStructTy() && init_val->getType()->isPointerTy())
                 {
                     // The init_val is a pointer to the struct data, memcpy to our alloca
-                    auto &data_layout = module()->getDataLayout();
-                    uint64_t size = data_layout.getTypeAllocSize(var_type);
+                    // Check if the struct type is sized before computing size
+                    if (!var_type->isSized())
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "DeclarationCodegen: Struct type for '{}' is opaque, using store instead of memcpy",
+                                 name);
+                        // Fall back to store for unsized types
+                        llvm::Value *cast_val = cast_if_needed(init_val, var_type);
+                        create_store(cast_val, alloca);
+                    }
+                    else
+                    {
+                        auto &data_layout = module()->getDataLayout();
+                        uint64_t size = data_layout.getTypeAllocSize(var_type);
 
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "DeclarationCodegen: Struct initialization via memcpy for '{}', size {} bytes",
-                              name, size);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Struct initialization via memcpy for '{}', size {} bytes",
+                                  name, size);
 
-                    builder().CreateMemCpy(
-                        alloca,                                                    // dest
-                        llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // dest align
-                        init_val,                                                  // src
-                        llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // src align
-                        size                                                       // size
-                    );
+                        builder().CreateMemCpy(
+                            alloca,                                                    // dest
+                            llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // dest align
+                            init_val,                                                  // src
+                            llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // src align
+                            size                                                       // size
+                        );
+                    }
                 }
                 else
                 {
@@ -807,13 +959,13 @@ namespace Cryo::Codegen
                 for (const auto &type_name : variant->associated_types())
                 {
                     llvm::Type *field_type = types().get_type(type_name);
-                    if (field_type)
+                    if (field_type && field_type->isSized())
                     {
                         variant_payload += module()->getDataLayout().getTypeAllocSize(field_type);
                     }
                     else
                     {
-                        // Default to 8 bytes for unknown types
+                        // Default to 8 bytes for unknown or unsized types
                         variant_payload += 8;
                     }
                 }
@@ -954,7 +1106,15 @@ namespace Cryo::Codegen
             field_ptr = ctor_builder.CreateBitCast(field_ptr, llvm::PointerType::get(arg_type, 0));
             ctor_builder.CreateStore(&arg, field_ptr);
 
-            offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+            // Calculate size of argument type, with safety check for unsized types
+            if (arg_type->isSized())
+            {
+                offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+            }
+            else
+            {
+                offset += 8; // Default to pointer size for unsized types
+            }
             arg_idx++;
         }
 
@@ -971,7 +1131,8 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::FunctionType *DeclarationCodegen::get_function_type(Cryo::FunctionDeclarationNode *node,
-                                                              bool has_this_param)
+                                                              bool has_this_param,
+                                                              const std::string &parent_type_name)
     {
         if (!node)
             return nullptr;
@@ -986,10 +1147,31 @@ namespace Cryo::Codegen
         // Collect parameter types
         std::vector<llvm::Type *> param_types;
 
-        // Add 'this' pointer for methods
+        // Add 'this' parameter for methods
         if (has_this_param)
         {
-            param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            // Check if this is a simple enum - if so, pass 'this' by value as i32
+            bool is_simple_enum = false;
+            if (!parent_type_name.empty())
+            {
+                Cryo::Type *parent_cryo_type = symbols().get_type_context()->lookup_enum_type(parent_type_name);
+                if (parent_cryo_type && parent_cryo_type->kind() == Cryo::TypeKind::Enum)
+                {
+                    auto *enum_type = static_cast<Cryo::EnumType *>(parent_cryo_type);
+                    is_simple_enum = enum_type->is_simple_enum();
+                }
+            }
+
+            if (is_simple_enum)
+            {
+                // Simple enum 'this' is passed by value as i32
+                param_types.push_back(llvm::Type::getInt32Ty(llvm_ctx()));
+            }
+            else
+            {
+                // Struct/class 'this' is passed as pointer
+                param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            }
         }
 
         // Add regular parameters
@@ -1574,21 +1756,31 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Check if this is a static method to handle parameter indexing correctly
+            bool is_static_method = false;
+            if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(node))
+            {
+                is_static_method = struct_method->is_static();
+            }
+
             // Register all parameter types in variable_types_map for Array<T> detection
             // StructMethodNode inherits from FunctionDeclarationNode so parameters() is available
             const auto &ast_params = node->parameters();
             size_t param_idx = 0;
+            bool seen_this = false;
             for (auto &arg : fn->args())
             {
-                // Skip 'this' as it's handled above
+                // Skip 'this' as it's handled above (only for non-static methods)
                 if (arg.getName() == "this")
                 {
+                    seen_this = true;
                     param_idx++;
                     continue;
                 }
 
                 // Account for 'this' parameter offset - AST params don't include 'this'
-                size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                // Only subtract 1 if we've seen 'this' (non-static methods)
+                size_t ast_idx = seen_this ? param_idx - 1 : param_idx;
                 if (ast_idx < ast_params.size())
                 {
                     Cryo::Type *param_type = ast_params[ast_idx]->get_resolved_type();
@@ -1781,11 +1973,15 @@ namespace Cryo::Codegen
                         // Register 'this' type in variable_types_map for member access resolution
                         if (arg.getName() == "this")
                         {
-                            // Get the Cryo type for the current struct/class
+                            // Get the Cryo type for the current struct/class/enum
                             Cryo::Type *this_type = ctx().symbols().get_type_context()->get_struct_type(type_name);
                             if (!this_type)
                             {
                                 this_type = ctx().symbols().get_type_context()->get_class_type(type_name);
+                            }
+                            if (!this_type)
+                            {
+                                this_type = ctx().symbols().get_type_context()->lookup_enum_type(type_name);
                             }
                             if (this_type)
                             {
