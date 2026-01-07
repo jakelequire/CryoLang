@@ -1010,6 +1010,18 @@ namespace Cryo
         }
         _lexer.reset();
         _parser.reset();
+        
+        // Reset TypeChecker state for multi-file compilation (especially stdlib)
+        // But preserve the stdlib_compilation_mode setting
+        if (_type_checker)
+        {
+            bool preserve_stdlib_mode = _stdlib_compilation_mode;
+            _type_checker->reset_state();
+            if (preserve_stdlib_mode)
+            {
+                _type_checker->set_stdlib_compilation_mode(true);
+            }
+        }
     }
 
     void CompilerInstance::populate_symbol_table(ASTNode *node)

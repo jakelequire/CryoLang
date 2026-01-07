@@ -215,6 +215,14 @@ namespace Cryo::Codegen
         llvm::Value *generate_condition(Cryo::ExpressionNode *condition, Cryo::ASTNode *node);
 
         /**
+         * @brief Ensure two LLVM values have compatible types for comparison
+         * @param lhs Left-hand side value (modified in place if needed)
+         * @param rhs Right-hand side value (modified in place if needed)
+         * @return true if types are compatible or successfully coerced
+         */
+        bool ensure_compatible_types(llvm::Value *&lhs, llvm::Value *&rhs);
+
+        /**
          * @brief Ensure a block has a terminator, adding a branch if needed
          * @param block Block to check
          * @param target Target for branch if no terminator

@@ -190,6 +190,14 @@ namespace Cryo
         // Current struct name (for field tracking)
         std::string _current_struct_name;
 
+        // Three-pass compilation state
+        enum class ProcessingPass {
+            STRUCT_TYPE_REGISTRATION,  // Pass 1a: Register struct types only
+            METHOD_SIGNATURE_REGISTRATION, // Pass 1b: Register method signatures only
+            BODY_PROCESSING           // Pass 2: Process method bodies only
+        };
+        ProcessingPass _current_pass = ProcessingPass::BODY_PROCESSING; // Default to normal processing
+
         // Type checking state
         bool _in_function = false;
         bool _in_loop = false;
@@ -357,6 +365,40 @@ namespace Cryo
             _runtime_symbols_loaded = false;
         }
 
+        // Reset all TypeChecker state (for multi-file compilation)
+        void reset_state()
+        {
+            // Clear symbol table and reset loading flags
+            clear_symbols();
+            
+            // Clear all tracking data structures
+            _struct_fields.clear();
+            _struct_methods.clear();
+            _private_struct_methods.clear();
+            _template_parameters.clear();
+            _current_generic_trait_bounds.clear();
+            _generic_context_stack.clear();
+            _required_instantiations.clear();
+            
+            // Reset current context state
+            _current_struct_type = nullptr;
+            _current_struct_name = "";
+            _current_function_return_type = nullptr;
+            _current_namespace = "Global";
+            _current_match_expr_type = nullptr;
+            _current_expected_type = nullptr;
+            
+            // Reset state flags
+            _in_function = false;
+            _in_loop = false;
+            _in_call_expression = false;
+            _in_unsafe_context = false;
+            
+            // Clear errors and warnings
+            _errors.clear();
+            _warnings.clear();
+        }
+
         // Symbol table access for LSP
         TypedSymbol *lookup_symbol(const std::string &name) { return _symbol_table->lookup_symbol(name); }
         TypedSymbol *lookup_symbol_in_any_namespace(const std::string &symbol_name) { return _symbol_table->lookup_symbol_in_any_namespace(symbol_name); }
@@ -384,11 +426,16 @@ namespace Cryo
         void visit(StructDeclarationNode &node) override;
         void visit(ClassDeclarationNode &node) override;
 
-        // Helper methods for two-pass struct/class processing
+        // Helper methods for three-pass struct/class processing
         void register_struct_declaration_signatures(StructDeclarationNode &node);
+        void register_struct_type_only(StructDeclarationNode &node);
         void process_struct_method_bodies(StructDeclarationNode &node);
+        void process_struct_method_body(StructMethodNode &node);
         void register_class_declaration_signatures(ClassDeclarationNode &node);
+        void register_class_type_only(ClassDeclarationNode &node);
         void process_class_method_bodies(ClassDeclarationNode &node);
+        void register_implementation_block_signatures(ImplementationBlockNode &node);
+        void process_implementation_block_bodies(ImplementationBlockNode &node);
 
         void visit(TraitDeclarationNode &node) override;
         void visit(EnumDeclarationNode &node) override;
