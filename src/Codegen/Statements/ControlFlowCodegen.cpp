@@ -1047,6 +1047,15 @@ namespace Cryo::Codegen
                                   "generate_return: Loading struct value from pointer for return");
                         ret_val = builder().CreateLoad(expected_ret_type, ret_val, "ret.load");
                     }
+                    // Special case: constructor pattern - function has void return but trying to return value
+                    // This happens with constructor-style methods that return struct literals
+                    else if (expected_ret_type->isVoidTy())
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "generate_return: Function has void return type but has return value - treating as void return (constructor pattern)");
+                        builder().CreateRetVoid();
+                        return;
+                    }
                     else
                     {
                         ret_val = cast_if_needed(ret_val, expected_ret_type);
