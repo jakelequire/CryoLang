@@ -848,7 +848,8 @@ namespace Cryo
 
     DiagnosticManager::DiagnosticManager()
         : _error_count(0), _warning_count(0), _note_count(0),
-          _errors_as_warnings(false), _warnings_as_errors(false), _max_errors(100)
+          _errors_as_warnings(false), _warnings_as_errors(false), _max_errors(100),
+          _show_stdlib_diagnostics(false)
     {
         // Initialize advanced formatter with clean ASCII by default for universal compatibility
         _formatter = std::make_unique<DiagnosticFormatter>(&_source_manager, true, false, 80);
@@ -986,8 +987,8 @@ namespace Cryo
         size_t error_number = 0;
         for (const auto &diagnostic : _diagnostics)
         {
-            // Filter out diagnostics from stdlib files to reduce noise for users
-            if (is_stdlib_diagnostic(diagnostic))
+            // Filter out diagnostics from stdlib files unless explicitly enabled
+            if (!_show_stdlib_diagnostics && is_stdlib_diagnostic(diagnostic))
             {
                 continue; // Skip stdlib diagnostics - users don't need to see these
             }
@@ -1010,10 +1011,10 @@ namespace Cryo
 
     void DiagnosticManager::print_summary(std::ostream &os) const
     {
-        // Use user-only counts to avoid reporting stdlib errors
-        size_t user_errors = user_error_count();
-        size_t user_warnings = user_warning_count();
-        size_t user_total = user_total_count();
+        // Use user-only counts (unless showing stdlib diagnostics)
+        size_t user_errors = _show_stdlib_diagnostics ? _error_count : user_error_count();
+        size_t user_warnings = _show_stdlib_diagnostics ? _warning_count : user_warning_count();
+        size_t user_total = _show_stdlib_diagnostics ? _diagnostics.size() : user_total_count();
 
         if (user_total == 0)
         {

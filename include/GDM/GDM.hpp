@@ -521,6 +521,7 @@ namespace Cryo
         bool _errors_as_warnings;
         bool _warnings_as_errors;
         size_t _max_errors;
+        bool _show_stdlib_diagnostics; // When true, show diagnostics from stdlib files
 
     public:
         DiagnosticManager();
@@ -582,7 +583,7 @@ namespace Cryo
 
         // Access diagnostics
         const std::vector<Diagnostic> &diagnostics() const { return _diagnostics; }
-        bool has_errors() const { return user_error_count() > 0; }
+        bool has_errors() const { return _show_stdlib_diagnostics ? _error_count > 0 : user_error_count() > 0; }
         bool has_warnings() const { return _warning_count > 0; }
 
         // Statistics
@@ -607,6 +608,8 @@ namespace Cryo
         void set_errors_as_warnings(bool enable) { _errors_as_warnings = enable; }
         void set_warnings_as_errors(bool enable) { _warnings_as_errors = enable; }
         void set_max_errors(size_t max_errors) { _max_errors = max_errors; }
+        void set_show_stdlib_diagnostics(bool enable) { _show_stdlib_diagnostics = enable; }
+        bool show_stdlib_diagnostics() const { return _show_stdlib_diagnostics; }
         void set_formatter_options(bool use_colors, bool use_unicode, size_t terminal_width = 80);
 
         // State management
