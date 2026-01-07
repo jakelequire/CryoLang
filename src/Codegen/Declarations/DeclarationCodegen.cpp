@@ -365,7 +365,7 @@ namespace Cryo::Codegen
         }
 
         // Get function type - only add 'this' parameter for non-static methods
-        llvm::FunctionType *fn_type = get_function_type(node, !is_static);
+        llvm::FunctionType *fn_type = get_function_type(node, !is_static, parent_type);
         if (!fn_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
@@ -1131,7 +1131,8 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::FunctionType *DeclarationCodegen::get_function_type(Cryo::FunctionDeclarationNode *node,
-                                                              bool has_this_param)
+                                                              bool has_this_param,
+                                                              const std::string &parent_type_name)
     {
         if (!node)
             return nullptr;
@@ -1146,10 +1147,31 @@ namespace Cryo::Codegen
         // Collect parameter types
         std::vector<llvm::Type *> param_types;
 
-        // Add 'this' pointer for methods
+        // Add 'this' parameter for methods
         if (has_this_param)
         {
-            param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            // Check if this is a simple enum - if so, pass 'this' by value as i32
+            bool is_simple_enum = false;
+            if (!parent_type_name.empty())
+            {
+                Cryo::Type *parent_cryo_type = symbols().get_type_context()->lookup_enum_type(parent_type_name);
+                if (parent_cryo_type && parent_cryo_type->kind() == Cryo::TypeKind::Enum)
+                {
+                    auto *enum_type = static_cast<Cryo::EnumType *>(parent_cryo_type);
+                    is_simple_enum = enum_type->is_simple_enum();
+                }
+            }
+
+            if (is_simple_enum)
+            {
+                // Simple enum 'this' is passed by value as i32
+                param_types.push_back(llvm::Type::getInt32Ty(llvm_ctx()));
+            }
+            else
+            {
+                // Struct/class 'this' is passed as pointer
+                param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            }
         }
 
         // Add regular parameters
@@ -1951,11 +1973,15 @@ namespace Cryo::Codegen
                         // Register 'this' type in variable_types_map for member access resolution
                         if (arg.getName() == "this")
                         {
-                            // Get the Cryo type for the current struct/class
+                            // Get the Cryo type for the current struct/class/enum
                             Cryo::Type *this_type = ctx().symbols().get_type_context()->get_struct_type(type_name);
                             if (!this_type)
                             {
                                 this_type = ctx().symbols().get_type_context()->get_class_type(type_name);
+                            }
+                            if (!this_type)
+                            {
+                                this_type = ctx().symbols().get_type_context()->lookup_enum_type(type_name);
                             }
                             if (this_type)
                             {
