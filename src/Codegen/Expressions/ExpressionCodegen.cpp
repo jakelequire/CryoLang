@@ -1783,10 +1783,48 @@ namespace Cryo::Codegen
                 auto it = var_types.find("this");
                 if (it != var_types.end() && it->second)
                 {
-                    // Use the type from variable_types_map but continue with normal resolution
+                    Cryo::Type *this_type = it->second;
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "resolve_member_info: Found 'this' in variable_types_map: {}",
-                              it->second->to_string());
+                              this_type->to_string());
+
+                    // Get the type name (handle pointer types)
+                    std::string this_type_name = this_type->to_string();
+                    if (this_type->kind() == Cryo::TypeKind::Pointer)
+                    {
+                        auto *ptr_type = dynamic_cast<Cryo::PointerType *>(this_type);
+                        if (ptr_type && ptr_type->pointee_type())
+                        {
+                            this_type_name = ptr_type->pointee_type()->to_string();
+                        }
+                    }
+                    else if (!this_type_name.empty() && this_type_name.back() == '*')
+                    {
+                        this_type_name.pop_back();
+                    }
+
+                    // Look up the struct type
+                    out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), this_type_name);
+                    if (!out_struct_type)
+                    {
+                        if (llvm::Type *type = ctx().get_type(this_type_name))
+                        {
+                            out_struct_type = llvm::dyn_cast<llvm::StructType>(type);
+                        }
+                    }
+
+                    if (out_struct_type)
+                    {
+                        int field_idx = ctx().get_struct_field_index(this_type_name, member_name);
+                        if (field_idx >= 0)
+                        {
+                            out_field_idx = static_cast<unsigned>(field_idx);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: Resolved this.{} to index {} via variable_types_map",
+                                      member_name, out_field_idx);
+                            return true;
+                        }
+                    }
                 }
             }
         }
