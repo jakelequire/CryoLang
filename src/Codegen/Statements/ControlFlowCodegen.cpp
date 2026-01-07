@@ -1034,7 +1034,18 @@ namespace Cryo::Codegen
                 // Cast return value to match function return type if needed
                 if (expected_ret_type && ret_val->getType() != expected_ret_type)
                 {
-                    ret_val = cast_if_needed(ret_val, expected_ret_type);
+                    // Special case: returning struct literal returns pointer to alloca,
+                    // but function expects struct value - need to load instead of cast
+                    if (ret_val->getType()->isPointerTy() && expected_ret_type->isStructTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_return: Loading struct value from pointer for return");
+                        ret_val = builder().CreateLoad(expected_ret_type, ret_val, "ret.load");
+                    }
+                    else
+                    {
+                        ret_val = cast_if_needed(ret_val, expected_ret_type);
+                    }
                 }
                 if (ret_val)
                 {
