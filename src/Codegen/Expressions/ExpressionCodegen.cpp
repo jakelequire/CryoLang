@@ -1374,6 +1374,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Check if type is sized before computing size
+        if (!llvm_type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: sizeof called on unsized type '{}', returning 0",
+                     node->type_name());
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
+        }
+
         // Generate sizeof using LLVM type
         auto &context = llvm_ctx();
         auto &data_layout = module()->getDataLayout();
@@ -1394,6 +1403,15 @@ namespace Cryo::Codegen
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
         }
 
+        // Check if type is sized before computing size
+        if (!llvm_type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: sizeof called on unsized type '{}', returning 0",
+                     type->to_string());
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
+        }
+
         const llvm::DataLayout &dl = module()->getDataLayout();
         uint64_t size = dl.getTypeAllocSize(llvm_type);
 
@@ -1411,6 +1429,15 @@ namespace Cryo::Codegen
         if (!llvm_type)
         {
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1);
+        }
+
+        // Check if type is sized before computing alignment
+        if (!llvm_type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: alignof called on unsized type '{}', returning default alignment",
+                     type->to_string());
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 8);
         }
 
         const llvm::DataLayout &dl = module()->getDataLayout();
@@ -1558,6 +1585,83 @@ namespace Cryo::Codegen
     }
 
     //===================================================================
+    // If Expression
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_if_expression(Cryo::IfExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null if-expression node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating if-expression");
+
+        // Generate condition
+        llvm::Value *condition = generate(node->condition());
+        if (!condition)
+        {
+            return nullptr;
+        }
+
+        // Convert to i1 if needed
+        if (!condition->getType()->isIntegerTy(1))
+        {
+            if (condition->getType()->isIntegerTy())
+            {
+                condition = builder().CreateICmpNE(
+                    condition,
+                    llvm::ConstantInt::get(condition->getType(), 0),
+                    "tobool");
+            }
+            else
+            {
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
+                             "If-expression condition must be boolean");
+                return nullptr;
+            }
+        }
+
+        // Create basic blocks
+        llvm::Function *fn = builder().GetInsertBlock()->getParent();
+        llvm::BasicBlock *then_block = create_block("ifexpr.then", fn);
+        llvm::BasicBlock *else_block = create_block("ifexpr.else", fn);
+        llvm::BasicBlock *merge_block = create_block("ifexpr.merge", fn);
+
+        // Branch on condition
+        builder().CreateCondBr(condition, then_block, else_block);
+
+        // Generate then value
+        builder().SetInsertPoint(then_block);
+        llvm::Value *then_val = generate(node->then_expression());
+        if (!then_val)
+        {
+            return nullptr;
+        }
+        llvm::BasicBlock *then_end = builder().GetInsertBlock();
+        builder().CreateBr(merge_block);
+
+        // Generate else value
+        builder().SetInsertPoint(else_block);
+        llvm::Value *else_val = generate(node->else_expression());
+        if (!else_val)
+        {
+            return nullptr;
+        }
+        llvm::BasicBlock *else_end = builder().GetInsertBlock();
+        builder().CreateBr(merge_block);
+
+        // Create phi node
+        builder().SetInsertPoint(merge_block);
+        llvm::PHINode *phi = builder().CreatePHI(then_val->getType(), 2, "ifexpr.result");
+        phi->addIncoming(then_val, then_end);
+        phi->addIncoming(cast_if_needed(else_val, then_val->getType()), else_end);
+
+        return phi;
+    }
+
+    //===================================================================
     // Helpers
     //===================================================================
 
@@ -1679,10 +1783,48 @@ namespace Cryo::Codegen
                 auto it = var_types.find("this");
                 if (it != var_types.end() && it->second)
                 {
-                    // Use the type from variable_types_map but continue with normal resolution
+                    Cryo::Type *this_type = it->second;
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "resolve_member_info: Found 'this' in variable_types_map: {}",
-                              it->second->to_string());
+                              this_type->to_string());
+
+                    // Get the type name (handle pointer types)
+                    std::string this_type_name = this_type->to_string();
+                    if (this_type->kind() == Cryo::TypeKind::Pointer)
+                    {
+                        auto *ptr_type = dynamic_cast<Cryo::PointerType *>(this_type);
+                        if (ptr_type && ptr_type->pointee_type())
+                        {
+                            this_type_name = ptr_type->pointee_type()->to_string();
+                        }
+                    }
+                    else if (!this_type_name.empty() && this_type_name.back() == '*')
+                    {
+                        this_type_name.pop_back();
+                    }
+
+                    // Look up the struct type
+                    out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), this_type_name);
+                    if (!out_struct_type)
+                    {
+                        if (llvm::Type *type = ctx().get_type(this_type_name))
+                        {
+                            out_struct_type = llvm::dyn_cast<llvm::StructType>(type);
+                        }
+                    }
+
+                    if (out_struct_type)
+                    {
+                        int field_idx = ctx().get_struct_field_index(this_type_name, member_name);
+                        if (field_idx >= 0)
+                        {
+                            out_field_idx = static_cast<unsigned>(field_idx);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: Resolved this.{} to index {} via variable_types_map",
+                                      member_name, out_field_idx);
+                            return true;
+                        }
+                    }
                 }
             }
         }
@@ -2122,9 +2264,20 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Calculate size
+        // Calculate size (with safety check for unsized types)
         const llvm::DataLayout &dl = module()->getDataLayout();
-        uint64_t size = dl.getTypeAllocSize(alloc_type);
+        uint64_t size;
+        if (alloc_type->isSized())
+        {
+            size = dl.getTypeAllocSize(alloc_type);
+        }
+        else
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: new expression for unsized type '{}', using default size",
+                     node->type_name());
+            size = 8; // Default to pointer size for unsized types
+        }
 
         // Call cryo_alloc (runtime heap allocator)
         llvm::Function *cryo_alloc_fn = module()->getFunction("std::Runtime::cryo_alloc");

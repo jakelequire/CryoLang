@@ -123,6 +123,14 @@ namespace Cryo
         }
     }
 
+    void CompilerInstance::set_show_stdlib_diagnostics(bool enable)
+    {
+        if (_diagnostic_manager)
+        {
+            _diagnostic_manager->set_show_stdlib_diagnostics(enable);
+        }
+    }
+
     bool CompilerInstance::compile_file(const std::string &source_file)
     {
         set_source_file(source_file);

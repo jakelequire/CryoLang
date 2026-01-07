@@ -196,6 +196,9 @@ namespace Cryo
         bool _in_call_expression = false;
         bool _in_unsafe_context = false;
 
+        // Current match expression type (for pattern variable type inference)
+        Type *_current_match_expr_type = nullptr;
+
         // Struct field tracking - maps struct name -> field name -> field type
         std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _struct_fields;
 
@@ -470,6 +473,9 @@ namespace Cryo
         void report_type_mismatch(SourceLocation loc, Type *expected, Type *actual, const std::string &context);
         void report_undefined_symbol(SourceLocation loc, const std::string &symbol_name);
         void report_redefined_symbol(SourceLocation loc, const std::string &symbol_name);
+        // Overloads with node for proper source context
+        void report_undefined_symbol(ASTNode *node, const std::string &symbol_name);
+        void report_redefined_symbol(ASTNode *node, const std::string &symbol_name);
 
         // Symbol table helpers
         void enter_scope();

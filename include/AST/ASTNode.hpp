@@ -57,6 +57,7 @@ namespace Cryo
         BinaryExpression,
         UnaryExpression,
         TernaryExpression,
+        IfExpression,
         CallExpression,
         NewExpression,
         SizeofExpression,
@@ -224,6 +225,7 @@ namespace Cryo
     protected:
         NodeKind _kind;
         SourceLocation _location;
+        std::string _source_file;                // Track which file this node came from
         mutable bool _has_error = false; // Track if this node already has errors reported
 
     private:
@@ -231,7 +233,7 @@ namespace Cryo
         std::unique_ptr<DirectiveStorage> _directive_storage;
 
     public:
-        ASTNode(NodeKind kind, SourceLocation location);
+        ASTNode(NodeKind kind, SourceLocation location, const std::string &source_file = "");
         virtual ~ASTNode();
 
         // Copy constructor and assignment operator
@@ -244,6 +246,8 @@ namespace Cryo
 
         NodeKind kind() const { return _kind; }
         const SourceLocation &location() const { return _location; }
+        const std::string &source_file() const { return _source_file; }
+        void set_source_file(const std::string &file) { _source_file = file; }
 
         // Error tracking to prevent duplicate error reports
         bool has_error() const { return _has_error; }
@@ -1712,6 +1716,49 @@ namespace Cryo
                     if (func)
                         func->print(os, indent + 4);
                 }
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // If expression (if used as a value: if (cond) { expr } else { expr })
+    class IfExpressionNode : public ExpressionNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _condition;
+        std::unique_ptr<ExpressionNode> _then_expr;
+        std::unique_ptr<ExpressionNode> _else_expr;
+
+    public:
+        IfExpressionNode(SourceLocation loc,
+                         std::unique_ptr<ExpressionNode> condition,
+                         std::unique_ptr<ExpressionNode> then_expr,
+                         std::unique_ptr<ExpressionNode> else_expr)
+            : ExpressionNode(NodeKind::IfExpression, loc), _condition(std::move(condition)),
+              _then_expr(std::move(then_expr)), _else_expr(std::move(else_expr)) {}
+
+        ExpressionNode *condition() const { return _condition.get(); }
+        ExpressionNode *then_expression() const { return _then_expr.get(); }
+        ExpressionNode *else_expression() const { return _else_expr.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "IfExpression:" << std::endl;
+            if (_condition)
+            {
+                os << std::string(indent + 2, ' ') << "Condition:" << std::endl;
+                _condition->print(os, indent + 4);
+            }
+            if (_then_expr)
+            {
+                os << std::string(indent + 2, ' ') << "ThenExpr:" << std::endl;
+                _then_expr->print(os, indent + 4);
+            }
+            if (_else_expr)
+            {
+                os << std::string(indent + 2, ' ') << "ElseExpr:" << std::endl;
+                _else_expr->print(os, indent + 4);
             }
         }
 

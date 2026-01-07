@@ -55,6 +55,7 @@ namespace Cryo
         {"default", TokenKind::TK_KW_DEFAULT},
         {"while", TokenKind::TK_KW_WHILE},
         {"for", TokenKind::TK_KW_FOR},
+        {"loop", TokenKind::TK_KW_LOOP},
         {"do", TokenKind::TK_KW_DO},
         {"break", TokenKind::TK_KW_BREAK},
         {"continue", TokenKind::TK_KW_CONTINUE},
@@ -80,7 +81,6 @@ namespace Cryo
         {"struct", TokenKind::TK_KW_STRUCT},
         {"union", TokenKind::TK_KW_UNION},
         {"enum", TokenKind::TK_KW_ENUM},
-        {"interface", TokenKind::TK_KW_INTERFACE},
         {"trait", TokenKind::TK_KW_TRAIT},
         {"type", TokenKind::TK_KW_TYPE},
         {"namespace", TokenKind::TK_KW_NAMESPACE},
@@ -505,8 +505,14 @@ namespace Cryo
                 advance(); // consume 'x' or 'X'
                 const char *hex_start = _current;
 
-                while (!at_end() && is_hex_digit(peek()))
+                while (!at_end() && (is_hex_digit(peek()) || peek() == '_'))
                 {
+                    // Skip underscores but don't count them as digits
+                    if (peek() == '_')
+                    {
+                        advance();
+                        continue;
+                    }
                     advance();
                 }
 
@@ -531,8 +537,14 @@ namespace Cryo
                 advance(); // consume 'b' or 'B'
                 const char *bin_start = _current;
 
-                while (!at_end() && (peek() == '0' || peek() == '1'))
+                while (!at_end() && (peek() == '0' || peek() == '1' || peek() == '_'))
                 {
+                    // Skip underscores but don't count them as digits
+                    if (peek() == '_')
+                    {
+                        advance();
+                        continue;
+                    }
                     advance();
                 }
 
@@ -557,8 +569,14 @@ namespace Cryo
                 advance(); // consume 'o' or 'O'
                 const char *oct_start = _current;
 
-                while (!at_end() && peek() >= '0' && peek() <= '7')
+                while (!at_end() && ((peek() >= '0' && peek() <= '7') || peek() == '_'))
                 {
+                    // Skip underscores but don't count them as digits
+                    if (peek() == '_')
+                    {
+                        advance();
+                        continue;
+                    }
                     advance();
                 }
 
@@ -580,8 +598,15 @@ namespace Cryo
         }
 
         // Regular decimal number - consume remaining digits (for all numbers, including those starting with 0)
-        while (!at_end() && is_digit(peek()))
+        // Also allow underscores as visual separators (e.g., 1_000_000)
+        while (!at_end() && (is_digit(peek()) || peek() == '_'))
         {
+            // Skip underscores but don't count them as digits
+            if (peek() == '_')
+            {
+                advance();
+                continue;
+            }
             advance();
         }
 
@@ -595,8 +620,13 @@ namespace Cryo
                 if (is_digit(next_char))
                 {
                     advance(); // consume '.'
-                    while (!at_end() && is_digit(peek()))
+                    while (!at_end() && (is_digit(peek()) || peek() == '_'))
                     {
+                        if (peek() == '_')
+                        {
+                            advance();
+                            continue;
+                        }
                         advance();
                     }
                 }
@@ -611,8 +641,13 @@ namespace Cryo
             {
                 advance();
             }
-            while (!at_end() && is_digit(peek()))
+            while (!at_end() && (is_digit(peek()) || peek() == '_'))
             {
+                if (peek() == '_')
+                {
+                    advance();
+                    continue;
+                }
                 advance();
             }
         }
@@ -685,10 +720,10 @@ namespace Cryo
 
         // Extract the string content without quotes
         std::string_view raw_text(start + 1, _current - start - 2);
-        
+
         // Process escape sequences during lexical analysis
         std::string processed_content = process_escape_sequences(std::string(raw_text));
-        
+
         // Store the processed string in the string pool and get a string_view to it
         std::string_view processed_text = store_processed_string(std::move(processed_content));
 
@@ -1346,15 +1381,15 @@ namespace Cryo
                     // Handle octal escape sequences (\000 to \377)
                     {
                         std::string octal_str;
-                        octal_str += next; // Include the first digit we already found
+                        octal_str += next;        // Include the first digit we already found
                         size_t octal_pos = i + 2; // Start from the next position after the first digit
-                        
+
                         // Collect up to 2 more octal digits (we already have 1)
                         for (int digit_count = 1; digit_count < 3 && octal_pos < str.length() && str[octal_pos] >= '0' && str[octal_pos] <= '7'; ++digit_count, ++octal_pos)
                         {
                             octal_str += str[octal_pos];
                         }
-                        
+
                         // Special case: if we only have \0 and no following octal digits, treat as null terminator
                         if (octal_str == "0" && (i + 2 >= str.length() || str[i + 2] < '0' || str[i + 2] > '7'))
                         {

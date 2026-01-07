@@ -16,16 +16,16 @@ namespace Cryo
     // ASTNode Implementation
     //===----------------------------------------------------------------------===//
 
-    ASTNode::ASTNode(NodeKind kind, SourceLocation location)
-        : _kind(kind), _location(location), _directive_storage(std::make_unique<DirectiveStorage>())
+    ASTNode::ASTNode(NodeKind kind, SourceLocation location, const std::string &source_file)
+        : _kind(kind), _location(location), _source_file(source_file), _directive_storage(std::make_unique<DirectiveStorage>())
     {
     }
 
     ASTNode::~ASTNode() = default;
 
     ASTNode::ASTNode(const ASTNode &other)
-        : _kind(other._kind), _location(other._location), _has_error(other._has_error),
-          _directive_storage(std::make_unique<DirectiveStorage>())
+        : _kind(other._kind), _location(other._location), _source_file(other._source_file),
+          _has_error(other._has_error), _directive_storage(std::make_unique<DirectiveStorage>())
     {
         // Note: We don't copy directives as they are typically tied to specific parse locations
     }
@@ -36,6 +36,7 @@ namespace Cryo
         {
             _kind = other._kind;
             _location = other._location;
+            _source_file = other._source_file;
             _has_error = other._has_error;
             _directive_storage = std::make_unique<DirectiveStorage>();
             // Note: We don't copy directives as they are typically tied to specific parse locations
@@ -44,8 +45,8 @@ namespace Cryo
     }
 
     ASTNode::ASTNode(ASTNode &&other) noexcept
-        : _kind(other._kind), _location(other._location), _has_error(other._has_error),
-          _directive_storage(std::move(other._directive_storage))
+        : _kind(other._kind), _location(other._location), _source_file(std::move(other._source_file)),
+          _has_error(other._has_error), _directive_storage(std::move(other._directive_storage))
     {
     }
 
@@ -55,6 +56,7 @@ namespace Cryo
         {
             _kind = other._kind;
             _location = other._location;
+            _source_file = std::move(other._source_file);
             _has_error = other._has_error;
             _directive_storage = std::move(other._directive_storage);
         }
@@ -220,6 +222,12 @@ namespace Cryo
 
     // TernaryExpressionNode visitor implementation
     void TernaryExpressionNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
+    // IfExpressionNode visitor implementation
+    void IfExpressionNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);
     }

@@ -505,6 +505,15 @@ namespace Cryo::Codegen
         if (!type)
             return 0;
 
+        // Check if the type is sized before computing size
+        // Opaque structs (structs without a body) are unsized and would cause LLVM to assert
+        if (!type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "MemoryCodegen::get_type_size called on unsized type, returning 0");
+            return 0;
+        }
+
         llvm::Module *mod = module();
         if (!mod)
             return 0;
@@ -517,6 +526,15 @@ namespace Cryo::Codegen
     {
         if (!type)
             return 0;
+
+        // Check if the type is sized before computing alignment
+        // Opaque structs (structs without a body) are unsized
+        if (!type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "MemoryCodegen::get_type_alignment called on unsized type, returning default alignment");
+            return 8; // Default to 8-byte alignment
+        }
 
         llvm::Module *mod = module();
         if (!mod)
