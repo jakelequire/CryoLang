@@ -220,6 +220,8 @@ namespace Cryo::Codegen
                         type_name += "(VariableDeclarationNode:" + inner_var->name() + ")";
                     else if (auto *inner_fn = dynamic_cast<Cryo::FunctionDeclarationNode *>(decl_stmt->declaration()))
                         type_name += "(FunctionDeclarationNode:" + inner_fn->name() + ")";
+                    else if (auto *inner_sm = dynamic_cast<Cryo::StructMethodNode *>(decl_stmt->declaration()))
+                        type_name += "(StructMethodNode:" + inner_sm->name() + ")";
                     else
                         type_name += "(other)";
                 }
@@ -388,8 +390,14 @@ namespace Cryo::Codegen
                 if (inner && (dynamic_cast<Cryo::EnumDeclarationNode *>(inner) ||
                               dynamic_cast<Cryo::StructDeclarationNode *>(inner) ||
                               dynamic_cast<Cryo::ClassDeclarationNode *>(inner) ||
-                              dynamic_cast<Cryo::VariableDeclarationNode *>(inner)))
+                              dynamic_cast<Cryo::VariableDeclarationNode *>(inner) ||
+                              dynamic_cast<Cryo::StructMethodNode *>(inner)))
                 {
+                    if (dynamic_cast<Cryo::StructMethodNode *>(inner))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 4: Skipping orphaned StructMethodNode wrapped in DeclarationStatementNode");
+                    }
                     continue;
                 }
             }
