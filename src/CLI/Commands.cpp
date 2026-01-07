@@ -958,6 +958,12 @@ namespace Cryo::CLI::Commands
             }
         }
 
+        // When building stdlib itself, show all stdlib diagnostics
+        if (is_stdlib)
+        {
+            compiler->set_show_stdlib_diagnostics(true);
+        }
+
         // Handle no_std: disable stdlib linking and auto-imports
         if (config.no_std)
         {

@@ -11,6 +11,13 @@ namespace Cryo
     Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context)
         : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(nullptr), _diagnostic_builder(nullptr)
     {
+        // Set source file on the builder from the lexer's file path
+        if (_lexer && &_lexer->file())
+        {
+            _source_file = _lexer->file().path();
+            _builder.set_source_file(_source_file);
+        }
+
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
         try
         {
@@ -35,6 +42,9 @@ namespace Cryo
     Parser::Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file)
         : _lexer(std::move(lexer)), _context(context), _builder(context), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
     {
+        // Set source file on the builder so created nodes know their origin
+        _builder.set_source_file(source_file);
+
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
         try
         {
@@ -595,6 +605,17 @@ namespace Cryo
                     current_kind == TokenKind::TK_KW_CONST || current_kind == TokenKind::TK_KW_MUT ||
                     current_kind == TokenKind::TK_KW_BREAK || current_kind == TokenKind::TK_KW_CONTINUE)
                 {
+                    // IMPORTANT: If we hit a statement keyword immediately without skipping any tokens,
+                    // the caller likely can't parse this statement. Skip past it to make progress.
+                    if (tokens_skipped == 0)
+                    {
+                        LOG_DEBUG(LogComponent::PARSER,
+                                  "[SYNC METHOD] Found statement keyword '{}' immediately - skipping to prevent infinite loop",
+                                  std::string(_current_token.text()));
+                        advance();
+                        tokens_skipped++;
+                        continue;
+                    }
                     LOG_DEBUG(LogComponent::PARSER, "Method body synchronized on statement keyword after skipping {} tokens", tokens_skipped);
                     return;
                 }
@@ -766,6 +787,20 @@ namespace Cryo
                         }
                     }
 
+                    // IMPORTANT: If we hit a statement start immediately without skipping any tokens,
+                    // the caller likely can't parse this statement. Consuming and retrying will cause
+                    // an infinite loop. Instead, skip past this statement start to make progress.
+                    if (tokens_skipped == 0)
+                    {
+                        LOG_DEBUG(LogComponent::PARSER,
+                                  "Synchronization found statement start '{}' immediately - skipping to prevent infinite loop",
+                                  std::string(_current_token.text()));
+                        advance();
+                        tokens_skipped++;
+                        // Continue looking for a better recovery point (like a semicolon)
+                        continue;
+                    }
+
                     LOG_DEBUG(LogComponent::PARSER, "Synchronized on statement start '{}' after skipping {} tokens",
                               std::string(_current_token.text()), tokens_skipped);
                     return;
@@ -930,7 +965,6 @@ namespace Cryo
                kind == TokenKind::TK_KW_STRUCT ||
                kind == TokenKind::TK_KW_ENUM ||
                kind == TokenKind::TK_KW_TRAIT ||
-               kind == TokenKind::TK_KW_INTERFACE ||
                kind == TokenKind::TK_KW_IMPLEMENT ||
                kind == TokenKind::TK_KW_EXTERN ||
                kind == TokenKind::TK_KW_INTRINSIC ||
@@ -1301,6 +1335,10 @@ namespace Cryo
         else if (_current_token.is(TokenKind::TK_KW_FOR))
         {
             statement = parse_for_statement();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_LOOP))
+        {
+            statement = parse_loop_statement();
         }
         else if (_current_token.is(TokenKind::TK_KW_MATCH))
         {
@@ -2130,13 +2168,13 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_bitwise_and()
     {
-        auto expr = parse_cast();
+        auto expr = parse_relational();
 
         while (_current_token.is(TokenKind::TK_AMP))
         {
             Token op = _current_token;
             advance();
-            auto right = parse_cast();
+            auto right = parse_relational();
             expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
         }
 
@@ -2145,7 +2183,7 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_cast()
     {
-        auto expr = parse_relational();
+        auto expr = parse_unary();
 
         // Handle type casts: expression as TargetType
         while (_current_token.is(TokenKind::TK_KW_AS))
@@ -2244,13 +2282,13 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_multiplicative()
     {
-        auto expr = parse_unary();
+        auto expr = parse_cast();
 
         while (_current_token.is(TokenKind::TK_STAR) || _current_token.is(TokenKind::TK_SLASH) || _current_token.is(TokenKind::TK_PERCENT))
         {
             Token op = _current_token;
             advance();
-            auto right = parse_unary();
+            auto right = parse_cast();
             expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
         }
 
@@ -2330,6 +2368,12 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_KW_TRUE) || _current_token.is(TokenKind::TK_KW_FALSE))
         {
             return parse_boolean_literal();
+        }
+
+        // If-expression: if (condition) { expr } else { expr }
+        if (_current_token.is(TokenKind::TK_KW_IF))
+        {
+            return parse_if_expression();
         }
 
         if (_current_token.is(TokenKind::TK_KW_NULL))
@@ -2576,7 +2620,8 @@ namespace Cryo
             {
                 advance(); // consume '::'
 
-                if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                // Allow both identifiers and keywords after :: (for things like T::default())
+                if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
                 {
                     error("Expected identifier after '::'");
                     return nullptr;
@@ -2637,6 +2682,66 @@ namespace Cryo
                     Token op = _current_token;
                     advance();
                     expr = _builder.create_unary_expression(op, std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_L_BRACE))
+                {
+                    // Struct literal initialization: TypeName { field: value, ... }
+                    // Only valid if expr is an identifier or scope resolution
+                    std::string struct_name;
+                    SourceLocation literal_location;
+
+                    if (auto identifier = dynamic_cast<IdentifierNode *>(expr.get()))
+                    {
+                        struct_name = identifier->name();
+                        literal_location = identifier->location();
+                    }
+                    else if (auto scope_res = dynamic_cast<ScopeResolutionNode *>(expr.get()))
+                    {
+                        // For generic types like MaybeUninit<T>
+                        struct_name = scope_res->scope_name() + "::" + scope_res->member_name();
+                        literal_location = scope_res->location();
+                    }
+                    else
+                    {
+                        // Not a valid struct literal context
+                        break;
+                    }
+
+                    advance(); // consume '{'
+
+                    auto struct_literal = _builder.create_struct_literal(literal_location, struct_name);
+
+                    // Parse field initializers
+                    if (!_current_token.is(TokenKind::TK_R_BRACE))
+                    {
+                        do
+                        {
+                            // Parse field name
+                            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                            {
+                                error("Expected field name in struct literal");
+                                return nullptr;
+                            }
+
+                            std::string field_name = std::string(_current_token.text());
+                            advance();
+
+                            // Expect ':'
+                            consume(TokenKind::TK_COLON, "Expected ':' after field name");
+
+                            // Parse field value
+                            auto field_value = parse_expression();
+
+                            // Create field initializer
+                            auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                            struct_literal->add_field_initializer(std::move(field_init));
+
+                        } while (match(TokenKind::TK_COMMA));
+                    }
+
+                    consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
+
+                    expr = std::move(struct_literal);
                 }
                 else
                 {
@@ -2761,14 +2866,15 @@ namespace Cryo
         {
             advance(); // consume '::'
 
-            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+            // Allow both identifiers and keywords after :: (for things like T::default())
+            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
             {
                 error("Expected identifier after '::'");
                 return _builder.create_identifier_node(token);
             }
 
-            Token member_token = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '::'");
-            std::string member_name = std::string(member_token.text());
+            std::string member_name = std::string(_current_token.text());
+            advance(); // consume the identifier/keyword
 
             return _builder.create_scope_resolution(base_loc, base_name, member_name);
         }
@@ -2896,6 +3002,32 @@ namespace Cryo
         return nullptr;
     }
 
+    std::unique_ptr<ExpressionNode> Parser::parse_if_expression()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_IF, "Expected 'if'");
+
+        // Parse condition in parentheses
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after 'if' in if-expression");
+        auto condition = parse_expression();
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after condition in if-expression");
+
+        // Parse then branch: { expression }
+        consume(TokenKind::TK_L_BRACE, "Expected '{' for then branch in if-expression");
+        auto then_expr = parse_expression();
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after then expression");
+
+        // Require else branch for if-expressions
+        consume(TokenKind::TK_KW_ELSE, "Expected 'else' in if-expression (both branches required)");
+
+        // Parse else branch: { expression }
+        consume(TokenKind::TK_L_BRACE, "Expected '{' for else branch in if-expression");
+        auto else_expr = parse_expression();
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after else expression");
+
+        return _builder.create_if_expression(start_loc, std::move(condition), std::move(then_expr), std::move(else_expr));
+    }
+
     std::unique_ptr<ASTNode> Parser::parse_while_statement()
     {
         SourceLocation start_loc = _current_token.location();
@@ -2914,6 +3046,28 @@ namespace Cryo
         }
 
         error("Invalid body statement in while");
+        return nullptr;
+    }
+
+    std::unique_ptr<ASTNode> Parser::parse_loop_statement()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_LOOP, "Expected 'loop'");
+
+        // loop { body } is equivalent to while(true) { body }
+        // Create a synthetic "true" token for the condition
+        Token true_token(TokenKind::TK_KW_TRUE, "true", start_loc);
+        auto condition = _builder.create_literal_node(true_token);
+
+        auto body = parse_statement();
+        if (auto stmt = dynamic_cast<StatementNode *>(body.get()))
+        {
+            body.release();
+            auto body_stmt = std::unique_ptr<StatementNode>(stmt);
+            return _builder.create_while_statement(start_loc, std::move(condition), std::move(body_stmt));
+        }
+
+        error("Invalid body statement in loop");
         return nullptr;
     }
 
@@ -3267,9 +3421,27 @@ namespace Cryo
             return parse_this_parameter();
         }
 
-        // Parse parameter name
-        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected parameter name");
-        std::string param_name = std::string(name_token.text());
+        // Parse parameter name - allow both identifiers and 'this' keyword (for this: Type syntax)
+        Token name_token;
+        std::string param_name;
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            name_token = _current_token;
+            param_name = std::string(name_token.text());
+            advance();
+        }
+        else if (_current_token.is(TokenKind::TK_KW_THIS))
+        {
+            // Allow 'this' as a parameter name when followed by ':'
+            name_token = _current_token;
+            param_name = "this";
+            advance();
+        }
+        else
+        {
+            error("Expected parameter name");
+            return nullptr;
+        }
 
         // Parse type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
@@ -3281,10 +3453,16 @@ namespace Cryo
 
     bool Parser::is_this_parameter()
     {
-        // Check for patterns: &this, mut &this, this
+        // Check for patterns: &this, mut &this, this (but NOT this: Type)
         if (_current_token.is(TokenKind::TK_KW_THIS))
         {
-            return true; // this (by value)
+            // Check if followed by ':' - if so, it's a regular named parameter like "this: T"
+            Token next = peek_next();
+            if (next.is(TokenKind::TK_COLON))
+            {
+                return false; // this: Type is a regular named parameter, not special 'this' syntax
+            }
+            return true; // this (by value) without explicit type
         }
         else if (_current_token.is(TokenKind::TK_AMP))
         {
@@ -3312,7 +3490,7 @@ namespace Cryo
         {
             is_mutable = true;
             advance(); // consume 'mut'
-            
+
             // After 'mut', we expect '&this'
             if (!_current_token.is(TokenKind::TK_AMP))
             {
@@ -3352,9 +3530,9 @@ namespace Cryo
 
         // Create a special parameter for 'this'
         auto param = _builder.create_variable_declaration(start_loc, "this", this_type);
-        
+
         // TODO: Add metadata to indicate this is a 'this' parameter and whether it's mutable
-        
+
         return param;
     }
 
@@ -3794,15 +3972,18 @@ namespace Cryo
 
                 bool is_method = false;
 
-                // Case 1: regular method - identifier followed by (
-                if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
+                // Case 1: regular method - identifier or keyword followed by ( or < (for generic methods)
+                // This allows method names like 'new', 'default', etc.
+                if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                    (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE)))
                 {
                     is_method = true;
                 }
-                // Case 2: static method - static followed by identifier
-                else if (_current_token.is(TokenKind::TK_KW_STATIC) && next.is(TokenKind::TK_IDENTIFIER))
+                // Case 2: static method - static followed by identifier or keyword (like 'new')
+                else if (_current_token.is(TokenKind::TK_KW_STATIC) &&
+                         (next.is(TokenKind::TK_IDENTIFIER) || next.is_keyword()))
                 {
-                    // For static methods, we assume it's a method if static is followed by identifier
+                    // For static methods, we assume it's a method if static is followed by identifier or keyword
                     // The method parsing will handle the rest
                     is_method = true;
                 }
@@ -3905,13 +4086,15 @@ namespace Cryo
 
                 bool is_method = false;
 
-                // Case 1: regular method - identifier followed by (
-                if (_current_token.is(TokenKind::TK_IDENTIFIER) && next.is(TokenKind::TK_L_PAREN))
+                // Case 1: regular method - identifier or keyword followed by ( or < (for generic methods)
+                // This allows method names like 'new', 'default', etc.
+                if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                    (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE)))
                 {
                     // Additional validation: identifiers starting with __ are likely function calls, not methods
                     // Also exclude primitive type names that are likely type casts
                     std::string identifier_text = std::string(_current_token.text());
-                    if (identifier_text.substr(0, 2) == "__" ||
+                    if (identifier_text.length() >= 2 && identifier_text.substr(0, 2) == "__" ||
                         identifier_text == "u8" || identifier_text == "u16" || identifier_text == "u32" || identifier_text == "u64" ||
                         identifier_text == "i8" || identifier_text == "i16" || identifier_text == "i32" || identifier_text == "i64" ||
                         identifier_text == "f32" || identifier_text == "f64" || identifier_text == "bool" || identifier_text == "char")
@@ -3925,10 +4108,11 @@ namespace Cryo
                         is_method = true;
                     }
                 }
-                // Case 2: static method - static followed by identifier
-                else if (_current_token.is(TokenKind::TK_KW_STATIC) && next.is(TokenKind::TK_IDENTIFIER))
+                // Case 2: static method - static followed by identifier or keyword (like 'new')
+                else if (_current_token.is(TokenKind::TK_KW_STATIC) &&
+                         (next.is(TokenKind::TK_IDENTIFIER) || next.is_keyword()))
                 {
-                    // For static methods, we assume it's a method if static is followed by identifier
+                    // For static methods, we assume it's a method if static is followed by identifier or keyword
                     // The method parsing will handle the rest
                     is_method = true;
                 }
@@ -4272,8 +4456,8 @@ namespace Cryo
                 enum_decl->add_variant(std::move(variant));
             }
 
-            // Optional comma between variants
-            if (_current_token.is(TokenKind::TK_COMMA))
+            // Optional comma or semicolon between variants
+            if (_current_token.is(TokenKind::TK_COMMA) || _current_token.is(TokenKind::TK_SEMICOLON))
             {
                 advance();
             }
@@ -4477,10 +4661,16 @@ namespace Cryo
                     field->set_default_value(std::move(value));
                     impl_block->add_field_implementation(std::move(field));
                 }
-                else if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
-                         (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
+                else if (_current_token.is(TokenKind::TK_KW_STATIC))
                 {
-                    // Method implementation
+                    // Static method implementation: static method_name() -> T { ... }
+                    auto method = parse_struct_method(target_type);
+                    impl_block->add_method_implementation(std::move(method));
+                }
+                else if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                         (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
+                {
+                    // Method implementation (including generic methods with <T> syntax)
                     auto method = parse_struct_method(target_type);
                     impl_block->add_method_implementation(std::move(method));
                 }
@@ -4712,6 +4902,15 @@ namespace Cryo
             is_constructor = true;
         }
 
+        // Parse optional generic parameters (e.g., <T> or <T, U>)
+        std::vector<std::unique_ptr<GenericParameterNode>> method_generics;
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            method_generics = parse_generic_parameters();
+            LOG_DEBUG(LogComponent::PARSER, "[METHOD] Parsed {} generic parameters for method '{}'",
+                      method_generics.size(), method_name);
+        }
+
         consume(TokenKind::TK_L_PAREN, "Expected '(' after method name");
 
         // Parse parameters
@@ -4776,6 +4975,12 @@ namespace Cryo
 
         // Set variadic flag if detected
         method->set_variadic(is_variadic);
+
+        // Add generic parameters
+        for (auto &generic : method_generics)
+        {
+            method->add_generic_parameter(std::move(generic));
+        }
 
         // Add parameters
         for (auto &param : params)
@@ -5265,8 +5470,11 @@ namespace Cryo
         LOG_DEBUG(LogComponent::PARSER, "parse_type_annotation_with_tokens() starting, current token: {} ({})",
                   static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
 
+        // Track parenthesis depth for function types like () -> T or (T, U) -> V
+        int paren_depth = 0;
+
         // Collect tokens that form the complete type expression
-        // This handles complex types like: const int**, Option<Result<T, E>>, u64[5], etc.
+        // This handles complex types like: const int**, Option<Result<T, E>>, u64[5], () -> T, etc.
         while (is_type_token() ||
                _current_token.is(TokenKind::TK_L_ANGLE) ||
                _current_token.is(TokenKind::TK_R_ANGLE) ||
@@ -5280,7 +5488,10 @@ namespace Cryo
                _current_token.is(TokenKind::TK_COLONCOLON) ||
                _current_token.is(TokenKind::TK_KW_CONST) ||
                _current_token.is(TokenKind::TK_KW_MUT) ||
-               _current_token.is(TokenKind::TK_IDENTIFIER))
+               _current_token.is(TokenKind::TK_IDENTIFIER) ||
+               _current_token.is(TokenKind::TK_L_PAREN) || // Function types: () -> T
+               _current_token.is(TokenKind::TK_R_PAREN) || // Function types: (T) -> U
+               _current_token.is(TokenKind::TK_ARROW))     // Function types: T -> U
         {
             // Track angle bracket depth
             if (_current_token.is(TokenKind::TK_L_ANGLE))
@@ -5297,6 +5508,21 @@ namespace Cryo
                 angle_bracket_depth -= 2;
             }
 
+            // Track parenthesis depth for function types
+            if (_current_token.is(TokenKind::TK_L_PAREN))
+            {
+                paren_depth++;
+            }
+            else if (_current_token.is(TokenKind::TK_R_PAREN))
+            {
+                paren_depth--;
+                // If we close more parens than we opened, this ) belongs to outer context
+                if (paren_depth < 0)
+                {
+                    break;
+                }
+            }
+
             LOG_DEBUG(LogComponent::PARSER, "Collecting token: {} ({})",
                       static_cast<int>(_current_token.kind()), std::string(_current_token.text()));
 
@@ -5304,8 +5530,8 @@ namespace Cryo
             type_string += std::string(_current_token.text());
             advance();
 
-            // Break on certain terminators, but only if we're not inside angle brackets
-            if (angle_bracket_depth == 0 &&
+            // Break on certain terminators, but only if we're not inside angle brackets or parentheses
+            if (angle_bracket_depth == 0 && paren_depth == 0 &&
                 (_current_token.is(TokenKind::TK_SEMICOLON) ||
                  _current_token.is(TokenKind::TK_COMMA) ||
                  _current_token.is(TokenKind::TK_R_PAREN) ||

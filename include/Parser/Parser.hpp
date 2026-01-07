@@ -158,7 +158,9 @@ namespace Cryo
         std::unique_ptr<ReturnStatementNode> parse_return_statement();
         std::unique_ptr<BlockStatementNode> parse_block_statement();
         std::unique_ptr<ASTNode> parse_if_statement();
+        std::unique_ptr<ExpressionNode> parse_if_expression();
         std::unique_ptr<ASTNode> parse_while_statement();
+        std::unique_ptr<ASTNode> parse_loop_statement();
         std::unique_ptr<ASTNode> parse_for_statement();
         std::unique_ptr<ASTNode> parse_match_statement();
         std::unique_ptr<ASTNode> parse_switch_statement();

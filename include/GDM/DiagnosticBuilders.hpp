@@ -245,6 +245,10 @@ namespace Cryo
         Diagnostic &create_redefined_symbol_error(const std::string &symbol_name,
                                                   NodeKind symbol_kind,
                                                   SourceLocation location);
+        // Overload with node for proper source context
+        Diagnostic &create_redefined_symbol_error(const std::string &symbol_name,
+                                                  NodeKind symbol_kind,
+                                                  ASTNode *node);
 
         // Access and dereference errors
         Diagnostic &create_invalid_member_access_error(const std::string &member_name,
@@ -274,6 +278,11 @@ namespace Cryo
                                                    Type *left_type, Type *right_type,
                                                    SourceLocation location);
 
+        // Overload with node for proper source context
+        Diagnostic &create_invalid_operation_error(const std::string &operation,
+                                                   Type *left_type, Type *right_type,
+                                                   ASTNode *node);
+
         Diagnostic &create_non_callable_error(Type *type, SourceLocation location, ASTNode *node = nullptr);
 
         Diagnostic &create_too_many_args_error(const std::string &function_name,
@@ -288,8 +297,12 @@ namespace Cryo
                                                     SourceLocation location);
 
         // Generic type error with custom message
-        Diagnostic &create_type_error(ErrorCode error_code, SourceLocation location, 
+        Diagnostic &create_type_error(ErrorCode error_code, SourceLocation location,
                                      const std::string &custom_message);
+
+        // Generic type error with node context - this provides full source code context
+        Diagnostic &create_error_with_node(ErrorCode error_code, ASTNode *node,
+                                          const std::string &message, const std::string &label = "");
     };
 
     /**

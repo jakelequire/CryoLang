@@ -16,6 +16,9 @@ namespace Cryo
             return SourceSpan(SourceLocation(1, 1), SourceLocation(1, 1), _source_file, true);
         }
 
+        // Use the node's source file if available, otherwise fall back to builder's source file
+        const std::string &source_file = node->source_file().empty() ? _source_file : node->source_file();
+
         SourceLocation start = node->location();
         // Try to estimate a reasonable end location based on node type
         size_t estimated_width = 1;
@@ -38,7 +41,7 @@ namespace Cryo
         }
 
         SourceLocation end(start.line(), start.column() + estimated_width);
-        return SourceSpan(start, end, _source_file, true);
+        return SourceSpan(start, end, source_file, true);
     }
 
     SourceSpan BaseDiagnosticBuilder::create_token_span(const Token &token) const
@@ -1337,6 +1340,66 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_redefined_symbol_error(const std::string &symbol_name,
+                                                                            NodeKind symbol_kind,
+                                                                            ASTNode *node)
+    {
+        // Use create_node_span which properly extracts source file from the node
+        SourceSpan span = create_node_span(node);
+
+        // Convert NodeKind to symbol type string
+        std::string symbol_type;
+        switch (symbol_kind)
+        {
+        case NodeKind::FunctionDeclaration:
+            symbol_type = "function";
+            break;
+        case NodeKind::StructDeclaration:
+            symbol_type = "struct";
+            break;
+        case NodeKind::ClassDeclaration:
+            symbol_type = "class";
+            break;
+        case NodeKind::TraitDeclaration:
+            symbol_type = "trait";
+            break;
+        case NodeKind::EnumDeclaration:
+            symbol_type = "enum";
+            break;
+        case NodeKind::TypeAliasDeclaration:
+            symbol_type = "type alias";
+            break;
+        case NodeKind::VariableDeclaration:
+            symbol_type = "variable";
+            break;
+        case NodeKind::Declaration: // Generic parameter
+            symbol_type = "generic parameter";
+            break;
+        default:
+            symbol_type = "symbol";
+            break;
+        }
+
+        span.set_label("redefined " + symbol_type);
+        std::string message = symbol_type + " `" + symbol_name + "` is already defined";
+
+        // Get the source file - prefer node's file, fall back to builder's file
+        const std::string &source_file = (node && !node->source_file().empty()) ? node->source_file() : _source_file;
+
+        auto &diagnostic = _diagnostic_manager->create_error(ErrorCode::E0205_REDEFINED_SYMBOL, span.to_source_range(), source_file);
+        diagnostic.with_primary_span(span);
+
+        add_common_help(diagnostic, ErrorCode::E0205_REDEFINED_SYMBOL);
+
+        // Mark node as having error to prevent duplicates
+        if (node)
+        {
+            node->mark_error();
+        }
+
+        return diagnostic;
+    }
+
     Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_dereference_error(Type *type,
                                                                                SourceLocation location)
     {
@@ -1426,6 +1489,43 @@ namespace Cryo
         return diagnostic;
     }
 
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_operation_error(const std::string &operation,
+                                                                             Type *left_type, Type *right_type,
+                                                                             ASTNode *node)
+    {
+        // Use create_node_span which properly extracts source file from the node
+        SourceSpan span = create_node_span(node);
+
+        std::string left_name = left_type ? left_type->to_string() : "unknown";
+        std::string right_name = right_type ? right_type->to_string() : "unknown";
+
+        if (right_type)
+        {
+            span.set_label("incompatible types for " + operation + " operation");
+        }
+        else
+        {
+            span.set_label("invalid " + operation + " operation on type '" + left_name + "'");
+        }
+
+        std::string message = right_type ? ("Cannot apply '" + operation + "' to types '" + left_name + "' and '" + right_name + "'") : ("Cannot apply '" + operation + "' to type '" + left_name + "'");
+
+        // Get the source file - prefer node's file, fall back to builder's file
+        const std::string &source_file = (node && !node->source_file().empty()) ? node->source_file() : _source_file;
+
+        ErrorCode error_code = right_type ? ErrorCode::E0229_INVALID_BINARY_OP : ErrorCode::E0230_INVALID_UNARY_OP;
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), source_file, message);
+        diagnostic.with_primary_span(span);
+
+        // Mark node as having error to prevent duplicates
+        if (node)
+        {
+            node->mark_error();
+        }
+
+        return diagnostic;
+    }
+
     Diagnostic &TypeCheckerDiagnosticBuilder::create_non_callable_error(Type *type, SourceLocation location, ASTNode *node)
     {
         // Check for duplicate error reporting
@@ -1503,6 +1603,39 @@ namespace Cryo
 
         auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), _source_file, custom_message);
         diagnostic.with_primary_span(span);
+
+        return diagnostic;
+    }
+
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_error_with_node(ErrorCode error_code, ASTNode *node,
+                                                                     const std::string &message,
+                                                                     const std::string &label)
+    {
+        // Use create_node_span which properly extracts source file from the node
+        SourceSpan span = create_node_span(node);
+
+        // Set a meaningful label
+        if (!label.empty())
+        {
+            span.set_label(label);
+        }
+        else
+        {
+            // Generate label from error code category
+            span.set_label(message.substr(0, std::min(message.size(), size_t(50))));
+        }
+
+        // Get the source file - prefer node's file, fall back to builder's file
+        const std::string &source_file = (node && !node->source_file().empty()) ? node->source_file() : _source_file;
+
+        auto &diagnostic = _diagnostic_manager->create_error(error_code, span.to_source_range(), source_file, message);
+        diagnostic.with_primary_span(span);
+
+        // Mark node as having error to prevent duplicates
+        if (node)
+        {
+            node->mark_error();
+        }
 
         return diagnostic;
     }
