@@ -787,11 +787,33 @@ namespace Cryo::Codegen
 
                 if (value->getType()->isIntegerTy() && pattern_val->getType()->isIntegerTy())
                 {
-                    return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
+                    // Ensure types are compatible before comparison
+                    llvm::Value *lhs = value;
+                    llvm::Value *rhs = pattern_val;
+                    if (ensure_compatible_types(lhs, rhs))
+                    {
+                        return builder().CreateICmpEQ(lhs, rhs, "pattern.match");
+                    }
+                    else
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to coerce types for pattern match comparison");
+                        return nullptr;
+                    }
                 }
                 else if (value->getType()->isFloatingPointTy() && pattern_val->getType()->isFloatingPointTy())
                 {
-                    return builder().CreateFCmpOEQ(value, pattern_val, "pattern.match");
+                    // Ensure types are compatible before comparison
+                    llvm::Value *lhs = value;
+                    llvm::Value *rhs = pattern_val;
+                    if (ensure_compatible_types(lhs, rhs))
+                    {
+                        return builder().CreateFCmpOEQ(lhs, rhs, "pattern.match");
+                    }
+                    else
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to coerce types for float pattern match comparison");
+                        return nullptr;
+                    }
                 }
                 else if (value->getType()->isPointerTy() && pattern_val->getType()->isPointerTy())
                 {
@@ -837,12 +859,32 @@ namespace Cryo::Codegen
             {
                 // Tagged union - extract discriminant from first field
                 llvm::Value *discriminant = builder().CreateExtractValue(value, 0, "discriminant");
-                return builder().CreateICmpEQ(discriminant, expected_discriminant, "pattern.match");
+                llvm::Value *lhs = discriminant;
+                llvm::Value *rhs = expected_discriminant;
+                if (ensure_compatible_types(lhs, rhs))
+                {
+                    return builder().CreateICmpEQ(lhs, rhs, "pattern.match");
+                }
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to coerce types for enum discriminant comparison");
+                    return nullptr;
+                }
             }
             else if (value->getType()->isIntegerTy())
             {
-                // Simple enum - compare directly
-                return builder().CreateICmpEQ(value, expected_discriminant, "pattern.match");
+                // Simple enum - compare directly with type coercion
+                llvm::Value *lhs = value;
+                llvm::Value *rhs = expected_discriminant;
+                if (ensure_compatible_types(lhs, rhs))
+                {
+                    return builder().CreateICmpEQ(lhs, rhs, "pattern.match");
+                }
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to coerce types for simple enum comparison");
+                    return nullptr;
+                }
             }
 
             return nullptr;
@@ -851,6 +893,65 @@ namespace Cryo::Codegen
 
         // Default: wildcard behavior
         return nullptr;
+    }
+
+    bool ControlFlowCodegen::ensure_compatible_types(llvm::Value *&lhs, llvm::Value *&rhs)
+    {
+        if (!lhs || !rhs)
+            return false;
+
+        llvm::Type *lhs_type = lhs->getType();
+        llvm::Type *rhs_type = rhs->getType();
+
+        if (lhs_type == rhs_type)
+            return true;
+
+        // Integer type promotion
+        if (lhs_type->isIntegerTy() && rhs_type->isIntegerTy())
+        {
+            unsigned lhs_bits = lhs_type->getIntegerBitWidth();
+            unsigned rhs_bits = rhs_type->getIntegerBitWidth();
+
+            if (lhs_bits < rhs_bits)
+            {
+                lhs = builder().CreateSExt(lhs, rhs_type, "sext");
+            }
+            else if (rhs_bits < lhs_bits)
+            {
+                rhs = builder().CreateSExt(rhs, lhs_type, "sext");
+            }
+            return true;
+        }
+
+        // Float promotion
+        if (lhs_type->isFloatingPointTy() && rhs_type->isFloatingPointTy())
+        {
+            if (lhs_type->isFloatTy() && rhs_type->isDoubleTy())
+            {
+                lhs = builder().CreateFPExt(lhs, rhs_type, "fpext");
+            }
+            else if (rhs_type->isFloatTy() && lhs_type->isDoubleTy())
+            {
+                rhs = builder().CreateFPExt(rhs, lhs_type, "fpext");
+            }
+            return true;
+        }
+
+        // Pointer comparison (both should be pointers)
+        if (lhs_type->isPointerTy() && rhs_type->isPointerTy())
+        {
+            // Opaque pointers in LLVM 15+ are compatible
+            return true;
+        }
+
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                  "ensure_compatible_types: Cannot convert between incompatible types in pattern match. "
+                  "lhs is integer: {}, lhs is pointer: {}, lhs is float: {}; "
+                  "rhs is integer: {}, rhs is pointer: {}, rhs is float: {}",
+                  lhs_type->isIntegerTy(), lhs_type->isPointerTy(), lhs_type->isFloatingPointTy(),
+                  rhs_type->isIntegerTy(), rhs_type->isPointerTy(), rhs_type->isFloatingPointTy());
+
+        return false;
     }
 
     void ControlFlowCodegen::bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern)
