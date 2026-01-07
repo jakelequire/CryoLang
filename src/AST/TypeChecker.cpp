@@ -4038,9 +4038,31 @@ namespace Cryo
     {
         // Look up the struct type in the symbol table
         const std::string &struct_name = node.struct_type();
-        TypedSymbol *type_symbol = _symbol_table->lookup_symbol(struct_name);
+        
+        // CRITICAL: Check if this is a struct literal in a generic context
+        // If we're inside a generic struct method and the literal matches the current struct,
+        // use the current struct type with its generic parameters
+        Type *resolved_type = nullptr;
+        
+        if (!_current_struct_name.empty() && struct_name == _current_struct_name && _current_struct_type)
+        {
+            // This is a literal for the current struct being processed - use the current struct type
+            // This ensures that Box { ptr: ptr } inside Box<T> constructor gets type Box<T>
+            resolved_type = _current_struct_type;
+            LOG_DEBUG(Cryo::LogComponent::AST, "StructLiteral: Using current struct type '{}' for literal '{}'", 
+                     resolved_type->to_string(), struct_name);
+        }
+        else
+        {
+            // Regular lookup for other struct types
+            TypedSymbol *type_symbol = _symbol_table->lookup_symbol(struct_name);
+            if (type_symbol)
+            {
+                resolved_type = type_symbol->type;
+            }
+        }
 
-        if (!type_symbol)
+        if (!resolved_type)
         {
             // Struct type not found - report error
             _diagnostic_builder->create_undefined_symbol_error(struct_name, NodeKind::StructDeclaration, node.location());
@@ -4049,7 +4071,9 @@ namespace Cryo
         else
         {
             // Struct type exists - set the resolved type
-            node.set_resolved_type(type_symbol->type);
+            node.set_resolved_type(resolved_type);
+            LOG_DEBUG(Cryo::LogComponent::AST, "StructLiteral: Set resolved type '{}' for literal '{}'", 
+                     resolved_type->to_string(), struct_name);
 
             // TODO: Validate field initializers against struct definition
             // For now, assume all field initializers are valid
@@ -4113,6 +4137,15 @@ namespace Cryo
         if (is_in_generic_context() && is_generic_parameter(type_name))
         {
             // This is a valid generic parameter - sizeof is valid
+            node.set_type("u64");
+            return;
+        }
+
+        // Try to resolve the type using generic context (handles parameterized types like BoundedChannel<T>)
+        Type* resolved_type = resolve_type_with_generic_context(type_name);
+        if (resolved_type)
+        {
+            // Successfully resolved the type in generic context
             node.set_type("u64");
             return;
         }
@@ -7566,6 +7599,18 @@ namespace Cryo
                     _current_function_return_type = node.get_resolved_return_type();
                 }
                 
+                // CRITICAL: Set up generic context if this struct has generic parameters
+                bool entered_generic_context = false;
+                if (!_current_struct_name.empty()) {
+                    auto template_it = _template_parameters.find(_current_struct_name);
+                    if (template_it != _template_parameters.end() && !template_it->second.empty()) {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Setting up generic context for method '{}' in struct '{}' with {} parameters", 
+                                  method_name, _current_struct_name, template_it->second.size());
+                        enter_generic_context(_current_struct_name, template_it->second, node.location());
+                        entered_generic_context = true;
+                    }
+                }
+                
                 // Add parameters to scope
                 for (const auto &param : node.parameters())
                 {
@@ -7577,6 +7622,11 @@ namespace Cryo
                 
                 // Process body
                 node.body()->accept(*this);
+                
+                // Clean up generic context
+                if (entered_generic_context) {
+                    exit_generic_context();
+                }
                 
                 // Clean up
                 _in_function = false;
@@ -7762,6 +7812,10 @@ namespace Cryo
             // Create function type
             FunctionType *func_type = static_cast<FunctionType *>(
                 _type_context.create_function_type(return_type, param_types));
+
+            // CRITICAL: Store the constructor return type on the node so it's available during Pass 2
+            node.set_resolved_return_type(return_type);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Constructor '{}' return type set to: '{}'", func_name, return_type ? return_type->to_string() : "NULL");
 
             // DO NOT declare constructor function in symbol table to avoid name conflict
             // The struct/class type is already declared with this name
@@ -9030,10 +9084,12 @@ namespace Cryo
     {
         // Extract method information
         std::string method_name = node.name();
-        bool is_constructor = node.is_constructor();
+        
+        // Use consistent constructor detection logic
+        bool is_constructor = node.is_constructor() || (!_current_struct_name.empty() && method_name == _current_struct_name);
 
-        LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: method_name='{}', struct='{}', is_constructor={}, visibility={}({})",
-                  method_name, _current_struct_name, is_constructor,
+        LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: method_name='{}', struct='{}', is_constructor={} (node.is_constructor={}, name_match={}), visibility={}({})",
+                  method_name, _current_struct_name, is_constructor, node.is_constructor(), (!_current_struct_name.empty() && method_name == _current_struct_name),
                   (node.visibility() == Visibility::Private ? "Private" : node.visibility() == Visibility::Public ? "Public"
                                                                                                                   : "Unknown"),
                   static_cast<int>(node.visibility()));
@@ -9043,8 +9099,38 @@ namespace Cryo
 
         if (!return_type && is_constructor)
         {
-            // Constructors return void or their class type
-            return_type = _type_context.get_void_type();
+            // Constructors return the struct type they belong to
+            LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: Processing constructor '{}', _current_struct_type={}, _current_struct_name='{}'", 
+                     method_name, _current_struct_type ? _current_struct_type->to_string() : "NULL", _current_struct_name);
+                     
+            if (_current_struct_type)
+            {
+                return_type = _current_struct_type;
+                LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: Constructor '{}' return type set to current struct type: '{}'", 
+                         method_name, return_type->to_string());
+            }
+            else if (!_current_struct_name.empty())
+            {
+                // Fallback: try to get struct type by name
+                return_type = _type_context.get_struct_type(_current_struct_name);
+                if (return_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: Constructor '{}' return type set via lookup: '{}'", 
+                             method_name, return_type->to_string());
+                }
+                else
+                {
+                    LOG_WARN(Cryo::LogComponent::AST, "register_method_signature: Failed to resolve struct type '{}' for constructor '{}'", 
+                            _current_struct_name, method_name);
+                }
+            }
+            
+            if (!return_type)
+            {
+                LOG_ERROR(Cryo::LogComponent::AST, "register_method_signature: CRITICAL - Failed to resolve any return type for constructor '{}' in struct '{}'", 
+                         method_name, _current_struct_name);
+                return_type = _type_context.get_void_type();
+            }
         }
 
         if (!return_type)
@@ -9098,6 +9184,11 @@ namespace Cryo
         // Create function type
         FunctionType *func_type = static_cast<FunctionType *>(
             _type_context.create_function_type(return_type, param_types));
+
+        // CRITICAL: Store the return type on the node so it's available during Pass 2
+        node.set_resolved_return_type(return_type);
+        LOG_DEBUG(Cryo::LogComponent::AST, "register_method_signature: Stored return type '{}' on method '{}'", 
+                  return_type ? return_type->to_string() : "NULL", method_name);
 
         // Register in appropriate registry based on visibility
         LOG_DEBUG(Cryo::LogComponent::AST, "Registering signature for method '{}' in struct '{}' with visibility: {} (enum value: {})",
@@ -9225,6 +9316,18 @@ namespace Cryo
             _current_function_return_type = node.get_resolved_return_type();
         }
         
+        // CRITICAL: Set up generic context if this struct has generic parameters
+        bool entered_generic_context = false;
+        if (!_current_struct_name.empty()) {
+            auto template_it = _template_parameters.find(_current_struct_name);
+            if (template_it != _template_parameters.end() && !template_it->second.empty()) {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Setting up generic context for method body '{}' in struct '{}' with {} parameters", 
+                          method_name, _current_struct_name, template_it->second.size());
+                enter_generic_context(_current_struct_name, template_it->second, node.location());
+                entered_generic_context = true;
+            }
+        }
+        
         // Add parameters to scope without re-processing them through full visitor
         for (const auto &param : node.parameters())
         {
@@ -9238,6 +9341,11 @@ namespace Cryo
         if (node.body())
         {
             node.body()->accept(*this);
+        }
+        
+        // Clean up generic context
+        if (entered_generic_context) {
+            exit_generic_context();
         }
         
         // Clean up function scope

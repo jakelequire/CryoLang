@@ -562,8 +562,8 @@ namespace Cryo
     }
     void Parser::synchronize()
     {
-        LOG_DEBUG(LogComponent::PARSER, "Parser synchronization initiated at {}:{} (brace_depth={}, paren_depth={}, bracket_depth={})",
-                  _current_token.location().line(), _current_token.location().column(),
+        LOG_DEBUG(LogComponent::PARSER, "Parser synchronization initiated at {}:{} (file: {})(brace_depth={}, paren_depth={}, bracket_depth={})",
+                  _current_token.location().line(), _current_token.location().column(), _source_file,
                   _brace_depth, _paren_depth, _bracket_depth);
 
         // Track starting position for diagnostic purposes
@@ -959,6 +959,13 @@ namespace Cryo
             return _brace_depth == 0;
         }
 
+        // Context-aware check: static is only a top-level declaration when at global scope
+        // Inside implementation blocks, static methods are not top-level declarations
+        if (kind == TokenKind::TK_KW_STATIC)
+        {
+            return _brace_depth == 0;
+        }
+
         return kind == TokenKind::TK_KW_FUNCTION ||
                kind == TokenKind::TK_KW_TYPE ||
                kind == TokenKind::TK_KW_CLASS ||
@@ -970,8 +977,7 @@ namespace Cryo
                kind == TokenKind::TK_KW_INTRINSIC ||
                kind == TokenKind::TK_KW_IMPORT ||
                kind == TokenKind::TK_KW_NAMESPACE ||
-               kind == TokenKind::TK_KW_MODULE ||
-               kind == TokenKind::TK_KW_STATIC;
+               kind == TokenKind::TK_KW_MODULE;
     }
 
     bool Parser::is_statement_start(TokenKind kind) const
