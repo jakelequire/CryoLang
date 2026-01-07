@@ -196,6 +196,9 @@ namespace Cryo
         bool _in_call_expression = false;
         bool _in_unsafe_context = false;
 
+        // Current match expression type (for pattern variable type inference)
+        Type *_current_match_expr_type = nullptr;
+
         // Struct field tracking - maps struct name -> field name -> field type
         std::unordered_map<std::string, std::unordered_map<std::string, Type *>> _struct_fields;
 

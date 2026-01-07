@@ -9122,10 +9122,16 @@ namespace Cryo
 
     void TypeChecker::visit(MatchStatementNode &node)
     {
-        // Visit the expression to match on
+        // Save previous match expression type (for nested matches)
+        Type *previous_match_expr_type = _current_match_expr_type;
+
+        // Visit the expression to match on and get its type
         if (node.expr())
         {
             node.expr()->accept(*this);
+            _current_match_expr_type = node.expr()->get_resolved_type();
+            LOG_DEBUG(Cryo::LogComponent::AST, "Match expression type: {}",
+                      _current_match_expr_type ? _current_match_expr_type->to_string() : "null");
         }
 
         // Visit all match arms
@@ -9136,6 +9142,9 @@ namespace Cryo
                 arm->accept(*this);
             }
         }
+
+        // Restore previous match expression type
+        _current_match_expr_type = previous_match_expr_type;
     }
 
     void TypeChecker::visit(MatchArmNode &node)
@@ -9175,6 +9184,8 @@ namespace Cryo
         const std::string &enum_name = node.enum_name();
         const std::string &variant_name = node.variant_name();
 
+        LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Visiting pattern {}::{}", enum_name, variant_name);
+
         // Look up the enum type
         TypedSymbol *enum_symbol = _symbol_table->lookup_symbol(enum_name);
         if (!enum_symbol)
@@ -9190,25 +9201,82 @@ namespace Cryo
             return;
         }
 
-        // TODO: In a more complete implementation, we would:
-        // - Verify that variant_name is a valid variant of the enum
-        // - Get the parameter types for this specific variant
-
-        // For now, bind pattern variables with inferred types based on common enum patterns
+        // Get bound variables from the pattern
         const auto &bound_vars = node.bound_variables();
 
-        for (const auto &var_name : bound_vars)
+        for (size_t i = 0; i < bound_vars.size(); ++i)
         {
-            if (!var_name.empty())
-            {
-                // For enum patterns, we need to infer the type based on the enum variant
-                // For now, we'll use float for most numeric patterns (Circle(radius), Rectangle(width, height), etc.)
-                // TODO: Get actual parameter types from enum variant definition
-                Type *var_type = _type_context.get_default_float_type();
+            const std::string &var_name = bound_vars[i];
+            if (var_name.empty())
+                continue;
 
-                // Bind the variable in the current scope
-                _symbol_table->declare_symbol(var_name, var_type, node.location(), false);
+            // Try to infer type from the match expression type
+            Type *var_type = nullptr;
+
+            if (_current_match_expr_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Match expr type is {} (kind={})",
+                          _current_match_expr_type->to_string(),
+                          TypeKindToString(_current_match_expr_type->kind()));
+
+                // Handle parameterized types like Result<T, E> and Option<T>
+                if (_current_match_expr_type->kind() == TypeKind::Parameterized)
+                {
+                    auto *param_type = static_cast<ParameterizedType *>(_current_match_expr_type);
+                    const std::string &base_name = param_type->base_name();
+                    const auto &type_params = param_type->type_parameters();
+
+                    LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Parameterized type {} with {} params",
+                              base_name, type_params.size());
+
+                    // For Result<T, E>: Ok holds T (index 0), Err holds E (index 1)
+                    if (base_name == "Result" && type_params.size() >= 2)
+                    {
+                        if (variant_name == "Ok" && type_params[0])
+                        {
+                            var_type = type_params[0].get();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Result::Ok binds to type {}",
+                                      var_type->to_string());
+                        }
+                        else if (variant_name == "Err" && type_params[1])
+                        {
+                            var_type = type_params[1].get();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Result::Err binds to type {}",
+                                      var_type->to_string());
+                        }
+                    }
+                    // For Option<T>: Some holds T (index 0)
+                    else if (base_name == "Option" && type_params.size() >= 1)
+                    {
+                        if (variant_name == "Some" && type_params[0])
+                        {
+                            var_type = type_params[0].get();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Option::Some binds to type {}",
+                                      var_type->to_string());
+                        }
+                    }
+                    // Generic handling: use first type parameter for first bound variable
+                    else if (!type_params.empty() && i < type_params.size() && type_params[i])
+                    {
+                        var_type = type_params[i].get();
+                        LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Generic enum binding to type {}",
+                                  var_type->to_string());
+                    }
+                }
             }
+
+            // Fallback to unknown type if we couldn't infer
+            if (!var_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Could not infer type for '{}', using unknown",
+                          var_name);
+                var_type = _type_context.get_unknown_type();
+            }
+
+            // Bind the variable in the current scope
+            _symbol_table->declare_symbol(var_name, var_type, node.location(), false);
+            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Bound '{}' with type {}", var_name,
+                      var_type ? var_type->to_string() : "null");
         }
     }
 
