@@ -191,6 +191,8 @@ namespace Cryo::Codegen
             std::string type_name = "Unknown";
             if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()))
                 type_name = "EnumDeclarationNode";
+            else if (auto *sm = dynamic_cast<Cryo::StructMethodNode *>(stmt.get()))
+                type_name = "StructMethodNode(" + sm->name() + ")";
             else if (dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()))
                 type_name = "StructDeclarationNode";
             else if (dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()))
@@ -369,6 +371,14 @@ namespace Cryo::Codegen
                 dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()) ||
                 dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
             {
+                continue;
+            }
+            // Skip StructMethodNodes at top level - they should only be processed within their parent context
+            // (inside StructDeclarationNode or ImplementationBlockNode)
+            if (dynamic_cast<Cryo::StructMethodNode *>(stmt.get()))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Pass 4: Skipping orphaned StructMethodNode at top level");
                 continue;
             }
             // Skip DeclarationStatementNode wrapping already-processed declaration types
