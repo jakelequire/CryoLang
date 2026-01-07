@@ -333,6 +333,15 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating method: {}::{}",
                   parent_type, node->name());
 
+        // Check if this is a static method (no 'this' parameter)
+        bool is_static = false;
+        if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(node))
+        {
+            is_static = struct_method->is_static();
+        }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Method '{}::{}' is_static={}",
+                  parent_type, node->name(), is_static);
+
         // Generate base method name (Type::method)
         std::string base_method_name = generate_method_name(parent_type, node->name());
 
@@ -355,8 +364,8 @@ namespace Cryo::Codegen
             return existing;
         }
 
-        // Get function type with implicit 'this' parameter
-        llvm::FunctionType *fn_type = get_function_type(node, true);
+        // Get function type - only add 'this' parameter for non-static methods
+        llvm::FunctionType *fn_type = get_function_type(node, !is_static);
         if (!fn_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
@@ -368,10 +377,15 @@ namespace Cryo::Codegen
         llvm::Function *fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
                                                     llvm_fn_name, module());
 
-        // Name parameters (first is 'this')
+        // Name parameters
         auto arg_it = fn->arg_begin();
-        arg_it->setName("this");
-        ++arg_it;
+
+        // For non-static methods, first parameter is 'this'
+        if (!is_static)
+        {
+            arg_it->setName("this");
+            ++arg_it;
+        }
 
         // Name remaining parameters
         if (node->parameters().size() > 0)
@@ -1720,21 +1734,31 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Check if this is a static method to handle parameter indexing correctly
+            bool is_static_method = false;
+            if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(node))
+            {
+                is_static_method = struct_method->is_static();
+            }
+
             // Register all parameter types in variable_types_map for Array<T> detection
             // StructMethodNode inherits from FunctionDeclarationNode so parameters() is available
             const auto &ast_params = node->parameters();
             size_t param_idx = 0;
+            bool seen_this = false;
             for (auto &arg : fn->args())
             {
-                // Skip 'this' as it's handled above
+                // Skip 'this' as it's handled above (only for non-static methods)
                 if (arg.getName() == "this")
                 {
+                    seen_this = true;
                     param_idx++;
                     continue;
                 }
 
                 // Account for 'this' parameter offset - AST params don't include 'this'
-                size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                // Only subtract 1 if we've seen 'this' (non-static methods)
+                size_t ast_idx = seen_this ? param_idx - 1 : param_idx;
                 if (ast_idx < ast_params.size())
                 {
                     Cryo::Type *param_type = ast_params[ast_idx]->get_resolved_type();
