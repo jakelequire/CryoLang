@@ -1034,6 +1034,11 @@ namespace Cryo::Codegen
                 // Cast return value to match function return type if needed
                 if (expected_ret_type && ret_val->getType() != expected_ret_type)
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_return: Type mismatch - ret_val type ID={}, expected type ID={}, isPtr={}, isStruct={}",
+                              ret_val->getType()->getTypeID(), expected_ret_type->getTypeID(),
+                              ret_val->getType()->isPointerTy(), expected_ret_type->isStructTy());
+
                     // Special case: returning struct literal returns pointer to alloca,
                     // but function expects struct value - need to load instead of cast
                     if (ret_val->getType()->isPointerTy() && expected_ret_type->isStructTy())
