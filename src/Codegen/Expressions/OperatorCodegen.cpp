@@ -1498,6 +1498,27 @@ namespace Cryo::Codegen
 
         llvm::IRBuilder<> &b = builder();
 
+        // For bitwise operations, ensure both operands have the same type
+        // This is especially important for shifts where LLVM requires matching types
+        llvm::Type *lhs_type = lhs->getType();
+        llvm::Type *rhs_type = rhs->getType();
+
+        if (lhs_type != rhs_type && lhs_type->isIntegerTy() && rhs_type->isIntegerTy())
+        {
+            unsigned lhs_bits = lhs_type->getIntegerBitWidth();
+            unsigned rhs_bits = rhs_type->getIntegerBitWidth();
+
+            // Extend the smaller type to match the larger one
+            if (lhs_bits > rhs_bits)
+            {
+                rhs = b.CreateZExt(rhs, lhs_type, "rhs.zext");
+            }
+            else if (rhs_bits > lhs_bits)
+            {
+                lhs = b.CreateZExt(lhs, rhs_type, "lhs.zext");
+            }
+        }
+
         switch (op)
         {
         case TokenKind::TK_AMP:
