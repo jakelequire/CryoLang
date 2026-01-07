@@ -1098,7 +1098,7 @@ trait Iterator {
     next(&mut this) -> Option<This::Item>;
 }
 
-implement Iterator for Vec<T> {
+implement Iterator for Array<T> {
     type Item = T;
     next(&mut this) -> Option<T> { ... }
 }
@@ -1630,7 +1630,7 @@ trait FromIterator<A> {
 ```
 trait Read {
     read(&mut this, buf: &mut [u8]) -> Result<usize>;
-    read_to_end(&mut this, buf: &mut Vec<u8>) -> Result<usize>;
+    read_to_end(&mut this, buf: &mut Array<u8>) -> Result<usize>;
     read_exact(&mut this, buf: &mut [u8]) -> Result<()>;
 }
 
