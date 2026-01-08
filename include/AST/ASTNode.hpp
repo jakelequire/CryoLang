@@ -61,6 +61,7 @@ namespace Cryo
         CallExpression,
         NewExpression,
         SizeofExpression,
+        AlignofExpression,
         CastExpression,
         StructLiteral,
         ArrayLiteral,
@@ -139,6 +140,8 @@ namespace Cryo
             return "NewExpression";
         case NodeKind::SizeofExpression:
             return "SizeofExpression";
+        case NodeKind::AlignofExpression:
+            return "AlignofExpression";
         case NodeKind::CastExpression:
             return "CastExpression";
         case NodeKind::StructLiteral:
@@ -1873,6 +1876,28 @@ namespace Cryo
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "SizeofExpression: " << _type_name << std::endl;
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    //===----------------------------------------------------------------------===//
+    // AlignofExpressionNode
+    //===----------------------------------------------------------------------===//
+    class AlignofExpressionNode : public ExpressionNode
+    {
+    private:
+        std::string _type_name;
+
+    public:
+        AlignofExpressionNode(SourceLocation loc, std::string type_name)
+            : ExpressionNode(NodeKind::AlignofExpression, loc), _type_name(std::move(type_name)) {}
+
+        const std::string &type_name() const { return _type_name; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "AlignofExpression: " << _type_name << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;

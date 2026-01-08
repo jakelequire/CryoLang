@@ -99,6 +99,11 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void AlignofExpressionNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     void CastExpressionNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);

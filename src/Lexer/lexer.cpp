@@ -155,6 +155,7 @@ namespace Cryo
         {"in", TokenKind::TK_KW_IN},
         {"typeof", TokenKind::TK_KW_TYPEOF},
         {"sizeof", TokenKind::TK_KW_SIZEOF},
+        {"alignof", TokenKind::TK_KW_ALIGNOF},
         {"new", TokenKind::TK_KW_NEW},
         {"delete", TokenKind::TK_KW_DELETE},
         {"with", TokenKind::TK_KW_WITH},

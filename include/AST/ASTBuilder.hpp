@@ -45,6 +45,7 @@ namespace Cryo
         std::unique_ptr<CallExpressionNode> create_call_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> callee);
         std::unique_ptr<NewExpressionNode> create_new_expression(SourceLocation loc, std::string type_name);
         std::unique_ptr<SizeofExpressionNode> create_sizeof_expression(SourceLocation loc, std::string type_name);
+        std::unique_ptr<AlignofExpressionNode> create_alignof_expression(SourceLocation loc, std::string type_name);
         std::unique_ptr<CastExpressionNode> create_cast_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::string target_type);
         std::unique_ptr<StructLiteralNode> create_struct_literal(SourceLocation loc, std::string struct_type);
         std::unique_ptr<ArrayLiteralNode> create_array_literal(SourceLocation loc);

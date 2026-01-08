@@ -687,6 +687,16 @@ namespace Cryo
         _output << " '" << node.type_name() << "'" << std::endl;
     }
 
+    void ASTDumper::visit(AlignofExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "AlignofExpr";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " '" << node.type_name() << "'" << std::endl;
+    }
+
     void ASTDumper::visit(CastExpressionNode &node)
     {
         print_prefix();

@@ -379,18 +379,46 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // If it's an alloca, load the value
+        // If we don't have a valid insertion point (basic block), we're likely in a global initialization context
+        // In this case, don't generate loads - work with constant values
+        bool in_global_context = !builder().GetInsertBlock();
+
+        // If it's an alloca, load the value (only if we're in a function context)
         if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value))
         {
+            if (in_global_context)
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN, 
+                         "ExpressionCodegen: Attempted to reference local variable '{}' in global context", name);
+                return nullptr;
+            }
             llvm::Type *loaded_type = alloca->getAllocatedType();
             return create_load(alloca, loaded_type, name + ".load");
         }
 
-        // If it's a global variable, load the value
+        // If it's a global variable, handle based on context
         if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(value))
         {
-            llvm::Type *loaded_type = global->getValueType();
-            return create_load(global, loaded_type, name + ".load");
+            if (in_global_context)
+            {
+                // In global context, check if the global has an initializer we can use as a constant
+                if (global->hasInitializer())
+                {
+                    return global->getInitializer();
+                }
+                else
+                {
+                    LOG_WARN(Cryo::LogComponent::CODEGEN, 
+                             "ExpressionCodegen: Referenced uninitialized global '{}' in global context", name);
+                    return global; // Return the global itself as a constant
+                }
+            }
+            else
+            {
+                // In function context, load the value
+                llvm::Type *loaded_type = global->getValueType();
+                return create_load(global, loaded_type, name + ".load");
+            }
         }
 
         return value;
@@ -1416,6 +1444,38 @@ namespace Cryo::Codegen
         uint64_t size = dl.getTypeAllocSize(llvm_type);
 
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
+    }
+
+    llvm::Value *ExpressionCodegen::generate_alignof(Cryo::AlignofExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null alignof node");
+            return nullptr;
+        }
+
+        // TODO: Get proper Cryo::Type* from node instead of string lookup
+        llvm::Type *llvm_type = types().get_type(node->type_name());
+        if (!llvm_type)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Unknown type for alignof: " + node->type_name());
+            return nullptr;
+        }
+
+        // Check if type is sized before computing alignment
+        if (!llvm_type->isSized())
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: alignof called on unsized type '{}', returning default alignment",
+                     node->type_name());
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 8);
+        }
+
+        // Generate alignof using LLVM type
+        auto &context = llvm_ctx();
+        auto &data_layout = module()->getDataLayout();
+        uint64_t align = data_layout.getABITypeAlign(llvm_type).value();
+        return llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), align);
     }
 
     llvm::Value *ExpressionCodegen::generate_alignof(Cryo::Type *type)

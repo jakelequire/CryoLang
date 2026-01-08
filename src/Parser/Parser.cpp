@@ -2819,6 +2819,12 @@ namespace Cryo
             return parse_sizeof_expression();
         }
 
+        // Alignof expressions
+        if (_current_token.is(TokenKind::TK_KW_ALIGNOF))
+        {
+            return parse_alignof_expression();
+        }
+
         error("Expected expression");
         return nullptr;
     }
@@ -3785,6 +3791,26 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after type name");
 
         return _builder.create_sizeof_expression(sizeof_location, type_name);
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_alignof_expression()
+    {
+        SourceLocation alignof_location = _current_token.location();
+        consume(TokenKind::TK_KW_ALIGNOF, "Expected 'alignof' keyword");
+
+        consume(TokenKind::TK_L_PAREN, "Expected '(' after 'alignof'");
+
+        // Parse type annotation (handles pointer types, arrays, etc.)
+        std::string type_name = parse_type_annotation()->to_string();
+        if (type_name.empty())
+        {
+            error("Expected type name in alignof expression");
+            return nullptr;
+        }
+
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after type name");
+
+        return _builder.create_alignof_expression(alignof_location, type_name);
     }
 
     std::string Parser::parse_generic_type_suffix()
