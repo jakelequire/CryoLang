@@ -273,6 +273,7 @@ namespace Cryo::Codegen
          * @return Size value
          */
         llvm::Value *generate_sizeof(Cryo::SizeofExpressionNode *node);
+        llvm::Value *generate_alignof(Cryo::AlignofExpressionNode *node);
 
         /**
          * @brief Generate sizeof for a type

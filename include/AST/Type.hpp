@@ -1202,6 +1202,7 @@ namespace Cryo
         Type *get_i16_type() { return get_integer_type(IntegerKind::I16); }
         Type *get_i32_type() { return get_integer_type(IntegerKind::I32); }
         Type *get_i64_type() { return get_integer_type(IntegerKind::I64); }
+        Type *get_i128_type() { return get_integer_type(IntegerKind::I128); }
         Type *get_int_type() { return get_integer_type(IntegerKind::Int); }
 
         // Get unsigned integer types
@@ -1209,6 +1210,7 @@ namespace Cryo
         Type *get_u16_type() { return get_integer_type(IntegerKind::U16, false); }
         Type *get_u32_type() { return get_integer_type(IntegerKind::U32, false); }
         Type *get_u64_type() { return get_integer_type(IntegerKind::U64, false); }
+        Type *get_u128_type() { return get_integer_type(IntegerKind::U128, false); }
 
         // Get float types
         Type *get_float_type(FloatKind kind);

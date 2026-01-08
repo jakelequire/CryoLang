@@ -200,6 +200,7 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> parse_call_expression(std::unique_ptr<ExpressionNode> expr);
         std::unique_ptr<ExpressionNode> parse_new_expression();
         std::unique_ptr<ExpressionNode> parse_sizeof_expression();
+        std::unique_ptr<ExpressionNode> parse_alignof_expression();
         std::unique_ptr<ExpressionNode> parse_array_access(std::unique_ptr<ExpressionNode> expr);
         std::unique_ptr<ExpressionNode> parse_member_access(std::unique_ptr<ExpressionNode> expr);
 
