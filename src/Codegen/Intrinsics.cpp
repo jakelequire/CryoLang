@@ -356,8 +356,198 @@ namespace Cryo::Codegen
         else if (intrinsic_name == "usleep")
             return generate_usleep(args);
         
-        // Note: Threading, atomic, and other complex intrinsics would require
-        // much more extensive implementation and platform-specific considerations
+        // Threading intrinsics (pthread)
+        else if (intrinsic_name == "pthread_create")
+            return generate_pthread_create(args);
+        else if (intrinsic_name == "pthread_join")
+            return generate_pthread_join(args);
+        else if (intrinsic_name == "pthread_exit")
+            return generate_pthread_exit(args);
+        else if (intrinsic_name == "pthread_detach")
+            return generate_pthread_detach(args);
+        else if (intrinsic_name == "pthread_self")
+            return generate_pthread_self(args);
+        else if (intrinsic_name == "pthread_equal")
+            return generate_pthread_equal(args);
+        else if (intrinsic_name == "sched_yield")
+            return generate_sched_yield(args);
+        
+        // Mutex intrinsics
+        else if (intrinsic_name == "pthread_mutex_init")
+            return generate_pthread_mutex_init(args);
+        else if (intrinsic_name == "pthread_mutex_destroy")
+            return generate_pthread_mutex_destroy(args);
+        else if (intrinsic_name == "pthread_mutex_lock")
+            return generate_pthread_mutex_lock(args);
+        else if (intrinsic_name == "pthread_mutex_trylock")
+            return generate_pthread_mutex_trylock(args);
+        else if (intrinsic_name == "pthread_mutex_unlock")
+            return generate_pthread_mutex_unlock(args);
+        
+        // Condition variable intrinsics
+        else if (intrinsic_name == "pthread_cond_init")
+            return generate_pthread_cond_init(args);
+        else if (intrinsic_name == "pthread_cond_destroy")
+            return generate_pthread_cond_destroy(args);
+        else if (intrinsic_name == "pthread_cond_wait")
+            return generate_pthread_cond_wait(args);
+        else if (intrinsic_name == "pthread_cond_timedwait")
+            return generate_pthread_cond_timedwait(args);
+        else if (intrinsic_name == "pthread_cond_signal")
+            return generate_pthread_cond_signal(args);
+        else if (intrinsic_name == "pthread_cond_broadcast")
+            return generate_pthread_cond_broadcast(args);
+        
+        // Read-write lock intrinsics
+        else if (intrinsic_name == "pthread_rwlock_init")
+            return generate_pthread_rwlock_init(args);
+        else if (intrinsic_name == "pthread_rwlock_destroy")
+            return generate_pthread_rwlock_destroy(args);
+        else if (intrinsic_name == "pthread_rwlock_rdlock")
+            return generate_pthread_rwlock_rdlock(args);
+        else if (intrinsic_name == "pthread_rwlock_tryrdlock")
+            return generate_pthread_rwlock_tryrdlock(args);
+        else if (intrinsic_name == "pthread_rwlock_wrlock")
+            return generate_pthread_rwlock_wrlock(args);
+        else if (intrinsic_name == "pthread_rwlock_trywrlock")
+            return generate_pthread_rwlock_trywrlock(args);
+        else if (intrinsic_name == "pthread_rwlock_unlock")
+            return generate_pthread_rwlock_unlock(args);
+        
+        // Thread-local storage intrinsics
+        else if (intrinsic_name == "pthread_key_create")
+            return generate_pthread_key_create(args);
+        else if (intrinsic_name == "pthread_key_delete")
+            return generate_pthread_key_delete(args);
+        else if (intrinsic_name == "pthread_getspecific")
+            return generate_pthread_getspecific(args);
+        else if (intrinsic_name == "pthread_setspecific")
+            return generate_pthread_setspecific(args);
+        
+        // Atomic intrinsics
+        else if (intrinsic_name == "atomic_load_8")
+            return generate_atomic_load_8(args);
+        else if (intrinsic_name == "atomic_load_16")
+            return generate_atomic_load_16(args);
+        else if (intrinsic_name == "atomic_load_32")
+            return generate_atomic_load_32(args);
+        else if (intrinsic_name == "atomic_load_64")
+            return generate_atomic_load_64(args);
+        else if (intrinsic_name == "atomic_store_8")
+            return generate_atomic_store_8(args);
+        else if (intrinsic_name == "atomic_store_16")
+            return generate_atomic_store_16(args);
+        else if (intrinsic_name == "atomic_store_32")
+            return generate_atomic_store_32(args);
+        else if (intrinsic_name == "atomic_store_64")
+            return generate_atomic_store_64(args);
+        else if (intrinsic_name == "atomic_exchange_32")
+            return generate_atomic_exchange_32(args);
+        else if (intrinsic_name == "atomic_exchange_64")
+            return generate_atomic_exchange_64(args);
+        else if (intrinsic_name == "atomic_compare_exchange_32")
+            return generate_atomic_compare_exchange_32(args);
+        else if (intrinsic_name == "atomic_compare_exchange_64")
+            return generate_atomic_compare_exchange_64(args);
+        else if (intrinsic_name == "atomic_fetch_add_32")
+            return generate_atomic_fetch_add_32(args);
+        else if (intrinsic_name == "atomic_fetch_add_64")
+            return generate_atomic_fetch_add_64(args);
+        else if (intrinsic_name == "atomic_fetch_sub_32")
+            return generate_atomic_fetch_sub_32(args);
+        else if (intrinsic_name == "atomic_fetch_sub_64")
+            return generate_atomic_fetch_sub_64(args);
+        else if (intrinsic_name == "atomic_fetch_and_32")
+            return generate_atomic_fetch_and_32(args);
+        else if (intrinsic_name == "atomic_fetch_and_64")
+            return generate_atomic_fetch_and_64(args);
+        else if (intrinsic_name == "atomic_fetch_or_32")
+            return generate_atomic_fetch_or_32(args);
+        else if (intrinsic_name == "atomic_fetch_or_64")
+            return generate_atomic_fetch_or_64(args);
+        else if (intrinsic_name == "atomic_fetch_xor_32")
+            return generate_atomic_fetch_xor_32(args);
+        else if (intrinsic_name == "atomic_fetch_xor_64")
+            return generate_atomic_fetch_xor_64(args);
+        else if (intrinsic_name == "atomic_fence")
+            return generate_atomic_fence(args);
+        
+        // Enhanced network intrinsics
+        else if (intrinsic_name == "listen")
+            return generate_listen(args);
+        else if (intrinsic_name == "accept")
+            return generate_accept(args);
+        else if (intrinsic_name == "connect")
+            return generate_connect(args);
+        else if (intrinsic_name == "send")
+            return generate_send(args);
+        else if (intrinsic_name == "recv")
+            return generate_recv(args);
+        else if (intrinsic_name == "sendto")
+            return generate_sendto(args);
+        else if (intrinsic_name == "recvfrom")
+            return generate_recvfrom(args);
+        else if (intrinsic_name == "shutdown")
+            return generate_shutdown(args);
+        else if (intrinsic_name == "setsockopt")
+            return generate_setsockopt(args);
+        else if (intrinsic_name == "getsockopt")
+            return generate_getsockopt(args);
+        else if (intrinsic_name == "getsockname")
+            return generate_getsockname(args);
+        else if (intrinsic_name == "getpeername")
+            return generate_getpeername(args);
+        else if (intrinsic_name == "poll")
+            return generate_poll(args);
+        
+        // Atomic intrinsics
+        else if (intrinsic_name == "atomic_load_8")
+            return generate_atomic_load_8(args);
+        else if (intrinsic_name == "atomic_load_16")
+            return generate_atomic_load_16(args);
+        else if (intrinsic_name == "atomic_load_32")
+            return generate_atomic_load_32(args);
+        else if (intrinsic_name == "atomic_load_64")
+            return generate_atomic_load_64(args);
+        else if (intrinsic_name == "atomic_store_8")
+            return generate_atomic_store_8(args);
+        else if (intrinsic_name == "atomic_store_16")
+            return generate_atomic_store_16(args);
+        else if (intrinsic_name == "atomic_store_32")
+            return generate_atomic_store_32(args);
+        else if (intrinsic_name == "atomic_store_64")
+            return generate_atomic_store_64(args);
+        else if (intrinsic_name == "atomic_exchange_32")
+            return generate_atomic_exchange_32(args);
+        else if (intrinsic_name == "atomic_exchange_64")
+            return generate_atomic_exchange_64(args);
+        else if (intrinsic_name == "atomic_compare_exchange_32")
+            return generate_atomic_compare_exchange_32(args);
+        else if (intrinsic_name == "atomic_compare_exchange_64")
+            return generate_atomic_compare_exchange_64(args);
+        else if (intrinsic_name == "atomic_fetch_add_32")
+            return generate_atomic_fetch_add_32(args);
+        else if (intrinsic_name == "atomic_fetch_add_64")
+            return generate_atomic_fetch_add_64(args);
+        else if (intrinsic_name == "atomic_fetch_sub_32")
+            return generate_atomic_fetch_sub_32(args);
+        else if (intrinsic_name == "atomic_fetch_sub_64")
+            return generate_atomic_fetch_sub_64(args);
+        else if (intrinsic_name == "atomic_fetch_and_32")
+            return generate_atomic_fetch_and_32(args);
+        else if (intrinsic_name == "atomic_fetch_and_64")
+            return generate_atomic_fetch_and_64(args);
+        else if (intrinsic_name == "atomic_fetch_or_32")
+            return generate_atomic_fetch_or_32(args);
+        else if (intrinsic_name == "atomic_fetch_or_64")
+            return generate_atomic_fetch_or_64(args);
+        else if (intrinsic_name == "atomic_fetch_xor_32")
+            return generate_atomic_fetch_xor_32(args);
+        else if (intrinsic_name == "atomic_fetch_xor_64")
+            return generate_atomic_fetch_xor_64(args);
+        else if (intrinsic_name == "atomic_fence")
+            return generate_atomic_fence(args);
+        
         else
         {
             report_unimplemented_intrinsic(intrinsic_name, node);
@@ -4054,11 +4244,8 @@ namespace Cryo::Codegen
         return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), -1); \
     }
 
-    DEFINE_NETWORK_STUB(listen, 2)
-    DEFINE_NETWORK_STUB(accept, 3)
-    DEFINE_NETWORK_STUB(connect, 3)
-    DEFINE_NETWORK_STUB(send, 4)
-    DEFINE_NETWORK_STUB(recv, 4)
+    // Network stubs for functions not yet fully implemented
+    // (listen, accept, connect, send, recv have full implementations below)
     DEFINE_NETWORK_STUB(sendto, 6)
     DEFINE_NETWORK_STUB(recvfrom, 6)
     DEFINE_NETWORK_STUB(shutdown, 2)
@@ -4260,5 +4447,1045 @@ namespace Cryo::Codegen
         llvm::Function *usleep_func = get_or_create_libc_function("usleep", usleep_type);
         return builder.CreateCall(usleep_func, {ensure_type(args[0], uint32_type, "usleep.usec")}, "usleep.result");
     }
+
+    // ========================================
+    // Threading Intrinsics (pthread)
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_pthread_create(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 4)
+        {
+            report_error("pthread_create requires exactly 4 arguments (thread, attr, start_routine, arg)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // pthread_create(pthread_t *thread, const pthread_attr_t *attr, 
+        //                void *(*start_routine)(void*), void *arg)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_create_type = llvm::FunctionType::get(
+            int_type, {void_ptr_type, void_ptr_type, void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *pthread_create_func = get_or_create_libc_function("pthread_create", pthread_create_type);
+        return builder.CreateCall(pthread_create_func, {args[0], args[1], args[2], args[3]}, "pthread_create.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_join(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("pthread_join requires exactly 2 arguments (thread, retval)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // pthread_join(pthread_t thread, void **retval)
+        llvm::Type *uint64_type = llvm::Type::getInt64Ty(context); // pthread_t
+        llvm::Type *void_ptr_ptr_type = llvm::PointerType::get(llvm::PointerType::get(context, 0), 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_join_type = llvm::FunctionType::get(
+            int_type, {uint64_type, void_ptr_ptr_type}, false);
+
+        llvm::Function *pthread_join_func = get_or_create_libc_function("pthread_join", pthread_join_type);
+        llvm::Value *thread = ensure_type(args[0], uint64_type, "pthread_join.thread");
+        return builder.CreateCall(pthread_join_func, {thread, args[1]}, "pthread_join.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_exit(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_exit requires exactly 1 argument (retval)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // pthread_exit(void *retval) - never returns
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *void_type = llvm::Type::getVoidTy(context);
+        llvm::FunctionType *pthread_exit_type = llvm::FunctionType::get(void_type, {void_ptr_type}, false);
+
+        llvm::Function *pthread_exit_func = get_or_create_libc_function("pthread_exit", pthread_exit_type);
+        llvm::Value *call_result = builder.CreateCall(pthread_exit_func, {args[0]});
+
+        // pthread_exit never returns
+        builder.CreateUnreachable();
+        return call_result;
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_detach(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_detach requires exactly 1 argument (thread)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *uint64_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_detach_type = llvm::FunctionType::get(int_type, {uint64_type}, false);
+
+        llvm::Function *pthread_detach_func = get_or_create_libc_function("pthread_detach", pthread_detach_type);
+        llvm::Value *thread = ensure_type(args[0], uint64_type, "pthread_detach.thread");
+        return builder.CreateCall(pthread_detach_func, {thread}, "pthread_detach.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_self(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 0)
+        {
+            report_error("pthread_self requires exactly 0 arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *uint64_type = llvm::Type::getInt64Ty(context);
+        llvm::FunctionType *pthread_self_type = llvm::FunctionType::get(uint64_type, {}, false);
+
+        llvm::Function *pthread_self_func = get_or_create_libc_function("pthread_self", pthread_self_type);
+        return builder.CreateCall(pthread_self_func, {}, "pthread_self.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_equal(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("pthread_equal requires exactly 2 arguments (t1, t2)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *uint64_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_equal_type = llvm::FunctionType::get(int_type, {uint64_type, uint64_type}, false);
+
+        llvm::Function *pthread_equal_func = get_or_create_libc_function("pthread_equal", pthread_equal_type);
+        llvm::Value *t1 = ensure_type(args[0], uint64_type, "pthread_equal.t1");
+        llvm::Value *t2 = ensure_type(args[1], uint64_type, "pthread_equal.t2");
+        return builder.CreateCall(pthread_equal_func, {t1, t2}, "pthread_equal.result");
+    }
+
+    llvm::Value *Intrinsics::generate_sched_yield(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 0)
+        {
+            report_error("sched_yield requires exactly 0 arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *sched_yield_type = llvm::FunctionType::get(int_type, {}, false);
+
+        llvm::Function *sched_yield_func = get_or_create_libc_function("sched_yield", sched_yield_type);
+        return builder.CreateCall(sched_yield_func, {}, "sched_yield.result");
+    }
+
+    // ========================================
+    // Mutex Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_pthread_mutex_init(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("pthread_mutex_init requires exactly 2 arguments (mutex, attr)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_mutex_init_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *pthread_mutex_init_func = get_or_create_libc_function("pthread_mutex_init", pthread_mutex_init_type);
+        return builder.CreateCall(pthread_mutex_init_func, {args[0], args[1]}, "pthread_mutex_init.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_mutex_destroy(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_mutex_destroy requires exactly 1 argument (mutex)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_mutex_destroy_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *pthread_mutex_destroy_func = get_or_create_libc_function("pthread_mutex_destroy", pthread_mutex_destroy_type);
+        return builder.CreateCall(pthread_mutex_destroy_func, {args[0]}, "pthread_mutex_destroy.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_mutex_lock(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_mutex_lock requires exactly 1 argument (mutex)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_mutex_lock_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *pthread_mutex_lock_func = get_or_create_libc_function("pthread_mutex_lock", pthread_mutex_lock_type);
+        return builder.CreateCall(pthread_mutex_lock_func, {args[0]}, "pthread_mutex_lock.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_mutex_trylock(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_mutex_trylock requires exactly 1 argument (mutex)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_mutex_trylock_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *pthread_mutex_trylock_func = get_or_create_libc_function("pthread_mutex_trylock", pthread_mutex_trylock_type);
+        return builder.CreateCall(pthread_mutex_trylock_func, {args[0]}, "pthread_mutex_trylock.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_mutex_unlock(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_mutex_unlock requires exactly 1 argument (mutex)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_mutex_unlock_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *pthread_mutex_unlock_func = get_or_create_libc_function("pthread_mutex_unlock", pthread_mutex_unlock_type);
+        return builder.CreateCall(pthread_mutex_unlock_func, {args[0]}, "pthread_mutex_unlock.result");
+    }
+
+    // ========================================
+    // Condition Variable Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_pthread_cond_init(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("pthread_cond_init requires exactly 2 arguments (cond, attr)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_cond_init_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *pthread_cond_init_func = get_or_create_libc_function("pthread_cond_init", pthread_cond_init_type);
+        return builder.CreateCall(pthread_cond_init_func, {args[0], args[1]}, "pthread_cond_init.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_cond_destroy(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_cond_destroy requires exactly 1 argument (cond)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_cond_destroy_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *pthread_cond_destroy_func = get_or_create_libc_function("pthread_cond_destroy", pthread_cond_destroy_type);
+        return builder.CreateCall(pthread_cond_destroy_func, {args[0]}, "pthread_cond_destroy.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_cond_wait(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("pthread_cond_wait requires exactly 2 arguments (cond, mutex)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_cond_wait_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *pthread_cond_wait_func = get_or_create_libc_function("pthread_cond_wait", pthread_cond_wait_type);
+        return builder.CreateCall(pthread_cond_wait_func, {args[0], args[1]}, "pthread_cond_wait.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_cond_timedwait(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("pthread_cond_timedwait requires exactly 3 arguments (cond, mutex, abstime)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_cond_timedwait_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *pthread_cond_timedwait_func = get_or_create_libc_function("pthread_cond_timedwait", pthread_cond_timedwait_type);
+        return builder.CreateCall(pthread_cond_timedwait_func, {args[0], args[1], args[2]}, "pthread_cond_timedwait.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_cond_signal(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_cond_signal requires exactly 1 argument (cond)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_cond_signal_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *pthread_cond_signal_func = get_or_create_libc_function("pthread_cond_signal", pthread_cond_signal_type);
+        return builder.CreateCall(pthread_cond_signal_func, {args[0]}, "pthread_cond_signal.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_cond_broadcast(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_cond_broadcast requires exactly 1 argument (cond)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_cond_broadcast_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *pthread_cond_broadcast_func = get_or_create_libc_function("pthread_cond_broadcast", pthread_cond_broadcast_type);
+        return builder.CreateCall(pthread_cond_broadcast_func, {args[0]}, "pthread_cond_broadcast.result");
+    }
+
+    // ========================================
+    // Read-Write Lock Intrinsics
+    // ========================================
+
+    #define DEFINE_PTHREAD_RWLOCK_FUNC(name, arg_count) \
+    llvm::Value *Intrinsics::generate_pthread_rwlock_##name(const std::vector<llvm::Value *> &args) \
+    { \
+        if (args.size() != arg_count) \
+        { \
+            report_error("pthread_rwlock_" #name " requires exactly " #arg_count " argument(s)"); \
+            return nullptr; \
+        } \
+        \
+        auto &builder = _context_manager.get_builder(); \
+        auto &context = _context_manager.get_context(); \
+        \
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0); \
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context); \
+        std::vector<llvm::Type *> arg_types(arg_count, void_ptr_type); \
+        llvm::FunctionType *func_type = llvm::FunctionType::get(int_type, arg_types, false); \
+        \
+        llvm::Function *func = get_or_create_libc_function("pthread_rwlock_" #name, func_type); \
+        return builder.CreateCall(func, args, "pthread_rwlock_" #name ".result"); \
+    }
+
+    DEFINE_PTHREAD_RWLOCK_FUNC(init, 2)
+    DEFINE_PTHREAD_RWLOCK_FUNC(destroy, 1)
+    DEFINE_PTHREAD_RWLOCK_FUNC(rdlock, 1)
+    DEFINE_PTHREAD_RWLOCK_FUNC(tryrdlock, 1)
+    DEFINE_PTHREAD_RWLOCK_FUNC(wrlock, 1)
+    DEFINE_PTHREAD_RWLOCK_FUNC(trywrlock, 1)
+    DEFINE_PTHREAD_RWLOCK_FUNC(unlock, 1)
+
+    // ========================================
+    // Thread-Local Storage Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_pthread_key_create(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("pthread_key_create requires exactly 2 arguments (key, destructor)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_key_create_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *pthread_key_create_func = get_or_create_libc_function("pthread_key_create", pthread_key_create_type);
+        return builder.CreateCall(pthread_key_create_func, {args[0], args[1]}, "pthread_key_create.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_key_delete(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_key_delete requires exactly 1 argument (key)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *uint64_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_key_delete_type = llvm::FunctionType::get(int_type, {uint64_type}, false);
+
+        llvm::Function *pthread_key_delete_func = get_or_create_libc_function("pthread_key_delete", pthread_key_delete_type);
+        llvm::Value *key = ensure_type(args[0], uint64_type, "pthread_key_delete.key");
+        return builder.CreateCall(pthread_key_delete_func, {key}, "pthread_key_delete.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_getspecific(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pthread_getspecific requires exactly 1 argument (key)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *uint64_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *pthread_getspecific_type = llvm::FunctionType::get(void_ptr_type, {uint64_type}, false);
+
+        llvm::Function *pthread_getspecific_func = get_or_create_libc_function("pthread_getspecific", pthread_getspecific_type);
+        llvm::Value *key = ensure_type(args[0], uint64_type, "pthread_getspecific.key");
+        return builder.CreateCall(pthread_getspecific_func, {key}, "pthread_getspecific.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pthread_setspecific(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("pthread_setspecific requires exactly 2 arguments (key, value)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *uint64_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pthread_setspecific_type = llvm::FunctionType::get(int_type, {uint64_type, void_ptr_type}, false);
+
+        llvm::Function *pthread_setspecific_func = get_or_create_libc_function("pthread_setspecific", pthread_setspecific_type);
+        llvm::Value *key = ensure_type(args[0], uint64_type, "pthread_setspecific.key");
+        return builder.CreateCall(pthread_setspecific_func, {key, args[1]}, "pthread_setspecific.result");
+    }
+
+    // ========================================
+    // Atomic Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_atomic_load_8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("atomic_load_8 requires exactly 2 arguments (ptr, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Convert memory ordering from Cryo to LLVM
+        llvm::Value *ptr = args[0];
+        llvm::Value *order = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_load_8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        // Create atomic load instruction
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::LoadInst *load = builder.CreateLoad(i8_type, ptr);
+        load->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        load->setAlignment(llvm::Align(1));
+
+        return load;
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_load_16(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("atomic_load_16 requires exactly 2 arguments (ptr, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_load_16: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i16_type = llvm::Type::getInt16Ty(context);
+        llvm::LoadInst *load = builder.CreateLoad(i16_type, ptr);
+        load->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        load->setAlignment(llvm::Align(2));
+
+        return load;
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_load_32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("atomic_load_32 requires exactly 2 arguments (ptr, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_load_32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::LoadInst *load = builder.CreateLoad(i32_type, ptr);
+        load->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        load->setAlignment(llvm::Align(4));
+
+        return load;
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_load_64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("atomic_load_64 requires exactly 2 arguments (ptr, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_load_64: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::LoadInst *load = builder.CreateLoad(i64_type, ptr);
+        load->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        load->setAlignment(llvm::Align(8));
+
+        return load;
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_store_8 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_store_8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::Value *val_i8 = ensure_type(val, i8_type, "atomic_store_8.val");
+
+        llvm::StoreInst *store = builder.CreateStore(val_i8, ptr);
+        store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        store->setAlignment(llvm::Align(1));
+
+        // Return void (null constant)
+        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_16(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_store_16 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_store_16: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i16_type = llvm::Type::getInt16Ty(context);
+        llvm::Value *val_i16 = ensure_type(val, i16_type, "atomic_store_16.val");
+
+        llvm::StoreInst *store = builder.CreateStore(val_i16, ptr);
+        store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        store->setAlignment(llvm::Align(2));
+
+        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_store_32 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_store_32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val_i32 = ensure_type(val, i32_type, "atomic_store_32.val");
+
+        llvm::StoreInst *store = builder.CreateStore(val_i32, ptr);
+        store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        store->setAlignment(llvm::Align(4));
+
+        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_store_64 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_store_64: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *val_i64 = ensure_type(val, i64_type, "atomic_store_64.val");
+
+        llvm::StoreInst *store = builder.CreateStore(val_i64, ptr);
+        store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        store->setAlignment(llvm::Align(8));
+
+        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_exchange_32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_exchange_32 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_exchange_32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val_i32 = ensure_type(val, i32_type, "atomic_exchange_32.val");
+
+        // Create atomic exchange instruction
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i32, 
+                                       llvm::MaybeAlign(4), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_exchange_64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_exchange_64 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_exchange_64: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *val_i64 = ensure_type(val, i64_type, "atomic_exchange_64.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i64, 
+                                       llvm::MaybeAlign(8), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_compare_exchange_32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 4)
+        {
+            report_error("atomic_compare_exchange_32 requires exactly 4 arguments (ptr, expected, desired, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *expected_ptr = args[1];
+        llvm::Value *desired = args[2];
+
+        if (!ptr->getType()->isPointerTy() || !expected_ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_compare_exchange_32: first two arguments must be pointers");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *expected = builder.CreateLoad(i32_type, expected_ptr, "expected_val");
+        llvm::Value *desired_i32 = ensure_type(desired, i32_type, "atomic_compare_exchange_32.desired");
+
+        // Create compare exchange instruction
+        llvm::AtomicCmpXchgInst *cmpxchg = builder.CreateAtomicCmpXchg(
+            ptr, expected, desired_i32, llvm::MaybeAlign(4),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+
+        // Extract the success flag
+        llvm::Value *success = builder.CreateExtractValue(cmpxchg, 1, "success");
+        
+        // Store the actual value back to expected pointer
+        llvm::Value *actual = builder.CreateExtractValue(cmpxchg, 0, "actual");
+        builder.CreateStore(actual, expected_ptr);
+
+        return success;
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_compare_exchange_64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 4)
+        {
+            report_error("atomic_compare_exchange_64 requires exactly 4 arguments (ptr, expected, desired, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *expected_ptr = args[1];
+        llvm::Value *desired = args[2];
+
+        if (!ptr->getType()->isPointerTy() || !expected_ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_compare_exchange_64: first two arguments must be pointers");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *expected = builder.CreateLoad(i64_type, expected_ptr, "expected_val");
+        llvm::Value *desired_i64 = ensure_type(desired, i64_type, "atomic_compare_exchange_64.desired");
+
+        llvm::AtomicCmpXchgInst *cmpxchg = builder.CreateAtomicCmpXchg(
+            ptr, expected, desired_i64, llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+
+        llvm::Value *success = builder.CreateExtractValue(cmpxchg, 1, "success");
+        llvm::Value *actual = builder.CreateExtractValue(cmpxchg, 0, "actual");
+        builder.CreateStore(actual, expected_ptr);
+
+        return success;
+    }
+
+    // Define atomic fetch operations using a macro for efficiency
+    #define DEFINE_ATOMIC_FETCH_OP(op_name, llvm_op, bit_size) \
+    llvm::Value *Intrinsics::generate_atomic_fetch_##op_name##_##bit_size(const std::vector<llvm::Value *> &args) \
+    { \
+        if (args.size() != 3) \
+        { \
+            report_error("atomic_fetch_" #op_name "_" #bit_size " requires exactly 3 arguments (ptr, val, order)"); \
+            return nullptr; \
+        } \
+        \
+        auto &builder = _context_manager.get_builder(); \
+        auto &context = _context_manager.get_context(); \
+        \
+        llvm::Value *ptr = args[0]; \
+        llvm::Value *val = args[1]; \
+        \
+        if (!ptr->getType()->isPointerTy()) \
+        { \
+            report_error("atomic_fetch_" #op_name "_" #bit_size ": first argument must be a pointer"); \
+            return nullptr; \
+        } \
+        \
+        llvm::Type *int_type = llvm::Type::getInt##bit_size##Ty(context); \
+        llvm::Value *val_typed = ensure_type(val, int_type, "atomic_fetch_" #op_name "_" #bit_size ".val"); \
+        \
+        return builder.CreateAtomicRMW(llvm_op, ptr, val_typed, \
+                                       llvm::MaybeAlign(bit_size / 8), llvm::AtomicOrdering::SequentiallyConsistent); \
+    }
+
+    DEFINE_ATOMIC_FETCH_OP(add, llvm::AtomicRMWInst::Add, 32)
+    DEFINE_ATOMIC_FETCH_OP(add, llvm::AtomicRMWInst::Add, 64)
+    DEFINE_ATOMIC_FETCH_OP(sub, llvm::AtomicRMWInst::Sub, 32)
+    DEFINE_ATOMIC_FETCH_OP(sub, llvm::AtomicRMWInst::Sub, 64)
+    DEFINE_ATOMIC_FETCH_OP(and, llvm::AtomicRMWInst::And, 32)
+    DEFINE_ATOMIC_FETCH_OP(and, llvm::AtomicRMWInst::And, 64)
+    DEFINE_ATOMIC_FETCH_OP(or, llvm::AtomicRMWInst::Or, 32)
+    DEFINE_ATOMIC_FETCH_OP(or, llvm::AtomicRMWInst::Or, 64)
+    DEFINE_ATOMIC_FETCH_OP(xor, llvm::AtomicRMWInst::Xor, 32)
+    DEFINE_ATOMIC_FETCH_OP(xor, llvm::AtomicRMWInst::Xor, 64)
+
+    llvm::Value *Intrinsics::generate_atomic_fence(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("atomic_fence requires exactly 1 argument (order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create memory fence instruction
+        builder.CreateFence(llvm::AtomicOrdering::SequentiallyConsistent);
+
+        // Return void
+        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+    }
+
+    // ========================================
+    // Enhanced Network Intrinsics (Full Implementations)
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_listen(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("listen requires exactly 2 arguments (sockfd, backlog)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *listen_type = llvm::FunctionType::get(int_type, {int_type, int_type}, false);
+
+        llvm::Function *listen_func = get_or_create_libc_function("listen", listen_type);
+        return builder.CreateCall(listen_func, {
+            ensure_type(args[0], int_type, "listen.sockfd"),
+            ensure_type(args[1], int_type, "listen.backlog")
+        }, "listen.result");
+    }
+
+    llvm::Value *Intrinsics::generate_accept(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("accept requires exactly 3 arguments (sockfd, addr, addrlen)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *uint32_ptr_type = llvm::PointerType::get(llvm::Type::getInt32Ty(context), 0);
+        llvm::FunctionType *accept_type = llvm::FunctionType::get(
+            int_type, {int_type, void_ptr_type, uint32_ptr_type}, false);
+
+        llvm::Function *accept_func = get_or_create_libc_function("accept", accept_type);
+        return builder.CreateCall(accept_func, {
+            ensure_type(args[0], int_type, "accept.sockfd"),
+            args[1], // addr
+            args[2]  // addrlen
+        }, "accept.result");
+    }
+
+    llvm::Value *Intrinsics::generate_connect(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("connect requires exactly 3 arguments (sockfd, addr, addrlen)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *uint32_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *connect_type = llvm::FunctionType::get(
+            int_type, {int_type, void_ptr_type, uint32_type}, false);
+
+        llvm::Function *connect_func = get_or_create_libc_function("connect", connect_type);
+        return builder.CreateCall(connect_func, {
+            ensure_type(args[0], int_type, "connect.sockfd"),
+            args[1], // addr
+            ensure_type(args[2], uint32_type, "connect.addrlen")
+        }, "connect.result");
+    }
+
+    llvm::Value *Intrinsics::generate_send(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 4)
+        {
+            report_error("send requires exactly 4 arguments (sockfd, buf, len, flags)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *ssize_t_type = llvm::Type::getInt64Ty(context);
+        llvm::FunctionType *send_type = llvm::FunctionType::get(
+            ssize_t_type, {int_type, void_ptr_type, size_t_type, int_type}, false);
+
+        llvm::Function *send_func = get_or_create_libc_function("send", send_type);
+        return builder.CreateCall(send_func, {
+            ensure_type(args[0], int_type, "send.sockfd"),
+            args[1], // buf
+            ensure_type(args[2], size_t_type, "send.len"),
+            ensure_type(args[3], int_type, "send.flags")
+        }, "send.result");
+    }
+
+    llvm::Value *Intrinsics::generate_recv(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 4)
+        {
+            report_error("recv requires exactly 4 arguments (sockfd, buf, len, flags)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *ssize_t_type = llvm::Type::getInt64Ty(context);
+        llvm::FunctionType *recv_type = llvm::FunctionType::get(
+            ssize_t_type, {int_type, void_ptr_type, size_t_type, int_type}, false);
+
+        llvm::Function *recv_func = get_or_create_libc_function("recv", recv_type);
+        return builder.CreateCall(recv_func, {
+            ensure_type(args[0], int_type, "recv.sockfd"),
+            args[1], // buf
+            ensure_type(args[2], size_t_type, "recv.len"),
+            ensure_type(args[3], int_type, "recv.flags")
+        }, "recv.result");
+    }
+
+    // Note: sendto, recvfrom, shutdown, setsockopt, getsockopt, getsockname, getpeername, and poll
+    // are implemented as stubs using DEFINE_NETWORK_STUB macro above
 
 } // namespace Cryo::Codegen
