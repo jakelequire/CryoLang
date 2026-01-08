@@ -2454,8 +2454,12 @@ namespace Cryo
 
         // Enter function scope for parameter and body checking
         enter_scope();
+        bool previous_in_function = _in_function;
         _in_function = true;
         _current_function_return_type = return_type;
+        
+        LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Entering function '{}', previous_in_function={}", 
+                  func_name, previous_in_function);
 
         // PRESERVE _current_struct_type and _current_struct_name during method body processing
         Type *preserved_struct_type = _current_struct_type;
@@ -2487,10 +2491,12 @@ namespace Cryo
 
         // Exit function scope and RESTORE _current_struct_type and _current_struct_name
         _current_function_return_type = nullptr;
-        _in_function = false;
+        _in_function = previous_in_function;
         _current_generic_trait_bounds.clear();
         _current_struct_type = preserved_struct_type; // RESTORE the struct context
         _current_struct_name = preserved_struct_name; // RESTORE the struct name
+        LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Exiting function '{}', restored_in_function={}", 
+                  func_name, _in_function);
         LOG_DEBUG(Cryo::LogComponent::AST, "FunctionDeclarationNode: Restored _current_struct_type='{}' and _current_struct_name='{}' for function '{}'",
                   _current_struct_type ? _current_struct_type->name() : "NULL", _current_struct_name, func_name);
         exit_scope();
@@ -2652,8 +2658,13 @@ namespace Cryo
 
     void TypeChecker::visit(ReturnStatementNode &node)
     {
+        LOG_DEBUG(Cryo::LogComponent::AST, "ReturnStatementNode: _in_function={}, location={}:{}", 
+                  _in_function, node.location().line, node.location().column);
+                  
         if (!_in_function)
         {
+            LOG_WARN(Cryo::LogComponent::AST, "ReturnStatementNode: Return statement found outside function context at {}:{}", 
+                     node.location().line, node.location().column);
             _diagnostic_builder->create_invalid_operation_error("return", nullptr, nullptr, &node);
             return;
         }
@@ -2673,6 +2684,14 @@ namespace Cryo
                     report_type_mismatch(node.location(), _current_function_return_type, expr_type,
                                          "return statement");
                 }
+            }
+            else
+            {
+                // Expression type could not be resolved - this might indicate a problem
+                // Don't create an invalid operation error here, as the expression visitor 
+                // should have already reported the specific issue
+                LOG_WARN(Cryo::LogComponent::AST, "Return expression type could not be resolved for return statement at {}:{}", 
+                         node.location().line, node.location().column);
             }
         }
         else
@@ -3274,8 +3293,8 @@ namespace Cryo
                             else if (left_type == right_type &&
                                      (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float" ||
                                       left_type->name() == "f32" || left_type->name() == "f64" ||
-                                      left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" ||
-                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64" ||
+                                      left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" || left_type->name() == "i128" ||
+                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64" || left_type->name() == "u128" ||
                                       left_type->name() == "char"))
                             {
                                 result_type = left_type;
@@ -3291,8 +3310,8 @@ namespace Cryo
                             }
                             // Handle implicit integer literal promotion (int to specific integer types)
                             else if (left_type->is_integral() && right_type->name() == "int" &&
-                                     (left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" ||
-                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64" ||
+                                     (left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" || left_type->name() == "i128" ||
+                                      left_type->name() == "u8" || left_type->name() == "u16" || left_type->name() == "u32" || left_type->name() == "u64" || left_type->name() == "u128" ||
                                       left_type->name() == "char"))
                             {
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}",
@@ -3301,8 +3320,8 @@ namespace Cryo
                             }
                             // Handle implicit integer literal promotion (specific integer type + int literal)
                             else if (left_type->name() == "int" && right_type->is_integral() &&
-                                     (right_type->name() == "i8" || right_type->name() == "i16" || right_type->name() == "i32" || right_type->name() == "i64" ||
-                                      right_type->name() == "u8" || right_type->name() == "u16" || right_type->name() == "u32" || right_type->name() == "u64" ||
+                                     (right_type->name() == "i8" || right_type->name() == "i16" || right_type->name() == "i32" || right_type->name() == "i64" || right_type->name() == "i128" ||
+                                      right_type->name() == "u8" || right_type->name() == "u16" || right_type->name() == "u32" || right_type->name() == "u64" || right_type->name() == "u128" ||
                                       right_type->name() == "char"))
                             {
                                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing integer literal promotion: {} -> {}",
@@ -4163,6 +4182,52 @@ namespace Cryo
             // Type not found - report error and set to unknown
             _diagnostic_builder->create_undefined_variable_error(type_name, NodeKind::Declaration, node.location());
             node.set_type("u64"); // Still return u64 even on error
+        }
+    }
+
+    void TypeChecker::visit(AlignofExpressionNode &node)
+    {
+        // alignof is a compile-time operator that returns u64
+        const std::string &type_name = node.type_name();
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: visiting alignof expression for type '{}'", type_name);
+
+        // Check if it's a known type
+        Type *type = lookup_type_by_name(type_name);
+        if (type != nullptr)
+        {
+            // The type exists, alignof is valid
+            node.set_resolved_type(_type_context.get_u64_type());
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: alignof({}): type exists, resolved to u64", type_name);
+        }
+        else
+        {
+            // Check if it's a valid generic parameter in current context
+            if (is_generic_parameter(type_name))
+            {
+                // This is a valid generic parameter - alignof is valid
+                node.set_resolved_type(_type_context.get_u64_type());
+                LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: alignof({}): generic parameter, resolved to u64", type_name);
+            }
+            else
+            {
+                // Check if it's a known struct/class type through different lookup methods
+                Type *struct_type = _type_context.lookup_struct_type(type_name);
+                Type *class_type = _type_context.lookup_class_type(type_name);
+
+                if (struct_type || class_type)
+                {
+                    // The type exists, alignof is valid
+                    node.set_resolved_type(_type_context.get_u64_type());
+                    LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: alignof({}): struct/class type found, resolved to u64", type_name);
+                }
+                else
+                {
+                    // Type not found - report error and set to unknown
+                    _diagnostic_builder->create_undefined_variable_error(type_name, NodeKind::Declaration, node.location());
+                    node.set_resolved_type(_type_context.get_u64_type()); // Still return u64 even on error
+                }
+            }
         }
     }
 
@@ -8386,6 +8451,13 @@ namespace Cryo
             return true;
         }
 
+        // Check if LHS is void* and RHS is an integer type (for cases like returning alignment as void*)
+        if (lhs_str == "void*" && rhs_type->is_integral())
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from integer {} to void* (e.g., alignment value)", rhs_str);
+            return true;
+        }
+
         // Special case: null can be assigned to any nullable type (pointers, optionals, etc.)
         if (rhs_type->kind() == TypeKind::Null && lhs_type->is_nullable())
         {
@@ -9046,6 +9118,8 @@ namespace Cryo
             return _type_context.get_i32_type();
         if (type_name == "i64")
             return _type_context.get_i64_type();
+        if (type_name == "i128")
+            return _type_context.get_i128_type();
         if (type_name == "int")
             return _type_context.get_int_type();
 
@@ -9058,6 +9132,8 @@ namespace Cryo
             return _type_context.get_u32_type();
         if (type_name == "u64")
             return _type_context.get_u64_type();
+        if (type_name == "u128")
+            return _type_context.get_u128_type();
 
         // Float types
         if (type_name == "f32")

@@ -466,6 +466,7 @@ namespace Cryo
         void visit(NewExpressionNode &node) override;
         void visit(StructLiteralNode &node) override;
         void visit(SizeofExpressionNode &node) override;
+        void visit(AlignofExpressionNode &node) override;
         void visit(CastExpressionNode &node) override;
         void visit(ArrayLiteralNode &node) override;
         void visit(ArrayAccessNode &node) override;

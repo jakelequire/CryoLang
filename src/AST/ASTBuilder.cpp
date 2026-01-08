@@ -149,6 +149,13 @@ namespace Cryo
         return node;
     }
 
+    std::unique_ptr<AlignofExpressionNode> ASTBuilder::create_alignof_expression(SourceLocation loc, std::string type_name)
+    {
+        auto node = std::make_unique<AlignofExpressionNode>(loc, std::move(type_name));
+        node->set_source_file(_source_file);
+        return node;
+    }
+
     std::unique_ptr<CastExpressionNode> ASTBuilder::create_cast_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::string target_type)
     {
         auto node = std::make_unique<CastExpressionNode>(loc, std::move(expression), std::move(target_type));
