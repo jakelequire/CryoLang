@@ -211,6 +211,70 @@ namespace Cryo::Codegen
         llvm::Value* generate_sleep(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_usleep(const std::vector<llvm::Value*>& args);
 
+        // Threading intrinsics (pthread)
+        llvm::Value* generate_pthread_create(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_join(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_exit(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_detach(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_self(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_equal(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_sched_yield(const std::vector<llvm::Value*>& args);
+
+        // Mutex intrinsics
+        llvm::Value* generate_pthread_mutex_init(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_mutex_destroy(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_mutex_lock(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_mutex_trylock(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_mutex_unlock(const std::vector<llvm::Value*>& args);
+
+        // Condition variable intrinsics
+        llvm::Value* generate_pthread_cond_init(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_cond_destroy(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_cond_wait(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_cond_timedwait(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_cond_signal(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_cond_broadcast(const std::vector<llvm::Value*>& args);
+
+        // Read-write lock intrinsics
+        llvm::Value* generate_pthread_rwlock_init(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_rwlock_destroy(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_rwlock_rdlock(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_rwlock_tryrdlock(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_rwlock_wrlock(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_rwlock_trywrlock(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_rwlock_unlock(const std::vector<llvm::Value*>& args);
+
+        // Thread-local storage intrinsics
+        llvm::Value* generate_pthread_key_create(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_key_delete(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_getspecific(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pthread_setspecific(const std::vector<llvm::Value*>& args);
+
+        // Atomic intrinsics
+        llvm::Value* generate_atomic_load_8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_load_16(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_load_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_load_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_16(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_exchange_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_exchange_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_compare_exchange_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_compare_exchange_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_add_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_add_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_sub_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_sub_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_and_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_and_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_or_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_or_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_xor_32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_xor_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fence(const std::vector<llvm::Value*>& args);
+
         // Threading intrinsics (stubs for now - not fully implemented)
         // pthread, atomic, etc. would require much more complex implementation
 
