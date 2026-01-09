@@ -2170,8 +2170,60 @@ namespace Cryo::Codegen
 
         auto *st = llvm::cast<llvm::StructType>(struct_type);
 
-        // Allocate struct on stack
-        llvm::AllocaInst *struct_alloca = create_entry_alloca(struct_type, type_name + ".literal");
+        // Check if we're in a constructor - constructors should allocate on heap
+        bool is_constructor = false;
+        llvm::Function *current_fn = builder().GetInsertBlock()
+                                         ? builder().GetInsertBlock()->getParent()
+                                         : nullptr;
+        if (current_fn)
+        {
+            std::string fn_name = current_fn->getName().str();
+            // Simple heuristic: if function returns a pointer and the name contains the struct type
+            // it's likely a constructor
+            llvm::Type *ret_type = current_fn->getReturnType();
+            is_constructor = ret_type && ret_type->isPointerTy() && 
+                           fn_name.find(type_name) != std::string::npos;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
+                     "Function '{}' constructor check: {} (return type: {}, contains '{}': {})", 
+                     fn_name, is_constructor ? "yes" : "no", 
+                     ret_type->isPointerTy() ? "pointer" : "non-pointer",
+                     type_name, fn_name.find(type_name) != std::string::npos ? "yes" : "no");
+        }
+
+        llvm::Value *struct_storage = nullptr;
+        
+        if (is_constructor)
+        {
+            // For constructors: allocate on heap using malloc
+            const llvm::DataLayout &DL = module()->getDataLayout();
+            llvm::Value *size = llvm::ConstantInt::get(
+                llvm::Type::getInt64Ty(llvm_ctx()), 
+                DL.getTypeAllocSize(struct_type));
+            
+            // Get or declare malloc function
+            llvm::Function *malloc_fn = module()->getFunction("malloc");
+            if (!malloc_fn)
+            {
+                llvm::Type *ptr_type = llvm::Type::getInt8Ty(llvm_ctx())->getPointerTo();
+                llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+                malloc_fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "malloc", module());
+            }
+            
+            llvm::Value *raw_ptr = builder().CreateCall(malloc_fn, {size}, "heap.alloc");
+            // Cast void* to struct*
+            struct_storage = builder().CreateBitCast(raw_ptr, 
+                                                     struct_type->getPointerTo(),
+                                                     type_name + ".heap.ptr");
+            
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
+                     "Constructor: allocated {} on heap", type_name);
+        }
+        else
+        {
+            // For non-constructors: allocate on stack
+            struct_storage = create_entry_alloca(struct_type, type_name + ".literal");
+        }
 
         // Initialize fields from field initializers
         // IMPORTANT: Use field name lookup to get correct index, NOT positional index
@@ -2218,7 +2270,7 @@ namespace Cryo::Codegen
             field_val = cast_if_needed(field_val, st->getElementType(field_idx));
 
             // Get pointer to field using correct index
-            llvm::Value *field_ptr = create_struct_gep(struct_type, struct_alloca,
+            llvm::Value *field_ptr = create_struct_gep(struct_type, struct_storage,
                                                        static_cast<unsigned>(field_idx),
                                                        field_name + ".ptr");
             create_store(field_val, field_ptr);
@@ -2228,7 +2280,17 @@ namespace Cryo::Codegen
                      field_name, field_idx, type_name);
         }
 
-        return struct_alloca;
+        if (is_constructor)
+        {
+            // For constructors: return pointer to heap-allocated struct
+            return struct_storage;
+        }
+        else
+        {
+            // For non-constructors: load and return the struct value, not the alloca pointer
+            // This is necessary because the caller expects a struct value, not a pointer
+            return create_load(struct_storage, struct_type, type_name + ".value");
+        }
     }
 
     llvm::Value *ExpressionCodegen::generate_new(Cryo::NewExpressionNode *node)

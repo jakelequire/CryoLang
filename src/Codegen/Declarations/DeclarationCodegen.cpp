@@ -1138,9 +1138,30 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Get return type
-        llvm::Type *return_type = get_llvm_type(node->get_resolved_return_type());
+        Type *resolved_type = node->get_resolved_return_type();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' resolved return type: '{}'", 
+                  node->name(), resolved_type ? resolved_type->to_string() : "NULL");
+        
+        // Special handling for constructors - if return type is void/unknown, fix it to pointer type
+        if (resolved_type && (resolved_type->kind() == TypeKind::Void || resolved_type->kind() == TypeKind::Unknown) &&
+            !parent_type_name.empty())
+        {
+            // This is a constructor with wrong return type - fix it to pointer to struct type
+            Type *struct_type = ctx().symbols().get_type_context()->get_struct_type(parent_type_name);
+            if (struct_type)
+            {
+                resolved_type = ctx().symbols().get_type_context()->create_pointer_type(struct_type);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Constructor '{}' return type fixed from {} to {}", 
+                          node->name(), 
+                          node->get_resolved_return_type() ? node->get_resolved_return_type()->to_string() : "NULL",
+                          resolved_type ? resolved_type->to_string() : "NULL");
+            }
+        }
+        
+        llvm::Type *return_type = get_llvm_type(resolved_type);
         if (!return_type)
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Using void return type for '{}'", node->name());
             return_type = llvm::Type::getVoidTy(llvm_ctx());
         }
 

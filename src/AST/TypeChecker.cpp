@@ -1708,6 +1708,16 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "Processing {} imported modules for AST node updates", imported_asts.size());
         auto all_symbols = _symbol_table->get_symbols();
 
+        // DEBUG: Check current state of _struct_methods before processing imports
+        std::cout << "[DEBUG] === STATE OF _struct_methods BEFORE IMPORT PROCESSING ===" << std::endl;
+        for (const auto &[struct_name, methods] : _struct_methods) {
+            std::cout << "[DEBUG] Struct '" << struct_name << "' has methods:" << std::endl;
+            for (const auto &[method_name, method_info] : methods) {
+                std::cout << "[DEBUG]   - " << method_name << std::endl;
+            }
+        }
+        std::cout << "[DEBUG] =================================================================" << std::endl;
+
         // Store the original source file to restore later
         std::string original_source_file = _source_file;
 
@@ -1845,13 +1855,23 @@ namespace Cryo
                     else
                     {
                         // For non-function statements, use normal visitor
-                        // std::cout << "[DEBUG] Calling accept() on " << node_type << " from module " << module_name << std::endl;
+                        std::cout << "[DEBUG] Processing " << node_type << " from module " << module_name << std::endl;
                         stmt->accept(*this);
-                        // std::cout << "[DEBUG] Finished accept() on " << node_type << std::endl;
+                        std::cout << "[DEBUG] Finished processing " << node_type << " from module " << module_name << std::endl;
                     }
                 }
             }
         }
+
+        // DEBUG: Check final state of _struct_methods after processing imports
+        std::cout << "[DEBUG] === STATE OF _struct_methods AFTER IMPORT PROCESSING ===" << std::endl;
+        for (const auto &[struct_name, methods] : _struct_methods) {
+            std::cout << "[DEBUG] Struct '" << struct_name << "' has methods:" << std::endl;
+            for (const auto &[method_name, method_info] : methods) {
+                std::cout << "[DEBUG]   - " << method_name << std::endl;
+            }
+        }
+        std::cout << "[DEBUG] =================================================================" << std::endl;
 
         // Restore the original source file context
         set_source_file(original_source_file);
@@ -7382,6 +7402,14 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "ImplementationBlockNode::visit() - Processing implementation for type: {} (source: {})", target_type_name, _source_file);
         LOG_DEBUG(Cryo::LogComponent::AST, "Number of methods in this implementation: {}", node.method_implementations().size());
 
+        // Handle generic types like "Option<T>" by extracting the base type name
+        std::string base_type_name = target_type_name;
+        size_t generic_start = target_type_name.find('<');
+        if (generic_start != std::string::npos)
+        {
+            base_type_name = target_type_name.substr(0, generic_start);
+        }
+
         // Special debug logging for string implementation
         if (target_type_name == "string")
         {
@@ -7398,14 +7426,6 @@ namespace Cryo
 
         if (!target_type_name.empty())
         {
-            // Handle generic types like "Option<T>" by extracting the base type name
-            std::string base_type_name = target_type_name;
-            size_t generic_start = target_type_name.find('<');
-            if (generic_start != std::string::npos)
-            {
-                base_type_name = target_type_name.substr(0, generic_start);
-            }
-
             // Check if it's a primitive type first
             if (base_type_name == "string" || base_type_name == "int" || base_type_name == "i8" ||
                 base_type_name == "i16" || base_type_name == "i32" || base_type_name == "i64" ||
@@ -7445,7 +7465,11 @@ namespace Cryo
         Type *previous_struct_type = _current_struct_type;
         std::string previous_struct_name = _current_struct_name;
         _current_struct_type = target_type;
-        _current_struct_name = target_type_name;
+        
+        // For method registration, use the base type name (without generics) to ensure
+        // consistent lookup regardless of concrete generic parameters
+        std::string registration_type_name = base_type_name;
+        _current_struct_name = registration_type_name;
 
         // Enter implementation scope
         enter_scope();
@@ -7496,6 +7520,12 @@ namespace Cryo
 
                 LOG_DEBUG(Cryo::LogComponent::AST, "Processing method: {} for type {} (source: {})", method->name(), target_type_name, _source_file);
 
+                // Special debug for BTreeMap methods
+                if (target_type_name.find("BTreeMap") != std::string::npos) 
+                {
+                    std::cout << "[DEBUG] === PROCESSING BTREEMAP METHOD: " << method->name() << " for type " << target_type_name << " (registration key: " << registration_type_name << ") ===" << std::endl;
+                }
+
                 // Special debug for string methods
                 if (target_type_name == "string")
                 {
@@ -7504,6 +7534,28 @@ namespace Cryo
 
                 method->accept(*this);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Finished processing method: {} for type {} - should be registered in _struct_methods", method->name(), target_type_name);
+
+                // Verify registration for BTreeMap methods
+                if (target_type_name.find("BTreeMap") != std::string::npos) 
+                {
+                    auto it = _struct_methods.find(registration_type_name);
+                    if (it != _struct_methods.end())
+                    {
+                        auto method_it = it->second.find(method->name());
+                        if (method_it != it->second.end())
+                        {
+                            std::cout << "[DEBUG] === CONFIRMED: BTreeMap method '" << method->name() << "' is registered for type '" << registration_type_name << "' ===" << std::endl;
+                        }
+                        else
+                        {
+                            std::cout << "[DEBUG] === ERROR: BTreeMap method '" << method->name() << "' NOT found for type '" << registration_type_name << "' ===" << std::endl;
+                        }
+                    }
+                    else
+                    {
+                        std::cout << "[DEBUG] === ERROR: No '" << registration_type_name << "' key found in _struct_methods ===" << std::endl;
+                    }
+                }
 
                 // Verify registration for string methods
                 if (target_type_name == "string")
@@ -7846,18 +7898,41 @@ namespace Cryo
 
             const std::string &func_name = node.name();
 
-            // For constructors, the return type is the struct type itself
-            // This allows constructors to return struct literals with `return StructName { ... }`
-            Type *return_type = _current_struct_type;
-            if (!return_type)
+            // For constructors, the return type is a pointer to the struct type
+            // This allows constructors to return allocated struct instances
+            Type *struct_type = _current_struct_type;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Constructor '{}': _current_struct_type = {}", 
+                      func_name, struct_type ? struct_type->to_string() : "NULL");
+            
+            if (!struct_type)
             {
                 // Fallback: try to get the struct type by name
-                return_type = _type_context.get_struct_type(_current_struct_name);
+                struct_type = _type_context.get_struct_type(_current_struct_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Constructor '{}': fallback lookup by name '{}' = {}", 
+                          func_name, _current_struct_name, struct_type ? struct_type->to_string() : "NULL");
             }
-            if (!return_type)
+            if (!struct_type)
+            {
+                // Constructor name should match struct name - try lookup by constructor name
+                struct_type = _type_context.get_struct_type(func_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Constructor '{}': lookup by constructor name = {}", 
+                          func_name, struct_type ? struct_type->to_string() : "NULL");
+            }
+            
+            Type *return_type = nullptr;
+            if (struct_type)
+            {
+                // Constructor returns pointer to struct
+                return_type = _type_context.create_pointer_type(struct_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Constructor '{}': return type set to pointer: {}", 
+                          func_name, return_type ? return_type->to_string() : "NULL");
+            }
+            else
             {
                 // Final fallback to node's return type
                 return_type = node.get_resolved_return_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "Constructor '{}': using node return type = {}", 
+                          func_name, return_type ? return_type->to_string() : "NULL");
             }
             const std::string &return_type_str = return_type ? return_type->to_string() : "void";
 

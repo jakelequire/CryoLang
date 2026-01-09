@@ -1,7 +1,5 @@
 #include "Codegen/Statements/ControlFlowCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
-#include "AST/ASTNode.hpp"
-#include "AST/Type.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -572,30 +570,12 @@ namespace Cryo::Codegen
         {
             auto *case_node = node->cases()[i].get();
             if (!case_node || !case_node->value())
-            {
-                // Skip cases without values (like default), but ensure current block has terminator
-                // This can happen if previous iteration set insert point to a "next" block
-                llvm::BasicBlock *current = builder().GetInsertBlock();
-                if (current && !current->getTerminator())
-                {
-                    // Branch to default block - we'll continue checking remaining cases
-                    builder().CreateBr(default_block);
-                }
                 continue;
-            }
 
             // Generate case value (string)
             llvm::Value *case_val = generate_expression(case_node->value());
             if (!case_val)
-            {
-                // Same fix for failed expression generation
-                llvm::BasicBlock *current = builder().GetInsertBlock();
-                if (current && !current->getTerminator())
-                {
-                    builder().CreateBr(default_block);
-                }
                 continue;
-            }
 
             // Compare strings
             llvm::Value *cmp_result = builder().CreateCall(strcmp_fn, {switch_value, case_val}, "strcmp.result");
@@ -740,13 +720,6 @@ namespace Cryo::Codegen
             // Generate arm body
             builder().SetInsertPoint(arm_block);
             enter_scope(arm_block);
-
-            // Bind pattern variables if this is an enum pattern
-            if (pattern && pattern->pattern_type() == Cryo::PatternNode::PatternType::Enum)
-            {
-                bind_enum_pattern_variables(match_value, pattern);
-            }
-
             if (arm->body())
             {
                 CodegenVisitor *visitor = ctx().visitor();
@@ -787,33 +760,11 @@ namespace Cryo::Codegen
 
                 if (value->getType()->isIntegerTy() && pattern_val->getType()->isIntegerTy())
                 {
-                    // Ensure types are compatible before comparison
-                    llvm::Value *lhs = value;
-                    llvm::Value *rhs = pattern_val;
-                    if (ensure_compatible_types(lhs, rhs))
-                    {
-                        return builder().CreateICmpEQ(lhs, rhs, "pattern.match");
-                    }
-                    else
-                    {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to coerce types for pattern match comparison");
-                        return nullptr;
-                    }
+                    return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
                 }
                 else if (value->getType()->isFloatingPointTy() && pattern_val->getType()->isFloatingPointTy())
                 {
-                    // Ensure types are compatible before comparison
-                    llvm::Value *lhs = value;
-                    llvm::Value *rhs = pattern_val;
-                    if (ensure_compatible_types(lhs, rhs))
-                    {
-                        return builder().CreateFCmpOEQ(lhs, rhs, "pattern.match");
-                    }
-                    else
-                    {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to coerce types for float pattern match comparison");
-                        return nullptr;
-                    }
+                    return builder().CreateFCmpOEQ(value, pattern_val, "pattern.match");
                 }
                 else if (value->getType()->isPointerTy() && pattern_val->getType()->isPointerTy())
                 {
@@ -832,223 +783,13 @@ namespace Cryo::Codegen
             return nullptr;
 
         case Cryo::PatternNode::PatternType::Enum:
-        {
-            // Cast to EnumPatternNode to get variant info
-            auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(pattern);
-            if (!enum_pattern)
-                return nullptr;
-
-            std::string enum_name = enum_pattern->enum_name();
-            std::string variant_name = enum_pattern->variant_name();
-            std::string qualified_variant = enum_name + "::" + variant_name;
-
-            // Look up the discriminant value for this variant
-            auto &enum_variants = ctx().enum_variants_map();
-            auto it = enum_variants.find(qualified_variant);
-            if (it == enum_variants.end())
-            {
-                LOG_WARN(Cryo::LogComponent::CODEGEN,
-                         "Unknown enum variant in pattern: {}", qualified_variant);
-                return nullptr;
-            }
-
-            llvm::Value *expected_discriminant = it->second;
-
-            // Check if value is a tagged union struct or simple enum
-            if (value->getType()->isStructTy())
-            {
-                // Tagged union - extract discriminant from first field
-                llvm::Value *discriminant = builder().CreateExtractValue(value, 0, "discriminant");
-                llvm::Value *lhs = discriminant;
-                llvm::Value *rhs = expected_discriminant;
-                if (ensure_compatible_types(lhs, rhs))
-                {
-                    return builder().CreateICmpEQ(lhs, rhs, "pattern.match");
-                }
-                else
-                {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to coerce types for enum discriminant comparison");
-                    return nullptr;
-                }
-            }
-            else if (value->getType()->isIntegerTy())
-            {
-                // Simple enum - compare directly with type coercion
-                llvm::Value *lhs = value;
-                llvm::Value *rhs = expected_discriminant;
-                if (ensure_compatible_types(lhs, rhs))
-                {
-                    return builder().CreateICmpEQ(lhs, rhs, "pattern.match");
-                }
-                else
-                {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "Failed to coerce types for simple enum comparison");
-                    return nullptr;
-                }
-            }
-
+            // Enum pattern - would need to compare enum discriminant
+            // For now, treat as wildcard
             return nullptr;
-        }
         }
 
         // Default: wildcard behavior
         return nullptr;
-    }
-
-    bool ControlFlowCodegen::ensure_compatible_types(llvm::Value *&lhs, llvm::Value *&rhs)
-    {
-        if (!lhs || !rhs)
-            return false;
-
-        llvm::Type *lhs_type = lhs->getType();
-        llvm::Type *rhs_type = rhs->getType();
-
-        if (lhs_type == rhs_type)
-            return true;
-
-        // Integer type promotion
-        if (lhs_type->isIntegerTy() && rhs_type->isIntegerTy())
-        {
-            unsigned lhs_bits = lhs_type->getIntegerBitWidth();
-            unsigned rhs_bits = rhs_type->getIntegerBitWidth();
-
-            if (lhs_bits < rhs_bits)
-            {
-                lhs = builder().CreateSExt(lhs, rhs_type, "sext");
-            }
-            else if (rhs_bits < lhs_bits)
-            {
-                rhs = builder().CreateSExt(rhs, lhs_type, "sext");
-            }
-            return true;
-        }
-
-        // Float promotion
-        if (lhs_type->isFloatingPointTy() && rhs_type->isFloatingPointTy())
-        {
-            if (lhs_type->isFloatTy() && rhs_type->isDoubleTy())
-            {
-                lhs = builder().CreateFPExt(lhs, rhs_type, "fpext");
-            }
-            else if (rhs_type->isFloatTy() && lhs_type->isDoubleTy())
-            {
-                rhs = builder().CreateFPExt(rhs, lhs_type, "fpext");
-            }
-            return true;
-        }
-
-        // Pointer comparison (both should be pointers)
-        if (lhs_type->isPointerTy() && rhs_type->isPointerTy())
-        {
-            // Opaque pointers in LLVM 15+ are compatible
-            return true;
-        }
-
-        LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                  "ensure_compatible_types: Cannot convert between incompatible types in pattern match. "
-                  "lhs is integer: {}, lhs is pointer: {}, lhs is float: {}; "
-                  "rhs is integer: {}, rhs is pointer: {}, rhs is float: {}",
-                  lhs_type->isIntegerTy(), lhs_type->isPointerTy(), lhs_type->isFloatingPointTy(),
-                  rhs_type->isIntegerTy(), rhs_type->isPointerTy(), rhs_type->isFloatingPointTy());
-
-        return false;
-    }
-
-    void ControlFlowCodegen::bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern)
-    {
-        auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(pattern);
-        if (!enum_pattern)
-            return;
-
-        const auto &bound_vars = enum_pattern->bound_variables();
-        if (bound_vars.empty())
-            return;
-
-        std::string enum_name = enum_pattern->enum_name();
-        std::string variant_name = enum_pattern->variant_name();
-        std::string qualified_variant = enum_name + "::" + variant_name;
-
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "Binding {} pattern variables for {}", bound_vars.size(), qualified_variant);
-
-        // Look up the variant field types from CodegenContext
-        const std::vector<std::string> *field_types = ctx().get_enum_variant_fields(qualified_variant);
-        if (!field_types)
-        {
-            LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Cannot find field types for enum variant '{}'", qualified_variant);
-            return;
-        }
-
-        if (field_types->size() != bound_vars.size())
-        {
-            LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Mismatch: {} bound variables but {} field types",
-                     bound_vars.size(), field_types->size());
-        }
-
-        // The value should be a tagged union struct
-        if (!value->getType()->isStructTy())
-        {
-            LOG_WARN(Cryo::LogComponent::CODEGEN,
-                     "Expected struct type for enum pattern binding, got {}",
-                     value->getType()->isIntegerTy() ? "integer" : "other");
-            return;
-        }
-
-        // Allocate the enum value so we can get pointers into it
-        llvm::Type *struct_type = value->getType();
-        llvm::Value *value_alloca = builder().CreateAlloca(struct_type, nullptr, "enum_tmp");
-        builder().CreateStore(value, value_alloca);
-
-        // Get pointer to payload (field 1 of the struct)
-        llvm::Value *payload_ptr = builder().CreateStructGEP(struct_type, value_alloca, 1, "payload_ptr");
-
-        // Bind each variable by extracting from the payload
-        size_t offset = 0;
-        for (size_t i = 0; i < bound_vars.size() && i < field_types->size(); ++i)
-        {
-            const std::string &var_name = bound_vars[i];
-            const std::string &type_name = (*field_types)[i];
-
-            // Get the LLVM type for this field
-            llvm::Type *field_type = types().get_type(type_name);
-            if (!field_type)
-            {
-                LOG_WARN(Cryo::LogComponent::CODEGEN,
-                         "Unknown type '{}' for pattern variable '{}'", type_name, var_name);
-                continue;
-            }
-
-            // Calculate field pointer with offset into the payload byte array
-            llvm::Value *field_ptr = builder().CreateConstGEP1_32(
-                llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, offset, "field_ptr");
-
-            // Cast to field type pointer and load
-            field_ptr = builder().CreateBitCast(field_ptr, llvm::PointerType::get(field_type, 0));
-            llvm::Value *field_value = builder().CreateLoad(field_type, field_ptr, var_name);
-
-            // Create alloca for the variable and store the value
-            llvm::AllocaInst *var_alloca = builder().CreateAlloca(field_type, nullptr, var_name + "_alloca");
-            builder().CreateStore(field_value, var_alloca);
-
-            // Register the variable in the current scope
-            values().set_value(var_name, field_value, var_alloca, field_type);
-
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Bound pattern variable '{}' (type: {}) from enum variant {}",
-                      var_name, type_name, variant_name);
-
-            // Advance offset by the size of this field (with safety check for unsized types)
-            if (field_type->isSized())
-            {
-                offset += module()->getDataLayout().getTypeAllocSize(field_type);
-            }
-            else
-            {
-                offset += 8; // Default to pointer size for unsized types
-            }
-        }
     }
 
     //===================================================================
@@ -1109,23 +850,11 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating return");
 
-        // Safety check: ensure we have a valid insert point
-        llvm::BasicBlock *current_block = builder().GetInsertBlock();
-        if (!current_block)
-        {
-            LOG_WARN(Cryo::LogComponent::CODEGEN, "generate_return: No valid insert block, skipping return generation");
-            return;
-        }
-
         // Get the current function's return type
-        llvm::Function *current_fn = current_block->getParent();
-        if (!current_fn)
-        {
-            LOG_WARN(Cryo::LogComponent::CODEGEN, "generate_return: Insert block has no parent function, skipping return generation");
-            return;
-        }
-
-        llvm::Type *expected_ret_type = current_fn->getReturnType();
+        llvm::Function *current_fn = builder().GetInsertBlock()
+                                         ? builder().GetInsertBlock()->getParent()
+                                         : nullptr;
+        llvm::Type *expected_ret_type = current_fn ? current_fn->getReturnType() : nullptr;
 
         if (node && node->expression())
         {
@@ -1136,30 +865,18 @@ namespace Cryo::Codegen
                 if (expected_ret_type && ret_val->getType() != expected_ret_type)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "generate_return: Type mismatch - ret_val type ID={}, expected type ID={}, isPtr={}, isStruct={}",
-                              ret_val->getType()->getTypeID(), expected_ret_type->getTypeID(),
-                              ret_val->getType()->isPointerTy(), expected_ret_type->isStructTy());
-
-                    // Special case: returning struct literal returns pointer to alloca,
-                    // but function expects struct value - need to load instead of cast
-                    if (ret_val->getType()->isPointerTy() && expected_ret_type->isStructTy())
-                    {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "generate_return: Loading struct value from pointer for return");
-                        ret_val = builder().CreateLoad(expected_ret_type, ret_val, "ret.load");
-                    }
-                    // Special case: constructor pattern - function has void return but trying to return value
-                    // This happens with constructor-style methods that return struct literals
-                    else if (expected_ret_type->isVoidTy())
+                             "Return type mismatch: expected {}, got {}. Attempting cast.",
+                             expected_ret_type->isVoidTy() ? "void" : "non-void",
+                             ret_val->getType()->isStructTy() ? "struct" : "non-struct");
+                    
+                    ret_val = cast_if_needed(ret_val, expected_ret_type);
+                    
+                    // If cast failed and returned null, use a default value instead
+                    if (!ret_val)
                     {
                         LOG_WARN(Cryo::LogComponent::CODEGEN,
-                                 "generate_return: Function has void return type but has return value - treating as void return (constructor pattern)");
-                        builder().CreateRetVoid();
-                        return;
-                    }
-                    else
-                    {
-                        ret_val = cast_if_needed(ret_val, expected_ret_type);
+                                "Cast failed in return statement, using default return value");
+                        ret_val = llvm::Constant::getNullValue(expected_ret_type);
                     }
                 }
                 if (ret_val)
