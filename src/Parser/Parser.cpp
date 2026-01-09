@@ -4992,7 +4992,26 @@ namespace Cryo
         }
         else if (is_constructor)
         {
-            return_type = _context.types().get_void_type(); // Constructors don't have explicit return types
+            // Constructors implicitly return a pointer to the struct type
+            // Use the struct name passed to this method
+            if (!struct_name.empty())
+            {
+                Type *struct_type = _context.types().get_struct_type(struct_name);
+                if (struct_type)
+                {
+                    return_type = _context.types().create_pointer_type(struct_type);
+                }
+                else
+                {
+                    // Fallback: create pointer to unknown type, TypeChecker will fix
+                    return_type = _context.types().create_pointer_type(_context.types().get_unknown_type());
+                }
+            }
+            else
+            {
+                // No struct context - use unknown pointer type
+                return_type = _context.types().create_pointer_type(_context.types().get_unknown_type());
+            }
         }
 
         // Check for default destructor syntax: ~TypeName() default;
