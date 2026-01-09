@@ -576,6 +576,7 @@ namespace Cryo
         std::vector<std::string> extract_template_parameter_names(const std::string &template_type_string);
         std::shared_ptr<Type> substitute_type_with_map(const std::shared_ptr<Type> &type,
                                                        const std::unordered_map<std::string, std::shared_ptr<Type>> &substitution_map);
+        Type *substitute_generic_parameters(Type *base_type, const std::vector<std::shared_ptr<Type>> &concrete_types);
 
         std::string format_type_error(const std::string &context, Type *expected, Type *actual);
     };

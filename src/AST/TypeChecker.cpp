@@ -3637,6 +3637,8 @@ namespace Cryo
 
     void TypeChecker::visit(CallExpressionNode &node)
     {
+        LOG_DEBUG(Cryo::LogComponent::AST, "CallExpressionNode: Starting call resolution");
+        
         // Visit callee with call expression context
         if (node.callee())
         {
@@ -3644,6 +3646,18 @@ namespace Cryo
             _in_call_expression = true;
             node.callee()->accept(*this);
             _in_call_expression = prev_in_call;
+            
+            // Debug the callee resolution
+            if (node.callee()->has_resolved_type())
+            {
+                Type *callee_type = node.callee()->get_resolved_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "CallExpressionNode: Callee resolved to type '{}' (kind={})", 
+                          callee_type->to_string(), TypeKindToString(callee_type->kind()));
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "CallExpressionNode: Callee has no resolved type");
+            }
         }
 
         // Visit arguments
@@ -4793,7 +4807,8 @@ namespace Cryo
 
         if (!object_type)
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Object type is null, cannot resolve member access");
+            std::string member_name = node.member();
+            LOG_DEBUG(Cryo::LogComponent::AST, "Object type is null, cannot resolve member access for member '{}'", member_name);
             Type *expected_type = _type_context.get_struct_type(""); // Placeholder for "object type"
             Type *found_type = _type_context.get_unknown_type();
             _diagnostic_builder->create_assignment_type_error(expected_type, found_type, node.location());
@@ -4959,12 +4974,7 @@ namespace Cryo
                 }
             }
 
-            // Fall through to error if method not found
-            std::string type_name = effective_type ? effective_type->to_string() : "unknown";
-            report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
-                         "No field '" + member_name + "' on type '" + type_name + "'", &node);
-            node.set_resolved_type(_type_context.get_unknown_type());
-            return;
+            // Fall through to method lookup if no primitive method found
         }
 
         // For non-struct/class/enum/parameterized types, reject member access
@@ -5041,109 +5051,62 @@ namespace Cryo
         auto struct_it = _struct_fields.find(lookup_type_name);
         if (struct_it != _struct_fields.end())
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found struct '{}' in _struct_fields with {} fields", lookup_type_name, struct_it->second.size());
             auto field_it = struct_it->second.find(member_name);
             if (field_it != struct_it->second.end())
             {
-                // CRITICAL DEBUG for runtime_instance field specifically
-                if (member_name == "runtime_instance")
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "RUNTIME_INSTANCE FIELD FOUND: field='{}' in struct '{}', stored_type='{}', kind={}",
-                              member_name, lookup_type_name, field_it->second->to_string(), TypeKindToString(field_it->second->kind()));
-                    LOG_DEBUG(Cryo::LogComponent::AST, "RUNTIME_INSTANCE: Setting node resolved type to: '{}'", field_it->second->to_string());
-                }
-
-                // Found the field - store the resolved Type*
                 node.set_resolved_type(field_it->second);
-
-                // CRITICAL DEBUG: Log what type was actually set
-                if (member_name == "runtime_instance" && node.has_resolved_type())
-                {
-                    Type *resolved = node.get_resolved_type();
-                    LOG_DEBUG(Cryo::LogComponent::AST, "RUNTIME_INSTANCE: Node resolved type after setting: '{}', kind={}",
-                              resolved ? resolved->to_string() : "null", resolved ? TypeKindToString(resolved->kind()) : "null");
-                }
                 return;
             }
-            else
-            {
-                // CRITICAL DEBUG for get_memory_statistics method specifically
-                if (member_name == "get_memory_statistics")
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "get_memory_statistics FIELD NOT FOUND: looking for field '{}' in struct '{}', will now check methods",
-                              member_name, lookup_type_name);
-                }
-                LOG_DEBUG(Cryo::LogComponent::AST, "Field '{}' NOT found in struct '{}'", member_name, lookup_type_name);
-            }
         }
-        else
+
+        // For generic types, try looking up the base type
+        size_t bracket_pos = lookup_type_name.find('<');
+        if (bracket_pos != std::string::npos)
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' NOT found in _struct_fields map", lookup_type_name);
-            LOG_DEBUG(Cryo::LogComponent::AST, "Available types in _struct_fields ({} total):", _struct_fields.size());
-            for (const auto &entry : _struct_fields)
-            {
-                LOG_DEBUG(Cryo::LogComponent::AST, "  - '{}' with {} fields", entry.first, entry.second.size());
-            }
-
-            // Fallback for well-known stdlib generic types that might not be imported
-            // This handles cases where types like Pair are used without explicit imports
-            // Check this BEFORE trying to extract base type from lookup_type_name
-            if (effective_type && effective_type->kind() == TypeKind::Parameterized)
-            {
-                ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
-                auto &concrete_types = param_type->type_parameters();
-                std::string base_name = param_type->base_name();
-
-                // Fallback field resolution for Pair<T1, T2>
-                if ((base_name == "Pair" || lookup_type_name == "Pair") && concrete_types.size() == 2)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Using fallback field resolution for Pair type (base_name='{}', concrete_types={})",
-                              base_name, concrete_types.size());
-                    if (member_name == "first")
-                    {
-                        node.set_resolved_type(concrete_types[0].get());
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Pair.first to '{}'", concrete_types[0]->to_string());
-                        return;
-                    }
-                    else if (member_name == "second")
-                    {
-                        node.set_resolved_type(concrete_types[1].get());
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved Pair.second to '{}'", concrete_types[1]->to_string());
-                        return;
-                    }
-                }
-            }
-
-            // For generic types like "Array<int>", try looking up the base type "Array"
-            size_t bracket_pos = lookup_type_name.find('<');
-            if (bracket_pos != std::string::npos)
-            {
                 std::string base_type_name = lookup_type_name.substr(0, bracket_pos);
-                LOG_DEBUG(Cryo::LogComponent::AST, "Trying base type '{}' for generic type '{}'", base_type_name, lookup_type_name);
-
                 auto base_struct_it = _struct_fields.find(base_type_name);
                 if (base_struct_it != _struct_fields.end())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Found base struct '{}' in _struct_fields with {} fields", base_type_name, base_struct_it->second.size());
                     auto field_it = base_struct_it->second.find(member_name);
                     if (field_it != base_struct_it->second.end())
                     {
-                        // Found the field in the base type - store the resolved Type*
-                        node.set_resolved_type(field_it->second);
+                        Type *base_field_type = field_it->second;
+                        
+                        // For generic types, substitute type parameters
+                        if (effective_type && effective_type->kind() == TypeKind::Parameterized)
+                        {
+                            ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
+                            auto &concrete_types = param_type->type_parameters();
+                            
+                            // Check if we have concrete types or just template parameters
+                            bool has_concrete_types = !concrete_types.empty() && 
+                                concrete_types[0] && 
+                                concrete_types[0]->kind() != TypeKind::Unknown &&
+                                concrete_types[0]->name() != "K" &&
+                                concrete_types[0]->name() != "V" &&
+                                concrete_types[0]->name() != "T";
+                                
+                            if (has_concrete_types)
+                            {
+                                // We have concrete types, do substitution
+                                Type *substituted_type = substitute_generic_parameters(base_field_type, concrete_types);
+                                node.set_resolved_type(substituted_type ? substituted_type : base_field_type);
+                            }
+                            else
+                            {
+                                // We're in a generic context, keep the generic field type as-is
+                                // This handles cases like accessing fields within generic methods
+                                node.set_resolved_type(base_field_type);
+                            }
+                        }
+                        else
+                        {
+                            node.set_resolved_type(base_field_type);
+                        }
                         return;
                     }
-                    else
-                    {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Field '{}' NOT found in base struct '{}'", member_name, base_type_name);
-                    }
-                }
-                else
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Base struct '{}' NOT found in _struct_fields map", base_type_name);
-                    // Fallback was already checked above for parameterized types
                 }
             }
-        }
 
         // Look up method in struct method map
         LOG_DEBUG(Cryo::LogComponent::AST, "Starting method lookup for '{}' in struct '{}'", member_name, lookup_type_name);
@@ -10185,6 +10148,83 @@ namespace Cryo
 
         // Return the original type if no substitution was needed
         return type;
+    }
+
+    Type *TypeChecker::substitute_generic_parameters(Type *base_type, const std::vector<std::shared_ptr<Type>> &concrete_types)
+    {
+        if (!base_type || concrete_types.empty())
+        {
+            return base_type;
+        }
+
+        // Handle array types - recursively substitute element types
+        if (base_type->kind() == TypeKind::Array)
+        {
+            ArrayType *arr_type = static_cast<ArrayType *>(base_type);
+            Type *element_type = arr_type->element_type().get();
+            
+            // Recursively substitute the element type
+            Type *substituted_element = substitute_generic_parameters(element_type, concrete_types);
+            
+            if (substituted_element != element_type)
+            {
+                // Element type was substituted, create new array type
+                return _type_context.create_array_type(substituted_element, arr_type->array_size());
+            }
+            return base_type;
+        }
+        
+        // Handle pointer types - recursively substitute pointee types  
+        if (base_type->kind() == TypeKind::Pointer)
+        {
+            PointerType *ptr_type = static_cast<PointerType *>(base_type);
+            Type *pointee_type = ptr_type->pointee_type().get();
+            
+            // Recursively substitute the pointee type
+            Type *substituted_pointee = substitute_generic_parameters(pointee_type, concrete_types);
+            
+            if (substituted_pointee != pointee_type)
+            {
+                // Pointee type was substituted, create new pointer type
+                return _type_context.create_pointer_type(substituted_pointee);
+            }
+            return base_type;
+        }
+
+        // Handle parameterized types - create new instance with concrete types
+        if (base_type->kind() == TypeKind::Parameterized)
+        {
+            ParameterizedType *param_type = static_cast<ParameterizedType *>(base_type);
+            std::string base_name = param_type->base_name();
+            
+            // For types like BTreeNode<K, V>, substitute with concrete types
+            // Create new ParameterizedType directly with concrete types
+            ParameterizedType *substituted = new ParameterizedType(base_name, concrete_types);
+            return substituted;
+        }
+        
+        // Handle direct generic parameter substitution
+        // Use a more flexible approach that works with common parameter naming conventions
+        std::string type_name = base_type->name();
+        
+        // Check for common generic parameter patterns
+        if (type_name.length() == 1 || 
+            (type_name.length() <= 5 && std::all_of(type_name.begin(), type_name.end(), ::isupper)))
+        {
+            // Common single-letter or short uppercase parameters: K, V, T, U, E, etc.
+            if ((type_name == "K" || type_name == "Key") && concrete_types.size() >= 1) 
+                return concrete_types[0].get();
+            else if ((type_name == "V" || type_name == "Value") && concrete_types.size() >= 2) 
+                return concrete_types[1].get();
+            else if (type_name == "T" && concrete_types.size() >= 1)
+                return concrete_types[0].get();
+            else if (type_name == "U" && concrete_types.size() >= 2)
+                return concrete_types[1].get();
+            else if (type_name == "E" && concrete_types.size() >= 2)
+                return concrete_types[1].get();
+        }
+        
+        return base_type;
     }
 
     //===================================================================
