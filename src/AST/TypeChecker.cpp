@@ -2678,6 +2678,16 @@ namespace Cryo
             {
                 Type *expr_type = node.expression()->get_resolved_type();
 
+                // Handle unknown types gracefully - don't generate unary operation errors
+                if (expr_type && expr_type->kind() == TypeKind::Unknown)
+                {
+                    // Expression resolved to unknown type - this indicates an unresolved expression
+                    // The specific error should have been reported by the expression visitor
+                    LOG_WARN(Cryo::LogComponent::AST, "Return expression resolved to unknown type at {}:{}", 
+                             node.location().line(), node.location().column());
+                    return;
+                }
+
                 if (_current_function_return_type &&
                     !check_assignment_compatibility(_current_function_return_type, expr_type, node.location()))
                 {
@@ -2704,7 +2714,7 @@ namespace Cryo
             }
         }
     }
-
+ 
     void TypeChecker::visit(IfStatementNode &node)
     {
         // Check condition type

@@ -478,6 +478,14 @@ namespace Cryo
 
             if (_debug_mode)
             {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing imported modules for method registration...");
+            }
+            // Process imported modules IMMEDIATELY after symbol population to register their methods
+            // This must happen BEFORE type checking the main program so that stdlib methods are available
+            _type_checker->check_imported_modules(_module_loader->get_imported_asts());
+
+            if (_debug_mode)
+            {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading intrinsic symbols into type checker...");
             }
             // Load only newly added intrinsic symbols into type checker
@@ -496,13 +504,6 @@ namespace Cryo
             }
             // Load user-defined function symbols that were registered during Pass 1
             _type_checker->load_user_symbols(*_symbol_table);
-
-            if (_debug_mode)
-            {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing imported modules for AST node updates...");
-            }
-            // Process imported modules to update symbols with AST node references
-            _type_checker->check_imported_modules(_module_loader->get_imported_asts());
 
             if (_debug_mode)
             {
