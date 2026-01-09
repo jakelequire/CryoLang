@@ -2659,12 +2659,12 @@ namespace Cryo
     void TypeChecker::visit(ReturnStatementNode &node)
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "ReturnStatementNode: _in_function={}, location={}:{}", 
-                  _in_function, node.location().line, node.location().column);
+                  _in_function, node.location().line(), node.location().column());
                   
         if (!_in_function)
         {
             LOG_WARN(Cryo::LogComponent::AST, "ReturnStatementNode: Return statement found outside function context at {}:{}", 
-                     node.location().line, node.location().column);
+                     node.location().line(), node.location().column());
             _diagnostic_builder->create_invalid_operation_error("return", nullptr, nullptr, &node);
             return;
         }
@@ -2691,7 +2691,7 @@ namespace Cryo
                 // Don't create an invalid operation error here, as the expression visitor 
                 // should have already reported the specific issue
                 LOG_WARN(Cryo::LogComponent::AST, "Return expression type could not be resolved for return statement at {}:{}", 
-                         node.location().line, node.location().column);
+                         node.location().line(), node.location().column());
             }
         }
         else
