@@ -1250,6 +1250,10 @@ namespace Cryo
                 primitive_base = get_i32_type();
             else if (type_name == "i64")
                 primitive_base = get_i64_type();
+            else if (type_name == "i128")
+                primitive_base = get_i128_type();
+            else if (type_name == "u128")
+                primitive_base = get_u128_type();
             else if (type_name == "f32")
                 primitive_base = get_f32_type();
             else if (type_name == "f64")
