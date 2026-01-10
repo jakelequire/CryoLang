@@ -1359,6 +1359,67 @@ namespace Cryo
                 return generic_type;
         }
 
+        // Try cross-module lookup using SRM context for simple type names
+        // This handles types imported via wildcard imports (e.g., "use std::collections::*")
+        if (_srm_context && _main_symbol_table)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Trying cross-module lookup for type: '{}'", type_string);
+
+            // Generate lookup candidates using SRM
+            auto candidates = _srm_context->generate_lookup_candidates(type_string, Cryo::SymbolKind::Type);
+
+            for (const auto &candidate : candidates)
+            {
+                if (!candidate)
+                    continue;
+
+                std::string qualified_name = candidate->to_string();
+                LOG_DEBUG(Cryo::LogComponent::AST, "Trying type candidate: '{}'", qualified_name);
+
+                // Try TypedSymbol lookup first
+                TypedSymbol *typed_symbol = _symbol_table->lookup_symbol(qualified_name);
+                if (typed_symbol && typed_symbol->type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found type '{}' as qualified name '{}' in typed symbol table", type_string, qualified_name);
+                    return typed_symbol->type;
+                }
+
+                // Try struct type lookup
+                Type *struct_type = _type_context.lookup_struct_type(qualified_name);
+                if (struct_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found struct type '{}' as qualified name '{}'", type_string, qualified_name);
+                    return struct_type;
+                }
+
+                // Try class type lookup
+                Type *class_type = _type_context.get_class_type(qualified_name);
+                if (class_type && class_type->kind() != TypeKind::Unknown)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found class type '{}' as qualified name '{}'", type_string, qualified_name);
+                    return class_type;
+                }
+
+                // Try enum type lookup
+                Type *enum_type = _type_context.lookup_enum_type(qualified_name);
+                if (enum_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found enum type '{}' as qualified name '{}'", type_string, qualified_name);
+                    return enum_type;
+                }
+
+                // Try main symbol table lookup
+                Symbol *main_symbol = _main_symbol_table->lookup_symbol(qualified_name);
+                if (main_symbol && main_symbol->data_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found type '{}' as qualified name '{}' in main symbol table", type_string, qualified_name);
+                    return main_symbol->data_type;
+                }
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::AST, "Cross-module lookup failed for type: '{}'", type_string);
+        }
+
         LOG_ERROR(Cryo::LogComponent::AST, "Failed to resolve type '{}' - type not found", type_string);
         return nullptr;
     }
@@ -5164,6 +5225,32 @@ namespace Cryo
             {
                 node.set_resolved_type(field_it->second);
                 return;
+            }
+        }
+
+        // Fallback: Try to look up field from the struct's AST node (handles cross-module access)
+        // This is needed for FFI structs and structs defined in other modules
+        TypedSymbol *struct_symbol = _symbol_table->lookup_symbol(lookup_type_name);
+        if (struct_symbol && struct_symbol->struct_node)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Trying AST-based field lookup for '{}' in struct '{}'", member_name, lookup_type_name);
+            const auto &fields = struct_symbol->struct_node->fields();
+            for (const auto &field : fields)
+            {
+                if (field && field->name() == member_name)
+                {
+                    // Found the field in the AST node, resolve its type
+                    std::string field_type_annotation = field->type_annotation();
+                    Type *field_type = resolve_type_with_generic_context(field_type_annotation);
+                    if (field_type && field_type->kind() != TypeKind::Unknown)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved field '{}' from AST node with type '{}'", member_name, field_type->to_string());
+                        // Cache this for future lookups
+                        _struct_fields[lookup_type_name][member_name] = field_type;
+                        node.set_resolved_type(field_type);
+                        return;
+                    }
+                }
             }
         }
 
