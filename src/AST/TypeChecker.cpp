@@ -1047,15 +1047,57 @@ namespace Cryo
                 }
 
                 // Check if any type arguments are generic parameters
-                bool has_generic_args = is_generic_parameter(type_args_str);
+                // Parse the type arguments and check each one individually
+                std::vector<std::string> parsed_args = parse_template_arguments(type_args_str);
+                bool has_generic_args = false;
+                for (const auto &arg : parsed_args)
+                {
+                    // Trim the argument and check if it's a generic parameter
+                    std::string trimmed_arg = arg;
+                    trimmed_arg.erase(0, trimmed_arg.find_first_not_of(" \t"));
+                    trimmed_arg.erase(trimmed_arg.find_last_not_of(" \t") + 1);
+
+                    // Remove pointer/reference suffixes for the check
+                    std::string clean_arg = trimmed_arg;
+                    while (!clean_arg.empty() && (clean_arg.back() == '*' || clean_arg.back() == '&'))
+                    {
+                        clean_arg.pop_back();
+                    }
+
+                    if (is_generic_parameter(clean_arg))
+                    {
+                        has_generic_args = true;
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found generic parameter '{}' in type args", clean_arg);
+                        break;
+                    }
+                }
 
                 LOG_DEBUG(Cryo::LogComponent::AST, "has_generic_args={}, is_in_generic_context={}", has_generic_args, is_in_generic_context());
 
                 if (has_generic_args)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "'{}' contains generic parameters, deferring resolution", type_string);
-                    // For template definitions with generic parameters, we don't create concrete types yet
-                    return _type_context.get_generic_type(type_string);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "'{}' contains generic parameters, creating ParameterizedType with generic args", type_string);
+                    // For template definitions with generic parameters, we create a ParameterizedType
+                    // with the generic types as parameters so they can be substituted later
+                    std::vector<std::shared_ptr<Type>> type_params;
+                    for (const auto &arg : parsed_args)
+                    {
+                        std::string trimmed_arg = arg;
+                        trimmed_arg.erase(0, trimmed_arg.find_first_not_of(" \t"));
+                        trimmed_arg.erase(trimmed_arg.find_last_not_of(" \t") + 1);
+                        Type *arg_type = resolve_type_with_generic_context(trimmed_arg);
+                        if (arg_type)
+                        {
+                            type_params.push_back(std::shared_ptr<Type>(arg_type, [](Type *) {})); // non-owning
+                        }
+                    }
+
+                    ParameterizedType *param_type = new ParameterizedType(base_type, type_params);
+                    if (is_reference)
+                    {
+                        return _type_context.create_reference_type(param_type);
+                    }
+                    return param_type;
                 }
                 else if (!is_in_generic_context())
                 {
@@ -3320,7 +3362,9 @@ namespace Cryo
                                 result_type = right_type; // int + float = float
                             }
                             // Same type numeric operations
-                            else if (left_type == right_type &&
+                            // Use type name comparison instead of pointer comparison to handle
+                            // cases where same logical type has different instances (e.g., from casts)
+                            else if (left_type->name() == right_type->name() &&
                                      (left_type->name() == "int" || left_type->name() == "double" || left_type->name() == "float" ||
                                       left_type->name() == "f32" || left_type->name() == "f64" ||
                                       left_type->name() == "i8" || left_type->name() == "i16" || left_type->name() == "i32" || left_type->name() == "i64" || left_type->name() == "i128" ||
@@ -4925,9 +4969,29 @@ namespace Cryo
                 auto field_it = struct_it->second.find(member_name);
                 if (field_it != struct_it->second.end())
                 {
-                    // Found the field - store the resolved Type*
-                    node.set_resolved_type(field_it->second);
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Found field '{}' in base struct '{}'", member_name, base_name);
+                    Type *base_field_type = field_it->second;
+                    auto &concrete_types = param_type->type_parameters();
+
+                    // Check if we have concrete types to substitute, or if we're in a generic context
+                    bool has_concrete_types = !concrete_types.empty() &&
+                        concrete_types[0] &&
+                        concrete_types[0]->kind() != TypeKind::Unknown &&
+                        concrete_types[0]->kind() != TypeKind::Generic;
+
+                    if (has_concrete_types)
+                    {
+                        // We have concrete types, do substitution
+                        Type *substituted_type = substitute_generic_parameters(base_field_type, concrete_types);
+                        node.set_resolved_type(substituted_type ? substituted_type : base_field_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found field '{}' in base struct '{}', substituted type to '{}'",
+                                  member_name, base_name, substituted_type ? substituted_type->to_string() : base_field_type->to_string());
+                    }
+                    else
+                    {
+                        // We're in a generic context, keep the generic field type as-is
+                        node.set_resolved_type(base_field_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found field '{}' in base struct '{}' (generic context)", member_name, base_name);
+                    }
                     return;
                 }
             }
@@ -8240,12 +8304,21 @@ namespace Cryo
         // SPECIAL CASE: Allow assignment between generic parameters and their concrete instantiations
         // This handles cases where T (generic) should be compatible with int (concrete) in Array<int>
         // Also handle Unknown types that might be unresolved generic parameters
-        if ((lhs_type->kind() == TypeKind::Generic || rhs_type->kind() == TypeKind::Generic ||
-             lhs_type->kind() == TypeKind::Unknown || rhs_type->kind() == TypeKind::Unknown) &&
-            (lhs_str.length() == 1 || rhs_str.length() == 1 || lhs_str == rhs_str)) // Simple heuristic for single-letter generic params
+        if (lhs_type->kind() == TypeKind::Generic || rhs_type->kind() == TypeKind::Generic ||
+            lhs_type->kind() == TypeKind::Unknown || rhs_type->kind() == TypeKind::Unknown)
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing generic parameter assignment with concrete type: {} = {}", lhs_str, rhs_str);
-            return true;
+            // Check if either type is a known generic parameter using proper context
+            bool lhs_is_generic_param = is_generic_parameter(lhs_str) || lhs_type->kind() == TypeKind::Generic;
+            bool rhs_is_generic_param = is_generic_parameter(rhs_str) || rhs_type->kind() == TypeKind::Generic;
+
+            // If at least one is a generic parameter, allow assignment
+            // This is necessary because generic code like T = T or T = value needs to work
+            if (lhs_is_generic_param || rhs_is_generic_param || lhs_str == rhs_str)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing generic parameter assignment: {} = {} (lhs_generic={}, rhs_generic={})",
+                          lhs_str, rhs_str, lhs_is_generic_param, rhs_is_generic_param);
+                return true;
+            }
         }
 
         // SPECIAL CASE: Empty array literal compatibility
@@ -8256,6 +8329,53 @@ namespace Cryo
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Allowing empty array literal assignment: {} = {} (empty array literal)", lhs_str, rhs_str);
             return true;
+        }
+
+        // SPECIAL CASE: Pointer-to-parameterized type with same base name
+        // This handles cases like BTreeNode<K, V>* = BTreeNode<K, V>* in generic contexts
+        if (lhs_type->kind() == TypeKind::Pointer && rhs_type->kind() == TypeKind::Pointer)
+        {
+            auto lhs_ptr = static_cast<PointerType *>(lhs_type);
+            auto rhs_ptr = static_cast<PointerType *>(rhs_type);
+            auto lhs_pointee = lhs_ptr->pointee_type();
+            auto rhs_pointee = rhs_ptr->pointee_type();
+
+            if (lhs_pointee && rhs_pointee)
+            {
+                // If both pointees are parameterized types with the same base name, allow assignment
+                if (lhs_pointee->kind() == TypeKind::Parameterized && rhs_pointee->kind() == TypeKind::Parameterized)
+                {
+                    auto lhs_param = static_cast<ParameterizedType *>(lhs_pointee.get());
+                    auto rhs_param = static_cast<ParameterizedType *>(rhs_pointee.get());
+                    if (lhs_param->base_name() == rhs_param->base_name())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Allowing pointer to same parameterized base type: {} = {}",
+                                  lhs_str, rhs_str);
+                        return true;
+                    }
+                }
+                // If pointees have the same string representation, allow assignment
+                if (lhs_pointee->to_string() == rhs_pointee->to_string())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing pointer assignment with same pointee type: {} = {}",
+                              lhs_str, rhs_str);
+                    return true;
+                }
+            }
+        }
+
+        // SPECIAL CASE: Parameterized types with same base name
+        // This handles cases like BTreeNode<K, V> = BTreeNode<K, V> in generic contexts
+        if (lhs_type->kind() == TypeKind::Parameterized && rhs_type->kind() == TypeKind::Parameterized)
+        {
+            auto lhs_param = static_cast<ParameterizedType *>(lhs_type);
+            auto rhs_param = static_cast<ParameterizedType *>(rhs_type);
+            if (lhs_param->base_name() == rhs_param->base_name())
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing same parameterized base type assignment: {} = {}",
+                          lhs_str, rhs_str);
+                return true;
+            }
         }
 
         // SPECIAL CASE: Class/Struct assignment compatibility
