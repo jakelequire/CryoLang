@@ -6302,8 +6302,9 @@ namespace Cryo
                 ParameterizedType *template_type = _type_registry->get_template(base_scope_name);
                 if (template_type)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' in type registry", base_scope_name);
-                    return; // Found the type, proceed with resolution
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' in type registry, setting resolved type", base_scope_name);
+                    node.set_resolved_type(template_type);
+                    return;
                 }
             }
 
@@ -6312,7 +6313,22 @@ namespace Cryo
             if (!scope_symbol && (base_scope_name == "Option" || base_scope_name == "Result" || base_scope_name == "Array"))
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Allowing forward reference for common generic type '{}'", base_scope_name);
-                return; // Allow the scope resolution to proceed
+                // Try to get or create a type for common generic types
+                ParameterizedType *common_type = _type_registry->get_template(base_scope_name);
+                if (common_type)
+                {
+                    node.set_resolved_type(common_type);
+                }
+                else
+                {
+                    // Create a placeholder type for the enum
+                    Type *enum_type = _type_context.lookup_enum_type(base_scope_name);
+                    if (enum_type)
+                    {
+                        node.set_resolved_type(enum_type);
+                    }
+                }
+                return;
             }
         }
         else
@@ -6331,8 +6347,9 @@ namespace Cryo
                 ParameterizedType *template_type = _type_registry->get_template(base_scope_name);
                 if (template_type)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' in type registry (non-generic case)", base_scope_name);
-                    return; // Found the type, proceed with resolution
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found generic type '{}' in type registry (non-generic case), setting resolved type", base_scope_name);
+                    node.set_resolved_type(template_type);
+                    return;
                 }
             }
         }
