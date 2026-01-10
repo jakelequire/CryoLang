@@ -2796,6 +2796,34 @@ namespace Cryo
     {
 
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate('{}') - starting", type_string);
+
+        // Check for trailing modifiers after closing '>' (e.g., "BTreeNode<K, V>*")
+        std::string trailing_modifiers;
+        size_t close_angle = std::string::npos;
+        int bracket_count = 0;
+        for (size_t i = 0; i < type_string.size(); ++i)
+        {
+            if (type_string[i] == '<')
+            {
+                bracket_count++;
+            }
+            else if (type_string[i] == '>')
+            {
+                bracket_count--;
+                if (bracket_count == 0)
+                {
+                    close_angle = i;
+                    break;
+                }
+            }
+        }
+
+        if (close_angle != std::string::npos && close_angle + 1 < type_string.size())
+        {
+            trailing_modifiers = type_string.substr(close_angle + 1);
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - found trailing modifiers: '{}'", trailing_modifiers);
+        }
+
         auto [base_name, param_strs] = parse_generic_syntax(type_string);
         LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - parsed base_name='{}', param_count={}", base_name, param_strs.size());
 
@@ -2823,8 +2851,45 @@ namespace Cryo
             Type *param_type = nullptr;
             if (param_str.find('<') != std::string::npos)
             {
+                // Check for trailing modifiers after closing '>' in the parameter (e.g., "BTreeNode<K, V>*")
+                std::string param_trailing_modifiers;
+                size_t param_close_angle = std::string::npos;
+                int param_bracket_count = 0;
+                for (size_t i = 0; i < param_str.size(); ++i)
+                {
+                    if (param_str[i] == '<')
+                        param_bracket_count++;
+                    else if (param_str[i] == '>')
+                    {
+                        param_bracket_count--;
+                        if (param_bracket_count == 0)
+                        {
+                            param_close_angle = i;
+                            break;
+                        }
+                    }
+                }
+
+                if (param_close_angle != std::string::npos && param_close_angle + 1 < param_str.size())
+                {
+                    param_trailing_modifiers = param_str.substr(param_close_angle + 1);
+                }
+
                 // This looks like a parameterized type, try recursive parse_and_instantiate
                 param_type = parse_and_instantiate(param_str);
+
+                // Apply trailing modifiers (pointer) if the parameterized type was successfully parsed
+                if (param_type && !param_trailing_modifiers.empty())
+                {
+                    for (char c : param_trailing_modifiers)
+                    {
+                        if (c == '*')
+                        {
+                            param_type = _type_context->create_pointer_type(param_type);
+                            LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - applied pointer modifier to param, result: '{}'", param_type->to_string());
+                        }
+                    }
+                }
             }
 
             // Fall back to token-based parsing if recursive parsing failed
@@ -2840,7 +2905,17 @@ namespace Cryo
             concrete_types.push_back(param_type);
         }
 
-        return instantiate(base_name, concrete_types);
+        ParameterizedType *result = instantiate(base_name, concrete_types);
+
+        // Note: parse_and_instantiate returns ParameterizedType* which can't have pointer modifiers
+        // The caller should handle trailing modifiers if needed
+        // For now, log a warning if modifiers are present but can't be applied here
+        if (!trailing_modifiers.empty() && result)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - WARNING: trailing modifiers '{}' cannot be applied to ParameterizedType, caller must handle", trailing_modifiers);
+        }
+
+        return result;
     }
 
     ParameterizedType *TypeRegistry::get_instantiation(const std::string &instantiated_name)
