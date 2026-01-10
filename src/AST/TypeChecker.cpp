@@ -1093,11 +1093,27 @@ namespace Cryo
                     }
 
                     ParameterizedType *param_type = new ParameterizedType(base_type, type_params);
+
+                    // Apply trailing modifiers (pointer) after the closing bracket
+                    // e.g., for "BTreeNode<K, V>*", apply the * after creating the ParameterizedType
+                    Type *result_type = param_type;
+                    if (close_bracket + 1 < clean_type_string.length())
+                    {
+                        std::string modifiers = clean_type_string.substr(close_bracket + 1);
+                        for (char c : modifiers)
+                        {
+                            if (c == '*')
+                            {
+                                result_type = _type_context.create_pointer_type(result_type);
+                            }
+                        }
+                    }
+
                     if (is_reference)
                     {
-                        return _type_context.create_reference_type(param_type);
+                        return _type_context.create_reference_type(result_type);
                     }
-                    return param_type;
+                    return result_type;
                 }
                 else if (!is_in_generic_context())
                 {
