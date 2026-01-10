@@ -1181,15 +1181,39 @@ namespace Cryo
         if (open_bracket_pos != std::string::npos && close_bracket_pos != std::string::npos)
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Detected generic type syntax in '{}', trying generic type resolution", type_string);
-            ParameterizedType *generic_type = resolve_generic_type(type_string);
+
+            // Check for pointer/array modifiers after the closing bracket
+            // e.g., "BTreeNode<K, V>*" or "Array<int>[]"
+            std::string base_generic_type = type_string.substr(0, close_bracket_pos + 1);
+            std::string modifiers = (close_bracket_pos + 1 < type_string.length())
+                                        ? type_string.substr(close_bracket_pos + 1)
+                                        : "";
+
+            LOG_DEBUG(Cryo::LogComponent::AST, "Generic type base='{}', modifiers='{}'", base_generic_type, modifiers);
+
+            ParameterizedType *generic_type = resolve_generic_type(base_generic_type);
             if (generic_type)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved generic type '{}' as ParameterizedType", type_string);
-                return generic_type;
+                LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved generic type '{}' as ParameterizedType", base_generic_type);
+
+                // Apply modifiers if any
+                Type *result_type = generic_type;
+                for (char c : modifiers)
+                {
+                    if (c == '*')
+                    {
+                        result_type = _type_context.create_pointer_type(result_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Applied pointer modifier to get '{}'", result_type->to_string());
+                    }
+                    // Note: array modifiers would need more complex parsing (e.g., "[size]")
+                    // For now, just handle pointer modifiers
+                }
+
+                return result_type;
             }
             else
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Generic type resolution failed for '{}', continuing with fallback", type_string);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Generic type resolution failed for '{}', continuing with fallback", base_generic_type);
             }
         }
 
@@ -1201,8 +1225,8 @@ namespace Cryo
             // Skip primitive types - let token parsing handle them
             type_string != "void" && type_string != "boolean" && type_string != "char" &&
             type_string != "string" && type_string != "auto" && type_string != "..." &&
-            type_string != "i8" && type_string != "i16" && type_string != "i32" && type_string != "i64" &&
-            type_string != "u8" && type_string != "u16" && type_string != "u32" && type_string != "u64" &&
+            type_string != "i8" && type_string != "i16" && type_string != "i32" && type_string != "i64" && type_string != "i128" &&
+            type_string != "u8" && type_string != "u16" && type_string != "u32" && type_string != "u64" && type_string != "u128" &&
             type_string != "int" && type_string != "float" && type_string != "double" &&
             type_string != "f32" && type_string != "f64")
         {
@@ -1282,6 +1306,10 @@ namespace Cryo
             return _type_context.get_u32_type();
         if (type_string == "u64")
             return _type_context.get_u64_type();
+        if (type_string == "i128")
+            return _type_context.get_i128_type();
+        if (type_string == "u128")
+            return _type_context.get_u128_type();
 
         // Float types
         if (type_string == "f32")
