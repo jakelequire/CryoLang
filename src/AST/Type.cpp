@@ -2849,10 +2849,11 @@ namespace Cryo
         {
             // Try recursive parsing first for parameterized types
             Type *param_type = nullptr;
+            std::string param_trailing_modifiers;
+
             if (param_str.find('<') != std::string::npos)
             {
                 // Check for trailing modifiers after closing '>' in the parameter (e.g., "BTreeNode<K, V>*")
-                std::string param_trailing_modifiers;
                 size_t param_close_angle = std::string::npos;
                 int param_bracket_count = 0;
                 for (size_t i = 0; i < param_str.size(); ++i)
@@ -2875,24 +2876,34 @@ namespace Cryo
                     param_trailing_modifiers = param_str.substr(param_close_angle + 1);
                 }
 
-                // This looks like a parameterized type, try recursive parse_and_instantiate
-                param_type = parse_and_instantiate(param_str);
-
-                // Apply trailing modifiers (pointer) if the parameterized type was successfully parsed
-                if (param_type && !param_trailing_modifiers.empty())
+                // Strip trailing modifiers before recursive call, then apply after
+                std::string base_param_str = param_str;
+                if (!param_trailing_modifiers.empty())
                 {
-                    for (char c : param_trailing_modifiers)
+                    base_param_str = param_str.substr(0, param_close_angle + 1);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - stripped trailing '{}' from param, base='{}'", param_trailing_modifiers, base_param_str);
+                }
+
+                // This looks like a parameterized type, try recursive parse_and_instantiate
+                param_type = parse_and_instantiate(base_param_str);
+            }
+
+            // Apply trailing modifiers (pointer) if parse_and_instantiate succeeded
+            // This must happen BEFORE the fallback because the fallback uses the full param_str
+            if (param_type && !param_trailing_modifiers.empty())
+            {
+                for (char c : param_trailing_modifiers)
+                {
+                    if (c == '*')
                     {
-                        if (c == '*')
-                        {
-                            param_type = _type_context->create_pointer_type(param_type);
-                            LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - applied pointer modifier to param, result: '{}'", param_type->to_string());
-                        }
+                        param_type = _type_context->create_pointer_type(param_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "TypeRegistry::parse_and_instantiate - applied pointer modifier to param, result: '{}'", param_type->to_string());
                     }
                 }
             }
 
             // Fall back to token-based parsing if recursive parsing failed
+            // Note: token parsing uses the FULL param_str including any modifiers
             if (!param_type)
             {
                 param_type = _type_context->parse_type_from_string_via_tokens(param_str);
