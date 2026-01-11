@@ -6,6 +6,7 @@
 #include "Codegen/Intrinsics.hpp"
 #include "Codegen/FunctionRegistry.hpp"
 #include "AST/SymbolTable.hpp"
+#include "AST/TemplateRegistry.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 
@@ -178,6 +179,12 @@ namespace Cryo::Codegen
 
         /** @brief Get symbol table */
         Cryo::SymbolTable &symbols() { return _symbols; }
+
+        /** @brief Set template registry for cross-module type resolution */
+        void set_template_registry(Cryo::TemplateRegistry *registry) { _template_registry = registry; }
+
+        /** @brief Get template registry (may be null) */
+        Cryo::TemplateRegistry *template_registry() { return _template_registry; }
 
         //===================================================================
         // Symbol Resolution
@@ -354,6 +361,7 @@ namespace Cryo::Codegen
         Cryo::SymbolTable &_symbols;
         Cryo::DiagnosticManager *_diagnostics;
         CodegenVisitor *_visitor = nullptr;
+        Cryo::TemplateRegistry *_template_registry = nullptr;
 
         //===================================================================
         // Owned Components
