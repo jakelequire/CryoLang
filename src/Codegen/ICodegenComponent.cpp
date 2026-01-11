@@ -316,63 +316,6 @@ namespace Cryo::Codegen
             }
         }
 
-        // Fallback for well-known stdlib generic types (Option, Result, Array, etc.)
-        // These are defined in std::core namespace and their methods need explicit lookup
-        static const std::unordered_map<std::string, std::string> stdlib_generic_namespaces = {
-            {"Option", "std::core::option"},
-            {"Result", "std::core::result"},
-            {"Array", "std::collections::array"},
-            {"HashMap", "std::collections::hashmap"},
-            {"HashSet", "std::collections::hashset"},
-            {"LinkedList", "std::collections::linkedlist"},
-            {"Deque", "std::collections::deque"},
-            {"Pair", "std::collections::pair"}};
-
-        // Extract base type name if parameterized
-        std::string lookup_base_name = type_name;
-        if (angle_pos != std::string::npos)
-        {
-            lookup_base_name = type_name.substr(0, angle_pos);
-        }
-
-        auto ns_it = stdlib_generic_namespaces.find(lookup_base_name);
-        if (ns_it != stdlib_generic_namespaces.end())
-        {
-            const std::string &ns = ns_it->second;
-
-            // Try various naming patterns for generic type methods
-            std::vector<std::string> method_candidates = {
-                ns + "::" + lookup_base_name + "<T>::" + method_name,
-                ns + "::" + lookup_base_name + "::" + method_name,
-                ns + "::" + lookup_base_name + "<T, E>::" + method_name,
-                lookup_base_name + "<T>::" + method_name,
-                lookup_base_name + "::" + method_name};
-
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_method_by_name: Trying stdlib generic fallback for '{}' in namespace '{}'",
-                      lookup_base_name, ns);
-
-            for (const auto &candidate : method_candidates)
-            {
-                if (llvm::Function *fn = module()->getFunction(candidate))
-                {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_method_by_name: Found stdlib generic method: {}", candidate);
-                    return fn;
-                }
-                if (llvm::Function *fn = ctx().get_function(candidate))
-                {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_method_by_name: Found stdlib generic method in registry: {}", candidate);
-                    return fn;
-                }
-            }
-
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_method_by_name: Stdlib generic fallback failed for '{}.{}'",
-                      lookup_base_name, method_name);
-        }
-
         return nullptr;
     }
 
