@@ -56,6 +56,13 @@ namespace Cryo
                 : trait_template(trait), module_namespace(ns), source_file(file) {}
         };
 
+        // Struct field types info: used to define struct bodies when processing imported modules
+        struct StructFieldInfo
+        {
+            std::vector<std::string> field_names;
+            std::vector<Type *> field_types;
+        };
+
     private:
         // Map from template base name to template info
         std::unordered_map<std::string, TemplateInfo> _templates;
@@ -64,13 +71,7 @@ namespace Cryo
         // Used for cross-module extern declarations when impl blocks aren't directly accessible
         std::unordered_map<std::string, Type *> _method_return_types;
 
-        // Struct field types registry: qualified struct name -> vector of (field_name, field_type)
-        // Used to define struct bodies when processing imported modules
-        struct StructFieldInfo
-        {
-            std::vector<std::string> field_names;
-            std::vector<Type *> field_types;
-        };
+        // Struct field types registry: qualified struct name -> StructFieldInfo
         std::unordered_map<std::string, StructFieldInfo> _struct_field_types;
 
     public:
