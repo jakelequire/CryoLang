@@ -6265,6 +6265,240 @@ namespace Cryo
             }
         }
 
+        // Cross-module method lookup fallback using SRM-based symbol lookup
+        // This is needed when methods from imported modules aren't registered in _struct_methods
+        LOG_DEBUG(Cryo::LogComponent::AST, "Attempting cross-module method lookup for '{}' on type '{}'", member_name, lookup_type_name);
+
+        if (_srm_context)
+        {
+            // Generate lookup candidates for the type
+            auto type_candidates = _srm_context->generate_lookup_candidates(lookup_type_name, Cryo::SymbolKind::Type);
+
+            for (const auto &candidate : type_candidates)
+            {
+                if (!candidate)
+                    continue;
+
+                std::string qualified_type_name = candidate->to_string();
+                LOG_DEBUG(Cryo::LogComponent::AST, "Cross-module lookup: checking type candidate '{}'", qualified_type_name);
+
+                // Try to find the struct/class symbol using this qualified name
+                TypedSymbol *type_symbol = _symbol_table->lookup_symbol(qualified_type_name);
+                if (!type_symbol)
+                {
+                    // Try with just the simple name in case it's in a different scope
+                    type_symbol = _symbol_table->lookup_symbol(lookup_type_name);
+                }
+
+                if (type_symbol)
+                {
+                    // Check struct methods
+                    if (type_symbol->struct_node)
+                    {
+                        const auto &methods = type_symbol->struct_node->methods();
+                        for (const auto &method : methods)
+                        {
+                            if (method && method->name() == member_name)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Found cross-module method '{}' in struct '{}'", member_name, qualified_type_name);
+
+                                // Build the function type from the method signature
+                                std::string return_type_str = method->return_type_annotation();
+                                Type *return_type = resolve_type_with_generic_context(return_type_str);
+                                if (!return_type)
+                                {
+                                    return_type = _type_context.get_unknown_type();
+                                }
+
+                                std::vector<Type *> param_types;
+                                const auto &parameters = method->parameters();
+                                for (const auto &param : parameters)
+                                {
+                                    if (param)
+                                    {
+                                        std::string param_type_str = param->type_annotation();
+                                        Type *param_type = resolve_type_with_generic_context(param_type_str);
+                                        if (!param_type)
+                                        {
+                                            param_type = _type_context.get_unknown_type();
+                                        }
+                                        param_types.push_back(param_type);
+                                    }
+                                }
+
+                                // Create a function type for this method
+                                Type *method_type = _type_context.create_function_type(return_type, param_types, false);
+                                node.set_resolved_type(method_type);
+
+                                // Also register the method in _struct_methods for future lookups
+                                _struct_methods[lookup_type_name][member_name] = method_type;
+
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved cross-module method '{}' with return type '{}'",
+                                          member_name, return_type->to_string());
+                                return;
+                            }
+                        }
+                    }
+
+                    // Check class methods
+                    if (type_symbol->class_node)
+                    {
+                        const auto &methods = type_symbol->class_node->methods();
+                        for (const auto &method : methods)
+                        {
+                            if (method && method->name() == member_name)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Found cross-module method '{}' in class '{}'", member_name, qualified_type_name);
+
+                                // Build the function type from the method signature
+                                std::string return_type_str = method->return_type_annotation();
+                                Type *return_type = resolve_type_with_generic_context(return_type_str);
+                                if (!return_type)
+                                {
+                                    return_type = _type_context.get_unknown_type();
+                                }
+
+                                std::vector<Type *> param_types;
+                                const auto &parameters = method->parameters();
+                                for (const auto &param : parameters)
+                                {
+                                    if (param)
+                                    {
+                                        std::string param_type_str = param->type_annotation();
+                                        Type *param_type = resolve_type_with_generic_context(param_type_str);
+                                        if (!param_type)
+                                        {
+                                            param_type = _type_context.get_unknown_type();
+                                        }
+                                        param_types.push_back(param_type);
+                                    }
+                                }
+
+                                // Create a function type for this method
+                                Type *method_type = _type_context.create_function_type(return_type, param_types, false);
+                                node.set_resolved_type(method_type);
+
+                                // Also register the method in _struct_methods for future lookups
+                                _struct_methods[lookup_type_name][member_name] = method_type;
+
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved cross-module method '{}' with return type '{}'",
+                                          member_name, return_type->to_string());
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::AST, "Cross-module method lookup via SRM failed for '{}' on type '{}'", member_name, lookup_type_name);
+        }
+
+        // Try TemplateRegistry-based lookup for generic types
+        if (_template_registry)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Attempting TemplateRegistry-based method lookup for '{}' on type '{}'", member_name, lookup_type_name);
+
+            const TemplateRegistry::TemplateInfo *template_info = _template_registry->find_template(lookup_type_name);
+            if (template_info)
+            {
+                // Check struct template methods
+                if (template_info->struct_template)
+                {
+                    const auto &methods = template_info->struct_template->methods();
+                    for (const auto &method : methods)
+                    {
+                        if (method && method->name() == member_name)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found method '{}' in TemplateRegistry struct '{}'", member_name, lookup_type_name);
+
+                            // Build the function type from the method signature
+                            std::string return_type_str = method->return_type_annotation();
+                            Type *return_type = resolve_type_with_generic_context(return_type_str);
+                            if (!return_type)
+                            {
+                                return_type = _type_context.get_unknown_type();
+                            }
+
+                            std::vector<Type *> param_types;
+                            const auto &parameters = method->parameters();
+                            for (const auto &param : parameters)
+                            {
+                                if (param)
+                                {
+                                    std::string param_type_str = param->type_annotation();
+                                    Type *param_type = resolve_type_with_generic_context(param_type_str);
+                                    if (!param_type)
+                                    {
+                                        param_type = _type_context.get_unknown_type();
+                                    }
+                                    param_types.push_back(param_type);
+                                }
+                            }
+
+                            // Create a function type for this method
+                            Type *method_type = _type_context.create_function_type(return_type, param_types, false);
+                            node.set_resolved_type(method_type);
+
+                            // Cache the method for future lookups
+                            _struct_methods[lookup_type_name][member_name] = method_type;
+
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Resolved TemplateRegistry method '{}' with return type '{}'",
+                                      member_name, return_type->to_string());
+                            return;
+                        }
+                    }
+                }
+
+                // Check class template methods
+                if (template_info->class_template)
+                {
+                    const auto &methods = template_info->class_template->methods();
+                    for (const auto &method : methods)
+                    {
+                        if (method && method->name() == member_name)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found method '{}' in TemplateRegistry class '{}'", member_name, lookup_type_name);
+
+                            // Build the function type from the method signature
+                            std::string return_type_str = method->return_type_annotation();
+                            Type *return_type = resolve_type_with_generic_context(return_type_str);
+                            if (!return_type)
+                            {
+                                return_type = _type_context.get_unknown_type();
+                            }
+
+                            std::vector<Type *> param_types;
+                            const auto &parameters = method->parameters();
+                            for (const auto &param : parameters)
+                            {
+                                if (param)
+                                {
+                                    std::string param_type_str = param->type_annotation();
+                                    Type *param_type = resolve_type_with_generic_context(param_type_str);
+                                    if (!param_type)
+                                    {
+                                        param_type = _type_context.get_unknown_type();
+                                    }
+                                    param_types.push_back(param_type);
+                                }
+                            }
+
+                            // Create a function type for this method
+                            Type *method_type = _type_context.create_function_type(return_type, param_types, false);
+                            node.set_resolved_type(method_type);
+
+                            // Cache the method for future lookups
+                            _struct_methods[lookup_type_name][member_name] = method_type;
+
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Resolved TemplateRegistry method '{}' with return type '{}'",
+                                      member_name, return_type->to_string());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Final error logging before giving up
         LOG_DEBUG(Cryo::LogComponent::AST, "MEMBER ACCESS RESOLUTION FAILED");
         LOG_DEBUG(Cryo::LogComponent::AST, "  member_name: '{}'", member_name);
