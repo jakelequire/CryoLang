@@ -2181,7 +2181,7 @@ namespace Cryo::Codegen
 
             // Try to look up the struct type by name directly from LLVM context
             // The type might have been registered under a different name (e.g., qualified name)
-            std::string module_namespace = ctx().get_module_namespace();
+            std::string module_namespace = ctx().namespace_context();
             std::string qualified_name = module_namespace.empty() ? type_name : module_namespace + "::" + type_name;
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2198,7 +2198,7 @@ namespace Cryo::Codegen
             else
             {
                 // Last resort: try to complete from TypeMapper registry
-                llvm::StructType *completed = types().get_struct_type(type_name);
+                llvm::StructType *completed = types().lookup_struct(type_name);
                 if (completed && !completed->isOpaque())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
