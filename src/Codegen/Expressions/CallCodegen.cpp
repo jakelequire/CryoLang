@@ -1147,6 +1147,96 @@ namespace Cryo::Codegen
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Chained call expression has no resolved type");
+
+                        // Fallback: Try to infer the return type from the inner method call
+                        // If the inner call's callee is a MemberAccessNode, we can find the method
+                        // and get its return type from the LLVM function
+                        if (auto *inner_callee = dynamic_cast<MemberAccessNode *>(call_expr->callee()))
+                        {
+                            std::string inner_method_name = inner_callee->member();
+                            std::string inner_receiver_type;
+
+                            // Get the receiver type for the inner call
+                            if (inner_callee->object())
+                            {
+                                if (auto *inner_id = dynamic_cast<IdentifierNode *>(inner_callee->object()))
+                                {
+                                    auto &var_types = ctx().variable_types_map();
+                                    auto it = var_types.find(inner_id->name());
+                                    if (it != var_types.end() && it->second)
+                                    {
+                                        inner_receiver_type = it->second->to_string();
+                                        if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
+                                        {
+                                            inner_receiver_type.pop_back();
+                                        }
+                                    }
+                                }
+                                else if (inner_callee->object()->has_resolved_type())
+                                {
+                                    Cryo::Type *inner_obj_type = inner_callee->object()->get_resolved_type();
+                                    if (inner_obj_type)
+                                    {
+                                        inner_receiver_type = inner_obj_type->to_string();
+                                        if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
+                                        {
+                                            inner_receiver_type.pop_back();
+                                        }
+                                        // Handle pointer types
+                                        if (inner_obj_type->kind() == Cryo::TypeKind::Pointer)
+                                        {
+                                            auto *ptr_type = dynamic_cast<Cryo::PointerType *>(inner_obj_type);
+                                            if (ptr_type && ptr_type->pointee_type())
+                                            {
+                                                inner_receiver_type = ptr_type->pointee_type()->to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Chained call fallback: inner method='{}', inner receiver type='{}'",
+                                      inner_method_name, inner_receiver_type);
+
+                            if (!inner_receiver_type.empty())
+                            {
+                                // Find the inner method's LLVM function
+                                llvm::Function *inner_method = resolve_method_by_name(inner_receiver_type, inner_method_name);
+                                if (inner_method)
+                                {
+                                    // Get the return type from the LLVM function
+                                    llvm::Type *ret_type = inner_method->getReturnType();
+                                    if (ret_type && !ret_type->isVoidTy())
+                                    {
+                                        // Try to get the Cryo type name from the LLVM struct type
+                                        if (ret_type->isStructTy())
+                                        {
+                                            llvm::StructType *struct_type = llvm::cast<llvm::StructType>(ret_type);
+                                            if (struct_type->hasName())
+                                            {
+                                                type_name = struct_type->getName().str();
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "Inferred chained call return type from LLVM: {}", type_name);
+                                            }
+                                        }
+                                        else if (ret_type->isPointerTy())
+                                        {
+                                            // For pointer returns, try to get the element type
+                                            type_name = "ptr";
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "Chained call returns pointer type");
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Chained call fallback: Could not find inner method '{}.{}'",
+                                              inner_receiver_type, inner_method_name);
+                                }
+                            }
+                        }
                     }
                 }
             }
