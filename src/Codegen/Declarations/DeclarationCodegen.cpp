@@ -1959,6 +1959,36 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Skipping generic impl block for {} - will be instantiated with concrete types",
                               type_name);
+
+                    // Even though we skip codegen for generic impl blocks, we still need to
+                    // register method return types in the TemplateRegistry for cross-module lookups.
+                    // This allows other modules to create correct extern declarations.
+                    Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+                    if (template_registry)
+                    {
+                        // Extract base type name (e.g., "Option" from "Option<T>")
+                        std::string base_type_name = type_name.substr(0, type_name.find('<'));
+                        std::string ns_context = ctx().namespace_context();
+                        std::string qualified_type = ns_context.empty() ? base_type_name : ns_context + "::" + base_type_name;
+
+                        for (const auto &method : node->method_implementations())
+                        {
+                            Cryo::StructMethodNode *fn_node = method.get();
+                            if (fn_node)
+                            {
+                                Cryo::Type *return_type = fn_node->get_resolved_return_type();
+                                if (return_type)
+                                {
+                                    std::string qualified_method_name = qualified_type + "::" + fn_node->name();
+                                    template_registry->register_method_return_type(qualified_method_name, return_type);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Registered generic method return type: {} -> {}",
+                                              qualified_method_name, return_type->to_string());
+                                }
+                            }
+                        }
+                    }
+
                     return;
                 }
             }
