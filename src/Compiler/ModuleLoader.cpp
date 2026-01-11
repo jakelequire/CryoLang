@@ -850,12 +850,10 @@ namespace Cryo
                                     }
                                     else
                                     {
-                                        // For complex types, try to get from TypeContext
-                                        field_type = _ast_context.types().lookup_struct_type(type_str);
-                                        if (!field_type)
-                                        {
-                                            field_type = _ast_context.types().lookup_class_type(type_str);
-                                        }
+                                        // For complex types, use get_struct_type which creates if not found
+                                        // This ensures struct types referenced before their declarations are still registered
+                                        field_type = _ast_context.types().get_struct_type(type_str);
+                                        // Note: get_struct_type auto-creates the struct type if it doesn't exist
                                         if (field_type)
                                         {
                                             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from TypeContext: {}", type_str, field_type->to_string());
