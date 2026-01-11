@@ -178,6 +178,7 @@ namespace Cryo
         std::string resolved_path = resolve_import_path(import_path);
 
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Loading import '{}' -> '{}'", import_path, resolved_path);
+        LOG_ERROR(LogComponent::GENERAL, "=== IMPORT: Loading '{}' (resolved: '{}') ===", import_path, resolved_path);
 
         // Check for specific vs wildcard import
         if (import_node.is_specific_import())
@@ -201,6 +202,7 @@ namespace Cryo
         if (cached != _loaded_modules.end())
         {
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using cached module");
+            LOG_ERROR(LogComponent::GENERAL, "=== IMPORT_CACHE: Module '{}' already cached, skipping registration ===", resolved_path);
 
             // Create a copy of the cached result to return
             ImportResult cached_result;
