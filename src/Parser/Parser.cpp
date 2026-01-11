@@ -1847,11 +1847,17 @@ namespace Cryo
         }
 
         // Parse remaining module path segments (identifier::identifier::...)
+        // Note: Keywords like 'string' are allowed as module path segments
         while (_current_token.is(TokenKind::TK_COLONCOLON))
         {
             advance(); // consume '::'
-            Token ident = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '::' in module path");
-            module_path += "::" + std::string(ident.text());
+            // Accept both identifiers and keywords as valid path segments
+            if (!_current_token.is_identifier() && !_current_token.is_keyword())
+            {
+                throw ParseError("Expected identifier after '::' in module path", _current_token.location());
+            }
+            module_path += "::" + std::string(_current_token.text());
+            advance(); // consume the identifier/keyword
         }
 
         // Parse optional 'as' alias (only for wildcard imports)
@@ -1903,20 +1909,27 @@ namespace Cryo
         consume(TokenKind::TK_KW_MODULE, "Expected 'module'");
 
         // Parse module path (e.g., alloc::global)
-        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+        // Note: Keywords like 'string' are allowed as module path segments
+        if (!_current_token.is_identifier() && !_current_token.is_keyword())
         {
             throw ParseError("Expected module path after 'module'", _current_token.location());
         }
 
         std::string module_path = std::string(_current_token.text());
-        advance(); // consume first identifier
+        advance(); // consume first identifier/keyword
 
         // Parse remaining module path segments (identifier::identifier::...)
+        // Keywords are allowed as path segments (e.g., collections::string)
         while (_current_token.is(TokenKind::TK_COLONCOLON))
         {
             advance(); // consume '::'
-            Token ident = consume(TokenKind::TK_IDENTIFIER, "Expected identifier after '::' in module path");
-            module_path += "::" + std::string(ident.text());
+            // Accept both identifiers and keywords as valid path segments
+            if (!_current_token.is_identifier() && !_current_token.is_keyword())
+            {
+                throw ParseError("Expected identifier after '::' in module path", _current_token.location());
+            }
+            module_path += "::" + std::string(_current_token.text());
+            advance(); // consume the identifier/keyword
         }
 
         // Parse optional ';'
