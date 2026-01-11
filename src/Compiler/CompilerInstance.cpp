@@ -53,6 +53,9 @@ namespace Cryo
         // Pass the main ASTContext to ensure all modules use the same TypeContext
         _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry, *_ast_context);
 
+        // Connect TypeChecker to TemplateRegistry for cross-module generic type resolution
+        _type_checker->set_template_registry(_template_registry.get());
+
         // Set auto-import callback for runtime dependencies
         _module_loader->set_auto_import_callback([this](SymbolTable *symbol_table, const std::string &scope_name, const std::string &source_file)
                                                  {
