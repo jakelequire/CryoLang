@@ -409,6 +409,88 @@ namespace Cryo::Codegen
             }
         }
 
+        // Create extern declarations for known stdlib generic type methods
+        // This handles cross-module calls where the method exists in another compilation unit
+        {
+            std::string base_type = type_name;
+            size_t angle_pos = type_name.find('<');
+            if (angle_pos != std::string::npos)
+            {
+                base_type = type_name.substr(0, angle_pos);
+            }
+
+            // Known stdlib generic types and their defining namespaces
+            static const std::unordered_map<std::string, std::string> stdlib_type_namespaces = {
+                {"Option", "std::core::option"},
+                {"Result", "std::core::result"},
+                {"Array", "std::core::collections"},
+                {"Vector", "std::core::collections"},
+                {"HashMap", "std::core::collections"},
+                {"String", "std::core::string"}};
+
+            auto ns_it = stdlib_type_namespaces.find(base_type);
+            if (ns_it != stdlib_type_namespaces.end())
+            {
+                std::string full_method_name = ns_it->second + "::" + base_type + "::" + method_name;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Creating extern declaration for stdlib method '{}'", full_method_name);
+
+                // Check if it already exists
+                if (llvm::Function *existing = module()->getFunction(full_method_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found existing declaration '{}'", full_method_name);
+                    return existing;
+                }
+
+                // Determine return type based on known method signatures
+                llvm::Type *return_type = nullptr;
+                std::vector<llvm::Type *> param_types;
+
+                // Add 'this' parameter (pointer to the enum/struct)
+                param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+
+                if (method_name == "is_some" || method_name == "is_none" || method_name == "is_ok" || method_name == "is_err")
+                {
+                    // Boolean methods
+                    return_type = llvm::Type::getInt1Ty(llvm_ctx());
+                }
+                else if (method_name == "unwrap" || method_name == "unwrap_or" || method_name == "expect")
+                {
+                    // These return the inner type - for now use a generic pointer
+                    // The actual type will be determined at link time
+                    return_type = llvm::PointerType::get(llvm_ctx(), 0);
+                }
+                else if (method_name == "map" || method_name == "and_then" || method_name == "or_else")
+                {
+                    // Combinator methods return Option/Result
+                    return_type = llvm::PointerType::get(llvm_ctx(), 0);
+                }
+                else
+                {
+                    // Default to void for unknown methods
+                    return_type = llvm::Type::getVoidTy(llvm_ctx());
+                }
+
+                // Create function type and declaration
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(return_type, param_types, false);
+                llvm::Function *fn = llvm::Function::Create(
+                    fn_type,
+                    llvm::Function::ExternalLinkage,
+                    full_method_name,
+                    module());
+
+                // Register in context
+                ctx().register_function(full_method_name, fn);
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Created extern declaration for '{}' returning {}",
+                          full_method_name, return_type->isVoidTy() ? "void" : (return_type->isIntegerTy(1) ? "bool" : "ptr"));
+
+                return fn;
+            }
+        }
+
         // Final diagnostic: list all functions in module containing the method name
         // This helps debug what the actual registered name is
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
