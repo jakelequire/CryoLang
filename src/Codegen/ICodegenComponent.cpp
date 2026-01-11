@@ -474,36 +474,19 @@ namespace Cryo::Codegen
                 if (template_registry)
                 {
                     const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(base_type);
-                    if (template_info && template_info->enum_template)
-                    {
-                        // Look for the method in the enum's impl blocks
-                        for (const auto &method : template_info->enum_template->methods())
-                        {
-                            if (method->name() == method_name)
-                            {
-                                // Found the method - try to get its return type
-                                Cryo::Type *method_return = method->return_type();
-                                if (method_return)
-                                {
-                                    return_type = types().get_type(method_return);
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "resolve_method_by_name: Got return type from template method: {}",
-                                              method_return->to_string());
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    else if (template_info && template_info->struct_template)
+                    if (template_info && template_info->struct_template)
                     {
                         for (const auto &method : template_info->struct_template->methods())
                         {
                             if (method->name() == method_name)
                             {
-                                Cryo::Type *method_return = method->return_type();
+                                Cryo::Type *method_return = method->get_resolved_return_type();
                                 if (method_return)
                                 {
                                     return_type = types().get_type(method_return);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_method_by_name: Got return type from struct template method: {}",
+                                              method_return->to_string());
                                 }
                                 break;
                             }
@@ -515,15 +498,20 @@ namespace Cryo::Codegen
                         {
                             if (method->name() == method_name)
                             {
-                                Cryo::Type *method_return = method->return_type();
+                                Cryo::Type *method_return = method->get_resolved_return_type();
                                 if (method_return)
                                 {
                                     return_type = types().get_type(method_return);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_method_by_name: Got return type from class template method: {}",
+                                              method_return->to_string());
                                 }
                                 break;
                             }
                         }
                     }
+                    // Note: EnumDeclarationNode doesn't have methods() - enum methods are in impl blocks
+                    // which are stored separately. For now, we'll use default return type for enum methods.
                 }
 
                 // Default return type if not found
