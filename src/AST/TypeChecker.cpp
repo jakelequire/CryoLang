@@ -8069,6 +8069,22 @@ namespace Cryo
                 method->accept(*this);
                 LOG_DEBUG(Cryo::LogComponent::AST, "Finished processing method: {} for type {} - should be registered in _struct_methods", method->name(), target_type_name);
 
+                // Register method return type in TemplateRegistry for cross-module lookups
+                // This ensures method signatures are available during codegen of importing modules
+                if (_template_registry)
+                {
+                    Cryo::Type *return_type = method->get_resolved_return_type();
+                    if (return_type)
+                    {
+                        // Build qualified method name: namespace::TypeName::method_name
+                        std::string qualified_type = _current_namespace.empty() ? base_type_name : _current_namespace + "::" + base_type_name;
+                        std::string qualified_method_name = qualified_type + "::" + method->name();
+                        _template_registry->register_method_return_type(qualified_method_name, return_type);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Registered method return type in TemplateRegistry: {} -> {}",
+                                  qualified_method_name, return_type->to_string());
+                    }
+                }
+
                 // Verify registration for BTreeMap methods
                 if (target_type_name.find("BTreeMap") != std::string::npos) 
                 {
