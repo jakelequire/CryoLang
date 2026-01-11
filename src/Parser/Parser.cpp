@@ -651,6 +651,34 @@ namespace Cryo
                 // Skip this entire section if we're inside a method body - the METHOD BODY CONTEXT
                 // above already handled it.
 
+                // CRITICAL: If we're inside parentheses (paren_depth > 0) or brackets (bracket_depth > 0),
+                // we're likely in a method signature parsing parameters or array type. Don't stop at
+                // identifier: patterns since those are parameters, not fields. Keep consuming until
+                // we exit the nested context.
+                if (_paren_depth > 0 || _bracket_depth > 0)
+                {
+                    // We're inside parentheses or brackets - likely in a method parameter list or array type
+                    // Skip tokens until we're out of the nested context
+                    if (current_kind == TokenKind::TK_R_PAREN && _paren_depth > 0)
+                    {
+                        // Don't consume the closing paren - let the caller handle it
+                        LOG_DEBUG(LogComponent::PARSER, "Class member synchronized on ')' (end of params) after skipping {} tokens",
+                                  tokens_skipped);
+                        return;
+                    }
+                    if (current_kind == TokenKind::TK_R_BRACKET && _bracket_depth > 0)
+                    {
+                        // Don't consume the closing bracket - let the caller handle it
+                        LOG_DEBUG(LogComponent::PARSER, "Class member synchronized on ']' (end of array) after skipping {} tokens",
+                                  tokens_skipped);
+                        return;
+                    }
+                    // Continue consuming tokens within the nested context
+                    advance();
+                    tokens_skipped++;
+                    continue;
+                }
+
                 // Visibility modifiers are safe recovery points
                 if (current_kind == TokenKind::TK_KW_PUBLIC ||
                     current_kind == TokenKind::TK_KW_PRIVATE ||
