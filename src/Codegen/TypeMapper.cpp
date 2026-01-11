@@ -692,9 +692,15 @@ namespace Cryo::Codegen
         // Try to complete opaque struct using TemplateRegistry for cross-module structs
         if (_template_registry && st->isOpaque())
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct - trying to complete opaque struct '{}' from registry", name);
+
             // Try both qualified and simple names
             const TemplateRegistry::StructFieldInfo *field_info = _template_registry->get_struct_field_types(name);
-            if (!field_info)
+            if (field_info)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct - found field info for '{}' directly", name);
+            }
+            else
             {
                 // Try with common namespace prefixes
                 std::vector<std::string> prefixes = {"std::collections::string::", "std::collections::", "std::fmt::write::", "std::fmt::", "std::core::", "std::"};
@@ -706,6 +712,10 @@ namespace Cryo::Codegen
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct - found field info with prefix: {}", prefix);
                         break;
                     }
+                }
+                if (!field_info)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct - no field info found for '{}' in registry", name);
                 }
             }
 

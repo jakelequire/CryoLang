@@ -821,6 +821,7 @@ namespace Cryo
                     {
                         // For non-generic structs, register their field types for cross-module resolution
                         std::string qualified_name = module_name.empty() ? struct_decl->name() : module_name + "::" + struct_decl->name();
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing non-generic struct '{}' (qualified: '{}')", struct_decl->name(), qualified_name);
 
                         std::vector<std::string> field_names;
                         std::vector<Type *> field_types;
@@ -833,15 +834,18 @@ namespace Cryo
                                 Type *field_type = field->get_resolved_type();
                                 if (field_type)
                                 {
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' has resolved type: {}", field->name(), field_type->to_string());
                                     field_types.push_back(field_type);
                                 }
                                 else
                                 {
                                     // Try to resolve from type annotation
                                     std::string type_str = field->type_annotation();
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' needs type resolution from annotation: '{}'", field->name(), type_str);
                                     field_type = resolve_primitive_type(type_str, _ast_context.types());
                                     if (field_type)
                                     {
+                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' to primitive type: {}", type_str, field_type->to_string());
                                         field_types.push_back(field_type);
                                     }
                                     else
@@ -851,6 +855,14 @@ namespace Cryo
                                         if (!field_type)
                                         {
                                             field_type = _ast_context.types().lookup_class_type(type_str);
+                                        }
+                                        if (field_type)
+                                        {
+                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from TypeContext: {}", type_str, field_type->to_string());
+                                        }
+                                        else
+                                        {
+                                            LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Could not resolve field type for '{}': '{}'", field->name(), type_str);
                                         }
                                         field_types.push_back(field_type); // May be nullptr for unresolvable types
                                     }
@@ -866,7 +878,11 @@ namespace Cryo
                             {
                                 _template_registry.register_struct_field_types(struct_decl->name(), field_names, field_types);
                             }
-                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct field types: {} with {} fields", qualified_name, field_types.size());
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct field types: {} with {} fields (simple name: {})", qualified_name, field_types.size(), struct_decl->name());
+                        }
+                        else
+                        {
+                            LOG_WARN(LogComponent::GENERAL, "ModuleLoader: No field types found for struct '{}', not registering", struct_decl->name());
                         }
                     }
                 }
@@ -948,6 +964,19 @@ namespace Cryo
     // Helper to resolve primitive type annotations to Type objects
     Type *ModuleLoader::resolve_primitive_type(const std::string &type_str, TypeContext &types)
     {
+        // Handle pointer types (e.g., "u8*", "i32*")
+        if (type_str.size() > 1 && type_str.back() == '*')
+        {
+            std::string base_type_str = type_str.substr(0, type_str.size() - 1);
+            Type *base_type = resolve_primitive_type(base_type_str, types);
+            if (base_type)
+            {
+                return types.create_pointer_type(base_type);
+            }
+            // If base type not found, still return a generic pointer type
+            return types.create_pointer_type(types.get_void_type());
+        }
+
         // Handle primitive types
         if (type_str == "boolean" || type_str == "bool")
             return types.get_boolean_type();
