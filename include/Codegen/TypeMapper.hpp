@@ -17,6 +17,7 @@
 
 #include "AST/Type.hpp"
 #include "AST/ASTNode.hpp"
+#include "AST/TemplateRegistry.hpp"
 #include "Codegen/LLVMContext.hpp"
 
 #include <llvm/IR/Type.h>
@@ -113,6 +114,19 @@ namespace Cryo::Codegen
         void clear_type_param_resolver()
         {
             _type_param_resolver = nullptr;
+        }
+
+        /**
+         * @brief Set the template registry for cross-module struct field lookup
+         *
+         * This allows TypeMapper to complete opaque struct types by looking up
+         * field types registered from imported modules.
+         *
+         * @param registry Pointer to the template registry
+         */
+        void set_template_registry(Cryo::TemplateRegistry *registry)
+        {
+            _template_registry = registry;
         }
 
         //===================================================================
@@ -395,6 +409,9 @@ namespace Cryo::Codegen
 
         // Type parameter resolver callback - for generic type parameters (T, E, etc.)
         TypeParameterResolver _type_param_resolver;
+
+        // Template registry for cross-module struct field lookup
+        Cryo::TemplateRegistry *_template_registry = nullptr;
 
         // Error state
         bool _has_error = false;
