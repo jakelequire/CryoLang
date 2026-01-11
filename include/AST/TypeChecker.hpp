@@ -5,6 +5,7 @@
 #include "AST/ASTContext.hpp"
 #include "AST/GenericInstantiation.hpp"
 #include "AST/SymbolTable.hpp"
+#include "AST/TemplateRegistry.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 #include "Lexer/lexer.hpp"
@@ -264,6 +265,9 @@ namespace Cryo
         // Reference to main symbol table (for scope resolution lookups)
         const SymbolTable *_main_symbol_table = nullptr;
 
+        // Reference to template registry (for cross-module generic template lookup)
+        TemplateRegistry *_template_registry = nullptr;
+
         // Symbol loading state tracking to prevent duplicate loading
         bool _builtin_symbols_loaded = false;
         bool _intrinsic_symbols_loaded = false;
@@ -317,6 +321,10 @@ namespace Cryo
         // Enhanced type resolution that considers generic context
         Type *resolve_type_with_generic_context(const std::string &type_string);
 
+        // Try to resolve a type from TemplateRegistry and sync to TypeRegistry
+        // Returns true if a template was found and registered
+        bool try_resolve_from_template_registry(const std::string &base_name);
+
         // Generic instantiation tracking - public access for monomorphization
         const std::vector<GenericInstantiation> &get_required_instantiations() const;
 
@@ -338,6 +346,11 @@ namespace Cryo
         // Access to SRM context for import resolution
         Cryo::SRM::SymbolResolutionContext *get_srm_context() { return _srm_context.get(); }
         const Cryo::SRM::SymbolResolutionContext *get_srm_context() const { return _srm_context.get(); }
+
+        // Access to TemplateRegistry for cross-module generic template lookup
+        void set_template_registry(TemplateRegistry *registry) { _template_registry = registry; }
+        TemplateRegistry *get_template_registry() { return _template_registry; }
+        const TemplateRegistry *get_template_registry() const { return _template_registry; }
 
         // Error and warning handling
         const std::vector<TypeError> &errors() const { return _errors; }
