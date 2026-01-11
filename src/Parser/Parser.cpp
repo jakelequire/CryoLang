@@ -666,7 +666,7 @@ namespace Cryo
                                   tokens_skipped);
                         return;
                     }
-                    if (current_kind == TokenKind::TK_R_BRACKET && _bracket_depth > 0)
+                    if (current_kind == TokenKind::TK_R_SQUARE && _bracket_depth > 0)
                     {
                         // Don't consume the closing bracket - let the caller handle it
                         LOG_DEBUG(LogComponent::PARSER, "Class member synchronized on ']' (end of array) after skipping {} tokens",
