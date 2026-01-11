@@ -64,6 +64,15 @@ namespace Cryo
         // Used for cross-module extern declarations when impl blocks aren't directly accessible
         std::unordered_map<std::string, Type *> _method_return_types;
 
+        // Struct field types registry: qualified struct name -> vector of (field_name, field_type)
+        // Used to define struct bodies when processing imported modules
+        struct StructFieldInfo
+        {
+            std::vector<std::string> field_names;
+            std::vector<Type *> field_types;
+        };
+        std::unordered_map<std::string, StructFieldInfo> _struct_field_types;
+
     public:
         TemplateRegistry() = default;
         ~TemplateRegistry() = default;
@@ -157,5 +166,33 @@ namespace Cryo
          * @return true if registered
          */
         bool has_method_return_type(const std::string &qualified_method_name) const;
+
+        //===================================================================
+        // Struct Field Types Registry (for cross-module struct definitions)
+        //===================================================================
+
+        /**
+         * @brief Register a struct's field types for cross-module lookups
+         * @param qualified_struct_name Fully qualified struct name (e.g., "std::collections::string::String")
+         * @param field_names Names of the struct fields
+         * @param field_types Types of the struct fields
+         */
+        void register_struct_field_types(const std::string &qualified_struct_name,
+                                         const std::vector<std::string> &field_names,
+                                         const std::vector<Type *> &field_types);
+
+        /**
+         * @brief Get a struct's field types for LLVM struct body definition
+         * @param qualified_struct_name Fully qualified struct name
+         * @return Pointer to StructFieldInfo, or nullptr if not registered
+         */
+        const StructFieldInfo *get_struct_field_types(const std::string &qualified_struct_name) const;
+
+        /**
+         * @brief Check if a struct's field types are registered
+         * @param qualified_struct_name Fully qualified struct name
+         * @return true if registered
+         */
+        bool has_struct_field_types(const std::string &qualified_struct_name) const;
     };
 }
