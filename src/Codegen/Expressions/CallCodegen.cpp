@@ -1020,26 +1020,81 @@ namespace Cryo::Codegen
         // Generate arguments
         auto args = generate_arguments(node->arguments());
 
-        // Resolve the method
+        // 1. First try: resolve the static method directly
         llvm::Function *method = resolve_method(type_name, method_name);
-        if (!method)
+        if (method)
         {
+            // Call with arguments (no implicit 'this')
+            std::vector<llvm::Value *> coerced_args;
+            llvm::FunctionType *fn_type = method->getFunctionType();
+
+            for (size_t i = 0; i < args.size() && i < fn_type->getNumParams(); ++i)
+            {
+                coerced_args.push_back(cast_if_needed(args[i], fn_type->getParamType(i)));
+            }
+
+            std::string result_name = method->getReturnType()->isVoidTy() ? "" : method_name + ".result";
+            return builder().CreateCall(method, coerced_args, result_name);
+        }
+
+        // 2. Fallback for ::new() - try constructor, then zero-init (Option C)
+        if (method_name == "new")
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Static new() not found for {}, trying constructor fallback", type_name);
+
+            // Get the struct type first
+            llvm::Type *struct_type = resolve_type_by_name(type_name);
+            if (!struct_type || !struct_type->isStructTy())
+            {
+                report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
+                             "Unknown type for ::new(): " + type_name);
+                return nullptr;
+            }
+
+            // 2a. Try to find a matching constructor
+            std::vector<llvm::Type *> arg_types;
+            for (auto *arg : args)
+            {
+                arg_types.push_back(arg->getType());
+            }
+            llvm::Function *ctor = resolve_constructor(type_name, arg_types);
+
+            if (ctor)
+            {
+                // Found a constructor - allocate and call it
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Found constructor for {}, calling with {} args", type_name, args.size());
+                llvm::AllocaInst *alloca = create_entry_alloca(struct_type, type_name + ".instance");
+                std::vector<llvm::Value *> ctor_args;
+                ctor_args.push_back(alloca);
+                ctor_args.insert(ctor_args.end(), args.begin(), args.end());
+                builder().CreateCall(ctor, ctor_args);
+                return alloca;
+            }
+
+            // 2b. No constructor found - if no args, zero-initialize (only if type has NO constructors)
+            if (args.empty())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "No constructor for {}, generating zero-initialized instance", type_name);
+                llvm::AllocaInst *alloca = create_entry_alloca(struct_type, type_name + ".instance");
+                // Zero-initialize the struct
+                builder().CreateStore(llvm::Constant::getNullValue(struct_type), alloca);
+                return alloca;
+            }
+
+            // 2c. Has args but no matching constructor - error
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
-                         "Static method not found: " + type_name + "::" + method_name);
+                         "No constructor found for " + type_name + " that accepts " +
+                         std::to_string(args.size()) + " argument(s)");
             return nullptr;
         }
 
-        // Call with arguments (no implicit 'this')
-        std::vector<llvm::Value *> coerced_args;
-        llvm::FunctionType *fn_type = method->getFunctionType();
-
-        for (size_t i = 0; i < args.size() && i < fn_type->getNumParams(); ++i)
-        {
-            coerced_args.push_back(cast_if_needed(args[i], fn_type->getParamType(i)));
-        }
-
-        std::string result_name = method->getReturnType()->isVoidTy() ? "" : method_name + ".result";
-        return builder().CreateCall(method, coerced_args, result_name);
+        // Not ::new(), regular static method not found - error
+        report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                     "Static method not found: " + type_name + "::" + method_name);
+        return nullptr;
     }
 
     llvm::Value *CallCodegen::generate_instance_method(Cryo::CallExpressionNode *node,
