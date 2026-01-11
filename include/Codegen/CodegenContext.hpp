@@ -401,6 +401,10 @@ namespace Cryo::Codegen
         // Struct field index mapping: type_name -> (field_name -> field_index)
         std::unordered_map<std::string, std::unordered_map<std::string, unsigned>> _struct_field_indices;
 
+        // Type namespace mapping: type_name -> namespace
+        // Used for cross-module method resolution
+        std::unordered_map<std::string, std::string> _type_namespace_map;
+
     public:
         //===================================================================
         // Struct Field Index API
@@ -435,6 +439,29 @@ namespace Cryo::Codegen
         bool has_struct_field(const std::string &type_name, const std::string &field_name) const
         {
             return get_struct_field_index(type_name, field_name) >= 0;
+        }
+
+        //===================================================================
+        // Type Namespace API
+        //===================================================================
+
+        /** @brief Register a type's source namespace for cross-module method resolution */
+        void register_type_namespace(const std::string &type_name, const std::string &namespace_path)
+        {
+            _type_namespace_map[type_name] = namespace_path;
+        }
+
+        /** @brief Get the namespace for a type, returns empty string if not found */
+        std::string get_type_namespace(const std::string &type_name) const
+        {
+            auto it = _type_namespace_map.find(type_name);
+            return it != _type_namespace_map.end() ? it->second : "";
+        }
+
+        /** @brief Get the type namespace map for inspection/debugging */
+        const std::unordered_map<std::string, std::string> &type_namespace_map() const
+        {
+            return _type_namespace_map;
         }
     };
 

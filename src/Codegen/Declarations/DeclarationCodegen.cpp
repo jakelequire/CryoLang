@@ -883,6 +883,15 @@ namespace Cryo::Codegen
         // Register type
         ctx().register_type(name, struct_type);
 
+        // Register type's namespace for cross-module method resolution
+        std::string ns_context = ctx().namespace_context();
+        if (!ns_context.empty())
+        {
+            ctx().register_type_namespace(name, ns_context);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Registered struct '{}' namespace: {}", name, ns_context);
+        }
+
         return struct_type;
     }
 
@@ -924,6 +933,15 @@ namespace Cryo::Codegen
 
         // Register type
         ctx().register_type(name, class_type);
+
+        // Register type's namespace for cross-module method resolution
+        std::string ns_context = ctx().namespace_context();
+        if (!ns_context.empty())
+        {
+            ctx().register_type_namespace(name, ns_context);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Registered class '{}' namespace: {}", name, ns_context);
+        }
 
         return class_type;
     }
@@ -1014,6 +1032,15 @@ namespace Cryo::Codegen
 
         // Register type
         ctx().register_type(name, enum_type);
+
+        // Register type's namespace for cross-module method resolution
+        std::string ns_context = ctx().namespace_context();
+        if (!ns_context.empty())
+        {
+            ctx().register_type_namespace(name, ns_context);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Registered enum '{}' namespace: {}", name, ns_context);
+        }
 
         // Generate variant constants and constructor functions
         int32_t index = 0;
