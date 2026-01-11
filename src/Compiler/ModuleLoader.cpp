@@ -847,9 +847,88 @@ namespace Cryo
                     }
                 }
             }
+            // Process implementation blocks to register method return types
+            else if (auto impl_block = dynamic_cast<ImplementationBlockNode *>(statement.get()))
+            {
+                std::string type_name = impl_block->target_type();
+                // Extract base type name (remove generics like "Option<T>" -> "Option")
+                std::string base_type_name = type_name;
+                size_t generic_start = type_name.find('<');
+                if (generic_start != std::string::npos)
+                {
+                    base_type_name = type_name.substr(0, generic_start);
+                }
+
+                std::string qualified_type = module_name.empty() ? base_type_name : module_name + "::" + base_type_name;
+                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing impl block for type: {} (qualified: {})", type_name, qualified_type);
+
+                for (const auto &method : impl_block->method_implementations())
+                {
+                    if (method)
+                    {
+                        std::string return_type_str = method->return_type_annotation();
+                        if (!return_type_str.empty())
+                        {
+                            // Resolve the return type using TypeContext
+                            TypeContext &types = _ast_context.types();
+                            Type *return_type = resolve_primitive_type(return_type_str, types);
+                            if (return_type)
+                            {
+                                std::string qualified_method_name = qualified_type + "::" + method->name();
+                                _template_registry.register_method_return_type(qualified_method_name, return_type);
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered method return type: {} -> {}",
+                                          qualified_method_name, return_type->to_string());
+                            }
+                            else
+                            {
+                                LOG_TRACE(LogComponent::GENERAL, "ModuleLoader: Could not resolve type '{}' for method {}::{}",
+                                          return_type_str, qualified_type, method->name());
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Finished registering templates from module: {}", module_name);
+    }
+
+    // Helper to resolve primitive type annotations to Type objects
+    Type *ModuleLoader::resolve_primitive_type(const std::string &type_str, TypeContext &types)
+    {
+        // Handle primitive types
+        if (type_str == "boolean" || type_str == "bool")
+            return types.get_boolean_type();
+        if (type_str == "void")
+            return types.get_void_type();
+        if (type_str == "i8")
+            return types.get_i8_type();
+        if (type_str == "i16")
+            return types.get_i16_type();
+        if (type_str == "i32" || type_str == "int")
+            return types.get_i32_type();
+        if (type_str == "i64")
+            return types.get_i64_type();
+        if (type_str == "u8")
+            return types.get_u8_type();
+        if (type_str == "u16")
+            return types.get_u16_type();
+        if (type_str == "u32" || type_str == "uint")
+            return types.get_u32_type();
+        if (type_str == "u64")
+            return types.get_u64_type();
+        if (type_str == "f32" || type_str == "float")
+            return types.get_f32_type();
+        if (type_str == "f64" || type_str == "double")
+            return types.get_f64_type();
+        if (type_str == "char")
+            return types.get_char_type();
+        if (type_str == "string")
+            return types.get_string_type();
+
+        // For non-primitive types (generics, user-defined), return nullptr
+        // These would need more complex resolution
+        return nullptr;
     }
 
     void ModuleLoader::mark_declarations_as_imported(ProgramNode &ast, const std::string &module_name)

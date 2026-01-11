@@ -189,6 +189,14 @@ namespace Cryo
         Type *create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context);
 
         /**
+         * @brief Resolve a primitive type annotation string to a Type object
+         * @param type_str The type annotation string (e.g., "boolean", "i32")
+         * @param types TypeContext for getting primitive types
+         * @return Type object or nullptr if not a primitive type
+         */
+        Type *resolve_primitive_type(const std::string &type_str, TypeContext &types);
+
+        /**
          * @brief Filter import result to only include specific symbols
          * @param result The import result to filter
          * @param specific_imports List of specific symbols to include
