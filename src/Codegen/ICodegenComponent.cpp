@@ -296,6 +296,26 @@ namespace Cryo::Codegen
             }
         }
 
+        // Fallback for parameterized types (e.g., Option<i64>, Array<string>, Result<T, E>)
+        // Extract the base type name and try to resolve the method using that
+        size_t angle_pos = type_name.find('<');
+        if (angle_pos != std::string::npos)
+        {
+            std::string base_type_name = type_name.substr(0, angle_pos);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Trying parameterized type fallback with base type '{}'", base_type_name);
+
+            // Recursively try to resolve using the base type name
+            llvm::Function *fn = resolve_method_by_name(base_type_name, method_name);
+            if (fn)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found '{}.{}' via base type '{}'",
+                          type_name, method_name, base_type_name);
+                return fn;
+            }
+        }
+
         return nullptr;
     }
 
