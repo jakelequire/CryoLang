@@ -690,9 +690,14 @@ namespace Cryo::Codegen
         }
 
         // Try to complete opaque struct using TemplateRegistry for cross-module structs
+        if (!_template_registry)
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_LOOKUP: _template_registry is NULL for struct '{}' ===", name);
+        }
         if (_template_registry && st->isOpaque())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct - trying to complete opaque struct '{}' from registry", name);
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_LOOKUP: Trying to complete opaque struct '{}' from registry ===", name);
 
             // Try both qualified and simple names
             const TemplateRegistry::StructFieldInfo *field_info = _template_registry->get_struct_field_types(name);
@@ -763,6 +768,10 @@ namespace Cryo::Codegen
         // The struct body should be set by TypeCodegen which has AST access
         // For now, leave opaque - TypeCodegen will complete it
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct - created opaque struct '{}'", name);
+        if (st->isOpaque())
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_LOOKUP: WARNING - Returning OPAQUE struct '{}' ===", name);
+        }
 
         return st;
     }
