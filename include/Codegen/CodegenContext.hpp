@@ -181,7 +181,15 @@ namespace Cryo::Codegen
         Cryo::SymbolTable &symbols() { return _symbols; }
 
         /** @brief Set template registry for cross-module type resolution */
-        void set_template_registry(Cryo::TemplateRegistry *registry) { _template_registry = registry; }
+        void set_template_registry(Cryo::TemplateRegistry *registry)
+        {
+            _template_registry = registry;
+            // Also set on TypeMapper for cross-module struct field lookups
+            if (_type_mapper)
+            {
+                _type_mapper->set_template_registry(registry);
+            }
+        }
 
         /** @brief Get template registry (may be null) */
         Cryo::TemplateRegistry *template_registry() { return _template_registry; }

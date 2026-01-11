@@ -817,6 +817,58 @@ namespace Cryo
                         );
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic struct template: {} from module: {}", struct_decl->name(), module_name);
                     }
+                    else
+                    {
+                        // For non-generic structs, register their field types for cross-module resolution
+                        std::string qualified_name = module_name.empty() ? struct_decl->name() : module_name + "::" + struct_decl->name();
+
+                        std::vector<std::string> field_names;
+                        std::vector<Type *> field_types;
+
+                        for (const auto &field : struct_decl->fields())
+                        {
+                            if (field)
+                            {
+                                field_names.push_back(field->name());
+                                Type *field_type = field->get_resolved_type();
+                                if (field_type)
+                                {
+                                    field_types.push_back(field_type);
+                                }
+                                else
+                                {
+                                    // Try to resolve from type annotation
+                                    std::string type_str = field->type_annotation();
+                                    field_type = resolve_primitive_type(type_str, _ast_context.types());
+                                    if (field_type)
+                                    {
+                                        field_types.push_back(field_type);
+                                    }
+                                    else
+                                    {
+                                        // For complex types, try to get from TypeContext
+                                        field_type = _ast_context.types().lookup_struct_type(type_str);
+                                        if (!field_type)
+                                        {
+                                            field_type = _ast_context.types().lookup_class_type(type_str);
+                                        }
+                                        field_types.push_back(field_type); // May be nullptr for unresolvable types
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!field_types.empty())
+                        {
+                            _template_registry.register_struct_field_types(qualified_name, field_names, field_types);
+                            // Also register with simple name for flexibility
+                            if (qualified_name != struct_decl->name())
+                            {
+                                _template_registry.register_struct_field_types(struct_decl->name(), field_names, field_types);
+                            }
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct field types: {} with {} fields", qualified_name, field_types.size());
+                        }
+                    }
                 }
                 else if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
                 {

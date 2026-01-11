@@ -221,4 +221,44 @@ namespace Cryo
     {
         return _method_return_types.find(qualified_method_name) != _method_return_types.end();
     }
+
+    //===================================================================
+    // Struct Field Types Registry Implementation
+    //===================================================================
+
+    void TemplateRegistry::register_struct_field_types(const std::string &qualified_struct_name,
+                                                       const std::vector<std::string> &field_names,
+                                                       const std::vector<Type *> &field_types)
+    {
+        if (qualified_struct_name.empty())
+            return;
+
+        StructFieldInfo info;
+        info.field_names = field_names;
+        info.field_types = field_types;
+
+        _struct_field_types[qualified_struct_name] = std::move(info);
+        LOG_DEBUG(Cryo::LogComponent::AST,
+                  "Registered struct field types: {} with {} fields",
+                  qualified_struct_name, field_names.size());
+    }
+
+    const TemplateRegistry::StructFieldInfo *TemplateRegistry::get_struct_field_types(
+        const std::string &qualified_struct_name) const
+    {
+        auto it = _struct_field_types.find(qualified_struct_name);
+        if (it != _struct_field_types.end())
+        {
+            LOG_TRACE(Cryo::LogComponent::AST,
+                      "Found struct field types: {} with {} fields",
+                      qualified_struct_name, it->second.field_names.size());
+            return &it->second;
+        }
+        return nullptr;
+    }
+
+    bool TemplateRegistry::has_struct_field_types(const std::string &qualified_struct_name) const
+    {
+        return _struct_field_types.find(qualified_struct_name) != _struct_field_types.end();
+    }
 }

@@ -689,6 +689,66 @@ namespace Cryo::Codegen
             return st;
         }
 
+        // Try to complete opaque struct using TemplateRegistry for cross-module structs
+        if (_template_registry && st->isOpaque())
+        {
+            // Try both qualified and simple names
+            const TemplateRegistry::StructFieldInfo *field_info = _template_registry->get_struct_field_types(name);
+            if (!field_info)
+            {
+                // Try with common namespace prefixes
+                std::vector<std::string> prefixes = {"std::collections::string::", "std::collections::", "std::fmt::write::", "std::fmt::", "std::core::", "std::"};
+                for (const auto &prefix : prefixes)
+                {
+                    field_info = _template_registry->get_struct_field_types(prefix + name);
+                    if (field_info)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeMapper::map_struct - found field info with prefix: {}", prefix);
+                        break;
+                    }
+                }
+            }
+
+            if (field_info && !field_info->field_types.empty())
+            {
+                std::vector<llvm::Type *> llvm_field_types;
+                bool all_fields_resolved = true;
+
+                for (Type *field_type : field_info->field_types)
+                {
+                    if (field_type)
+                    {
+                        llvm::Type *mapped = map(field_type);
+                        if (mapped)
+                        {
+                            llvm_field_types.push_back(mapped);
+                        }
+                        else
+                        {
+                            // Fallback to pointer for unresolved types
+                            llvm_field_types.push_back(ptr_type());
+                            all_fields_resolved = false;
+                        }
+                    }
+                    else
+                    {
+                        // Null field type - use pointer as fallback
+                        llvm_field_types.push_back(ptr_type());
+                        all_fields_resolved = false;
+                    }
+                }
+
+                if (!llvm_field_types.empty())
+                {
+                    st->setBody(llvm_field_types);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "TypeMapper::map_struct - completed opaque struct '{}' with {} fields from registry (all resolved: {})",
+                              name, llvm_field_types.size(), all_fields_resolved ? "yes" : "no");
+                    return st;
+                }
+            }
+        }
+
         // Try to get field information from TypeContext
         // The struct body should be set by TypeCodegen which has AST access
         // For now, leave opaque - TypeCodegen will complete it
