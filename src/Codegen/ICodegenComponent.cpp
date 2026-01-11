@@ -153,6 +153,43 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "resolve_method_by_name: '{}.{}' not found after SRM lookup", type_name, method_name);
 
+        // Try using registered type namespace from CodegenContext
+        // This handles cross-module types like Option, Result, Array, etc.
+        {
+            // Extract base type name for parameterized types (e.g., "Option" from "Option<i64>")
+            std::string base_type = type_name;
+            size_t angle_pos = type_name.find('<');
+            if (angle_pos != std::string::npos)
+            {
+                base_type = type_name.substr(0, angle_pos);
+            }
+
+            std::string type_namespace = ctx().get_type_namespace(base_type);
+            if (!type_namespace.empty())
+            {
+                // Try fully qualified method name: namespace::Type::method
+                std::string qualified_method = type_namespace + "::" + base_type + "::" + method_name;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Trying type namespace lookup '{}'", qualified_method);
+
+                if (llvm::Function *fn = module()->getFunction(qualified_method))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found '{}.{}' via type namespace as '{}'",
+                              type_name, method_name, qualified_method);
+                    return fn;
+                }
+
+                if (llvm::Function *fn = ctx().get_function(qualified_method))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found '{}.{}' in registry via type namespace as '{}'",
+                              type_name, method_name, qualified_method);
+                    return fn;
+                }
+            }
+        }
+
         // Fallback for primitive type methods (string, i32, u64, etc.)
         // These are defined in std::core::Types with fully qualified names
         static const std::unordered_set<std::string> primitive_types = {
@@ -323,6 +360,52 @@ namespace Cryo::Codegen
                           "resolve_method_by_name: Found '{}.{}' via base type '{}'",
                           type_name, method_name, base_type_name);
                 return fn;
+            }
+        }
+
+        // Pattern-based method lookup: scan module for functions matching *::BaseType::method
+        // This handles cross-module cases where we don't have the namespace info
+        {
+            std::string base_type = type_name;
+            size_t angle_pos = type_name.find('<');
+            if (angle_pos != std::string::npos)
+            {
+                base_type = type_name.substr(0, angle_pos);
+            }
+
+            // Build pattern suffix: "::BaseType::method"
+            std::string pattern_suffix = "::" + base_type + "::" + method_name;
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Scanning module for pattern '*{}'", pattern_suffix);
+
+            for (auto &fn : module()->functions())
+            {
+                std::string fn_name = fn.getName().str();
+                // Check if function name ends with our pattern
+                if (fn_name.length() >= pattern_suffix.length() &&
+                    fn_name.compare(fn_name.length() - pattern_suffix.length(),
+                                    pattern_suffix.length(), pattern_suffix) == 0)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found '{}.{}' via pattern match as '{}'",
+                              type_name, method_name, fn_name);
+                    return &fn;
+                }
+            }
+
+            // Also try in function registry
+            for (const auto &[name, fn] : ctx().functions_map())
+            {
+                if (name.length() >= pattern_suffix.length() &&
+                    name.compare(name.length() - pattern_suffix.length(),
+                                 pattern_suffix.length(), pattern_suffix) == 0)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found '{}.{}' in registry via pattern match as '{}'",
+                              type_name, method_name, name);
+                    return fn;
+                }
             }
         }
 
