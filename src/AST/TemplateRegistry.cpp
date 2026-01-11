@@ -188,4 +188,37 @@ namespace Cryo
     {
         return _templates.size();
     }
+
+    //===================================================================
+    // Method Return Type Registry Implementation
+    //===================================================================
+
+    void TemplateRegistry::register_method_return_type(const std::string &qualified_method_name, Type *return_type)
+    {
+        if (qualified_method_name.empty() || !return_type)
+            return;
+
+        _method_return_types[qualified_method_name] = return_type;
+        LOG_DEBUG(Cryo::LogComponent::AST,
+                  "Registered method return type: {} -> {}",
+                  qualified_method_name, return_type->to_string());
+    }
+
+    Type *TemplateRegistry::get_method_return_type(const std::string &qualified_method_name) const
+    {
+        auto it = _method_return_types.find(qualified_method_name);
+        if (it != _method_return_types.end())
+        {
+            LOG_TRACE(Cryo::LogComponent::AST,
+                      "Found method return type: {} -> {}",
+                      qualified_method_name, it->second->to_string());
+            return it->second;
+        }
+        return nullptr;
+    }
+
+    bool TemplateRegistry::has_method_return_type(const std::string &qualified_method_name) const
+    {
+        return _method_return_types.find(qualified_method_name) != _method_return_types.end();
+    }
 }

@@ -511,7 +511,27 @@ namespace Cryo::Codegen
                         }
                     }
                     // Note: EnumDeclarationNode doesn't have methods() - enum methods are in impl blocks
-                    // which are stored separately. For now, we'll use default return type for enum methods.
+                    // which are stored separately. Check the method registry for return type.
+                }
+
+                // Try to get return type from method registry (populated from impl blocks)
+                // First check local CodegenContext, then shared TemplateRegistry
+                if (!return_type)
+                {
+                    Cryo::Type *cryo_return_type = ctx().get_method_return_type(full_method_name);
+                    if (!cryo_return_type && template_registry)
+                    {
+                        // Try TemplateRegistry for cross-module method signatures
+                        cryo_return_type = template_registry->get_method_return_type(full_method_name);
+                    }
+
+                    if (cryo_return_type)
+                    {
+                        return_type = types().get_type(cryo_return_type);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Got return type from method registry for '{}': {}",
+                                  full_method_name, cryo_return_type->to_string());
+                    }
                 }
 
                 // Default return type if not found

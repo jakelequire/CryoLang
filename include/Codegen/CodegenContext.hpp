@@ -413,6 +413,11 @@ namespace Cryo::Codegen
         // Used for cross-module method resolution
         std::unordered_map<std::string, std::string> _type_namespace_map;
 
+        // Method signature storage for cross-module extern declarations
+        // Key: fully qualified method name (e.g., "std::core::option::Option::is_some")
+        // Value: return type as Cryo::Type*
+        std::unordered_map<std::string, Cryo::Type *> _method_return_types;
+
     public:
         //===================================================================
         // Struct Field Index API
@@ -470,6 +475,41 @@ namespace Cryo::Codegen
         const std::unordered_map<std::string, std::string> &type_namespace_map() const
         {
             return _type_namespace_map;
+        }
+
+        //===================================================================
+        // Method Signature Registry API
+        //===================================================================
+
+        /**
+         * @brief Register a method's return type for cross-module extern declarations
+         * @param qualified_method_name Fully qualified method name (e.g., "std::core::option::Option::is_some")
+         * @param return_type The method's return type
+         */
+        void register_method_return_type(const std::string &qualified_method_name, Cryo::Type *return_type)
+        {
+            _method_return_types[qualified_method_name] = return_type;
+        }
+
+        /**
+         * @brief Get a method's return type for extern declaration creation
+         * @param qualified_method_name Fully qualified method name
+         * @return The return type, or nullptr if not registered
+         */
+        Cryo::Type *get_method_return_type(const std::string &qualified_method_name) const
+        {
+            auto it = _method_return_types.find(qualified_method_name);
+            return it != _method_return_types.end() ? it->second : nullptr;
+        }
+
+        /**
+         * @brief Check if a method's return type is registered
+         * @param qualified_method_name Fully qualified method name
+         * @return true if registered
+         */
+        bool has_method_return_type(const std::string &qualified_method_name) const
+        {
+            return _method_return_types.find(qualified_method_name) != _method_return_types.end();
         }
     };
 
