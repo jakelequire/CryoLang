@@ -619,7 +619,8 @@ namespace Cryo::Codegen
                     {
                         if (st->isOpaque())
                         {
-                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: WARNING - Field '{}' mapped to OPAQUE struct ===", field->name());
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: WARNING - Field '{}' mapped to OPAQUE struct '{}' ===",
+                                     field->name(), st->getName().str());
                         }
                     }
                     field_types.push_back(field_type);
