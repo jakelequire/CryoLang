@@ -1107,10 +1107,11 @@ namespace Cryo
         std::string base_type = type_prefix + std::string(type_token.text());
 
         // Handle scope resolution (e.g., This::Error, T::Output)
+        // Keywords like 'string' are allowed as path segments
         if (_current_token.is(TokenKind::TK_COLONCOLON))
         {
             advance(); // consume '::'
-            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+            if (!_current_token.is_identifier() && !_current_token.is_keyword())
             {
                 error("Expected identifier after '::'");
                 return base_type;
@@ -1201,7 +1202,8 @@ namespace Cryo
         std::string namespace_name;
 
         // Parse namespace identifier (can be scoped like Std::Runtime)
-        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        // Keywords like 'string' are allowed as namespace segments
+        if (_current_token.is_identifier() || _current_token.is_keyword())
         {
             namespace_name = std::string(_current_token.text());
             advance();
@@ -1210,7 +1212,8 @@ namespace Cryo
             while (_current_token.is(TokenKind::TK_COLONCOLON))
             {
                 advance(); // consume '::'
-                if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                // Allow both identifiers and keywords as namespace segments
+                if (_current_token.is_identifier() || _current_token.is_keyword())
                 {
                     namespace_name = generate_scope_resolution_name(namespace_name, std::string(_current_token.text()));
                     advance();
@@ -3308,7 +3311,8 @@ namespace Cryo
             {
                 advance();
 
-                if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                // Allow both identifiers and keywords as variant names
+                if (_current_token.is_identifier() || _current_token.is_keyword())
                 {
                     std::string variant_name{_current_token.text()};
                     advance();
