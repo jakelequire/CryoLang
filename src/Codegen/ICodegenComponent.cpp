@@ -115,11 +115,21 @@ namespace Cryo::Codegen
                   "resolve_method_by_name: Looking for '{}.{}', {} type candidates",
                   type_name, method_name, type_candidates.size());
 
+        // Log all candidates for debugging
+        for (size_t i = 0; i < type_candidates.size(); ++i)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Candidate[{}]: '{}'", i, type_candidates[i]);
+        }
+
         // For each type candidate, try to find the method
         for (const auto &type_candidate : type_candidates)
         {
             // Build qualified method name: Type::method
             std::string qualified_method = type_candidate + "::" + method_name;
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Trying '{}'", qualified_method);
 
             // Try LLVM module
             if (llvm::Function *fn = module()->getFunction(qualified_method))
@@ -314,6 +324,33 @@ namespace Cryo::Codegen
                           type_name, method_name, base_type_name);
                 return fn;
             }
+        }
+
+        // Final diagnostic: list all functions in module containing the method name
+        // This helps debug what the actual registered name is
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "resolve_method_by_name: FAILED to find '{}.{}' - listing functions containing '{}':",
+                  type_name, method_name, method_name);
+        int match_count = 0;
+        for (const auto &fn : module()->functions())
+        {
+            std::string fn_name = fn.getName().str();
+            if (fn_name.find(method_name) != std::string::npos)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "  Module function: '{}'", fn_name);
+                match_count++;
+                if (match_count >= 10)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  ... (truncated, more matches exist)");
+                    break;
+                }
+            }
+        }
+        if (match_count == 0)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "  No functions in module contain '{}'", method_name);
         }
 
         return nullptr;
