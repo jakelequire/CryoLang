@@ -846,43 +846,43 @@ namespace Cryo
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic trait template: {} from module: {}", trait_decl->name(), module_name);
                     }
                 }
-            }
-            // Process implementation blocks to register method return types
-            else if (auto impl_block = dynamic_cast<ImplementationBlockNode *>(statement.get()))
-            {
-                std::string type_name = impl_block->target_type();
-                // Extract base type name (remove generics like "Option<T>" -> "Option")
-                std::string base_type_name = type_name;
-                size_t generic_start = type_name.find('<');
-                if (generic_start != std::string::npos)
+                // Process implementation blocks to register method return types
+                else if (auto impl_block = dynamic_cast<ImplementationBlockNode *>(decl))
                 {
-                    base_type_name = type_name.substr(0, generic_start);
-                }
-
-                std::string qualified_type = module_name.empty() ? base_type_name : module_name + "::" + base_type_name;
-                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing impl block for type: {} (qualified: {})", type_name, qualified_type);
-
-                for (const auto &method : impl_block->method_implementations())
-                {
-                    if (method)
+                    std::string type_name = impl_block->target_type();
+                    // Extract base type name (remove generics like "Option<T>" -> "Option")
+                    std::string base_type_name = type_name;
+                    size_t generic_start = type_name.find('<');
+                    if (generic_start != std::string::npos)
                     {
-                        std::string return_type_str = method->return_type_annotation();
-                        if (!return_type_str.empty())
+                        base_type_name = type_name.substr(0, generic_start);
+                    }
+
+                    std::string qualified_type = module_name.empty() ? base_type_name : module_name + "::" + base_type_name;
+                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing impl block for type: {} (qualified: {})", type_name, qualified_type);
+
+                    for (const auto &method : impl_block->method_implementations())
+                    {
+                        if (method)
                         {
-                            // Resolve the return type using TypeContext
-                            TypeContext &types = _ast_context.types();
-                            Type *return_type = resolve_primitive_type(return_type_str, types);
-                            if (return_type)
+                            std::string return_type_str = method->return_type_annotation();
+                            if (!return_type_str.empty())
                             {
-                                std::string qualified_method_name = qualified_type + "::" + method->name();
-                                _template_registry.register_method_return_type(qualified_method_name, return_type);
-                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered method return type: {} -> {}",
-                                          qualified_method_name, return_type->to_string());
-                            }
-                            else
-                            {
-                                LOG_TRACE(LogComponent::GENERAL, "ModuleLoader: Could not resolve type '{}' for method {}::{}",
-                                          return_type_str, qualified_type, method->name());
+                                // Resolve the return type using TypeContext
+                                TypeContext &types = _ast_context.types();
+                                Type *return_type = resolve_primitive_type(return_type_str, types);
+                                if (return_type)
+                                {
+                                    std::string qualified_method_name = qualified_type + "::" + method->name();
+                                    _template_registry.register_method_return_type(qualified_method_name, return_type);
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered method return type: {} -> {}",
+                                              qualified_method_name, return_type->to_string());
+                                }
+                                else
+                                {
+                                    LOG_TRACE(LogComponent::GENERAL, "ModuleLoader: Could not resolve type '{}' for method {}::{}",
+                                              return_type_str, qualified_type, method->name());
+                                }
                             }
                         }
                     }
