@@ -757,6 +757,7 @@ namespace Cryo
     void ModuleLoader::register_templates_from_ast(const ProgramNode &ast, const std::string &module_name)
     {
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registering templates from module: {}", module_name);
+        LOG_ERROR(LogComponent::GENERAL, "=== STRUCT_REG: Starting registration for module '{}' ===", module_name);
 
         // Process all top-level declarations and register generic templates
         for (const auto &statement : ast.statements())
@@ -822,6 +823,7 @@ namespace Cryo
                         // For non-generic structs, register their field types for cross-module resolution
                         std::string qualified_name = module_name.empty() ? struct_decl->name() : module_name + "::" + struct_decl->name();
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing non-generic struct '{}' (qualified: '{}')", struct_decl->name(), qualified_name);
+                        LOG_ERROR(LogComponent::GENERAL, "=== STRUCT_REG: Found non-generic struct '{}' with {} fields ===", struct_decl->name(), struct_decl->fields().size());
 
                         std::vector<std::string> field_names;
                         std::vector<Type *> field_types;
