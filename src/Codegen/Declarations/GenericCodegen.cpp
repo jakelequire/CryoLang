@@ -128,6 +128,25 @@ namespace Cryo::Codegen
         ctx().register_type(mangled, struct_type);
         types().register_struct(mangled, struct_type);
 
+        // Register type's namespace for cross-module method resolution
+        // Use the base generic type's namespace if registered, otherwise use current context
+        std::string base_namespace = ctx().get_type_namespace(generic_name);
+        if (base_namespace.empty())
+        {
+            base_namespace = ctx().namespace_context();
+        }
+        if (!base_namespace.empty())
+        {
+            // Register both the mangled name and the base type name
+            ctx().register_type_namespace(mangled, base_namespace);
+            if (ctx().get_type_namespace(generic_name).empty())
+            {
+                ctx().register_type_namespace(generic_name, base_namespace);
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Registered instantiated struct '{}' namespace: {}", mangled, base_namespace);
+        }
+
         // Register field names BEFORE generating methods so this.field accesses work
         if (!field_names.empty())
         {
@@ -359,6 +378,24 @@ namespace Cryo::Codegen
         _type_cache[mangled] = class_type;
         ctx().register_type(mangled, class_type);
         types().register_struct(mangled, class_type);
+
+        // Register type's namespace for cross-module method resolution
+        // Use the base generic type's namespace if registered, otherwise use current context
+        std::string base_namespace = ctx().get_type_namespace(generic_name);
+        if (base_namespace.empty())
+        {
+            base_namespace = ctx().namespace_context();
+        }
+        if (!base_namespace.empty())
+        {
+            ctx().register_type_namespace(mangled, base_namespace);
+            if (ctx().get_type_namespace(generic_name).empty())
+            {
+                ctx().register_type_namespace(generic_name, base_namespace);
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Registered instantiated class '{}' namespace: {}", mangled, base_namespace);
+        }
 
         // Register field names BEFORE generating methods so this.field accesses work
         if (!field_names.empty())
