@@ -1120,6 +1120,35 @@ namespace Cryo::Codegen
                                   "Resolved nested member access type: {} -> {}", member_name, type_name);
                     }
                 }
+                // Additional fallback for chained method calls (e.g., this.next().is_some())
+                // When the object is a CallExpressionNode, try to get the return type from the call
+                else if (auto *call_expr = dynamic_cast<CallExpressionNode *>(callee->object()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Attempting type resolution for chained call expression");
+
+                    // Try to get the resolved type from the call expression
+                    if (call_expr->has_resolved_type())
+                    {
+                        Cryo::Type *call_return_type = call_expr->get_resolved_type();
+                        if (call_return_type)
+                        {
+                            type_name = call_return_type->to_string();
+                            // Strip pointer suffix if present
+                            if (!type_name.empty() && type_name.back() == '*')
+                            {
+                                type_name.pop_back();
+                            }
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Resolved chained call return type: {}", type_name);
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Chained call expression has no resolved type");
+                    }
+                }
             }
         }
 
