@@ -60,6 +60,10 @@ namespace Cryo
         // Map from template base name to template info
         std::unordered_map<std::string, TemplateInfo> _templates;
 
+        // Method return type registry: fully qualified method name -> return type
+        // Used for cross-module extern declarations when impl blocks aren't directly accessible
+        std::unordered_map<std::string, Type *> _method_return_types;
+
     public:
         TemplateRegistry() = default;
         ~TemplateRegistry() = default;
@@ -128,5 +132,30 @@ namespace Cryo
          * @brief Get count of registered templates
          */
         size_t size() const;
+
+        //===================================================================
+        // Method Return Type Registry (for cross-module extern declarations)
+        //===================================================================
+
+        /**
+         * @brief Register a method's return type for cross-module lookups
+         * @param qualified_method_name Fully qualified method name (e.g., "std::core::option::Option::is_some")
+         * @param return_type The method's return type
+         */
+        void register_method_return_type(const std::string &qualified_method_name, Type *return_type);
+
+        /**
+         * @brief Get a method's return type for extern declaration creation
+         * @param qualified_method_name Fully qualified method name
+         * @return The return type, or nullptr if not registered
+         */
+        Type *get_method_return_type(const std::string &qualified_method_name) const;
+
+        /**
+         * @brief Check if a method's return type is registered
+         * @param qualified_method_name Fully qualified method name
+         * @return true if registered
+         */
+        bool has_method_return_type(const std::string &qualified_method_name) const;
     };
 }

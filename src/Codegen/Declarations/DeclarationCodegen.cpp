@@ -414,6 +414,28 @@ namespace Cryo::Codegen
                       "DeclarationCodegen: Registered method as: {}", llvm_fn_name);
         }
 
+        // Register method return type for cross-module extern declarations
+        // This allows other modules to create correct extern declarations for this method
+        // Register in both CodegenContext (for current compilation unit) and
+        // TemplateRegistry (for cross-module lookups)
+        Cryo::Type *return_type = node->get_resolved_return_type();
+        if (return_type)
+        {
+            // Register in local CodegenContext
+            ctx().register_method_return_type(llvm_fn_name, return_type);
+
+            // Also register in shared TemplateRegistry for cross-module access
+            Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+            if (template_registry)
+            {
+                template_registry->register_method_return_type(llvm_fn_name, return_type);
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Registered method return type for '{}': {}",
+                      llvm_fn_name, return_type->to_string());
+        }
+
         return fn;
     }
 
