@@ -568,7 +568,7 @@ namespace Cryo::Codegen
             return nullptr;
 
         std::string name = node->name();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating struct: {}", name);
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_TYPE_GEN: Generating struct type: '{}' ===", name);
 
         // CRITICAL: Do not generate struct types for generic templates
         // Generic templates should only be instantiated when used with concrete types
@@ -642,7 +642,8 @@ namespace Cryo::Codegen
 
         // Set struct body - always set even if empty to mark as non-opaque
         struct_type->setBody(field_types);
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Set struct {} body with {} fields", name, field_types.size());
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_TYPE_GEN: Set struct '{}' body with {} fields (isOpaque after: {}) ===",
+                 name, field_types.size(), struct_type->isOpaque() ? "YES" : "NO");
 
         // Register type in both context and TypeMapper cache for consistency
         ctx().register_type(name, struct_type);
