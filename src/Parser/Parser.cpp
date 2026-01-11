@@ -4050,11 +4050,17 @@ namespace Cryo
                 if (is_method)
                 {
                     auto method = parse_struct_method(struct_name, current_visibility);
+                    LOG_DEBUG(LogComponent::PARSER, "[STRUCT_PARSE] {} :: Added method '{}' (total methods: {})",
+                              struct_name, method ? method->name() : "null", struct_decl->methods().size() + 1);
                     struct_decl->add_method(std::move(method));
                 }
                 else
                 {
                     auto field = parse_struct_field(current_visibility);
+                    LOG_DEBUG(LogComponent::PARSER, "[STRUCT_PARSE] {} :: Added field '{}' of type '{}' (total fields: {})",
+                              struct_name, field ? field->name() : "null",
+                              field && field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown",
+                              struct_decl->fields().size() + 1);
                     struct_decl->add_field(std::move(field));
                 }
             }
@@ -4069,6 +4075,16 @@ namespace Cryo
         _parsing_class_members = false;
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after struct body");
+
+        LOG_DEBUG(LogComponent::PARSER, "[STRUCT_PARSE] {} :: COMPLETE - {} fields, {} methods",
+                  struct_name, struct_decl->fields().size(), struct_decl->methods().size());
+        for (const auto &f : struct_decl->fields())
+        {
+            LOG_DEBUG(LogComponent::PARSER, "[STRUCT_PARSE] {} :: Field summary: '{}' : '{}'",
+                      struct_name, f->name(),
+                      f->get_resolved_type() ? f->get_resolved_type()->to_string() : "unknown");
+        }
+
         return struct_decl;
     }
 
