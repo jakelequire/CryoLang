@@ -2170,6 +2170,51 @@ namespace Cryo::Codegen
 
         auto *st = llvm::cast<llvm::StructType>(struct_type);
 
+        // CRITICAL: Check if struct is opaque (unsized) before proceeding
+        // This can happen if the struct body hasn't been set yet due to order-of-operations issues
+        if (st->isOpaque())
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                     "ExpressionCodegen: ERROR - Struct '{}' is OPAQUE (unsized), cannot create struct literal. "
+                     "This likely means the struct body was not set before method body generation.",
+                     type_name);
+
+            // Try to look up the struct type by name directly from LLVM context
+            // The type might have been registered under a different name (e.g., qualified name)
+            std::string module_namespace = ctx().namespace_context();
+            std::string qualified_name = module_namespace.empty() ? type_name : module_namespace + "::" + type_name;
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "Attempting to find non-opaque struct under qualified name: '{}'", qualified_name);
+
+            llvm::StructType *qualified_type = llvm::StructType::getTypeByName(llvm_ctx(), qualified_name);
+            if (qualified_type && !qualified_type->isOpaque())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                         "Found non-opaque struct type under qualified name: '{}'", qualified_name);
+                st = qualified_type;
+                struct_type = qualified_type;
+            }
+            else
+            {
+                // Last resort: try to complete from TypeMapper registry
+                llvm::StructType *completed = types().lookup_struct(type_name);
+                if (completed && !completed->isOpaque())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                             "Completed struct '{}' from TypeMapper registry", type_name);
+                    st = completed;
+                    struct_type = completed;
+                }
+                else
+                {
+                    report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
+                                 "Cannot create struct literal for opaque (unsized) struct: " + type_name);
+                    return nullptr;
+                }
+            }
+        }
+
         // Check if we're in a constructor - constructors should allocate on heap
         bool is_constructor = false;
         llvm::Function *current_fn = builder().GetInsertBlock()
