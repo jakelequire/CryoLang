@@ -602,25 +602,38 @@ namespace Cryo::Codegen
         }
         // Collect field types
         std::vector<llvm::Type *> field_types;
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping {} fields for struct '{}' ===", node->fields().size(), name);
         for (const auto &field : node->fields())
         {
             Cryo::Type *cryo_field_type = field->get_resolved_type();
             if (cryo_field_type)
             {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping field '{}' of type '{}' ===",
+                         field->name(), cryo_field_type->to_string());
                 // Use the main type mapping method like the old implementation did
                 llvm::Type *field_type = types().map(cryo_field_type);
                 if (field_type)
                 {
+                    // Check if the mapped type is opaque
+                    if (auto st = llvm::dyn_cast<llvm::StructType>(field_type))
+                    {
+                        if (st->isOpaque())
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: WARNING - Field '{}' mapped to OPAQUE struct ===", field->name());
+                        }
+                    }
                     field_types.push_back(field_type);
                 }
                 else
                 {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Field '{}' mapping returned NULL ===", field->name());
                     // Default to i64 for unknown types
                     field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
                 }
             }
             else
             {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Field '{}' has no resolved type ===", field->name());
                 // Default to i64 for unresolved types
                 field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
             }
