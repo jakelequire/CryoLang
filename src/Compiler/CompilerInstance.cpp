@@ -428,6 +428,14 @@ namespace Cryo
                 }
             }
 
+            // Set TemplateRegistry for cross-module type resolution
+            // This allows codegen to dynamically look up type namespaces from imported templates
+            if (_codegen->ensure_visitor_initialized() && _template_registry)
+            {
+                _codegen->get_visitor()->context().set_template_registry(_template_registry.get());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Set TemplateRegistry in CodegenContext for cross-module resolution");
+            }
+
             if (_debug_mode)
             {
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Created CodeGenerator with module name: '{}'", namespace_for_module);
