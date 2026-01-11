@@ -1717,15 +1717,140 @@ namespace Cryo
 
     ParameterizedType *TypeChecker::resolve_generic_type(const std::string &type_string)
     {
-
         auto result = _type_registry->parse_and_instantiate(type_string);
         if (result)
         {
+            return result;
         }
-        else
+
+        // If parse_and_instantiate failed, try to find the template in TemplateRegistry
+        // and sync it to TypeRegistry
+        size_t angle_pos = type_string.find('<');
+        if (angle_pos != std::string::npos)
         {
+            std::string base_name = type_string.substr(0, angle_pos);
+            if (try_resolve_from_template_registry(base_name))
+            {
+                // Template was found and registered, try again
+                result = _type_registry->parse_and_instantiate(type_string);
+                if (result)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Successfully resolved '{}' after syncing from TemplateRegistry", type_string);
+                    return result;
+                }
+            }
         }
-        return result;
+
+        return nullptr;
+    }
+
+    bool TypeChecker::try_resolve_from_template_registry(const std::string &base_name)
+    {
+        if (!_template_registry)
+        {
+            return false;
+        }
+
+        // Check if TypeRegistry already has this template
+        if (_type_registry && _type_registry->has_template(base_name))
+        {
+            return true; // Already registered
+        }
+
+        // Try to find the template in TemplateRegistry
+        const TemplateRegistry::TemplateInfo *template_info = _template_registry->find_template(base_name);
+        if (!template_info)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Template '{}' not found in TemplateRegistry", base_name);
+            return false;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "Found template '{}' in TemplateRegistry, syncing to TypeRegistry", base_name);
+
+        // Extract generic parameter names from the template
+        std::vector<std::string> param_names;
+
+        if (template_info->struct_template)
+        {
+            for (const auto &param : template_info->struct_template->generic_parameters())
+            {
+                if (param)
+                {
+                    param_names.push_back(param->name());
+                }
+            }
+            if (!param_names.empty())
+            {
+                register_generic_type(base_name, param_names);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Synced struct template '{}' with {} parameters from TemplateRegistry",
+                          base_name, param_names.size());
+                return true;
+            }
+        }
+        else if (template_info->class_template)
+        {
+            for (const auto &param : template_info->class_template->generic_parameters())
+            {
+                if (param)
+                {
+                    param_names.push_back(param->name());
+                }
+            }
+            if (!param_names.empty())
+            {
+                register_generic_type(base_name, param_names);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Synced class template '{}' with {} parameters from TemplateRegistry",
+                          base_name, param_names.size());
+                return true;
+            }
+        }
+        else if (template_info->enum_template)
+        {
+            for (const auto &param : template_info->enum_template->generic_parameters())
+            {
+                if (param)
+                {
+                    param_names.push_back(param->name());
+                }
+            }
+            if (!param_names.empty())
+            {
+                register_generic_enum_type(base_name, param_names);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Synced enum template '{}' with {} parameters from TemplateRegistry",
+                          base_name, param_names.size());
+                return true;
+            }
+        }
+        else if (template_info->trait_template)
+        {
+            for (const auto &param : template_info->trait_template->generic_parameters())
+            {
+                if (param)
+                {
+                    param_names.push_back(param->name());
+                }
+            }
+            if (!param_names.empty())
+            {
+                register_generic_type(base_name, param_names);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Synced trait template '{}' with {} parameters from TemplateRegistry",
+                          base_name, param_names.size());
+                return true;
+            }
+        }
+
+        // If no AST node available, try to use the stored metadata
+        if (!template_info->metadata.generic_parameter_names.empty())
+        {
+            param_names = template_info->metadata.generic_parameter_names;
+            register_generic_type(base_name, param_names);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Synced template '{}' with {} parameters from TemplateRegistry metadata",
+                      base_name, param_names.size());
+            return true;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "Template '{}' found but has no generic parameters", base_name);
+        return false;
     }
 
     void TypeChecker::discover_generic_types_from_ast(ProgramNode &program)
